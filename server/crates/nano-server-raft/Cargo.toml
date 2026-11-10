@@ -38,8 +38,11 @@ flate2 = "1.1.9"
 base64 = "0.22.1"
 
 [dev-dependencies]
+# The #1405 fail-closed apply tests corrupt a replica's cold-spill row directly
+# (the #1388 failure shape), which needs raw SQLite access to the store file.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Enable the storage crate's `test-hooks` (e.g. `Journal::force_cold_spill_all`)
-# so the snapshot-streaming test (#1337) can force the cold tier
+# so the snapshot-streaming test (#1337) and the #1405 fail-closed apply tests can force the cold tier
 # deterministically instead of driving real RAM pressure.
 nano-server-storage = { path = "../nano-server-storage", features = ["test-hooks"] }
 

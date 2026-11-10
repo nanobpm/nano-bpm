@@ -118,6 +118,12 @@ pub struct EngineSnapshot {
     pub num_partitions: u64,
     pub now: u64,
     pub start_dispatch_rr: u64,
+    /// The last Raft applied-entry record (#1405) at snapshot time —
+    /// `(raft log index, opaque replication state)` — so a snapshot+tail
+    /// recovery restores it exactly as a full journal replay would. Additive: a
+    /// pre-#1405 snapshot decodes with `None`.
+    #[serde(default)]
+    pub raft_applied: Option<(u64, String)>,
 }
 
 /// Synthetic worker name stamped on a job whose activation lease was recovered
@@ -165,10 +171,12 @@ pub struct Engine {
     /// timestamp is carried on the event.
     now: u64,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
-    /// instances across the cluster's partitions. Not journaled — at RF=1 it
-    /// only balances load (the chosen target is baked onto the emitted
-    /// `StartInstanceDispatched` event, so replay is unaffected); a restart
-    /// simply resumes the rotation from zero.
+    /// instances across the cluster's partitions. Not derived from events (the
+    /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
+    /// so replay is unaffected), so it is carried explicitly: in the snapshot
+    /// and in every [`Event::RaftEntryApplied`] record (#1405), which a replay
+    /// restores — a replica seeded from the journal then routes the next
+    /// round-robin start exactly like a peer that never restarted.
     start_dispatch_rr: u64,
     /// When `true`, a `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a
     /// job that has never been activated (the `activated` latch is not required).
@@ -232,6 +240,14 @@ pub struct Engine {
     /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
     /// in which case variable resolution keeps its zero-copy fast path.
     cluster_variables: crate::cluster_vars::ClusterVariables,
+    /// The last Raft applied-entry record (#1405): `(raft log index, opaque
+    /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
+    /// engine journaled or replayed. It is written in the SAME atomic journal
+    /// frame as the entry's events, so after a crash it names exactly the last
+    /// Raft entry whose effects are durable. A Raft state machine bootstrapping
+    /// without a snapshot seeds `last_applied` from it so journaled entries are
+    /// never re-applied. `None` on a non-replicated engine.
+    raft_applied: Option<(u64, String)>,
 }
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
@@ -605,6 +621,7 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            raft_applied: None,
         }
     }
 
@@ -727,7 +744,21 @@ impl Engine {
         );
         let mut state = State::new();
         let mut next_local: u64 = 0;
+        let mut raft_applied: Option<(u64, String)> = None;
+        let mut start_dispatch_rr: u64 = 0;
         for event in events {
+            // A Raft applied-entry record (#1405) carries no keys and mutates no
+            // state; it only reseeds `raft_applied`.
+            if let Event::RaftEntryApplied {
+                index,
+                raft_state,
+                start_dispatch_rr: rr,
+            } = event
+            {
+                raft_applied = Some((index, raft_state));
+                start_dispatch_rr = rr;
+                continue;
+            }
             let max_key = event.max_key();
             if state::partition_of(max_key) == partition_id {
                 next_local = next_local.max(state::local_of(max_key));
@@ -740,7 +771,7 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
-            start_dispatch_rr: 0,
+            start_dispatch_rr,
             lenient_completion: false,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
@@ -748,7 +779,28 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            raft_applied,
         }
+    }
+
+    /// The last Raft applied-entry record (#1405) this engine journaled or
+    /// recovered by replay: `(raft log index, opaque replication state)`.
+    pub fn raft_applied(&self) -> Option<&(u64, String)> {
+        self.raft_applied.as_ref()
+    }
+
+    /// The round-robin start-dispatch cursor (see the field). Journaled in each
+    /// [`Event::RaftEntryApplied`] record so a seeded replica resumes it (#1405).
+    pub fn start_dispatch_rr(&self) -> u64 {
+        self.start_dispatch_rr
+    }
+
+    /// Records that the Raft entry at `index` was applied, mirroring the
+    /// [`Event::RaftEntryApplied`] record the journal writes in the entry's
+    /// atomic frame, so the in-memory value tracks the durable one without a
+    /// replay.
+    pub fn set_raft_applied(&mut self, index: u64, raft_state: String) {
+        self.raft_applied = Some((index, raft_state));
     }
 
     fn mint_key(&mut self) -> Key {
@@ -16606,6 +16658,111 @@ impl std::fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
+
+impl EngineError {
+    /// Whether this rejection is **environmental** — a function of THIS
+    /// replica's local machinery (an off-heap cold/spill row that will not read,
+    /// #1388) rather than of the command and the replicated state.
+    ///
+    /// The Raft apply path (`PartitionStateMachine::apply`, #1405) keys the
+    /// fail-closed decision off this classification: a *deterministic* rejection
+    /// is a pure function of `(command, replicated state)`, so every replica
+    /// computes it identically and the log entry is consumed as a per-command
+    /// rejection (replicas stay in lockstep). An *environmental* failure can
+    /// strike one replica and not its peers, so consuming the entry would
+    /// silently diverge the impaired replica from the healthy ones — the apply
+    /// must instead fail closed and return a `StorageError` so openraft halts
+    /// this replica's Raft core, leaving `last_applied` behind so recovery
+    /// re-applies the still-unapplied entry via snapshot/replay.
+    ///
+    /// This match is deliberately **exhaustive** (no wildcard): a newly added
+    /// `EngineError` variant fails to compile until its author classifies it
+    /// here, so a new environmental error can never silently degrade into a
+    /// replicated per-command rejection.
+    pub fn is_environmental(&self) -> bool {
+        match self {
+            // The only environmental failure the engine surface defines: the
+            // command's target instance exists in the replicated state, but its
+            // off-heap (cold-spilled / variable-spilled) payload could not be
+            // read back on THIS replica. Retryable once the local store
+            // recovers; a peer with a healthy store applies the same command
+            // fine.
+            EngineError::InstanceUnavailable { .. } => true,
+            // Everything else is a deterministic function of the command and the
+            // replicated state: every replica that has applied the same log
+            // prefix reaches the same verdict, so the rejection itself is
+            // replicated truth.
+            EngineError::ProcessNotFound { .. }
+            | EngineError::DecisionNotFound { .. }
+            | EngineError::NoStartEvent { .. }
+            | EngineError::StartEventExpressionInvalid { .. }
+            | EngineError::JobNotFound { .. }
+            | EngineError::JobNotActive { .. }
+            | EngineError::JobLeaseMismatch { .. }
+            | EngineError::JobUpdateInvalid { .. }
+            | EngineError::AgentInstanceAlreadyExists { .. }
+            | EngineError::AgentInstanceActiveWriter { .. }
+            | EngineError::AgentHistoryInvalid { .. }
+            | EngineError::JobNotActivated { .. }
+            | EngineError::BusinessIdOnChildInstance { .. }
+            | EngineError::BusinessIdInvalid { .. }
+            | EngineError::BusinessIdAlreadyAssigned { .. }
+            | EngineError::IncidentNotFound { .. }
+            | EngineError::IncidentNotResolvable { .. }
+            | EngineError::ScopeNotFound { .. }
+            | EngineError::InstanceNotFound { .. }
+            | EngineError::InstanceTransitionInvalid { .. }
+            | EngineError::ElementNotFound { .. }
+            | EngineError::ElementInstanceNotFound { .. }
+            | EngineError::UserTaskNotFound { .. }
+            | EngineError::UserTaskNotActive { .. }
+            | EngineError::UserTaskAlreadyAssigned { .. }
+            | EngineError::TaskListenerJobWithVariables { .. }
+            | EngineError::TaskListenerDenyWithCorrections { .. }
+            | EngineError::TaskListenerDenyNotSupported { .. }
+            | EngineError::TaskListenerAssigneeCorrectionOnCreating { .. }
+            | EngineError::AdHocUnknownElement { .. }
+            | EngineError::AdHocActivateWithCompletion { .. }
+            | EngineError::AdHocSubProcessNotFound { .. }
+            | EngineError::AdHocNoActivationTargets { .. }
+            | EngineError::TargetProcessDefinitionNotFound { .. }
+            | EngineError::DuplicateMappingSourceElement { .. }
+            | EngineError::MappingSourceElementNotFound { .. }
+            | EngineError::MappingTargetElementNotFound { .. }
+            | EngineError::UnmappedActiveElement { .. }
+            | EngineError::MappedElementTypeChanged { .. }
+            | EngineError::MigratedParallelJoinArityChanged { .. }
+            | EngineError::MigratedJoinFlowMissing { .. }
+            | EngineError::MigratedGatewayRouteMissing { .. }
+            | EngineError::UnsupportedMigration { .. }
+            | EngineError::ModificationInstructionNotYetSupported { .. }
+            | EngineError::ModificationInstructionInvalid { .. }
+            | EngineError::InstanceNotActive { .. }
+            | EngineError::AmbiguousFlowScope { .. }
+            | EngineError::AncestorScopeNotFound { .. }
+            | EngineError::AncestorNotAnAncestor { .. }
+            | EngineError::ElementNotActivatable { .. }
+            | EngineError::MigrationFlowScopeChanged { .. }
+            | EngineError::MigrationMultiInstanceMismatch { .. }
+            | EngineError::MigrationCatchEventDetached { .. }
+            | EngineError::MigrationCatchEventsMerged { .. }
+            | EngineError::MigrationCatchEventSubscriptionFailed { .. }
+            | EngineError::AgentInstanceNotFound { .. }
+            | EngineError::AgentInstanceElementInstanceInactive { .. }
+            | EngineError::AgentInstanceElementNotEligible { .. }
+            | EngineError::AgentInstanceMissingAgentDefinition { .. }
+            | EngineError::AgentInstanceJobRequiredForHistory { .. }
+            | EngineError::AgentInstanceJobNotActive { .. }
+            | EngineError::AgentInstanceJobLeaseMismatch { .. }
+            | EngineError::AgentInstanceJobElementMismatch { .. }
+            | EngineError::AgentInstanceOwnershipMismatch { .. }
+            | EngineError::AgentInstanceConflict { .. }
+            | EngineError::AgentInstanceStatusNotSettable { .. }
+            | EngineError::AgentInstanceAlreadyCompleted { .. }
+            | EngineError::AgentInstanceLimitExceeded { .. } => false,
+        }
+    }
+}
 
 /// A job handed to a worker by [`Engine::activate_jobs`]: everything the worker
 /// needs to do the work and complete it by key.

@@ -1464,6 +1464,7 @@ dependencies = [
  "nano-server-storage",
  "nanobpmn-engine-core",
  "openraft",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -1488,6 +1489,7 @@ name = "nano-server-storage"
 version = "0.0.16"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "flate2",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",

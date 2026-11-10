@@ -86,6 +86,10 @@ pub(crate) struct InstanceChunk {
 pub(crate) struct ControlFrame {
     covered_events: u64,
     control: EngineSnapshot,
+    /// The rebase-floor identity this snapshot was stamped with (#1405), see
+    /// `seglog::PersistedSnapshot::base_id`. Additive: absent decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 /// The decomposed halves of a streaming capture, produced on the engine thread
@@ -127,6 +131,8 @@ where
     pub path: &'a Path,
     pub header_line: &'a str,
     pub covered_events: u64,
+    /// The rebase-floor identity to stamp into the control frame (#1405).
+    pub base_id: Option<u64>,
     pub control: EngineSnapshot,
     pub instances: I,
     pub cold: &'a [Key],
@@ -177,6 +183,7 @@ where
         path,
         header_line,
         covered_events,
+        base_id,
         control,
         instances,
         cold,
@@ -189,6 +196,7 @@ where
         &tmp,
         header_line,
         covered_events,
+        base_id,
         control,
         instances,
         cold,
@@ -228,6 +236,7 @@ fn write_streaming_snapshot_inner<I, RC, RS>(
     tmp: &Path,
     header_line: &str,
     covered_events: u64,
+    base_id: Option<u64>,
     control: EngineSnapshot,
     instances: I,
     cold: &[Key],
@@ -251,6 +260,7 @@ where
         &ControlFrame {
             covered_events,
             control,
+            base_id,
         },
     )
     .map_err(into_invalid_data)?;
@@ -350,6 +360,7 @@ pub fn write_streaming_snapshot_from_stores(
     path: &Path,
     header_line: &str,
     covered_events: u64,
+    base_id: Option<u64>,
     capture: StreamingCapture,
     cold_keys: &[Key],
     stores: SpillStores,
@@ -364,6 +375,7 @@ pub fn write_streaming_snapshot_from_stores(
         path,
         header_line,
         covered_events,
+        base_id,
         control: capture.control,
         instances: capture.resident,
         cold: cold_keys,
@@ -460,9 +472,35 @@ where
 /// it. The reader is wrapped in a `BufReader` internally.
 pub fn read_streaming_snapshot_from<RD, R>(
     reader: RD,
+    restore_control: impl FnMut(EngineSnapshot, u64),
+    restore: R,
+) -> std::io::Result<()>
+where
+    RD: std::io::Read,
+    R: FnMut(InstanceSnapshot),
+{
+    read_streaming_snapshot_based_from(reader, restore_control, restore).map(|_| ())
+}
+
+/// [`read_streaming_snapshot`] that also returns the control frame's rebase-floor
+/// identity (#1405; `None` when absent, incl. the legacy headerless layout).
+pub fn read_streaming_snapshot_based<R>(
+    path: &Path,
+    restore_control: impl FnMut(EngineSnapshot, u64),
+    restore: R,
+) -> std::io::Result<Option<u64>>
+where
+    R: FnMut(InstanceSnapshot),
+{
+    let file = File::open(path)?;
+    read_streaming_snapshot_based_from(file, restore_control, restore)
+}
+
+fn read_streaming_snapshot_based_from<RD, R>(
+    reader: RD,
     mut restore_control: impl FnMut(EngineSnapshot, u64),
     mut restore: R,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<u64>>
 where
     RD: std::io::Read,
     R: FnMut(InstanceSnapshot),
@@ -489,7 +527,8 @@ where
     // is fixed-for-all-time (see `seglog::SnapshotHeader`), so its presence on
     // line 1 unambiguously marks the chunked framing; its absence marks legacy.
     if !is_envelope_header_line(&header_line) {
-        return restore_legacy_headerless_snapshot(header_line, reader, restore_control, restore);
+        return restore_legacy_headerless_snapshot(header_line, reader, restore_control, restore)
+            .map(|()| None);
     }
 
     // Line 2: the control frame.
@@ -499,6 +538,7 @@ where
     }
     let control_frame: ControlFrame =
         serde_json::from_str(&control_line).map_err(into_invalid_data)?;
+    let base_id = control_frame.base_id;
     restore_control(control_frame.control, control_frame.covered_events);
 
     // Remaining lines: instance chunk frames until the terminal `end` frame.
@@ -529,7 +569,7 @@ where
              restore an incomplete instance set",
         ));
     }
-    Ok(())
+    Ok(base_id)
 }
 
 fn into_invalid_data(e: serde_json::Error) -> std::io::Error {
@@ -601,6 +641,7 @@ where
         num_partitions,
         now,
         start_dispatch_rr,
+        raft_applied,
     } = snapshot;
     let (control_state, instances) =
         nanobpmn_engine_core::Engine::decompose_state_for_streaming(state);
@@ -611,6 +652,7 @@ where
         num_partitions,
         now,
         start_dispatch_rr,
+        raft_applied,
     };
     restore_control(control, 0);
     for snap in instances {
@@ -674,6 +716,10 @@ struct MultiControlFrame {
     partition: u64,
     covered_events: u64,
     control: EngineSnapshot,
+    /// The partition's rebase-floor identity (#1405), see [`ControlFrame`].
+    /// Additive: absent decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 /// One instance chunk in a combined multi-partition snapshot, tagged with the
@@ -697,13 +743,17 @@ struct MultiInstanceChunk {
 /// checkpoint) serializes a variable-spilled placeholder as-is rather than
 /// resolving it. Fail-closed and atomic (tmp + fsync + rename, partial file
 /// removed on error), exactly like [`write_streaming_snapshot_from_stores`].
+///
+/// `base_ids` maps a partition to the rebase-floor identity stamped into its
+/// control frame (#1405); a partition absent from the map is written without one.
 pub fn write_multi_streaming_snapshot(
     path: &Path,
     header_line: &str,
     entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
+    base_ids: &std::collections::HashMap<u64, u64>,
 ) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries);
+    let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries, base_ids);
     match outcome {
         Ok(()) => {
             let f = File::open(&tmp)?;
@@ -728,6 +778,7 @@ fn write_multi_streaming_snapshot_inner(
     tmp: &Path,
     header_line: &str,
     entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
+    base_ids: &std::collections::HashMap<u64, u64>,
 ) -> std::io::Result<()> {
     let file = File::create(tmp)?;
     let mut w = BufWriter::new(file);
@@ -743,6 +794,7 @@ fn write_multi_streaming_snapshot_inner(
                 partition: *partition,
                 covered_events: *covered_events,
                 control: capture.control.clone(),
+                base_id: base_ids.get(partition).copied(),
             },
         )
         .map_err(into_invalid_data)?;
@@ -891,6 +943,23 @@ fn resolve_spilled_from_stores(
 pub fn read_multi_streaming_snapshot(
     path: &Path,
 ) -> std::io::Result<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
+    read_multi_streaming_snapshot_based(path).map(|(map, _)| map)
+}
+
+/// Per-partition rebase-floor identities read from a combined snapshot's
+/// control frames (#1405); a partition without one is absent.
+pub type MultiBaseIds = std::collections::HashMap<u64, u64>;
+
+/// [`read_multi_streaming_snapshot`] plus each partition's control-frame
+/// rebase-floor identity.
+#[allow(clippy::type_complexity)]
+pub fn read_multi_streaming_snapshot_based(
+    path: &Path,
+) -> std::io::Result<(
+    std::collections::HashMap<u64, (u64, EngineSnapshot)>,
+    MultiBaseIds,
+)> {
+    let mut bases = MultiBaseIds::new();
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -922,6 +991,9 @@ pub fn read_multi_streaming_snapshot(
         if value.get("control").is_some() {
             let frame: MultiControlFrame =
                 serde_json::from_value(value).map_err(into_invalid_data)?;
+            if let Some(id) = frame.base_id {
+                bases.insert(frame.partition, id);
+            }
             map.insert(frame.partition, (frame.covered_events, frame.control));
         } else {
             let chunk: MultiInstanceChunk =
@@ -950,7 +1022,7 @@ pub fn read_multi_streaming_snapshot(
              restore an incomplete instance set",
         ));
     }
-    Ok(map)
+    Ok((map, bases))
 }
 
 #[cfg(test)]
@@ -1036,6 +1108,62 @@ mod tests {
         "{\"format_version\":3,\"incarnation\":1,\"engine_fingerprint\":\"test\"}".to_string()
     }
 
+    // #1405: the rebase-floor identity rides in the v3 control frame (single and
+    // multi), additively — absent means `None`, present round-trips verbatim.
+    #[test]
+    fn control_frames_round_trip_base_id_additively() {
+        let engine = engine_with_instances(3);
+        for base_id in [None, Some(0xfeed_u64)] {
+            let (control, instances) =
+                Engine::decompose_state_for_streaming(engine.state().clone());
+            let path = tmp_path("base-id");
+            write_streaming_snapshot(StreamWrite {
+                path: &path,
+                header_line: &header_line(),
+                covered_events: 5,
+                base_id,
+                control: control_snapshot(&control, &engine),
+                instances,
+                cold: &[],
+                read_cold: |_key| Err(invalid_data("no cold tier in this test")),
+                resolve_spilled: |_snap| Ok(()),
+                control_only: false,
+            })
+            .expect("streaming write");
+            let control_line = std::fs::read_to_string(&path).unwrap();
+            let control_line = control_line.lines().nth(1).unwrap();
+            assert_eq!(control_line.contains("\"base_id\""), base_id.is_some());
+            let got = read_streaming_snapshot_based(&path, |_, _| {}, |_| {}).unwrap();
+            assert_eq!(got, base_id);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+            let (control, resident) = Engine::decompose_state_for_streaming(engine.state().clone());
+            let path = tmp_path("multi-base-id");
+            let ids: MultiBaseIds = base_id.map(|id| (0, id)).into_iter().collect();
+            write_multi_streaming_snapshot(
+                &path,
+                &header_line(),
+                vec![(
+                    0,
+                    5,
+                    StreamingCapture {
+                        control: control_snapshot(&control, &engine),
+                        resident,
+                    },
+                    Vec::new(),
+                    SpillStores::default(),
+                    false,
+                )],
+                &ids,
+            )
+            .expect("multi streaming write");
+            let (map, bases) = read_multi_streaming_snapshot_based(&path).unwrap();
+            assert_eq!(map.get(&0).map(|(c, _)| *c), Some(5));
+            assert_eq!(bases.get(&0).copied(), base_id);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
     // #1337 red/green: a streaming snapshot must round-trip every resident
     // instance's payload WITHOUT materializing the whole set at once, and a
     // restore must rebuild an equivalent engine.
@@ -1076,6 +1204,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 42,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances,
             cold: &[],
@@ -1137,6 +1266,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 7,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances: Vec::new(), // nothing resident — the cold set is NOT folded in up front
             cold: &cold_keys,
@@ -1207,6 +1337,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 9,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances: Vec::new(), // the instance is cold, not resident
             cold: &cold_keys,
@@ -1256,6 +1387,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 1,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances,
             cold: &[],
@@ -1298,6 +1430,7 @@ mod tests {
             num_partitions: full.num_partitions,
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
+            raft_applied: full.raft_applied,
         }
     }
 
@@ -1370,6 +1503,7 @@ mod tests {
             &path,
             &header_line(),
             7,
+            None,
             StreamingCapture {
                 control: control_snapshot(&control, &engine),
                 resident: vec![snap],

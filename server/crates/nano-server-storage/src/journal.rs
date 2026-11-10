@@ -17,8 +17,7 @@
 //! semantic — after a restart, workers simply re-activate.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -276,6 +275,23 @@ pub struct Journal {
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
     activation_cursor: HashMap<String, Key>,
+    /// The Raft entry currently being applied (#1405): `Some(buffer)` between
+    /// [`begin_raft_entry`](Self::begin_raft_entry) and
+    /// [`commit_raft_entry`](Self::commit_raft_entry) /
+    /// [`abort_raft_entry`](Self::abort_raft_entry). While armed, each applied
+    /// command's events are BUFFERED here instead of written, so the whole
+    /// entry — plus its [`Event::RaftEntryApplied`] record — is journaled as
+    /// ONE atomic frame. `None` outside Raft apply (the direct REST /
+    /// single-node path journals per command as before).
+    raft_entry: Option<Vec<Event>>,
+    /// Set by [`abort_raft_entry`](Self::abort_raft_entry) (#1405): the live
+    /// engine may hold a refused entry's partial, NON-durable effects, so this
+    /// journal is FENCED until the process rebuilds it from disk — no further
+    /// mutation, journal write, spill, or snapshot/checkpoint capture. Without
+    /// the fence a later checkpoint (once the cold-read failure clears) could
+    /// persist that partial prefix under the previous applied index, and a
+    /// restart would re-execute the entry on top of it.
+    fenced: bool,
     /// Test-only instrumentation: how many times the cold-descendant traversal
     /// scanned the resident instance set per visited descendant (the O(N × D)
     /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
@@ -1007,6 +1023,14 @@ impl SharedWriter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only crash injection for [`Journal::checkpoint_base`]: fail right
+    /// after the rebase floor is published, before any authoritative state is
+    /// touched (#1405).
+    pub(crate) static FAIL_AFTER_FLOOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Journal {
     /// A non-persistent journal: the engine runs purely in memory and nothing is
     /// written. Used for tests and ephemeral runs.
@@ -1034,6 +1058,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1068,6 +1094,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1140,20 +1168,9 @@ impl Journal {
     /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
     /// replay into the engine) and the boot-time read-model catch-up.
     pub fn read_events(path: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-        let path = path.as_ref();
-        let mut events = Vec::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: Event = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                events.push(event);
-            }
-        }
-        Ok(events)
+        // Frame-aware (#1405): the single-file journal can carry atomic Raft
+        // entry frames, and shares the segment reader's torn-tail contract.
+        crate::seglog::read_segment_events(path.as_ref())
     }
 
     /// Opens (creating if absent) the journal at `path`, replaying any existing
@@ -1200,6 +1217,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1238,6 +1257,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1281,6 +1302,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1319,6 +1342,8 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1950,6 +1975,9 @@ impl Journal {
     /// snapshots are derived from the durable journal, so a lost one is
     /// reconstructable: this is a memory cache, not a system of record.
     pub fn maybe_cold_spill(&mut self) {
+        if self.fenced {
+            return;
+        }
         let (high, low, shedding) = match self.cold.as_ref() {
             Some(cold) if cold.high_water > 0 => (cold.high_water, cold.low_water, cold.shedding),
             _ => return,
@@ -2320,9 +2348,9 @@ impl Journal {
             });
         }
 
-        let Some(writer) = self.writer.as_ref() else {
+        if self.writer.is_none() {
             return Commit::ready();
-        };
+        }
 
         // The shared multi-partition segmented writer records each event line
         // with its GLOBAL write-partition tag (`<partition>\t<json>`), so
@@ -2333,7 +2361,15 @@ impl Journal {
         // which a node not owning partition 0 could not otherwise route back. The
         // single-partition / legacy / in-memory paths keep the bare `<json>` line
         // format (their reader does not expect a tag).
-        let tagged = shared_backed;
+        let bytes = self.serialize_events(events);
+        self.send_write(bytes, events, shared_backed)
+    }
+
+    /// Serializes `events` to the journal's newline-terminated record format
+    /// (`<partition>\t<json>` on the shared multi-partition writer, bare
+    /// `<json>` otherwise — see [`persist`](Self::persist)).
+    fn serialize_events(&self, events: &[Event]) -> Vec<u8> {
+        let tagged = self.shared_exporter.is_some();
         let mut bytes = Vec::new();
         for event in events.iter() {
             if tagged {
@@ -2352,7 +2388,15 @@ impl Journal {
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
         }
+        bytes
+    }
 
+    /// Hands already-serialized `bytes` (carrying `events`) to the writer and
+    /// returns their durability barrier.
+    fn send_write(&self, bytes: Vec<u8>, events: &Arc<Vec<Event>>, shared_backed: bool) -> Commit {
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
         let (ack, rx) = oneshot::channel();
         let events_count = events.len();
         let bytes_len = bytes.len();
@@ -2382,11 +2426,21 @@ impl Journal {
     /// on success. Returns the events (shared via `Arc` with the read-model
     /// exporter) and a [`Commit`] the caller should await before acknowledging the
     /// request. Mirrors [`Engine::apply_command_at`].
+    ///
+    /// Under a Raft entry ([`begin_raft_entry`](Self::begin_raft_entry)) the
+    /// events are BUFFERED, not written, and the returned [`Commit`] is
+    /// already-ready: the entry's single durable barrier is the one
+    /// [`commit_raft_entry`](Self::commit_raft_entry) returns (#1405).
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        if self.fenced {
+            // Environmental + retryable: a peer (or this replica once rebuilt
+            // from its journal) applies the command; this one must not (#1405).
+            return Err(EngineError::InstanceUnavailable { instance_key: 0 });
+        }
         self.ensure_resident_for_command(&command)?;
         let settles_job = matches!(
             command,
@@ -2401,6 +2455,14 @@ impl Journal {
             })
             .collect();
         self.rehydrate_activated_variables(&mut activated);
+        if let Some(buffer) = self.raft_entry.as_mut() {
+            // Raft entry (#1405): buffer for the entry's atomic frame. No
+            // spill either — spilling state whose events are not yet durable
+            // would let the off-heap store run ahead of the journal; the
+            // deferred `maybe_spill` runs in `commit_raft_entry`.
+            buffer.extend(events.iter().cloned());
+            return Ok((events, Commit::ready()));
+        }
         // An eventless success (an idempotent settlement replay, #1181) has
         // nothing new to persist, but acknowledging it must still wait until
         // the ORIGINAL settlement it restates is durable — otherwise a crash
@@ -2418,6 +2480,86 @@ impl Journal {
         };
         self.maybe_spill();
         Ok((events, commit))
+    }
+
+    /// Arms entry-level atomicity for one committed Raft entry (#1405): until
+    /// [`commit_raft_entry`](Self::commit_raft_entry) or
+    /// [`abort_raft_entry`](Self::abort_raft_entry), applied commands buffer
+    /// their events instead of journaling them.
+    pub fn begin_raft_entry(&mut self) {
+        self.raft_entry = Some(Vec::new());
+    }
+
+    /// Journals the armed Raft entry as ONE atomic frame (#1405): every
+    /// buffered event followed by an [`Event::RaftEntryApplied`] record for
+    /// `index` (`raft_state` is the replication layer's opaque log-id +
+    /// membership), with a single durability barrier. A torn frame is dropped
+    /// whole on recovery, so a crash can never keep part of an entry. Returns
+    /// the entry's events (the record included, for log-order export) and the
+    /// barrier. Errors — journaling nothing — when the frame would exceed the
+    /// frame cap; the caller must fail closed.
+    pub fn commit_raft_entry(
+        &mut self,
+        index: u64,
+        raft_state: String,
+    ) -> io::Result<(Arc<Vec<Event>>, Commit)> {
+        if self.fenced {
+            self.raft_entry = None;
+            return Err(io::Error::other(
+                "journal fenced after an aborted Raft entry; rebuild from disk (#1405)",
+            ));
+        }
+        let mut events = self.raft_entry.take().unwrap_or_default();
+        events.push(Event::RaftEntryApplied {
+            index,
+            raft_state: raft_state.clone(),
+            start_dispatch_rr: self.engine.start_dispatch_rr(),
+        });
+        let events = Arc::new(events);
+        let shared_backed = self.shared_exporter.is_some();
+        let commit = if self.writer.is_some() {
+            let compress = self.seg.as_ref().is_some_and(|s| s.compress);
+            let frame = crate::seglog::frame_atomic(
+                &self.serialize_events(&events),
+                events.len() as u64,
+                compress,
+            )?;
+            if !shared_backed && let Some(exporter) = self.exporter.as_ref() {
+                let _ = exporter.send(ExportBatch {
+                    events: Arc::clone(&events),
+                    bytes: 0,
+                });
+            }
+            self.send_write(frame, &events, shared_backed)
+        } else {
+            // In-memory journal: nothing to frame, but the exporter still sees
+            // the entry exactly as `persist` would forward it.
+            self.persist(&events)
+        };
+        self.engine.set_raft_applied(index, raft_state);
+        self.maybe_spill();
+        Ok((events, commit))
+    }
+
+    /// Disarms the Raft entry WITHOUT journaling anything (#1405): the entry
+    /// failed closed on an environmental error. The live engine state may hold
+    /// the entry's partial, non-durable effects; the replica must shut down and
+    /// rebuild from the durable journal, which never saw them.
+    pub fn abort_raft_entry(&mut self) {
+        self.raft_entry = None;
+        self.fenced = true;
+    }
+
+    /// Whether this journal is fenced after an aborted Raft entry (#1405, see
+    /// the `fenced` field).
+    pub fn is_fenced(&self) -> bool {
+        self.fenced
+    }
+
+    /// The last Raft applied-entry record this journal wrote or recovered
+    /// (#1405): `(raft log index, opaque replication state)`.
+    pub fn raft_applied(&self) -> Option<(u64, String)> {
+        self.engine.raft_applied().cloned()
     }
 
     /// The authoritative ownership tuple `(element_id, process_instance_key)` of
@@ -2438,6 +2580,9 @@ impl Journal {
         &mut self,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        if self.fenced {
+            return Err(EngineError::InstanceUnavailable { instance_key: 0 });
+        }
         self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
@@ -2469,6 +2614,9 @@ impl Journal {
     }
 
     fn maybe_spill(&mut self) {
+        if self.fenced {
+            return;
+        }
         let Some(cap) = self
             .spill
             .as_ref()
@@ -2560,6 +2708,9 @@ impl Journal {
     /// small a fraction of the overshoot to matter, so a tiny-payload backlog is
     /// not thrashed for negligible relief.
     pub fn maybe_var_spill_pressure(&mut self) {
+        if self.fenced {
+            return;
+        }
         let (floor, high, low, reserve) = match self.spill.as_ref().map(|vs| &vs.trigger) {
             Some(VarSpillTrigger::Adaptive {
                 floor,
@@ -2691,6 +2842,11 @@ impl Journal {
         now: u64,
         fetch_variables: Vec<String>,
     ) -> Vec<ActivatedJob> {
+        if self.fenced {
+            // Fenced after an aborted entry (#1405): the resident state holds a
+            // non-durable prefix; never hand its jobs to a worker.
+            return Vec::new();
+        }
         let job_type = job_type.into();
         self.rehydrate_activation_candidates(&job_type, max_jobs);
         let mut activated = self.engine.activate_jobs_with_fetch(
@@ -2712,6 +2868,9 @@ impl Journal {
         now: u64,
         with_lease: bool,
     ) -> Vec<Key> {
+        if self.fenced {
+            return Vec::new(); // see `activate_jobs_with_fetch` (#1405)
+        }
         self.rehydrate_activation_candidates(job_type, max_jobs);
         self.engine
             .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
@@ -2902,6 +3061,9 @@ impl Journal {
     /// [`Engine::trigger_timers`]; returns the events produced (empty if none
     /// were due) and their [`Commit`].
     pub fn trigger_timers(&mut self, now: u64) -> (Arc<Vec<Event>>, Commit) {
+        if self.fenced {
+            return (Arc::new(Vec::new()), Commit::ready());
+        }
         // Rehydrate any cold instance whose armed timer is now due, so the tick
         // can fire it. No-op when nothing cold is due.
         if let Some(cold) = self.cold.as_ref() {
@@ -3069,6 +3231,9 @@ impl Journal {
     /// recording it. Only the local journal rotation tolerates orphans — see
     /// [`try_engine_snapshot_quarantining`](Journal::try_engine_snapshot_quarantining).
     pub fn try_engine_snapshot(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         let mut snap = self.engine.snapshot();
         self.fold_offheap_into(&mut snap, OrphanPolicy::Strict)?;
         Some(snap)
@@ -3080,6 +3245,9 @@ impl Journal {
     /// readable, wired store is quarantined (logged once, see `note_orphan`) so a
     /// permanently lost payload cannot block local snapshots + compaction forever.
     pub fn try_engine_snapshot_quarantining(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         let mut snap = self.engine.snapshot();
         self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
         Some(snap)
@@ -3099,6 +3267,9 @@ impl Journal {
     pub fn try_engine_snapshot_quarantining_with_incidents(
         &mut self,
     ) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         // Under replicated (Raft) application the classic rotation still runs on
         // the Raft-owned actor, but raising an incident here would mint a
         // replica-local key + wall-clock stamp outside any Raft proposal and
@@ -3340,6 +3511,9 @@ impl Journal {
     /// may have re-spilled it right after activation (`maybe_spill`), and a
     /// healthy activation must not be withheld for that.
     pub fn resident_activated_job(&mut self, job_key: Key) -> Option<ActivatedJob> {
+        if self.fenced {
+            return None; // see `activate_jobs_with_fetch` (#1405)
+        }
         let mut job = self.engine.activated_job(job_key)?;
         if self.engine.is_variables_spilled(job.instance_key)
             && (self.varstore.is_some() || self.spill.is_some())
@@ -3518,13 +3692,20 @@ impl Journal {
     /// payload is resolved from the spill tier as it streams out. A cold instance
     /// is not read at all here — only its key is captured, and the row is read
     /// lazily during the stream.
+    ///
+    /// Returns `None` while the journal is fenced after an aborted Raft entry
+    /// (#1405): the live engine may hold the entry's partial, non-durable
+    /// effects, so no capture of it may be persisted or shipped.
     pub fn streaming_snapshot_parts(
         &self,
-    ) -> (
+    ) -> Option<(
         crate::snapstream::StreamingCapture,
         Vec<Key>,
         crate::snapstream::SpillStores,
-    ) {
+    )> {
+        if self.fenced {
+            return None;
+        }
         let full = self.engine.snapshot();
         // Move the captured state into decomposition (rather than cloning it):
         // `Engine::snapshot` already cloned the resident `State` off the live
@@ -3540,6 +3721,7 @@ impl Journal {
             num_partitions: full.num_partitions,
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
+            raft_applied: full.raft_applied,
         };
         let cold_keys: Vec<Key> = self
             .cold
@@ -3551,11 +3733,11 @@ impl Journal {
             spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
             varstore: self.varstore.as_ref().map(Arc::clone),
         };
-        (
+        Some((
             crate::snapstream::StreamingCapture { control, resident },
             cold_keys,
             stores,
-        )
+        ))
     }
 
     /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)
@@ -3571,11 +3753,17 @@ impl Journal {
         header_line: &str,
         covered_events: u64,
     ) -> std::io::Result<()> {
-        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts().ok_or_else(|| {
+            std::io::Error::other(
+                "journal fenced after an aborted Raft entry; refusing to snapshot (#1405)",
+            )
+        })?;
         crate::snapstream::write_streaming_snapshot_from_stores(
             path,
             header_line,
             covered_events,
+            // Not a seglog journal base: no rebase-floor identity (#1405).
+            None,
             capture,
             &cold_keys,
             stores,
@@ -3670,6 +3858,9 @@ impl Journal {
     /// snapshot. No command runs between the snapshot and the seal because the
     /// actor is single-threaded.
     pub fn snapshot_and_rotate(&mut self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Fail-closed: abort the rotation (returning `None` before the seal) if any
         // off-heap payload could not be folded in, so an incomplete snapshot is
@@ -3721,13 +3912,18 @@ impl Journal {
         crate::snapstream::SpillStores,
         u64,
     )> {
+        // Fenced after an aborted Raft entry (#1405): refuse BEFORE validation
+        // can journal anything or the seal can rotate.
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Validate + quarantine row-at-a-time (journaling any `VariablesLost`
         // incident BEFORE the seal), collecting the cold keys proven ABSENT so
         // they are excluded from the streaming write. No whole-set fold happens
         // here — each peeked row is dropped before the next is read.
         let absent_cold = self.validate_offheap_for_streaming()?;
-        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts()?;
         let cold_keys: Vec<Key> = cold_keys
             .into_iter()
             .filter(|k| !absent_cold.contains(k))
@@ -3882,6 +4078,86 @@ impl Journal {
         Some(covered)
     }
 
+    /// Makes the engine's CURRENT state this journal's durable recovery base
+    /// (#1405): seals the active segment at the current boundary and persists a
+    /// snapshot covering it (lean: the variable delta goes to the var store
+    /// first), in the layout this journal recovers from (single-partition
+    /// snapshot file, or this partition's entry in the combined multi-partition
+    /// snapshot). Called right after the engine adopts a Raft snapshot that is
+    /// NEWER than the journal: without it the journal would hold only the older
+    /// history, and once later entries were journaled a restart preferring the
+    /// journal would lose everything only the snapshot carried.
+    ///
+    /// An in-memory journal (no writer) has nothing durable to rebase and is a
+    /// no-op. A durable journal that cannot hold a snapshot base (non-segmented),
+    /// or a failed/refused checkpoint (fenced, unfoldable cold state), errors —
+    /// the caller must fail closed rather than run on a journal that would
+    /// silently lose state on the next restart.
+    ///
+    /// A segmented journal requires its directory's
+    /// [`CheckpointPermit`](crate::seglog::CheckpointPermit) (else it errors): the whole cycle is serialized with the periodic
+    /// checkpoint, so an older periodic capture cannot be published over the
+    /// adopted base. A durable REBASE FLOOR is recorded before the base snapshot
+    /// is published, so recovery fails closed (never replays a history lacking
+    /// the adopted state) if that snapshot is later missing or unreadable.
+    pub fn checkpoint_base(
+        &mut self,
+        permit: Option<&crate::seglog::CheckpointPermit>,
+    ) -> io::Result<()> {
+        if self.writer.is_none() {
+            return Ok(());
+        }
+        let Some(seg) = self.seg.clone() else {
+            return Err(io::Error::other(
+                "a non-segmented (legacy single-file) durable journal cannot hold a Raft \
+                 snapshot as its recovery base, so booting it over a newer snapshot would \
+                 lose that snapshot's state on a later restart; re-enable the segmented \
+                 journal (the default) for this replica (#1405)",
+            ));
+        };
+        if !permit.is_some_and(|p| p.is_for(&seg)) {
+            return Err(io::Error::other(
+                "checkpoint_base requires this journal directory's checkpoint permit (#1405)",
+            ));
+        }
+        let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
+        let floor_partition = (!seg.per_partition_total.is_empty()).then_some(self.partition_id);
+        // Publish the rebase floor BEFORE touching any authoritative state (the
+        // var store, then the snapshot): a crash at any later boundary leaves a
+        // floor no older snapshot satisfies, so recovery fails closed instead of
+        // mixing newly adopted variables with the old control state (#1405).
+        let snap = if let Some(vs) = self.varstore.clone() {
+            let (snap, covered, upserts, forgets) =
+                self.snapshot_and_rotate_lean().ok_or_else(refused)?;
+            crate::seglog::write_rebase_floor(&seg.dir, floor_partition, covered)?;
+            #[cfg(test)]
+            if FAIL_AFTER_FLOOR.with(|f| f.get()) {
+                return Err(io::Error::other("injected crash after the floor"));
+            }
+            let ups: Vec<(Key, &HashMap<String, Value>)> =
+                upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+            vs.checkpoint(self.partition_id, covered, &ups, &forgets)
+                .map_err(io::Error::other)?;
+            (snap, covered)
+        } else {
+            let (snap, covered) = self.snapshot_and_rotate().ok_or_else(refused)?;
+            crate::seglog::write_rebase_floor(&seg.dir, floor_partition, covered)?;
+            (snap, covered)
+        };
+        let (snap, covered) = snap;
+        match floor_partition {
+            None => crate::seglog::write_snapshot(&seg.dir, snap, covered),
+            Some(p) => crate::seglog::upsert_multi_snapshot_entry(&seg.dir, p, covered, snap),
+        }
+    }
+
+    /// This journal's segmented seal state, if segmented — the source of the
+    /// [`CheckpointPermit`](crate::seglog::CheckpointPermit) that
+    /// [`checkpoint_base`](Journal::checkpoint_base) requires.
+    pub fn seg_shared(&self) -> Option<Arc<SegShared>> {
+        self.seg.clone()
+    }
+
     /// The lean-snapshot counterpart of
     /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate): drains this
     /// partition's variable delta since the last checkpoint (the current maps of
@@ -3906,6 +4182,9 @@ impl Journal {
     /// cannot be folded in, so an incomplete lean checkpoint never gates
     /// compaction.
     pub fn snapshot_and_rotate_lean(&mut self) -> Option<LeanCheckpoint> {
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Fold cold instances FIRST: it is a pure read of engine + cold store (no
         // mutation), so doing it before the drain is equivalent on the success

@@ -1,5 +1,12 @@
 [
   {
+    "RaftEntryApplied": {
+      "index": 41,
+      "raft_state": "{\"opaque\":true}",
+      "start_dispatch_rr": 7
+    }
+  },
+  {
     "CompensationScopeSubscriptionCompleted": {
       "instance_key": 1,
       "scope_subscription_key": 3,

@@ -103,8 +103,37 @@ const FRAME_MAGIC: u8 = 0x1E;
 const CODEC_RAW: u8 = 0;
 /// Frame body is raw-deflate (mirrors the Raft wire codec in `raft_net.rs`).
 const CODEC_DEFLATE: u8 = 1;
-/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`.
+/// [`CODEC_RAW`] plus a CRC-32 of the plaintext (#1405). The only RAW codec
+/// this build writes; plain [`CODEC_RAW`] is read for compatibility.
+const CODEC_RAW_CRC: u8 = 2;
+/// [`CODEC_DEFLATE`] plus a CRC-32 of the inflated plaintext (#1405). The only
+/// deflate codec this build writes; plain [`CODEC_DEFLATE`] is read for
+/// compatibility.
+const CODEC_DEFLATE_CRC: u8 = 3;
+/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`,
+/// followed — for the checksummed codecs only — by [`FRAME_CRC_LEN`] bytes of
+/// CRC-32 (LE) over the frame's PLAINTEXT.
 const FRAME_HEADER_LEN: usize = 10;
+/// Length of the plaintext CRC-32 trailing a checksummed codec's header.
+const FRAME_CRC_LEN: usize = 4;
+
+/// Whether `codec` carries a plaintext CRC-32 after its header.
+fn codec_has_crc(codec: u8) -> bool {
+    matches!(codec, CODEC_RAW_CRC | CODEC_DEFLATE_CRC)
+}
+
+/// Builds a checksummed frame: header, CRC-32 of `plaintext`, then `body`.
+fn checksummed_frame(codec: u8, plaintext: &[u8], raw_len: u32, body: &[u8]) -> Option<Vec<u8>> {
+    let comp_len = u32::try_from(body.len()).ok()?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + FRAME_CRC_LEN + body.len());
+    frame.push(FRAME_MAGIC);
+    frame.push(codec);
+    frame.extend_from_slice(&raw_len.to_le_bytes());
+    frame.extend_from_slice(&comp_len.to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(plaintext).to_le_bytes());
+    frame.extend_from_slice(body);
+    Some(frame)
+}
 /// Don't frame batches below this — the header + deflate cost isn't worth it,
 /// and (crucially) the negligible/high-rate regime commits small batches that
 /// must stay verbatim so the single journal-writer thread is never taxed.
@@ -135,63 +164,160 @@ fn frame_compress(buf: &[u8], events: u64) -> Option<Vec<u8>> {
     }
     let comp = enc.finish().ok()?;
     // Only worth a frame if it meaningfully shrinks the physical write.
-    if comp.len().checked_add(FRAME_HEADER_LEN)? >= buf.len() {
+    if comp.len().checked_add(FRAME_HEADER_LEN + FRAME_CRC_LEN)? >= buf.len() {
         return None;
     }
     let raw_len = u32::try_from(buf.len()).ok()?;
-    let comp_len = u32::try_from(comp.len()).ok()?;
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + comp.len());
-    frame.push(FRAME_MAGIC);
-    frame.push(CODEC_DEFLATE);
-    frame.extend_from_slice(&raw_len.to_le_bytes());
-    frame.extend_from_slice(&comp_len.to_le_bytes());
-    frame.extend_from_slice(&comp);
-    Some(frame)
+    checksummed_frame(CODEC_DEFLATE_CRC, buf, raw_len, &comp)
 }
 
-/// Decodes a segment file into its logical plaintext bytes — the concatenated
-/// newline-terminated records the writer appended — transparently inflating any
-/// compressed frames. Walks the file record-by-record: a [`FRAME_MAGIC`] byte
-/// begins a frame, anything else begins a legacy plaintext line, so a segment
-/// may freely interleave the two. A torn trailing frame header/body (a crash
-/// mid-append that was never fsynced, hence never acked) is dropped, matching
-/// the writer's ack-after-write-before-fsync durability contract.
-fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    let raw = fs::read(path)?;
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+/// The largest payload one atomic frame can carry: the frame header stores the
+/// payload lengths as `u32`.
+pub(crate) const MAX_ATOMIC_FRAME_BYTES: usize = u32::MAX as usize;
+
+/// Frames `buf` (newline-terminated records) as ONE all-or-nothing journal
+/// record (#1405): the reader ([`decode_segment_bytes`]) drops a torn frame
+/// WHOLE, so either every record in `buf` survives a crash or none does. The
+/// Raft apply path uses it to make each committed entry's events plus its
+/// applied-entry record atomic. Deflates when `compress` is set and it pays
+/// (see [`frame_compress`]); otherwise emits a [`CODEC_RAW`] frame. Errors when
+/// `buf` exceeds [`MAX_ATOMIC_FRAME_BYTES`] — the caller must fail closed
+/// rather than split the entry across non-atomic writes.
+pub(crate) fn frame_atomic(buf: &[u8], events: u64, compress: bool) -> io::Result<Vec<u8>> {
+    frame_atomic_capped(buf, events, compress, MAX_ATOMIC_FRAME_BYTES)
+}
+
+/// [`frame_atomic`] with an explicit size cap (testable without a 4 GiB buffer).
+fn frame_atomic_capped(buf: &[u8], events: u64, compress: bool, cap: usize) -> io::Result<Vec<u8>> {
+    if buf.len() > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "atomic journal frame of {} bytes exceeds the {cap}-byte frame cap",
+                buf.len()
+            ),
+        ));
+    }
+    if compress && let Some(frame) = frame_compress(buf, events) {
+        return Ok(frame);
+    }
+    let len =
+        u32::try_from(buf.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    checksummed_frame(CODEC_RAW_CRC, buf, len, buf).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic journal frame too large",
+        )
+    })
+}
+
+/// One physical journal record recovered from a segment file: either a single
+/// legacy plaintext line or a whole frame (#1405). `bytes` is its logical
+/// plaintext (newline-terminated records, inflated when compressed) and `end`
+/// the file offset just past it. A frame is the reader's unit of atomicity: its
+/// records are accepted or dropped TOGETHER, never flattened into a partial
+/// entry.
+struct SegRecord {
+    bytes: Vec<u8>,
+    end: usize,
+    /// `false` when a checksummed frame's plaintext fails its CRC-32 (or will
+    /// not inflate): a full-length frame whose bytes were not all durably
+    /// written (#1405). The reader treats it like any other torn record —
+    /// dropped WHOLE at the tail, fatal mid-file — so damage that still parses
+    /// (e.g. the trailing applied-entry marker overwritten by same-length
+    /// whitespace) can never expose a frame's events without its marker.
+    intact: bool,
+}
+
+/// Walks `raw` record-by-record: a [`FRAME_MAGIC`] byte begins a frame,
+/// anything else begins a legacy plaintext line, so a segment may freely
+/// interleave the two. A torn trailing frame header/body or an unterminated
+/// trailing line (a crash mid-append that was never fsynced, hence never acked)
+/// ends the walk, matching the writer's ack-after-write-before-fsync durability
+/// contract.
+///
+/// The returned flag is `true` when the walk stopped at such an INCOMPLETE
+/// physical record (torn header/checksum/body or unterminated line). Callers
+/// reading a SEALED segment ([`TailPolicy::Strict`]) must reject it: a sealed
+/// segment was fsynced whole, so a truncated record there is lost durable
+/// history, never a crash mid-append (#1405).
+fn decode_segment_records(raw: &[u8]) -> io::Result<(Vec<SegRecord>, bool)> {
+    let mut out = Vec::new();
+    let mut incomplete = false;
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == FRAME_MAGIC {
             if i + FRAME_HEADER_LEN > raw.len() {
+                incomplete = true;
                 break; // torn header tail — nothing durable past here
             }
             let codec = raw[i + 1];
             // Total: the `i + FRAME_HEADER_LEN <= raw.len()` guard above
-            // guarantees both 4-byte windows are in bounds, and a `[u8; 4]`
-            // conversion from a 4-byte slice cannot fail.
+            // guarantees both 4-byte windows are in bounds.
             let raw_len =
                 u32::from_le_bytes([raw[i + 2], raw[i + 3], raw[i + 4], raw[i + 5]]) as usize;
             let comp_len =
                 u32::from_le_bytes([raw[i + 6], raw[i + 7], raw[i + 8], raw[i + 9]]) as usize;
-            let start = i + FRAME_HEADER_LEN;
+            let mut start = i + FRAME_HEADER_LEN;
+            let crc = if codec_has_crc(codec) {
+                if start + FRAME_CRC_LEN > raw.len() {
+                    incomplete = true;
+                    break; // torn checksum tail
+                }
+                let c = u32::from_le_bytes([
+                    raw[start],
+                    raw[start + 1],
+                    raw[start + 2],
+                    raw[start + 3],
+                ]);
+                start += FRAME_CRC_LEN;
+                Some(c)
+            } else {
+                None
+            };
             let Some(end) = start.checked_add(comp_len).filter(|e| *e <= raw.len()) else {
+                incomplete = true;
                 break; // torn frame body
             };
             let payload = &raw[start..end];
-            match codec {
-                CODEC_RAW => out.extend_from_slice(payload),
+            let bytes = match codec {
+                CODEC_RAW | CODEC_RAW_CRC => {
+                    // A RAW frame's two lengths are written identically; any
+                    // disagreement is a damaged header that could shorten the
+                    // frame and split off its marker (#1405) — fail closed.
+                    if raw_len != comp_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "journal RAW frame header lengths disagree",
+                        ));
+                    }
+                    payload.to_vec()
+                }
+                CODEC_DEFLATE_CRC => {
+                    use std::io::Read;
+
+                    use flate2::read::DeflateDecoder;
+                    // A torn checksummed deflate body is a damaged record, not
+                    // an I/O failure: hand it to the reader as non-intact.
+                    let mut buf = Vec::with_capacity(raw_len);
+                    match DeflateDecoder::new(payload).read_to_end(&mut buf) {
+                        Ok(_) if buf.len() == raw_len => buf,
+                        _ => Vec::new(),
+                    }
+                }
                 CODEC_DEFLATE => {
                     use std::io::Read;
 
                     use flate2::read::DeflateDecoder;
-                    let before = out.len();
-                    DeflateDecoder::new(payload).read_to_end(&mut out)?;
-                    if out.len() - before != raw_len {
+                    let mut buf = Vec::with_capacity(raw_len);
+                    DeflateDecoder::new(payload).read_to_end(&mut buf)?;
+                    if buf.len() != raw_len {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "journal frame inflated to unexpected length",
                         ));
                     }
+                    buf
                 }
                 other => {
                     return Err(io::Error::new(
@@ -199,26 +325,182 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
                         format!("unknown journal frame codec {other}"),
                     ));
                 }
-            }
+            };
+            let intact = crc.is_none_or(|c| bytes.len() == raw_len && crc32fast::hash(&bytes) == c);
+            out.push(SegRecord { bytes, end, intact });
             i = end;
         } else {
-            // Legacy plaintext record: copy through the next newline (inclusive).
-            // An unterminated trailing line is a crash mid-append that was never
-            // newline-terminated — hence never fsynced/acked — so it is dropped,
-            // matching the torn-frame contract above and the writer's
-            // ack-after-write-before-fsync durability contract. Copying it through
-            // would hand a truncated JSON record to the segment reader and panic
-            // boot recovery ("EOF while parsing a string").
+            // Legacy plaintext record: through the next newline (inclusive). An
+            // unterminated trailing line was never newline-terminated — hence
+            // never fsynced/acked — so it is dropped; copying it through would
+            // hand a truncated JSON record to the segment reader.
             match raw[i..].iter().position(|&b| b == b'\n') {
                 Some(nl) => {
-                    out.extend_from_slice(&raw[i..=i + nl]);
+                    out.push(SegRecord {
+                        bytes: raw[i..=i + nl].to_vec(),
+                        end: i + nl + 1,
+                        intact: true,
+                    });
                     i += nl + 1;
                 }
-                None => break,
+                None => {
+                    incomplete = true;
+                    break;
+                }
             }
         }
     }
-    Ok(out)
+    Ok((out, incomplete))
+}
+
+/// Decodes a segment file into its logical plaintext bytes — the concatenated
+/// newline-terminated records the writer appended — transparently inflating any
+/// compressed frames (see [`decode_segment_records`]).
+///
+/// A checksum-failing frame is corruption: fatal, never silently flattened.
+/// Under [`TailPolicy::Strict`] (sealed segments — the archive path) an
+/// incomplete trailing physical record is fatal too; [`TailPolicy::DropTorn`]
+/// drops it as a crash mid-append (#1405).
+fn decode_segment_bytes(path: &Path, tail: TailPolicy) -> io::Result<Vec<u8>> {
+    let (records, incomplete) = decode_segment_records(&fs::read(path)?)?;
+    if incomplete && tail == TailPolicy::Strict {
+        return Err(incomplete_sealed_record(path));
+    }
+    if records.iter().any(|r| !r.intact) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("journal frame checksum mismatch in {}", path.display()),
+        ));
+    }
+    Ok(records.into_iter().flat_map(|r| r.bytes).collect())
+}
+
+/// The fail-closed error for an incomplete physical record in a SEALED
+/// segment (#1405).
+fn incomplete_sealed_record(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "incomplete journal record in sealed segment {}",
+            path.display()
+        ),
+    )
+}
+
+/// Whether `bytes` carries any content (a non-whitespace, non-NUL byte).
+fn has_content(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b != 0 && !b.is_ascii_whitespace())
+}
+
+/// Parses every record of a segment file with `parse` (one call per non-blank
+/// line), returning the parsed values and the byte length of the VALID prefix —
+/// the offset just past the last accepted record.
+///
+/// Frame-atomic (#1405): a record's lines are accepted or rejected as a UNIT.
+/// Only the LAST content-carrying record may be a torn tail — a crash mid-append
+/// can leave an unterminated/garbled line, NUL padding, or a full-length frame
+/// whose reused-block payload is garbled — so a non-UTF-8 or
+/// [`EventDecodeError::Malformed`] line THERE drops that whole record (never
+/// exposing a frame's events without its trailing applied-entry marker), while
+/// the same failure mid-file is genuine corruption and fatal. An
+/// [`EventDecodeError::UnknownVariant`] is a complete record this build cannot
+/// replay — never a torn write — so it is fatal anywhere (#1065, #1071).
+fn read_segment_with<T>(
+    path: &Path,
+    tail: TailPolicy,
+    mut parse: impl FnMut(&str) -> Result<T, EventDecodeError>,
+) -> io::Result<(Vec<T>, u64)> {
+    let mut out = Vec::new();
+    let mut valid_end = 0u64;
+    if !path.exists() {
+        return Ok((out, valid_end));
+    }
+    let (records, incomplete) = decode_segment_records(&fs::read(path)?)?;
+    if incomplete && tail == TailPolicy::Strict {
+        return Err(incomplete_sealed_record(path));
+    }
+    // A damaged (non-intact) frame is content even when its bytes are blank:
+    // it must be classified, never skipped past as padding.
+    let carries = |r: &SegRecord| !r.intact || has_content(&r.bytes);
+    let last = records.iter().rposition(carries);
+    for (idx, record) in records.iter().enumerate() {
+        if !carries(record) {
+            continue;
+        }
+        let torn_tail = tail == TailPolicy::DropTorn && Some(idx) == last;
+        let mut parsed = Vec::new();
+        let mut failure: Option<(bool, io::Error)> = if record.intact {
+            None
+        } else {
+            Some((
+                true,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal frame checksum mismatch",
+                ),
+            ))
+        };
+        let lines: &[u8] = if record.intact { &record.bytes } else { &[] };
+        for line in lines.split(|&b| b == b'\n') {
+            let line = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(e) => {
+                    failure = Some((true, io::Error::new(io::ErrorKind::InvalidData, e)));
+                    break;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse(line) {
+                Ok(v) => parsed.push(v),
+                Err(e) => {
+                    let tolerable = matches!(e, EventDecodeError::Malformed { .. });
+                    failure = Some((tolerable, io::Error::new(io::ErrorKind::InvalidData, e)));
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => {
+                out.extend(parsed);
+                valid_end = record.end as u64;
+            }
+            Some((true, e)) if torn_tail => {
+                tracing::warn!(
+                    "dropping torn journal tail record in {}: {e}",
+                    path.display()
+                );
+                break;
+            }
+            Some((_, e)) => return Err(e),
+        }
+    }
+    Ok((out, valid_end))
+}
+
+/// How [`read_segment_with`] treats a damaged/incomplete FINAL record (#1405).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TailPolicy {
+    /// The ACTIVE segment: a torn final record is a crash mid-append and is
+    /// dropped whole.
+    DropTorn,
+    /// A SEALED segment: every record was fsynced before the seal, so a damaged
+    /// final record is lost durable history and fails closed.
+    Strict,
+}
+
+/// The byte length of `path`'s valid record prefix (see
+/// [`read_segment_with`]): everything past it is a torn tail that recovery
+/// drops. [`ActiveSegment::open`] truncates the active segment to it before
+/// appending, so a retried write can never splice into a torn record's
+/// advertised length (#1405).
+fn valid_segment_len(path: &Path) -> io::Result<u64> {
+    read_segment_with(path, TailPolicy::DropTorn, |line| {
+        let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
+        decode_event_json(json).map(|_| ())
+    })
+    .map(|(_, end)| end)
 }
 
 /// Whether the segmented journal is enabled for the persistent single-partition
@@ -321,9 +603,56 @@ pub struct SegShared {
     /// [`journal_compress_from_env`] on the segmented path; always `false` on the
     /// legacy single-file path.
     pub compress: bool,
+    /// Serializes every checkpoint cycle (capture -> seal -> publish) over this
+    /// journal directory (#1405). The periodic maintenance tick holds it from
+    /// capture through publish, and adopting a Raft snapshot as the recovery
+    /// base ([`Journal::checkpoint_base`](crate::journal::Journal::checkpoint_base))
+    /// requires a [`CheckpointPermit`] from it — so an older periodic capture can
+    /// never be published OVER a newer adopted base. Acquire it BEFORE entering
+    /// the engine actor (never on it) so the two paths cannot deadlock.
+    pub checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Proof of holding a journal directory's
+/// [`checkpoint_gate`](SegShared::checkpoint_gate) (#1405). Obtained only via
+/// [`SegShared::checkpoint_permit`], so a checkpoint that must not interleave
+/// with another cycle cannot be called without it.
+pub struct CheckpointPermit {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl CheckpointPermit {
+    /// Whether this permit was issued by `shared`'s gate.
+    pub fn is_for(&self, shared: &SegShared) -> bool {
+        Arc::ptr_eq(&self.gate, &shared.checkpoint_gate)
+    }
 }
 
 impl SegShared {
+    /// Waits for this directory's checkpoint gate (see
+    /// [`checkpoint_gate`](SegShared::checkpoint_gate)). Call off the engine
+    /// actor, then hold the permit across the whole capture -> publish cycle.
+    pub async fn checkpoint_permit(&self) -> CheckpointPermit {
+        let gate = self.checkpoint_gate.clone();
+        let guard = gate.clone().lock_owned().await;
+        CheckpointPermit {
+            gate,
+            _guard: guard,
+        }
+    }
+
+    /// Non-blocking [`checkpoint_permit`](SegShared::checkpoint_permit): `None`
+    /// while another checkpoint cycle holds the gate.
+    pub fn try_checkpoint_permit(&self) -> Option<CheckpointPermit> {
+        let gate = self.checkpoint_gate.clone();
+        let guard = gate.clone().try_lock_owned().ok()?;
+        Some(CheckpointPermit {
+            gate,
+            _guard: guard,
+        })
+    }
+
     /// A non-segmenting shared state for the legacy single-file paths
     /// (`Journal::open_partition`, `SharedWriter`): an infinite seal threshold
     /// means the writer never rotates, so the file keeps its given path and
@@ -343,6 +672,7 @@ impl SegShared {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: false,
+            checkpoint_gate: Arc::default(),
         })
     }
 
@@ -456,6 +786,23 @@ pub struct ActiveSegment {
 impl ActiveSegment {
     /// Opens (creating, positioned to append) the active segment for `shared`.
     pub fn open(shared: Arc<SegShared>) -> io::Result<Self> {
+        // Truncate any torn tail first (#1405): recovery drops it, but its
+        // bytes would otherwise stay in front of the next append — a retried
+        // write could then fill a torn frame's advertised length with new
+        // bytes, and a later recovery would parse a mixed record.
+        if let Ok(meta) = fs::metadata(&shared.active_path) {
+            let valid = valid_segment_len(&shared.active_path)?;
+            if valid < meta.len() {
+                tracing::warn!(
+                    "truncating torn tail of {} from {} to {valid} bytes",
+                    shared.active_path.display(),
+                    meta.len()
+                );
+                let f = OpenOptions::new().write(true).open(&shared.active_path)?;
+                f.set_len(valid)?;
+                f.sync_all()?;
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -481,7 +828,13 @@ impl ActiveSegment {
     /// large payloads — shrinks; `self.bytes` therefore tracks on-disk bytes, so
     /// size-based sealing rotates on physical size.
     pub fn write_all(&mut self, buf: &[u8], events: u64) -> io::Result<()> {
+        // A batch that already contains an atomic frame (#1405) is written
+        // verbatim: re-framing it would nest a frame inside a frame, which the
+        // reader does not decode. Serialized JSON never contains a raw
+        // `FRAME_MAGIC` byte (serde escapes control characters), so its
+        // presence means a pre-framed record.
         let written = if self.shared.compress
+            && !buf.contains(&FRAME_MAGIC)
             && let Some(frame) = frame_compress(buf, events)
         {
             self.file.write_all(&frame)?;
@@ -659,6 +1012,12 @@ fn read_pphead(path: &Path) -> Option<Vec<u64>> {
 struct PersistedSnapshot {
     covered_events: u64,
     engine: EngineSnapshot,
+    /// The rebase-floor identity this snapshot was published under (#1405),
+    /// stamped by [`write_snapshot`] when its `covered_events` equals the
+    /// floor's boundary (see [`RebaseFloor`]). Additive: absent on every older
+    /// snapshot (decodes as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 /// The `format_version` at which the local snapshot payload is the chunked
@@ -693,6 +1052,183 @@ const STREAMING_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 /// [`SnapshotHeader::incarnation`]). Generated once per data dir and stamped
 /// into every snapshot header.
 const INCARNATION_NAME: &str = "journal.incarnation";
+
+/// Infix marking a [`unique_tmp_path`] staging file, so recovery can sweep the
+/// leftovers of a crash mid-write.
+const UNIQUE_TMP_INFIX: &str = ".stage-";
+
+/// A staging path for an atomic `tmp + rename` publish of `path` that is unique
+/// per process AND per call (#1405): two concurrent publishers of the same file
+/// (e.g. a periodic checkpoint and a Raft-snapshot adoption) must never share a
+/// temp file, or one could rename the other's half-written bytes into place.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(
+        "{UNIQUE_TMP_INFIX}{}-{seq}.tmp",
+        std::process::id()
+    ));
+    path.with_file_name(name)
+}
+
+/// Removes staging files a crash left behind mid-publish (see
+/// [`unique_tmp_path`]). Best-effort: a leftover is only wasted disk, never
+/// read as state.
+fn sweep_unique_tmp(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(UNIQUE_TMP_INFIX) && name.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Filename of the durable REBASE FLOOR (#1405) for the single-partition layout,
+/// or for partition `p` of the multi-partition layout. Present only once a Raft
+/// snapshot was adopted as this journal's recovery base: the journal's own
+/// history does NOT contain the adopted state, so recovery is valid only from a
+/// snapshot covering at least the floor.
+fn rebase_floor_path(dir: &Path, partition: Option<u64>) -> PathBuf {
+    match partition {
+        None => dir.join("journal.rebase-floor"),
+        Some(p) => dir.join(format!("journal.rebase-floor.p{p}")),
+    }
+}
+
+/// A durable rebase floor (#1405): the journal boundary an adopted Raft base
+/// was checkpointed at, plus a unique IDENTITY for that adoption. Adopting a
+/// snapshot appends no journal events, so an OLDER checkpoint can sit at the
+/// very same boundary; the boundary alone cannot tell it from the adopted base.
+/// The id can: the base snapshot is stamped with it (see [`floor_stamp`]), so
+/// a same-boundary snapshot without it predates the adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RebaseFloor {
+    covered: u64,
+    /// `None` only for a legacy count-only floor file.
+    id: Option<u64>,
+}
+
+impl RebaseFloor {
+    /// Whether a snapshot covering `covered`, stamped `base_id`, holds the
+    /// adopted base: strictly past the boundary (a later checkpoint, which
+    /// captured the adopted state plus a suffix), or AT it and carrying this
+    /// floor's identity.
+    fn satisfied_by(&self, covered: u64, base_id: Option<u64>) -> bool {
+        covered > self.covered
+            || (covered == self.covered && (self.id.is_none() || base_id == self.id))
+    }
+}
+
+/// A fresh identity for one adoption: unique per process lifetime (counter)
+/// and across restarts (wall clock + pid).
+fn fresh_rebase_id() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 40) ^ SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Durably records the rebase floor (see [`rebase_floor_path`]) BEFORE the
+/// adopted base snapshot is published, so there is no crash window in which
+/// the base is relied on but unprotected: a crash between the two leaves a
+/// floor no snapshot satisfies — not even an older checkpoint at the same
+/// boundary, which lacks this floor's fresh identity — and recovery fails
+/// closed instead of replaying a history that lacks the adopted state.
+pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> io::Result<()> {
+    let path = rebase_floor_path(dir, partition);
+    let tmp = unique_tmp_path(&path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(format!("{covered} {}", fresh_rebase_id()).as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Reads the rebase floor, if any. An unreadable or malformed floor is an error
+/// (fail closed): it means a base was adopted and we cannot tell how far.
+fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<RebaseFloor>> {
+    let malformed = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed journal rebase floor: {what}"),
+        )
+    };
+    let s = match fs::read_to_string(rebase_floor_path(dir, partition)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut parts = s.split_whitespace();
+    let covered = parts
+        .next()
+        .ok_or_else(|| malformed("empty"))?
+        .parse::<u64>()
+        .map_err(|e| malformed(&e.to_string()))?;
+    let id = parts
+        .next()
+        .map(|t| t.parse::<u64>().map_err(|e| malformed(&e.to_string())))
+        .transpose()?;
+    if parts.next().is_some() {
+        return Err(malformed("trailing data"));
+    }
+    Ok(Some(RebaseFloor { covered, id }))
+}
+
+/// The base identity to stamp into a snapshot of `partition` covering
+/// `covered`: the floor's id when the snapshot sits exactly at the floor's
+/// boundary (the adopted base itself, or a later checkpoint of the same state,
+/// both of which hold the adopted state — the checkpoint permit serializes
+/// every capture -> publish cycle with the adoption, so no pre-adoption capture
+/// can publish after the floor). The floor file is the single source of truth.
+fn floor_stamp(dir: &Path, partition: Option<u64>, covered: u64) -> io::Result<Option<u64>> {
+    Ok(read_rebase_floor(dir, partition)?
+        .filter(|f| f.covered == covered)
+        .and_then(|f| f.id))
+}
+
+/// Enforces the rebase floor (#1405): when a Raft snapshot was adopted as the
+/// recovery base, the only valid recovery is from a READABLE snapshot that
+/// holds it (see [`RebaseFloor::satisfied_by`]). A missing,
+/// unreadable/incompatible (which would route to replay-migration), older, or
+/// same-boundary-but-pre-adoption snapshot cannot reconstruct the adopted state
+/// from the journal's own history — replaying it would silently rewind (the
+/// #1065 class) — so recovery fails closed and the node must be re-seeded from
+/// its Raft peers / snapshot. `loaded` is the snapshot's `(covered, base_id)`.
+fn enforce_rebase_floor(
+    dir: &Path,
+    partition: Option<u64>,
+    loaded: Option<(u64, Option<u64>)>,
+) -> io::Result<()> {
+    let Some(floor) = read_rebase_floor(dir, partition)? else {
+        return Ok(());
+    };
+    match loaded {
+        Some((covered, base_id)) if floor.satisfied_by(covered, base_id) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal{} was rebased onto an adopted Raft snapshot at {} but no readable \
+                 journal snapshot holds that base (found {loaded:?}); the journal's own \
+                 history lacks the adopted state, so refusing to recover (would rewind, \
+                 #1065/#1405). Re-seed this replica from its Raft peers.",
+                partition
+                    .map(|p| format!(" partition {p}"))
+                    .unwrap_or_default(),
+                floor.covered,
+            ),
+        )),
+    }
+}
 
 /// The always-parseable envelope header prefixed to every persisted snapshot.
 ///
@@ -931,56 +1467,16 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
-/// Index of the last line that carries content (any non-whitespace, non-NUL
-/// byte), or `None` when every line is blank. Only this final line may be a torn
-/// tail — a crash mid-append can leave an unterminated record or NUL padding at
-/// end-of-file — so segment readers tolerate a parse failure *there* (dropping
-/// it) while still hard-erroring on genuine mid-file corruption.
-fn last_content_line(lines: &[&[u8]]) -> Option<usize> {
-    lines
-        .iter()
-        .rposition(|l| l.iter().any(|&b| b != 0 && !b.is_ascii_whitespace()))
+/// Reads and deserializes every event from a single segment/log file (empty if
+/// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
+pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
+    read_segment_with(path, TailPolicy::DropTorn, decode_event_json).map(|(events, _)| events)
 }
 
-/// Reads and deserializes every event from a single segment/log file (empty if
-/// absent).
-pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    let mut events = Vec::new();
-    if path.exists() {
-        let decoded = decode_segment_bytes(path)?;
-        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
-        let last = last_content_line(&lines);
-        for (idx, line) in lines.iter().enumerate() {
-            let torn_tail = Some(idx) == last;
-            let line = match std::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: Event = match decode_event_json(line) {
-                Ok(ev) => ev,
-                // A torn trailing write can leave a truncated/garbled last line;
-                // that is `Malformed` and safe to drop as an unfsynced tail. An
-                // `UnknownVariant` is a COMPLETE, well-formed record naming an
-                // event this build cannot replay (a renamed/removed variant or a
-                // newer/foreign journal) — never a torn write, so it is fatal
-                // even as the last line (routed to fail-closed / #1071, #1065).
-                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            events.push(event);
-        }
-    }
-    Ok(events)
+/// [`read_segment_events`] for a SEALED segment: no torn-tail tolerance — a
+/// damaged final record fails closed ([`TailPolicy::Strict`]).
+fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
+    read_segment_with(path, TailPolicy::Strict, decode_event_json).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -992,47 +1488,27 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
 /// key partition, so a directory written by the pre-tag multi-partition format
 /// still recovers with the same demux behaviour it had then.
 fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
-    let mut events = Vec::new();
-    if path.exists() {
-        let decoded = decode_segment_bytes(path)?;
-        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
-        let last = last_content_line(&lines);
-        for (idx, line) in lines.iter().enumerate() {
-            let torn_tail = Some(idx) == last;
-            let line = match std::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (tag, json) = match line.split_once('\t') {
-                Some((t, rest)) => (t.parse::<u64>().ok(), rest),
-                None => (None, line),
-            };
-            let event: Event = match decode_event_json(json) {
-                Ok(ev) => ev,
-                // Same torn-tail vs. unknown-frame distinction as
-                // `read_segment_events`: tolerate only a `Malformed` tail; an
-                // `UnknownVariant` is a real cross-version frame, never dropped.
-                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            let tag = tag.unwrap_or_else(|| {
-                (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1))
-                    as u64
-            });
-            events.push((tag, event));
-        }
-    }
-    Ok(events)
+    read_segment_events_tagged_with(path, num_partitions, TailPolicy::DropTorn)
+}
+
+/// [`read_segment_events_tagged`] under an explicit [`TailPolicy`].
+fn read_segment_events_tagged_with(
+    path: &Path,
+    num_partitions: usize,
+    tail: TailPolicy,
+) -> io::Result<Vec<(u64, Event)>> {
+    read_segment_with(path, tail, |line| {
+        let (tag, json) = match line.split_once('\t') {
+            Some((t, rest)) => (t.parse::<u64>().ok(), rest),
+            None => (None, line),
+        };
+        let event = decode_event_json(json)?;
+        let tag = tag.unwrap_or_else(|| {
+            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+        });
+        Ok((tag, event))
+    })
+    .map(|(events, _)| events)
 }
 
 /// Loads the latest persisted snapshot in `dir`.
@@ -1044,7 +1520,16 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
 ///
 /// The loaded value keeps `covered_events` as the SECOND tuple element to match
 /// the callers in [`recover`].
+#[cfg(test)]
 fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
+    Ok(load_latest_snapshot_based(dir)?.map(|(snap, covered, _)| (snap, covered)))
+}
+
+/// [`load_latest_snapshot`] plus the snapshot's rebase-floor identity
+/// ([`PersistedSnapshot::base_id`]).
+fn load_latest_snapshot_based(
+    dir: &Path,
+) -> io::Result<Option<(EngineSnapshot, u64, Option<u64>)>> {
     let mut best: Option<(u64, PathBuf)> = None;
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -1092,7 +1577,7 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
         // instance chunk is restored into it as it streams by — the whole
         // serialized body is never held as one buffer.
         let acc: std::cell::RefCell<Option<(EngineSnapshot, u64)>> = std::cell::RefCell::new(None);
-        crate::snapstream::read_streaming_snapshot(
+        let base_id = crate::snapstream::read_streaming_snapshot_based(
             &path,
             |control, covered| *acc.borrow_mut() = Some((control, covered)),
             |snap| {
@@ -1120,7 +1605,7 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
         let (engine, covered) = acc.into_inner().ok_or_else(|| SnapshotLoadError::Corrupt {
             reason: "streaming snapshot had no control frame".to_string(),
         })?;
-        return Ok(Some((engine, covered)));
+        return Ok(Some((engine, covered, base_id)));
     }
     // Legacy monolithic framing (v0 headerless, v1, v2).
     let bytes = fs::read(&path)?;
@@ -1130,7 +1615,7 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("snapshot payload deserialize failed: {e}"),
         })?;
-    Ok(Some((snap.engine, snap.covered_events)))
+    Ok(Some((snap.engine, snap.covered_events, snap.base_id)))
 }
 
 /// Rewrites the `covered_events` in a v3 streaming single-partition snapshot's
@@ -1212,7 +1697,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     let mut events: Vec<Event> = Vec::new();
     let mut cursor = first_index.unwrap_or(0);
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events(path)?;
+        let seg_events = read_sealed_segment_events(path)?;
         let end = start + seg_events.len() as u64;
         sealed.push(SealedSeg {
             start: *start,
@@ -1245,7 +1730,18 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     // surviving tail) and rewrite a fresh NEW-format snapshot. Fail-closed only
     // when the history cannot fully reconstruct the engine (a pruned gap, or an
     // unreadable event frame — both snapshot AND journal gone).
-    let (engine, fresh) = match load_latest_snapshot(dir) {
+    sweep_unique_tmp(dir);
+    let loaded = load_latest_snapshot_based(dir);
+    enforce_rebase_floor(
+        dir,
+        None,
+        loaded
+            .as_ref()
+            .ok()
+            .and_then(|o| o.as_ref().map(|(_, c, id)| (*c, *id))),
+    )?;
+    let loaded = loaded.map(|o| o.map(|(snap, covered, _)| (snap, covered)));
+    let (engine, fresh) = match loaded {
         // A readable snapshot whose `covered` is BELOW the compaction floor is
         // stale (e.g. the newest snapshot was lost/removed post-compaction and an
         // older one resurfaced). Trusting it would `saturating_sub`-clamp `skip`
@@ -1355,6 +1851,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         per_partition_total: Vec::new(),
         per_partition_active_start: Vec::new(),
         compress: journal_compress_from_env(),
+        checkpoint_gate: Arc::default(),
     });
 
     Ok((
@@ -1390,6 +1887,7 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
             num_partitions: snap.num_partitions,
             now: snap.now,
             start_dispatch_rr: snap.start_dispatch_rr,
+            raft_applied: snap.raft_applied,
         },
         resident,
     };
@@ -1431,10 +1929,12 @@ fn write_snapshot_parts(
 ) -> io::Result<()> {
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
     let header_line = snapshot_envelope_header_line(dir)?;
+    let base_id = floor_stamp(dir, None, covered_events)?;
     crate::snapstream::write_streaming_snapshot_from_stores(
         &final_path,
         &header_line,
         covered_events,
+        base_id,
         capture,
         cold_keys,
         stores,
@@ -1567,7 +2067,7 @@ fn archive_cold_segment(dir: &Path, seg_path: &Path, start: u64, end: u64) -> io
     if final_path.exists() {
         return Ok(());
     }
-    let plaintext = decode_segment_bytes(seg_path)?;
+    let plaintext = decode_segment_bytes(seg_path, TailPolicy::Strict)?;
     let compressed = deflate_all(&plaintext)?;
     let tmp = final_path.with_extension("z.tmp");
     {
@@ -1905,6 +2405,9 @@ struct MultiSnapshotEntry {
     partition: u64,
     covered: u64,
     engine: EngineSnapshot,
+    /// See [`PersistedSnapshot::base_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1950,7 +2453,24 @@ fn write_multi_snapshot_with_mode(
     entries: Vec<(u64, u64, EngineSnapshot)>,
     control_only: bool,
 ) -> io::Result<()> {
-    let parts = entries
+    write_multi_snapshot_streaming(dir, decompose_multi_entries(entries, control_only))
+}
+
+/// Decomposes value-taking `(partition, covered, snapshot)` entries into the
+/// streaming writer's per-partition captures (no cold set, no stores).
+#[allow(clippy::type_complexity)]
+fn decompose_multi_entries(
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+    control_only: bool,
+) -> Vec<(
+    u64,
+    u64,
+    crate::snapstream::StreamingCapture,
+    Vec<nanobpmn_engine_core::Key>,
+    crate::snapstream::SpillStores,
+    bool,
+)> {
+    entries
         .into_iter()
         .map(|(partition, covered, snap)| {
             let (control_state, resident) = Engine::decompose_state_for_streaming(snap.state);
@@ -1965,6 +2485,7 @@ fn write_multi_snapshot_with_mode(
                         num_partitions: snap.num_partitions,
                         now: snap.now,
                         start_dispatch_rr: snap.start_dispatch_rr,
+                        raft_applied: snap.raft_applied,
                     },
                     resident,
                 },
@@ -1973,8 +2494,7 @@ fn write_multi_snapshot_with_mode(
                 control_only,
             )
         })
-        .collect();
-    write_multi_snapshot_streaming(dir, parts)
+        .collect()
 }
 
 /// The production multi-partition combined snapshot write (#1463): streams every
@@ -2000,9 +2520,75 @@ pub fn write_multi_snapshot_streaming(
         bool,
     )>,
 ) -> io::Result<()> {
+    // Every written entry is stamped from the current floor (#1405).
+    let mut base_ids = crate::snapstream::MultiBaseIds::new();
+    for (partition, covered, ..) in &entries {
+        if let Some(id) = floor_stamp(dir, Some(*partition), *covered)? {
+            base_ids.insert(*partition, id);
+        }
+    }
+    write_multi_snapshot_streaming_based(dir, entries, &base_ids)
+}
+
+/// [`write_multi_snapshot_streaming`] with explicit per-partition rebase-floor
+/// identities (a partition absent from `base_ids` is written without one).
+#[allow(clippy::type_complexity)]
+fn write_multi_snapshot_streaming_based(
+    dir: &Path,
+    entries: Vec<(
+        u64,
+        u64,
+        crate::snapstream::StreamingCapture,
+        Vec<nanobpmn_engine_core::Key>,
+        crate::snapstream::SpillStores,
+        bool,
+    )>,
+    base_ids: &crate::snapstream::MultiBaseIds,
+) -> io::Result<()> {
     let final_path = dir.join(MULTI_SNAP_NAME);
     let header_line = snapshot_envelope_header_line(dir)?;
-    crate::snapstream::write_multi_streaming_snapshot(&final_path, &header_line, entries)
+    crate::snapstream::write_multi_streaming_snapshot(&final_path, &header_line, entries, base_ids)
+}
+
+/// Replaces (or adds) ONE partition's entry in the combined snapshot, keeping
+/// every other partition's entry as it is (#1405). Used when a single partition
+/// must make its current state its journal recovery base out of band of the
+/// periodic all-partitions tick — e.g. right after adopting a newer Raft
+/// snapshot that the journal does not hold. A present-but-unreadable combined
+/// snapshot fails closed (never overwritten with a partial set).
+pub fn upsert_multi_snapshot_entry(
+    dir: &Path,
+    partition: u64,
+    covered: u64,
+    snap: EngineSnapshot,
+) -> io::Result<()> {
+    // Untouched partitions keep their STORED base identity verbatim: only the
+    // replaced entry is stamped from the current floor. Re-stamping every entry
+    // would let a partition whose adoption published a new floor but failed to
+    // write its base certify its unchanged, same-boundary snapshot as that base.
+    let mut base_ids = crate::snapstream::MultiBaseIds::new();
+    let mut entries: Vec<(u64, u64, EngineSnapshot)> = match load_multi_snapshot_based(dir)? {
+        Some((engines, bases)) => engines
+            .into_iter()
+            .filter(|(p, _)| *p != partition)
+            .map(|(p, (c, engine))| {
+                if let Some(id) = bases.get(&p).and_then(|(_, id)| *id) {
+                    base_ids.insert(p, id);
+                }
+                (p, c, engine)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(id) = floor_stamp(dir, Some(partition), covered)? {
+        base_ids.insert(partition, id);
+    }
+    entries.push((partition, covered, snap));
+    entries.sort_by_key(|e| e.0);
+    // Serialized as-is (`control_only`): a stored lean entry keeps its spilled
+    // placeholders verbatim (the var store holds the payload), and the adopted
+    // snapshot is self-contained, so nothing needs resolving.
+    write_multi_snapshot_streaming_based(dir, decompose_multi_entries(entries, true), &base_ids)
 }
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
@@ -2011,9 +2597,20 @@ pub fn write_multi_snapshot_streaming(
 /// `Ok(None)` means ONLY "no combined snapshot file exists". A present-but-
 /// incompatible or corrupt file is a FATAL typed error ([`SnapshotLoadError`],
 /// surfaced as an [`io::Error`]) — never a silent `None`, never a rewind.
-fn load_multi_snapshot(
-    dir: &Path,
-) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
+#[cfg(test)]
+fn load_multi_snapshot(dir: &Path) -> io::Result<Option<MultiEngines>> {
+    Ok(load_multi_snapshot_based(dir)?.map(|(m, _)| m))
+}
+
+/// Per-partition `(covered, base_id)` of a combined snapshot (see
+/// [`PersistedSnapshot::base_id`]).
+type MultiBases = std::collections::HashMap<u64, (u64, Option<u64>)>;
+
+/// A decoded combined snapshot: global partition id -> `(covered, snapshot)`.
+type MultiEngines = std::collections::HashMap<u64, (u64, EngineSnapshot)>;
+
+/// [`load_multi_snapshot`] plus each entry's `(covered, base_id)`.
+fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, MultiBases)>> {
     let path = dir.join(MULTI_SNAP_NAME);
     // Version dispatch (#1463), mirroring `load_latest_snapshot`: v3 is the
     // chunked per-partition stream; v0/v1/v2 are the monolithic
@@ -2032,19 +2629,24 @@ fn load_multi_snapshot(
         .into());
     }
     if version == STREAMING_SNAPSHOT_FORMAT_VERSION {
-        let map = crate::snapstream::read_multi_streaming_snapshot(&path).map_err(|e| {
-            match e
-                .get_ref()
-                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
-            {
-                Some(_) => e,
-                None => SnapshotLoadError::Corrupt {
-                    reason: format!("streaming multi snapshot read failed: {e}"),
+        let (map, ids) =
+            crate::snapstream::read_multi_streaming_snapshot_based(&path).map_err(|e| {
+                match e
+                    .get_ref()
+                    .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                {
+                    Some(_) => e,
+                    None => SnapshotLoadError::Corrupt {
+                        reason: format!("streaming multi snapshot read failed: {e}"),
+                    }
+                    .into(),
                 }
-                .into(),
-            }
-        })?;
-        return Ok(Some(map));
+            })?;
+        let bases = map
+            .iter()
+            .map(|(p, (covered, _))| (*p, (*covered, ids.get(p).copied())))
+            .collect();
+        return Ok(Some((map, bases)));
     }
     // Legacy monolithic framing (v0 headerless, v1, v2).
     let bytes = fs::read(&path)?;
@@ -2054,12 +2656,18 @@ fn load_multi_snapshot(
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("multi-snapshot payload deserialize failed: {e}"),
         })?;
-    Ok(Some(
+    let bases = snap
+        .entries
+        .iter()
+        .map(|e| (e.partition, (e.covered, e.base_id)))
+        .collect();
+    Ok(Some((
         snap.entries
             .into_iter()
             .map(|e| (e.partition, (e.covered, e.engine)))
             .collect(),
-    ))
+        bases,
+    )))
 }
 
 /// The outcome of recovering a multi-partition segmented journal directory.
@@ -2134,7 +2742,7 @@ pub fn recover_multi(
     let mut cursor = first_index_opt.unwrap_or(0);
     let mut pp_running = pp_base.clone();
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events_tagged(path, num_partitions)?;
+        let seg_events = read_segment_events_tagged_with(path, num_partitions, TailPolicy::Strict)?;
         let end = start + seg_events.len() as u64;
         for (tag, _) in &seg_events {
             let p = (*tag as usize).min(num_partitions.saturating_sub(1));
@@ -2212,7 +2820,21 @@ pub fn recover_multi(
     // The full tagged history for a migration replay (cold-archived prefix +
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
-    let migrate = match load_multi_snapshot(dir) {
+    sweep_unique_tmp(dir);
+    let loaded = load_multi_snapshot_based(dir);
+    for &p in owned {
+        enforce_rebase_floor(
+            dir,
+            Some(p),
+            loaded
+                .as_ref()
+                .ok()
+                .and_then(|m| m.as_ref())
+                .and_then(|(_, bases)| bases.get(&p).copied()),
+        )?;
+    }
+    let loaded = loaded.map(|o| o.map(|(m, _)| m));
+    let migrate = match loaded {
         Ok(Some(c)) => {
             combined = Some(c);
             false
@@ -2483,6 +3105,7 @@ pub fn recover_multi(
             .map(AtomicU64::new)
             .collect(),
         compress: journal_compress_from_env(),
+        checkpoint_gate: Arc::default(),
     });
 
     Ok(MultiSegRecovery {
@@ -4117,12 +4740,12 @@ mod tests {
             frame.len()
         );
         assert_eq!(frame[0], FRAME_MAGIC);
-        assert_eq!(frame[1], CODEC_DEFLATE);
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC);
 
         let path = dir.join("frame.bin");
         fs::write(&path, &frame).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             buf,
             "exact round-trip"
         );
@@ -4179,7 +4802,10 @@ mod tests {
         let mut expected = head.clone();
         expected.extend_from_slice(&mid);
         expected.extend_from_slice(&tail);
-        assert_eq!(decode_segment_bytes(&path).unwrap(), expected);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            expected
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4208,7 +4834,7 @@ mod tests {
         let path = dir.join("torn.jsonl");
         fs::write(&path, &file).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             durable,
             "durable prefix survives, torn frame dropped"
         );
@@ -4269,6 +4895,7 @@ mod tests {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: true,
+            checkpoint_gate: Arc::default(),
         });
         {
             let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
@@ -4290,7 +4917,7 @@ mod tests {
         // events would be flaky — the process definition's element map has
         // nondeterministic iteration order).
         assert_eq!(
-            decode_segment_bytes(&active_path).unwrap(),
+            decode_segment_bytes(&active_path, TailPolicy::DropTorn).unwrap(),
             lines,
             "compressed active segment decodes byte-for-byte to the plaintext batch"
         );
@@ -4314,7 +4941,7 @@ mod tests {
         let path = dir.join("torn-plain.jsonl");
         fs::write(&path, &file).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             durable,
             "durable prefix survives, torn unterminated line dropped"
         );
@@ -4854,6 +5481,7 @@ mod tests {
         };
         // A perfectly VALID payload — the mismatch must trip on the header alone.
         let payload = PersistedSnapshot {
+            base_id: None,
             covered_events: covered,
             engine: demo_snapshot(),
         };
@@ -5210,6 +5838,7 @@ mod tests {
         let payload = PersistedSnapshot {
             covered_events: covered,
             engine: snap.clone(),
+            base_id: None,
         };
         let mut out = serde_json::to_vec(&header).unwrap();
         out.push(b'\n');
@@ -5667,6 +6296,7 @@ mod tests {
         let covered = 9;
         // Exactly the OLD on-disk format: bare compact JSON, no header line.
         let payload = PersistedSnapshot {
+            base_id: None,
             covered_events: covered,
             engine: demo_snapshot(),
         };
@@ -5775,6 +6405,7 @@ mod tests {
         };
         let payload = MultiPersistedSnapshot {
             entries: vec![MultiSnapshotEntry {
+                base_id: None,
                 partition: 0,
                 covered: 4,
                 engine: demo_snapshot(),
@@ -5801,6 +6432,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let payload = MultiPersistedSnapshot {
             entries: vec![MultiSnapshotEntry {
+                base_id: None,
                 partition: 2,
                 covered: 8,
                 engine: demo_snapshot(),
@@ -6288,6 +6920,453 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1405: an INCOMPLETE physical record (torn frame header, checksum,
+    /// body, or an unterminated plaintext line) at the end of a SEALED segment
+    /// is lost fsynced history. Every strict reader — single-partition
+    /// recovery, the tagged multi-partition layout, and cold-archive decoding
+    /// — must reject it, while the ACTIVE-segment readers keep dropping it as
+    /// a crash mid-append.
+    #[test]
+    fn sealed_segment_readers_reject_every_incomplete_record_shape() {
+        let dir = temp_dir("sealed-incomplete");
+        fs::create_dir_all(&dir).unwrap();
+        let durable = b"0\t{}\n".to_vec();
+        let frame = frame_atomic(b"0\t{}\n", 1, false).unwrap();
+        let header_len = FRAME_HEADER_LEN;
+        let shapes: Vec<(&str, Vec<u8>)> = vec![
+            ("torn frame header", frame[..header_len - 1].to_vec()),
+            ("torn frame checksum", frame[..header_len + 2].to_vec()),
+            ("torn frame body", frame[..frame.len() - 1].to_vec()),
+            ("unterminated line", b"0\t{\"x\"".to_vec()),
+        ];
+        for (name, tail) in shapes {
+            let mut file = durable.clone();
+            file.extend_from_slice(&tail);
+            let path = dir.join("seg.jsonl");
+            fs::write(&path, &file).unwrap();
+            assert!(
+                decode_segment_bytes(&path, TailPolicy::Strict).is_err(),
+                "archive decode must reject a sealed {name}"
+            );
+            assert_eq!(
+                decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+                durable,
+                "active decode drops a torn {name}"
+            );
+            let strict = read_segment_with(&path, TailPolicy::Strict, |_| Ok(()));
+            assert!(
+                strict.is_err(),
+                "strict recovery must reject a sealed {name}"
+            );
+            assert!(
+                read_segment_events_tagged_with(&path, 1, TailPolicy::Strict).is_err(),
+                "tagged strict recovery must reject a sealed {name}"
+            );
+            let (_, end) = read_segment_with(&path, TailPolicy::DropTorn, |_| Ok(())).unwrap();
+            assert_eq!(
+                end,
+                durable.len() as u64,
+                "active recovery keeps the prefix ({name})"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: an atomic Raft-entry frame round-trips, is dropped WHOLE when
+    /// torn at any byte, and an oversized entry is refused (never split).
+    #[test]
+    fn atomic_frame_round_trips_drops_whole_when_torn_and_is_capped() {
+        let dir = temp_dir("atomic-frame");
+        fs::create_dir_all(&dir).unwrap();
+        let durable = b"{\"a\":1}\n".to_vec();
+        let entry = b"{\"b\":2}\n{\"c\":3}\n".to_vec();
+        let frame = frame_atomic(&entry, 2, false).unwrap();
+        assert_eq!(frame[0], FRAME_MAGIC);
+        assert_eq!(frame[1], CODEC_RAW_CRC);
+        let path = dir.join("j.jsonl");
+        let mut file = durable.clone();
+        file.extend_from_slice(&frame);
+        fs::write(&path, &file).unwrap();
+        let mut whole = durable.clone();
+        whole.extend_from_slice(&entry);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            whole
+        );
+        for cut in 1..frame.len() {
+            fs::write(&path, &file[..file.len() - cut]).unwrap();
+            assert_eq!(
+                decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+                durable,
+                "a frame torn {cut} byte(s) short is dropped whole"
+            );
+        }
+        let err = frame_atomic_capped(&entry, 2, false, entry.len() - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(frame_atomic_capped(&entry, 2, false, entry.len()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Serialized event lines for the #1405 frame-integrity tests: a real
+    /// command event followed by its entry's applied-entry marker.
+    fn entry_lines(index: u64) -> (Vec<u8>, Vec<u8>) {
+        let ev = serde_json::to_string(&Event::RaftEntryApplied {
+            index: index * 1000,
+            raft_state: "cmd".into(),
+            start_dispatch_rr: 0,
+        })
+        .unwrap();
+        let marker = serde_json::to_string(&Event::RaftEntryApplied {
+            index,
+            raft_state: "{}".into(),
+            start_dispatch_rr: 0,
+        })
+        .unwrap();
+        (
+            format!("{ev}\n").into_bytes(),
+            format!("{marker}\n").into_bytes(),
+        )
+    }
+
+    /// #1405: a FULL-LENGTH frame whose trailing applied-entry marker line is
+    /// garbled (reused-block torn tail) is dropped WHOLE — its command events
+    /// are never exposed without the marker — by BOTH the bare and the tagged
+    /// readers; the same frame mid-file is fatal corruption.
+    #[test]
+    fn garbled_marker_line_drops_the_entire_frame() {
+        let dir = temp_dir("garbled-marker");
+        fs::create_dir_all(&dir).unwrap();
+        let (durable_ev, durable_marker) = entry_lines(1);
+        let mut durable = durable_ev.clone();
+        durable.extend_from_slice(&durable_marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let (ev, marker) = entry_lines(2);
+        let mut payload = ev.clone();
+        // Same length as the real marker, but garbled.
+        payload.extend(std::iter::repeat_n(b'#', marker.len() - 1));
+        payload.push(b'\n');
+        let bad = frame_atomic(&payload, 2, false).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&bad);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            read_segment_events(&path).unwrap().len(),
+            2,
+            "only the durable entry"
+        );
+        assert_eq!(read_segment_events_tagged(&path, 1).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // Mid-file, the garbled frame is genuine corruption: fatal, never skipped.
+        let mut mid = bad.clone();
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a full-length RAW frame whose trailing applied-entry marker was
+    /// replaced ON DISK by same-length whitespace (a reused-block torn tail that
+    /// still parses — the blank line is skipped, the events decode) is dropped
+    /// WHOLE by its checksum: the command events are never exposed without the
+    /// marker. Mid-file the same damage is fatal corruption.
+    #[test]
+    fn whitespace_overwritten_marker_drops_the_entire_frame() {
+        let dir = temp_dir("ws-marker");
+        fs::create_dir_all(&dir).unwrap();
+        let (durable_ev, durable_marker) = entry_lines(1);
+        let mut durable = durable_ev;
+        durable.extend_from_slice(&durable_marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let (ev, marker) = entry_lines(2);
+        let mut payload = ev;
+        payload.extend_from_slice(&marker);
+        let mut torn = frame_atomic(&payload, 2, false).unwrap();
+        // Overwrite the marker bytes in place (header + checksum untouched).
+        let (marker_start, marker_end) = (torn.len() - marker.len(), torn.len() - 1);
+        for b in &mut torn[marker_start..marker_end] {
+            *b = b' ';
+        }
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&torn);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            read_segment_events(&path).unwrap().len(),
+            2,
+            "only the durable entry"
+        );
+        assert_eq!(read_segment_events_tagged(&path, 1).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // An all-whitespace payload is still a damaged record, never padding.
+        let mut blank = frame_atomic(&payload, 2, false).unwrap();
+        let body = blank.len() - payload.len();
+        for b in &mut blank[body..] {
+            *b = b' ';
+        }
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&blank);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(read_segment_events(&path).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // Mid-file: fatal, never skipped; and a sealed-segment decode refuses it.
+        let mut mid = torn.clone();
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        assert!(decode_segment_bytes(&path, TailPolicy::DropTorn).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: torn-tail tolerance is for the ACTIVE segment only. A sealed
+    /// segment was fully fsynced before its seal, so a damaged final record is
+    /// lost durable history — dropping it would let a later applied marker in
+    /// the active segment skip its effects forever. Both layouts fail closed.
+    #[test]
+    fn damaged_sealed_tail_fails_closed_in_both_layouts() {
+        let frame = |i: u64| {
+            let (mut ev, marker) = entry_lines(i);
+            ev.extend_from_slice(&marker);
+            frame_atomic(&ev, 2, false).unwrap()
+        };
+        let write_dir = |tag: &str, damage: bool| {
+            let dir = temp_dir(tag);
+            fs::create_dir_all(&dir).unwrap();
+            let mut tail = frame(2);
+            if damage {
+                let n = tail.len();
+                tail[n - 3] ^= 0x01;
+            }
+            let mut sealed = frame(1);
+            sealed.extend_from_slice(&tail);
+            fs::write(
+                dir.join(format!("{SEG_PREFIX}{:020}{SEG_SUFFIX}", 0)),
+                sealed,
+            )
+            .unwrap();
+            fs::write(dir.join(ACTIVE_NAME), frame(3)).unwrap();
+            dir
+        };
+        // Control: an intact sealed tail recovers in both layouts.
+        let ok = write_dir("sealed-tail-ok", false);
+        assert!(recover(&ok).is_ok(), "intact single-partition recovery");
+        let _ = fs::remove_dir_all(&ok);
+        let ok = write_dir("sealed-tail-ok-multi", false);
+        assert!(
+            recover_multi(&ok, &[0], 1, None).is_ok(),
+            "intact multi recovery"
+        );
+        let _ = fs::remove_dir_all(&ok);
+        // Damaged sealed tail: fatal, never a silent drop.
+        let bad = write_dir("sealed-tail-bad", true);
+        assert!(recover(&bad).is_err(), "single-partition must fail closed");
+        let _ = fs::remove_dir_all(&bad);
+        let bad = write_dir("sealed-tail-bad-multi", true);
+        assert!(
+            recover_multi(&bad, &[0], 1, None).is_err(),
+            "multi must fail closed"
+        );
+        let _ = fs::remove_dir_all(&bad);
+    }
+
+    /// #1405: the same in-place damage inside a checksummed DEFLATE frame is a
+    /// torn tail too — dropped whole at the tail, fatal mid-file.
+    #[test]
+    fn damaged_deflate_frame_is_a_torn_tail() {
+        let dir = temp_dir("bad-deflate");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut durable = ev;
+        durable.extend_from_slice(&marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let big: Vec<u8> = (0..64)
+            .flat_map(|i| format!("{{\"pad\":\"{}\"}}\n", "x".repeat(2000 + i)).into_bytes())
+            .collect();
+        let mut frame = frame_compress(&big, 64).expect("deflated");
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC);
+        let mid_byte = FRAME_HEADER_LEN + FRAME_CRC_LEN + (frame.len() - FRAME_HEADER_LEN) / 2;
+        frame[mid_byte] ^= 0xFF;
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&frame);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        let mut mid = frame;
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(valid_segment_len(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: pre-checksum journals stay readable — legacy [`CODEC_RAW`] and
+    /// [`CODEC_DEFLATE`] frames (written by older builds) decode verbatim.
+    #[test]
+    fn legacy_unchecksummed_frames_still_decode() {
+        use flate2::{Compression, write::DeflateEncoder};
+        let dir = temp_dir("legacy-frames");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut payload = ev;
+        payload.extend_from_slice(&marker);
+        let len = u32::try_from(payload.len()).unwrap().to_le_bytes();
+        let mut file = vec![FRAME_MAGIC, CODEC_RAW];
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&payload);
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&payload).unwrap();
+        let comp = enc.finish().unwrap();
+        file.extend_from_slice(&[FRAME_MAGIC, CODEC_DEFLATE]);
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&u32::try_from(comp.len()).unwrap().to_le_bytes());
+        file.extend_from_slice(&comp);
+        let path = dir.join("j.jsonl");
+        fs::write(&path, &file).unwrap();
+        let mut both = payload.clone();
+        both.extend_from_slice(&payload);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            both
+        );
+        assert_eq!(read_segment_events(&path).unwrap().len(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a RAW frame whose header `comp_len` was shortened (so the frame
+    /// would end after its events, splitting the marker off as a "legacy tail")
+    /// is rejected: RAW header lengths must agree.
+    #[test]
+    fn shortened_raw_frame_header_is_rejected() {
+        let dir = temp_dir("short-raw");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut payload = ev.clone();
+        payload.extend_from_slice(&marker);
+        let mut frame = frame_atomic(&payload, 2, false).unwrap();
+        let short = u32::try_from(ev.len()).unwrap().to_le_bytes();
+        frame[6..10].copy_from_slice(&short);
+        let path = dir.join("j.jsonl");
+        fs::write(&path, &frame).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a torn frame is TRUNCATED when the active segment reopens, so a
+    /// retried append never splices into the torn frame's advertised length:
+    /// the retried entry survives two consecutive recoveries.
+    #[test]
+    fn retried_append_after_a_torn_frame_survives_two_recoveries() {
+        let dir = temp_dir("torn-retry");
+        fs::create_dir_all(&dir).unwrap();
+        let active_path = dir.join(ACTIVE_NAME);
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: active_path.clone(),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: false,
+            checkpoint_gate: Arc::default(),
+        });
+        let entry = |i: u64| {
+            let (ev, marker) = entry_lines(i);
+            let mut buf = ev;
+            buf.extend_from_slice(&marker);
+            frame_atomic(&buf, 2, false).unwrap()
+        };
+        let durable = entry(1);
+        let retried = entry(2);
+        let mut file = durable.clone();
+        file.extend_from_slice(&retried[..retried.len() - 3]); // torn
+        fs::write(&active_path, &file).unwrap();
+        assert_eq!(read_segment_events(&active_path).unwrap().len(), 2);
+        // Recovery 1 → reopen → the retried entry is appended again.
+        {
+            let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+            seg.write_all(&retried, 2).unwrap();
+            seg.fsync().unwrap();
+        }
+        for round in 1..=2 {
+            let events = read_segment_events(&active_path).unwrap();
+            assert_eq!(events.len(), 4, "recovery {round}: both entries intact");
+            assert_eq!(
+                events.last(),
+                Some(&Event::RaftEntryApplied {
+                    index: 2,
+                    raft_state: "{}".into(),
+                    start_dispatch_rr: 0,
+                })
+            );
+            drop(ActiveSegment::open(Arc::clone(&shared)).unwrap());
+        }
+        let mut expected = durable;
+        expected.extend_from_slice(&retried);
+        assert_eq!(fs::read(&active_path).unwrap(), expected);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a compressing writer must NOT re-frame a batch that already holds
+    /// an atomic frame (a nested frame would not decode); a compressible
+    /// atomic frame is itself deflated when compression is on.
+    #[test]
+    fn compressing_writer_never_nests_an_atomic_frame() {
+        let dir = temp_dir("atomic-nest");
+        fs::create_dir_all(&dir).unwrap();
+        let mut entry = Vec::new();
+        for i in 0..64 {
+            entry.extend_from_slice(
+                format!("{{\"seq\":{i},\"p\":\"{}\"}}\n", "abcdefgh".repeat(256)).as_bytes(),
+            );
+        }
+        let frame = frame_atomic(&entry, 64, true).unwrap();
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC, "big entry frame is deflated");
+        let mut batch = entry.clone();
+        batch.extend_from_slice(&frame);
+        let active_path = dir.join(ACTIVE_NAME);
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: active_path.clone(),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: true,
+            checkpoint_gate: Arc::default(),
+        });
+        {
+            let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+            seg.write_all(&batch, 128).unwrap();
+            seg.fsync().unwrap();
+        }
+        let mut expected = entry.clone();
+        expected.extend_from_slice(&entry);
+        assert_eq!(
+            decode_segment_bytes(&active_path, TailPolicy::DropTorn).unwrap(),
+            expected
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Epic #1357 failure-injection guard: a failing read-model export during
     /// catch-up must surface as a typed `Err` (rusqlite), never a panic — the
     /// replay-migrator path (#1071) changes error handling only, never silently
@@ -6332,5 +7411,393 @@ mod tests {
             result.is_err(),
             "a failing export must surface as a typed error, not a panic"
         );
+    }
+
+    /// A donor journal's engine snapshot: deploy + three instances, returning
+    /// the snapshot and the third instance's key (one the adopting journal never
+    /// creates itself), standing in for a newer Raft snapshot (#1405).
+    fn donor_snapshot(tag: &str) -> (nanobpmn_engine_core::EngineSnapshot, u64) {
+        let dir = temp_dir(tag);
+        let (mut donor, _) = crate::journal::Journal::open_segmented(&dir).expect("donor");
+        let _ = donor.apply_command(Command::DeployProcess(demo())).unwrap();
+        let mut last = 0;
+        for _ in 0..3 {
+            let (ev, _) = donor
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            last = ev.iter().find_map(|e| e.instance_key()).unwrap();
+        }
+        let snap = donor.engine_snapshot();
+        drop(donor);
+        let _ = fs::remove_dir_all(&dir);
+        (snap, last)
+    }
+
+    /// Adopts `donor` as `dir`'s journal base (as the Raft bootstrap does), then
+    /// journals one more instance on top. Returns the donor-only key.
+    fn adopt_base(dir: &Path, tag: &str) -> u64 {
+        let (snap, donor_key) = donor_snapshot(tag);
+        let (mut journal, _) = crate::journal::Journal::open_segmented(dir).expect("open");
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        journal.restore_engine_from_snapshot(snap);
+        // The permit is mandatory on a segmented journal.
+        assert!(journal.checkpoint_base(None).is_err());
+        let seg = journal.seg_shared().expect("segmented");
+        let permit = seg.try_checkpoint_permit().expect("gate free");
+        journal
+            .checkpoint_base(Some(&permit))
+            .expect("checkpoint base");
+        drop(permit);
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        donor_key
+    }
+
+    fn snap_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| is_snap_file(&e.file_name().to_string_lossy()).is_some())
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// #1405: an adopted Raft base lives ONLY in the journal snapshot. When that
+    /// snapshot is later missing, recovery must fail closed — never replay the
+    /// journal's own history (which lacks the adopted state) as if complete.
+    #[test]
+    fn adopted_base_fails_closed_when_its_snapshot_is_missing() {
+        let dir = temp_dir("rebase-missing");
+        let donor_key = adopt_base(&dir, "rebase-missing-donor");
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        assert!(
+            reopened.instance(donor_key).is_some(),
+            "adopted state survives"
+        );
+        drop(reopened);
+
+        let snaps = snap_files(&dir);
+        assert!(!snaps.is_empty());
+        for p in snaps {
+            fs::remove_file(p).unwrap();
+        }
+        let err = crate::journal::Journal::open_segmented(&dir)
+            .err()
+            .expect("missing adopted base must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: an unreadable adopted base must not route to replay-migration
+    /// (which would rebuild from a history lacking the adopted state).
+    #[test]
+    fn adopted_base_fails_closed_when_its_snapshot_is_corrupt() {
+        let dir = temp_dir("rebase-corrupt");
+        let _ = adopt_base(&dir, "rebase-corrupt-donor");
+        for p in snap_files(&dir) {
+            fs::write(p, b"{not a snapshot").unwrap();
+        }
+        let err = crate::journal::Journal::open_segmented(&dir)
+            .err()
+            .expect("corrupt adopted base must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: same guard on the multi-partition layout — a combined snapshot
+    /// whose entry for the rebased partition is missing fails closed.
+    #[test]
+    fn multi_adopted_base_fails_closed_when_its_entry_is_missing() {
+        let dir = temp_dir("rebase-multi-missing");
+        let (snap, _) = donor_snapshot("rebase-multi-missing-donor");
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.restore_engine_from_snapshot(snap);
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            j0.checkpoint_base(Some(&permit)).expect("checkpoint base");
+        }
+        recover_multi(&dir, &[0, 1], 2, None).expect("intact base recovers");
+        fs::remove_file(dir.join(MULTI_SNAP_NAME)).unwrap();
+        let err = recover_multi(&dir, &[0, 1], 2, None)
+            .err()
+            .expect("missing adopted base must fail closed");
+        assert!(err.to_string().contains("partition 0 was rebased"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a crash AFTER the rebase floor is published but BEFORE the adopted
+    /// base snapshot is: an OLDER checkpoint at the very same boundary (adoption
+    /// appends no events) must not satisfy the floor — it lacks the floor's
+    /// identity — in BOTH layouts. A later checkpoint at that boundary, written
+    /// once the floor exists, is stamped with the identity and does satisfy it.
+    #[test]
+    fn floor_rejects_a_pre_adoption_checkpoint_at_the_same_boundary() {
+        let (old, _) = donor_snapshot("floor-identity-donor");
+        // Single-partition layout.
+        let dir = temp_dir("floor-identity-single");
+        fs::create_dir_all(&dir).unwrap();
+        write_snapshot(&dir, old.clone(), 0).unwrap();
+        write_rebase_floor(&dir, None, 0).unwrap();
+        let err = recover(&dir)
+            .err()
+            .expect("pre-adoption checkpoint must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        // The base published under the floor carries its identity: recovers.
+        write_snapshot(&dir, old.clone(), 0).unwrap();
+        recover(&dir).expect("stamped base recovers");
+        // A NEW adoption at the same boundary invalidates the earlier stamp.
+        write_rebase_floor(&dir, None, 0).unwrap();
+        assert!(recover(&dir).is_err(), "stale identity must fail closed");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Multi-partition layout.
+        let dir = temp_dir("floor-identity-multi");
+        fs::create_dir_all(&dir).unwrap();
+        drop(recover_multi(&dir, &[0, 1], 2, None).expect("init multi"));
+        write_multi_snapshot(&dir, vec![(0, 0, old.clone())]).unwrap();
+        write_rebase_floor(&dir, Some(0), 0).unwrap();
+        let err = recover_multi(&dir, &[0, 1], 2, None)
+            .err()
+            .expect("pre-adoption checkpoint must fail closed");
+        assert!(err.to_string().contains("partition 0 was rebased"), "{err}");
+        upsert_multi_snapshot_entry(&dir, 0, 0, old).unwrap();
+        recover_multi(&dir, &[0, 1], 2, None).expect("stamped base recovers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a legacy count-only floor stays readable (boundary-only check);
+    /// a malformed one fails closed.
+    #[test]
+    fn rebase_floor_file_formats() {
+        let dir = temp_dir("floor-format");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(rebase_floor_path(&dir, None), "7").unwrap();
+        assert_eq!(
+            read_rebase_floor(&dir, None).unwrap(),
+            Some(RebaseFloor {
+                covered: 7,
+                id: None
+            })
+        );
+        assert!(
+            RebaseFloor {
+                covered: 7,
+                id: None
+            }
+            .satisfied_by(7, None)
+        );
+        assert!(
+            !RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(7, None)
+        );
+        assert!(
+            RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(8, None)
+        );
+        assert!(
+            !RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(6, Some(1))
+        );
+        for bad in ["", "x", "7 y", "7 1 2"] {
+            fs::write(rebase_floor_path(&dir, None), bad).unwrap();
+            assert!(read_rebase_floor(&dir, None).is_err(), "{bad:?}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a periodic checkpoint that captured BEFORE a Raft snapshot was
+    /// adopted must never publish OVER the adopted base. Deterministic
+    /// interleaving (barriers, no sleeps): the periodic cycle captures under the
+    /// gate, the adoption runs while the capture is in flight and must find the
+    /// gate held, the stale publish lands, and only then does the adoption's
+    /// base checkpoint run — so recovery sees the adopted state.
+    #[test]
+    fn periodic_checkpoint_cannot_publish_over_an_adopted_base() {
+        use std::sync::Barrier;
+
+        let dir = temp_dir("rebase-interleave");
+        let (snap, donor_key) = donor_snapshot("rebase-interleave-donor");
+        // Keep the exporter receiver alive so shared writes have a wired cell.
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx, Arc::new(AtomicU64::new(0)));
+            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let j0 = Arc::new(Mutex::new(j0));
+            let captured = Arc::new(Barrier::new(2));
+            let adopted = Arc::new(Barrier::new(2));
+
+            let periodic = {
+                let (j0, seg, dir) = (Arc::clone(&j0), Arc::clone(&seg), dir.clone());
+                let (captured, adopted) = (Arc::clone(&captured), Arc::clone(&adopted));
+                std::thread::spawn(move || {
+                    let _permit = seg.try_checkpoint_permit().expect("gate free");
+                    // A capture-only stale read (no seal): the SharedWriter in
+                    // this test has no exporter, so a real `snapshot_and_rotate`
+                    // would block on the rotate reply — and the gate, not the
+                    // seal, is what this interleaving exercises.
+                    let stale = j0.lock().unwrap().try_engine_snapshot().unwrap();
+                    let covered = 0;
+                    captured.wait();
+                    adopted.wait();
+                    write_multi_snapshot(&dir, vec![(0, covered, stale)]).unwrap();
+                })
+            };
+
+            captured.wait();
+            j0.lock().unwrap().restore_engine_from_snapshot(snap);
+            assert!(
+                seg.try_checkpoint_permit().is_none(),
+                "the adoption must wait for the in-flight periodic cycle"
+            );
+            adopted.wait();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let permit = rt.block_on(seg.checkpoint_permit());
+            j0.lock()
+                .unwrap()
+                .checkpoint_base(Some(&permit))
+                .expect("checkpoint base");
+            drop(permit);
+            periodic.join().unwrap();
+        }
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(donor_key).is_some(),
+            "adopted base survives"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a lean adoption that crashes right after publishing the floor —
+    /// before the authoritative var store or the snapshot is touched — must
+    /// fail recovery closed. Publishing the floor AFTER the var store would let
+    /// a crash in between pair the new variables with the old lean snapshot.
+    #[test]
+    fn lean_adoption_crash_after_floor_fails_closed() {
+        let dir = temp_dir("lean-adopt-crash");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+        let (snap, _) = donor_snapshot("lean-adopt-crash-donor");
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let (base, covered, _, _) = j0.snapshot_and_rotate_lean().expect("lean base");
+            let engine1 = engines.remove(&1).unwrap().snapshot();
+            write_multi_snapshot(&dir, vec![(0, covered, base), (1, 0, engine1)])
+                .expect("old lean snapshot");
+
+            j0.restore_engine_from_snapshot(snap);
+            let seg = j0.seg_shared().expect("segmented");
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(true));
+            let res = j0.checkpoint_base(Some(&permit));
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(false));
+            assert!(res.is_err(), "injected crash");
+        }
+        assert!(
+            recover_multi(&dir, &[0, 1], 2, Some(&varstore)).is_err(),
+            "the old lean snapshot must not satisfy the newly published floor"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: upserting partition B must NOT re-stamp partition A's untouched
+    /// entry with A's current floor. If A published a new floor (same boundary)
+    /// but its base write failed, re-stamping would certify A's pre-adoption
+    /// snapshot as the adopted base and bypass fail-closed recovery.
+    #[test]
+    fn upsert_preserves_untouched_partitions_base_identity() {
+        let dir = temp_dir("upsert-preserve-base");
+        fs::create_dir_all(&dir).unwrap();
+        let empty = || Engine::new().snapshot();
+        write_multi_snapshot(&dir, vec![(0, 0, empty()), (1, 0, empty())]).unwrap();
+        // A's adoption publishes a floor at A's existing boundary, then its base
+        // write "fails" (never happens).
+        write_rebase_floor(&dir, Some(0), 0).unwrap();
+        let before = load_multi_snapshot_based(&dir).unwrap().unwrap().1;
+        assert_eq!(before[&0].1, None);
+        // B's upsert succeeds.
+        upsert_multi_snapshot_entry(&dir, 1, 0, empty()).unwrap();
+        let after = load_multi_snapshot_based(&dir).unwrap().unwrap().1;
+        assert_eq!(after[&0].1, None, "A's stored identity is preserved");
+        let floor = read_rebase_floor(&dir, Some(0)).unwrap().unwrap();
+        assert!(
+            !floor.satisfied_by(after[&0].0, after[&0].1),
+            "A's pre-adoption snapshot must not satisfy A's new floor"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: concurrent publishers of the same file never share a temp path.
+    #[test]
+    fn unique_tmp_paths_never_collide() {
+        let p = Path::new("/x/msnapshot.bin");
+        let (a, b) = (unique_tmp_path(p), unique_tmp_path(p));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), p.parent());
+        assert!(a.to_string_lossy().contains(UNIQUE_TMP_INFIX));
     }
 }
