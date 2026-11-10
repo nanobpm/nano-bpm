@@ -6,7 +6,8 @@ description: >-
   (#668), so every CI/release consumer gets it from here (or from the
   `engine-wasm-pkg` artifact that the ci.yml `engine-wasm-ffi-dist` job uploads
   after running this), never from a committed copy. This is the single place
-  CI installs the wasm-pack build toolchain. Requires Node on PATH (the
+  CI builds the package (wasm-pack itself comes from the cached
+  .github/actions/wasm-pack-cache, #1461). Requires Node on PATH (the
   free-guard injection step of `make console-wasm` runs a .mjs script).
 inputs:
   rust-cache:
@@ -36,18 +37,8 @@ runs:
         sudo apt-get update
         sudo apt-get install -y llvm clang mold
         scripts/wasm-cc-env.sh --github-env --require
-    - name: Resolve the pinned wasm-pack version (Makefile WASM_PACK_VERSION)
-      id: wasmpack
-      shell: bash
-      run: echo "version=$(make -s print-wasm-pack-version)" >> "$GITHUB_OUTPUT"
-    - name: Cache the wasm-pack binary
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/wasm-pack
-        key: wasm-pack-${{ runner.os }}-${{ steps.wasmpack.outputs.version }}
-    - name: Install wasm-pack
-      shell: bash
-      run: make install-wasm-pack
+    - name: Install wasm-pack + restore its cached tool downloads (#1461)
+      uses: ./.github/actions/wasm-pack-cache
     - name: Build engine-wasm/pkg (make console-wasm)
       shell: bash
       run: make console-wasm

@@ -1,0 +1,33 @@
+name: wasm-pack (pinned, with cached tool downloads)
+description: >-
+  Install the pinned wasm-pack (Makefile WASM_PACK_VERSION) and restore its
+  tool cache. wasm-pack downloads wasm-bindgen and binaryen (wasm-opt) from
+  GitHub Releases on first use; an uncached download made a Releases 504 fail
+  the required gates (#1461). The cache dir is pinned via WASM_PACK_CACHE and
+  keyed on the wasm-pack version (which fixes the binaryen version) plus
+  engine-wasm/Cargo.lock (which fixes the wasm-bindgen version). Every job that
+  runs `make console-wasm` must use this action (scripts/release-download-cache.test.mjs).
+runs:
+  using: composite
+  steps:
+    - name: Resolve the pinned wasm-pack version (Makefile WASM_PACK_VERSION)
+      id: wasmpack
+      shell: bash
+      run: |
+        echo "version=$(make -s print-wasm-pack-version)" >> "$GITHUB_OUTPUT"
+        echo "WASM_PACK_CACHE=$HOME/.cache/nanobpm-wasm-pack" >> "$GITHUB_ENV"
+    - name: Cache the wasm-pack binary
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/wasm-pack
+        key: wasm-pack-${{ runner.os }}-${{ steps.wasmpack.outputs.version }}
+    - name: Cache wasm-pack's downloaded tools (wasm-bindgen, binaryen/wasm-opt)
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/nanobpm-wasm-pack
+        key: wasm-pack-tools-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.version }}-${{ hashFiles('engine-wasm/Cargo.lock') }}
+        restore-keys: |
+          wasm-pack-tools-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.version }}-
+    - name: Install wasm-pack
+      shell: bash
+      run: make install-wasm-pack
