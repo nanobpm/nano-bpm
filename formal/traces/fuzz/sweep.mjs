@@ -146,18 +146,22 @@ export function differential (root, cases) {
 }
 
 /** Greedy minimisation: cut the script at the first diverging step, then
- *  apply tree reductions while the case still diverges. Each round captures
- *  every candidate in ONE Zeebe run. */
-export function shrink (work, tree, verdict) {
+ *  apply tree reductions while the case still diverges WITH THE ORIGINAL
+ *  SIGNATURE — a reduction that trades the defect for a different (possibly
+ *  already-filed) one is rejected, so `--file` always reports the defect the
+ *  seed actually found. Each round captures every candidate in ONE Zeebe run.
+ *  `run` is the differential oracle (injectable for tests). */
+export function shrink (work, tree, verdict, run = differential) {
+  const target = signature(verdict.diff)
   let best = { tree, steps: verdict.step === null ? undefined : verdict.step + 1, verdict }
   for (let round = 0; ; round++) {
     const cands = reductions(best.tree).map((t) => ({ tree: t }))
     if (cands.length === 0) return best
     const cases = cands.map((c, i) => [`r${round}-${i}`, renderCase(c.tree, best.steps ? { maxSteps: best.steps } : {})])
-    const res = differential(path.join(work, `shrink-${tree.seed}-${round}`), cases)
+    const res = run(path.join(work, `shrink-${tree.seed}-${round}`), cases)
     const hits = cands
       .map((c, i) => ({ ...c, verdict: res[`r${round}-${i}`] }))
-      .filter((c) => c.verdict)
+      .filter((c) => c.verdict && signature(c.verdict.diff) === target)
       .sort((a, b) => size(a.tree) - size(b.tree))
     if (hits.length === 0) return best
     const h = hits[0]

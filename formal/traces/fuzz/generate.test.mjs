@@ -11,7 +11,7 @@ import {
   COLLIDING, GENERATED_PREFIX, TRACES_DIR, blocks, budgetDrift, generateCase, generateTree,
   loadBudget, renderCase, scenarioName
 } from './generate.mjs'
-import { parseSeeds, reductions, signature, size } from './sweep.mjs'
+import { parseSeeds, reductions, shrink, signature, size } from './sweep.mjs'
 
 const SEEDS = parseSeeds('1..200')
 
@@ -187,4 +187,17 @@ test('non-trace failures get distinct, normalised signatures (never the empty-tr
   assert.notEqual(a, signature('order'))
   assert.equal(a, signature('nano could not replay the script: unknown element "y9" at step 7'))
   assert.notEqual(a, signature('nano could not replay the script: deploy rejected'))
+})
+
+test('shrink only accepts reductions that preserve the original divergence signature', () => {
+  const tree = SEEDS.map(generateTree).find((t) => reductions(t).length > 0)
+  assert.ok(tree, 'some seed must admit a reduction')
+  const sameDiff = 'zeebe: {"op":"a","records":[{"valueType":"JOB","intent":"CREATED"}]}\n  nano:  {"op":"a","records":[]}'
+  const otherDiff = 'zeebe: {"op":"b","records":[]}\n  nano:  {"op":"b","records":[{"valueType":"INCIDENT","intent":"CREATED"}]}'
+  assert.notEqual(signature(sameDiff), signature(otherDiff))
+  // Every candidate still diverges, but with a DIFFERENT defect: none may be taken.
+  const fake = (_root, cases) => Object.fromEntries(cases.map(([n]) => [n, { step: 0, diff: otherDiff }]))
+  const best = shrink('/nonexistent', tree, { step: 0, diff: sameDiff }, fake)
+  assert.equal(best.tree, tree)
+  assert.equal(signature(best.verdict.diff), signature(sameDiff))
 })
