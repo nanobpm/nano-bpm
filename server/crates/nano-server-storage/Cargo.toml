@@ -39,8 +39,8 @@ tikv-jemalloc-sys = "0.6"
 
 [dev-dependencies]
 # Test-only tokio extras: `remote_sink`'s mock HTTP server binds a TcpListener
-# and reads/writes streams.
-tokio = { version = "1", features = ["net", "io-util"] }
+# and reads/writes streams; `macros` provides `#[tokio::test]`.
+tokio = { version = "1", features = ["net", "io-util", "macros"] }
 
 [features]
 # Cfg marker only: the console-only metric surface in `metrics.rs`
