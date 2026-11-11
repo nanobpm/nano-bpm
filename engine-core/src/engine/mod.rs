@@ -1713,6 +1713,26 @@ impl Engine {
                     }
                 }
             }
+            // Two message starts whose names differ textually (`go` vs
+            // `="go"`) can still resolve to the same name. The raw-name
+            // duplicate rule cannot see that, so reject resolved collisions
+            // here: otherwise the engine and the read model would each keep a
+            // different start for the one subscription (#1499, Zeebe rejects
+            // duplicate message start names).
+            let mut seen_message_names: HashSet<&str> = HashSet::new();
+            for (start_element_id, r) in &resolved_starts {
+                if let ResolvedStart::Message { message_name, .. } = r {
+                    if !seen_message_names.insert(message_name.as_str()) {
+                        return Err(EngineError::StartEventExpressionInvalid {
+                            process_id: process.id.clone(),
+                            element_id: start_element_id.clone(),
+                            reason: format!(
+                                "multiple message start events resolve to the same message name '{message_name}'"
+                            ),
+                        });
+                    }
+                }
+            }
             preflight.push(resolved_starts);
         }
 

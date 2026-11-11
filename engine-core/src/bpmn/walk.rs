@@ -144,6 +144,12 @@ pub(crate) fn parse_with_captures(
     // io_stack", so a non-flow owner nested in a subprocess can never leak its
     // properties onto the subprocess (#1499).
     let mut ext_owner: Option<usize> = None;
+    // `flow_node_stack` depth of the open pending boundary event, and whether
+    // the currently-open `<extensionElements>` is a *direct* child of it. A
+    // boundary's nested `dataOutput/extensionElements` must not populate the
+    // boundary's own properties (#1499).
+    let mut boundary_depth: Option<usize> = None;
+    let mut ext_boundary_direct = false;
     // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
     // container; each link attaches to the innermost open activity on the
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
@@ -526,6 +532,7 @@ pub(crate) fn parse_with_captures(
                                 // never a real boundary — not buffering it is safe.
                                 if !self_closing {
                                     if let Some(id) = attr(attrs, "id") {
+                                        boundary_depth = Some(flow_node_stack.len());
                                         cur_boundary = Some(PendingBoundary {
                                             id: id.to_string(),
                                             attached_to: attr(attrs, "attachedToRef")
@@ -1165,6 +1172,8 @@ pub(crate) fn parse_with_captures(
                             // real open element enters the subtree.
                             "extensionElements" => {
                                 ext_owner = flow_node_stack.last().copied().flatten();
+                                ext_boundary_direct = cur_boundary.is_some()
+                                    && boundary_depth.map(|d| d + 1) == Some(flow_node_stack.len());
                                 if !self_closing {
                                     extension_depth += 1;
                                 }
@@ -1209,7 +1218,12 @@ pub(crate) fn parse_with_captures(
                                 if let Some(name) = attr(attrs, "name") {
                                     let value = attr(attrs, "value").unwrap_or("").to_string();
                                     if let Some(boundary) = cur_boundary.as_mut() {
-                                        boundary.properties.insert(name.to_string(), value);
+                                        // Only the boundary's own direct
+                                        // extensionElements; nested owners
+                                        // (dataOutput, …) are ignored.
+                                        if ext_boundary_direct {
+                                            boundary.properties.insert(name.to_string(), value);
+                                        }
                                     } else if let Some(idx) = ext_owner {
                                         // Bound to the exact flow node owning
                                         // this extensionElements; a non-flow
@@ -1748,6 +1762,7 @@ pub(crate) fn parse_with_captures(
                 "extensionElements" => {
                     extension_depth = extension_depth.saturating_sub(1);
                     ext_owner = None;
+                    ext_boundary_direct = false;
                 }
                 "taskHeaders" => in_task_headers = false,
                 "properties" => in_properties = false,

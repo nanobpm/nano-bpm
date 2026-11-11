@@ -3754,6 +3754,56 @@ fn should_attach_zeebe_properties_to_a_top_level_boundary_event() {
 }
 
 #[test]
+fn should_not_attach_nested_data_output_properties_to_a_boundary_event() {
+    // Properties inside a boundary's nested `dataOutput/extensionElements`
+    // belong to the data output, not the boundary (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="work" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:boundaryEvent id="b" attachedToRef="t">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="boundary" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataOutput id="do">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data-output" />
+                      <zeebe:property name="extra" value="x" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataOutput>
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+              <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+    assert!(!boundary.properties.contains_key("extra"));
+}
+
+#[test]
 fn should_not_attach_nested_boundary_event_properties_to_the_enclosing_subprocess() {
     // A boundary nested in a subprocess: with the subprocess on the io_stack,
     // its properties must not be attached to (and overwrite) the subprocess's.
