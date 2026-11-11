@@ -1175,7 +1175,10 @@ jobs:
       - name: Install Chromium
         # Only chromium: the suite asserts DOM structure and app behaviour, not
         # cross-browser rendering, so more engines would triple the run for nothing.
-        run: npx playwright install --with-deps chromium
+        # No `--with-deps`: that shells out to apt-get, and an Ubuntu mirror
+        # outage then fails this required job before any test runs (#1546). The
+        # ubuntu runner image already ships Chrome's system libraries.
+        run: npx playwright install chromium
       - name: Journey e2e
         run: npm run test:e2e
       - name: Upload trace on failure

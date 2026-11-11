@@ -13,12 +13,13 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ALLOWED = join('.github', 'actions', 'build-tools');
 
-/** Non-comment lines invoking apt / apt-get. */
+/** Non-comment lines invoking apt / apt-get, directly or hidden behind
+ * Playwright's `--with-deps` / `install-deps` (which shell out to apt-get). */
 export function bareApt(text) {
   return text
     .split('\n')
     .map((line, i) => ({ code: line.replace(/#.*$/, ''), n: i + 1 }))
-    .filter(({ code }) => /\bapt(-get)?(\s+-{1,2}[\w-]+(=\S+)?(\s+(?!update\b|install\b|upgrade\b|dist-upgrade\b|full-upgrade\b)[^\s-]\S*)?)*\s+(update|install|upgrade|dist-upgrade|full-upgrade)\b/.test(code))
+    .filter(({ code }) => /\bapt(-get)?(\s+-{1,2}[\w-]+(=\S+)?(\s+(?!update\b|install\b|upgrade\b|dist-upgrade\b|full-upgrade\b)[^\s-]\S*)?)*\s+(update|install|upgrade|dist-upgrade|full-upgrade)\b/.test(code) || /\bplaywright\s+install(-deps\b|\b.*--with-deps\b)/.test(code))
     .map(({ n }) => `line ${n}`);
 }
 
@@ -37,6 +38,10 @@ test('bareApt detects direct apt-get calls and ignores comments', () => {
   assert.deepEqual(bareApt('sudo apt-get -o Acquire::Retries=5 install mold'), ['line 1']);
   assert.deepEqual(bareApt('sudo apt -qq update'), ['line 1']);
   assert.deepEqual(bareApt('sudo apt-get --quiet=2 -o A=b upgrade'), ['line 1']);
+  // Playwright's system-dependency install is apt in disguise.
+  assert.deepEqual(bareApt('run: npx playwright install --with-deps chromium'), ['line 1']);
+  assert.deepEqual(bareApt('run: npx playwright install-deps'), ['line 1']);
+  assert.deepEqual(bareApt('run: npx playwright install chromium'), []);
   assert.deepEqual(bareApt('# sudo apt-get install mold\nuses: ./.github/actions/build-tools'), []);
 });
 
