@@ -1609,6 +1609,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "validator",
 ]
 
 [[package]]
