@@ -39,13 +39,15 @@ export interface EmitOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Fetch override (tests inject a stub transport). */
   fetchFn?: typeof fetch;
-  /** Per-attempt deadline in ms covering the POST **and** the response-body
-   * read (default 10 000). Without it a stalled body blocks the emit forever:
-   * after a non-2xx it would prevent the retry, and after a 2xx it would
-   * prevent the return even though the event is already durably persisted. On
-   * expiry the body read is abandoned — a 2xx still resolves (durability was
-   * confirmed by the status), a non-2xx/transport attempt fails and retries.
-   * Set to `Infinity` to disable. */
+  /** Per-attempt deadline in ms covering the whole attempt — the POST, the
+   * wait for response headers, **and** the response-body read (default
+   * 10 000). Without it a stalled ingress blocks the emit forever: a stall
+   * before headers would delay the retry and the `EmitError` past the
+   * configured budget, and a stalled body would prevent the retry after a
+   * non-2xx or the return after a 2xx (durability is already confirmed by the
+   * status). On expiry the attempt is abandoned — a 2xx still resolves
+   * (durability was confirmed by the status), anything else fails and
+   * retries. Set to `Infinity` to disable. */
   timeoutMs?: number;
 }
 
@@ -71,33 +73,35 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
-/** Race `read` against an abort deadline so a stalled response body can never
- * block the emit: the timer aborts the request (which rejects the pending
- * read) and the timeout wins the race even if the abort rejection is delayed.
- * Resolves `undefined` on expiry — the caller decides what a timed-out read
- * means for the status it already has. */
+/** Race `read` against the attempt's abort deadline so a stalled response
+ * body can never block the emit: on expiry the deadline aborts the request
+ * (which rejects the pending read) and this race resolves even if the abort
+ * rejection is delayed. Resolves `undefined` on expiry — the caller decides
+ * what a timed-out read means for the status it already has. Adds no timer of
+ * its own: the single per-attempt timer lives in {@link emitEvent}, which
+ * starts it before the POST and clears it when the attempt settles, so a
+ * settled attempt never leaves a referenced timer alive. */
 async function readWithDeadline(
   read: Promise<string>,
   ctrl: AbortController,
-  timeoutMs: number,
+  deadline: number,
 ): Promise<string | undefined> {
-  if (!Number.isFinite(timeoutMs)) return await read.catch(() => undefined);
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    ctrl.abort();
-  }, timeoutMs);
+  if (!Number.isFinite(deadline)) return await read.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const winner = await Promise.race([
-      read.then((text) => ({ text })),
-      new Promise<{ expired: true }>((resolve) =>
-        setTimeout(() => resolve({ expired: true }), timeoutMs),
+      read.then(
+        (text) => ({ text }),
+        () => ({ failed: true }),
       ),
+      new Promise<{ expired: true }>((resolve) => {
+        timer = setTimeout(() => resolve({ expired: true }), deadline);
+      }),
     ]);
-    if ("expired" in winner || timedOut) return undefined;
+    if ("expired" in winner || "failed" in winner || ctrl.signal.aborted) {
+      return undefined;
+    }
     return winner.text;
-  } catch {
-    return undefined;
   } finally {
     clearTimeout(timer);
   }
@@ -132,9 +136,15 @@ export async function emitEvent(
   let lastStatus = 0;
   let lastDetail = "no attempt made";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // One deadline per attempt, covering the POST and the response-body read
-    // (the read is the unbounded part: undici streams it without a timeout).
+    // One deadline per attempt, started BEFORE the POST so it covers the wait
+    // for response headers as well as the body read (undici streams both
+    // without a timeout). A single timer: it aborts the request on expiry and
+    // is cleared when the attempt settles, so a settled attempt never leaves
+    // a referenced timer alive to delay driver shutdown.
     const ctrl = new AbortController();
+    const finite = Number.isFinite(timeoutMs);
+    const deadlineAt = finite ? Date.now() + timeoutMs : Infinity;
+    const timer = finite ? setTimeout(() => ctrl.abort(), timeoutMs) : undefined;
     try {
       const res = await fetchImpl(url, {
         method: "POST",
@@ -155,7 +165,7 @@ export async function emitEvent(
         const text = await readWithDeadline(
           res.arrayBuffer().then((buf) => new TextDecoder().decode(buf)),
           ctrl,
-          timeoutMs,
+          deadlineAt - Date.now(),
         );
         if (text === undefined || text === "") return {};
         try {
@@ -165,7 +175,11 @@ export async function emitEvent(
         }
       }
       lastStatus = res.status;
-      const detail = await readWithDeadline(res.text(), ctrl, timeoutMs);
+      const detail = await readWithDeadline(
+        res.text(),
+        ctrl,
+        deadlineAt - Date.now(),
+      );
       lastDetail =
         detail === undefined
           ? `HTTP ${res.status}: <response body unreadable or timed out>`
@@ -174,8 +188,9 @@ export async function emitEvent(
       lastStatus = 0;
       lastDetail = `transport: ${String((err as Error)?.message ?? err)}`;
     } finally {
-      // The attempt is settled — never leave the abort timer (or a pending
-      // signal) holding resources past the retry backoff.
+      // The attempt is settled — clear the deadline timer and abort the
+      // request, so neither holds resources past the retry backoff.
+      clearTimeout(timer);
       ctrl.abort();
     }
     if (attempt < maxAttempts) {

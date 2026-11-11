@@ -298,3 +298,65 @@ test("emitEvent retries when a non-2xx response body stalls (the read is deadlin
   assertEquals(ack.id, 11);
   assertEquals(posts, 2, "the stalled first attempt is retried to durability");
 });
+
+test("emitEvent bounds the wait for response headers by the same per-attempt deadline", async () => {
+  // The deadline starts before the POST, not at the body read: an ingress
+  // that accepts the request but never sends headers must fail the attempt
+  // within `timeoutMs` and be retried, not hang past the configured budget.
+  let posts = 0;
+  const delayedHeadersThenAck = (async (_url: string, init?: RequestInit) => {
+    posts++;
+    if (posts === 1) {
+      // Never resolves on its own; rejects when the attempt's deadline aborts
+      // the request — the only way this promise settles.
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("The operation was aborted.", "AbortError")));
+      });
+    }
+    return new Response('{"enqueued":true,"id":12}', {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const started = Date.now();
+  const ack = (await emitEvent("http://trigger.invalid/hook", { n: 11 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: delayedHeadersThenAck,
+    timeoutMs: 50,
+  })) as { enqueued: boolean; id: number };
+  const elapsed = Date.now() - started;
+  assertEquals(ack.enqueued, true);
+  assertEquals(ack.id, 12);
+  assertEquals(posts, 2, "the headers-stalled first attempt is retried to durability");
+  assert(
+    elapsed < 5_000,
+    `the stalled attempt failed within the deadline budget, not by hanging (took ${elapsed} ms)`,
+  );
+});
+
+test("emitEvent clears its deadline timer when an attempt settles (no leaked timer)", async () => {
+  // A settled attempt must not leave a referenced timer alive: a leaked
+  // 10 s default timer would delay driver shutdown after every emit and
+  // accumulate during continuous emission. If `emitEvent` leaks one, this
+  // test's own 100 ms watchdog is what keeps the event loop alive at the
+  // await below — proving the emit itself left nothing pending.
+  const ack = await emitEvent("http://trigger.invalid/hook", { n: 12 }, {
+    maxAttempts: 1,
+    sleep: noSleep,
+    fetchFn: (async () =>
+      new Response('{"enqueued":true,"id":13}', {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch,
+    // A large deadline: if its timer outlives the attempt, it is still
+    // referenced long after the emit resolved.
+    timeoutMs: 60_000,
+  });
+  assertEquals((ack as { id: number }).id, 13);
+  // Only this watchdog may fire; if the emit's 60 s timer were still
+  // referenced the process would be held for a minute — the watchdog firing
+  // immediately after the await shows the loop had nothing else pending.
+  await new Promise((r) => setTimeout(r, 100));
+});

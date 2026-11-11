@@ -1908,18 +1908,21 @@ mod tests {
     /// A dependency-free Node trigger driver: it reads the env contract and
     /// emits two distinct events to the ingress through the **canonical**
     /// checked, retrying emit — `emitEvent` imported from `trigger_sdk.ts`
-    /// itself, materialized next to the driver by [`write_driver_pack`] (the
-    /// runner passes `--experimental-strip-types`; every runtime the launcher
-    /// admits is Node >= 22.6, which strips the SDK's types). The driver runs
-    /// the SDK the tests claim to exercise, so a contract regression in
-    /// `trigger_sdk.ts` fails here instead of drifting from an inlined copy.
+    /// itself, materialized next to the driver by [`write_driver_pack`]. The
+    /// entrypoint is TypeScript (`driver.ts`) so the launcher enables
+    /// `--experimental-strip-types` for it on **every** runtime it admits
+    /// (Node >= 22.6): a `.mjs` entry would run without the flag on 22.6.x,
+    /// where stripping is not yet on by default, and the SDK import would fail
+    /// before either event is emitted. The driver runs the SDK the tests
+    /// claim to exercise, so a contract regression in `trigger_sdk.ts` fails
+    /// here instead of drifting from an inlined copy.
     /// A 2xx means durably persisted (persist-before-ack); a non-2xx /
     /// transport failure is retried with backoff and then thrown, so the
     /// unhandled rejection exits the driver non-zero — a failed emit is loud
     /// (the supervisor logs the crash), never the silent drop of #1543. It
     /// then stays alive (so the supervisor doesn't treat its exit as a crash
     /// and respawn it).
-    const TEST_DRIVER_MJS: &str = r#"
+    const TEST_DRIVER_TS: &str = r#"
 import { emitEvent } from "./trigger_sdk.ts";
 const env = process.env;
 const url = env.NANOBPMN_HOOK_URL;
@@ -1939,10 +1942,13 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
     const TRIGGER_SDK_TS: &str = include_str!("trigger_sdk.ts");
 
     /// Materialize a driver fixture: the driver entry plus the canonical SDK
-    /// it imports, in one directory (the layout a pack driver runs from).
+    /// it imports, in one directory (the layout a pack driver runs from). The
+    /// entry is `driver.ts` — a TypeScript entrypoint is what makes the
+    /// launcher (and the direct runner below) enable type-stripping for the
+    /// SDK import on every admitted runtime.
     fn write_driver_pack(dir: &std::path::Path, driver_src: &str) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("driver.mjs"), driver_src).unwrap();
+        std::fs::write(dir.join("driver.ts"), driver_src).unwrap();
         std::fs::write(dir.join("trigger_sdk.ts"), TRIGGER_SDK_TS).unwrap();
     }
 
@@ -1994,12 +2000,12 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
                 "kind": "trigger",
                 "displayName": "Test trigger pack",
                 "triggerSources": [
-                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.mjs" }
+                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.ts" }
                 ]
             }"#,
         )
         .unwrap();
-        write_driver_pack(&pack, TEST_DRIVER_MJS);
+        write_driver_pack(&pack, TEST_DRIVER_TS);
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
@@ -2104,12 +2110,12 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
                 "kind": "trigger",
                 "displayName": "Untrusted trigger pack",
                 "triggerSources": [
-                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.mjs" }
+                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.ts" }
                 ]
             }"#,
         )
         .unwrap();
-        write_driver_pack(&pack, TEST_DRIVER_MJS);
+        write_driver_pack(&pack, TEST_DRIVER_TS);
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
@@ -2158,7 +2164,7 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
     /// Defect-class guard for #1543: a pack driver that **ignores** the ingress
     /// response (the pre-#1543 contract) silently drops an event when the emit
     /// fails; the checked, retrying emit (the `emitEvent` contract, inlined in
-    /// `TEST_DRIVER_MJS`) retries the same failure to durability. Deterministic
+    /// `TEST_DRIVER_TS`) retries the same failure to durability. Deterministic
     /// — no reliance on SQLite contention timing: a stub ingress fails the first
     /// POST of each idempotency key with a 500 (the #1287
     /// `SQLITE_BUSY`-surfacing-as-5xx class) and acks the retry, and each driver
@@ -2167,7 +2173,7 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
     /// - `LEGACY_DRIVER_MJS` (fire-and-forget) persists nothing: every first
     ///   POST is failed and, because it never inspects the response, no event
     ///   is retried — the #1543 silent drop.
-    /// - `TEST_DRIVER_MJS` (the checked emit) persists **both**: each failed
+    /// - `TEST_DRIVER_TS` (the checked emit) persists **both**: each failed
     ///   emit lands on its retry.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -2225,8 +2231,8 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
         });
 
         // Run one driver variant against the stub and return its exit output.
-        // Both drivers are self-contained (no SDK import), so a bare temp dir
-        // suffices — matching how a real pack driver runs from its pack dir.
+        // Each runs from its own temp dir with the canonical SDK materialized
+        // beside it — matching how a real pack driver runs from its pack dir.
         async fn run_driver(driver_src: &str, port: u16) -> std::process::Output {
             let dir = std::env::temp_dir().join(format!(
                 "nano-trig-driver-{}-{}",
@@ -2240,10 +2246,13 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
             let node = workers::usable_node().expect("a JS runtime");
             let out = tokio::process::Command::new(node)
                 .current_dir(&dir)
-                // The driver imports the canonical `trigger_sdk.ts`; strip its
-                // types (every runtime the launcher admits is Node >= 22.6).
+                // The driver imports the canonical `trigger_sdk.ts`; a `.ts`
+                // entrypoint is what enables type-stripping on every runtime
+                // the launcher admits (Node >= 22.6), exactly as
+                // `spawn_driver_child` does for a real pack driver.
                 .arg("--experimental-strip-types")
-                .arg("driver.mjs")
+                .arg("--no-warnings")
+                .arg("driver.ts")
                 .env("NO_COLOR", "1")
                 .env("NANOBPMN_HOOK_URL", format!("http://127.0.0.1:{port}/hook"))
                 .env("NANOBPMN_TRIGGER_CONFIG", "{}")
@@ -2284,7 +2293,7 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        let sdk = run_driver(TEST_DRIVER_MJS, port).await;
+        let sdk = run_driver(TEST_DRIVER_TS, port).await;
         let after_sdk = persisted.lock().unwrap_or_else(|e| e.into_inner()).len();
         server.abort();
         assert_eq!(
