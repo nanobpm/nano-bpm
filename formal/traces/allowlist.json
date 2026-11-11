@@ -2,6 +2,21 @@
   "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?, reorderRecords?, nanoTrace?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe. `reorderRecords` ({steps: [i..], match: [matchers]}) tolerates only the ORDER of matching records, only in the listed steps — they are still compared as a multiset. `nanoTrace` (#1521) pins the fingerprint of nano's divergent trace: any change in nano's behaviour on that scenario fails until re-reviewed and re-pinned; generated-budget (g-*) entries must carry it (or ignoreRecords).",
   "entries": [
     {
+      "scenario": "mi-parallel-output-element-scope",
+      "issue": "#1539",
+      "reason": "Step 0 (createInstance) only: nano runs each parallel-MI child's inner flow depth-first (child 0's whole flow before child 1 activates); Zeebe's worklist is FIFO (MultiInstanceBodyProcessor activates every child, then drains each behaviour), so the children interleave. Both emit the SAME 27 PROCESS_INSTANCE records (verified multiset-equal) — only their order differs. This is a record-ordering/scheduling difference, not a scoping or correctness defect; the variable scoping (#1518, fixed by #1519) and the body-local outputCollection + per-child updates (#1534, rendered by the trace adapter) all match. Narrowed with reorderRecords: only the ORDER of step-0 PROCESS_INSTANCE records may differ (compared as a multiset, so a missing/changed record still fails); every other record and all of steps 1-4 must still equal Zeebe exactly.",
+      "reorderRecords": {
+        "steps": [
+          0
+        ],
+        "match": [
+          {
+            "valueType": "PROCESS_INSTANCE"
+          }
+        ]
+      }
+    },
+    {
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed + call-activity input mapping not local (#1536)",
