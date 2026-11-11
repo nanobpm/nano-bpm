@@ -1,0 +1,37 @@
+name: build tools (mold / binaryen / LLVM clang) without apt
+description: >-
+  The ONE place CI installs native build tools (#1546). A sustained Ubuntu apt
+  mirror outage (`Temporary failure resolving 'azure.archive.ubuntu.com'`, ~1h,
+  apt's own retries exhausted) failed every required Rust job before any code
+  compiled. So required jobs no longer depend on apt: mold and binaryen come
+  from pinned, sha256-verified GitHub release downloads (curl with retries),
+  and LLVM clang is the runner image's preinstalled toolchain. apt is only a
+  last-resort fallback (with Acquire::Retries + bounded backoff), and the only
+  path for extra distro packages (`apt` input). Guarded by
+  scripts/no-bare-apt.test.mjs: no workflow or other action may call apt-get.
+inputs:
+  mold:
+    description: Install the mold linker (.cargo/config.toml links x86_64 Linux with -fuse-ld=mold).
+    default: 'false'
+  binaryen:
+    description: Install binaryen (wasm-opt).
+    default: 'false'
+  llvm:
+    description: >-
+      Ensure an LLVM clang with a wasm32 backend + llvm-ar and export
+      CC_/AR_wasm32_unknown_unknown via scripts/wasm-cc-env.sh.
+    default: 'false'
+  apt:
+    description: Extra distro packages with no release-download source (e.g. cross compilers). Installed with retries.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Install build tools
+      shell: bash
+      env:
+        WANT_MOLD: ${{ inputs.mold }}
+        WANT_BINARYEN: ${{ inputs.binaryen }}
+        WANT_LLVM: ${{ inputs.llvm }}
+        EXTRA_APT: ${{ inputs.apt }}
+      run: '"$GITHUB_ACTION_PATH/install.sh"'

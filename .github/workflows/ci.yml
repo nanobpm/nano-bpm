@@ -278,7 +278,9 @@ jobs:
         with:
           workspaces: engine-core
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - uses: taiki-e/install-action@nextest
       - name: Clippy (scripts/clippy-matrix.json, job engine-core)
         # `--features serde` is REQUIRED, not optional: the snapshot/event serde
@@ -353,6 +355,10 @@ jobs:
         # A cache-backend outage must degrade to an uncached build, not fail the
         # job: sccache may only be wired through .github/actions/sccache.
         run: node --test scripts/sccache-fail-open.test.mjs
+      - name: No bare apt in CI (#1546)
+        # An apt mirror outage must not fail required jobs: native build tools
+        # come only through .github/actions/build-tools (release downloads).
+        run: node --test scripts/no-bare-apt.test.mjs
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -375,13 +381,14 @@ jobs:
         # have no wasm backend — upstream LLVM clang does. The `cc` crate reads
         # these per-target knobs to pick the compiler + archiver; export them for
         # the wasm read-model Clippy step below.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y binaryen mold llvm clang
-          # The ONE definition of the wasm32 C toolchain env, shared with the
-          # Makefile's WASM_READ_MODEL_ENV and the clippy matrix (#1368).
-          scripts/wasm-cc-env.sh --github-env --require
+        # No apt (#1546): .github/actions/build-tools installs these and exports
+        # the wasm32 C toolchain env from its ONE definition, scripts/wasm-cc-env.sh
+        # (shared with the Makefile's WASM_READ_MODEL_ENV and the clippy matrix, #1368).
+        uses: ./.github/actions/build-tools
+        with:
+          binaryen: 'true'
+          mold: 'true'
+          llvm: 'true'
       - name: Build engine-wasm/pkg from this PR's source (#668)
         # engine-wasm/pkg is a gitignored build output, so every probe below runs
         # against a wasm built from THIS commit, never a stale committed binary.
@@ -500,16 +507,15 @@ jobs:
         # amalgamation (via the `cc` crate + read-model/build.rs) to wasm32. GCC
         # and Apple clang have no wasm backend; upstream LLVM clang does. The `cc`
         # crate reads these per-target knobs to pick the compiler + archiver.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          # mold: the host-test step below links host binaries, and the repo's
-          # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu
-          # (the wasm32 type-check escapes it only because `--target` keeps
-          # target rustflags off host build scripts).
-          sudo apt-get install -y llvm clang mold
-          # Same single definition as the dist/clippy builds (#1368).
-          scripts/wasm-cc-env.sh --github-env --require
+        # mold: the host-test step below links host binaries, and the repo's
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu
+        # (the wasm32 type-check escapes it only because `--target` keeps
+        # target rustflags off host build scripts). No apt (#1546); the CC/AR env
+        # comes from the same single definition as the dist/clippy builds (#1368).
+        uses: ./.github/actions/build-tools
+        with:
+          llvm: 'true'
+          mold: 'true'
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
       - name: Test engine-wasm on the host (--features read-model)
@@ -981,7 +987,9 @@ jobs:
         with:
           workspaces: processos
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - uses: taiki-e/install-action@nextest
       # Link the prebuilt DuckDB from the Actions cache via DUCKDB_LIB_DIR
       # (which libduckdb-sys prefers over DUCKDB_DOWNLOAD_LIB), so a GitHub
@@ -1030,7 +1038,9 @@ jobs:
         with:
           workspaces: server
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - uses: taiki-e/install-action@nextest
       - name: Generate REST layer + stub impls
         # The server depends on the path crate ../generated and on

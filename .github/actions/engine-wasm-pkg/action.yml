@@ -31,12 +31,11 @@ runs:
       # wasm32 (GCC has no wasm backend; LLVM clang does). mold: host build
       # scripts link with `-fuse-ld=mold` per .cargo/config.toml. The CC/AR env
       # comes from the ONE definition, scripts/wasm-cc-env.sh (#1368).
-      shell: bash
-      run: |
-        set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y llvm clang mold
-        scripts/wasm-cc-env.sh --github-env --require
+      # No apt (#1546) — installed by the shared build-tools action.
+      uses: ./.github/actions/build-tools
+      with:
+        llvm: 'true'
+        mold: 'true'
     - name: Install wasm-pack + restore its cached tool downloads (#1461)
       uses: ./.github/actions/wasm-pack-cache
     - name: Build engine-wasm/pkg (make console-wasm)
