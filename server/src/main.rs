@@ -18513,6 +18513,13 @@ impl ServerImpl {
     /// within [`ENGINE_HEALTH_PROBE_BOUND`] — a replica built without its seed
     /// would fail every create, and an unbounded read of a wedged actor would
     /// hang the serial recovery pass, so the caller fails retryably instead.
+    ///
+    /// FALLIBLE (`try_with`, #1473 review): the owner can die between the
+    /// `is_alive` check and the queued read running — its `AliveGuard` then
+    /// drops the read's reply sender, and an infallible `with` would PANIC
+    /// here (a `timeout` around it does not catch that panic), unwinding the
+    /// recovery supervisor and halting recovery for EVERY partition. `None`
+    /// is just a retryable seed-read failure for this pass.
     async fn current_deployment_events(&self) -> Option<Vec<Event>> {
         let handles = self.engine.all();
         let Some(owner) = handles.first() else {
@@ -18523,10 +18530,11 @@ impl ServerImpl {
         }
         tokio::time::timeout(
             ENGINE_HEALTH_PROBE_BOUND,
-            owner.with(|journal| deployment_replication_events(journal)),
+            owner.try_with(|journal| deployment_replication_events(journal)),
         )
         .await
         .ok()
+        .flatten()
     }
 
     /// Whether partition `p`'s activation lock is replicated through Raft. Static:

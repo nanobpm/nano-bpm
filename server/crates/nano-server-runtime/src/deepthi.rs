@@ -325,11 +325,11 @@ impl Drop for DeepthiHandle {
 }
 
 /// Fires when the engine thread's command loop unwinds — whether by clean
-/// shutdown or (the case we hunt) a **panic inside a command**. Clears the
-/// [`ActorStats::alive`] flag and logs loudly so a silently-dead single writer
-/// can never again masquerade as a mysterious completion-freeze. The panic's
-/// payload/location is captured separately by the process-wide panic hook
-/// installed in `main`.
+/// shutdown or (the case we hunt) a **panic inside a command**. Closes and
+/// drains the mailbox, then clears the [`ActorStats::alive`] flag and logs
+/// loudly so a silently-dead single writer can never again masquerade as a
+/// mysterious completion-freeze. The panic's payload/location is captured
+/// separately by the process-wide panic hook installed in `main`.
 ///
 /// It also DRAINS every still-queued request ([`Mailbox::fail_pending`]): a
 /// `with` job queued behind the dead consumer would otherwise never run, so its
@@ -338,6 +338,11 @@ impl Drop for DeepthiHandle {
 /// `retire()` against the dead actor (#1473 review). Dropping the queued jobs
 /// releases their reply senders, so each pending caller terminates (its
 /// `reply_rx` resolves to `Err`) and releases its guard.
+///
+/// ORDER MATTERS: the mailbox is closed and drained BEFORE `alive` flips to
+/// `false`, so a caller that observes `is_alive() == false` is guaranteed the
+/// mailbox already rejects new submissions — no window in which a request
+/// lands in a not-yet-closed queue whose drain already ran (#1473 review).
 struct AliveGuard {
     stats: Arc<ActorStats>,
     mb: Arc<Mailbox>,
@@ -345,10 +350,11 @@ struct AliveGuard {
 
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        self.stats.alive.store(false, Ordering::Relaxed);
-        // Terminate every pending request BEFORE logging, so a waiting caller's
-        // guard is released even if the log sink blocks.
+        // Terminate every pending request BEFORE publishing death or logging,
+        // so a waiting caller's guard is released even if the log sink blocks,
+        // and so `is_alive() == false` implies the mailbox is already closed.
         self.mb.fail_pending();
+        self.stats.alive.store(false, Ordering::Relaxed);
         let panicking = thread::panicking();
         tracing::error!(
             partition = self.stats.partition,
@@ -392,9 +398,9 @@ impl DeepthiHandle {
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
-                // Clears `alive` + drains pending requests + logs on
-                // exit/panic-unwind (drop-guard, so it fires even when a
-                // command panics through the loop).
+                // Closes + drains pending requests, then clears `alive` and
+                // logs on exit/panic-unwind (drop-guard, so it fires even when
+                // a command panics through the loop).
                 let _alive = AliveGuard {
                     stats: Arc::clone(&consumer.stats),
                     mb: Arc::clone(&consumer),
@@ -614,11 +620,14 @@ impl DeepthiHandle {
 
     /// Whether this handle's engine actor thread is still running (#1473).
     /// `false` the instant the actor's command loop exits for ANY reason (clean
-    /// shutdown or a panic inside a command — the `AliveGuard` clears it). A
-    /// caller about to reuse a handle for a long-lived rebuild MUST check this
-    /// first: [`with`](Self::with) on a dead actor queues work onto a mailbox no
-    /// consumer drains, so the caller hangs forever waiting for a reply that can
-    /// never arrive.
+    /// shutdown or a panic inside a command — the `AliveGuard` clears it, and
+    /// only AFTER it closed and drained the mailbox, so observing `false`
+    /// guarantees a new submission is rejected rather than stranded). A caller
+    /// about to reuse a handle for a long-lived rebuild MUST check this first:
+    /// [`with`](Self::with) on a dead actor is rejected by the closed mailbox
+    /// (its reply sender drops, so the await panics on the dead-actor
+    /// `expect`) — use [`try_with`](Self::try_with) on any path that must
+    /// survive the actor's death.
     pub fn is_alive(&self) -> bool {
         self.mb.stats.alive.load(Ordering::Relaxed)
     }
