@@ -26,18 +26,32 @@ retry() {
 
 # The ONLY apt invocation in CI: retries per fetch, plus bounded backoff.
 apt_install() {
-  retry 4 sudo apt-get -o Acquire::Retries=5 update
+  # Error-Mode=any: a failed index fetch (e.g. DNS) fails `update`, so the
+  # bounded retry actually re-runs it instead of installing from stale indexes.
+  retry 4 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
   retry 4 sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends "$@"
 }
 
-# Download a release tarball, verify its sha256, unpack into /usr/local.
+# Release archives are kept in an Actions-cached dir (action.yml), so a warm
+# cache never touches GitHub Releases (#1461 failure mode). Keyed by sha256.
+CACHE_DIR=${BUILD_TOOLS_CACHE:-$HOME/.cache/nanobpm-build-tools}
+
+# Fetch a release tarball (cache miss only), verify its sha256 (always, also
+# on a restored artifact), unpack into /usr/local.
 release_install() {
-  local url=$1 sha=$2 tmp
-  tmp=$(mktemp)
-  retry 4 curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$tmp" "$url"
-  echo "$sha  $tmp" | sha256sum -c -
-  sudo tar -xzf "$tmp" -C /usr/local --strip-components=1
-  rm -f "$tmp"
+  local url=$1 sha=$2 file
+  mkdir -p "$CACHE_DIR"
+  file="$CACHE_DIR/$sha.tar.gz"
+  if [ -f "$file" ] && ! echo "$sha  $file" | sha256sum -c --status -; then
+    echo "build-tools: cached archive fails sha256, refetching: $file" >&2
+    rm -f "$file"
+  fi
+  if [ ! -f "$file" ]; then
+    retry 4 curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$file.part" "$url"
+    mv "$file.part" "$file"
+  fi
+  echo "$sha  $file" | sha256sum -c -
+  sudo tar -xzf "$file" -C /usr/local --strip-components=1
 }
 
 if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ] && { [ "$WANT_MOLD" = true ] || [ "$WANT_BINARYEN" = true ]; }; then

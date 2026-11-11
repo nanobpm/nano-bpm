@@ -27,6 +27,16 @@ inputs:
 runs:
   using: composite
   steps:
+    # Release archives (mold/binaryen) are restored from the Actions cache so a
+    # GitHub Releases outage cannot fail a warm run. Keyed on install.sh, which
+    # pins the versions + sha256 (single source of truth); install.sh still
+    # verifies the sha256 of every restored archive.
+    - name: Cache release archives
+      if: inputs.mold == 'true' || inputs.binaryen == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/nanobpm-build-tools
+        key: build-tools-${{ runner.os }}-${{ runner.arch }}-m${{ inputs.mold }}-b${{ inputs.binaryen }}-${{ hashFiles('.github/actions/build-tools/install.sh') }}
     - name: Install build tools
       shell: bash
       env:

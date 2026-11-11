@@ -18,7 +18,7 @@ export function bareApt(text) {
   return text
     .split('\n')
     .map((line, i) => ({ code: line.replace(/#.*$/, ''), n: i + 1 }))
-    .filter(({ code }) => /\bapt(-get)?\s+(update|install|upgrade)\b/.test(code))
+    .filter(({ code }) => /\bapt(-get)?(\s+-{1,2}[\w-]+(=\S+)?(\s+(?!update\b|install\b|upgrade\b|dist-upgrade\b|full-upgrade\b)[^\s-]\S*)?)*\s+(update|install|upgrade|dist-upgrade|full-upgrade)\b/.test(code))
     .map(({ n }) => `line ${n}`);
 }
 
@@ -32,6 +32,11 @@ function walk(dir) {
 test('bareApt detects direct apt-get calls and ignores comments', () => {
   assert.deepEqual(bareApt('run: sudo apt-get update && sudo apt-get install -y mold'), ['line 1']);
   assert.deepEqual(bareApt('x\n  sudo apt install -y foo'), ['line 2']);
+  // Global options before the subcommand must not hide the call.
+  assert.deepEqual(bareApt('sudo apt-get -y install mold'), ['line 1']);
+  assert.deepEqual(bareApt('sudo apt-get -o Acquire::Retries=5 install mold'), ['line 1']);
+  assert.deepEqual(bareApt('sudo apt -qq update'), ['line 1']);
+  assert.deepEqual(bareApt('sudo apt-get --quiet=2 -o A=b upgrade'), ['line 1']);
   assert.deepEqual(bareApt('# sudo apt-get install mold\nuses: ./.github/actions/build-tools'), []);
 });
 
@@ -50,4 +55,7 @@ test('build-tools pins and verifies its release downloads', () => {
   assert.match(sh, /BINARYEN_SHA256=[0-9a-f]{64}/);
   assert.match(sh, /sha256sum -c/);
   assert.match(sh, /Acquire::Retries/);
+  assert.match(sh, /APT::Update::Error-Mode=any/);
+  const yml = readFileSync(join(root, ALLOWED, 'action.yml'), 'utf8');
+  assert.match(yml, /uses: actions\/cache@/, 'release archives must be cached (#1461)');
 });
