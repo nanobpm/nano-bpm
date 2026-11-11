@@ -499,6 +499,37 @@ impl DeepthiHandle {
         self.with_priority(Priority::High, f).await
     }
 
+    /// Fallible [`with`](DeepthiHandle::with): returns `None` instead of
+    /// panicking when the engine actor is dead and can never answer — either
+    /// already dead when the job is queued, or unwound while the job sat in the
+    /// mailbox (its [`AliveGuard`] drains the queue, dropping the job's reply
+    /// sender, so the receiver resolves to `Err`).
+    ///
+    /// Use this on every path that must SURVIVE the actor's death — the raft
+    /// rebuild supervisor's health probe, recovery-metadata read, and journal
+    /// swap (#1473): a `with` there would panic on the dead-actor `expect`,
+    /// unwinding the supervisor task and halting recovery for EVERY partition,
+    /// where `None` just fails this partition's pass (the supervisor retries).
+    pub async fn try_with<R, F>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Journal) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if !self.is_alive() {
+            return None;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let job: Job = Box::new(move |journal| {
+            // A dropped receiver (caller cancelled) is fine; the command still ran.
+            let _ = reply_tx.send(f(journal));
+        });
+        self.mb.push(Priority::High, job);
+        // `Err` means the sender was dropped without answering: the actor is
+        // dead and its `AliveGuard` drained the queue (the panic hook already
+        // captured the cause).
+        reply_rx.await.ok()
+    }
+
     /// Like [`with`](DeepthiHandle::with) but at [`Priority::Low`] — the engine
     /// services it only when no completion-side work is queued. Used by the
     /// instance-create path so a flood of creates cannot starve completion and
@@ -759,5 +790,62 @@ mod tests {
         caller
             .join()
             .expect("a queued request is terminated when the actor dies");
+    }
+
+    /// #1473 (review): `try_with` is the FALLIBLE request the rebuild
+    /// supervisor's probe / metadata read / swap use. It must return `None` —
+    /// never panic, never hang — both when the actor is already dead and when
+    /// it dies with the request still queued, so the supervisor task survives
+    /// and keeps recovering the other partitions.
+    #[test]
+    fn try_with_returns_none_on_a_dead_actor_without_panicking() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+
+        // Already-dead actor: `None` immediately, nothing queued.
+        h.spawn_job(|_journal| panic!("boom"));
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let dead = h.clone();
+        let answered = rt.block_on(async move { dead.try_with(|_j| 1u32).await });
+        assert_eq!(answered, None, "a dead actor never answers");
+        assert_eq!(
+            h.stats().hi_depth.load(Ordering::Relaxed),
+            0,
+            "an already-dead actor's request is never queued"
+        );
+
+        // Live actor that dies with the `try_with` still queued behind a parked
+        // job: the drain drops the reply sender, so the await resolves to None.
+        let h2 = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats2 = Arc::clone(h2.stats());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        h2.spawn_job(move |_journal| {
+            let _ = started_tx.send(());
+            let _ = block_rx.recv();
+            panic!("boom");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking job is running");
+        let caller_handle = h2.clone();
+        let caller = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move { caller_handle.try_with(|_j| 2u32).await })
+        });
+        wait_until(|| h2.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+        let _ = block_tx.send(());
+        wait_until(|| !stats2.alive.load(Ordering::Relaxed));
+        let answered = caller
+            .join()
+            .expect("try_with never panics on a dead actor");
+        assert_eq!(answered, None, "a queued try_with resolves to None");
     }
 }

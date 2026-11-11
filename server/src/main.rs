@@ -17936,13 +17936,27 @@ impl ServerImpl {
             );
             return None;
         }
+        // Fallible probe (`try_with`): the actor can die between the is_alive
+        // check above and the queued probe running — its AliveGuard then drops
+        // the probe's reply sender, and an infallible `with` would PANIC here,
+        // unwinding the liveness supervisor and halting recovery for EVERY
+        // partition (#1473 review). `None` is just an unhealthy engine.
         let fenced = match tokio::time::timeout(
             ENGINE_HEALTH_PROBE_BOUND,
-            handle.with(|journal| journal.is_fenced()),
+            handle.try_with(|journal| journal.is_fenced()),
         )
         .await
         {
-            Ok(fenced) => fenced,
+            Ok(Some(fenced)) => fenced,
+            Ok(None) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the predecessor's engine actor DIED with the liveness probe \
+                     queued; reconstructing from durable state instead of reusing a dead \
+                     handle (#1473)"
+                );
+                return None;
+            }
             Err(_) => {
                 tracing::warn!(
                     partition = p,
@@ -18041,7 +18055,7 @@ impl ServerImpl {
         // BOUNDED: a wedged actor must not hang the serial recovery pass.
         let swapped = tokio::time::timeout(
             ENGINE_HEALTH_PROBE_BOUND,
-            handle.with(move |journal| {
+            handle.try_with(move |journal| {
                 journal.replace_engine(rebuilt);
                 journal.set_num_partitions(num_partitions);
                 if !seed.is_empty() {
@@ -18050,14 +18064,26 @@ impl ServerImpl {
             }),
         )
         .await;
-        if swapped.is_err() {
-            tracing::warn!(
-                partition = p,
-                "raft rebuild: the owned engine actor did not answer the durable-state swap \
-                 within {ENGINE_HEALTH_PROBE_BOUND:?}; leaving the partition down for the \
-                 supervisor to retry rather than hanging the recovery pass (#1473)"
-            );
-            return None;
+        match swapped {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the owned engine actor DIED with the durable-state swap \
+                     queued; leaving the partition down for the supervisor to retry rather \
+                     than panicking the recovery pass (#1473)"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the owned engine actor did not answer the durable-state swap \
+                     within {ENGINE_HEALTH_PROBE_BOUND:?}; leaving the partition down for the \
+                     supervisor to retry rather than hanging the recovery pass (#1473)"
+                );
+                return None;
+            }
         }
         Some(handle)
     }
@@ -18128,17 +18154,25 @@ impl ServerImpl {
                 "partition {p} is not locally owned; cannot rebuild it from durable state"
             ))
         })?;
-        let (seg, varstore) = tokio::time::timeout(
+        let (seg, varstore) = match tokio::time::timeout(
             ENGINE_HEALTH_PROBE_BOUND,
-            handle.with(|journal| (journal.seg_shared(), journal.varstore())),
+            handle.try_with(|journal| (journal.seg_shared(), journal.varstore())),
         )
         .await
-        .map_err(|_| {
-            std::io::Error::other(format!(
-                "partition {p}'s engine actor did not answer the recovery metadata read \
-                 within {ENGINE_HEALTH_PROBE_BOUND:?}"
-            ))
-        })?;
+        {
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                return Err(std::io::Error::other(format!(
+                    "partition {p}'s engine actor DIED with the recovery metadata read queued"
+                )));
+            }
+            Err(_) => {
+                return Err(std::io::Error::other(format!(
+                    "partition {p}'s engine actor did not answer the recovery metadata read \
+                     within {ENGINE_HEALTH_PROBE_BOUND:?}"
+                )));
+            }
+        };
         let _permit = match seg.as_ref() {
             Some(seg) => Some(
                 tokio::time::timeout(ENGINE_HEALTH_PROBE_BOUND, seg.checkpoint_permit())
@@ -18881,11 +18915,15 @@ impl ServerImpl {
             };
             let low_water = match tokio::time::timeout(
                 std::time::Duration::from_millis(200),
-                handle.with(|journal| journal.retirement_low_water()),
+                handle.try_with(|journal| journal.retirement_low_water()),
             )
             .await
             {
-                Ok(lw) => lw,
+                Ok(Some(lw)) => lw,
+                // The owned engine actor DIED with the watermark read queued:
+                // skip this partition this round (the supervisor rebuilds it)
+                // rather than panicking the whole broadcast loop (#1473 review).
+                Ok(None) => continue,
                 // The owned engine actor is saturated (heavy-payload create/complete
                 // backlog); skip this partition this round rather than stalling the
                 // whole broadcast behind it. The watermark is idempotent and re-sent
@@ -30313,6 +30351,44 @@ mod clustered_startup_tests {
                 "the broadcast definition landed on an owned partition"
             );
         }
+    }
+
+    /// #1473 (review): the rebuild supervisor's health probe must SURVIVE the
+    /// engine actor dying with the probe queued — the actor's death drains the
+    /// mailbox, so an infallible `with` would panic here and unwind the
+    /// supervisor, halting recovery for EVERY partition. The probe instead
+    /// resolves to `None` (unhealthy), so the rebuild falls back to the durable
+    /// reconstruction and the supervisor lives to retry.
+    #[tokio::test]
+    async fn rebuild_health_probe_survives_the_actors_death() {
+        let node1 = clustered_node(1);
+        let p = node1.engine.topology().local_partitions()[0];
+        let handle = node1.engine_handle_for(p).expect("owned partition");
+
+        // Park the actor inside a job that panics once released, so the probe
+        // below is queued behind it when the actor dies.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        handle.spawn_job(move |_journal| {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+            panic!("boom");
+        });
+
+        // Probe while the actor is parked inside the panicking job: the probe
+        // is queued behind it, the job panics, the queue drains — and the
+        // probe must return None rather than panic this task. Either ordering
+        // (probe queued before the death, or submitted after it) must resolve
+        // to None, so no synchronization with the enqueue is needed.
+        let probe = tokio::spawn({
+            let node = node1.clone();
+            async move { node.healthy_engine_for_rebuild(p).await }
+        });
+        // Release the parked job: it panics, unwinding the actor.
+        drop(tx);
+        let resolved = probe.await.expect("the supervisor task must not panic");
+        assert!(
+            resolved.is_none(),
+            "a dead actor resolves to None (rebuild from durable state)"
+        );
     }
 
     #[tokio::test]
