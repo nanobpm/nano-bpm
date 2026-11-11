@@ -1272,6 +1272,7 @@ mod tests {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            properties: std::collections::BTreeMap::new(),
         };
         let mut emitted = Vec::new();
         render_element_attrs_for_test(&el, &mut emitted);

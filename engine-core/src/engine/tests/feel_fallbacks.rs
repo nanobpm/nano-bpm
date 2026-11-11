@@ -1447,3 +1447,30 @@ fn first_start_listener_failure_retry_mints_the_listener_then_the_work() {
     complete_only_job(&mut engine, "audit");
     assert_eq!(job_types(&engine), vec!["work".to_string()]);
 }
+
+#[test]
+fn message_starts_resolving_to_the_same_name_reject_the_deployment() {
+    // `go` and `="go"` differ textually (passing the raw-name duplicate rule)
+    // but resolve to the same subscription name: reject, so the engine and the
+    // read model can never retain different starts for one subscription.
+    let def = parse(
+        r#"<bpmn:process id="ms" isExecutable="true">
+          <bpmn:startEvent id="s1"><bpmn:messageEventDefinition messageRef="M1" /></bpmn:startEvent>
+          <bpmn:startEvent id="s2"><bpmn:messageEventDefinition messageRef="M2" /></bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s1" targetRef="e" />
+          <bpmn:sequenceFlow id="f2" sourceRef="s2" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="M1" name="go" />
+        <bpmn:message id="M2" name="=&quot;go&quot;" />"#,
+    );
+    let mut engine = Engine::new();
+    let err = engine
+        .apply_command(Command::DeployProcess(def))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::StartEventExpressionInvalid { ref element_id, .. } if element_id == "s2"),
+        "{err:?}"
+    );
+    assert!(engine.state().processes.is_empty(), "nothing deployed");
+}
