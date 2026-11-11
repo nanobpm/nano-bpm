@@ -171,12 +171,12 @@ export function App() {
 
       <section className="demo">
         {!pinned && (
-        <div className="scenario-picker" role="tablist" aria-label="Example flow">
+        <div className="scenario-picker" role="group" aria-label="Example flow">
           {SCENARIOS.map((s) => (
             <button
               key={s.id}
-              role="tab"
-              aria-selected={s.id === scenario.id}
+              type="button"
+              aria-pressed={s.id === scenario.id}
               className={s.id === scenario.id ? "scenario on" : "scenario"}
               onClick={() => {
                 if (s.id !== scenario.id) {

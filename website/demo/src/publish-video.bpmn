@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- GENERATED from website/snippets/publish-video.ts by website/scripts/compile-demo-flows.mjs
-     (Nano Agent Graph Engine's compiler). Do not edit; re-run the script. -->
+     (Nano Agent Graph Engine's compiler). Do not edit; re-run the script.
+     source-sha256: ccbb5b23644b3b91f9ef7ad220499a3d0a0a42721c2d39e54574263a02a58eb7
+     bpmn-sha256: 0a767cbd325ffc1b53a8d7a2201feeb58324cdc2c6777f4d63c4f08de5fe44ec -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="Definitions_publish-video" targetNamespace="http://bpmn.io/schema/bpmn">
   <bpmn:process id="publish-video" name="publish-video" isExecutable="true">
     <bpmn:extensionElements>
