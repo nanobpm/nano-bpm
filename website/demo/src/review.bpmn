@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- GENERATED from website/snippets/nage-review.ts by website/scripts/compile-demo-flows.mjs
+     (Nano Agent Graph Engine's compiler). Do not edit; re-run the script.
+     source-sha256: 29474eef42298372b252b07aa0e7e47a3a058f954d6df1ebe807b29eb53eec21
+     bpmn-sha256: 6bcb331f88cd9cd6604a488cb6bd4c38559973b4b13197a3c0a287c39bd11a7d -->
+<bpmn:definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="Definitions_review" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="review" name="review" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f_0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Loop_0">
+      <bpmn:incoming>f_0</bpmn:incoming>
+      <bpmn:incoming>f_12</bpmn:incoming>
+      <bpmn:incoming>f_16</bpmn:incoming>
+      <bpmn:outgoing>f_1</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="changeset" name="changeset">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="review:changeset" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_1</bpmn:incoming>
+      <bpmn:outgoing>f_2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:subProcess id="Sub_1" name="Review by lens">
+      <bpmn:incoming>f_2</bpmn:incoming>
+      <bpmn:outgoing>f_5</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=lenses" inputElement="lens" outputCollection="reviews" outputElement="=found" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="Sub_1_start">
+        <bpmn:outgoing>f_3</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="review-lens" name="review-lens">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="senior:review" />
+          <zeebe:agentDefinition agentType="external" />
+          <zeebe:linkedResources>
+            <zeebe:linkedResource resourceId="review.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" />
+          </zeebe:linkedResources>
+        </bpmn:extensionElements>
+        <bpmn:incoming>f_3</bpmn:incoming>
+        <bpmn:outgoing>f_4</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="Sub_1_end">
+        <bpmn:incoming>f_4</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="f_3" sourceRef="Sub_1_start" targetRef="review-lens" />
+      <bpmn:sequenceFlow id="f_4" sourceRef="review-lens" targetRef="Sub_1_end" />
+    </bpmn:subProcess>
+    <bpmn:serviceTask id="triage" name="triage">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="review:triage" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_5</bpmn:incoming>
+      <bpmn:outgoing>f_6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:subProcess id="Sub_2" name="Challenge each finding">
+      <bpmn:incoming>f_6</bpmn:incoming>
+      <bpmn:outgoing>f_9</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=findings" inputElement="finding" outputCollection="verdicts" outputElement="=verdict" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="Sub_2_start">
+        <bpmn:outgoing>f_7</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="challenge" name="challenge">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="senior:challenge" />
+          <zeebe:agentDefinition agentType="external" />
+          <zeebe:linkedResources>
+            <zeebe:linkedResource resourceId="challenge.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" />
+          </zeebe:linkedResources>
+        </bpmn:extensionElements>
+        <bpmn:incoming>f_7</bpmn:incoming>
+        <bpmn:outgoing>f_8</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="Sub_2_end">
+        <bpmn:incoming>f_8</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="f_7" sourceRef="Sub_2_start" targetRef="challenge" />
+      <bpmn:sequenceFlow id="f_8" sourceRef="challenge" targetRef="Sub_2_end" />
+    </bpmn:subProcess>
+    <bpmn:serviceTask id="fix" name="fix">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="senior:fix" />
+        <zeebe:agentDefinition agentType="external" />
+        <zeebe:linkedResources>
+          <zeebe:linkedResource resourceId="fix.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" />
+        </zeebe:linkedResources>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_9</bpmn:incoming>
+      <bpmn:outgoing>f_10</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Gw_3" name="fixState" default="f_13">
+      <bpmn:incoming>f_10</bpmn:incoming>
+      <bpmn:outgoing>f_11</bpmn:outgoing>
+      <bpmn:outgoing>f_12</bpmn:outgoing>
+      <bpmn:outgoing>f_13</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="escalate" name="escalate">
+      <bpmn:extensionElements>
+        <zeebe:formDefinition formId="escalation" />
+        <zeebe:userTask />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_13</bpmn:incoming>
+      <bpmn:outgoing>f_14</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_4" name="decision" default="f_16">
+      <bpmn:incoming>f_14</bpmn:incoming>
+      <bpmn:outgoing>f_15</bpmn:outgoing>
+      <bpmn:outgoing>f_16</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f_11</bpmn:incoming>
+      <bpmn:incoming>f_15</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_0" sourceRef="Start" targetRef="Loop_0" />
+    <bpmn:sequenceFlow id="f_1" sourceRef="Loop_0" targetRef="changeset" />
+    <bpmn:sequenceFlow id="f_2" sourceRef="changeset" targetRef="Sub_1" />
+    <bpmn:sequenceFlow id="f_5" sourceRef="Sub_1" targetRef="triage" />
+    <bpmn:sequenceFlow id="f_6" sourceRef="triage" targetRef="Sub_2" />
+    <bpmn:sequenceFlow id="f_9" sourceRef="Sub_2" targetRef="fix" />
+    <bpmn:sequenceFlow id="f_10" sourceRef="fix" targetRef="Gw_3" />
+    <bpmn:sequenceFlow id="f_11" name="clean" sourceRef="Gw_3" targetRef="End">
+      <bpmn:conditionExpression>=fixState = "clean"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_12" name="fixed" sourceRef="Gw_3" targetRef="Loop_0">
+      <bpmn:conditionExpression>=fixState = "fixed"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_13" name="default" sourceRef="Gw_3" targetRef="escalate" />
+    <bpmn:sequenceFlow id="f_14" sourceRef="escalate" targetRef="Gw_4" />
+    <bpmn:sequenceFlow id="f_15" name="ship" sourceRef="Gw_4" targetRef="End">
+      <bpmn:conditionExpression>=decision = "ship"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_16" name="default" sourceRef="Gw_4" targetRef="Loop_0" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_review">
+    <bpmndi:BPMNPlane id="BPMNPlane_review" bpmnElement="review">
+      <bpmndi:BPMNShape id="BPMNShape_Start" bpmnElement="Start">
+        <dc:Bounds x="80" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Loop_0" bpmnElement="Loop_0" isMarkerVisible="true">
+        <dc:Bounds x="216" y="135" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_changeset" bpmnElement="changeset">
+        <dc:Bounds x="366" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_1" bpmnElement="Sub_1" isExpanded="true">
+        <dc:Bounds x="566" y="80" width="452" height="160" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_triage" bpmnElement="triage">
+        <dc:Bounds x="1118" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_2" bpmnElement="Sub_2" isExpanded="true">
+        <dc:Bounds x="1318" y="80" width="452" height="160" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_fix" bpmnElement="fix">
+        <dc:Bounds x="1870" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Gw_3" bpmnElement="Gw_3" isMarkerVisible="true">
+        <dc:Bounds x="2070" y="135" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2064" y="116" width="62" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_escalate" bpmnElement="escalate">
+        <dc:Bounds x="2220" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Gw_4" bpmnElement="Gw_4" isMarkerVisible="true">
+        <dc:Bounds x="2420" y="135" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2415" y="116" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_End" bpmnElement="End">
+        <dc:Bounds x="2570" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_0" bpmnElement="f_0">
+        <di:waypoint x="116" y="160" />
+        <di:waypoint x="216" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_1" bpmnElement="f_1">
+        <di:waypoint x="266" y="160" />
+        <di:waypoint x="366" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_2" bpmnElement="f_2">
+        <di:waypoint x="466" y="160" />
+        <di:waypoint x="566" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_5" bpmnElement="f_5">
+        <di:waypoint x="1018" y="160" />
+        <di:waypoint x="1118" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_6" bpmnElement="f_6">
+        <di:waypoint x="1218" y="160" />
+        <di:waypoint x="1318" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_9" bpmnElement="f_9">
+        <di:waypoint x="1770" y="160" />
+        <di:waypoint x="1870" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_10" bpmnElement="f_10">
+        <di:waypoint x="1970" y="160" />
+        <di:waypoint x="2070" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_13" bpmnElement="f_13">
+        <di:waypoint x="2120" y="160" />
+        <di:waypoint x="2220" y="160" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2144" y="138" width="53" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_14" bpmnElement="f_14">
+        <di:waypoint x="2320" y="160" />
+        <di:waypoint x="2420" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_15" bpmnElement="f_15">
+        <di:waypoint x="2470" y="160" />
+        <di:waypoint x="2570" y="160" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2504" y="138" width="32" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_16" bpmnElement="f_16">
+        <di:waypoint x="2445" y="185" />
+        <di:waypoint x="2445" y="280" />
+        <di:waypoint x="241" y="280" />
+        <di:waypoint x="241" y="185" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2244" y="258" width="53" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_11" bpmnElement="f_11">
+        <di:waypoint x="2095" y="185" />
+        <di:waypoint x="2095" y="220" />
+        <di:waypoint x="2588" y="220" />
+        <di:waypoint x="2588" y="178" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2322" y="228" width="39" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_12" bpmnElement="f_12">
+        <di:waypoint x="2095" y="185" />
+        <di:waypoint x="2095" y="280" />
+        <di:waypoint x="241" y="280" />
+        <di:waypoint x="241" y="185" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2100" y="243" width="39" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_1_start" bpmnElement="Sub_1_start">
+        <dc:Bounds x="606" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_review-lens" bpmnElement="review-lens">
+        <dc:Bounds x="742" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_1_end" bpmnElement="Sub_1_end">
+        <dc:Bounds x="942" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_3" bpmnElement="f_3">
+        <di:waypoint x="642" y="160" />
+        <di:waypoint x="742" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_4" bpmnElement="f_4">
+        <di:waypoint x="842" y="160" />
+        <di:waypoint x="942" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_2_start" bpmnElement="Sub_2_start">
+        <dc:Bounds x="1358" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_challenge" bpmnElement="challenge">
+        <dc:Bounds x="1494" y="120" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Sub_2_end" bpmnElement="Sub_2_end">
+        <dc:Bounds x="1694" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_7" bpmnElement="f_7">
+        <di:waypoint x="1394" y="160" />
+        <di:waypoint x="1494" y="160" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_8" bpmnElement="f_8">
+        <di:waypoint x="1594" y="160" />
+        <di:waypoint x="1694" y="160" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

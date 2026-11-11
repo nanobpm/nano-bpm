@@ -1,25 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BpmnRuntimeView, useBojtos } from "@nanobpm/bojtos-react";
-import convergenceLoopBpmn from "./convergence-loop.bpmn?raw";
 import { ParticleField } from "./ParticleField";
-import { makeWorkers, type ReviewStep } from "./workers";
-
-const PROCESS_ID = "convergence-loop";
-const PR_NUMBER = 4821;
-const PR_KEY = `pr-${PR_NUMBER}`;
-const MAX_ROUNDS = 3;
-const SEED = JSON.stringify({
-  prNumber: PR_NUMBER,
-  prKey: PR_KEY,
-  round: 0,
-  maxRounds: MAX_ROUNDS,
-});
+import { Cancelled, SCENARIOS, initialScenario, type LogKind, type Scenario } from "./scenarios";
 
 /** Pace of the animation, ms per token beat. */
 const BEAT = 1400;
 const RESTART_DELAY = 4200;
+/** Activity lines kept (the panel scrolls; this just bounds memory). */
+const LOG_LINES = 20;
 
-type LogKind = "submit" | "task" | "review" | "msg" | "done";
 interface LogEntry {
   id: number;
   kind: LogKind;
@@ -27,15 +16,17 @@ interface LogEntry {
 }
 
 export function App() {
-  const { phase, error, processIds, snapshot, createInstance, correlateMessage, stepWorkers, reset } =
-    useBojtos({ bpmn: convergenceLoopBpmn });
+  const [scenario, setScenario] = useState<Scenario>(() =>
+    initialScenario(typeof window === "undefined" ? "" : window.location.search),
+  );
+  const bojtos = useBojtos({ bpmn: scenario.bpmn });
+  const { phase, error, processIds, snapshot, reset } = bojtos;
 
   const [running, setRunning] = useState(true);
   const [log, setLog] = useState<LogEntry[]>([]);
 
-  // Embed mode (`/demo/?embed=1`): render just the live loop demo — no topbar,
-  // hero or footer — so the landing page's Model-first tab can iframe the running
-  // demo section alone rather than the whole standalone page.
+  // Embed mode (`/demo/?embed=1`): render just the live demo — no topbar, hero
+  // or footer — so the landing page can iframe the running demo section alone.
   const embed = useMemo(
     () =>
       typeof window !== "undefined" &&
@@ -43,17 +34,28 @@ export function App() {
     [],
   );
 
+  // An embed that names its scenario (the home page's per-example tabs) shows
+  // that flow alone; the host page does the picking.
+  const pinned = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const q = new URLSearchParams(window.location.search);
+    return q.has("embed") && q.has("scenario");
+  }, []);
+
   const runningRef = useRef(running);
   runningRef.current = running;
-  const processIdRef = useRef<string>(PROCESS_ID);
-  processIdRef.current = processIds[0] ?? PROCESS_ID;
+  const bojtosRef = useRef(bojtos);
+  bojtosRef.current = bojtos;
+  const processIdRef = useRef<string>(scenario.id);
+  processIdRef.current = processIds[0] ?? scenario.id;
 
   const logIdRef = useRef(0);
-  const counterRef = useRef({ i: 0 });
+  // Last variables shown; see the render below and DriveCtx.noteVars.
+  const lastVarsRef = useRef<Record<string, unknown>>({});
   const logRef = useRef<HTMLUListElement>(null);
 
   // Keep the newest activity line in view as the (scrollable, fixed-height) log
-  // fills, so the closing "Converged" entry is always visible.
+  // fills, so the closing entry is always visible.
   useEffect(() => {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -62,20 +64,12 @@ export function App() {
   const pushLog = (kind: LogKind, text: string) =>
     setLog((prev) => {
       const next = [...prev, { id: logIdRef.current++, kind, text }];
-      return next.slice(-9);
+      return next.slice(-LOG_LINES);
     });
 
-  const workers = useMemo(
-    () =>
-      makeWorkers(counterRef.current, (step: ReviewStep, round: number) => {
-        pushLog("review", `Round ${round + 1} — ${labelFor(step)}: ${step.summary}`);
-      }),
-    [],
-  );
-
-  // The auto-driver: runs the real convergence loop over the wasm engine,
-  // auto-publishing `review-ready` / `escalation-answered` (keyed by prKey)
-  // whenever the token parks at a message-catch, exactly as a real app would.
+  // The auto-driver: replays the selected scenario on the wasm engine, forever.
+  // Keyed on the scenario too, so switching tears down the old run (the hook
+  // re-deploys the new model on a fresh engine and phase cycles to "ready").
   useEffect(() => {
     if (phase !== "ready") return;
     let cancelled = false;
@@ -83,50 +77,41 @@ export function App() {
     const waitWhilePaused = async () => {
       while (!runningRef.current && !cancelled) await sleep(120);
     };
+    const beat = async () => {
+      await sleep(BEAT);
+      await waitWhilePaused();
+      if (cancelled) throw new Cancelled();
+    };
 
     (async () => {
       while (!cancelled) {
         await waitWhilePaused();
         if (cancelled) break;
-
-        counterRef.current.i = 0;
         setLog([]);
+        // A new instance starts with no variables: drop the previous run's held
+        // ones here, not via the render's `!snapshot` branch — reset() and
+        // createInstance() land in one batched render, so that branch never runs.
+        lastVarsRef.current = {};
         // Wipe the engine before each run so `completedInstances` starts at 0 —
-        // otherwise prior runs' completed instances stay resident and a re-run
-        // reads `completedInstances >= 1` immediately and "converges" at once.
+        // otherwise a prior run's completed instance makes the next one "finish" at once.
         reset();
-        pushLog("submit", `PR #${PR_NUMBER} submitted for review`);
-        let snap = createInstance(processIdRef.current, SEED);
-        await sleep(BEAT);
-
-        let guard = 0;
-        while (!cancelled && snap && snap.completedInstances < 1 && guard++ < 40) {
-          await waitWhilePaused();
-          if (cancelled) break;
-
-          const round = await stepWorkers(workers);
-          snap = round?.snapshot ?? snap;
-          if (!snap) break;
-          await sleep(BEAT);
-
-          if (snap.activeElementIds.includes("wait-review")) {
-            pushLog("msg", "App published message → review-ready");
-            snap = correlateMessage("review-ready", PR_KEY, "{}") ?? snap;
-            await sleep(BEAT);
-          } else if (snap.activeElementIds.includes("wait-answer")) {
-            pushLog("msg", "Human answered escalation → escalation-answered");
-            snap =
-              correlateMessage(
-                "escalation-answered",
-                PR_KEY,
-                JSON.stringify({ answer: "soft-delete" }),
-              ) ?? snap;
-            await sleep(BEAT);
-          }
-        }
-
-        if (!cancelled && snap && snap.completedInstances >= 1) {
-          pushLog("done", "Converged — pull request approved ✅");
+        try {
+          await scenario.drive({
+            // The hook's commands are stable callbacks over its session ref.
+            bojtos: bojtosRef.current,
+            processId: processIdRef.current,
+            log: (kind, text) => {
+              if (!cancelled) pushLog(kind, text);
+            },
+            noteVars: (v) => {
+              if (!cancelled) lastVarsRef.current = { ...lastVarsRef.current, ...v };
+            },
+            beat,
+            cancelled: () => cancelled,
+          });
+        } catch (e) {
+          if (e instanceof Cancelled) break;
+          throw e;
         }
         await sleep(RESTART_DELAY);
       }
@@ -135,13 +120,18 @@ export function App() {
     return () => {
       cancelled = true;
     };
-    // Intentionally keyed on phase only: the driver reads live values via refs.
+    // Intentionally keyed on phase + scenario only: the driver reads live values via refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
+  }, [phase, scenario]);
 
   const activeIds = snapshot?.activeElementIds ?? [];
   const incidentIds = snapshot?.incidentElementIds ?? [];
-  const vars = snapshot?.instances?.[0]?.variables ?? {};
+  // A completed instance's variables are dropped from the snapshot, so hold the
+  // last ones seen until the next run starts rather than blanking at the finish.
+  const liveVars = snapshot?.instances?.[0]?.variables;
+  if (liveVars && Object.keys(liveVars).length > 0) lastVarsRef.current = { ...lastVarsRef.current, ...liveVars };
+  else if (!snapshot) lastVarsRef.current = {};
+  const vars = lastVarsRef.current;
 
   return (
     <div className={embed ? "page embed" : "page"}>
@@ -170,19 +160,40 @@ export function App() {
             </h1>
             <p className="sub">
               nanobpm is the load-bearing runtime for agent systems — a from-scratch process
-              orchestration engine in a single Rust binary. The workflow below is the real{" "}
-              <code>urban-pr-review</code> convergence loop, executing live on the WebAssembly build
-              of the very same engine — no server, no mocks in the runtime.
+              orchestration engine in a single Rust binary. Pick a flow below: two Nano Agent Graph
+              Engine flows (an adversarial branch review, and publishing a video), or an Urban app's
+              PR review loop. Each runs live on the WebAssembly build of the very same engine — no
+              server, no mocks in the runtime. Agents and people are scripted.
             </p>
           </section>
         </>
       )}
 
       <section className="demo">
+        {!pinned && (
+        <div className="scenario-picker" role="group" aria-label="Example flow">
+          {SCENARIOS.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              aria-pressed={s.id === scenario.id}
+              className={s.id === scenario.id ? "scenario on" : "scenario"}
+              onClick={() => {
+                if (s.id !== scenario.id) {
+                  setLog([]);
+                  setScenario(s);
+                }
+              }}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        )}
         <div className="demo-head">
           <div className="demo-title">
             <span className={`pulse ${running ? "on" : ""}`} aria-hidden />
-            Live: PR review convergence loop
+            Live: {scenario.title}
           </div>
           <div className="controls">
             <button className="btn ghost" onClick={() => setRunning((r) => !r)}>
@@ -191,7 +202,7 @@ export function App() {
           </div>
         </div>
 
-        <div className="demo-grid">
+        <div className={scenario.wide ? "demo-grid wide" : "demo-grid"}>
           <div className="diagram-wrap">
             {phase === "error" ? (
               <div className="fallback">Failed to load the engine: {error}</div>
@@ -199,7 +210,7 @@ export function App() {
               <div className="fallback">Booting the WebAssembly engine…</div>
             ) : (
               <BpmnRuntimeView
-                xml={convergenceLoopBpmn}
+                xml={scenario.bpmn}
                 activeIds={activeIds}
                 incidentIds={incidentIds}
                 className="diagram"
@@ -243,18 +254,12 @@ export function App() {
       {!embed && (
         <footer className="foot">
           Running <code>@nanobpm/engine-wasm</code> via the Bojtos in-browser framework.
-          The reviewer here is a scripted stand-in for the real <code>senior:pr-review</code>{" "}
-          agent; every token move, gateway, message and variable update is the actual engine.
+          The agents and humans here are scripted stand-ins; every token move, gateway, message,
+          user task and variable update is the actual engine.
         </footer>
       )}
     </div>
   );
-}
-
-function labelFor(step: ReviewStep): string {
-  if (step.status === "converged") return "approved";
-  if (step.status === "needs_input") return "needs input";
-  return "changes requested";
 }
 
 function format(v: unknown): string {

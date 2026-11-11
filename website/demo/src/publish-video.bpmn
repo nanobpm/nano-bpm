@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- GENERATED from website/snippets/publish-video.ts by website/scripts/compile-demo-flows.mjs
+     (Nano Agent Graph Engine's compiler). Do not edit; re-run the script.
+     source-sha256: ccbb5b23644b3b91f9ef7ad220499a3d0a0a42721c2d39e54574263a02a58eb7
+     bpmn-sha256: 0a767cbd325ffc1b53a8d7a2201feeb58324cdc2c6777f4d63c4f08de5fe44ec -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="Definitions_publish-video" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="publish-video" name="publish-video" isExecutable="true">
+    <bpmn:extensionElements>
+      <nano:shapes>
+        <nano:shape id="PublishVideoInput">
+          <nano:extend name="videoPath" type="string" />
+        </nano:shape>
+      </nano:shapes>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <zeebe:properties>
+          <zeebe:property name="io.nanobpm.dataEnvelope.in" value="PublishVideoInput" />
+        </zeebe:properties>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f_0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="transcribe" name="transcribe">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="publish-video:transcribe" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_0</bpmn:incoming>
+      <bpmn:outgoing>f_1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="correct" name="correct">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="publish-video:correct" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_1</bpmn:incoming>
+      <bpmn:outgoing>f_2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Loop_0">
+      <bpmn:incoming>f_2</bpmn:incoming>
+      <bpmn:incoming>f_15</bpmn:incoming>
+      <bpmn:outgoing>f_3</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="Loop_1">
+      <bpmn:incoming>f_3</bpmn:incoming>
+      <bpmn:incoming>f_8</bpmn:incoming>
+      <bpmn:outgoing>f_4</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="describe" name="describe">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="senior:describe" />
+        <zeebe:agentDefinition agentType="external" />
+        <zeebe:linkedResources>
+          <zeebe:linkedResource resourceId="describe.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" />
+        </zeebe:linkedResources>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_4</bpmn:incoming>
+      <bpmn:outgoing>f_5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="check-description" name="check-description">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="publish-video:check-description" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_5</bpmn:incoming>
+      <bpmn:outgoing>f_6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Gw_2" name="describeState" default="f_8">
+      <bpmn:incoming>f_6</bpmn:incoming>
+      <bpmn:outgoing>f_7</bpmn:outgoing>
+      <bpmn:outgoing>f_8</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="thumbnails" name="thumbnails">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="senior:thumbnails" />
+        <zeebe:agentDefinition agentType="external" />
+        <zeebe:linkedResources>
+          <zeebe:linkedResource resourceId="thumbnails.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" />
+        </zeebe:linkedResources>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_7</bpmn:incoming>
+      <bpmn:outgoing>f_9</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="review" name="review">
+      <bpmn:extensionElements>
+        <zeebe:formDefinition formId="video-review" />
+        <zeebe:userTask />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_9</bpmn:incoming>
+      <bpmn:outgoing>f_10</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_3" name="decision" default="f_15">
+      <bpmn:incoming>f_10</bpmn:incoming>
+      <bpmn:outgoing>f_11</bpmn:outgoing>
+      <bpmn:outgoing>f_13</bpmn:outgoing>
+      <bpmn:outgoing>f_15</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="upload" name="upload">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="publish-video:upload" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_11</bpmn:incoming>
+      <bpmn:outgoing>f_12</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="save" name="save">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="publish-video:save" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_13</bpmn:incoming>
+      <bpmn:outgoing>f_14</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f_12</bpmn:incoming>
+      <bpmn:incoming>f_14</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_0" sourceRef="Start" targetRef="transcribe" />
+    <bpmn:sequenceFlow id="f_1" sourceRef="transcribe" targetRef="correct" />
+    <bpmn:sequenceFlow id="f_2" sourceRef="correct" targetRef="Loop_0" />
+    <bpmn:sequenceFlow id="f_3" sourceRef="Loop_0" targetRef="Loop_1" />
+    <bpmn:sequenceFlow id="f_4" sourceRef="Loop_1" targetRef="describe" />
+    <bpmn:sequenceFlow id="f_5" sourceRef="describe" targetRef="check-description" />
+    <bpmn:sequenceFlow id="f_6" sourceRef="check-description" targetRef="Gw_2" />
+    <bpmn:sequenceFlow id="f_7" name="done" sourceRef="Gw_2" targetRef="thumbnails">
+      <bpmn:conditionExpression>=describeState = "done"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_8" name="default" sourceRef="Gw_2" targetRef="Loop_1" />
+    <bpmn:sequenceFlow id="f_9" sourceRef="thumbnails" targetRef="review" />
+    <bpmn:sequenceFlow id="f_10" sourceRef="review" targetRef="Gw_3" />
+    <bpmn:sequenceFlow id="f_11" name="upload" sourceRef="Gw_3" targetRef="upload">
+      <bpmn:conditionExpression>=decision = "upload"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_12" sourceRef="upload" targetRef="End" />
+    <bpmn:sequenceFlow id="f_13" name="save" sourceRef="Gw_3" targetRef="save">
+      <bpmn:conditionExpression>=decision = "save"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_14" sourceRef="save" targetRef="End" />
+    <bpmn:sequenceFlow id="f_15" name="default" sourceRef="Gw_3" targetRef="Loop_0" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_publish-video">
+    <bpmndi:BPMNPlane id="BPMNPlane_publish-video" bpmnElement="publish-video">
+      <bpmndi:BPMNShape id="BPMNShape_Start" bpmnElement="Start">
+        <dc:Bounds x="80" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_transcribe" bpmnElement="transcribe">
+        <dc:Bounds x="216" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_correct" bpmnElement="correct">
+        <dc:Bounds x="416" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Loop_0" bpmnElement="Loop_0" isMarkerVisible="true">
+        <dc:Bounds x="616" y="95" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Loop_1" bpmnElement="Loop_1" isMarkerVisible="true">
+        <dc:Bounds x="766" y="95" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_describe" bpmnElement="describe">
+        <dc:Bounds x="916" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_check-description" bpmnElement="check-description">
+        <dc:Bounds x="1116" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Gw_2" bpmnElement="Gw_2" isMarkerVisible="true">
+        <dc:Bounds x="1316" y="95" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1296" y="62" width="90" height="28" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_thumbnails" bpmnElement="thumbnails">
+        <dc:Bounds x="1466" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_review" bpmnElement="review">
+        <dc:Bounds x="1666" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Gw_3" bpmnElement="Gw_3" isMarkerVisible="true">
+        <dc:Bounds x="1866" y="95" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1861" y="76" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_upload" bpmnElement="upload">
+        <dc:Bounds x="2016" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_save" bpmnElement="save">
+        <dc:Bounds x="2016" y="240" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_End" bpmnElement="End">
+        <dc:Bounds x="2216" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_0" bpmnElement="f_0">
+        <di:waypoint x="116" y="120" />
+        <di:waypoint x="216" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_1" bpmnElement="f_1">
+        <di:waypoint x="316" y="120" />
+        <di:waypoint x="416" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_2" bpmnElement="f_2">
+        <di:waypoint x="516" y="120" />
+        <di:waypoint x="616" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_3" bpmnElement="f_3">
+        <di:waypoint x="666" y="120" />
+        <di:waypoint x="766" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_4" bpmnElement="f_4">
+        <di:waypoint x="816" y="120" />
+        <di:waypoint x="916" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_5" bpmnElement="f_5">
+        <di:waypoint x="1016" y="120" />
+        <di:waypoint x="1116" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_6" bpmnElement="f_6">
+        <di:waypoint x="1216" y="120" />
+        <di:waypoint x="1316" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_7" bpmnElement="f_7">
+        <di:waypoint x="1366" y="120" />
+        <di:waypoint x="1466" y="120" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1400" y="98" width="32" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_9" bpmnElement="f_9">
+        <di:waypoint x="1566" y="120" />
+        <di:waypoint x="1666" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_10" bpmnElement="f_10">
+        <di:waypoint x="1766" y="120" />
+        <di:waypoint x="1866" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_11" bpmnElement="f_11">
+        <di:waypoint x="1916" y="120" />
+        <di:waypoint x="2016" y="120" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1943" y="98" width="46" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_12" bpmnElement="f_12">
+        <di:waypoint x="2116" y="120" />
+        <di:waypoint x="2216" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_13" bpmnElement="f_13">
+        <di:waypoint x="1891" y="145" />
+        <di:waypoint x="1891" y="280" />
+        <di:waypoint x="2016" y="280" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1896" y="233" width="32" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_14" bpmnElement="f_14">
+        <di:waypoint x="2116" y="280" />
+        <di:waypoint x="2234" y="280" />
+        <di:waypoint x="2234" y="138" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_8" bpmnElement="f_8">
+        <di:waypoint x="1341" y="145" />
+        <di:waypoint x="1341" y="180" />
+        <di:waypoint x="791" y="180" />
+        <di:waypoint x="791" y="145" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1040" y="158" width="53" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_15" bpmnElement="f_15">
+        <di:waypoint x="1891" y="145" />
+        <di:waypoint x="1891" y="200" />
+        <di:waypoint x="641" y="200" />
+        <di:waypoint x="641" y="145" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1240" y="208" width="53" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
