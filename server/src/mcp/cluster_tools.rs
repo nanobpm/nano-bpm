@@ -1,0 +1,492 @@
+//! The 18 static cluster tools: Camunda-compatible metadata (from
+//! [`cluster_schemas`]) plus dispatch into the existing REST `*_impl` handlers.
+//!
+//! **No drift surface:** every tool deserializes its MCP arguments into the
+//! generated `nanobpm-gateway-rest` spec types (path params, query params, or
+//! request body) and calls the same `*_impl` handler the REST route uses. No
+//! query/filter/mapping logic is re-implemented here — the only adaptation is
+//! building the typed request from the flat MCP argument object.
+
+use nanobpm_gateway_rest::models;
+use serde_json::{Value, json};
+
+use super::cluster_schemas::CLUSTER_TOOL_SCHEMAS;
+use super::{DispatchFuture, Tool, ToolServer, map_rest_response, tool_error_result};
+use crate::ServerImpl;
+
+/// Register the `/mcp/cluster` tool server. Slice 3 (`/mcp/processes`) pushes
+/// additional `ToolServer`s onto the returned vec without editing this file's
+/// dispatch internals.
+pub(crate) fn cluster_tool_servers() -> Vec<ToolServer> {
+    vec![ToolServer {
+        path: "/mcp/cluster",
+        tools: build_tools(),
+    }]
+}
+
+/// Build the 18 tools, wiring each schema entry to its dispatch by name.
+fn build_tools() -> Vec<Tool> {
+    CLUSTER_TOOL_SCHEMAS
+        .iter()
+        .map(|s| Tool {
+            name: s.name,
+            description: s.description,
+            read_only: s.read_only,
+            input_schema: s.input_schema(),
+            dispatch: dispatch_for(s.name),
+        })
+        .collect()
+}
+
+/// Resolve a tool name to its dispatch fn. The set of names is exactly the 18
+/// in the snapshot; an unknown name is unreachable (the registry is built from
+/// the same table) but maps to a defensive `isError` rather than panicking.
+fn dispatch_for(name: &str) -> fn(&ServerImpl, Value) -> DispatchFuture {
+    match name {
+        "getClusterStatus" => |_, _| Box::pin(async { not_implemented("getClusterStatus") }),
+        "getTopology" => |s, _| Box::pin(get_topology(s)),
+        "getIncident" => |s, a| Box::pin(get_incident(s, a)),
+        "resolveIncident" => |s, a| Box::pin(resolve_incident(s, a)),
+        "searchIncidents" => |s, a| Box::pin(search_incidents(s, a)),
+        "getProcessDefinition" => |s, a| Box::pin(get_process_definition(s, a)),
+        "getProcessDefinitionXml" => |s, a| Box::pin(get_process_definition_xml(s, a)),
+        "searchProcessDefinitions" => |s, a| Box::pin(search_process_definitions(s, a)),
+        "createProcessInstance" => |s, a| Box::pin(create_process_instance(s, a)),
+        "getProcessInstance" => |s, a| Box::pin(get_process_instance(s, a)),
+        "searchProcessInstances" => |s, a| Box::pin(search_process_instances(s, a)),
+        "assignUserTask" => |s, a| Box::pin(assign_user_task(s, a)),
+        "completeUserTask" => |s, a| Box::pin(complete_user_task(s, a)),
+        "getUserTask" => |s, a| Box::pin(get_user_task(s, a)),
+        "searchUserTaskVariables" => {
+            |_, _| Box::pin(async { not_implemented("searchUserTaskVariables") })
+        }
+        "searchUserTasks" => |s, a| Box::pin(search_user_tasks(s, a)),
+        "getVariable" => |s, a| Box::pin(get_variable(s, a)),
+        "searchVariables" => |s, a| Box::pin(search_variables(s, a)),
+        // Unreachable: the registry is built from the fixed 18-tool table, so
+        // `dispatch_for` only ever sees a known name. A non-capturing fn
+        // pointer keeps the match total without a defensive allocation.
+        _ => |_, _| Box::pin(async { tool_error_result("Unknown tool", 400) }),
+    }
+}
+
+/// The 501-shaped outcome for the two operations Nano has not implemented yet
+/// (`getClusterStatus`, `searchUserTaskVariables`), matching the REST stub.
+fn not_implemented(tool: &str) -> Value {
+    tool_error_result(
+        &format!("The `{tool}` operation is not implemented by this Nano gateway yet."),
+        501,
+    )
+}
+
+/// Pull a required key out of the flat MCP argument object. Nano keys are
+/// `u64` (partitions >= 4096 mint keys above `i64::MAX`), so parse unsigned.
+pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
+    args.get(camel)
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .map(|k| k.to_string())
+        .ok_or_else(|| {
+            tool_error_result(
+                &format!("Missing or invalid required parameter `{camel}`."),
+                400,
+            )
+        })
+}
+
+/// Deserialize the MCP arguments into a spec request-body model. The body
+/// models use `#[serde(rename = "camelCase")]`, so the flat MCP argument object
+/// deserializes directly.
+fn arg_body<T: serde::de::DeserializeOwned + validator::Validate>(args: Value) -> Result<T, Value> {
+    // Serde accepts a JSON array for a derived struct (positional fields), so
+    // a non-object would bypass the advertised object schema: reject it.
+    if !args.is_object() {
+        return Err(tool_error_result(
+            "Tool arguments must be a JSON object.",
+            400,
+        ));
+    }
+    let body: T = serde_json::from_value(args)
+        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))?;
+    validated(body)
+}
+
+/// Run the generated model's validation rules (incl. nested models). Calling
+/// a shared `*_impl` directly skips the generated REST router, which is the
+/// only other place these rules run — so every body adapter must go through
+/// here before dispatch.
+fn validated<T: validator::Validate>(body: T) -> Result<T, Value> {
+    body.validate()
+        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))?;
+    Ok(body)
+}
+
+// --- cluster ---------------------------------------------------------------
+
+async fn get_topology(server: &ServerImpl) -> Value {
+    match server.get_topology_impl().await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("topology unavailable", 500),
+    }
+}
+
+// --- incidents ---------------------------------------------------------------
+
+async fn get_incident(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "incidentKey") {
+        Ok(k) => models::GetIncidentPathParams { incident_key: k },
+        Err(e) => return e,
+    };
+    match server.get_incident_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get incident failed", 500),
+    }
+}
+
+async fn resolve_incident(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "incidentKey") {
+        Ok(k) => models::ResolveIncidentPathParams { incident_key: k },
+        Err(e) => return e,
+    };
+    match server.resolve_incident_impl(&path, &None).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("resolve incident failed", 500),
+    }
+}
+
+async fn search_incidents(server: &ServerImpl, args: Value) -> Value {
+    let body: Option<models::IncidentSearchQuery> = match optional_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.search_incidents_impl(&body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("search incidents failed", 500),
+    }
+}
+
+// --- process definitions -----------------------------------------------------
+
+async fn get_process_definition(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "processDefinitionKey") {
+        Ok(k) => models::GetProcessDefinitionPathParams {
+            process_definition_key: k,
+        },
+        Err(e) => return e,
+    };
+    match server.get_process_definition_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get process definition failed", 500),
+    }
+}
+
+async fn get_process_definition_xml(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "processDefinitionKey") {
+        Ok(k) => models::GetProcessDefinitionXmlPathParams {
+            process_definition_key: k,
+        },
+        Err(e) => return e,
+    };
+    match server.get_process_definition_xml_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get process definition xml failed", 500),
+    }
+}
+
+async fn search_process_definitions(server: &ServerImpl, args: Value) -> Value {
+    let body: Option<models::ProcessDefinitionSearchQuery> = match optional_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.search_process_definitions_impl(&body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("search process definitions failed", 500),
+    }
+}
+
+/// `createProcessInstance` options Camunda's tool advertises but the shared
+/// REST creation model does not carry. Silently dropping them would start the
+/// wrong version / leave variables unprotected, so they are rejected instead.
+const CREATE_UNSUPPORTED_OPTIONS: &[&str] = &["processDefinitionVersionTag", "variablesMetadata"];
+
+/// Fail closed on any advertised-but-unsupported argument that is present and
+/// non-null: an explicit 400 `isError` instead of a silent drop.
+fn reject_unsupported(args: &Value, keys: &[&str]) -> Result<(), Value> {
+    for key in keys {
+        if args.get(*key).is_some_and(|v| !v.is_null()) {
+            return Err(tool_error_result(
+                &format!("The `{key}` option is not supported by this Nano gateway yet."),
+                400,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Like [`reject_unsupported`], for advertised `filter.*` keys the shared REST
+/// filter model lacks: deserializing would silently drop the condition and
+/// widen the search, so fail closed instead.
+fn reject_unsupported_filter(args: &Value, keys: &[&str]) -> Result<(), Value> {
+    match args.get("filter") {
+        Some(f) => reject_unsupported(f, keys),
+        None => Ok(()),
+    }
+}
+
+// --- process instances ---------------------------------------------------------
+
+async fn create_process_instance(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported(&args, CREATE_UNSUPPORTED_OPTIONS) {
+        return e;
+    }
+    let body: models::ProcessInstanceCreationInstruction = match arg_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.create_process_instance_impl(&body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("create process instance failed", 500),
+    }
+}
+
+async fn get_process_instance(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "processInstanceKey") {
+        Ok(k) => models::GetProcessInstancePathParams {
+            process_instance_key: k,
+        },
+        Err(e) => return e,
+    };
+    match server.get_process_instance_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get process instance failed", 500),
+    }
+}
+
+async fn search_process_instances(server: &ServerImpl, args: Value) -> Value {
+    let body: Option<models::ProcessInstanceSearchQuery> = match optional_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.search_process_instances_impl(&body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("search process instances failed", 500),
+    }
+}
+
+// --- user tasks ----------------------------------------------------------------
+
+async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "userTaskKey") {
+        Ok(k) => models::AssignUserTaskPathParams { user_task_key: k },
+        Err(e) => return e,
+    };
+    // An omitted/null `assignee` means "unassign" in Camunda's tool contract:
+    // route it through the shared unassign handler, never store `""`.
+    if args.get("assignee").is_none_or(Value::is_null) {
+        let path = models::UnassignUserTaskPathParams {
+            user_task_key: path.user_task_key,
+        };
+        return match server.unassign_user_task_impl(&path).await {
+            Ok(resp) => map_rest_response(&resp),
+            Err(()) => tool_error_result("unassign user task failed", 500),
+        };
+    }
+    // Camunda's MCP tool nests `action`/`allowOverride` under
+    // `assignmentOptions`; the REST `UserTaskAssignmentRequest` expects them
+    // flat alongside `assignee`. Flatten them (thin adapter, no logic).
+    let mut body_json = json!({});
+    if let Some(a) = args.get("assignee") {
+        body_json["assignee"] = a.clone();
+    }
+    let opts = match args.get("assignmentOptions") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => Some(o),
+        Some(_) => {
+            return tool_error_result("`assignmentOptions` must be an object", 400);
+        }
+    };
+    if let Some(opts) = opts {
+        if let Some(action) = opts.get("action") {
+            body_json["action"] = action.clone();
+        }
+        if let Some(allow) = opts.get("allowOverride") {
+            body_json["allowOverride"] = allow.clone();
+        }
+    }
+    let body: models::UserTaskAssignmentRequest = match arg_body(body_json) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.assign_user_task_impl(&path, &body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("assign user task failed", 500),
+    }
+}
+
+async fn complete_user_task(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "userTaskKey") {
+        Ok(k) => models::CompleteUserTaskPathParams { user_task_key: k },
+        Err(e) => return e,
+    };
+    // `completionOptions` holds the variables/action; map it onto the
+    // completion request body the REST handler expects.
+    let body: Option<models::UserTaskCompletionRequest> = match completion_body(&args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.complete_user_task_impl(&path, &body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("complete user task failed", 500),
+    }
+}
+
+async fn get_user_task(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "userTaskKey") {
+        Ok(k) => models::GetUserTaskPathParams { user_task_key: k },
+        Err(e) => return e,
+    };
+    match server.get_user_task_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get user task failed", 500),
+    }
+}
+
+async fn search_user_tasks(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_filter(&args, &["isSuspended"]) {
+        return e;
+    }
+    let body: Option<models::UserTaskSearchQuery> = match optional_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.search_user_tasks_impl(&body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("search user tasks failed", 500),
+    }
+}
+
+// --- variables -----------------------------------------------------------------
+
+async fn get_variable(server: &ServerImpl, args: Value) -> Value {
+    let path = match arg_key(&args, "variableKey") {
+        Ok(k) => models::GetVariablePathParams { variable_key: k },
+        Err(e) => return e,
+    };
+    match server.get_variable_impl(&path).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("get variable failed", 500),
+    }
+}
+
+async fn search_variables(server: &ServerImpl, args: Value) -> Value {
+    // `truncateValues` is a query param; the rest is the search body.
+    if let Err(e) = reject_unsupported_filter(&args, &["protectionMode"]) {
+        return e;
+    }
+    let truncate = match args.get("truncateValues") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return tool_error_result("`truncateValues` must be a boolean", 400),
+    };
+    let query = models::SearchVariablesQueryParams {
+        truncate_values: truncate,
+    };
+    let body: Option<models::VariableSearchQuery> = match optional_body(args) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match server.search_variables_impl(&query, &body).await {
+        Ok(resp) => map_rest_response(&resp),
+        Err(()) => tool_error_result("search variables failed", 500),
+    }
+}
+
+// --- argument adapters -----------------------------------------------------------
+
+/// Deserialize an optional search body: an empty argument object maps to
+/// `None` (no filters), a non-empty one to `Some(body)`.
+pub(super) fn optional_body<T: serde::de::DeserializeOwned + validator::Validate>(
+    mut args: Value,
+) -> Result<Option<T>, Value> {
+    if let Some(filter) = args.get_mut("filter") {
+        translate_date_ranges(filter)?;
+    }
+    let is_empty = args.as_object().map(|o| o.is_empty()).unwrap_or(false);
+    if is_empty || args.is_null() {
+        return Ok(None);
+    }
+    arg_body(args).map(Some)
+}
+
+/// Camunda's MCP tools advertise date-range filters as `{from, to}` (inclusive
+/// `from`, exclusive `to`), but the REST `AdvancedDateTimeFilter` uses
+/// `$gte`/`$lt` operators — deserializing `{from, to}` directly would silently
+/// drop both bounds. Rewrite every top-level filter field whose value is an
+/// object with only `from`/`to` keys into the REST operator form. A `from`/`to`
+/// object carrying any other key, or a non-string bound, is rejected (fail
+/// closed) rather than partially honoured.
+pub(super) fn translate_date_ranges(filter: &mut Value) -> Result<(), Value> {
+    let Some(fields) = filter.as_object_mut() else {
+        return Ok(());
+    };
+    for (field, value) in fields.iter_mut() {
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let has_range = obj.contains_key("from") || obj.contains_key("to");
+        if !has_range {
+            continue;
+        }
+        let mut out = serde_json::Map::new();
+        for (k, v) in obj {
+            let op = match k.as_str() {
+                "from" => "$gte",
+                "to" => "$lt",
+                _ => {
+                    return Err(tool_error_result(
+                        &format!("Invalid date range `{field}`: unexpected key `{k}`."),
+                        400,
+                    ));
+                }
+            };
+            if v.is_null() {
+                continue;
+            }
+            if !v.is_string() {
+                return Err(tool_error_result(
+                    &format!("Invalid date range `{field}.{k}`: expected an RFC 3339 string."),
+                    400,
+                ));
+            }
+            out.insert(op.to_string(), v.clone());
+        }
+        *value = Value::Object(out);
+    }
+    Ok(())
+}
+
+/// Build the user-task completion body from the flat MCP arguments. Camunda's
+/// `completeUserTask` nests `variables`/`action` under `completionOptions`;
+/// the REST `UserTaskCompletionRequest` expects them at the top level.
+fn completion_body(args: &Value) -> Result<Option<models::UserTaskCompletionRequest>, Value> {
+    let Some(opts) = args.get("completionOptions") else {
+        return Ok(None);
+    };
+    if opts.is_null() {
+        return Ok(None);
+    }
+    // Serde accepts a sequence for a derived struct, so `[]` would deserialize
+    // as an empty completion and complete the task: require an object.
+    if !opts.is_object() {
+        return Err(tool_error_result(
+            "`completionOptions` must be an object",
+            400,
+        ));
+    }
+    serde_json::from_value(opts.clone())
+        .map_err(|e| tool_error_result(&format!("Invalid `completionOptions`: {e}."), 400))
+        .and_then(validated)
+        .map(Some)
+}
