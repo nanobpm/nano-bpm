@@ -1456,3 +1456,151 @@ fn multi_instance_body_input_mapping_with_bare_var_filter_runs() {
     assert_eq!(jobs.len(), 1, "a bare-var filter must not skip the mapping");
     assert_eq!(jobs[0].variables.get("item"), Some(&Value::Bool(true)));
 }
+
+/// #1518 — Zeebe parity: an `outputElement` that is a bare variable reference
+/// (`=result`) is seeded as a LOCAL (null) variable of every inner instance, so
+/// a job result of that name lands in the child's own scope. Without the seed it
+/// propagates to the process root, shared by every parallel child: here child
+/// A's `t1` writes `result=a`, child B's `t1` overwrites it with `b`, and child A
+/// then collects `b`.
+#[test]
+fn parallel_mi_output_element_variable_is_local_to_each_inner_instance() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:subProcess id="Each">
+            <bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item"
+                  outputCollection="results" outputElement="=result" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:startEvent id="ss" />
+            <bpmn:serviceTask id="t1">
+              <bpmn:extensionElements><zeebe:taskDefinition type="first" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="t2">
+              <bpmn:extensionElements><zeebe:taskDefinition type="second" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:endEvent id="se" />
+            <bpmn:sequenceFlow id="i1" sourceRef="ss" targetRef="t1" />
+            <bpmn:sequenceFlow id="i2" sourceRef="t1" targetRef="t2" />
+            <bpmn:sequenceFlow id="i3" sourceRef="t2" targetRef="se" />
+          </bpmn:subProcess>
+          <bpmn:serviceTask id="sink">
+            <bpmn:extensionElements><zeebe:taskDefinition type="sink" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Each" targetRef="sink" />
+          <bpmn:sequenceFlow id="f3" sourceRef="sink" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            )]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Both children's first job writes `result` = its own item, before either child completes.
+    let firsts = engine.activate_jobs("first", "w", 10, 60_000, 0);
+    assert_eq!(firsts.len(), 2);
+    for job in &firsts {
+        let item = job.variables.get("item").cloned().unwrap();
+        engine
+            .apply_command(Command::complete_job_with(
+                job.key,
+                vars(&[("result", item)]),
+            ))
+            .unwrap();
+    }
+    let seconds = engine.activate_jobs("second", "w", 10, 60_000, 0);
+    assert_eq!(seconds.len(), 2);
+    for job in &seconds {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+
+    // Joined: the token is parked at the sink, so the instance scope is inspectable.
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.activate_jobs("sink", "w", 10, 60_000, 0).len(),
+        1,
+        "MI body joined"
+    );
+    let vars = &engine.instance(key).unwrap().variables;
+    assert_eq!(
+        vars.get("results"),
+        Some(&Value::List(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into())
+        ])),
+        "each child collects its OWN result, in index order"
+    );
+    assert_eq!(
+        vars.get("result"),
+        None,
+        "the output element variable must not leak to the parent"
+    );
+}
+
+/// #1518 guard: seeding the output element local must never clobber the input
+/// element when both name the same variable (`outputElement="=item"`).
+#[test]
+fn mi_output_element_naming_the_input_element_keeps_the_item() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="Each">
+            <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item"
+                  outputCollection="results" outputElement="=item" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>
+          </bpmn:serviceTask>
+          <bpmn:serviceTask id="sink">
+            <bpmn:extensionElements><zeebe:taskDefinition type="sink" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Each" targetRef="sink" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    for job in engine.activate_jobs("work", "w", 10, 60_000, 0) {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(1), Value::Int(2)]))
+    );
+}

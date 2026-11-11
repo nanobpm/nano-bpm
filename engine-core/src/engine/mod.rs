@@ -8352,7 +8352,7 @@ impl Engine {
         body_key: Key,
         index: usize,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (item, input_element) = match self
+        let (item, input_element, output_element) = match self
             .state
             .instances
             .get(&instance_key)
@@ -8361,6 +8361,7 @@ impl Engine {
             Some(mi) => (
                 mi.items.get(index).cloned().unwrap_or(Value::Null),
                 mi.input_element.clone(),
+                mi.output_element.clone(),
             ),
             None => return (Vec::new(), Vec::new()),
         };
@@ -8371,6 +8372,17 @@ impl Engine {
             locals.insert(name.clone(), item);
         }
         locals.insert("loopCounter".to_string(), Value::Int((index as i64) + 1));
+        // Zeebe parity (#1518): an `outputElement` that is just a variable (or a
+        // nested property of one) is seeded as a local null on the inner
+        // instance, so a job result of that name stays in this child's scope
+        // instead of propagating to an ancestor shared by every parallel child.
+        // `or_insert`: never clobber the input element (`outputElement="=item"`).
+        if let Some(name) = output_element
+            .as_deref()
+            .and_then(crate::feel::variable_reference_root)
+        {
+            locals.entry(name).or_insert(Value::Null);
+        }
 
         // Seed the ad-hoc container's `outputCollection` as an empty local list
         // BEFORE the per-child input mappings are applied below — mirroring the
