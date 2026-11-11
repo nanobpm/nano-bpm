@@ -244,10 +244,17 @@ impl Mailbox {
     fn fail_pending(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
-        g.hi.clear();
-        g.lo.clear();
+        // Move the queued jobs OUT under the lock, then drop them only after
+        // releasing it: a queued closure may own a `DeepthiHandle` clone whose
+        // `Drop` re-acquires this same (non-reentrant) mutex — dropping it while
+        // held would self-deadlock the death handler (#1473 review).
+        let hi = std::mem::take(&mut g.hi);
+        let lo = std::mem::take(&mut g.lo);
         self.stats.hi_depth.store(0, Ordering::Relaxed);
         self.stats.lo_depth.store(0, Ordering::Relaxed);
+        drop(g);
+        drop(hi);
+        drop(lo);
     }
 }
 
