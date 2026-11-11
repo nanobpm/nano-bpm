@@ -1577,9 +1577,7 @@ pub fn tool_name_of(properties: &BTreeMap<String, String>) -> Option<String> {
 
 /// The subset of `properties` whose keys carry the [`TOOL_PROPERTY_PREFIX`]
 /// prefix — the full MCP tool marker set (name, purpose, inputs, usage hints).
-pub fn tool_properties_of(
-    properties: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+pub fn tool_properties_of(properties: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     properties
         .iter()
         .filter(|(k, _)| k.starts_with(TOOL_PROPERTY_PREFIX))

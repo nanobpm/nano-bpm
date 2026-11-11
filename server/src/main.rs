@@ -12496,22 +12496,15 @@ impl ServerImpl {
                     ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
                         && query::match_process_instance_key_opt(
                             &f.process_instance_key,
-                            e.process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
+                            e.process_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
                         && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            e.element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
+                            e.element_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.message_name, &e.message_name)
-                        && query::match_string_opt(
-                            &f.correlation_key,
-                            e.correlation_key.as_deref(),
-                        )
+                        && query::match_string_opt(&f.correlation_key, e.correlation_key.as_deref())
                         && query::match_message_subscription_state(
                             &f.message_subscription_state,
                             &state_str,
@@ -12600,17 +12593,17 @@ impl ServerImpl {
                         None => types::Nullable::Null,
                     },
                     process_instance_key: match e.process_instance_key {
-                        Some(k) => types::Nullable::Present(models::ProcessInstanceKey(
-                            k.to_string(),
-                        )),
+                        Some(k) => {
+                            types::Nullable::Present(models::ProcessInstanceKey(k.to_string()))
+                        }
                         None => types::Nullable::Null,
                     },
                     root_process_instance_key: types::Nullable::Null,
                     element_id: e.element_id,
                     element_instance_key: match e.element_instance_key {
-                        Some(k) => types::Nullable::Present(models::ElementInstanceKey(
-                            k.to_string(),
-                        )),
+                        Some(k) => {
+                            types::Nullable::Present(models::ElementInstanceKey(k.to_string()))
+                        }
                         None => types::Nullable::Null,
                     },
                     message_subscription_state: models::MessageSubscriptionStateEnum::Created,
@@ -32967,7 +32960,10 @@ mod clustered_startup_tests {
             tool_row.message_subscription_state,
             models::MessageSubscriptionStateEnum::Created
         );
-        assert_eq!(tool_row.process_definition_version, types::Nullable::Present(1));
+        assert_eq!(
+            tool_row.process_definition_version,
+            types::Nullable::Present(1)
+        );
 
         // The plain message start row is a START_EVENT with no tool metadata.
         let plain_row = items
@@ -33090,18 +33086,23 @@ mod clustered_startup_tests {
         );
 
         // messageSubscriptionType filters select each side.
-        let type_filter = |t: models::MessageSubscriptionTypeEnum| {
-            models::MessageSubscriptionFilter {
+        let type_filter =
+            |t: models::MessageSubscriptionTypeEnum| models::MessageSubscriptionFilter {
                 message_subscription_type: Some(
                     models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(t),
                 ),
                 ..models::MessageSubscriptionFilter::new()
-            }
-        };
+            };
         assert_eq!(
-            matched_ids(&server, type_filter(models::MessageSubscriptionTypeEnum::StartEvent))
-                .await,
-            vec!["mcpProcessWithInputs".to_string(), "plain-start".to_string()]
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::StartEvent)
+            )
+            .await,
+            vec![
+                "mcpProcessWithInputs".to_string(),
+                "plain-start".to_string()
+            ]
         );
         assert_eq!(
             matched_ids(
