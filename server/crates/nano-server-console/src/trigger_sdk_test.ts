@@ -1,0 +1,369 @@
+// Node unit tests for the trigger pack-driver SDK (`trigger_sdk.ts`,
+// ADR 0025 §6) — the checked, retrying emit half of the pack-source contract.
+//
+// Run in CI by the `console-ts` job, and locally with:
+//   node --experimental-strip-types --test server/crates/nano-server-console/src/trigger_sdk_test.ts
+//
+// These are the defect-class guards for #1543: a pack driver that ignored the
+// ingress response silently lost an event when the emit failed (a non-2xx, or
+// a rejected `fetch`). `emitEvent` must (a) resolve only on a durable 2xx,
+// (b) retry a failed emit, and (c) throw — loudly — once its attempts are
+// exhausted, so a dropped trigger event always names its cause.
+
+import { test } from "node:test";
+import { spawnSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "./test_support.ts";
+import { emitEvent, EmitError } from "./trigger_sdk.ts";
+
+const noSleep = () => Promise.resolve();
+
+/** Start a loopback HTTP server that answers each POST with the queued
+ * `(status, body)` responses in order (repeating the last one when exhausted),
+ * recording every request it receives. Returns the base URL, the recorded
+ * requests, and a `close`. */
+async function stubIngress(
+  responses: Array<[number, string]>,
+): Promise<{ url: string; seen: Array<{ idem?: string; token?: string; body: string }>; close: () => Promise<void> }> {
+  const seen: Array<{ idem?: string; token?: string; body: string }> = [];
+  let n = 0;
+  const server: Server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      seen.push({
+        idem: req.headers["idempotency-key"] as string | undefined,
+        token: req.headers["x-webhook-token"] as string | undefined,
+        body: Buffer.concat(chunks).toString("utf8"),
+      });
+      const [status, body] = responses[Math.min(n++, responses.length - 1)];
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+  return {
+    url: `http://127.0.0.1:${port}/hook`,
+    seen,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+test("emitEvent resolves with the ack on a durable 2xx, sending token + idempotency key", async () => {
+  const stub = await stubIngress([[202, '{"enqueued":true,"id":7}']]);
+  try {
+    const ack = (await emitEvent(stub.url, { n: 1 }, {
+      token: "s3cret",
+      idempotencyKey: "evt-1",
+      sleep: noSleep,
+    })) as { enqueued: boolean; id: number };
+    assertEquals(ack.enqueued, true);
+    assertEquals(ack.id, 7);
+    assertEquals(stub.seen.length, 1);
+    assertEquals(stub.seen[0].idem, "evt-1");
+    assertEquals(stub.seen[0].token, "s3cret");
+    assertEquals(JSON.parse(stub.seen[0].body).n, 1);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent treats a duplicate-key 200 as durable (the retry no-op)", async () => {
+  const stub = await stubIngress([[200, '{"enqueued":false}']]);
+  try {
+    const ack = (await emitEvent(stub.url, { n: 1 }, { sleep: noSleep })) as {
+      enqueued: boolean;
+    };
+    assertEquals(ack.enqueued, false);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent retries a non-2xx until the durable insert lands", async () => {
+  // The #1287 class: a contended inbox surfaces 500s, then the write goes
+  // through. The emit must not drop the event on the first failure.
+  const stub = await stubIngress([[500, "database is locked"], [500, "database is locked"], [202, '{"enqueued":true,"id":9}']]);
+  try {
+    const ack = (await emitEvent(stub.url, { n: 2 }, {
+      idempotencyKey: "evt-2",
+      sleep: noSleep,
+    })) as { enqueued: boolean };
+    assertEquals(ack.enqueued, true);
+    assertEquals(stub.seen.length, 3, "two failed attempts, then the retry");
+    // Every attempt carries the same idempotency key, so a retry after an
+    // ambiguous outcome collapses instead of duplicating.
+    assert(stub.seen.every((r) => r.idem === "evt-2"));
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent throws an EmitError naming the cause once attempts are exhausted", async () => {
+  const stub = await stubIngress([[500, "database is locked"]]);
+  try {
+    await assertRejects(
+      () => emitEvent(stub.url, { n: 3 }, { maxAttempts: 3, sleep: noSleep }),
+      EmitError,
+      "HTTP 500",
+    );
+    assertEquals(stub.seen.length, 3, "exactly maxAttempts tries, no more");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent throws on a transport error (a rejected fetch is not a silent drop)", async () => {
+  // Nothing is listening: every attempt rejects. The old fire-and-forget
+  // driver lost the event here without a trace; the SDK must surface it.
+  const closed = await stubIngress([[202, "{}"]]);
+  await closed.close();
+  await assertRejects(
+    () => emitEvent(closed.url, { n: 4 }, { maxAttempts: 2, sleep: noSleep }),
+    EmitError,
+    "transport:",
+  );
+});
+
+test("EmitError carries the last status and the attempt count", async () => {
+  const stub = await stubIngress([[503, "unavailable"]]);
+  try {
+    let caught: unknown;
+    try {
+      await emitEvent(stub.url, { n: 5 }, { maxAttempts: 2, sleep: noSleep });
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof EmitError, "an EmitError");
+    assertEquals(caught.status, 503);
+    assertEquals(caught.attempts, 2);
+    assertStringIncludes(caught.message, "503");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent retries back off (base doubling, capped) before giving up", async () => {
+  const stub = await stubIngress([[500, "busy"]]);
+  const delays: number[] = [];
+  try {
+    await assertRejects(
+      () =>
+        emitEvent(stub.url, { n: 6 }, {
+          maxAttempts: 4,
+          baseDelayMs: 100,
+          maxDelayMs: 250,
+          sleep: (ms) => {
+            delays.push(ms);
+            return Promise.resolve();
+          },
+        }),
+      EmitError,
+    );
+    assertEquals(delays, [100, 200, 250], "100 → 200 → capped at 250");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent preserves an explicit JSON null body; only undefined defaults to {}", async () => {
+  const stub = await stubIngress([[202, '{"enqueued":true}']]);
+  try {
+    await emitEvent(stub.url, null, { sleep: noSleep });
+    await emitEvent(stub.url, undefined, { sleep: noSleep });
+    assertEquals(stub.seen[0].body, "null");
+    assertEquals(stub.seen[1].body, "{}");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent honors a maxDelayMs below the base delay (the cap is not raised to base)", async () => {
+  const stub = await stubIngress([[500, "busy"]]);
+  const delays: number[] = [];
+  try {
+    await assertRejects(
+      () =>
+        emitEvent(stub.url, { n: 7 }, {
+          maxAttempts: 3,
+          // Deliberately leave baseDelayMs at its 250 ms default and ask for a
+          // 100 ms cap: every retry wait must be 100 ms, never the base.
+          maxDelayMs: 100,
+          sleep: (ms) => {
+            delays.push(ms);
+            return Promise.resolve();
+          },
+        }),
+      EmitError,
+    );
+    assertEquals(delays, [100, 100], "the requested cap wins over the larger base delay");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent treats a 2xx as durable even when the ack body is interrupted", async () => {
+  // The ingress has already persisted the event when it sends a 2xx
+  // (persist-before-ack), so a connection that dies mid-body must NOT cause a
+  // second POST — the emit resolves instead of retrying a durable event. The
+  // stream ERRORS (not merely delivers invalid JSON): `arrayBuffer()` itself
+  // rejects, so the guard genuinely exercises a body-read rejection — a
+  // well-formed-but-invalid-JSON body would still pass if the read moved
+  // outside the success-path catch.
+  let posts = 0;
+  const interrupted = (async () => {
+    posts++;
+    // Status/headers arrive (202 = durable), then the socket dies mid-body.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"enqueued":tru'));
+        c.error(new Error("socket hangup"));
+      },
+    });
+    return new Response(stream, {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = await emitEvent("http://trigger.invalid/hook", { n: 8 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: interrupted,
+  });
+  assertEquals(ack, {}, "a best-effort ack read falls back to {}");
+  assertEquals(posts, 1, "exactly one POST — no retry of a durable 2xx");
+});
+
+test("emitEvent returns when a durable 2xx's ack body stalls (the read is deadline-bound)", async () => {
+  // A stalled body must not block the emit: the 2xx already confirmed
+  // durability, so the deadline abandons the read and resolves — no retry of
+  // an already-persisted event.
+  let posts = 0;
+  const stalled = (async () => {
+    posts++;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"enqueued":true'));
+        // Never enqueues again and never closes: the body read hangs.
+      },
+    });
+    return new Response(stream, {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = await emitEvent("http://trigger.invalid/hook", { n: 9 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: stalled,
+    timeoutMs: 50,
+  });
+  assertEquals(ack, {}, "a stalled ack read resolves to the {} fallback");
+  assertEquals(posts, 1, "exactly one POST — no retry of a durable 2xx");
+});
+
+test("emitEvent retries when a non-2xx response body stalls (the read is deadline-bound)", async () => {
+  // The failure path's body read is bounded by the same deadline: a stalled
+  // 500 body must not prevent the retry that lands the durable insert.
+  let posts = 0;
+  const stalledThenAck = (async () => {
+    posts++;
+    if (posts === 1) {
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode("database is "));
+          // Never finishes: the error-detail read hangs.
+        },
+      });
+      return new Response(stream, { status: 500 });
+    }
+    return new Response('{"enqueued":true,"id":11}', {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = (await emitEvent("http://trigger.invalid/hook", { n: 10 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: stalledThenAck,
+    timeoutMs: 50,
+  })) as { enqueued: boolean; id: number };
+  assertEquals(ack.enqueued, true);
+  assertEquals(ack.id, 11);
+  assertEquals(posts, 2, "the stalled first attempt is retried to durability");
+});
+
+test("emitEvent bounds the wait for response headers by the same per-attempt deadline", async () => {
+  // The deadline starts before the POST, not at the body read: an ingress
+  // that accepts the request but never sends headers must fail the attempt
+  // within `timeoutMs` and be retried, not hang past the configured budget.
+  let posts = 0;
+  const delayedHeadersThenAck = (async (_url: string, init?: RequestInit) => {
+    posts++;
+    if (posts === 1) {
+      // Never resolves on its own; rejects when the attempt's deadline aborts
+      // the request — the only way this promise settles.
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("The operation was aborted.", "AbortError")));
+      });
+    }
+    return new Response('{"enqueued":true,"id":12}', {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const started = Date.now();
+  const ack = (await emitEvent("http://trigger.invalid/hook", { n: 11 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: delayedHeadersThenAck,
+    timeoutMs: 50,
+  })) as { enqueued: boolean; id: number };
+  const elapsed = Date.now() - started;
+  assertEquals(ack.enqueued, true);
+  assertEquals(ack.id, 12);
+  assertEquals(posts, 2, "the headers-stalled first attempt is retried to durability");
+  assert(
+    elapsed < 5_000,
+    `the stalled attempt failed within the deadline budget, not by hanging (took ${elapsed} ms)`,
+  );
+});
+
+test("emitEvent clears its deadline timer when an attempt settles (no leaked timer)", () => {
+  // A settled attempt must not leave a referenced timer alive: a leaked
+  // deadline timer would hold the driver process open after every emit.
+  // Run the emit in a child process with a 60 s deadline and assert the
+  // child EXITS promptly — a leaked referenced timer would keep it alive
+  // until the spawnSync timeout kills it, failing this test.
+  const sdkUrl = new URL("./trigger_sdk.ts", import.meta.url).href;
+  const script = `
+    import { emitEvent } from ${JSON.stringify(sdkUrl)};
+    const ack = await emitEvent("http://trigger.invalid/hook", { n: 12 }, {
+      maxAttempts: 1,
+      sleep: () => Promise.resolve(),
+      fetchFn: async () => new Response('{"enqueued":true,"id":13}', {
+        status: 202, headers: { "content-type": "application/json" },
+      }),
+      timeoutMs: 60_000,
+    });
+    if (ack.id !== 13) process.exit(3);
+  `;
+  const started = Date.now();
+  const child = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", script],
+    { timeout: 15_000, encoding: "utf8" },
+  );
+  const elapsed = Date.now() - started;
+  assertEquals(child.signal, null, `child was killed (leaked timer held it open): ${child.stderr}`);
+  assertEquals(child.status, 0, `child failed: ${child.stderr}`);
+  assert(elapsed < 15_000, `child exited promptly after the emit settled (took ${elapsed} ms)`);
+});

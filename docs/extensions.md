@@ -433,6 +433,19 @@ using that trigger runs.
 - `transport` is `webhook` (the universal ingress) in v1 — the driver POSTs each
   event to the trigger ingress. It is forward-declared so a pack states its
   contract explicitly.
+- **Emitting is checked, never fire-and-forget.** The ingress persists an event
+  into the durable inbox *before* it acks (persist-before-ack, ADR 0025 §2), so
+  a **2xx means the event is durable** and a **non-2xx means it was not
+  persisted**. A driver must treat a non-2xx (or a rejected `fetch`) as a failed
+  emit: retry it idempotently (send a stable `Idempotency-Key` per source event
+  so a retry after an ambiguous outcome collapses to a no-op), and surface the
+  failure — throw / exit non-zero — once its retries are exhausted. A driver
+  that ignores the response loses events silently (#1543). The checked,
+  retrying `emitEvent` helper in
+  `server/crates/nano-server-console/src/trigger_sdk.ts` is the reference
+  implementation of this contract; a self-contained driver may inline it (a pack
+  driver runs with the pack dir as its cwd and cannot resolve the project's
+  `nano-generated/` SDK).
 - With a `driver`, the runtime launches `driver.ts` (a Node
   `.ts`/`.js`/`.mjs`) with the **pack directory as its working directory**,
   restarts it with backoff on crash, and kills it when the app stops. Omit
