@@ -1558,9 +1558,22 @@ fn parallel_mi_output_element_variable_is_local_to_each_inner_instance() {
 }
 
 /// #1518 guard: seeding the output element local must never clobber the input
-/// element when both name the same variable (`outputElement="=item"`).
+/// element or `loopCounter` when the output element names it (Zeebe:
+/// `shouldNotInitializeOutputElementVariableIfSameNameAsInputElement` /
+/// `...IfSetToLoopCounter`).
 #[test]
 fn mi_output_element_naming_the_input_element_keeps_the_item() {
+    assert_eq!(
+        collect_output_element("=item"),
+        vec![Value::Int(10), Value::Int(20)]
+    );
+    assert_eq!(
+        collect_output_element("=loopCounter"),
+        vec![Value::Int(1), Value::Int(2)]
+    );
+}
+
+fn collect_output_element(output_element: &str) -> Vec<Value> {
     let xml = r#"
       <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -1571,7 +1584,7 @@ fn mi_output_element_naming_the_input_element_keeps_the_item() {
             <bpmn:multiInstanceLoopCharacteristics>
               <bpmn:extensionElements>
                 <zeebe:loopCharacteristics inputCollection="=items" inputElement="item"
-                  outputCollection="results" outputElement="=item" />
+                  outputCollection="results" outputElement="OUT" />
               </bpmn:extensionElements>
             </bpmn:multiInstanceLoopCharacteristics>
           </bpmn:serviceTask>
@@ -1582,13 +1595,14 @@ fn mi_output_element_naming_the_input_element_keeps_the_item() {
           <bpmn:sequenceFlow id="f2" sourceRef="Each" targetRef="sink" />
         </bpmn:process>
       </bpmn:definitions>"#;
-    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let xml = xml.replace("OUT", output_element);
+    let def = crate::bpmn::parse_bpmn(&xml).unwrap().remove(0);
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let key = engine
         .apply_command(Command::create_instance_with(
             "p",
-            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+            vars(&[("items", Value::List(vec![Value::Int(10), Value::Int(20)]))]),
         ))
         .unwrap()
         .iter()
@@ -1599,8 +1613,8 @@ fn mi_output_element_naming_the_input_element_keeps_the_item() {
             .apply_command(Command::complete_job(job.key))
             .unwrap();
     }
-    assert_eq!(
-        engine.instance(key).unwrap().variables.get("results"),
-        Some(&Value::List(vec![Value::Int(1), Value::Int(2)]))
-    );
+    match engine.instance(key).unwrap().variables.get("results") {
+        Some(Value::List(items)) => items.clone(),
+        other => panic!("results not collected: {other:?}"),
+    }
 }
