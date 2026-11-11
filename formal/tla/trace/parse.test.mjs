@@ -37,3 +37,64 @@ test('parses nested records with quoted keys', () => {
 test('still parses functions in the (k :> v @@ ...) form', () => {
   assert.deepEqual(parseTlaValue('("a" :> 1 @@ "b" :> 2)'), { a: 1, b: 2 });
 });
+
+test('VariableScopes fixture: derives the acting child and projects scopes (#1522)', async () => {
+  const { variableScopesFixture } = await import('./parse.mjs');
+  const st = (cstate, sv, collected = [-1, -1]) => ({
+    phase: 'running', cstate, sv, collected, rootResults: [-1, -1],
+  });
+  const empty = { item: -1, loopCounter: -1, result: -1, seen: -1 };
+  const c = (i) => ({ item: i, loopCounter: i, result: 0, seen: -1 });
+  const s0 = st(['active', 'active'], { 0: empty, 1: c(1), 2: c(2), 3: empty });
+  const s1 = st(['written', 'active'],
+    { 0: { ...empty, seen: 1 }, 1: { ...c(1), result: 1 }, 2: c(2), 3: empty });
+  const fx = variableScopesFixture('VariableScopes', 'M', { n: 2 }, [
+    { step: 1, action: '<Activate line 1>', vars: s0 },
+    { step: 2, action: '<Write line 2>', vars: s1 },
+  ]);
+  assert.equal(fx.steps.length, 1);
+  assert.equal(fx.steps[0].action, 'Write');
+  assert.equal(fx.steps[0].child, 1);
+  assert.deepEqual(fx.steps[0].state.root, { seen: 1 });
+  assert.deepEqual(fx.steps[0].state.children['1'], { item: 1, loopCounter: 1, result: 1 });
+  assert.deepEqual(fx.steps[0].state.children['2'], { item: 2, loopCounter: 2, result: null });
+  assert.deepEqual(fx.initial.collected, ['undef', 'undef']);
+});
+
+test('VariableScopes fixture: a state missing the vocabulary fails loudly', async () => {
+  const { variableScopesFixture } = await import('./parse.mjs');
+  assert.throws(() => variableScopesFixture('VariableScopes', 'M', { n: 1 },
+    [{ step: 1, action: 'Init', vars: { phase: 'init' } }]), /observable variables/);
+});
+
+test('CLI runs when parse.mjs lives under a path containing spaces', async () => {
+  // Regression guard for the direct-execution check: a naive
+  // `import.meta.url === 'file://' + argv[1]` comparison fails under a
+  // directory with spaces (import.meta.url is percent-encoded), so main()
+  // silently never ran and fixtures came out empty. Run a copy of the CLI
+  // from such a directory and assert main() actually executed.
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  // realpath: macOS tmpdir is a symlink, and import.meta.url is resolved.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'nano parse spaces ')));
+  try {
+    const script = path.join(dir, 'parse.mjs');
+    fs.copyFileSync(fileURLToPath(new URL('./parse.mjs', import.meta.url)), script);
+    // Usage path: no args -> main() must run and exit 2 with usage text.
+    const usage = spawnSync(process.execPath, [script], { input: '', encoding: 'utf8' });
+    assert.equal(usage.status, 2, usage.stderr);
+    assert.match(usage.stderr, /usage: parse\.mjs/);
+    // Non-witness input -> main() must run and fail loudly (exit 1).
+    const bad = spawnSync(process.execPath, [script, '--spec', 'VariableScopes', '--model', 'M'], {
+      input: 'no witness here\n',
+      encoding: 'utf8',
+    });
+    assert.equal(bad.status, 1, bad.stderr);
+    assert.match(bad.stderr, /did not produce a completing witness behaviour for M/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,190 @@
+{
+  "spec": "VariableScopes",
+  "model": "VS_MISeeded",
+  "config": {
+    "n": 2,
+    "outputElement": "result",
+    "seedOutput": true
+  },
+  "initial": {
+    "phase": "init",
+    "root": {},
+    "body": {},
+    "children": {
+      "1": null,
+      "2": null
+    },
+    "collected": [
+      "undef",
+      "undef"
+    ],
+    "rootResults": [
+      "undef",
+      "undef"
+    ]
+  },
+  "steps": [
+    {
+      "action": "Activate",
+      "state": {
+        "phase": "running",
+        "root": {},
+        "body": {},
+        "children": {
+          "1": {
+            "item": 1,
+            "loopCounter": 1,
+            "result": null
+          },
+          "2": {
+            "item": 2,
+            "loopCounter": 2,
+            "result": null
+          }
+        },
+        "collected": [
+          "undef",
+          "undef"
+        ],
+        "rootResults": [
+          "undef",
+          "undef"
+        ]
+      }
+    },
+    {
+      "action": "Write",
+      "child": 1,
+      "state": {
+        "phase": "running",
+        "root": {
+          "seen": 1
+        },
+        "body": {},
+        "children": {
+          "1": {
+            "item": 1,
+            "loopCounter": 1,
+            "result": 1
+          },
+          "2": {
+            "item": 2,
+            "loopCounter": 2,
+            "result": null
+          }
+        },
+        "collected": [
+          "undef",
+          "undef"
+        ],
+        "rootResults": [
+          "undef",
+          "undef"
+        ]
+      }
+    },
+    {
+      "action": "Write",
+      "child": 2,
+      "state": {
+        "phase": "running",
+        "root": {
+          "seen": 2
+        },
+        "body": {},
+        "children": {
+          "1": {
+            "item": 1,
+            "loopCounter": 1,
+            "result": 1
+          },
+          "2": {
+            "item": 2,
+            "loopCounter": 2,
+            "result": 2
+          }
+        },
+        "collected": [
+          "undef",
+          "undef"
+        ],
+        "rootResults": [
+          "undef",
+          "undef"
+        ]
+      }
+    },
+    {
+      "action": "Finish",
+      "child": 1,
+      "state": {
+        "phase": "running",
+        "root": {
+          "seen": 2
+        },
+        "body": {},
+        "children": {
+          "1": null,
+          "2": {
+            "item": 2,
+            "loopCounter": 2,
+            "result": 2
+          }
+        },
+        "collected": [
+          1,
+          "undef"
+        ],
+        "rootResults": [
+          "undef",
+          "undef"
+        ]
+      }
+    },
+    {
+      "action": "Finish",
+      "child": 2,
+      "state": {
+        "phase": "running",
+        "root": {
+          "seen": 2
+        },
+        "body": {},
+        "children": {
+          "1": null,
+          "2": null
+        },
+        "collected": [
+          1,
+          2
+        ],
+        "rootResults": [
+          "undef",
+          "undef"
+        ]
+      }
+    },
+    {
+      "action": "Complete",
+      "state": {
+        "phase": "done",
+        "root": {
+          "seen": 2
+        },
+        "body": {},
+        "children": {
+          "1": null,
+          "2": null
+        },
+        "collected": [
+          1,
+          2
+        ],
+        "rootResults": [
+          1,
+          2
+        ]
+      }
+    }
+  ]
+}

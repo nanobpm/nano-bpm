@@ -23,6 +23,7 @@
 //   parse.mjs --spec TokenFlow --model MCParallelDiamond < tlc.out > fixture.json
 
 import fs from 'node:fs'
+import { pathToFileURL } from 'node:url'
 
 function argv (flag) {
   const i = process.argv.indexOf(flag)
@@ -256,6 +257,83 @@ function milestoneKey (m) {
   return [m.kind, m.from || '', m.to || '', m.node || ''].join('\u0000')
 }
 
+// --- VariableScopes vocabulary (#1522). The VariableScopes family's state is a
+// per-scope variable tree, not token flow, so it gets its own projection: the
+// ordered step list of the witness behaviour, each step naming the spec action
+// (`Activate`/`Write`/`Finish`/`Complete`), the child it acted on (derived from
+// the `cstate` delta — TLC's tool header does not print action parameters), and
+// the full observable variable state after it. The Rust replay
+// (engine-core/tests/variable_scopes_trace_validation.rs) drives the engine
+// through the same steps and asserts its scope tree equals `state` each time.
+const VS_STATE_VARS = ['phase', 'cstate', 'sv', 'collected', 'rootResults']
+const VS_UNDEF = -1
+const VS_NULL = 0
+
+// TLC prints a 1..N function as a tuple and a 0..N+1 function in `:>` form;
+// normalise both to an object keyed by the decimal scope / child id.
+function byId (v, base) {
+  if (Array.isArray(v)) return Object.fromEntries(v.map((x, k) => [String(k + base), x]))
+  return v
+}
+
+// One scope's defined variables: Undef names are absent, Null is JSON null.
+function scopeVars (m) {
+  const out = {}
+  for (const n of Object.keys(m).sort()) {
+    if (m[n] === VS_UNDEF) continue
+    out[n] = m[n] === VS_NULL ? null : m[n]
+  }
+  return out
+}
+
+function vsValue (x) { return x === VS_UNDEF ? 'undef' : (x === VS_NULL ? null : x) }
+
+export function variableScopesFixture (spec, model, config, states) {
+  if (!states.length) throw new Error(`${spec}/${model}: no witness states parsed`)
+  for (const s of states) {
+    const missing = VS_STATE_VARS.filter((v) => !(v in s.vars))
+    if (missing.length) {
+      throw new Error(`${spec}/${model}: state ${s.step} (${s.action}) lacks the ` +
+        `VariableScopes observable variables [${missing.join(', ')}]`)
+    }
+  }
+  const n = config.n
+  const project = (vars) => {
+    const sv = byId(vars.sv, 0)
+    const cs = byId(vars.cstate, 1)
+    const children = {}
+    for (let i = 1; i <= n; i++) {
+      // A child scope exists only while the child is running.
+      children[String(i)] = (cs[String(i)] === 'active' || cs[String(i)] === 'written')
+        ? scopeVars(sv[String(i)])
+        : null
+    }
+    return {
+      phase: vars.phase,
+      root: scopeVars(sv['0']),
+      body: scopeVars(sv[String(n + 1)]),
+      children,
+      collected: Object.values(byId(vars.collected, 1)).map(vsValue),
+      rootResults: Object.values(byId(vars.rootResults, 1)).map(vsValue),
+    }
+  }
+  const steps = []
+  for (let k = 1; k < states.length; k++) {
+    const a = byId(states[k - 1].vars.cstate, 1)
+    const b = byId(states[k].vars.cstate, 1)
+    const changed = Object.keys(b).filter((i) => a[i] !== b[i])
+    const action = /^<?(\w+)/.exec(states[k].action)[1]
+    const step = { action }
+    if (action === 'Write' || action === 'Finish') {
+      if (changed.length !== 1) throw new Error(`${spec}/${model}: step ${k} (${action}) changed ${changed.length} children`)
+      step.child = Number(changed[0])
+    }
+    step.state = project(states[k].vars)
+    steps.push(step)
+  }
+  return { spec, model, config, initial: project(states[0].vars), steps }
+}
+
 function main () {
   const spec = argv('--spec')
   const model = argv('--model')
@@ -265,6 +343,14 @@ function main () {
     process.stderr.write(`error: TLC did not produce a completing witness behaviour for ${model}\n`)
     process.stderr.write(out)
     process.exit(1)
+  }
+  if (spec === 'VariableScopes') {
+    const idx = out.indexOf('"GRAPHJSON"')
+    if (idx < 0) throw new Error('no GRAPHJSON marker in TLC output')
+    const config = parseTlaValue(out.slice(out.lastIndexOf('<<', idx)))[1]
+    const fixture = variableScopesFixture(spec, model, config, extractStates(out))
+    process.stdout.write(JSON.stringify(fixture, null, 2) + '\n')
+    return
   }
   const graph = extractGraph(out)
   const states = extractStates(out)
@@ -280,4 +366,6 @@ function main () {
 }
 
 // Run the CLI only when executed directly, not when imported by a test.
-if (import.meta.url === `file://${process.argv[1]}`) main()
+// `pathToFileURL` percent-encodes the path the way `import.meta.url` is, so a
+// checkout under a directory with spaces still runs the CLI.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main()

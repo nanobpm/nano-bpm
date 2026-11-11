@@ -323,6 +323,20 @@ rule): TLC emits a spec behaviour, and a Rust test replays it against
   no per-flow identity, so their milestone multiset cannot distinguish the two
   same-endpoint flows and the anchor would be unsound.
 
+**VariableScopes (#1522).** `formal/tla/varscopes/VariableScopes.tla` models
+the scope tree of a parallel multi-instance sub-process (root → MI body →
+children) with Zeebe's `setLoopVariables` seeding (inputElement, loopCounter,
+and a bare-variable outputElement seeded nil unless it names the input element
+or `loopCounter` — cited at the pinned sha), nearest-scope propagation, output
+collection and scope teardown. Invariants: `TypeOK`, `OutputIsolation`,
+`NoLostUpdate`, `NoLeak`; property `EventuallyDone`. `VS_MINoSeed` (no
+outputElement seeding — the #1518 defect) must violate `OutputIsolation`. Its
+trace models use a dedicated vocabulary in `trace/parse.mjs`
+(`variableScopesFixture`: per-step action, acting child and full per-scope
+variable state; `SPEC_TRACE_DONE` requires interleaved sibling writes) and are
+replayed step by step by `engine-core/tests/variable_scopes_trace_validation.rs`,
+which asserts the engine's scope tree equals the spec's after every step.
+
 **Reuse entry point (for sibling specs #1227, #1240, …).** The replay driver is
 spec-agnostic and lives in `engine-core/tests/trace_validation/harness.rs`. A
 new spec anchors its own models by implementing the `TraceMapping` trait and
