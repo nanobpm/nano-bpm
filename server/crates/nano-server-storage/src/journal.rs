@@ -1191,6 +1191,13 @@ impl Journal {
         if let Some(cold) = self.cold.as_mut() {
             cold.index = ColdIndex::default();
         }
+        // Evict the rebuilt terminal shells (#1473): a durable replay resurrects
+        // every completed instance whose terminal event survived, but those
+        // events are not re-exported here, so the exporter never drives another
+        // eviction for them — without this sweep the rebuilt engine pins its
+        // whole completed history resident indefinitely (the boot path runs the
+        // same post-catch-up `evict_completed` for the same reason).
+        self.engine.evict_completed();
         // The rebuild IS the durable state: the fence and any armed (aborted)
         // raft-entry buffer are predecessor state that must not outlive it.
         self.raft_entry = None;
@@ -1393,6 +1400,25 @@ impl Journal {
     /// deployment). See [`Engine::install_deployment`].
     pub fn install_deployment(&mut self, events: &[Event]) {
         self.engine.install_deployment(events);
+    }
+
+    /// Installs a deployment seed onto a freshly rebuilt engine, keeping every
+    /// historical version and never regressing the latest-by-id index
+    /// (version-guarded). Used by the Raft rebuild path (#1473) to reseed the
+    /// canonical deployments onto an engine reconstructed from durable state —
+    /// definitions journaled under a different partition are not in `p`'s own
+    /// replay, so without this the rebuilt partition's creates fail with
+    /// `ProcessNotFound`. See [`Engine::install_deployment_if_newer`].
+    pub fn install_deployment_if_newer(&mut self, events: &[Event]) {
+        self.engine.install_deployment_if_newer(events);
+    }
+
+    /// The authoritative lean-snapshot variable store wired onto this journal,
+    /// if any (#1463). The Raft rebuild's durable recovery reads it so a lean
+    /// (control-only) combined snapshot's variables are installed before the
+    /// surviving tail replays (#1473).
+    pub fn varstore(&self) -> Option<Arc<VarStore>> {
+        self.varstore.clone()
     }
 
     /// Durably installs a deployment replicated from another node: registers the
@@ -4448,6 +4474,56 @@ mod tests {
             queued.load(Ordering::Relaxed),
             bytes as u64,
             "queued-byte gauge accounts the forwarded batch",
+        );
+    }
+
+    /// #1473 (review): `replace_engine` installs an engine rebuilt from durable
+    /// state, whose replay resurrects every completed instance whose terminal
+    /// event survived. Those events are NOT re-exported, so the exporter never
+    /// drives another eviction for them — the swap must evict the rebuilt
+    /// terminal shells itself, or the rebuilt engine pins its whole completed
+    /// history resident indefinitely.
+    #[test]
+    fn replace_engine_evicts_the_rebuilt_completed_instances() {
+        // Build the durable history of an instance that runs to COMPLETION.
+        let mut history: Vec<Event> = Vec::new();
+        let mut source = Journal::in_memory();
+        let (d, _) = source
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        history.extend(d.iter().cloned());
+        let (c, _) = source
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key = c.iter().find_map(|e| e.instance_key()).unwrap();
+        history.extend(c.iter().cloned());
+        let jobs = source.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(jobs.len(), 1);
+        let (done, _) = source
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+        assert!(done.iter().any(
+            |e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)
+        ));
+        history.extend(done.iter().cloned());
+        assert!(
+            source.instance(key).is_some(),
+            "the completed shell is resident"
+        );
+
+        // The durable replay of that history resurrects the completed shell.
+        let replayed = nanobpmn_engine_core::Engine::replay_partition(0, history);
+        assert!(
+            replayed.state().instances.contains_key(&key),
+            "the replay resurrects the completed instance"
+        );
+
+        // Swapping it in must evict the terminal shell (not leave it resident).
+        let mut target = Journal::in_memory();
+        target.replace_engine(replayed);
+        assert!(
+            target.instance(key).is_none(),
+            "replace_engine evicts the rebuilt terminal shell"
         );
     }
 
