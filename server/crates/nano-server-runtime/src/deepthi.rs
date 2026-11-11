@@ -147,6 +147,8 @@ pub enum Priority {
 /// boxed closure (never across the engine work itself), so — unlike the old
 /// `RwLock<Journal>` — it never parks a tokio worker on a contended lock.
 struct Mailbox {
+    /// The engine's lifecycle lock (#1473) — see [`EngineLifecycle`].
+    lifecycle: Arc<EngineLifecycle>,
     inner: Mutex<MailboxInner>,
     signal: Condvar,
     /// Heartbeat/liveness telemetry for this partition's engine thread. The
@@ -161,23 +163,40 @@ struct MailboxInner {
     /// Live [`DeepthiHandle`] count. When it hits zero with both queues drained,
     /// the consumer loop exits (mirrors an mpsc channel disconnect).
     producers: usize,
+    /// Set (under this mutex) by [`Mailbox::fail_pending`] when the engine
+    /// thread dies. Once closed, [`Mailbox::push`] rejects every submission by
+    /// dropping the job — releasing its reply sender — so a request that passed
+    /// an `is_alive` check just before the death can never land in an
+    /// already-drained queue with no consumer (#1473 review).
+    closed: bool,
 }
 
 impl Mailbox {
     fn new(partition: u64) -> Arc<Self> {
         Arc::new(Self {
+            lifecycle: Arc::new(EngineLifecycle::default()),
             inner: Mutex::new(MailboxInner {
                 hi: VecDeque::new(),
                 lo: VecDeque::new(),
                 producers: 1,
+                closed: false,
             }),
             signal: Condvar::new(),
             stats: ActorStats::new(partition),
         })
     }
 
+    /// Enqueues `job`, or — when the mailbox is closed (the engine thread is
+    /// dead) — drops it, so its reply sender is released and the awaiting
+    /// caller terminates instead of hanging. Closure and enqueue are decided
+    /// under the same mutex as the drain, so no ordering can strand a job.
     fn push(&self, priority: Priority, job: Job) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            drop(g);
+            drop(job);
+            return;
+        }
         match priority {
             Priority::High => {
                 g.hi.push_back(job);
@@ -214,7 +233,70 @@ impl Mailbox {
             g = self.signal.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// Drops every queued job, releasing each one's resources — a `with` job's
+    /// reply sender, so its awaiting caller terminates (its `reply_rx` resolves
+    /// to `Err`) instead of hanging, and with it any engine-lifecycle guard that
+    /// caller holds. Called when the engine thread dies: no consumer will ever
+    /// drain these, so a queued apply / snapshot-capture would otherwise park
+    /// its caller (and its shared lifecycle guard) forever, deadlocking a
+    /// rebuild's `retire()` against the dead actor (#1473 review).
+    fn fail_pending(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.closed = true;
+        // Move the queued jobs OUT under the lock, then drop them only after
+        // releasing it: a queued closure may own a `DeepthiHandle` clone whose
+        // `Drop` re-acquires this same (non-reentrant) mutex — dropping it while
+        // held would self-deadlock the death handler (#1473 review).
+        let hi = std::mem::take(&mut g.hi);
+        let lo = std::mem::take(&mut g.lo);
+        self.stats.hi_depth.store(0, Ordering::Relaxed);
+        self.stats.lo_depth.store(0, Ordering::Relaxed);
+        drop(g);
+        drop(hi);
+        drop(lo);
+    }
 }
+
+/// The single per-engine LIFECYCLE LOCK (#1473).
+///
+/// An engine actor outlives the Raft member that drives it: a partition rebuild
+/// retires the predecessor member and hands the same engine (or a journal
+/// swapped into it from durable state) to the successor. Every operation that
+/// must never interleave with that hand-over takes this one lock, instead of
+/// each operation carrying its own bespoke fence/counter/gate:
+///
+/// - **Shared** ([`DeepthiHandle::lifecycle_enter`] for a Raft member bound to
+///   an epoch, [`DeepthiHandle::lifecycle_shared`] for epoch-agnostic work):
+///   Raft `apply`, snapshot capture / build+publish / install, and deployment
+///   fan-out into the engine. A member-bound entry is refused (`None`) once the
+///   epoch it was constructed in has been retired, so a late predecessor
+///   operation can never touch the engine or the snapshot dir again.
+/// - **Exclusive** ([`DeepthiHandle::lifecycle_exclusive`]): retiring the
+///   member (fence + drain) and the rebuild's engine resolution — the health
+///   probe, the durable reconstruction, and the journal swap. Acquiring it
+///   retires the current epoch (every member bound to it is fenced) and waits
+///   until no shared holder is in flight; tokio's `RwLock` is write-preferring,
+///   so new shared entries queue behind it and then observe the new epoch.
+///
+/// **Lock order** (deadlock freedom): engine lifecycle lock → the journal's
+/// segmented checkpoint permit. A snapshot build takes the build semaphore
+/// BEFORE the lifecycle lock and never waits on the semaphore while holding it.
+/// No holder of the lifecycle lock ever waits on another engine's lifecycle
+/// lock, and the exclusive holder never waits on a Raft
+/// apply (the member's core is shut down first). Callers bound the exclusive
+/// acquisition with a timeout so a wedged shared holder fails the rebuild
+/// closed (the supervisor retries) rather than hanging it.
+#[derive(Default)]
+pub struct EngineLifecycle {
+    lock: Arc<tokio::sync::RwLock<()>>,
+    epoch: AtomicU64,
+}
+
+/// A shared hold on an engine's lifecycle lock ([`EngineLifecycle`]).
+pub type LifecycleShared = tokio::sync::OwnedRwLockReadGuard<()>;
+/// An exclusive hold on an engine's lifecycle lock ([`EngineLifecycle`]).
+pub type LifecycleExclusive = tokio::sync::OwnedRwLockWriteGuard<()>;
 
 /// A cloneable handle to the engine actor. All engine mutation and engine-state
 /// reads go through here; the [`Journal`] lives on a single dedicated thread, so
@@ -250,20 +332,40 @@ impl Drop for DeepthiHandle {
 }
 
 /// Fires when the engine thread's command loop unwinds — whether by clean
-/// shutdown or (the case we hunt) a **panic inside a command**. Clears the
-/// [`ActorStats::alive`] flag and logs loudly so a silently-dead single writer
-/// can never again masquerade as a mysterious completion-freeze. The panic's
-/// payload/location is captured separately by the process-wide panic hook
-/// installed in `main`.
-struct AliveGuard(Arc<ActorStats>);
+/// shutdown or (the case we hunt) a **panic inside a command**. Closes and
+/// drains the mailbox, then clears the [`ActorStats::alive`] flag and logs
+/// loudly so a silently-dead single writer can never again masquerade as a
+/// mysterious completion-freeze. The panic's payload/location is captured
+/// separately by the process-wide panic hook installed in `main`.
+///
+/// It also DRAINS every still-queued request ([`Mailbox::fail_pending`]): a
+/// `with` job queued behind the dead consumer would otherwise never run, so its
+/// caller's `reply_rx` would never resolve — parking the caller (and any
+/// engine-lifecycle guard it holds) forever and deadlocking a rebuild's
+/// `retire()` against the dead actor (#1473 review). Dropping the queued jobs
+/// releases their reply senders, so each pending caller terminates (its
+/// `reply_rx` resolves to `Err`) and releases its guard.
+///
+/// ORDER MATTERS: the mailbox is closed and drained BEFORE `alive` flips to
+/// `false`, so a caller that observes `is_alive() == false` is guaranteed the
+/// mailbox already rejects new submissions — no window in which a request
+/// lands in a not-yet-closed queue whose drain already ran (#1473 review).
+struct AliveGuard {
+    stats: Arc<ActorStats>,
+    mb: Arc<Mailbox>,
+}
 
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        self.0.alive.store(false, Ordering::Relaxed);
+        // Terminate every pending request BEFORE publishing death or logging,
+        // so a waiting caller's guard is released even if the log sink blocks,
+        // and so `is_alive() == false` implies the mailbox is already closed.
+        self.mb.fail_pending();
+        self.stats.alive.store(false, Ordering::Relaxed);
         let panicking = thread::panicking();
         tracing::error!(
-            partition = self.0.partition,
-            jobs = self.0.jobs.load(Ordering::Relaxed),
+            partition = self.stats.partition,
+            jobs = self.stats.jobs.load(Ordering::Relaxed),
             panicking,
             "engine actor thread exited: the single writer for this partition is \
              DOWN — every subsequent create/complete on it will hang forever \
@@ -303,9 +405,13 @@ impl DeepthiHandle {
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
-                // Clears `alive` + logs on exit/panic-unwind (drop-guard, so it
-                // fires even when a command panics through the loop).
-                let _alive = AliveGuard(Arc::clone(&consumer.stats));
+                // Closes + drains pending requests, then clears `alive` and
+                // logs on exit/panic-unwind (drop-guard, so it fires even when
+                // a command panics through the loop).
+                let _alive = AliveGuard {
+                    stats: Arc::clone(&consumer.stats),
+                    mb: Arc::clone(&consumer),
+                };
                 if profile || controller.is_some() {
                     Self::run_instrumented(&consumer, &mut journal, profile, controller);
                 } else {
@@ -423,6 +529,37 @@ impl DeepthiHandle {
         self.with_priority(Priority::High, f).await
     }
 
+    /// Fallible [`with`](DeepthiHandle::with): returns `None` instead of
+    /// panicking when the engine actor is dead and can never answer — either
+    /// already dead when the job is queued, or unwound while the job sat in the
+    /// mailbox (its [`AliveGuard`] drains the queue, dropping the job's reply
+    /// sender, so the receiver resolves to `Err`).
+    ///
+    /// Use this on every path that must SURVIVE the actor's death — the raft
+    /// rebuild supervisor's health probe, recovery-metadata read, and journal
+    /// swap (#1473): a `with` there would panic on the dead-actor `expect`,
+    /// unwinding the supervisor task and halting recovery for EVERY partition,
+    /// where `None` just fails this partition's pass (the supervisor retries).
+    pub async fn try_with<R, F>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Journal) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if !self.is_alive() {
+            return None;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let job: Job = Box::new(move |journal| {
+            // A dropped receiver (caller cancelled) is fine; the command still ran.
+            let _ = reply_tx.send(f(journal));
+        });
+        self.mb.push(Priority::High, job);
+        // `Err` means the sender was dropped without answering: the actor is
+        // dead and its `AliveGuard` drained the queue (the panic hook already
+        // captured the cause).
+        reply_rx.await.ok()
+    }
+
     /// Like [`with`](DeepthiHandle::with) but at [`Priority::Low`] — the engine
     /// services it only when no completion-side work is queued. Used by the
     /// instance-create path so a flood of creates cannot starve completion and
@@ -487,6 +624,57 @@ impl DeepthiHandle {
     pub fn stats(&self) -> &Arc<ActorStats> {
         &self.mb.stats
     }
+
+    /// Whether this handle's engine actor thread is still running (#1473).
+    /// `false` the instant the actor's command loop exits for ANY reason (clean
+    /// shutdown or a panic inside a command — the `AliveGuard` clears it, and
+    /// only AFTER it closed and drained the mailbox, so observing `false`
+    /// guarantees a new submission is rejected rather than stranded). A caller
+    /// about to reuse a handle for a long-lived rebuild MUST check this first:
+    /// [`with`](Self::with) on a dead actor is rejected by the closed mailbox
+    /// (its reply sender drops, so the await panics on the dead-actor
+    /// `expect`) — use [`try_with`](Self::try_with) on any path that must
+    /// survive the actor's death.
+    pub fn is_alive(&self) -> bool {
+        self.mb.stats.alive.load(Ordering::Relaxed)
+    }
+
+    /// The engine's current lifecycle epoch ([`EngineLifecycle`]). A Raft
+    /// member records it at construction and passes it to
+    /// [`lifecycle_enter`](Self::lifecycle_enter) for every operation.
+    pub fn lifecycle_epoch(&self) -> u64 {
+        self.mb.lifecycle.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Enters the lifecycle lock SHARED on behalf of a member bound to `epoch`.
+    /// `None` when that epoch has been retired — the caller must not touch the
+    /// engine or its snapshot dir. The epoch only changes under the exclusive
+    /// lock, so it cannot change while the returned guard is held.
+    pub async fn lifecycle_enter(&self, epoch: u64) -> Option<LifecycleShared> {
+        let guard = Arc::clone(&self.mb.lifecycle.lock).read_owned().await;
+        (self.lifecycle_epoch() == epoch).then_some(guard)
+    }
+
+    /// Enters the lifecycle lock SHARED for epoch-agnostic engine work
+    /// (deployment fan-out): excluded only from a concurrent rebuild's engine
+    /// resolution, so the work lands either before the durable read or in the
+    /// swapped-in engine — never in between.
+    pub async fn lifecycle_shared(&self) -> LifecycleShared {
+        Arc::clone(&self.mb.lifecycle.lock).read_owned().await
+    }
+
+    /// Enters the lifecycle lock EXCLUSIVE and retires the current epoch. Wrap
+    /// in a timeout: it waits for every shared holder to leave.
+    pub async fn lifecycle_exclusive(&self) -> LifecycleExclusive {
+        let guard = Arc::clone(&self.mb.lifecycle.lock).write_owned().await;
+        self.mb.lifecycle.epoch.fetch_add(1, Ordering::SeqCst);
+        guard
+    }
+
+    /// Whether `self` and `other` drive the same engine lifecycle.
+    pub fn same_lifecycle(&self, other: &DeepthiHandle) -> bool {
+        Arc::ptr_eq(&self.mb.lifecycle, &other.mb.lifecycle)
+    }
 }
 
 #[cfg(test)]
@@ -547,10 +735,11 @@ mod tests {
         wait_until(|| !stats.alive.load(Ordering::Relaxed));
         assert!(!stats.alive.load(Ordering::Relaxed));
         // The panic happened with the mailbox lock released, so producers can
-        // still enqueue (mutex is NOT poisoned) — enqueue must not panic even
-        // though the consumer is gone.
+        // still submit (mutex is NOT poisoned) — submission must not panic even
+        // though the consumer is gone. The closed mailbox rejects the job rather
+        // than stranding it in a queue nobody drains (#1473 review).
         h.spawn_job(|_journal| {});
-        assert!(h.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+        assert_eq!(h.stats().hi_depth.load(Ordering::Relaxed), 0);
     }
 
     /// A poisoned mailbox mutex (a panic while the guard is held) must not
@@ -571,5 +760,159 @@ mod tests {
         let (job, prio) = mb.pop().expect("job enqueued before poison is served");
         assert_eq!(prio, Priority::High);
         drop(job);
+    }
+
+    /// #1473 (review): when the engine actor dies with a `with` request still
+    /// QUEUED, the pending request is terminated — its reply sender is dropped,
+    /// so the awaiting caller's `reply_rx` resolves (to `Err`, surfacing as a
+    /// panic at the `expect`) instead of hanging forever, and any
+    /// engine-lifecycle guard the caller holds is released with it. This is
+    /// what lets a rebuild's `retire()` drain past a dead actor instead of
+    /// timing out on a guard that can never leave.
+    #[test]
+    fn actor_death_terminates_a_queued_request_and_releases_its_guard() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+
+        // A job that parks the actor until released, then PANICS — dying while
+        // the `with` below is still queued behind it. The park guarantees the
+        // `with` is enqueued (not yet served) at the moment of the unwind.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        h.spawn_job(move |_journal| {
+            let _ = started_tx.send(()); // the actor is now INSIDE this job
+            let _ = block_rx.recv(); // park until the test releases us
+            panic!("boom"); // die with the `with` still queued behind us
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking job is running");
+
+        // The queued request: its caller holds a lifecycle guard across the
+        // await — the exact shape the rebuild's retire() must be able to drain.
+        let guard_holder = h.clone();
+        let caller = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            // The `with` await panics once the actor is dead (its pending job's
+            // reply sender is dropped, closing the oneshot). Catch that panic so
+            // the thread returns normally; the caller's guard drops with the
+            // frame either way — it is NOT held forever.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(async move {
+                    let _guard = guard_holder.lifecycle_shared().await;
+                    // Queues behind the parked job; terminated by the actor's
+                    // death rather than hanging on a reply that can never arrive.
+                    guard_holder.with(|_j| ()).await;
+                });
+            }));
+        });
+        // Wait until the `with` request is actually QUEUED behind the parked job
+        // (the parked job was already popped, so depth 1 == the `with`).
+        wait_until(|| h.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+
+        // Release the parked job: it panics, unwinding the actor with the
+        // caller's `with` still queued behind it.
+        let _ = block_tx.send(());
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+        assert!(!stats.alive.load(Ordering::Relaxed));
+
+        // The queued request's caller terminated (its guard released) rather
+        // than hanging on a reply that can never arrive.
+        caller
+            .join()
+            .expect("a queued request is terminated when the actor dies");
+    }
+
+    /// #1473 (review): `try_with` is the FALLIBLE request the rebuild
+    /// supervisor's probe / metadata read / swap use. It must return `None` —
+    /// never panic, never hang — both when the actor is already dead and when
+    /// it dies with the request still queued, so the supervisor task survives
+    /// and keeps recovering the other partitions.
+    #[test]
+    fn try_with_returns_none_on_a_dead_actor_without_panicking() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+
+        // Already-dead actor: `None` immediately, nothing queued.
+        h.spawn_job(|_journal| panic!("boom"));
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let dead = h.clone();
+        let answered = rt.block_on(async move { dead.try_with(|_j| 1u32).await });
+        assert_eq!(answered, None, "a dead actor never answers");
+        assert_eq!(
+            h.stats().hi_depth.load(Ordering::Relaxed),
+            0,
+            "an already-dead actor's request is never queued"
+        );
+
+        // Live actor that dies with the `try_with` still queued behind a parked
+        // job: the drain drops the reply sender, so the await resolves to None.
+        let h2 = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats2 = Arc::clone(h2.stats());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        h2.spawn_job(move |_journal| {
+            let _ = started_tx.send(());
+            let _ = block_rx.recv();
+            panic!("boom");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking job is running");
+        let caller_handle = h2.clone();
+        let caller = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move { caller_handle.try_with(|_j| 2u32).await })
+        });
+        wait_until(|| h2.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+        let _ = block_tx.send(());
+        wait_until(|| !stats2.alive.load(Ordering::Relaxed));
+        let answered = caller
+            .join()
+            .expect("try_with never panics on a dead actor");
+        assert_eq!(answered, None, "a queued try_with resolves to None");
+    }
+
+    /// #1473 (review): the check-before-death / enqueue-after-drain ordering.
+    /// A request that passed `is_alive` just before the actor died is pushed
+    /// AFTER `fail_pending` drained the queue. The closed mailbox must reject
+    /// it (dropping its reply sender) rather than strand it with no consumer.
+    #[test]
+    fn push_after_the_drain_is_rejected_not_stranded() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+        h.spawn_job(|_journal| panic!("boom"));
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+
+        // Simulate the late enqueue directly (bypassing the is_alive fast path).
+        let (reply_tx, mut reply_rx) = oneshot::channel::<u32>();
+        h.mb.push(
+            Priority::High,
+            Box::new(move |_journal| {
+                let _ = reply_tx.send(3);
+            }),
+        );
+        assert_eq!(
+            h.stats().hi_depth.load(Ordering::Relaxed),
+            0,
+            "a closed mailbox never queues"
+        );
+        assert!(
+            matches!(
+                reply_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the rejected job's reply sender is released, so the caller terminates"
+        );
     }
 }

@@ -4501,6 +4501,66 @@ const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
 /// default 1000ms) with margin for a starved runtime.
 const LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS: u64 = 3000;
 
+/// Upper bound on the engine-liveness probe a partition rebuild runs before
+/// reusing the predecessor's engine handle (#1473). A healthy actor answers a
+/// fence check in microseconds; the bound only trips when the actor is wedged
+/// (alive but not draining its mailbox), in which case the rebuild must
+/// reconstruct the engine from durable state rather than hang the serial
+/// recovery pass waiting on a reply that never comes.
+const ENGINE_HEALTH_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A rebuild refused to reconstruct partition `partition` from a LEGACY
+/// single-file journal shared by `num_partitions` partitions (#1473): that
+/// layout's `RaftEntryApplied` records carry no partition attribution, so the
+/// partition's applied watermark cannot be recovered and guessing it would let
+/// a durable Raft-log replay execute non-idempotent commands twice. Fails
+/// closed (#1066). Operator action: migrate the data directory to the
+/// segmented journal (restart with segmented journaling enabled), or restart
+/// the node so the boot path recovers the partition.
+#[derive(Debug)]
+struct LegacyRecoveryAttributionError {
+    partition: u64,
+    num_partitions: usize,
+}
+
+impl std::fmt::Display for LegacyRecoveryAttributionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to rebuild partition {} from a legacy single-file journal shared by {} \
+             partitions: its RaftEntryApplied records carry no partition attribution, so the \
+             applied watermark cannot be recovered without guessing (#1473, fail closed per \
+             #1066). Operator action: migrate to the segmented journal, or restart the node so \
+             the boot path recovers the partition.",
+            self.partition, self.num_partitions
+        )
+    }
+}
+
+impl std::error::Error for LegacyRecoveryAttributionError {}
+
+/// Fails closed (#1473) when a LEGACY single-file journal is shared by more
+/// than one partition — see [`LegacyRecoveryAttributionError`]. The typed error
+/// is downcastable from the returned `io::Error`.
+fn check_legacy_recovery_attribution(p: u64, num_partitions: usize) -> std::io::Result<()> {
+    if num_partitions > 1 {
+        return Err(std::io::Error::other(LegacyRecoveryAttributionError {
+            partition: p,
+            num_partitions,
+        }));
+    }
+    Ok(())
+}
+
+/// How a rebuild reconstructs an engine that is dead or fenced (#1473): a
+/// PROMOTION needs an authoritative durable baseline (never an empty replica),
+/// while a RECEIVER can start from a fresh replica the leader backfills.
+#[derive(Clone, Copy, Debug)]
+enum RebuildEngineMode {
+    Promote,
+    Receiver,
+}
+
 /// How long a self-promote waits for a surviving replica to acknowledge the
 /// promotion (adopt the epoch + rebuild as our receiver) before we ship it the
 /// fresh lineage via `add_learner` (issue #228). The `Promote` announcement and
@@ -15672,17 +15732,29 @@ impl ServerImpl {
     /// the durable `ProcessDeployed` into every owned partition, so the
     /// definition survives this node's independent restart on all of them.
     /// Invoked by the `InstallDeployment` falcon frame handler.
+    ///
+    /// Every install holds that engine's lifecycle lock SHARED (#1473): a
+    /// concurrent rebuild's durable read → journal swap holds it exclusive, so
+    /// each install lands before the read or in the swapped-in engine — never
+    /// in between, where the swap would silently discard an acknowledged
+    /// definition. The durable owner's guard is released BEFORE the sibling
+    /// fan-out (the durable commit is the serialized part; the in-memory
+    /// sibling copies need no mutual ordering against each other).
     pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
         let handles = self.engine.all();
         let events = Arc::new(events);
         let durable = {
             let events = Arc::clone(&events);
+            // Owner's durable commit under its shared guard.
+            let _lifecycle = handles[0].lifecycle_shared().await;
             handles[0]
                 .with(move |journal| journal.install_deployment_durable(&events))
                 .await
         };
         for handle in handles.iter().skip(1) {
             let events = Arc::clone(&events);
+            // Each sibling install under its own shared guard.
+            let _lifecycle = handle.lifecycle_shared().await;
             handle
                 .with(move |journal| journal.install_deployment(&events))
                 .await;
@@ -15902,7 +15974,12 @@ impl ServerImpl {
                 let evict_terminal = owned.is_none();
                 let engine = match owned {
                     Some(owned) => owned.clone(),
-                    None => server.replica_engine_for(p).await,
+                    None => match server.replica_engine_for(p).await {
+                        Some(engine) => engine,
+                        // Logged inside; the partition stays unhosted rather
+                        // than serving a replica that fails every create.
+                        None => continue,
+                    },
                 };
                 // Purge-hole → snapshot fallback (issue #111) applies only to a
                 // partition this node REPLICATES but does not own: such a partition
@@ -16883,15 +16960,24 @@ impl ServerImpl {
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
 
-        // The engine actor holding the replicated state for `p` on this node.
-        let engine = match self.engine_handle_for(p) {
-            Some(h) => h,
-            None => self.replica_engine_for(p).await,
+        // Tear down the stale group (a learner of the dead leader) before
+        // replacing it, so its openraft task and sockets are released. This also
+        // fully retires the predecessor (#1473): it fences + drains any detached
+        // snapshot build and reclaims a volatile staging dir, and returns the
+        // engine actor only while it is ALIVE and UNFENCED — a dead or fenced
+        // predecessor engine is reconstructed from durable state instead of
+        // reusing a handle whose mailbox is never drained (which would hang the
+        // rebuild) or whose journal refuses every apply (#1405).
+        let Some(engine) = self
+            .retire_and_resolve_engine(p, RebuildEngineMode::Promote)
+            .await
+        else {
+            tracing::error!(
+                "leader-durable: promote partition {p} aborted: the predecessor did not retire \
+                 or no healthy engine could be resolved; the supervisor retries (#1473)"
+            );
+            return;
         };
-
-        // Tear down the stale group (a learner of the dead leader) before replacing
-        // it, so its openraft task and sockets are released.
-        self.retire_predecessor_core(p).await;
 
         // Form a fresh single-voter group on a clean in-memory log (the engine's
         // own journal remains the local durability source). Initialize with this
@@ -17738,12 +17824,51 @@ impl ServerImpl {
             .clone()
     }
 
-    /// Shut down and await the current core for `p` (if any) before a rebuild
-    /// constructs its replacement — the single canonical teardown step shared by
-    /// every rebuild path. Must be called with `p`'s rebuild lock held.
-    async fn retire_predecessor_core(&self, p: u64) {
+    /// Retires the current core for `p` (if any) and resolves the engine the
+    /// successor will drive — the single canonical teardown + engine-resolution
+    /// step shared by every rebuild path (#1473). Must be called with `p`'s
+    /// rebuild lock held.
+    ///
+    /// The whole step runs under the engine's single LIFECYCLE LOCK held
+    /// EXCLUSIVE (see `EngineLifecycle` in `nano-server-runtime`):
+    ///
+    /// 1. [`RaftPartition::retire`] shuts the predecessor core down and takes
+    ///    its engine's lifecycle lock exclusive, which ends the predecessor's
+    ///    epoch and drains every in-flight apply / snapshot build / install —
+    ///    none can touch the engine or the snapshot dir afterwards.
+    /// 2. The partition's CURRENT engine (when it is a different actor) is
+    ///    taken exclusive too, so deployment fan-out cannot interleave with the
+    ///    durable read → journal swap below (it lands before the read, or in
+    ///    the swapped-in engine).
+    /// 3. Under those guards the engine is resolved: reused only while ALIVE
+    ///    and UNFENCED, otherwise reconstructed (owned: from durable state;
+    ///    receiver replica: a fresh, seeded replica).
+    /// 4. The guards drop BEFORE the caller constructs the successor (whose
+    ///    construction may dispatch applies that enter the lock shared).
+    ///
+    /// Returns `None` — fail closed, the supervisor retries — when the
+    /// predecessor did not drain within the bound, the current engine's lock
+    /// could not be taken within the bound, or no healthy engine resolved.
+    async fn retire_and_resolve_engine(
+        &self,
+        p: u64,
+        mode: RebuildEngineMode,
+    ) -> Option<DeepthiHandle> {
+        let mut guards = Vec::with_capacity(2);
+        let mut retired_engine: Option<DeepthiHandle> = None;
         if let Some(old) = self.raft.get(p) {
-            old.raft.shutdown().await.ok();
+            match old.retire().await {
+                Ok(guard) => guards.push(guard),
+                Err(e) => {
+                    tracing::warn!(
+                        partition = p,
+                        "raft rebuild: the predecessor's retirement did not drain: {e}; NOT \
+                         rebuilding over it yet — the supervisor retries (#1473)"
+                    );
+                    return None;
+                }
+            }
+            retired_engine = Some(old.sm_engine().clone());
             // Test-only: record any predecessor still live after teardown, so a
             // test fails if a rebuild constructs a successor next to a live core.
             #[cfg(test)]
@@ -17753,7 +17878,365 @@ impl ServerImpl {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
+        if let Some(current) = self.engine_handle_for(p) {
+            let already_held = retired_engine
+                .as_ref()
+                .is_some_and(|old| old.same_lifecycle(&current));
+            if !already_held {
+                match tokio::time::timeout(ENGINE_HEALTH_PROBE_BOUND, current.lifecycle_exclusive())
+                    .await
+                {
+                    Ok(guard) => guards.push(guard),
+                    Err(_) => {
+                        tracing::warn!(
+                            partition = p,
+                            "raft rebuild: partition {p}'s engine lifecycle lock was not free \
+                             within {ENGINE_HEALTH_PROBE_BOUND:?}; the supervisor retries (#1473)"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        let engine = match self.healthy_engine_for_rebuild(p).await {
+            Some(h) => Some(h),
+            None => match mode {
+                RebuildEngineMode::Promote => self.rebuild_engine_from_durable(p).await,
+                RebuildEngineMode::Receiver => self.rebuild_engine_for_receiver(p).await,
+            },
+        };
+        drop(guards);
+        engine
     }
+
+    /// The partition `p` engine actor to carry into a rebuild, or `None` when it
+    /// must be reconstructed from durable state (#1473). A handle is reusable
+    /// only while its actor is ALIVE and its journal UNFENCED:
+    ///
+    /// - **Dead actor** (its thread unwound): [`DeepthiHandle::with`] still
+    ///   queues work onto the mailbox, but no consumer drains it, so a
+    ///   successor that restores a snapshot or replays commands through the
+    ///   handle waits forever for a reply. The liveness check is cheap and
+    ///   synchronous (`ActorStats::alive`, cleared by the actor's `AliveGuard`).
+    /// - **Fenced journal** (`abort_raft_entry`, #1405): the live engine may
+    ///   hold the aborted entry's partial, non-durable effects, and every
+    ///   subsequent apply / snapshot is refused. Reusing it would strand the
+    ///   rebuilt partition even after the environmental fault heals.
+    ///
+    /// The fence probe is BOUNDED ([`ENGINE_HEALTH_PROBE_BOUND`]) so a wedged
+    /// actor also yields `None` (rebuild from disk) rather than hanging the
+    /// serial recovery pass.
+    async fn healthy_engine_for_rebuild(&self, p: u64) -> Option<DeepthiHandle> {
+        let handle = self.engine_handle_for(p)?;
+        if !handle.is_alive() {
+            tracing::warn!(
+                partition = p,
+                "raft rebuild: the predecessor's engine actor is DEAD; reconstructing the \
+                 engine from durable state instead of reusing a handle that would hang (#1473)"
+            );
+            return None;
+        }
+        // Fallible probe (`try_with`): the actor can die between the is_alive
+        // check above and the queued probe running — its AliveGuard then drops
+        // the probe's reply sender, and an infallible `with` would PANIC here,
+        // unwinding the liveness supervisor and halting recovery for EVERY
+        // partition (#1473 review). `None` is just an unhealthy engine.
+        let fenced = match tokio::time::timeout(
+            ENGINE_HEALTH_PROBE_BOUND,
+            handle.try_with(|journal| journal.is_fenced()),
+        )
+        .await
+        {
+            Ok(Some(fenced)) => fenced,
+            Ok(None) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the predecessor's engine actor DIED with the liveness probe \
+                     queued; reconstructing from durable state instead of reusing a dead \
+                     handle (#1473)"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the predecessor's engine actor did not answer a liveness \
+                     probe within {ENGINE_HEALTH_PROBE_BOUND:?}; reconstructing from durable \
+                     state instead of reusing a wedged handle (#1473)"
+                );
+                return None;
+            }
+        };
+        if fenced {
+            tracing::warn!(
+                partition = p,
+                "raft rebuild: the predecessor's journal is FENCED after an aborted Raft entry \
+                 (#1405); reconstructing the engine from durable state so the rebuilt partition \
+                 recovers once the environmental fault heals (#1473)"
+            );
+            return None;
+        }
+        Some(handle)
+    }
+
+    /// Reconstructs partition `p`'s engine from authoritative durable state for
+    /// a rebuild whose predecessor engine is dead or fenced (#1473), returning
+    /// the fresh actor to hand the successor core.
+    ///
+    /// - A partition this node **owns** is rebuilt from its durable journal
+    ///   (segmented or legacy), then swapped into the live owned actor so the
+    ///   serving/read-model wiring (exporter, spill tiers, cluster variables)
+    ///   is preserved. Never just clears the fence: the rebuilt engine comes
+    ///   from disk, so the aborted entry's partial in-memory effects are gone.
+    /// - A partition this node only **replicates** has no durable engine of its
+    ///   own (its journal is in-memory; the leader re-seeds it), so there is no
+    ///   authoritative baseline to rebuild from. Rebuilding it to an EMPTY
+    ///   replica and then PROMOTING it would lose every replicated instance and
+    ///   job (a fresh single-voter leader with no state), so this path returns
+    ///   `None` — the caller must abort the promotion and leave the partition
+    ///   down for the supervisor to retry once the peer that holds the state is
+    ///   reachable. (The RECEIVER path [`Self::rebuild_as_receiver`] never calls
+    ///   this: it reseeds the replica from the live leader instead.)
+    ///
+    /// Returns `None` when the durable rebuild fails (logged; the supervisor
+    /// retries on its next tick) — the caller must then NOT reuse the stale
+    /// engine.
+    async fn rebuild_engine_from_durable(&self, p: u64) -> Option<DeepthiHandle> {
+        if self.engine.local_for_partition(p).is_some() {
+            self.rebuild_owned_engine_from_durable(p).await
+        } else {
+            tracing::error!(
+                partition = p,
+                "raft rebuild: the predecessor's engine is dead or fenced and this node only \
+                 REPLICATES partition {p} (no durable baseline of its own); NOT rebuilding to \
+                 an empty replica — aborting the rebuild/promotion so the supervisor retries \
+                 once the peer holding the state is reachable (#1473)"
+            );
+            None
+        }
+    }
+
+    /// Reconstructs an OWNED partition's engine from its durable journal and
+    /// swaps it into the live owned actor (#1473). The actor thread is alive
+    /// (the caller checked), only its journal is fenced — so a single bounded
+    /// `with(...)` installs the disk-rebuilt journal in one actor turn, keeping
+    /// the actor's mailbox, exporter wiring, spill tiers and cluster variables.
+    /// Returns `None` (leaving the stale journal in place, the partition down,
+    /// and the supervisor retrying) when no durable journal is configured, the
+    /// rebuild fails, or the actor does not answer the swap within the bound
+    /// (a wedged actor must not hang the serial recovery pass — #1473).
+    async fn rebuild_owned_engine_from_durable(&self, p: u64) -> Option<DeepthiHandle> {
+        let handle = self.engine.local_for_partition(p)?.clone();
+        let (rebuilt, seed) = match self.durable_engine_for(p).await {
+            Ok(rebuilt) => rebuilt,
+            Err(e) => {
+                tracing::error!(
+                    partition = p,
+                    "raft rebuild: failed to reconstruct the owned engine from durable state: \
+                     {e}; leaving the partition down for the supervisor to retry (#1473)"
+                );
+                return None;
+            }
+        };
+        let num_partitions = self.engine.topology().num_partitions;
+        // The canonical deployment seed (#1473): definitions journaled under
+        // this node's first-owned partition and fanned out to siblings only in
+        // memory are NOT in `p`'s durable replay, so the rebuilt engine must be
+        // reseeded or its creates fail with `ProcessNotFound` (mirrors the boot
+        // reseed in `ServerImpl::new`). The seed is derived from the DURABLY
+        // recovered deployment owner (returned by `durable_engine_for`), never
+        // from a live actor: the live owner may be the very fenced journal being
+        // discarded, holding a deployment from an aborted, non-durable entry, and
+        // awaiting it would be an unbounded read of a possibly wedged actor.
+        // Swap the journal on the engine thread: the actor is alive, so this is
+        // a single bounded turn. The rebuilt engine replaces the fenced one; the
+        // journal's writer/exporter/seg wiring is preserved by the swap because
+        // only the `engine` field is replaced (see `Journal::replace_engine`).
+        // BOUNDED: a wedged actor must not hang the serial recovery pass.
+        let swapped = tokio::time::timeout(
+            ENGINE_HEALTH_PROBE_BOUND,
+            handle.try_with(move |journal| {
+                journal.replace_engine(rebuilt);
+                journal.set_num_partitions(num_partitions);
+                if !seed.is_empty() {
+                    journal.install_deployment_if_newer(&seed);
+                }
+            }),
+        )
+        .await;
+        match swapped {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the owned engine actor DIED with the durable-state swap \
+                     queued; leaving the partition down for the supervisor to retry rather \
+                     than panicking the recovery pass (#1473)"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    partition = p,
+                    "raft rebuild: the owned engine actor did not answer the durable-state swap \
+                     within {ENGINE_HEALTH_PROBE_BOUND:?}; leaving the partition down for the \
+                     supervisor to retry rather than hanging the recovery pass (#1473)"
+                );
+                return None;
+            }
+        }
+        Some(handle)
+    }
+
+    /// Rebuilds partition `p`'s [`nanobpmn_engine_core::Engine`] from its
+    /// durable journal on disk, or errors when this deployment has no durable
+    /// journal (an in-memory deployment cannot reconstruct — the caller refuses
+    /// the rebuild). Handles the three journal layouts the boot path opens:
+    /// segmented single-partition, segmented multi-partition (demux by write
+    /// tag), and the legacy single-file log (demux by key partition).
+    ///
+    /// Coordinated with the live journal's writers and checkpoints (#1473):
+    /// BOTH segmented layouts hold the shared journal's checkpoint permit
+    /// across the read, so a concurrent rotation/checkpoint cannot advance the
+    /// active segment, rewrite the snapshot, or have its live staging file
+    /// swept by recovery's tmp sweep mid-read. The permit acquisition is
+    /// BOUNDED: the checkpoint loop holds it while awaiting every owned actor,
+    /// so a wedged sibling must fail this rebuild (the supervisor retries)
+    /// rather than hang the serial recovery pass. Lock order: the caller holds
+    /// the engine lifecycle lock; the permit is taken inside it. The
+    /// multi-partition read recovers the COMPLETE locally owned set (not just
+    /// `p`) so a replay migration never rewrites the shared snapshot from a
+    /// subset and drops the siblings, and supplies the authoritative VarStore
+    /// so a lean snapshot's variables are restored before the tail replays.
+    ///
+    /// A LEGACY single-file journal shared by several partitions fails closed
+    /// with [`LegacyRecoveryAttributionError`]: its `RaftEntryApplied` records
+    /// carry no partition attribution, so `p`'s applied watermark cannot be
+    /// reconstructed and guessing would let a durable Raft-log replay execute
+    /// non-idempotent commands twice (#1066 fail-closed rule).
+    ///
+    /// Returns the rebuilt engine together with the canonical deployment seed
+    /// derived from the durably recovered deployment owner (the first locally
+    /// owned partition). The seed is empty where `p`'s own durable replay
+    /// already carries every deployment (single-partition layouts).
+    async fn durable_engine_for(
+        &self,
+        p: u64,
+    ) -> std::io::Result<(nanobpmn_engine_core::Engine, Vec<Event>)> {
+        let (journal_path, _) = resolve_data_paths();
+        let journal_path = journal_path.ok_or_else(|| {
+            std::io::Error::other(
+                "no durable journal configured (in-memory deployment); cannot reconstruct \
+                 the engine from durable state",
+            )
+        })?;
+        let dir = journal_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let num_partitions = self.engine.topology().num_partitions as usize;
+        if !seglog::segmented_enabled() {
+            check_legacy_recovery_attribution(p, num_partitions)?;
+            // Legacy single-partition: every record (deployments and
+            // `RaftEntryApplied` included) belongs to `p`.
+            let events = Journal::read_events(&journal_path)?;
+            return Ok((
+                nanobpmn_engine_core::Engine::replay_partition(p, events),
+                Vec::new(),
+            ));
+        }
+        // Segmented (either layout): read the recovery metadata from `p`'s
+        // actor (BOUNDED — it may be the dead or wedged one the health probe
+        // just rejected), then hold the checkpoint permit (BOUNDED) across the
+        // whole durable read.
+        let handle = self.engine.local_for_partition(p).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "partition {p} is not locally owned; cannot rebuild it from durable state"
+            ))
+        })?;
+        let (seg, varstore) = match tokio::time::timeout(
+            ENGINE_HEALTH_PROBE_BOUND,
+            handle.try_with(|journal| (journal.seg_shared(), journal.varstore())),
+        )
+        .await
+        {
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                return Err(std::io::Error::other(format!(
+                    "partition {p}'s engine actor DIED with the recovery metadata read queued"
+                )));
+            }
+            Err(_) => {
+                return Err(std::io::Error::other(format!(
+                    "partition {p}'s engine actor did not answer the recovery metadata read \
+                     within {ENGINE_HEALTH_PROBE_BOUND:?}"
+                )));
+            }
+        };
+        let _permit = match seg.as_ref() {
+            Some(seg) => Some(
+                tokio::time::timeout(ENGINE_HEALTH_PROBE_BOUND, seg.checkpoint_permit())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::other(format!(
+                            "the journal checkpoint permit was not free within \
+                             {ENGINE_HEALTH_PROBE_BOUND:?} (a checkpoint is in flight, possibly \
+                             waiting on a wedged actor); the supervisor retries (#1473)"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+        if num_partitions > 1 {
+            // Recover the COMPLETE locally owned set, then select `p`: a replay
+            // migration rewrites the shared combined snapshot and prunes the
+            // cold archive, so recovering only `[p]` would drop the sibling
+            // partitions' state and history (#1473).
+            let owned = self.engine.topology().local_partitions();
+            let recovery =
+                seglog::recover_multi(&dir, &owned, num_partitions, varstore.as_deref())?;
+            let mut engines = recovery.engines;
+            // Seed from the DURABLY recovered deployment owner (#1473).
+            let seed = owned
+                .first()
+                .and_then(|owner| engines.iter().find(|(pid, _)| pid == owner))
+                .map(|(_, e)| deployment_replication_events_from_state(e.state()))
+                .unwrap_or_default();
+            let engine = engines
+                .iter()
+                .position(|(pid, _)| *pid == p)
+                .map(|i| engines.swap_remove(i).1)
+                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+            return Ok((engine, seed));
+        }
+        // Single-partition segmented: `p`'s replay carries every deployment.
+        let (engine, _recovery) = seglog::recover(&dir)?;
+        Ok((engine, Vec::new()))
+    }
+
+    /// Reconstructs partition `p`'s engine for a RECEIVER rebuild whose
+    /// predecessor engine is dead or fenced (#1473), returning the fresh actor
+    /// to hand the successor core. Unlike a promotion, a receiver is reseeded
+    /// from the live leader, so a partition this node only replicates needs no
+    /// durable baseline of its own: the stale replica actor is dropped from the
+    /// registry and a fresh one built via [`Self::replica_engine_for`] (seeded
+    /// with the current deployments). An owned partition falls back to the
+    /// durable reconstruction (its journal is the authoritative baseline).
+    async fn rebuild_engine_for_receiver(&self, p: u64) -> Option<DeepthiHandle> {
+        if self.engine.local_for_partition(p).is_some() {
+            self.rebuild_owned_engine_from_durable(p).await
+        } else {
+            // Replica: drop the stale actor so `replica_engine_for` builds a
+            // fresh one (seeded with the current deployments); the leader
+            // backfills its state.
+            self.raft_replicas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&p);
+            self.replica_engine_for(p).await
+        }
+    }
+
     /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
     /// receive-only) of `leader_node`'s group, replacing any existing member. A
     /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
@@ -17772,11 +18255,20 @@ impl ServerImpl {
         #[cfg(test)]
         let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
         let me = self.engine.topology().node_id as u64;
-        let engine = match self.engine_handle_for(p) {
-            Some(h) => h,
-            None => self.replica_engine_for(p).await,
+        // Fully retire the predecessor (#1473) and take its engine only while it
+        // is alive and unfenced; a dead/fenced predecessor engine is
+        // reconstructed from durable state (never reused — a dead actor's
+        // mailbox is never drained, and a fenced journal refuses every apply).
+        let Some(engine) = self
+            .retire_and_resolve_engine(p, RebuildEngineMode::Receiver)
+            .await
+        else {
+            tracing::error!(
+                "node {me} cannot rebuild partition {p} as receiver: the predecessor did not \
+                 retire or no healthy engine could be resolved; the supervisor retries (#1473)"
+            );
+            return false;
         };
-        self.retire_predecessor_core(p).await;
         let transport = self.raft_transport();
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
@@ -17865,10 +18357,6 @@ impl ServerImpl {
             return false;
         }
 
-        let engine = match self.engine_handle_for(p) {
-            Some(h) => h,
-            None => self.replica_engine_for(p).await,
-        };
         let transport = self.raft_transport();
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
@@ -17918,8 +18406,25 @@ impl ServerImpl {
         }
         // Tear down the dead core first so its tasks fully stop before we
         // construct the replacement (and so a durable log store's file handles
-        // are released before the new store reopens the same dir).
-        self.retire_predecessor_core(p).await;
+        // are released before the new store reopens the same dir). This fully
+        // retires the predecessor (#1473): it fences + drains any detached
+        // snapshot build and reclaims a volatile staging dir, and yields the
+        // engine actor only while it is ALIVE and UNFENCED. A dead or fenced
+        // predecessor engine (#1405) is reconstructed from authoritative durable
+        // state — never reused (a dead actor's mailbox is never drained, so
+        // reusing it would hang the rebuild; a fenced journal refuses every
+        // apply even after the environmental fault heals).
+        let Some(engine) = self
+            .retire_and_resolve_engine(p, RebuildEngineMode::Receiver)
+            .await
+        else {
+            tracing::error!(
+                "raft: node {me} cannot auto-recover shutdown partition {p}: the predecessor \
+                 did not retire or no healthy engine could be resolved; the supervisor retries \
+                 (#1473)"
+            );
+            return false;
+        };
         // A rebuild with no durable log is an EMPTY receiver, so it goes through
         // the one canonical fail-closed constructor every receiver path uses
         // (#1454): it refuses to hand back a member carrying any log, vote,
@@ -17988,6 +18493,11 @@ impl ServerImpl {
         }
         for handle in self.engine.all().iter().skip(1) {
             let events = Arc::clone(events);
+            // Engine lifecycle lock SHARED (#1473): a concurrent rebuild's
+            // durable read → journal swap holds it exclusive, so this install
+            // lands before the read or in the swapped-in engine — never in
+            // between, where the swap would silently drop it.
+            let _lifecycle = handle.lifecycle_shared().await;
             handle
                 .with(move |journal| journal.install_deployment(&events))
                 .await;
@@ -17998,14 +18508,33 @@ impl ServerImpl {
     /// node, read from one of its owned engine actors. Used to seed a freshly
     /// built replica engine actor (a follower partition under RF>1) so it can
     /// apply `CreateInstance` for already-deployed processes.
-    async fn current_deployment_events(&self) -> Vec<Event> {
+    ///
+    /// BOUNDED (#1473): `None` when the owned actor is dead or does not answer
+    /// within [`ENGINE_HEALTH_PROBE_BOUND`] — a replica built without its seed
+    /// would fail every create, and an unbounded read of a wedged actor would
+    /// hang the serial recovery pass, so the caller fails retryably instead.
+    ///
+    /// FALLIBLE (`try_with`, #1473 review): the owner can die between the
+    /// `is_alive` check and the queued read running — its `AliveGuard` then
+    /// drops the read's reply sender, and an infallible `with` would PANIC
+    /// here (a `timeout` around it does not catch that panic), unwinding the
+    /// recovery supervisor and halting recovery for EVERY partition. `None`
+    /// is just a retryable seed-read failure for this pass.
+    async fn current_deployment_events(&self) -> Option<Vec<Event>> {
         let handles = self.engine.all();
-        if handles.is_empty() {
-            return Vec::new();
+        let Some(owner) = handles.first() else {
+            return Some(Vec::new());
+        };
+        if !owner.is_alive() {
+            return None;
         }
-        handles[0]
-            .with(|journal| deployment_replication_events(journal))
-            .await
+        tokio::time::timeout(
+            ENGINE_HEALTH_PROBE_BOUND,
+            owner.try_with(|journal| deployment_replication_events(journal)),
+        )
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Whether partition `p`'s activation lock is replicated through Raft. Static:
@@ -18029,15 +18558,27 @@ impl ServerImpl {
     /// / serving path. Seeded with the current deployments so it can apply creates
     /// of already-deployed processes; later deploys fan in via
     /// [`Self::install_into_raft_replicas`].
-    async fn replica_engine_for(&self, p: u64) -> DeepthiHandle {
+    ///
+    /// `None` (retryable, logged) when the deployment seed cannot be read
+    /// within its bound (#1473) — see [`Self::current_deployment_events`].
+    async fn replica_engine_for(&self, p: u64) -> Option<DeepthiHandle> {
         if let Some(h) = self
             .raft_replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&p)
         {
-            return h.clone();
+            return Some(h.clone());
         }
+        let Some(seed) = self.current_deployment_events().await else {
+            tracing::error!(
+                partition = p,
+                "raft: cannot build a replica engine for partition {p}: the deployment seed \
+                 could not be read from the owned engine within {ENGINE_HEALTH_PROBE_BOUND:?} \
+                 (dead or wedged actor); failing retryably (#1473)"
+            );
+            return None;
+        };
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
         if self.activation_policy.may_be_leader_local() {
@@ -18051,17 +18592,18 @@ impl ServerImpl {
         if let Some(config) = &self.spill_config {
             config.apply(&mut journal);
         }
-        let seed = self.current_deployment_events().await;
         if !seed.is_empty() {
             journal.install_deployment(&seed);
         }
         let handle = DeepthiHandle::spawn(journal, p, None);
-        self.raft_replicas
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(p)
-            .or_insert(handle)
-            .clone()
+        Some(
+            self.raft_replicas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(p)
+                .or_insert(handle)
+                .clone(),
+        )
     }
 
     /// The partitions this node currently LEADS: every partition for which it
@@ -18381,11 +18923,15 @@ impl ServerImpl {
             };
             let low_water = match tokio::time::timeout(
                 std::time::Duration::from_millis(200),
-                handle.with(|journal| journal.retirement_low_water()),
+                handle.try_with(|journal| journal.retirement_low_water()),
             )
             .await
             {
-                Ok(lw) => lw,
+                Ok(Some(lw)) => lw,
+                // The owned engine actor DIED with the watermark read queued:
+                // skip this partition this round (the supervisor rebuilds it)
+                // rather than panicking the whole broadcast loop (#1473 review).
+                Ok(None) => continue,
                 // The owned engine actor is saturated (heavy-payload create/complete
                 // backlog); skip this partition this round rather than stalling the
                 // whole broadcast behind it. The watermark is idempotent and re-sent
@@ -18485,6 +19031,11 @@ impl ServerImpl {
         };
         for handle in handles {
             let events = Arc::clone(events);
+            // Engine lifecycle lock SHARED (#1473): a concurrent rebuild's
+            // durable read → journal swap holds it exclusive, so this install
+            // lands before the read or in the swapped-in engine — never in
+            // between, where the swap would silently drop it.
+            let _lifecycle = handle.lifecycle_shared().await;
             handle
                 .with(move |journal| journal.install_deployment(&events))
                 .await;
@@ -29762,6 +30313,92 @@ mod clustered_startup_tests {
             .await
     }
 
+    /// #1473 (review): `install_replicated_deployment` holds the owner's
+    /// lifecycle lock SHARED across its durable commit, so a rebuild's
+    /// exclusive acquisition (retire → durable read → journal swap) cannot
+    /// interleave with it — a broadcast landing mid-rebuild can no longer slip
+    /// an acknowledged definition between the read and the swap, where the swap
+    /// would silently discard it.
+    ///
+    /// Deterministic: with the owner partition's lifecycle held EXCLUSIVE (the
+    /// rebuild's hold), the install's durable commit cannot acquire its shared
+    /// guard, so it does not complete; once the exclusive hold releases, the
+    /// install proceeds and the definition lands.
+    #[tokio::test]
+    async fn replicated_install_is_serialized_with_an_owned_partition_rebuild() {
+        let node1 = clustered_node(1);
+        let events = demo_deployment_events().await;
+        assert!(!events.is_empty());
+        // The first owned partition is the durable owner (handles[0]).
+        let owner = node1.engine.all()[0].clone();
+
+        // Hold the owner's lifecycle EXCLUSIVE — the rebuild's hold during its
+        // durable read → journal swap.
+        let exclusive = owner.lifecycle_exclusive().await;
+
+        // The install cannot complete its durable commit while the rebuild
+        // holds the lock: poll it in-line and assert it is still pending.
+        let mut install = Box::pin(node1.install_replicated_deployment(events));
+        use std::future::Future;
+        use std::task::Poll;
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(install.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending,
+            "the durable commit must wait for the rebuild's exclusive hold"
+        );
+
+        // Release the rebuild hold: the install proceeds and the definition
+        // lands on every owned partition.
+        drop(exclusive);
+        install.await;
+        for handle in node1.engine.all() {
+            let n = handle.with(|j| j.state().processes.len()).await;
+            assert!(
+                n >= 1,
+                "the broadcast definition landed on an owned partition"
+            );
+        }
+    }
+
+    /// #1473 (review): the rebuild supervisor's health probe must SURVIVE the
+    /// engine actor dying with the probe queued — the actor's death drains the
+    /// mailbox, so an infallible `with` would panic here and unwind the
+    /// supervisor, halting recovery for EVERY partition. The probe instead
+    /// resolves to `None` (unhealthy), so the rebuild falls back to the durable
+    /// reconstruction and the supervisor lives to retry.
+    #[tokio::test]
+    async fn rebuild_health_probe_survives_the_actors_death() {
+        let node1 = clustered_node(1);
+        let p = node1.engine.topology().local_partitions()[0];
+        let handle = node1.engine_handle_for(p).expect("owned partition");
+
+        // Park the actor inside a job that panics once released, so the probe
+        // below is queued behind it when the actor dies.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        handle.spawn_job(move |_journal| {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+            panic!("boom");
+        });
+
+        // Probe while the actor is parked inside the panicking job: the probe
+        // is queued behind it, the job panics, the queue drains — and the
+        // probe must return None rather than panic this task. Either ordering
+        // (probe queued before the death, or submitted after it) must resolve
+        // to None, so no synchronization with the enqueue is needed.
+        let probe = tokio::spawn({
+            let node = node1.clone();
+            async move { node.healthy_engine_for_rebuild(p).await }
+        });
+        // Release the parked job: it panics, unwinding the actor.
+        drop(tx);
+        let resolved = probe.await.expect("the supervisor task must not panic");
+        assert!(
+            resolved.is_none(),
+            "a dead actor resolves to None (rebuild from durable state)"
+        );
+    }
+
     #[tokio::test]
     async fn peer_cannot_create_until_deployment_is_installed() {
         // A peer owns no deployment partition, so it has no demo definition and a
@@ -37216,6 +37853,239 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1473 (review): legacy multi-partition durable recovery fails CLOSED with
+    /// a typed, operator-actionable error — its `RaftEntryApplied` records have
+    /// no partition attribution, so a partition is never guessed. A
+    /// single-partition legacy journal (every record is `p`'s) is allowed.
+    #[test]
+    fn legacy_multi_partition_recovery_fails_closed_with_a_typed_error() {
+        let err = check_legacy_recovery_attribution(1, 4).expect_err("multi-partition refused");
+        let typed = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<LegacyRecoveryAttributionError>())
+            .expect("the refusal is the typed attribution error");
+        assert_eq!((typed.partition, typed.num_partitions), (1, 4));
+        assert!(err.to_string().contains("Operator action"));
+        check_legacy_recovery_attribution(0, 1).expect("single-partition legacy is attributable");
+    }
+
+    /// #1473 (defect 4): a rebuild must never reuse the predecessor's FENCED
+    /// journal. When a replica fails closed on a committed Raft entry
+    /// (`abort_raft_entry` sets the journal's fence, #1405), its engine may hold
+    /// the entry's partial, non-durable effects and every later apply is
+    /// refused. Rebuilding the core over that same fenced journal would strand
+    /// the partition even after the environmental fault heals. The rebuild must
+    /// instead reconstruct the engine from authoritative durable state — here,
+    /// a fresh replica the leader backfills — so the recovered partition applies
+    /// new entries again, all without a process restart.
+    #[tokio::test]
+    async fn a_fenced_predecessor_journal_is_rebuilt_not_reused() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit one entry so the group has real state.
+        let proc = ProcessBuilder::new("pre-fence")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("propose deploy via the leader");
+
+        // Fence the FOLLOWER's replica journal (the #1405 abort path), then
+        // drive its core to Shutdown — the state the #53 supervisor recovers.
+        // The fixture boots the member with an ad-hoc engine, so register it as
+        // the partition's replica engine first — that is the handle the rebuild
+        // path inspects and (because it is fenced) replaces.
+        let replica = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        node1
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, replica);
+        let replica = node1.engine_handle_for(0).expect("node 1 has a p0 engine");
+        replica.with(|j| j.abort_raft_entry()).await;
+        let fenced = replica.with(|j| j.is_fenced()).await;
+        assert!(fenced, "the replica journal is fenced after the abort");
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive the fenced follower to shutdown");
+
+        // Recover. The predecessor's journal is fenced, so the rebuild must NOT
+        // reuse it — it reconstructs the engine (a fresh replica the leader
+        // backfills) instead.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            recovered.contains(&0),
+            "the fenced shutdown partition must be recovered, got {recovered:?}"
+        );
+
+        // The recovered partition's engine is UNFENCED (reconstructed, not the
+        // reused fenced one) — it can apply again.
+        let engine = node1.engine_handle_for(0).expect("node 1 has a p0 engine");
+        let still_fenced = engine.with(|j| j.is_fenced()).await;
+        assert!(
+            !still_fenced,
+            "the recovered partition's engine must be reconstructed unfenced, not the reused fenced journal"
+        );
+
+        // Proof of recovery: the leader commits a NEW entry after the rebuild and
+        // the recovered follower applies it — impossible had the fenced journal
+        // been reused (every apply would be refused).
+        let proc2 = ProcessBuilder::new("post-heal")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc2), 2_000)
+            .await
+            .expect("propose a post-recovery deploy via the leader");
+        let target = part0
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        let mut caught_up = false;
+        for _ in 0..500 {
+            let idx = node1
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "the recovered (previously fenced) follower must apply new entries, target {target}"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
+    /// #1473 (defect 1): a rebuild must never reuse a DEAD engine actor's handle.
+    /// `DeepthiHandle::with` still queues work onto a dead actor's mailbox, but no
+    /// consumer drains it, so a successor that restores a snapshot or replays
+    /// commands through the handle would wait forever for a reply — hanging the
+    /// serial recovery pass for every other partition. The rebuild must detect
+    /// the dead actor and reconstruct the engine (a fresh replica the leader
+    /// backfills) instead of reusing the corpse.
+    #[tokio::test]
+    async fn a_dead_predecessor_engine_actor_is_rebuilt_not_reused() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit one entry so the group has real state the follower re-attains.
+        let proc = ProcessBuilder::new("survives-dead-actor")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("propose deploy via the leader");
+
+        // Register a replica engine for p0 on node 1, then KILL its actor thread
+        // (a panicking command unwinds the single writer; its `AliveGuard` clears
+        // `alive`). The handle still enqueues — the defect — but nothing drains.
+        let replica = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        node1
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, replica.clone());
+        replica.spawn_job(|_journal| panic!("kill the engine actor"));
+        // Wait (bounded) for the actor to report dead.
+        let mut dead = false;
+        for _ in 0..300 {
+            if !replica.is_alive() {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dead, "the engine actor thread died");
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive the follower core to shutdown");
+
+        // Recover. The predecessor's engine actor is dead, so the rebuild must
+        // NOT reuse its handle (that would hang); it reconstructs a fresh engine.
+        // Crucially this RETURNS (bounded) rather than hanging the recovery pass.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            recovered.contains(&0),
+            "the shutdown partition with a dead engine actor must be recovered, got {recovered:?}"
+        );
+
+        // The recovered partition's engine is a LIVE actor (a fresh one), able to
+        // answer commands.
+        let engine = node1.engine_handle_for(0).expect("node 1 has a p0 engine");
+        assert!(
+            engine.is_alive(),
+            "the recovered partition's engine must be a live actor, not the reused corpse"
+        );
+
+        // Proof of recovery: a new entry proposed via the leader is applied by
+        // the recovered follower.
+        let proc2 = ProcessBuilder::new("post-dead-actor")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc2), 2_000)
+            .await
+            .expect("propose a post-recovery deploy via the leader");
+        let target = part0
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        let mut caught_up = false;
+        for _ in 0..500 {
+            let idx = node1
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "the recovered follower (dead actor replaced) must apply new entries, target {target}"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
     /// Defect-class guard (issue #53 follow-through): rebuilding a follower as a
     /// fresh receiver reverts its local log, and the leader's replication
     /// progress must NOT panic on that reversion (openraft's
@@ -42509,7 +43379,7 @@ mod clustered_startup_tests {
         // Host a Raft member for partition 1 (node 0 is a mere replica/learner of
         // it) but NEVER form the group — its owner (node 1) is absent, exactly as
         // in a staggered cold start. Its `current_leader` therefore stays `None`.
-        let engine = node0.replica_engine_for(1).await;
+        let engine = node0.replica_engine_for(1).await.expect("replica engine");
         let part =
             RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None, false)
                 .await
@@ -42578,7 +43448,7 @@ mod clustered_startup_tests {
         // Without a configured spill tier, a replica engine has no cold store —
         // exactly the pre-fix behaviour that stranded the follower working set
         // in hot RAM.
-        let bare = node0.replica_engine_for(1).await;
+        let bare = node0.replica_engine_for(1).await.expect("replica engine");
         assert!(
             !bare.with(|j| j.cold_spill_configured()).await,
             "no spill configured => replica has no cold store"
@@ -42593,7 +43463,7 @@ mod clustered_startup_tests {
             var: None,
             cold: Some((64 * 1024 * 1024, 32 * 1024 * 1024)),
         });
-        let replica = node0.replica_engine_for(2).await;
+        let replica = node0.replica_engine_for(2).await.expect("replica engine");
         assert!(
             replica.with(|j| j.cold_spill_configured()).await,
             "configured spill => replica engine inherits the cold store"

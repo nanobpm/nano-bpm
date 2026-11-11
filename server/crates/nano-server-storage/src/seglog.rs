@@ -857,8 +857,20 @@ impl ActiveSegment {
 
     /// Seals the active segment if it has grown past the size threshold,
     /// returning the boundary when a seal happened.
+    ///
+    /// Coordinated with the checkpoint gate (#1473): a size-based seal is
+    /// DEFERRED (to the next write) while any checkpoint permit holder — a
+    /// checkpoint cycle or an online durable recovery read — holds the gate, so
+    /// a writer can never rename the active segment between a reader's
+    /// sealed-file listing and its active-file read. `try_lock` keeps the
+    /// writer thread non-blocking; the segment merely overshoots its threshold
+    /// for the duration of the permit.
     pub fn maybe_seal(&mut self) -> io::Result<Option<SealInfo>> {
         if self.bytes >= self.shared.segment_bytes && self.bytes > 0 {
+            let gate = Arc::clone(&self.shared.checkpoint_gate);
+            let Ok(_gate) = gate.try_lock() else {
+                return Ok(None);
+            };
             Ok(Some(self.seal()?))
         } else {
             Ok(None)
@@ -7799,5 +7811,41 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.parent(), p.parent());
         assert!(a.to_string_lossy().contains(UNIQUE_TMP_INFIX));
+    }
+
+    /// #1473: a size-based seal must never race an online recovery read. While
+    /// any checkpoint permit holder holds the gate, `maybe_seal` DEFERS (the
+    /// active segment is not renamed under a reader); once the permit drops, the
+    /// overdue seal happens on the next call.
+    #[tokio::test]
+    async fn size_based_seal_defers_while_the_checkpoint_gate_is_held() {
+        let dir = temp_dir("seal-gate");
+        fs::create_dir_all(&dir).unwrap();
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: dir.join(ACTIVE_NAME),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: 1,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: false,
+            checkpoint_gate: Arc::default(),
+        });
+        let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+        seg.write_all(b"{}\n", 1).unwrap();
+
+        let permit = shared.checkpoint_permit().await;
+        assert!(
+            seg.maybe_seal().unwrap().is_none(),
+            "a seal must defer while a permit holder may be reading the segment set"
+        );
+        drop(permit);
+        assert!(
+            seg.maybe_seal().unwrap().is_some(),
+            "the overdue seal happens once the permit is released"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
