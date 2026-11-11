@@ -2466,7 +2466,7 @@ impl Engine {
                         // scope that defines it, defaulting to root. For a root-only
                         // instance this collapses to the flat `VariablesUpdated`,
                         // byte-identical to the pre-scoping engine.
-                        let flow_scope = self.scope_of(instance_key, element_instance_key);
+                        let flow_scope = self.completion_scope(instance_key, element_instance_key);
                         for event in
                             self.propagated_updates(instance_key, flow_scope, variables, false)
                         {
@@ -2809,7 +2809,7 @@ impl Engine {
                         // User-task completion variables propagate from the task's
                         // enclosing (flow) scope upward, defaulting to root (flat
                         // `VariablesUpdated` for a root-only instance).
-                        let flow_scope = self.scope_of(instance_key, element_instance_key);
+                        let flow_scope = self.completion_scope(instance_key, element_instance_key);
                         for event in
                             self.propagated_updates(instance_key, flow_scope, variables, false)
                         {

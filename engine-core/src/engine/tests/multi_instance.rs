@@ -1618,3 +1618,84 @@ fn collect_output_element(output_element: &str) -> Vec<Value> {
         other => panic!("results not collected: {other:?}"),
     }
 }
+
+/// #1518 — the output element is child-local for a multi-instance applied
+/// DIRECTLY to a service task too: the completion variables must
+/// start propagating at the MI child's own scope (where `result` is seeded),
+/// not at the enclosing body, or every child collects null and `result` leaks
+/// to the parent.
+#[test]
+fn direct_mi_service_task_collects_each_job_result_without_leaking() {
+    let (mut engine, key, _) = direct_mi_task(
+        r#"<bpmn:serviceTask id="Each">
+            <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+            MI
+          </bpmn:serviceTask>"#,
+    );
+    for job in engine.activate_jobs("work", "w", 10, 60_000, 0) {
+        let item = job.variables.get("item").cloned().unwrap();
+        engine
+            .apply_command(Command::complete_job_with(
+                job.key,
+                vars(&[("result", item)]),
+            ))
+            .unwrap();
+    }
+    assert_direct_mi_collected(&engine, key);
+}
+
+fn direct_mi_task(task: &str) -> (Engine, Key, Vec<Event>) {
+    let mi = r#"<bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item"
+                  outputCollection="results" outputElement="=result" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>"#;
+    let xml = format!(
+        r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          {}
+          <bpmn:serviceTask id="sink">
+            <bpmn:extensionElements><zeebe:taskDefinition type="sink" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Each" targetRef="sink" />
+        </bpmn:process>
+      </bpmn:definitions>"#,
+        task.replace("MI", mi)
+    );
+    let def = crate::bpmn::parse_bpmn(&xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            )]),
+        ))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    (engine, key, events)
+}
+
+fn assert_direct_mi_collected(engine: &Engine, key: Key) {
+    let vars = &engine.instance(key).unwrap().variables;
+    assert_eq!(
+        vars.get("results"),
+        Some(&Value::List(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into())
+        ])),
+        "each direct MI child collects its OWN completion result"
+    );
+    assert_eq!(
+        vars.get("result"),
+        None,
+        "the output element variable must not leak to the parent"
+    );
+}
