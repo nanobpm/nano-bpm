@@ -983,6 +983,9 @@ impl<'a> Parser<'a> {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            // processos' IR does not model zeebe:properties (out of the IR's
+            // scope, #1499); parsed elements carry no extension properties.
+            properties: std::collections::BTreeMap::new(),
         };
         if let Some((leftover, _)) = attrs.scalars.iter().next() {
             return Err(format!(
