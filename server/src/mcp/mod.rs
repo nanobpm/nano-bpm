@@ -230,10 +230,46 @@ async fn handle_http(
                 .into_response();
         }
     };
-    match handle_frame(server, srv, frame).await {
+    match handle_message(server, srv, frame).await {
         Some(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+/// Upper bound on entries in one JSON-RPC batch, so a single POST cannot fan
+/// out unbounded tool calls.
+const MAX_BATCH: usize = 100;
+
+/// Dispatch one HTTP message: a single frame, or (MCP 2025-03-26 requires
+/// receiving them) a JSON-RPC batch. A batch's entries run in order; their
+/// responses are aggregated into an array, and a batch of only notifications
+/// yields `None` (HTTP 202). An empty or oversized batch is a single
+/// `-32600`.
+async fn handle_message(server: &ServerImpl, srv: &ToolServer, frame: Value) -> Option<Value> {
+    let Value::Array(entries) = frame else {
+        return handle_frame(server, srv, frame).await;
+    };
+    if entries.is_empty() {
+        return Some(rpc_error(
+            Value::Null,
+            -32600,
+            "Invalid Request: empty batch",
+        ));
+    }
+    if entries.len() > MAX_BATCH {
+        return Some(rpc_error(
+            Value::Null,
+            -32600,
+            &format!("Invalid Request: batch exceeds {MAX_BATCH} entries"),
+        ));
+    }
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(resp) = handle_frame(server, srv, entry).await {
+            out.push(resp);
+        }
+    }
+    (!out.is_empty()).then_some(Value::Array(out))
 }
 
 /// A validated JSON-RPC 2.0 envelope. `id` is `None` for a notification.
@@ -766,6 +802,124 @@ mod tests {
         out["result"].clone()
     }
 
+    /// Nano keys are `u64`: partition >= 4096 keys exceed `i64::MAX` and must
+    /// parse in both numeric and string form; negatives/garbage are rejected.
+    #[test]
+    fn arg_key_accepts_full_u64_key_range() {
+        let big = 9_223_372_036_854_775_809_u64;
+        for args in [json!({ "k": big }), json!({ "k": big.to_string() })] {
+            assert_eq!(
+                cluster_tools::arg_key(&args, "k").ok(),
+                Some(big.to_string()),
+                "{args}"
+            );
+        }
+        for args in [json!({ "k": -1 }), json!({ "k": "x" }), json!({})] {
+            assert!(cluster_tools::arg_key(&args, "k").is_err(), "{args}");
+        }
+    }
+
+    /// Generated model validation runs on MCP bodies (it is skipped when the
+    /// generated REST router is bypassed): more than 10 tags (`maxItems`)
+    /// creates nothing.
+    /// Non-object tool arguments (serde would read an array positionally) and
+    /// a non-boolean `truncateValues` are rejected before dispatch too.
+    #[tokio::test]
+    async fn invalid_arguments_rejected_before_dispatch() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("v")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        deploy_and_project(&server, proc).await;
+        let tags: Vec<String> = (0..11).map(|i| format!("t{i}")).collect();
+        let r = call(
+            &server,
+            "createProcessInstance",
+            json!({ "processDefinitionId": "v", "tags": tags }),
+        )
+        .await;
+        assert_eq!(r["isError"].as_bool(), Some(true), "{r}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            server.store.process_instances().is_empty(),
+            "no instance created"
+        );
+        for (tool, args) in [
+            ("createProcessInstance", json!(["v"])),
+            ("searchProcessInstances", json!([{}])),
+            ("searchVariables", json!({ "truncateValues": "false" })),
+            ("searchVariables", json!({ "truncateValues": 0 })),
+        ] {
+            let r = call(&server, tool, args.clone()).await;
+            assert_eq!(r["isError"].as_bool(), Some(true), "{tool} {args}: {r}");
+        }
+        let r = call(
+            &server,
+            "searchVariables",
+            json!({ "truncateValues": false }),
+        )
+        .await;
+        assert_eq!(r["isError"].as_bool(), Some(false), "{r}");
+    }
+
+    /// Non-object `completionOptions` (serde reads `[]` as an empty struct)
+    /// is rejected and leaves the task open.
+    #[tokio::test]
+    async fn complete_rejects_non_object_completion_options() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("ct")
+            .start_event("s")
+            .user_task("t")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
+        let def_key = deploy_and_project(&server, proc).await;
+        let created = call(
+            &server,
+            "createProcessInstance",
+            json!({ "processDefinitionKey": def_key.to_string() }),
+        )
+        .await;
+        assert_eq!(created["isError"].as_bool(), Some(false), "{created}");
+        let mut task_key = None;
+        for _ in 0..300 {
+            if let Some(t) = server.store.user_tasks().first() {
+                task_key = Some(t.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_key = task_key.expect("user task projected");
+        for opts in [json!([]), json!("x"), json!(3)] {
+            let r = call(
+                &server,
+                "completeUserTask",
+                json!({ "userTaskKey": task_key, "completionOptions": opts }),
+            )
+            .await;
+            assert_eq!(r["isError"].as_bool(), Some(true), "{opts}: {r}");
+            let text = r["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("completionOptions"), "{text}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let task = server
+            .store
+            .user_tasks()
+            .into_iter()
+            .find(|t| t.key == task_key)
+            .expect("task row");
+        assert_eq!(
+            task.state,
+            nanobpmn_engine_core::UserTaskState::Created,
+            "task left open"
+        );
+    }
+
     /// Advertised-but-unsupported creation options are rejected, not dropped.
     #[tokio::test]
     async fn create_rejects_unsupported_options_instead_of_dropping() {
@@ -937,6 +1091,7 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 1.5, "method": "tools/list" }),
             json!({ "jsonrpc": "2.0", "id": 1, "method": 7 }),
             json!({ "jsonrpc": "2.0", "id": 1 }),
+            // A nested batch is not a valid entry inside a batch frame.
             json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }]),
             json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/call",
                     "params": { "name": "getTopology", "arguments": {} } }),
@@ -1012,6 +1167,49 @@ mod tests {
         .await;
         assert_eq!(st, axum::http::StatusCode::ACCEPTED);
         assert!(body.is_empty(), "no body for a notification");
+    }
+
+    /// HTTP-level JSON-RPC batches (MCP 2025-03-26): responses aggregate in
+    /// order, notification-only batches get 202, empty/oversized are -32600.
+    #[tokio::test]
+    async fn http_batches() {
+        let ct = [("content-type", "application/json")];
+        let (st, body) = post(
+            &ct,
+            json!([
+                { "jsonrpc": "2.0", "id": 1, "method": "ping" },
+                { "jsonrpc": "2.0", "method": "notifications/initialized" },
+                { "jsonrpc": "2.0", "id": 2, "method": "tools/list" },
+                { "jsonrpc": "1.0", "id": 3, "method": "ping" },
+            ]),
+        )
+        .await;
+        assert_eq!(st, axum::http::StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().expect("batch response is an array");
+        assert_eq!(arr.len(), 3, "{v}");
+        assert_eq!(arr[0]["id"], json!(1));
+        assert_eq!(arr[1]["id"], json!(2));
+        assert!(arr[1]["result"]["tools"].is_array());
+        assert_eq!(arr[2]["error"]["code"].as_i64(), Some(-32600));
+
+        let (st, body) = post(
+            &ct,
+            json!([{ "jsonrpc": "2.0", "method": "notifications/initialized" }]),
+        )
+        .await;
+        assert_eq!(st, axum::http::StatusCode::ACCEPTED);
+        assert!(body.is_empty());
+
+        let too_many: Vec<Value> = (0..=MAX_BATCH)
+            .map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "ping" }))
+            .collect();
+        for batch in [json!([]), Value::Array(too_many)] {
+            let (st, body) = post(&ct, batch).await;
+            assert_eq!(st, axum::http::StatusCode::OK);
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"]["code"].as_i64(), Some(-32600), "{v}");
+        }
     }
 
     /// HTTP-level: non-JSON content types and foreign Origins are rejected

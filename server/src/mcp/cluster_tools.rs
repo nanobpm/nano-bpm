@@ -79,12 +79,13 @@ fn not_implemented(tool: &str) -> Value {
     )
 }
 
-/// Pull a required integer key out of the flat MCP argument object.
-fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
+/// Pull a required key out of the flat MCP argument object. Nano keys are
+/// `u64` (partitions >= 4096 mint keys above `i64::MAX`), so parse unsigned.
+pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
     args.get(camel)
         .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
         })
         .map(|k| k.to_string())
         .ok_or_else(|| {
@@ -98,9 +99,28 @@ fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
 /// Deserialize the MCP arguments into a spec request-body model. The body
 /// models use `#[serde(rename = "camelCase")]`, so the flat MCP argument object
 /// deserializes directly.
-fn arg_body<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Value> {
-    serde_json::from_value(args)
-        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))
+fn arg_body<T: serde::de::DeserializeOwned + validator::Validate>(args: Value) -> Result<T, Value> {
+    // Serde accepts a JSON array for a derived struct (positional fields), so
+    // a non-object would bypass the advertised object schema: reject it.
+    if !args.is_object() {
+        return Err(tool_error_result(
+            "Tool arguments must be a JSON object.",
+            400,
+        ));
+    }
+    let body: T = serde_json::from_value(args)
+        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))?;
+    validated(body)
+}
+
+/// Run the generated model's validation rules (incl. nested models). Calling
+/// a shared `*_impl` directly skips the generated REST router, which is the
+/// only other place these rules run — so every body adapter must go through
+/// here before dispatch.
+fn validated<T: validator::Validate>(body: T) -> Result<T, Value> {
+    body.validate()
+        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))?;
+    Ok(body)
 }
 
 // --- cluster ---------------------------------------------------------------
@@ -365,7 +385,11 @@ async fn search_variables(server: &ServerImpl, args: Value) -> Value {
     if let Err(e) = reject_unsupported_filter(&args, &["protectionMode"]) {
         return e;
     }
-    let truncate = args.get("truncateValues").and_then(Value::as_bool);
+    let truncate = match args.get("truncateValues") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return tool_error_result("`truncateValues` must be a boolean", 400),
+    };
     let query = models::SearchVariablesQueryParams {
         truncate_values: truncate,
     };
@@ -383,7 +407,7 @@ async fn search_variables(server: &ServerImpl, args: Value) -> Value {
 
 /// Deserialize an optional search body: an empty argument object maps to
 /// `None` (no filters), a non-empty one to `Some(body)`.
-pub(super) fn optional_body<T: serde::de::DeserializeOwned>(
+pub(super) fn optional_body<T: serde::de::DeserializeOwned + validator::Validate>(
     mut args: Value,
 ) -> Result<Option<T>, Value> {
     if let Some(filter) = args.get_mut("filter") {
@@ -393,9 +417,7 @@ pub(super) fn optional_body<T: serde::de::DeserializeOwned>(
     if is_empty || args.is_null() {
         return Ok(None);
     }
-    serde_json::from_value(args)
-        .map(Some)
-        .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))
+    arg_body(args).map(Some)
 }
 
 /// Camunda's MCP tools advertise date-range filters as `{from, to}` (inclusive
@@ -455,7 +477,16 @@ fn completion_body(args: &Value) -> Result<Option<models::UserTaskCompletionRequ
     if opts.is_null() {
         return Ok(None);
     }
+    // Serde accepts a sequence for a derived struct, so `[]` would deserialize
+    // as an empty completion and complete the task: require an object.
+    if !opts.is_object() {
+        return Err(tool_error_result(
+            "`completionOptions` must be an object",
+            400,
+        ));
+    }
     serde_json::from_value(opts.clone())
-        .map(Some)
         .map_err(|e| tool_error_result(&format!("Invalid `completionOptions`: {e}."), 400))
+        .and_then(validated)
+        .map(Some)
 }
