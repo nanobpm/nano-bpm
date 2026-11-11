@@ -218,6 +218,16 @@ confined to identifiable records.
 3. Run the nano runner. If nano diverges, fix nano (red/green), or file an
    issue and add an allow-list entry for it.
 
+**One job per step.** `completeJob` activates and completes a *single* job of
+its `jobType` (both runners pick one job by type). To drive several jobs of one
+logical task — e.g. the parallel inner instances of a multi-instance body —
+give each a distinct type with a FEEL expression
+(`type="= \"first-\" + item"`), so the script addresses them one step at a time
+(`first-a`, `first-b`, …). `mi-parallel-output-element-scope` uses this to
+interleave a parallel MI's two-step bodies: both `first-*` jobs write the
+`outputElement` variable before either `second-*` job completes its child —
+the variable-scoping defect class of #1518.
+
 ## Generative differential testing (#1521)
 
 The hand-written and harvested scenarios only cover shapes someone thought of.
