@@ -123,6 +123,25 @@ crate that is failing it — these are the traps the fleet hit:
   DUCKDB_DOWNLOAD_LIB=1 cargo nextest run --no-default-features
   ```
 
+## Long builds and test runs (agent sessions)
+
+Agent harnesses kill a single tool command after a fixed timeout (nano-coder:
+600 s), and a killed or idle-killed run loses everything not yet pushed (#1514).
+A cold `server` build, a full `cargo nextest run`, or a bundled-DuckDB
+`processos` build can each exceed that. Therefore:
+
+- **Scope first, widen last.** Run the crate/test you touched
+  (`cargo nextest run -p <crate> <filter>`, `cargo check -p <crate>`) while
+  iterating; run the full suite once, at the end.
+- **processos:** always build/run with `DUCKDB_DOWNLOAD_LIB=1 …
+  --no-default-features` (above) — never the default bundled feature, which
+  compiles DuckDB's C++ from source and alone outlasts the tool timeout.
+- **Keep the full log.** Write long output to a file and read the end
+  (`cargo nextest run > /tmp/test.log 2>&1; echo "exit $?"; tail -40 /tmp/test.log`)
+  rather than `| tail`, so a failure can be inspected without re-running.
+- **Commit and push early** on your task branch once a coherent step compiles, so
+  a killed run resumes from your work instead of starting over.
+
 ## BPMN Models need DI
 
 All BPMN Models need DI for rendering for humans.
@@ -175,8 +194,14 @@ one parity test):**
   (exhaustive — will not compile until handled).
 - `processos/src/bpmn_model.rs`: `kind_label`, `is_gateway`/`is_task` helpers,
   the XML emitter match, and `node_dims` (diagram footprint).
-- Regenerate the grammar artifact: `cd processos && cargo run -- emit-gbnf --out
-  assets/ir.gbnf` (commit the result — it is a checked-in derived artifact).
+- Regenerate the grammar artifact (commit the result — it is a checked-in
+  derived artifact). Use the CI flags so DuckDB is linked prebuilt, not
+  compiled from C++ source (~20 min cold — see the processos note above):
+
+  ```bash
+  cd processos
+  DUCKDB_DOWNLOAD_LIB=1 cargo run --no-default-features -- emit-gbnf --out assets/ir.gbnf
+  ```
 
 **3. `engine-wasm` — thin pass-through (silent):**
 
