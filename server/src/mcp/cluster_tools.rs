@@ -186,9 +186,31 @@ async fn search_process_definitions(server: &ServerImpl, args: Value) -> Value {
     }
 }
 
+/// `createProcessInstance` options Camunda's tool advertises but the shared
+/// REST creation model does not carry. Silently dropping them would start the
+/// wrong version / leave variables unprotected, so they are rejected instead.
+const CREATE_UNSUPPORTED_OPTIONS: &[&str] = &["processDefinitionVersionTag", "variablesMetadata"];
+
+/// Fail closed on any advertised-but-unsupported argument that is present and
+/// non-null: an explicit 400 `isError` instead of a silent drop.
+fn reject_unsupported(args: &Value, keys: &[&str]) -> Result<(), Value> {
+    for key in keys {
+        if args.get(*key).is_some_and(|v| !v.is_null()) {
+            return Err(tool_error_result(
+                &format!("The `{key}` option is not supported by this Nano gateway yet."),
+                400,
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- process instances ---------------------------------------------------------
 
 async fn create_process_instance(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported(&args, CREATE_UNSUPPORTED_OPTIONS) {
+        return e;
+    }
     let body: models::ProcessInstanceCreationInstruction = match arg_body(args) {
         Ok(b) => b,
         Err(e) => return e,
@@ -230,6 +252,17 @@ async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
         Ok(k) => models::AssignUserTaskPathParams { user_task_key: k },
         Err(e) => return e,
     };
+    // An omitted/null `assignee` means "unassign" in Camunda's tool contract:
+    // route it through the shared unassign handler, never store `""`.
+    if args.get("assignee").is_none_or(Value::is_null) {
+        let path = models::UnassignUserTaskPathParams {
+            user_task_key: path.user_task_key,
+        };
+        return match server.unassign_user_task_impl(&path).await {
+            Ok(resp) => map_rest_response(&resp),
+            Err(()) => tool_error_result("unassign user task failed", 500),
+        };
+    }
     // Camunda's MCP tool nests `action`/`allowOverride` under
     // `assignmentOptions`; the REST `UserTaskAssignmentRequest` expects them
     // flat alongside `assignee`. Flatten them (thin adapter, no logic).
@@ -327,7 +360,12 @@ async fn search_variables(server: &ServerImpl, args: Value) -> Value {
 
 /// Deserialize an optional search body: an empty argument object maps to
 /// `None` (no filters), a non-empty one to `Some(body)`.
-fn optional_body<T: serde::de::DeserializeOwned>(args: Value) -> Result<Option<T>, Value> {
+pub(super) fn optional_body<T: serde::de::DeserializeOwned>(
+    mut args: Value,
+) -> Result<Option<T>, Value> {
+    if let Some(filter) = args.get_mut("filter") {
+        translate_date_ranges(filter)?;
+    }
     let is_empty = args.as_object().map(|o| o.is_empty()).unwrap_or(false);
     if is_empty || args.is_null() {
         return Ok(None);
@@ -335,6 +373,53 @@ fn optional_body<T: serde::de::DeserializeOwned>(args: Value) -> Result<Option<T
     serde_json::from_value(args)
         .map(Some)
         .map_err(|e| tool_error_result(&format!("Invalid arguments: {e}."), 400))
+}
+
+/// Camunda's MCP tools advertise date-range filters as `{from, to}` (inclusive
+/// `from`, exclusive `to`), but the REST `AdvancedDateTimeFilter` uses
+/// `$gte`/`$lt` operators — deserializing `{from, to}` directly would silently
+/// drop both bounds. Rewrite every top-level filter field whose value is an
+/// object with only `from`/`to` keys into the REST operator form. A `from`/`to`
+/// object carrying any other key, or a non-string bound, is rejected (fail
+/// closed) rather than partially honoured.
+pub(super) fn translate_date_ranges(filter: &mut Value) -> Result<(), Value> {
+    let Some(fields) = filter.as_object_mut() else {
+        return Ok(());
+    };
+    for (field, value) in fields.iter_mut() {
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let has_range = obj.contains_key("from") || obj.contains_key("to");
+        if !has_range {
+            continue;
+        }
+        let mut out = serde_json::Map::new();
+        for (k, v) in obj {
+            let op = match k.as_str() {
+                "from" => "$gte",
+                "to" => "$lt",
+                _ => {
+                    return Err(tool_error_result(
+                        &format!("Invalid date range `{field}`: unexpected key `{k}`."),
+                        400,
+                    ));
+                }
+            };
+            if v.is_null() {
+                continue;
+            }
+            if !v.is_string() {
+                return Err(tool_error_result(
+                    &format!("Invalid date range `{field}.{k}`: expected an RFC 3339 string."),
+                    400,
+                ));
+            }
+            out.insert(op.to_string(), v.clone());
+        }
+        *value = Value::Object(out);
+    }
+    Ok(())
 }
 
 /// Build the user-task completion body from the flat MCP arguments. Camunda's

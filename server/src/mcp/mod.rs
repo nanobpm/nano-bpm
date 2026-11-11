@@ -132,53 +132,164 @@ pub(crate) fn mcp_router(server: ServerImpl) -> axum::Router {
         let server = server.clone();
         app = app.route(
             srv.path,
-            axum::routing::post(move |body: axum::body::Bytes| {
-                let server = server.clone();
-                let srv = srv.clone();
-                async move { handle_http(&server, &srv, &body).await }
-            }),
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let server = server.clone();
+                    let srv = srv.clone();
+                    async move { handle_http(&server, &srv, &headers, &body).await }
+                },
+            ),
         );
     }
     app
 }
 
-/// The HTTP entry point: parse the JSON-RPC frame, dispatch, serialize the
-/// response. A stateless POST → single JSON-RPC response (no SSE stream).
+/// Reject a request whose transport metadata is unsafe before any parsing or
+/// dispatch happens. Two checks, both fail-closed:
+///
+/// - **Content-Type must be `application/json`.** A hostile page can send a
+///   CORS-"simple" `text/plain` POST without a preflight; requiring JSON forces
+///   a preflight, which the gateway's CORS policy then governs.
+/// - **Origin, when present, must be same-origin or loopback.** Browsers always
+///   attach `Origin` to cross-origin POSTs, so this blocks DNS-rebinding /
+///   drive-by pages from reaching an unauthenticated local gateway. Non-browser
+///   MCP clients send no `Origin` and are unaffected.
+fn check_transport(
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (axum::http::StatusCode, &'static str)> {
+    use axum::http::{StatusCode, header};
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    if !mime.eq_ignore_ascii_case("application/json") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+        ));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        if !origin_allowed(origin.to_str().unwrap_or(""), host) {
+            return Err((StatusCode::FORBIDDEN, "Origin not allowed"));
+        }
+    }
+    Ok(())
+}
+
+/// An `Origin` is allowed iff its authority is a loopback host or exactly the
+/// request's own `Host` (same-origin). Anything unparseable (incl. `null`) is
+/// rejected.
+fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains('/') {
+        return false;
+    }
+    if host.is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
+        return true;
+    }
+    let hostname = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(
+        hostname.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+/// The HTTP entry point: check transport metadata, parse the JSON-RPC frame,
+/// dispatch, serialize the response. A stateless POST → single JSON-RPC
+/// response (no SSE stream); a notification → HTTP 202 with no body.
 async fn handle_http(
     server: &ServerImpl,
     srv: &ToolServer,
+    headers: &axum::http::HeaderMap,
     body: &[u8],
 ) -> axum::response::Response {
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    if let Err((status, msg)) = check_transport(headers) {
+        return (status, msg).into_response();
+    }
     let frame: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             return (
-                axum::http::StatusCode::BAD_REQUEST,
+                StatusCode::BAD_REQUEST,
                 axum::Json(rpc_error(Value::Null, -32700, &format!("Parse error: {e}"))),
             )
                 .into_response();
         }
     };
-    let resp = handle_frame(server, srv, frame).await;
-    (axum::http::StatusCode::OK, axum::Json(resp)).into_response()
+    match handle_frame(server, srv, frame).await {
+        Some(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
 }
 
-/// Dispatch one parsed JSON-RPC request frame to the right MCP method.
-async fn handle_frame(server: &ServerImpl, srv: &ToolServer, frame: Value) -> Value {
-    let id = frame.get("id").cloned().unwrap_or(Value::Null);
-    let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-    match method {
+/// A validated JSON-RPC 2.0 envelope. `id` is `None` for a notification.
+struct Envelope {
+    id: Option<Value>,
+    method: String,
+    params: Value,
+}
+
+/// Validate a JSON-RPC 2.0 request envelope: an object with
+/// `jsonrpc: "2.0"`, a string `method`, and (if present) a string or integer
+/// `id`. Anything else is `-32600 Invalid Request` — never dispatched.
+fn parse_envelope(frame: Value) -> Result<Envelope, Value> {
+    let invalid = |msg: &str| rpc_error(Value::Null, -32600, &format!("Invalid Request: {msg}"));
+    let Value::Object(mut obj) = frame else {
+        return Err(invalid("frame must be a JSON object"));
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC) {
+        return Err(invalid("`jsonrpc` must be \"2.0\""));
+    }
+    let id = match obj.remove("id") {
+        None => None,
+        Some(v @ Value::String(_)) => Some(v),
+        Some(v @ Value::Number(_)) if v.is_i64() || v.is_u64() => Some(v),
+        Some(_) => return Err(invalid("`id` must be a string or integer")),
+    };
+    let Some(Value::String(method)) = obj.remove("method") else {
+        return Err(match id {
+            Some(id) => rpc_error(id, -32600, "Invalid Request: `method` must be a string"),
+            None => invalid("`method` must be a string"),
+        });
+    };
+    let params = obj.remove("params").unwrap_or(Value::Null);
+    Ok(Envelope { id, method, params })
+}
+
+/// Dispatch one parsed JSON-RPC frame. Returns `None` for a notification
+/// (no `id`): notifications are accepted and never answered.
+async fn handle_frame(server: &ServerImpl, srv: &ToolServer, frame: Value) -> Option<Value> {
+    let env = match parse_envelope(frame) {
+        Ok(env) => env,
+        Err(err) => return Some(err),
+    };
+    // A notification never gets a response, whatever its method. Only
+    // side-effect-free notifications are defined for this server, so none is
+    // dispatched (in particular a `tools/call` without an id is NOT executed).
+    let id = env.id?;
+    Some(match env.method.as_str() {
         "initialize" => rpc_result(id, initialize_result()),
-        "notifications/initialized" | "initialized" => rpc_result(id, json!({})),
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, srv.tools_list()),
-        "tools/call" => {
-            let params = frame.get("params").cloned().unwrap_or(Value::Null);
-            handle_tool_call(server, srv, id, params).await
-        }
+        "tools/call" => handle_tool_call(server, srv, id, env.params).await,
         other => rpc_error(id, -32601, &format!("Method not found: {other}")),
-    }
+    })
 }
 
 /// Execute a `tools/call`: resolve the tool, run its dispatch, wrap the result.
@@ -613,6 +724,320 @@ mod tests {
         assert_eq!(out["result"]["isError"].as_bool(), Some(true));
     }
 
+    /// Deploy `proc` and wait until its definition is projected; returns its key.
+    async fn deploy_and_project(
+        server: &ServerImpl,
+        proc: nanobpmn_engine_core::ProcessDefinition,
+    ) -> u64 {
+        let id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(id.clone(), format!("{id}.bpmn"));
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        for _ in 0..300 {
+            if let Some(pd) = server
+                .store
+                .process_definitions()
+                .iter()
+                .find(|pd| pd.process_id == id)
+            {
+                return pd.key;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("definition `{id}` never projected");
+    }
+
+    async fn call(server: &ServerImpl, name: &str, args: Value) -> Value {
+        let srv = cluster_server();
+        let out = handle_tool_call(
+            server,
+            &srv,
+            json!(1),
+            json!({ "name": name, "arguments": args }),
+        )
+        .await;
+        out["result"].clone()
+    }
+
+    /// Advertised-but-unsupported creation options are rejected, not dropped.
+    #[tokio::test]
+    async fn create_rejects_unsupported_options_instead_of_dropping() {
+        let server = ServerImpl::default();
+        for (key, val) in [
+            ("processDefinitionVersionTag", json!("v1")),
+            ("variablesMetadata", json!([{ "name": "x" }])),
+        ] {
+            let mut args = json!({ "processDefinitionId": "p" });
+            args[key] = val;
+            let result = call(&server, "createProcessInstance", args).await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{key}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(key), "{key} named in error: {text}");
+        }
+    }
+
+    /// A null/omitted assignee unassigns (it does not store `""`), so a later
+    /// `allowOverride: false` assignment succeeds.
+    #[tokio::test]
+    async fn null_assignee_unassigns_user_task() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("ut")
+            .start_event("s")
+            .user_task("t")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
+        let def_key = deploy_and_project(&server, proc).await;
+        let created = call(
+            &server,
+            "createProcessInstance",
+            json!({ "processDefinitionKey": def_key.to_string() }),
+        )
+        .await;
+        assert_eq!(created["isError"].as_bool(), Some(false), "{created}");
+        let mut task_key = None;
+        for _ in 0..300 {
+            if let Some(t) = server.store.user_tasks().first() {
+                task_key = Some(t.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_key = task_key.expect("user task projected");
+        let assignee = |server: &ServerImpl| {
+            server
+                .store
+                .user_tasks()
+                .iter()
+                .find(|t| t.key == task_key)
+                .and_then(|t| t.assignee.clone())
+        };
+        let r = call(
+            &server,
+            "assignUserTask",
+            json!({ "userTaskKey": task_key, "assignee": "alice" }),
+        )
+        .await;
+        assert_eq!(r["isError"].as_bool(), Some(false), "{r}");
+        for unassign_args in [
+            json!({ "userTaskKey": task_key, "assignee": null }),
+            json!({ "userTaskKey": task_key }),
+        ] {
+            let r = call(&server, "assignUserTask", unassign_args).await;
+            assert_eq!(r["isError"].as_bool(), Some(false), "{r}");
+            let mut cleared = false;
+            for _ in 0..300 {
+                if assignee(&server).is_none() {
+                    cleared = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(cleared, "assignee cleared, got {:?}", assignee(&server));
+            let r = call(
+                &server,
+                "assignUserTask",
+                json!({ "userTaskKey": task_key, "assignee": "bob",
+                        "assignmentOptions": { "allowOverride": false } }),
+            )
+            .await;
+            assert_eq!(
+                r["isError"].as_bool(),
+                Some(false),
+                "reassign after unassign: {r}"
+            );
+        }
+    }
+
+    /// `{from, to}` date ranges become `$gte`/`$lt` on every search tool's
+    /// filter, so the bounds reach the shared REST filter instead of vanishing.
+    #[test]
+    fn date_ranges_translate_to_rest_operators() {
+        let args = json!({ "filter": { "startDate": { "from": "2024-01-01T00:00:00Z", "to": "2024-02-01T00:00:00Z" } } });
+        let q: Option<nanobpm_gateway_rest::models::ProcessInstanceSearchQuery> =
+            cluster_tools::optional_body(args).expect("valid");
+        let v = serde_json::to_value(q.expect("some")).unwrap();
+        let sd = &v["filter"]["startDate"];
+        assert!(sd["$gte"].is_string(), "{v}");
+        assert!(sd["$lt"].is_string(), "{v}");
+        for (tool_args, field) in [
+            (
+                json!({ "filter": { "creationTime": { "from": "2024-01-01T00:00:00Z" } } }),
+                "creationTime",
+            ),
+            (
+                json!({ "filter": { "dueDate": { "to": "2024-01-01T00:00:00Z" } } }),
+                "dueDate",
+            ),
+        ] {
+            let mut a = tool_args;
+            cluster_tools::translate_date_ranges(&mut a["filter"]).expect("valid");
+            let obj = a["filter"][field].as_object().unwrap();
+            assert!(obj.keys().all(|k| k == "$gte" || k == "$lt"), "{a}");
+        }
+        let mut bad = json!({ "startDate": { "from": 5 } });
+        assert!(cluster_tools::translate_date_ranges(&mut bad).is_err());
+        let mut bad = json!({ "startDate": { "from": "2024-01-01T00:00:00Z", "x": 1 } });
+        assert!(cluster_tools::translate_date_ranges(&mut bad).is_err());
+    }
+
+    /// Malformed envelopes are `-32600` and never dispatched.
+    #[tokio::test]
+    async fn malformed_envelopes_are_invalid_request() {
+        let server = ServerImpl::default();
+        let srv = cluster_server();
+        for frame in [
+            json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/list" }),
+            json!({ "id": 1, "method": "tools/list" }),
+            json!({ "jsonrpc": "2.0", "id": {}, "method": "tools/list" }),
+            json!({ "jsonrpc": "2.0", "id": 1.5, "method": "tools/list" }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": 7 }),
+            json!({ "jsonrpc": "2.0", "id": 1 }),
+            json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }]),
+            json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "getTopology", "arguments": {} } }),
+        ] {
+            let out = handle_frame(&server, &srv, frame.clone())
+                .await
+                .expect("error response");
+            assert_eq!(
+                out["error"]["code"].as_i64(),
+                Some(-32600),
+                "{frame} -> {out}"
+            );
+            assert!(out.get("result").is_none(), "{frame} not dispatched");
+        }
+    }
+
+    /// Notifications (no `id`) — known or unknown — get no JSON-RPC response.
+    #[tokio::test]
+    async fn notifications_get_no_response() {
+        let server = ServerImpl::default();
+        let srv = cluster_server();
+        for method in [
+            "notifications/initialized",
+            "notifications/whatever",
+            "tools/call",
+        ] {
+            let out =
+                handle_frame(&server, &srv, json!({ "jsonrpc": "2.0", "method": method })).await;
+            assert!(out.is_none(), "{method} answered: {out:?}");
+        }
+    }
+
+    async fn post(headers: &[(&str, &str)], body: Value) -> (axum::http::StatusCode, Vec<u8>) {
+        use tower::ServiceExt;
+        let app = mcp_router(ServerImpl::default());
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp/cluster");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app
+            .oneshot(req.body(axum::body::Body::from(body.to_string())).unwrap())
+            .await
+            .expect("route responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    /// HTTP-level: the MCP initialize handshake — request 200 with a body,
+    /// `notifications/initialized` 202 with no body.
+    #[tokio::test]
+    async fn http_initialize_handshake() {
+        let json_ct = [("content-type", "application/json")];
+        let (st, body) = post(
+            &json_ct,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+        )
+        .await;
+        assert_eq!(st, axum::http::StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["result"]["protocolVersion"].as_str(),
+            Some(PROTOCOL_VERSION)
+        );
+        let (st, body) = post(
+            &json_ct,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+        assert_eq!(st, axum::http::StatusCode::ACCEPTED);
+        assert!(body.is_empty(), "no body for a notification");
+    }
+
+    /// HTTP-level: non-JSON content types and foreign Origins are rejected
+    /// before dispatch; loopback / same-origin / absent Origin pass.
+    #[tokio::test]
+    async fn http_rejects_non_json_and_foreign_origin() {
+        let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data"),
+        ] {
+            let headers: Vec<(&str, &str)> = ct.map(|c| ("content-type", c)).into_iter().collect();
+            let (st, _) = post(&headers, frame.clone()).await;
+            assert_eq!(st, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+        }
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil:80",
+        ] {
+            let (st, _) = post(
+                &[
+                    ("content-type", "application/json"),
+                    ("origin", origin),
+                    ("host", "localhost:8080"),
+                ],
+                frame.clone(),
+            )
+            .await;
+            assert_eq!(st, axum::http::StatusCode::FORBIDDEN, "{origin}");
+        }
+        for origin in [
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "http://[::1]:9",
+            "https://gw.example:8080",
+        ] {
+            let (st, _) = post(
+                &[
+                    ("content-type", "application/json; charset=utf-8"),
+                    ("origin", origin),
+                    ("host", "gw.example:8080"),
+                ],
+                frame.clone(),
+            )
+            .await;
+            assert_eq!(st, axum::http::StatusCode::OK, "{origin}");
+        }
+        let (st, _) = post(&[("content-type", "application/json")], frame).await;
+        assert_eq!(
+            st,
+            axum::http::StatusCode::OK,
+            "no Origin (non-browser client)"
+        );
+    }
+
     /// `initialize` negotiates the protocol version and server identity.
     #[tokio::test]
     async fn initialize_returns_protocol_and_server_info() {
@@ -623,7 +1048,8 @@ mod tests {
             &srv,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
         )
-        .await;
+        .await
+        .expect("a request gets a response");
         let result = &out["result"];
         assert_eq!(result["protocolVersion"].as_str(), Some(PROTOCOL_VERSION));
         assert_eq!(result["serverInfo"]["name"].as_str(), Some(SERVER_NAME));

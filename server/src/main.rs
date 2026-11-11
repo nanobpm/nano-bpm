@@ -14213,7 +14213,7 @@ impl ServerImpl {
     }
 
     /// Clears a user task's assignee.
-    async fn unassign_user_task_impl(
+    pub(crate) async fn unassign_user_task_impl(
         &self,
         path_params: &models::UnassignUserTaskPathParams,
     ) -> Result<apis::user_task::UnassignUserTaskResponse, ()> {
