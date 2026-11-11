@@ -690,11 +690,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - name: Typecheck landing-hero snippet against published @nanobpm/workflow
-        # The landing hero (website/build.mjs) renders the `hero` region of
-        # website/snippets/hero-pr-review.ts VERBATIM. This job compiles that
-        # snippet against the published @nanobpm/workflow so the marketing
-        # example can never drift from the real defineFlow API.
+      - name: Typecheck landing snippets against the published @nanobpm packages
+        # The landing page (website/build.mjs) renders regions of
+        # website/snippets/*.ts VERBATIM: nage-review.ts and publish-video.ts (the
+        # Nano Agent Graph Engine example flows, also compiled to the demo's BPMN)
+        # and hero-pr-review.ts (the Nano server's defineFlow). This
+        # job compiles them against the published @nanobpm/nano-agent-graph-engine
+        # and @nanobpm/workflow so the examples can never drift from the real APIs.
         run: npm ci && npm run typecheck
         working-directory: website/snippets
 

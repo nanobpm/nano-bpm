@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { buildSite } from "./test-build.mjs";
 import { bindInstallCopy } from "./install-copy.mjs";
+import { nageFacts } from "./nage-facts.mjs";
 
 function control(command) {
   const attributes = new Map();
@@ -100,9 +101,14 @@ test("a pending copy cannot be raced by repeated clicks", async () => {
 const CURL = "curl -fsSL https://nanobpm.io/install.sh | sh";
 const NPM = "npm install -g @nanobpm/nano-coder";
 
+// The homepage's controls, in page order: every command of every tested NAGE
+// host tab (derived from the same facts the page renders), then nano-coder's
+// npm install, then the distributed Nano Workforce installer.
+const HOME = [...nageFacts().hosts.filter((h) => h.tested).flatMap((h) => h.commands), NPM, CURL];
+
 // `commands` lists, in page order, the install command each control must carry.
-function assertInstallControls(html, commands = [CURL, NPM, CURL]) {
-  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command" role="group" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
+function assertInstallControls(html, commands = HOME) {
+  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command(?: noprompt)?" role="group" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
   assert.equal(controls.length, commands.length);
   assert.equal(new Set(controls.map(([, label]) => label)).size, commands.length);
   for (const [i, [, , content]] of controls.entries()) {
@@ -136,4 +142,22 @@ test("the published homepage wires every install control to the shipped handler"
     site("install-copy.mjs"),
     readFileSync(new URL("./install-copy.mjs", import.meta.url), "utf8"),
   );
+});
+
+// The install box is `width: max-content`. WebKit computes a flex item's max-content
+// contribution from its content, ignoring a fixed flex-basis, while still painting it
+// at the basis — so a fixed-size part sized only by `flex: 0 0 <n>px` (the 44px copy
+// button) made Safari size the box too narrow and clip the end of every command
+// (`$ nage` showed as `$ nag`). Any fixed flex-basis inside the install box must be
+// mirrored by an explicit width.
+test("fixed-size install-box parts declare an explicit width, not only a flex-basis", () => {
+  const html = buildSite()("index.html");
+  const rules = [...html.matchAll(/(\.install[^{}]*)\{([^}]*)\}/g)];
+  assert.ok(rules.length > 0, "install-box CSS not found");
+  const fixed = rules.filter(([, , body]) => /flex:\s*0 0 \d+px/.test(body));
+  assert.ok(fixed.length > 0, "expected the copy button's fixed flex-basis rule");
+  for (const [, selector, body] of fixed) {
+    const basis = body.match(/flex:\s*0 0 (\d+px)/)[1];
+    assert.match(body, new RegExp(`(^|[;\\s])width:\\s*${basis}`), `${selector.trim()} sets flex-basis ${basis} without width: ${basis}`);
+  }
 });

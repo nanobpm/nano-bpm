@@ -3,11 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Compilable sources for the code snippets rendered on nanobpm.io. Type-checked in CI so the landing-page examples never drift from the real @nanobpm/* APIs.",
+  "description": "Compilable sources for the code snippets rendered on nanobpm.io. Type-checked in CI so the landing-page examples never drift from the real @nanobpm/* APIs (@nanobpm/nano-agent-graph-engine, @nanobpm/workflow).",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
+    "@nanobpm/nano-agent-graph-engine": "0.15.0",
     "@nanobpm/workflow": "0.7.0",
     "typescript": "^5.6.0"
   }

@@ -434,3 +434,63 @@ code {
       0 0 16px 3px rgba(52, 211, 153, 1);
   }
 }
+
+.scenario-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 20px 0;
+}
+.scenario {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+}
+.scenario:hover {
+  color: var(--ink);
+}
+.scenario.on {
+  border-color: var(--emerald);
+  color: var(--emerald);
+}
+
+/* Wide models: diagram full-width on top, variables and activity side by side below. */
+.demo-grid.wide {
+  grid-template-columns: 1fr;
+  grid-template-rows: 260px 300px;
+  height: auto;
+}
+.demo-grid.wide .diagram-wrap {
+  border-right: none;
+  border-bottom: 1px solid var(--border);
+}
+.demo-grid.wide .side {
+  flex-direction: row;
+}
+.demo-grid.wide .side > .panel {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+}
+@media (max-width: 900px) {
+  .demo-grid.wide {
+    grid-template-rows: auto;
+  }
+  .demo-grid.wide .side {
+    flex-direction: column;
+  }
+}
+
+/* Zoom in / out / fit, over the diagram (BpmnRuntimeView zoomControls). */
+.nano-zoom button {
+  width: 30px; height: 30px; display: grid; place-items: center; padding: 0;
+  font: 600 16px/1 system-ui, sans-serif; color: #e2e8f0; cursor: pointer;
+  background: rgba(15, 23, 42, .85); border: 1px solid rgba(148, 163, 184, .35); border-radius: 8px;
+}
+.nano-zoom button:hover { border-color: #38bdf8; color: #fff; }
+.nano-zoom button:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }

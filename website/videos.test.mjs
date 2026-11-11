@@ -47,7 +47,7 @@ test("the built homepage and console artifact both carry the shared Videos secti
   const home = site("index.html");
   assert.ok(home.includes(section), "homepage embeds the shared section");
   assert.match(home, /id="videos"[\s\S]*?Coming soon/);
-  assert.match(home, /<header class="nav">[\s\S]*?<a href="\/#videos">Videos<\/a>[\s\S]*?<\/header>/);
+  assert.match(home, /<footer class="site-foot[\s\S]*?<a href="\/#videos">Videos<\/a>[\s\S]*?<\/footer>/);
   const gen = readFileSync(
     new URL("../server/crates/nano-server-console/src/videos.gen.html", import.meta.url),
     "utf8",
