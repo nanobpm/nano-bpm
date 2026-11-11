@@ -39,6 +39,14 @@ export interface EmitOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Fetch override (tests inject a stub transport). */
   fetchFn?: typeof fetch;
+  /** Per-attempt deadline in ms covering the POST **and** the response-body
+   * read (default 10 000). Without it a stalled body blocks the emit forever:
+   * after a non-2xx it would prevent the retry, and after a 2xx it would
+   * prevent the return even though the event is already durably persisted. On
+   * expiry the body read is abandoned — a 2xx still resolves (durability was
+   * confirmed by the status), a non-2xx/transport attempt fails and retries.
+   * Set to `Infinity` to disable. */
+  timeoutMs?: number;
 }
 
 /** The error {@link emitEvent} throws once every attempt failed. Carries the
@@ -58,9 +66,42 @@ export class EmitError extends Error {
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_BASE_DELAY_MS = 250;
 const DEFAULT_MAX_DELAY_MS = 4_000;
+const DEFAULT_TIMEOUT_MS = 10_000;
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
+
+/** Race `read` against an abort deadline so a stalled response body can never
+ * block the emit: the timer aborts the request (which rejects the pending
+ * read) and the timeout wins the race even if the abort rejection is delayed.
+ * Resolves `undefined` on expiry — the caller decides what a timed-out read
+ * means for the status it already has. */
+async function readWithDeadline(
+  read: Promise<string>,
+  ctrl: AbortController,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  if (!Number.isFinite(timeoutMs)) return await read.catch(() => undefined);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, timeoutMs);
+  try {
+    const winner = await Promise.race([
+      read.then((text) => ({ text })),
+      new Promise<{ expired: true }>((resolve) =>
+        setTimeout(() => resolve({ expired: true }), timeoutMs),
+      ),
+    ]);
+    if ("expired" in winner || timedOut) return undefined;
+    return winner.text;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** POST one event to the trigger ingress, throwing unless it is durably
  * persisted. `url` is the driver's `NANOBPMN_HOOK_URL`. Resolves with the
@@ -79,6 +120,7 @@ export async function emitEvent(
   // caller asking for `maxDelayMs: 100` with the default 250 ms base gets a
   // genuine 100 ms ceiling, not a silent override of its advertised cap.
   const maxDelay = Math.max(0, opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sleep = opts.sleep ?? defaultSleep;
   const fetchImpl = opts.fetchFn ?? fetch;
 
@@ -90,29 +132,51 @@ export async function emitEvent(
   let lastStatus = 0;
   let lastDetail = "no attempt made";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // One deadline per attempt, covering the POST and the response-body read
+    // (the read is the unbounded part: undici streams it without a timeout).
+    const ctrl = new AbortController();
     try {
-      const res = await fetchImpl(url, { method: "POST", headers, body: payload });
+      const res = await fetchImpl(url, {
+        method: "POST",
+        headers,
+        body: payload,
+        signal: ctrl.signal,
+      });
       // Check the status BEFORE touching the body: a 2xx already confirms the
-      // event is durably persisted (persist-before-ack), so an interrupted or
-      // unparseable acknowledgement body must never trigger a retrying second
-      // POST — reading it is strictly best-effort.
+      // event is durably persisted (persist-before-ack), so an interrupted,
+      // stalled, or unparseable acknowledgement body must never trigger a
+      // retrying second POST — reading it is strictly best-effort.
       if (res.ok) {
+        // `arrayBuffer()` (not `text()`): undici rejects a text() decode when
+        // the socket dies mid-body, but a 2xx is already durable, so the read
+        // must tolerate the truncation instead of failing the emit. The
+        // deadline abandons a body that never finishes; a timed-out or failed
+        // read yields `undefined` and the durable 2xx still resolves.
+        const text = await readWithDeadline(
+          res.arrayBuffer().then((buf) => new TextDecoder().decode(buf)),
+          ctrl,
+          timeoutMs,
+        );
+        if (text === undefined || text === "") return {};
         try {
-          // `arrayBuffer()` (not `text()`): undici rejects a text() decode when
-          // the socket dies mid-body, but a 2xx is already durable, so the read
-          // must tolerate the truncation instead of failing the emit.
-          const buf = await res.arrayBuffer();
-          const text = new TextDecoder().decode(buf);
-          return text ? JSON.parse(text) : {};
+          return JSON.parse(text);
         } catch {
           return {};
         }
       }
       lastStatus = res.status;
-      lastDetail = `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`;
+      const detail = await readWithDeadline(res.text(), ctrl, timeoutMs);
+      lastDetail =
+        detail === undefined
+          ? `HTTP ${res.status}: <response body unreadable or timed out>`
+          : `HTTP ${res.status}: ${detail.slice(0, 200)}`;
     } catch (err) {
       lastStatus = 0;
       lastDetail = `transport: ${String((err as Error)?.message ?? err)}`;
+    } finally {
+      // The attempt is settled — never leave the abort timer (or a pending
+      // signal) holding resources past the retry backoff.
+      ctrl.abort();
     }
     if (attempt < maxAttempts) {
       const shift = Math.min(attempt - 1, 20);

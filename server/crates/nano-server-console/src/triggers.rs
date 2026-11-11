@@ -1906,42 +1906,45 @@ mod tests {
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
 
     /// A dependency-free Node trigger driver: it reads the env contract and
-    /// emits two distinct events to the ingress through a **checked, retrying
-    /// emit** (the `emitEvent` contract from `trigger_sdk.ts`, inlined so the
-    /// driver stays self-contained — a pack driver runs with the pack dir as
-    /// its cwd and cannot resolve the project's `nano-generated/` SDK). A 2xx
-    /// means durably persisted (persist-before-ack); a non-2xx / transport
-    /// failure is retried with backoff and then thrown, so the unhandled
-    /// rejection exits the driver non-zero — a failed emit is loud (the
-    /// supervisor logs the crash), never the silent drop of #1543. It then
-    /// stays alive (so the supervisor doesn't treat its exit as a crash and
-    /// respawn it).
+    /// emits two distinct events to the ingress through the **canonical**
+    /// checked, retrying emit — `emitEvent` imported from `trigger_sdk.ts`
+    /// itself, materialized next to the driver by [`write_driver_pack`] (the
+    /// runner passes `--experimental-strip-types`; every runtime the launcher
+    /// admits is Node >= 22.6, which strips the SDK's types). The driver runs
+    /// the SDK the tests claim to exercise, so a contract regression in
+    /// `trigger_sdk.ts` fails here instead of drifting from an inlined copy.
+    /// A 2xx means durably persisted (persist-before-ack); a non-2xx /
+    /// transport failure is retried with backoff and then thrown, so the
+    /// unhandled rejection exits the driver non-zero — a failed emit is loud
+    /// (the supervisor logs the crash), never the silent drop of #1543. It
+    /// then stays alive (so the supervisor doesn't treat its exit as a crash
+    /// and respawn it).
     const TEST_DRIVER_MJS: &str = r#"
+import { emitEvent } from "./trigger_sdk.ts";
 const env = process.env;
 const url = env.NANOBPMN_HOOK_URL;
 const token = env.NANOBPMN_WEBHOOK_TOKEN;
 const cfg = JSON.parse(env.NANOBPMN_TRIGGER_CONFIG || "{}");
-async function emit(body, idem) {
-  const headers = { "content-type": "application/json", "idempotency-key": idem };
-  if (token) headers["x-webhook-token"] = token;
-  let last = "no attempt";
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-      if (res.ok) return;
-      last = `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`;
-    } catch (e) {
-      last = `transport: ${e && e.message ? e.message : e}`;
-    }
-    await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** attempt, 4000)));
-  }
-  throw new Error(`emit failed after retries: ${last}`);
-}
 for (let i = 0; i < 2; i++) {
-  await emit({ n: i, topic: cfg.topic }, `evt-${i}`);
+  await emitEvent(url, { n: i, topic: cfg.topic }, {
+    token,
+    idempotencyKey: `evt-${i}`,
+  });
 }
 await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 60000)));
 "#;
+
+    /// The canonical pack-driver SDK, embedded so the fixture drivers import
+    /// the real `emitEvent` rather than a handwritten copy of the contract.
+    const TRIGGER_SDK_TS: &str = include_str!("trigger_sdk.ts");
+
+    /// Materialize a driver fixture: the driver entry plus the canonical SDK
+    /// it imports, in one directory (the layout a pack driver runs from).
+    fn write_driver_pack(dir: &std::path::Path, driver_src: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("driver.mjs"), driver_src).unwrap();
+        std::fs::write(dir.join("trigger_sdk.ts"), TRIGGER_SDK_TS).unwrap();
+    }
 
     /// The pre-#1543 fire-and-forget driver: it POSTs each event and **ignores
     /// the response**, so a non-2xx (or a rejected `fetch`) loses the event with
@@ -1996,7 +1999,7 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
             }"#,
         )
         .unwrap();
-        std::fs::write(pack.join("driver.mjs"), TEST_DRIVER_MJS).unwrap();
+        write_driver_pack(&pack, TEST_DRIVER_MJS);
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
@@ -2106,7 +2109,7 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
             }"#,
         )
         .unwrap();
-        std::fs::write(pack.join("driver.mjs"), TEST_DRIVER_MJS).unwrap();
+        write_driver_pack(&pack, TEST_DRIVER_MJS);
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
@@ -2233,11 +2236,13 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             ));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("driver.mjs"), driver_src).unwrap();
+            write_driver_pack(&dir, driver_src);
             let node = workers::usable_node().expect("a JS runtime");
             let out = tokio::process::Command::new(node)
                 .current_dir(&dir)
+                // The driver imports the canonical `trigger_sdk.ts`; strip its
+                // types (every runtime the launcher admits is Node >= 22.6).
+                .arg("--experimental-strip-types")
                 .arg("driver.mjs")
                 .env("NO_COLOR", "1")
                 .env("NANOBPMN_HOOK_URL", format!("http://127.0.0.1:{port}/hook"))

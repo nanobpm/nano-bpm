@@ -211,12 +211,22 @@ test("emitEvent honors a maxDelayMs below the base delay (the cap is not raised 
 test("emitEvent treats a 2xx as durable even when the ack body is interrupted", async () => {
   // The ingress has already persisted the event when it sends a 2xx
   // (persist-before-ack), so a connection that dies mid-body must NOT cause a
-  // second POST — the emit resolves instead of retrying a durable event.
+  // second POST — the emit resolves instead of retrying a durable event. The
+  // stream ERRORS (not merely delivers invalid JSON): `arrayBuffer()` itself
+  // rejects, so the guard genuinely exercises a body-read rejection — a
+  // well-formed-but-invalid-JSON body would still pass if the read moved
+  // outside the success-path catch.
   let posts = 0;
   const interrupted = (async () => {
     posts++;
     // Status/headers arrive (202 = durable), then the socket dies mid-body.
-    return new Response('{"enqueued":tru', {
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"enqueued":tru'));
+        c.error(new Error("socket hangup"));
+      },
+    });
+    return new Response(stream, {
       status: 202,
       headers: { "content-type": "application/json" },
     });
@@ -228,4 +238,63 @@ test("emitEvent treats a 2xx as durable even when the ack body is interrupted", 
   });
   assertEquals(ack, {}, "a best-effort ack read falls back to {}");
   assertEquals(posts, 1, "exactly one POST — no retry of a durable 2xx");
+});
+
+test("emitEvent returns when a durable 2xx's ack body stalls (the read is deadline-bound)", async () => {
+  // A stalled body must not block the emit: the 2xx already confirmed
+  // durability, so the deadline abandons the read and resolves — no retry of
+  // an already-persisted event.
+  let posts = 0;
+  const stalled = (async () => {
+    posts++;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"enqueued":true'));
+        // Never enqueues again and never closes: the body read hangs.
+      },
+    });
+    return new Response(stream, {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = await emitEvent("http://trigger.invalid/hook", { n: 9 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: stalled,
+    timeoutMs: 50,
+  });
+  assertEquals(ack, {}, "a stalled ack read resolves to the {} fallback");
+  assertEquals(posts, 1, "exactly one POST — no retry of a durable 2xx");
+});
+
+test("emitEvent retries when a non-2xx response body stalls (the read is deadline-bound)", async () => {
+  // The failure path's body read is bounded by the same deadline: a stalled
+  // 500 body must not prevent the retry that lands the durable insert.
+  let posts = 0;
+  const stalledThenAck = (async () => {
+    posts++;
+    if (posts === 1) {
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode("database is "));
+          // Never finishes: the error-detail read hangs.
+        },
+      });
+      return new Response(stream, { status: 500 });
+    }
+    return new Response('{"enqueued":true,"id":11}', {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = (await emitEvent("http://trigger.invalid/hook", { n: 10 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: stalledThenAck,
+    timeoutMs: 50,
+  })) as { enqueued: boolean; id: number };
+  assertEquals(ack.enqueued, true);
+  assertEquals(ack.id, 11);
+  assertEquals(posts, 2, "the stalled first attempt is retried to durability");
 });
