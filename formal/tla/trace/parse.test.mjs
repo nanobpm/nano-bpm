@@ -37,3 +37,32 @@ test('parses nested records with quoted keys', () => {
 test('still parses functions in the (k :> v @@ ...) form', () => {
   assert.deepEqual(parseTlaValue('("a" :> 1 @@ "b" :> 2)'), { a: 1, b: 2 });
 });
+
+test('VariableScopes fixture: derives the acting child and projects scopes (#1522)', async () => {
+  const { variableScopesFixture } = await import('./parse.mjs');
+  const st = (cstate, sv, collected = [-1, -1]) => ({
+    phase: 'running', cstate, sv, collected, rootResults: [-1, -1],
+  });
+  const empty = { item: -1, loopCounter: -1, result: -1, seen: -1 };
+  const c = (i) => ({ item: i, loopCounter: i, result: 0, seen: -1 });
+  const s0 = st(['active', 'active'], { 0: empty, 1: c(1), 2: c(2), 3: empty });
+  const s1 = st(['written', 'active'],
+    { 0: { ...empty, seen: 1 }, 1: { ...c(1), result: 1 }, 2: c(2), 3: empty });
+  const fx = variableScopesFixture('VariableScopes', 'M', { n: 2 }, [
+    { step: 1, action: '<Activate line 1>', vars: s0 },
+    { step: 2, action: '<Write line 2>', vars: s1 },
+  ]);
+  assert.equal(fx.steps.length, 1);
+  assert.equal(fx.steps[0].action, 'Write');
+  assert.equal(fx.steps[0].child, 1);
+  assert.deepEqual(fx.steps[0].state.root, { seen: 1 });
+  assert.deepEqual(fx.steps[0].state.children['1'], { item: 1, loopCounter: 1, result: 1 });
+  assert.deepEqual(fx.steps[0].state.children['2'], { item: 2, loopCounter: 2, result: null });
+  assert.deepEqual(fx.initial.collected, ['undef', 'undef']);
+});
+
+test('VariableScopes fixture: a state missing the vocabulary fails loudly', async () => {
+  const { variableScopesFixture } = await import('./parse.mjs');
+  assert.throws(() => variableScopesFixture('VariableScopes', 'M', { n: 1 },
+    [{ step: 1, action: 'Init', vars: { phase: 'init' } }]), /observable variables/);
+});
