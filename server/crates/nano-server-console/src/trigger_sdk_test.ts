@@ -11,6 +11,7 @@
 // exhausted, so a dropped trigger event always names its cause.
 
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import {
   assert,
@@ -336,27 +337,33 @@ test("emitEvent bounds the wait for response headers by the same per-attempt dea
   );
 });
 
-test("emitEvent clears its deadline timer when an attempt settles (no leaked timer)", async () => {
+test("emitEvent clears its deadline timer when an attempt settles (no leaked timer)", () => {
   // A settled attempt must not leave a referenced timer alive: a leaked
-  // 10 s default timer would delay driver shutdown after every emit and
-  // accumulate during continuous emission. If `emitEvent` leaks one, this
-  // test's own 100 ms watchdog is what keeps the event loop alive at the
-  // await below — proving the emit itself left nothing pending.
-  const ack = await emitEvent("http://trigger.invalid/hook", { n: 12 }, {
-    maxAttempts: 1,
-    sleep: noSleep,
-    fetchFn: (async () =>
-      new Response('{"enqueued":true,"id":13}', {
-        status: 202,
-        headers: { "content-type": "application/json" },
-      })) as typeof fetch,
-    // A large deadline: if its timer outlives the attempt, it is still
-    // referenced long after the emit resolved.
-    timeoutMs: 60_000,
-  });
-  assertEquals((ack as { id: number }).id, 13);
-  // Only this watchdog may fire; if the emit's 60 s timer were still
-  // referenced the process would be held for a minute — the watchdog firing
-  // immediately after the await shows the loop had nothing else pending.
-  await new Promise((r) => setTimeout(r, 100));
+  // deadline timer would hold the driver process open after every emit.
+  // Run the emit in a child process with a 60 s deadline and assert the
+  // child EXITS promptly — a leaked referenced timer would keep it alive
+  // until the spawnSync timeout kills it, failing this test.
+  const sdkUrl = new URL("./trigger_sdk.ts", import.meta.url).href;
+  const script = `
+    import { emitEvent } from ${JSON.stringify(sdkUrl)};
+    const ack = await emitEvent("http://trigger.invalid/hook", { n: 12 }, {
+      maxAttempts: 1,
+      sleep: () => Promise.resolve(),
+      fetchFn: async () => new Response('{"enqueued":true,"id":13}', {
+        status: 202, headers: { "content-type": "application/json" },
+      }),
+      timeoutMs: 60_000,
+    });
+    if (ack.id !== 13) process.exit(3);
+  `;
+  const started = Date.now();
+  const child = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", script],
+    { timeout: 15_000, encoding: "utf8" },
+  );
+  const elapsed = Date.now() - started;
+  assertEquals(child.signal, null, `child was killed (leaked timer held it open): ${child.stderr}`);
+  assertEquals(child.status, 0, `child failed: ${child.stderr}`);
+  assert(elapsed < 15_000, `child exited promptly after the emit settled (took ${elapsed} ms)`);
 });
