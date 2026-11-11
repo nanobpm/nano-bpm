@@ -12414,6 +12414,15 @@ impl ServerImpl {
             /// The Zeebe `messageSubscriptionType` of this row.
             is_start_event: bool,
         }
+        // The Zeebe `messageSubscriptionType` string of a row: the single
+        // source for the filter and the sort.
+        let type_str = |e: &MsgSubEntry| {
+            if e.is_start_event {
+                models::MessageSubscriptionTypeEnum::StartEvent.to_string()
+            } else {
+                models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
+            }
+        };
 
         let mut entries: Vec<MsgSubEntry> = subs
             .into_iter()
@@ -12446,12 +12455,13 @@ impl ServerImpl {
             .collect();
 
         // Definition-scoped message start event subscriptions (#1499). The
-        // subscription key is the process definition key (nano keys message
-        // start subscriptions by it — see `MessageStartEventCorrelated`).
+        // subscription key is the read model's canonical derived key
+        // (`message_start_subscription_key`), unique per start event even when
+        // one definition declares several message starts.
         entries.extend(start_subs.into_iter().filter_map(|sub| {
             let def = by_definition_key.get(&sub.process_definition_key)?;
             Some(MsgSubEntry {
-                subscription_key: sub.process_definition_key,
+                subscription_key: sub.subscription_key,
                 process_definition_id: def.process_id.clone(),
                 process_definition_key: Some(sub.process_definition_key.to_string()),
                 process_instance_key: None,
@@ -12482,11 +12492,7 @@ impl ServerImpl {
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
-                    let type_str = if e.is_start_event {
-                        models::MessageSubscriptionTypeEnum::StartEvent.to_string()
-                    } else {
-                        models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
-                    };
+                    let type_str = type_str(e);
                     query::match_message_subscription_key(
                         &f.message_subscription_key,
                         &e.subscription_key.to_string(),
@@ -12561,6 +12567,8 @@ impl ServerImpl {
                 }
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
+                "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
+                "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -32849,6 +32857,132 @@ mod clustered_startup_tests {
                 "$exists:false matches an unprojected field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_message_start_subscriptions_have_unique_keys_and_sort_by_tool_name() {
+        // #1499: a definition with several message start events yields one
+        // START_EVENT row per start event, each with its own
+        // `messageSubscriptionKey` (cursor pagination must not loop), and the
+        // advertised `toolName` sort orders by tool name, not by key.
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let multi = ProcessBuilder::new("multi")
+            .message_start_event("s1", "m1")
+            .message_start_event("s2", "m2")
+            .end_event("e")
+            .connect("s1", "e")
+            .connect("s2", "e")
+            .build()
+            .expect("valid two-start process");
+        let tool = |id: &str, name: &str| {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("io.camunda.tool:name".to_string(), name.to_string());
+            ProcessBuilder::new(id)
+                .message_start_event("s", format!("{id}-msg"))
+                .end_event("e")
+                .connect("s", "e")
+                .with_properties("s", props)
+                .build()
+                .expect("valid tool process")
+        };
+        let mut names = std::collections::HashMap::new();
+        for id in ["multi", "zeta-proc", "alpha-proc"] {
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+        }
+        // `zeta` deploys before `alpha`, so key order differs from name order.
+        server
+            .deploy_resources_locally(
+                vec![
+                    multi,
+                    tool("zeta-proc", "zeta"),
+                    tool("alpha-proc", "alpha"),
+                ],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let search = |q: models::MessageSubscriptionSearchQuery| {
+            let server = &server;
+            async move {
+                let Resp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .expect("search returns")
+                else {
+                    panic!("expected a 200 result");
+                };
+                r
+            }
+        };
+        let all = || models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        };
+        for _ in 0..200 {
+            if search(all()).await.items.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(search(all()).await.items.len(), 4);
+
+        // Page the two `multi` start subscriptions one at a time.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..4 {
+            let r = search(models::MessageSubscriptionSearchQuery {
+                page: Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(1),
+                    },
+                )),
+                sort: None,
+                filter: Some(models::MessageSubscriptionFilter {
+                    process_definition_id: Some(models::StringFilterProperty::String(
+                        "multi".to_string(),
+                    )),
+                    ..models::MessageSubscriptionFilter::new()
+                }),
+            })
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(|i| i.message_name.clone()));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Sort by toolName ascending: alpha before zeta despite key order.
+        let r = search(models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: Some(vec![models::MessageSubscriptionSearchQuerySortRequest {
+                field: "toolName".to_string(),
+                order: Some(models::SortOrderEnum::Asc),
+            }]),
+            filter: None,
+        })
+        .await;
+        let tools: Vec<String> = r
+            .items
+            .into_iter()
+            .filter_map(|i| match i.tool_name {
+                types::Nullable::Present(t) => Some(t),
+                types::Nullable::Null => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["alpha".to_string(), "zeta".to_string()]);
     }
 
     #[tokio::test]

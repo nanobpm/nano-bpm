@@ -293,6 +293,11 @@ pub(super) struct PendingBoundary {
     /// mis-attached to the enclosing activity on the `io_stack`.
     pub(super) start_listeners: Vec<crate::model::ExecutionListener>,
     pub(super) end_listeners: Vec<crate::model::ExecutionListener>,
+    /// `zeebe:properties` declared on this boundary event (#1499). Captured on
+    /// the pending boundary (it is never on the `io_stack`) so they attach to
+    /// the boundary element itself — never dropped, nor mis-attached to (and
+    /// overwriting) an enclosing subprocess's properties.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -1758,6 +1763,12 @@ impl ProcessAcc {
                 )
             })
             .collect();
+        let boundary_properties: Vec<(String, std::collections::BTreeMap<String, String>)> = self
+            .boundaries
+            .iter()
+            .filter(|b| !b.properties.is_empty())
+            .map(|b| (b.id.clone(), b.properties.clone()))
+            .collect();
         for boundary in self.boundaries {
             let attached_to =
                 boundary
@@ -2009,6 +2020,10 @@ impl ProcessAcc {
         // activity it parsed adjacent to.
         for (id, start_listeners, end_listeners) in boundary_listeners {
             builder = builder.with_listeners(id, start_listeners, end_listeners);
+        }
+        // Likewise re-attach boundary `zeebe:properties` by element id (#1499).
+        for (id, properties) in boundary_properties {
+            builder = builder.with_properties(id, properties);
         }
         // Compensation boundary events and their `isForCompensation` handlers are
         // structural markers, NOT part of ordinary token flow: a compensation

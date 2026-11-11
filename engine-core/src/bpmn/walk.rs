@@ -538,6 +538,7 @@ pub(crate) fn parse_with_captures(
                                             escalation_dup: false,
                                             start_listeners: Vec::new(),
                                             end_listeners: Vec::new(),
+                                            properties: std::collections::BTreeMap::new(),
                                         });
                                     }
                                 }
@@ -1192,11 +1193,18 @@ pub(crate) fn parse_with_captures(
                                 }
                             }
                             "property" if in_properties => {
-                                if let (Some(&idx), Some(name)) =
-                                    (io_stack.last(), attr(attrs, "name"))
-                                {
+                                // A boundary event is buffered in `cur_boundary`
+                                // (never on the io_stack), so check it first;
+                                // falling back to the io_stack would drop a
+                                // top-level boundary's properties or attach a
+                                // nested one's to the enclosing subprocess.
+                                if let Some(name) = attr(attrs, "name") {
                                     let value = attr(attrs, "value").unwrap_or("").to_string();
-                                    acc.nodes[idx].properties.insert(name.to_string(), value);
+                                    if let Some(boundary) = cur_boundary.as_mut() {
+                                        boundary.properties.insert(name.to_string(), value);
+                                    } else if let Some(&idx) = io_stack.last() {
+                                        acc.nodes[idx].properties.insert(name.to_string(), value);
+                                    }
                                 }
                             }
                             // zeebe:header key="…" value="…" inside a

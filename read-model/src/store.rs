@@ -57,12 +57,15 @@ const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
 /// The schema version that introduced `message_start_subscriptions` (the
 /// definition-scoped message start event subscriptions carrying the MCP tool
-/// metadata, #1499). Purely additive (a new table): a database migrated across
-/// it starts with the table empty and the next deployment's
-/// `MessageStartSubscriptionCreated` (or the #732 engine-state reprojection)
-/// populates it.
-#[allow(dead_code)]
+/// metadata, #1499). A database migrated across it starts with the table empty
+/// while the warm cursor keeps the already-deployed subscriptions' creation
+/// events below it, so the migration flags an engine-state backfill
+/// ([`MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY`]).
 const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 14;
+/// `meta` key flagging that `message_start_subscriptions` awaits an
+/// engine-state backfill (see [`ReadStore::backfill_pending_event_waits`]).
+const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
+    "message_start_subscriptions_backfill_pending";
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -1576,6 +1579,11 @@ pub struct MessageSubscriptionRow {
 /// tool metadata the start event declared via `zeebe:properties`
 /// (`io.camunda.tool:*`).
 pub struct MessageStartSubscriptionRow {
+    /// The stable, unique `messageSubscriptionKey` of this subscription,
+    /// derived by [`message_start_subscription_key`] from
+    /// `(process_definition_key, message_name)`. A process may declare several
+    /// message start events, so the definition key alone is not unique.
+    pub subscription_key: Key,
     /// The BPMN message name that triggers a new instance (the primary key).
     pub message_name: String,
     /// The definition (and version) whose instances this start event creates.
@@ -2104,6 +2112,16 @@ impl ReadStore {
         // and then returned to `Created` before the upgrade, whose activation
         // instant is unrecoverable) is closed by the v13 durable-position
         // backfill below, which holds any replay at or below the warm cursor.
+        // `message_start_subscriptions` (v14) is likewise projected from
+        // creation events only: flag the same boot-time engine-state backfill
+        // so already-deployed message start subscriptions are not missing
+        // from search after a warm upgrade.
+        if stored_version.is_none_or(|v| v < MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION) {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+        }
         if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
             conn.execute(
                 "UPDATE jobs SET last_event_identity_ms = \
@@ -2383,9 +2401,10 @@ impl ReadStore {
         restored
     }
 
-    /// Backfills `event_waits` from the boot engine `state` if this store was
-    /// migrated from a schema predating it (see [`Self::ensure_schema_on`]),
-    /// then clears the pending flag. Call it BEFORE replaying the journal tail
+    /// Backfills `event_waits` (and, independently, `message_start_subscriptions`)
+    /// from the boot engine `state` if this store was migrated from a schema
+    /// predating it (see [`Self::ensure_schema_on`]), then clears the pending
+    /// flag(s). Call it BEFORE replaying the journal tail
     /// the `state` already reflects: replaying a `*Created` for a backfilled
     /// wait is a no-op and a later settle event deletes it, so the result
     /// matches a full projection. Returns whether a backfill ran.
@@ -2411,8 +2430,23 @@ impl ReadStore {
                 params![EVENT_WAITS_BACKFILL_KEY],
             )?;
         }
+        let start_pending = tx
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if start_pending {
+            project_message_start_subscriptions_from_state(&tx, state, now_ms())?;
+            tx.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+        }
         tx.commit()?;
-        Ok(pending)
+        Ok(pending || start_pending)
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
@@ -3558,6 +3592,28 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
     })
 }
 
+/// The canonical `messageSubscriptionKey` of a definition-scoped message start
+/// subscription (#1499): a deterministic FNV-1a hash of
+/// `(process_definition_key, message_name)`. Stable across restarts and
+/// reseeds (it depends only on the subscription's identity), unique per start
+/// event of a definition, and confined to `[2^62, 2^63)` so it stays a
+/// positive `i64` and is disjoint from engine-allocated keys (which are far
+/// below `2^62`).
+pub fn message_start_subscription_key(process_definition_key: Key, message_name: &str) -> Key {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in process_definition_key
+        .to_le_bytes()
+        .iter()
+        .chain(message_name.as_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(PRIME);
+    }
+    (h & ((1u64 << 62) - 1)) | (1u64 << 62)
+}
+
 /// Column list for `message_start_subscriptions` selects.
 const MESSAGE_START_SUBSCRIPTION_COLS: &str = "message_name, process_definition_key, process_id, \
      start_element_id, tool_name, tool_properties, created_at_ms";
@@ -3565,9 +3621,12 @@ const MESSAGE_START_SUBSCRIPTION_COLS: &str = "message_name, process_definition_
 fn map_message_start_subscription(
     r: &rusqlite::Row,
 ) -> rusqlite::Result<MessageStartSubscriptionRow> {
+    let message_name: String = r.get(0)?;
+    let process_definition_key = r.get::<_, i64>(1)? as Key;
     Ok(MessageStartSubscriptionRow {
-        message_name: r.get(0)?,
-        process_definition_key: r.get::<_, i64>(1)? as Key,
+        subscription_key: message_start_subscription_key(process_definition_key, &message_name),
+        message_name,
+        process_definition_key,
         process_id: r.get(2)?,
         start_element_id: r.get(3)?,
         tool_name: r.get(4)?,
@@ -4465,33 +4524,81 @@ fn project_engine_state(
     // 11) Message start event subscriptions (definition-scoped, #1499). These
     //     never settle, so every one held in engine state is live; project them
     //     all, keyed by message name like the event projector.
-    for sub in state.message_start_subscriptions.values() {
-        let tool_properties_json =
-            serde_json::to_string(&sub.tool_properties).unwrap_or_else(|_| "{}".to_string());
-        tx.cexecute(
-            "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
-             process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(message_name) DO UPDATE SET \
-             process_definition_key = excluded.process_definition_key, \
-             process_id = excluded.process_id, \
-             start_element_id = excluded.start_element_id, \
-             tool_name = excluded.tool_name, \
-             tool_properties = excluded.tool_properties, \
-             created_at_ms = excluded.created_at_ms",
-            params![
-                sub.message_name,
-                sub.process_definition_key as i64,
-                sub.process_id,
-                sub.start_element_id,
-                sub.tool_name,
-                tool_properties_json,
-                now_ms as i64,
-            ],
-        )?;
-    }
+    project_message_start_subscriptions_from_state(tx, state, now_ms)?;
 
     project_event_waits_from_state(tx, state)
+}
+
+/// Projects every message start subscription held by the live engine `state`
+/// (definition-scoped, never settle — so all are live). Shared by the #732
+/// reseed and the schema-v14 upgrade backfill
+/// ([`ReadStore::backfill_pending_event_waits`]); idempotent.
+fn project_message_start_subscriptions_from_state(
+    tx: &rusqlite::Transaction,
+    state: &nanobpmn_engine_core::State,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    for sub in state.message_start_subscriptions.values() {
+        upsert_message_start_subscription(
+            tx,
+            &sub.message_name,
+            sub.process_definition_key,
+            &sub.process_id,
+            &sub.start_element_id,
+            sub.tool_name.as_deref(),
+            &sub.tool_properties,
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// The single upsert for a `message_start_subscriptions` row, shared by the
+/// event projector and the engine-state seed/backfill.
+///
+/// Replay-safe under `ReadStore::export`'s overlapping-prefix contract: a row
+/// is only replaced by a **strictly newer** definition (process definition
+/// keys are allocated monotonically, so a later deployment always carries a
+/// larger key). Replaying the same or an older deployment's creation is a
+/// no-op — it neither regresses the definition/tool metadata nor re-stamps
+/// `created_at_ms` (`lastUpdatedDate`). The ordering is durable in the row
+/// itself, so it holds equally after a snapshot seed.
+#[allow(clippy::too_many_arguments)]
+fn upsert_message_start_subscription(
+    tx: &rusqlite::Transaction,
+    message_name: &str,
+    process_definition_key: Key,
+    process_id: &str,
+    start_element_id: &str,
+    tool_name: Option<&str>,
+    tool_properties: &std::collections::BTreeMap<String, String>,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    let tool_properties_json =
+        serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
+    tx.cexecute(
+        "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
+         process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(message_name) DO UPDATE SET \
+         process_definition_key = excluded.process_definition_key, \
+         process_id = excluded.process_id, \
+         start_element_id = excluded.start_element_id, \
+         tool_name = excluded.tool_name, \
+         tool_properties = excluded.tool_properties, \
+         created_at_ms = excluded.created_at_ms \
+         WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key",
+        params![
+            message_name,
+            process_definition_key as i64,
+            process_id,
+            start_element_id,
+            tool_name,
+            tool_properties_json,
+            now_ms as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Projects every open timer / signal / conditional wait held by the live engine
@@ -5137,28 +5244,15 @@ fn project_event(
             tool_name,
             tool_properties,
         } => {
-            let tool_properties_json =
-                serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
-            tx.cexecute(
-                "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
-                 process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(message_name) DO UPDATE SET \
-                 process_definition_key = excluded.process_definition_key, \
-                 process_id = excluded.process_id, \
-                 start_element_id = excluded.start_element_id, \
-                 tool_name = excluded.tool_name, \
-                 tool_properties = excluded.tool_properties, \
-                 created_at_ms = excluded.created_at_ms",
-                params![
-                    message_name,
-                    *process_definition_key as i64,
-                    process_id,
-                    start_element_id,
-                    tool_name,
-                    tool_properties_json,
-                    now_ms as i64,
-                ],
+            upsert_message_start_subscription(
+                tx,
+                message_name,
+                *process_definition_key,
+                process_id,
+                start_element_id,
+                tool_name.as_deref(),
+                tool_properties,
+                now_ms,
             )?;
         }
 
@@ -5245,10 +5339,15 @@ fn project_event(
         // message name / correlation key itself. The start event has not been
         // activated yet, so its element instance key is unknown (0). The
         // business id is snapshotted from the instance the message created
-        // (projected by the preceding `ProcessInstanceCreated`).
+        // (projected by the preceding `ProcessInstanceCreated`). The
+        // subscription key is the canonical derived start-subscription key
+        // ([`message_start_subscription_key`]) — the same identity the
+        // `START_EVENT` search rows carry — rather than the event's
+        // definition-key placeholder, which is shared by every message start
+        // event of one definition (#1499).
         Event::MessageStartEventCorrelated {
             message_key,
-            subscription_key,
+            process_definition_key,
             instance_key,
             element_id,
             message_name,
@@ -5263,7 +5362,7 @@ fn project_event(
                  ON CONFLICT(message_key, subscription_key) DO NOTHING",
                 params![
                     *message_key as i64,
-                    *subscription_key as i64,
+                    message_start_subscription_key(*process_definition_key, message_name) as i64,
                     *instance_key as i64,
                     element_id,
                     message_name,
@@ -9477,6 +9576,102 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn message_start_subscription_keys_are_unique_per_start_event_and_stable() {
+        let a = super::message_start_subscription_key(7, "order");
+        let b = super::message_start_subscription_key(7, "refund");
+        assert_ne!(
+            a, b,
+            "two start events of one definition need distinct keys"
+        );
+        assert_eq!(a, super::message_start_subscription_key(7, "order"));
+        assert_ne!(a, super::message_start_subscription_key(8, "order"));
+        assert!((1 << 62..1 << 63).contains(&a));
+    }
+
+    fn start_created(def_key: super::Key, tool: &str) -> Event {
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key: def_key,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: "s".into(),
+            tool_name: Some(tool.into()),
+            tool_properties: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn replaying_older_or_duplicate_message_start_creations_leaves_the_row_unchanged() {
+        let store = ReadStore::open(None).unwrap();
+        replay_at(&store, &start_created(20, "new"), 1, 1_000);
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.process_definition_key, r.tool_name, r.created_at_ms)
+        };
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Duplicate replay: no re-stamp of lastUpdatedDate.
+        replay_at(&store, &start_created(20, "new"), 1, 5_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Older deployment replay: no regression of definition/tool metadata.
+        replay_at(&store, &start_created(10, "old"), 0, 6_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // A genuine later deployment replaces it.
+        replay_at(&store, &start_created(30, "newer"), 2, 7_000);
+        assert_eq!(row(&store), (30, Some("newer".into()), 7_000));
+    }
+
+    #[test]
+    fn upgrading_from_before_message_start_subscriptions_backfills_them_from_engine_state() {
+        use nanobpmn_engine_core::{MessageStartSubscription, State};
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-msg-start-backfill-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(
+            !store
+                .backfill_pending_event_waits(&State::default())
+                .unwrap()
+        );
+        // Wind it back to a v13 store (no `message_start_subscriptions`).
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(store.message_start_subscriptions().is_empty());
+        let mut state = State::default();
+        state.message_start_subscriptions.insert(
+            "go".into(),
+            MessageStartSubscription {
+                process_definition_key: 5,
+                process_id: "p".into(),
+                message_name: "go".into(),
+                start_element_id: "s".into(),
+                tool_name: Some("tool".into()),
+                tool_properties: std::collections::BTreeMap::new(),
+            },
+        );
+        assert!(store.backfill_pending_event_waits(&state).unwrap());
+        let rows = store.message_start_subscriptions();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("tool"));
+        // The flag is cleared: the backfill runs once.
+        assert!(!store.backfill_pending_event_waits(&state).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn upgrading_from_before_event_waits_backfills_live_waits_from_the_engine_state() {
         use nanobpmn_engine_core::{
             ConditionalSubscription, MessageSubscriptionKind, MessageSubscriptionState, State,
@@ -13230,7 +13425,11 @@ mod element_instance_tests {
         let row = &corr[0];
         assert_eq!(
             (row.message_key, row.subscription_key, row.instance_key),
-            (55, 900, 7001)
+            (
+                55,
+                super::message_start_subscription_key(900, "order-placed"),
+                7001
+            )
         );
         assert_eq!(row.element_instance_key, 0, "start event not yet activated");
         assert_eq!(row.element_id, "start");
