@@ -111,6 +111,15 @@ fn engine_state(engine: &Engine, key: Key, n: usize) -> Json {
     let inst = engine
         .instance(key)
         .expect("instance present (parked at sink)");
+    // Teardown guard: every non-root variable scope must belong to a live
+    // element instance, so a child/body scope leaked past completion fails the
+    // replay instead of projecting as null/empty.
+    for k in inst.scope_variables.keys().chain(inst.scope_parents.keys()) {
+        assert!(
+            inst.active.contains_key(k),
+            "stale variable scope {k} outlived its element instance"
+        );
+    }
     let mi = inst.multi_instances.values().next();
     let mut children = serde_json::Map::new();
     let mut collected = vec![json!("undef"); n];

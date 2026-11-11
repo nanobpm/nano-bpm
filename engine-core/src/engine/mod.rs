@@ -12039,12 +12039,19 @@ impl Engine {
         ));
         // A script task's (or business rule task's) result is merged before output
         // mappings so a `zeebe:output` can reference/remap it (Zeebe merges
-        // `resultVariable` first, then applies output mappings).
+        // `resultVariable` first, then applies output mappings). Like a job
+        // result, the write starts at the task's completion scope — for a
+        // multi-instance inner instance the child itself, which owns the
+        // `inputElement`/`loopCounter`/seeded `outputElement` locals — and
+        // propagates to the nearest ancestor scope defining the name, defaulting
+        // to root. A root-only write would be shadowed by the child's seeded
+        // null, so an MI sub-process running a script whose `resultVariable`
+        // feeds the loop's `outputElement` would collect null for every child
+        // (#1530 review). Root-only instances still collapse to the legacy flat
+        // `VariablesUpdated`, keeping their journals byte-identical.
         if let Some(update) = &script_update {
-            events.push(Event::VariablesUpdated {
-                instance_key,
-                variables: update.clone(),
-            });
+            let flow_scope = self.completion_scope(instance_key, element_instance_key);
+            events.extend(self.propagated_updates(instance_key, flow_scope, update.clone(), false));
         }
         // Output mappings (zeebe:output): merge the projection evaluated above
         // (before the completion events) into the element's enclosing (flow) scope
