@@ -171,3 +171,15 @@ test("emitEvent retries back off (base doubling, capped) before giving up", asyn
     await stub.close();
   }
 });
+
+test("emitEvent preserves an explicit JSON null body; only undefined defaults to {}", async () => {
+  const stub = await stubIngress([[202, '{"enqueued":true}']]);
+  try {
+    await emitEvent(stub.url, null, { sleep: noSleep });
+    await emitEvent(stub.url, undefined, { sleep: noSleep });
+    assertEquals(stub.seen[0].body, "null");
+    assertEquals(stub.seen[1].body, "{}");
+  } finally {
+    await stub.close();
+  }
+});

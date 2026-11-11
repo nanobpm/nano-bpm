@@ -2272,6 +2272,13 @@ await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 600
 
         // The checked SDK driver retries each failed emit: both events persist
         // (each lands on its second attempt).
+        // Reset the fail-once ledger: both fixtures emit the same event ids, so
+        // without this the SDK driver's first attempts would get 202 and its
+        // retry path would go unexercised.
+        failed_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let sdk = run_driver(TEST_DRIVER_MJS, port).await;
         let after_sdk = persisted.lock().unwrap_or_else(|e| e.into_inner()).len();
         server.abort();

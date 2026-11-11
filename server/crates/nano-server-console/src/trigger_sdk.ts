@@ -78,7 +78,7 @@ export async function emitEvent(
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (opts.token) headers["x-webhook-token"] = opts.token;
   if (opts.idempotencyKey) headers["idempotency-key"] = opts.idempotencyKey;
-  const payload = JSON.stringify(body ?? {});
+  const payload = JSON.stringify(body === undefined ? {} : body);
 
   let lastStatus = 0;
   let lastDetail = "no attempt made";
