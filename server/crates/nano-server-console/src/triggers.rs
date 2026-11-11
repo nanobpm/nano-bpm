@@ -1905,10 +1905,50 @@ mod tests {
 
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
 
-    /// A dependency-free Node trigger driver: it reads the env contract, POSTs
-    /// two distinct events to the ingress, then stays alive (so the supervisor
-    /// doesn't treat its exit as a crash and respawn it).
+    /// A dependency-free Node trigger driver: it reads the env contract and
+    /// emits two distinct events to the ingress through a **checked, retrying
+    /// emit** (the `emitEvent` contract from `trigger_sdk.ts`, inlined so the
+    /// driver stays self-contained — a pack driver runs with the pack dir as
+    /// its cwd and cannot resolve the project's `nano-generated/` SDK). A 2xx
+    /// means durably persisted (persist-before-ack); a non-2xx / transport
+    /// failure is retried with backoff and then thrown, so the unhandled
+    /// rejection exits the driver non-zero — a failed emit is loud (the
+    /// supervisor logs the crash), never the silent drop of #1543. It then
+    /// stays alive (so the supervisor doesn't treat its exit as a crash and
+    /// respawn it).
     const TEST_DRIVER_MJS: &str = r#"
+const env = process.env;
+const url = env.NANOBPMN_HOOK_URL;
+const token = env.NANOBPMN_WEBHOOK_TOKEN;
+const cfg = JSON.parse(env.NANOBPMN_TRIGGER_CONFIG || "{}");
+async function emit(body, idem) {
+  const headers = { "content-type": "application/json", "idempotency-key": idem };
+  if (token) headers["x-webhook-token"] = token;
+  let last = "no attempt";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+      if (res.ok) return;
+      last = `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`;
+    } catch (e) {
+      last = `transport: ${e && e.message ? e.message : e}`;
+    }
+    await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** attempt, 4000)));
+  }
+  throw new Error(`emit failed after retries: ${last}`);
+}
+for (let i = 0; i < 2; i++) {
+  await emit({ n: i, topic: cfg.topic }, `evt-${i}`);
+}
+await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 60000)));
+"#;
+
+    /// The pre-#1543 fire-and-forget driver: it POSTs each event and **ignores
+    /// the response**, so a non-2xx (or a rejected `fetch`) loses the event with
+    /// no trace. Kept as the defect-class fixture: pointed at a failing ingress,
+    /// it drops an event that the checked driver above retries to durability —
+    /// the red/green pair proving the contract fix, not just the test fix.
+    const LEGACY_DRIVER_MJS: &str = r#"
 const env = process.env;
 const url = env.NANOBPMN_HOOK_URL;
 const token = env.NANOBPMN_WEBHOOK_TOKEN;
@@ -1918,7 +1958,7 @@ for (let i = 0; i < 2; i++) {
   if (token) headers["x-webhook-token"] = token;
   await fetch(url, { method: "POST", headers, body: JSON.stringify({ n: i, topic: cfg.topic }) });
 }
-await new Promise((r) => setTimeout(r, 60000));
+await new Promise((r) => setTimeout(r, Number(env.NANOBPMN_DRIVER_TAIL_MS || 60000)));
 "#;
 
     /// End-to-end: an installed pack declaring a source `kind` with a `driver`
@@ -1991,16 +2031,29 @@ await new Promise((r) => setTimeout(r, 60000));
         let handle = LoopHandle::new_running();
         crate::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
 
-        // Poll until both events land in the inbox (or time out ~10s).
-        let mut pending = 0;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll until both events are durably in the inbox, on a **deadline**
+        // (not an iteration count — each `inbox_status` is a spawned data-op
+        // round-trip whose cost varies with load, so N iterations is not a
+        // time budget). Assert on the *total* persisted — `pending + done +
+        // failed` — keyed by the events' idempotency keys, not on `pending`
+        // alone: a dispatcher drain moves a row out of `pending`, so a
+        // `pending`-only count can read 1 even when both events landed (the
+        // hypothesis-2 reclassification the #1543 failure could not rule out).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut last = (0i64, 0i64, 0i64);
+        let mut persisted = 0i64;
+        loop {
             if let Ok(s) = inbox_status(&name).await {
-                pending = s.pending;
-                if pending >= 2 {
+                last = (s.pending, s.done, s.failed);
+                persisted = s.pending + s.done + s.failed;
+                if persisted >= 2 {
                     break;
                 }
             }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         handle.stop_for_test();
@@ -2011,8 +2064,10 @@ await new Promise((r) => setTimeout(r, 60000));
         let _ = std::fs::remove_dir_all(&ext_root);
 
         assert_eq!(
-            pending, 2,
-            "the auto-launched pack driver emitted two events over the ingress"
+            persisted, 2,
+            "the auto-launched pack driver must durably emit two events over the ingress \
+             (pending={}, done={}, failed={}): a non-2xx emit is retried, never silently dropped",
+            last.0, last.1, last.2
         );
     }
 
@@ -2094,6 +2149,137 @@ await new Promise((r) => setTimeout(r, 60000));
         assert_eq!(
             pending, 0,
             "an untrusted pack's trigger driver must not launch or emit"
+        );
+    }
+
+    /// Defect-class guard for #1543: a pack driver that **ignores** the ingress
+    /// response (the pre-#1543 contract) silently drops an event when the emit
+    /// fails; the checked, retrying emit (the `emitEvent` contract, inlined in
+    /// `TEST_DRIVER_MJS`) retries the same failure to durability. Deterministic
+    /// — no reliance on SQLite contention timing: a stub ingress fails the first
+    /// POST of each idempotency key with a 500 (the #1287
+    /// `SQLITE_BUSY`-surfacing-as-5xx class) and acks the retry, and each driver
+    /// variant runs against it in turn.
+    ///
+    /// - `LEGACY_DRIVER_MJS` (fire-and-forget) persists nothing: every first
+    ///   POST is failed and, because it never inspects the response, no event
+    ///   is retried — the #1543 silent drop.
+    /// - `TEST_DRIVER_MJS` (the checked emit) persists **both**: each failed
+    ///   emit lands on its retry.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pack_driver_sdk_recovers_a_failed_emit_that_the_legacy_driver_drops() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+
+        // A stub ingress that 500s the first POST of each idempotency key and
+        // 202s the retry, recording every persisted key. This is the failure
+        // the merge-queue run hit: the inbox write contended and the ingress
+        // returned non-2xx.
+        use std::collections::HashSet;
+        let failed_once = std::sync::Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let app = {
+            let failed_once = failed_once.clone();
+            let persisted = persisted.clone();
+            axum::Router::new().route(
+                "/hook",
+                axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                    let failed_once = failed_once.clone();
+                    let persisted = persisted.clone();
+                    async move {
+                        let key = headers
+                            .get("idempotency-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        // Fail the first attempt of each key; ack the retry.
+                        let mut failed = failed_once.lock().unwrap_or_else(|e| e.into_inner());
+                        if failed.insert(key.clone()) {
+                            drop(failed);
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "database is locked".to_string(),
+                            );
+                        }
+                        drop(failed);
+                        persisted
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(key);
+                        (axum::http::StatusCode::ACCEPTED, body)
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        // Run one driver variant against the stub and return its exit output.
+        // Both drivers are self-contained (no SDK import), so a bare temp dir
+        // suffices — matching how a real pack driver runs from its pack dir.
+        async fn run_driver(driver_src: &str, port: u16) -> std::process::Output {
+            let dir = std::env::temp_dir().join(format!(
+                "nano-trig-driver-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("driver.mjs"), driver_src).unwrap();
+            let node = workers::usable_node().expect("a JS runtime");
+            let out = tokio::process::Command::new(node)
+                .current_dir(&dir)
+                .arg("driver.mjs")
+                .env("NO_COLOR", "1")
+                .env("NANOBPMN_HOOK_URL", format!("http://127.0.0.1:{port}/hook"))
+                .env("NANOBPMN_TRIGGER_CONFIG", "{}")
+                .env("NANOBPMN_PROJECT", "p")
+                .env("NANOBPMN_TRIGGER_ID", "sensor")
+                .env("NANOBPMN_TRIGGER_TYPE", "testmqtt")
+                // Cut the driver's stay-alive tail: we only need its two emits.
+                .env("NANOBPMN_DRIVER_TAIL_MS", "50")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await
+                .expect("run driver");
+            let _ = std::fs::remove_dir_all(&dir);
+            out
+        }
+
+        // The legacy fire-and-forget driver drops BOTH events: each first POST
+        // is 500'd, and because it never inspects the response nothing retries
+        // them. This is the #1543 silent drop, reproduced deterministically.
+        let before = persisted.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let legacy = run_driver(LEGACY_DRIVER_MJS, port).await;
+        let after_legacy = persisted.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(
+            after_legacy - before,
+            0,
+            "the fire-and-forget driver silently drops every event whose first POST failed \
+             (legacy exit status: {:?})",
+            legacy.status.code()
+        );
+
+        // The checked SDK driver retries each failed emit: both events persist
+        // (each lands on its second attempt).
+        let sdk = run_driver(TEST_DRIVER_MJS, port).await;
+        let after_sdk = persisted.lock().unwrap_or_else(|e| e.into_inner()).len();
+        server.abort();
+        assert_eq!(
+            after_sdk - after_legacy,
+            2,
+            "the emitEvent contract retries a failed emit to durability (sdk exit status: {:?})",
+            sdk.status.code()
         );
     }
 
