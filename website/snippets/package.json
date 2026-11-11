@@ -8,8 +8,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@nanobpm/nano-agent-graph-engine": "0.15.0",
-    "@nanobpm/workflow": "0.7.0",
+    "@nanobpm/nano-agent-graph-engine": "^0.18.0",
+    "@nanobpm/workflow": "^0.19.0",
     "typescript": "^5.6.0"
   }
 }
