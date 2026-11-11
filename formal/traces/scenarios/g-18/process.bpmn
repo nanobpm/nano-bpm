@@ -19,9 +19,7 @@
     <bpmn:sequenceFlow id="f4" sourceRef="t6" targetRef="pj5" />
     <bpmn:sequenceFlow id="f5" sourceRef="p4" targetRef="t7" />
     <bpmn:sequenceFlow id="f6" sourceRef="m9" targetRef="pj5" />
-    <bpmn:sequenceFlow id="f7" sourceRef="ss11" targetRef="w12" />
-    <bpmn:sequenceFlow id="f8" sourceRef="w12" targetRef="se13" />
-    <bpmn:subProcess id="mi10"><bpmn:multiInstanceLoopCharacteristics isSequential="true"><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items13" inputElement="item" outputCollection="out13" outputElement="=item" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss11" /><bpmn:intermediateCatchEvent id="w12"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:endEvent id="se13" /></bpmn:subProcess>
+    <bpmn:subProcess id="mi10"><bpmn:multiInstanceLoopCharacteristics isSequential="true"><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items13" inputElement="item" outputCollection="out13" outputElement="=item" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss11" /><bpmn:intermediateCatchEvent id="w12"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:endEvent id="se13" /><bpmn:sequenceFlow id="f7" sourceRef="ss11" targetRef="w12" /><bpmn:sequenceFlow id="f8" sourceRef="w12" targetRef="se13" /></bpmn:subProcess>
     <bpmn:parallelGateway id="pj2" />
     <bpmn:sequenceFlow id="f9" sourceRef="p1" targetRef="mi3" />
     <bpmn:sequenceFlow id="f10" sourceRef="mi3" targetRef="pj2" />
@@ -30,9 +28,7 @@
     <bpmn:sequenceFlow id="f13" sourceRef="p1" targetRef="mi10" />
     <bpmn:sequenceFlow id="f14" sourceRef="mi10" targetRef="pj2" />
     <bpmn:parallelGateway id="p14" />
-    <bpmn:sequenceFlow id="f15" sourceRef="ss17" targetRef="t18" />
-    <bpmn:sequenceFlow id="f16" sourceRef="t18" targetRef="se19" />
-    <bpmn:subProcess id="mi16"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items19" inputElement="item" outputCollection="out19" outputElement="=item" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss17" /><bpmn:serviceTask id="t18"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t18_&quot; + string(loopCounter)" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se19" /></bpmn:subProcess>
+    <bpmn:subProcess id="mi16"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items19" inputElement="item" outputCollection="out19" outputElement="=item" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss17" /><bpmn:serviceTask id="t18"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t18_&quot; + string(loopCounter)" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se19" /><bpmn:sequenceFlow id="f15" sourceRef="ss17" targetRef="t18" /><bpmn:sequenceFlow id="f16" sourceRef="t18" targetRef="se19" /></bpmn:subProcess>
     <bpmn:intermediateCatchEvent id="c20"><bpmn:messageEventDefinition messageRef="Message_msg20" /></bpmn:intermediateCatchEvent>
     <bpmn:exclusiveGateway id="x21" default="f19" />
     <bpmn:serviceTask id="t23"><bpmn:extensionElements><zeebe:taskDefinition type="t23" /><zeebe:ioMapping><zeebe:output source="=result" target="o23" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask>

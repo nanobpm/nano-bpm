@@ -65,11 +65,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
-      # The pinned camunda checkout + engine build (capture.sh caches it).
+      # The pinned camunda checkout + engine build (capture.sh caches it),
+      # cached TOGETHER with the Maven repository its saved classpath points
+      # into: restoring the build stamp + `.nano-traces-classpath` without
+      # ~/.m2 makes capture.sh skip Maven and hand javac missing JAR paths.
+      # The `-m2` key suffix invalidates older caches that lacked ~/.m2.
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/nano-zeebe-traces
-          key: zeebe-traces-${{ hashFiles('formal/parity/zeebe-pin.json') }}
+          path: |
+            ~/.cache/nano-zeebe-traces
+            ~/.m2/repository
+          key: zeebe-traces-m2-${{ hashFiles('formal/parity/zeebe-pin.json') }}
       - name: Resolve seeds
         id: seeds
         run: |

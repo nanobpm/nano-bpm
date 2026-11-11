@@ -153,3 +153,38 @@ test('the allowlist ratchet refuses masking a seed that already passed', async (
   // a base without the budget (pre-#1521) accepts anything
   assert.deepEqual(ratchetViolations({ baseAllowlist: null, baseBudget: null, headAllowlist: { entries: [entry('g-1')] } }), [])
 })
+
+/** Maps every `id` to the id of its innermost enclosing process/subProcess. */
+function containers (xml) {
+  const owner = new Map()
+  const stack = []
+  for (const m of xml.matchAll(/<(\/?)bpmn:(\w+)([^>]*?)(\/?)>/g)) {
+    const [, close, tag, attrs, selfClose] = m
+    const container = tag === 'process' || tag === 'subProcess'
+    if (close) { if (container) stack.pop(); continue }
+    const id = /\bid="([^"]+)"/.exec(attrs)?.[1]
+    if (id && stack.length) owner.set(id, stack.at(-1))
+    if (container && !selfClose) stack.push(id)
+  }
+  return owner
+}
+
+test('every sequence flow lives in the container that owns both its endpoints', () => {
+  for (const s of SEEDS) {
+    const { xml } = generateCase(s)
+    const owner = containers(xml)
+    for (const [, id, src, tgt] of xml.matchAll(/<bpmn:sequenceFlow id="([^"]+)" sourceRef="([^"]+)" targetRef="([^"]+)"/g)) {
+      assert.equal(owner.get(id), owner.get(src), `seed ${s}: flow ${id} not in ${src}'s container`)
+      assert.equal(owner.get(id), owner.get(tgt), `seed ${s}: flow ${id} not in ${tgt}'s container`)
+    }
+  }
+})
+
+test('non-trace failures get distinct, normalised signatures (never the empty-trace default)', () => {
+  const empty = signature('')
+  const a = signature('nano could not replay the script: unknown element "x1" at step 3')
+  assert.notEqual(a, empty)
+  assert.notEqual(a, signature('order'))
+  assert.equal(a, signature('nano could not replay the script: unknown element "y9" at step 7'))
+  assert.notEqual(a, signature('nano could not replay the script: deploy rejected'))
+})

@@ -170,7 +170,19 @@ export function shrink (work, tree, verdict) {
  *  wrote at that step — runtime values, keys and ids dropped, so the same
  *  defect found from different seeds/shapes maps to one signature (one issue). */
 export function signature (diff) {
-  const [, z = '{}', n = '{}'] = /zeebe: (.*)\n\s*nano:\s+(.*)/.exec(diff) ?? []
+  const m = /zeebe: (.*)\n\s*nano:\s+(.*)/.exec(diff)
+  if (!m) {
+    // Not a record-level trace diff (e.g. `nano could not replay the script:
+    // …`): fingerprint a NORMALISED failure category — digits, quoted text and
+    // hex keys dropped — never the empty-trace `|order` default, so distinct
+    // failure causes never collapse onto one (already-filed) signature.
+    const category = String(diff).split('\n')[0]
+      .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '_')
+      .replace(/\b[0-9a-f]{8,}\b|\d+/gi, '#')
+      .replace(/\s+/g, ' ').trim()
+    return crypto.createHash('sha256').update(`failure|${category}`).digest('hex').slice(0, 12)
+  }
+  const [, z, n] = m
   const parse = (line) => { try { return JSON.parse(line) } catch { return {} } }
   const zs = parse(z)
   const ns = parse(n)
@@ -256,8 +268,10 @@ function main (argv) {
     if (!v) continue
     diverged++
     console.log(`\nseed ${seed}: DIVERGES\n${v.diff}`)
-    if (!doShrink) continue
-    const best = shrink(work, trees.get(seed), v)
+    // --no-shrink alone is a report-only shortcut; with --emit/--file the
+    // UNSHRUNK tree still goes through emission and filing.
+    if (!doShrink && !doEmit && !doFile) continue
+    const best = doShrink ? shrink(work, trees.get(seed), v) : { tree: trees.get(seed), steps: undefined, verdict: v }
     const name = `fuzz-${seed}`
     const root = path.join(work, `min-${seed}`)
     const c = renderCase(best.tree, best.steps ? { maxSteps: best.steps } : {})

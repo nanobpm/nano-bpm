@@ -31,9 +31,7 @@
     <bpmn:sequenceFlow id="f11" sourceRef="m14" targetRef="pj10" />
     <bpmn:sequenceFlow id="f12" sourceRef="p9" targetRef="w15" />
     <bpmn:sequenceFlow id="f13" sourceRef="t16" targetRef="pj10" />
-    <bpmn:sequenceFlow id="f14" sourceRef="ss18" targetRef="t19" />
-    <bpmn:sequenceFlow id="f15" sourceRef="t19" targetRef="se20" />
-    <bpmn:subProcess id="mi17"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items20" inputElement="item" outputCollection="out20" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss18" /><bpmn:serviceTask id="t19"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t19_&quot; + string(loopCounter)" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se20" /></bpmn:subProcess>
+    <bpmn:subProcess id="mi17"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items20" inputElement="item" outputCollection="out20" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss18" /><bpmn:serviceTask id="t19"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t19_&quot; + string(loopCounter)" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se20" /><bpmn:sequenceFlow id="f14" sourceRef="ss18" targetRef="t19" /><bpmn:sequenceFlow id="f15" sourceRef="t19" targetRef="se20" /></bpmn:subProcess>
     <bpmn:sequenceFlow id="f16" sourceRef="pj10" targetRef="mi17" />
     <bpmn:exclusiveGateway id="xj3" />
     <bpmn:sequenceFlow id="f17" sourceRef="x2" targetRef="p4"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x3 = 0</bpmn:conditionExpression></bpmn:sequenceFlow>
@@ -42,10 +40,7 @@
     <bpmn:sequenceFlow id="f20" sourceRef="mi17" targetRef="xj3" />
     <bpmn:sequenceFlow id="f21" sourceRef="t1" targetRef="x2" />
     <bpmn:exclusiveGateway id="x21" default="f39" />
-    <bpmn:sequenceFlow id="f22" sourceRef="ca25" targetRef="w29" />
-    <bpmn:sequenceFlow id="f23" sourceRef="ss24" targetRef="ca25" />
-    <bpmn:sequenceFlow id="f24" sourceRef="w29" targetRef="se30" />
-    <bpmn:subProcess id="s23"><bpmn:startEvent id="ss24" /><bpmn:callActivity id="ca25"><bpmn:extensionElements><zeebe:calledElement processId="fuzz_ca25" propagateAllParentVariables="false" propagateAllChildVariables="false" /><zeebe:ioMapping><zeebe:input source="=cfg" target="cfg" /><zeebe:output source="=result" target="o25" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:callActivity><bpmn:intermediateCatchEvent id="w29"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:endEvent id="se30" /></bpmn:subProcess>
+    <bpmn:subProcess id="s23"><bpmn:startEvent id="ss24" /><bpmn:callActivity id="ca25"><bpmn:extensionElements><zeebe:calledElement processId="fuzz_ca25" propagateAllParentVariables="false" propagateAllChildVariables="false" /><zeebe:ioMapping><zeebe:input source="=cfg" target="cfg" /><zeebe:output source="=result" target="o25" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:callActivity><bpmn:intermediateCatchEvent id="w29"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:sequenceFlow id="f22" sourceRef="ca25" targetRef="w29" /><bpmn:endEvent id="se30" /><bpmn:sequenceFlow id="f23" sourceRef="ss24" targetRef="ca25" /><bpmn:sequenceFlow id="f24" sourceRef="w29" targetRef="se30" /></bpmn:subProcess>
     <bpmn:serviceTask id="t31"><bpmn:extensionElements><zeebe:taskDefinition type="t31" /></bpmn:extensionElements></bpmn:serviceTask>
     <bpmn:sequenceFlow id="f25" sourceRef="s23" targetRef="t31" />
     <bpmn:exclusiveGateway id="x32" default="f32" />

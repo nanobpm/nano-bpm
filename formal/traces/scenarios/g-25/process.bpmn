@@ -12,9 +12,7 @@
     <bpmn:sequenceFlow id="f3" sourceRef="x2" targetRef="t5" />
     <bpmn:sequenceFlow id="f4" sourceRef="t5" targetRef="xj3" />
     <bpmn:sequenceFlow id="f5" sourceRef="mi1" targetRef="x2" />
-    <bpmn:sequenceFlow id="f6" sourceRef="ss7" targetRef="t8" />
-    <bpmn:sequenceFlow id="f7" sourceRef="t8" targetRef="se9" />
-    <bpmn:subProcess id="mi6"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items9" inputElement="item" outputCollection="out9" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss7" /><bpmn:serviceTask id="t8"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t8_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:output source="=result" target="o8" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se9" /></bpmn:subProcess>
+    <bpmn:subProcess id="mi6"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items9" inputElement="item" outputCollection="out9" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss7" /><bpmn:serviceTask id="t8"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t8_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:output source="=result" target="o8" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se9" /><bpmn:sequenceFlow id="f6" sourceRef="ss7" targetRef="t8" /><bpmn:sequenceFlow id="f7" sourceRef="t8" targetRef="se9" /></bpmn:subProcess>
     <bpmn:sequenceFlow id="f8" sourceRef="xj3" targetRef="mi6" />
     <bpmn:endEvent id="end" />
     <bpmn:sequenceFlow id="f9" sourceRef="start" targetRef="mi1" />

@@ -266,16 +266,20 @@ export function renderBpmn (tree) {
   // Layout primitives: each laid-out fragment is
   // { w, h, inY, outY, place(x, y) -> { inPt, outPt } } relative to its box.
   const mkProcess = (pid) => {
-    const lines = []
     const shapes = []
     const edges = []
-    const flow = (from, to, extra = '', pts = null) => {
+    // `P.lines` is re-pointed while a subprocess body is placed, so a flow
+    // must go to the ACTIVE container (`P.lines` at call time), never to a
+    // captured process-level array — otherwise subprocess-internal flows land
+    // outside the container that owns their endpoints (malformed BPMN).
+    const P = { pid, lines: [], shapes, edges }
+    P.flow = (from, to, extra = '', pts = null) => {
       const f = flowId()
-      if (extra) lines.push(`<bpmn:sequenceFlow id="${f}" sourceRef="${from}" targetRef="${to}">${extra}</bpmn:sequenceFlow>`)
-      else lines.push(`<bpmn:sequenceFlow id="${f}" sourceRef="${from}" targetRef="${to}" />`)
+      if (extra) P.lines.push(`<bpmn:sequenceFlow id="${f}" sourceRef="${from}" targetRef="${to}">${extra}</bpmn:sequenceFlow>`)
+      else P.lines.push(`<bpmn:sequenceFlow id="${f}" sourceRef="${from}" targetRef="${to}" />`)
       return { id: f, setPts: (p) => edges.push({ id: f, pts: p }), pts }
     }
-    return { pid, lines, shapes, edges, flow }
+    return P
   }
 
   // ── fragment builders (semantic lines are emitted while placing) ──

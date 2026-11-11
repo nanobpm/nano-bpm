@@ -5,16 +5,7 @@
   <bpmn:process id="fuzz" isExecutable="true">
     <bpmn:startEvent id="start" />
     <bpmn:intermediateCatchEvent id="c1"><bpmn:messageEventDefinition messageRef="Message_msg1" /></bpmn:intermediateCatchEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="t6" targetRef="m8" />
-    <bpmn:sequenceFlow id="f2" sourceRef="b7" targetRef="m8" />
-    <bpmn:sequenceFlow id="f3" sourceRef="x4" targetRef="t6"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x5 = 0</bpmn:conditionExpression></bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="f4" sourceRef="m8" targetRef="xj5" />
-    <bpmn:sequenceFlow id="f5" sourceRef="x4" targetRef="t9" />
-    <bpmn:sequenceFlow id="f6" sourceRef="t9" targetRef="xj5" />
-    <bpmn:sequenceFlow id="f7" sourceRef="xj5" targetRef="w10" />
-    <bpmn:sequenceFlow id="f8" sourceRef="ss3" targetRef="x4" />
-    <bpmn:sequenceFlow id="f9" sourceRef="w10" targetRef="se11" />
-    <bpmn:subProcess id="s2"><bpmn:startEvent id="ss3" /><bpmn:exclusiveGateway id="x4" default="f5" /><bpmn:userTask id="t6"><bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements></bpmn:userTask><bpmn:boundaryEvent id="b7" attachedToRef="t6"><bpmn:messageEventDefinition messageRef="Message_msg7" /></bpmn:boundaryEvent><bpmn:exclusiveGateway id="m8" /><bpmn:serviceTask id="t9"><bpmn:extensionElements><zeebe:taskDefinition type="t9" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:exclusiveGateway id="xj5" /><bpmn:intermediateCatchEvent id="w10"><bpmn:timerEventDefinition><bpmn:timeDuration>PT2M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:endEvent id="se11" /></bpmn:subProcess>
+    <bpmn:subProcess id="s2"><bpmn:startEvent id="ss3" /><bpmn:exclusiveGateway id="x4" default="f5" /><bpmn:userTask id="t6"><bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements></bpmn:userTask><bpmn:boundaryEvent id="b7" attachedToRef="t6"><bpmn:messageEventDefinition messageRef="Message_msg7" /></bpmn:boundaryEvent><bpmn:exclusiveGateway id="m8" /><bpmn:sequenceFlow id="f1" sourceRef="t6" targetRef="m8" /><bpmn:sequenceFlow id="f2" sourceRef="b7" targetRef="m8" /><bpmn:serviceTask id="t9"><bpmn:extensionElements><zeebe:taskDefinition type="t9" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:exclusiveGateway id="xj5" /><bpmn:sequenceFlow id="f3" sourceRef="x4" targetRef="t6"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x5 = 0</bpmn:conditionExpression></bpmn:sequenceFlow><bpmn:sequenceFlow id="f4" sourceRef="m8" targetRef="xj5" /><bpmn:sequenceFlow id="f5" sourceRef="x4" targetRef="t9" /><bpmn:sequenceFlow id="f6" sourceRef="t9" targetRef="xj5" /><bpmn:intermediateCatchEvent id="w10"><bpmn:timerEventDefinition><bpmn:timeDuration>PT2M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:sequenceFlow id="f7" sourceRef="xj5" targetRef="w10" /><bpmn:endEvent id="se11" /><bpmn:sequenceFlow id="f8" sourceRef="ss3" targetRef="x4" /><bpmn:sequenceFlow id="f9" sourceRef="w10" targetRef="se11" /></bpmn:subProcess>
     <bpmn:sequenceFlow id="f10" sourceRef="c1" targetRef="s2" />
     <bpmn:parallelGateway id="p12" />
     <bpmn:intermediateCatchEvent id="w14"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>

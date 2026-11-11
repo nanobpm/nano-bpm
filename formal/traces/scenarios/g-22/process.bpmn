@@ -40,10 +40,7 @@
     <bpmn:sequenceFlow id="f18" sourceRef="x2" targetRef="i13" />
     <bpmn:sequenceFlow id="f19" sourceRef="t20" targetRef="xj3" />
     <bpmn:sequenceFlow id="f20" sourceRef="t1" targetRef="x2" />
-    <bpmn:sequenceFlow id="f21" sourceRef="t23" targetRef="w24" />
-    <bpmn:sequenceFlow id="f22" sourceRef="ss22" targetRef="t23" />
-    <bpmn:sequenceFlow id="f23" sourceRef="w24" targetRef="se25" />
-    <bpmn:subProcess id="mi21"><bpmn:multiInstanceLoopCharacteristics isSequential="true"><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items25" inputElement="item" outputCollection="out25" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss22" /><bpmn:serviceTask id="t23"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t23_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:input source="=cfg.ck" target="local" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:intermediateCatchEvent id="w24"><bpmn:timerEventDefinition><bpmn:timeDuration>PT2M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:endEvent id="se25" /></bpmn:subProcess>
+    <bpmn:subProcess id="mi21"><bpmn:multiInstanceLoopCharacteristics isSequential="true"><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items25" inputElement="item" outputCollection="out25" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss22" /><bpmn:serviceTask id="t23"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t23_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:input source="=cfg.ck" target="local" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:intermediateCatchEvent id="w24"><bpmn:timerEventDefinition><bpmn:timeDuration>PT2M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent><bpmn:sequenceFlow id="f21" sourceRef="t23" targetRef="w24" /><bpmn:endEvent id="se25" /><bpmn:sequenceFlow id="f22" sourceRef="ss22" targetRef="t23" /><bpmn:sequenceFlow id="f23" sourceRef="w24" targetRef="se25" /></bpmn:subProcess>
     <bpmn:sequenceFlow id="f24" sourceRef="xj3" targetRef="mi21" />
     <bpmn:endEvent id="end" />
     <bpmn:sequenceFlow id="f25" sourceRef="start" targetRef="t1" />
