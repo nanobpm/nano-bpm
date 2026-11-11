@@ -1001,6 +1001,14 @@ impl PartitionStateMachine {
         })
     }
 
+    /// The partition this state machine replicates.
+    fn partition_id(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .partition_id
+    }
+
     /// A unique per-process, per-partition snapshot directory under the system
     /// temp dir, for in-memory deployments and tests that have no durable log dir
     /// to anchor snapshots to.
@@ -1491,6 +1499,13 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
+        // #1488: publish the per-partition/per-replica snapshot size (+ the
+        // oversize alert) and reap every OTHER superseded artifact still in the
+        // dir — an orphaned older-generation or un-tagged file must not
+        // accumulate until the next process restart sweeps it.
+        let partition_id = self.sm.partition_id();
+        observe_snapshot_file_size(partition_id, self.sm.node_id, snapshot_bytes);
+        reap_superseded_snapshots(&self.sm.snapshot_dir, &path, partition_id, self.sm.node_id);
 
         let tokio_file = tokio::fs::File::open(&path)
             .await
@@ -1911,6 +1926,17 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         write_snapshot_ptr(&self.snapshot_dir, &stored)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // #1488: publish the installed snapshot's per-partition/per-replica size
+        // (+ the oversize alert) and promptly reap every OTHER superseded
+        // snapshot artifact on this follower — under a catch-up retry loop the
+        // orphaned leftovers are multi-GB each (the #100 follower blowup) and
+        // must not accumulate until the next process restart sweeps them.
+        let partition_id = self.partition_id();
+        let installed_bytes = std::fs::metadata(&stored.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        observe_snapshot_file_size(partition_id, self.node_id, installed_bytes);
+        reap_superseded_snapshots(&self.snapshot_dir, &stored.path, partition_id, self.node_id);
         let previous = self
             .current_snapshot
             .lock()
@@ -1968,6 +1994,105 @@ fn snapshot_build_concurrency() -> u32 {
 /// (`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES`, default 32 MiB).
 fn snapshot_recovery_bytes_threshold() -> u64 {
     raft_env_u64("NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES", 32 * 1024 * 1024)
+}
+
+/// Snapshot-FILE byte ceiling for the oversize alert (#1488): when a partition's
+/// current snapshot `.bin` on this replica exceeds this, the publish helper logs
+/// a WARN naming the partition, the replica, and the size. This is the "cap/alert"
+/// half of #100's residual scope — the #100 blowup wrote 8.4 GB follower
+/// snapshots against a 435 KB leader snapshot of the same partition, and nothing
+/// flagged it until the disk filled. The default (1 GiB) is ~2000x the healthy
+/// per-partition snapshot size observed in that soak, so it fires only on a real
+/// blowup, never on ordinary growth. `0` disables the WARN (the
+/// `nanobpm_raft_snapshot_file_bytes` gauge is still published for a
+/// Prometheus-side threshold alert).
+/// (`NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES`, default 1 GiB.)
+fn snapshot_alert_bytes_threshold() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES", 1024 * 1024 * 1024)
+}
+
+/// Publish one partition's current snapshot-file size on this replica: the
+/// per-partition/per-replica `nanobpm_raft_snapshot_file_bytes` gauge plus the
+/// oversize WARN alert (#1488). Called on every local snapshot build and every
+/// follower snapshot install, so both the leader's and the followers' snapshot
+/// files carry a size series — an oversized snapshot on ONE replica of ONE
+/// partition is then visible per-replica instead of hiding inside the
+/// process-wide `raft_snapshot_bytes` last-write gauge.
+fn observe_snapshot_file_size(partition_id: u64, node_id: NodeId, bytes: u64) {
+    crate::metrics::set_raft_snapshot_file_bytes(partition_id, node_id, bytes);
+    let threshold = snapshot_alert_bytes_threshold();
+    if threshold > 0 && bytes > threshold {
+        tracing::warn!(
+            partition = partition_id,
+            node = node_id,
+            snapshot_bytes = bytes,
+            threshold_bytes = threshold,
+            "Raft snapshot file exceeds the alert threshold \
+             (NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES): an oversized snapshot on one \
+             replica of one partition is the #100 blowup signature — check for \
+             follower snapshot divergence before the disk fills"
+        );
+    }
+}
+
+/// Reap every superseded snapshot artifact in `snapshot_dir` that is not the
+/// CURRENT snapshot `keep` (#1488). `build_snapshot` and `install_snapshot`
+/// unlink only the one file they directly replace, so any older artifact — a
+/// pre-#1473 un-tagged `snap-<idx>.bin`, a same-generation file orphaned by a
+/// crash between the file write and the durable-pointer write, or a
+/// predecessor-generation file a late build/install left behind — accumulated
+/// on the replica until a process restart swept it. Under a catch-up retry
+/// loop those orphans are multi-GB each (the #100 follower blowup), so they are
+/// reaped here, the moment a newer snapshot becomes current, rather than at
+/// the next boot. Only recognized snapshot artifacts (`snap-*.bin` /
+/// `snap-installed-*.bin`) are touched; the durable pointer and foreign files
+/// are left alone. Best-effort: a removal failure is logged, never fatal.
+fn reap_superseded_snapshots(snapshot_dir: &Path, keep: &Path, partition_id: u64, node_id: NodeId) {
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                partition = partition_id,
+                node = node_id,
+                error = %e,
+                "could not list the snapshot dir to reap superseded snapshots"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("snap-"))
+            .unwrap_or(false);
+        if !ours {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    partition = partition_id,
+                    node = node_id,
+                    reaped = ?path,
+                    "reaped a superseded Raft snapshot file"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    partition = partition_id,
+                    node = node_id,
+                    reaped = ?path,
+                    error = %e,
+                    "could not reap a superseded Raft snapshot file"
+                );
+            }
+        }
+    }
 }
 
 /// Whether this node's resident state machine is currently large enough that its
@@ -3537,6 +3662,153 @@ mod tests {
         // Byte threshold disabled (0): only quiescence triggers.
         assert!(!should_compact(200, 100, i64::MAX, 0, Some(150)));
         assert!(should_compact(200, 100, i64::MAX, 0, Some(200)));
+    }
+
+    #[test]
+    fn reap_superseded_snapshots_removes_stale_artifacts_and_keeps_current() {
+        // #1488: the prompt-reaping helper. A snapshot dir holding the current
+        // snapshot plus the stale shapes a real replica accrues — an un-tagged
+        // pre-#1473 file, a predecessor-generation file, a same-generation
+        // orphan — must be reduced to just the current file, while the durable
+        // pointer and foreign files survive.
+        let dir = std::env::temp_dir().join(format!(
+            "nano-reap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create snapshot dir");
+        let keep = dir.join("snap-installed-g3-9.bin");
+        let stale = [
+            dir.join("snap-7.bin"),              // pre-#1473 un-tagged
+            dir.join("snap-g1-3.bin"),           // predecessor generation
+            dir.join("snap-installed-g2-8.bin"), // superseded install
+            dir.join("snap-g3-8.bin"),           // same-generation orphan
+        ];
+        for path in stale.iter().chain(std::iter::once(&keep)) {
+            std::fs::write(path, b"snapshot-bytes").expect("write snapshot file");
+        }
+        let ptr = dir.join("current-snapshot.json");
+        std::fs::write(&ptr, b"{}").expect("write pointer");
+        let foreign = dir.join("notes.txt");
+        std::fs::write(&foreign, b"not ours").expect("write foreign file");
+        let incoming = dir.join(format!("incoming-{}-0.tmp", std::process::id()));
+        std::fs::write(&incoming, b"partial").expect("write in-flight partial");
+
+        reap_superseded_snapshots(&dir, &keep, 0, 0);
+
+        assert!(keep.exists(), "the current snapshot survives");
+        for path in &stale {
+            assert!(!path.exists(), "stale artifact reaped: {path:?}");
+        }
+        assert!(ptr.exists(), "the durable pointer is never reaped");
+        assert!(foreign.exists(), "a foreign file is never reaped");
+        assert!(
+            incoming.exists(),
+            "an in-flight receive is never reaped out from under openraft"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_alert_threshold_defaults_positive() {
+        // #1488: the alert threshold helper. The env var is read per call; the
+        // test env never sets it, so this asserts the documented default (1 GiB,
+        // ~2000x the healthy per-partition snapshot size observed in the #100
+        // soak) — high enough that ordinary growth never pages, low enough that
+        // a multi-GB follower blowup fires immediately.
+        assert_eq!(
+            snapshot_alert_bytes_threshold(),
+            1024 * 1024 * 1024,
+            "the default alert ceiling is 1 GiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_publishes_size_metric_and_reaps_superseded_files() {
+        // #1488 end-to-end at the state-machine surface: a follower installing a
+        // snapshot publishes the per-partition/per-replica size series AND
+        // promptly reaps the superseded snapshot files already in its dir.
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        src.with(|j| {
+            let _ = j
+                .apply_command_at(deploy_command(), 1)
+                .expect("deploy applies");
+        })
+        .await;
+        let mut src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
+        let mut builder = src_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+        let mut reader = snap.snapshot;
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read snapshot body");
+        }
+
+        // The follower: an empty replica whose snapshot dir already holds a
+        // superseded artifact (as a lagging follower's would after earlier
+        // installs / crashed receives).
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let mut dst_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("snapshot dir"));
+        let stale = dst_sm.snapshot_dir.join("snap-g1-1.bin");
+        std::fs::write(&stale, b"stale").expect("write stale snapshot");
+
+        let mut received = dst_sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+        dst_sm
+            .install_snapshot(&snap.meta, received)
+            .await
+            .expect("install snapshot");
+
+        // The superseded file is reaped promptly, the installed snapshot is the
+        // only one left, and the per-partition/per-replica gauge carries the
+        // installed file's size for this replica.
+        assert!(
+            !stale.exists(),
+            "the superseded snapshot was reaped at install time"
+        );
+        let remaining: Vec<_> = std::fs::read_dir(&dst_sm.snapshot_dir)
+            .expect("list snapshot dir")
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(str::to_owned)
+                    .filter(|n| n.starts_with("snap-"))
+            })
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly the installed snapshot remains, got {remaining:?}"
+        );
+        let gauge = crate::metrics::gather();
+        let expected = format!(
+            "nanobpm_raft_snapshot_file_bytes{{node=\"0\",partition=\"0\"}} {}",
+            bytes.len()
+        );
+        assert!(
+            gauge.contains(&expected),
+            "the per-replica size series is published ({expected}):\n{gauge}"
+        );
     }
 
     #[test]
