@@ -16,6 +16,12 @@
 //!   key through the SAME `correlate_message_impl` the REST `correlateMessage`
 //!   route uses; every argument except `businessId` becomes a process variable.
 //!
+//! **Scope:** like the other read-model query endpoints (which do not
+//! scatter-gather across peers), tool resolution reads this node's read model.
+//! In a multi-node cluster, point MCP clients at a node that owns the
+//! partition holding the message start subscriptions; cluster-wide resolution
+//! is a tracked follow-up of #1499.
+//!
 //! The three static tools (`searchIncidents`, `getProcessInstance`,
 //! `searchVariables`) are the cluster server's own [`Tool`]s, shared via
 //! [`shared_cluster_tools`] — not copies.
@@ -186,6 +192,46 @@ pub(crate) fn build_input_schema(props: &BTreeMap<String, String>) -> Value {
     schema
 }
 
+/// Validate tool `arguments` against an input schema produced by
+/// [`build_input_schema`]: every `required` property must be present and
+/// every supplied property with a declared JSON-Schema `type` must match it.
+/// Undeclared arguments pass through (they become process variables), and an
+/// unrecognised declared type is not enforced.
+pub(crate) fn validate_arguments(
+    schema: &Value,
+    arguments: &Map<String, Value>,
+) -> Result<(), String> {
+    if let Some(required) = schema["required"].as_array() {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !arguments.contains_key(name) {
+                return Err(format!("Missing required argument `{name}`"));
+            }
+        }
+    }
+    let Some(properties) = schema["properties"].as_object() else {
+        return Ok(());
+    };
+    for (name, value) in arguments {
+        let Some(ty) = properties.get(name).and_then(|p| p["type"].as_str()) else {
+            continue;
+        };
+        let matches = match ty {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !matches {
+            return Err(format!("Argument `{name}` must be of type {ty}"));
+        }
+    }
+    Ok(())
+}
+
 fn output_schema() -> Value {
     json!({
         "type": "object",
@@ -236,9 +282,16 @@ async fn call_tool(server: &ServerImpl, name: String, args: Value) -> Value {
         Value::Null => Map::new(),
         _ => return tool_error_result("`arguments` must be an object", 400),
     };
-    // `businessId` is a reserved tool argument, not a process variable.
+    // Validate against the SAME schema advertised in `tools/list`.
+    if let Err(msg) = validate_arguments(&build_input_schema(&tool.properties), &arguments) {
+        return tool_error_result(&msg, 400);
+    }
+    // `businessId` is a reserved tool argument, not a process variable. A
+    // supplied string is passed through verbatim so the shared correlation
+    // path enforces the business-id rules (never silently dropped).
+    // (`validate_arguments` already rejected a non-string `businessId`.)
     let business_id = match arguments.remove(BUSINESS_ID_ARGUMENT) {
-        Some(Value::String(b)) if !b.trim().is_empty() => Some(b),
+        Some(Value::String(b)) => Some(b),
         _ => None,
     };
     let variables = arguments
@@ -535,6 +588,74 @@ mod tests {
         let (inst, names) = found.expect("instance and variables projected");
         assert_eq!(inst.business_id.as_deref(), Some("order-7"));
         assert!(!names.contains("businessId"), "{names:?}");
+    }
+
+    #[test]
+    fn validate_arguments_enforces_required_and_types() {
+        let mut props = BTreeMap::new();
+        for (k, v) in [
+            ("input_1_name", "amount"),
+            ("input_1_type", "integer"),
+            ("input_1_required", "true"),
+            ("input_2_name", "flag"),
+            ("input_2_type", "boolean"),
+            ("input_3_name", "free"),
+            ("input_3_type", "custom"),
+        ] {
+            props.insert(format!("{TOOL_PROPERTY_PREFIX}{k}"), v.to_string());
+        }
+        let schema = build_input_schema(&props);
+        let check = |v: Value| validate_arguments(&schema, v.as_object().unwrap());
+        assert!(check(json!({})).unwrap_err().contains("amount"));
+        assert!(check(json!({ "amount": "x" })).is_err());
+        assert!(check(json!({ "amount": 1.5 })).is_err());
+        assert!(check(json!({ "amount": 1, "flag": "yes" })).is_err());
+        assert!(check(json!({ "amount": 1, "businessId": 7 })).is_err());
+        assert!(check(json!({ "amount": 1, "businessId": null })).is_err());
+        assert!(check(json!({ "amount": 1, "flag": true, "free": [1], "extra": {} })).is_ok());
+    }
+
+    /// Invalid calls are rejected before correlation: no instance is created.
+    #[tokio::test]
+    async fn invalid_arguments_return_is_error_without_starting_an_instance() {
+        let server = ServerImpl::default();
+        deploy_xml(&server, FIXTURE).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        for args in [
+            json!({}),
+            json!({ "amount": "not-an-integer" }),
+            json!({ "amount": 1, "businessId": 5 }),
+        ] {
+            let r = rpc(
+                &server,
+                "tools/call",
+                json!({ "name": name, "arguments": args }),
+            )
+            .await;
+            assert_eq!(r["isError"], json!(true), "{args}: {r}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(server.store.process_instances().is_empty());
+    }
+
+    /// A supplied empty `businessId` is not silently dropped: the shared
+    /// correlation path rejects it instead of starting an anonymous instance.
+    #[tokio::test]
+    async fn empty_business_id_is_rejected_not_dropped() {
+        let server = ServerImpl::default();
+        deploy_xml(&server, FIXTURE).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        let r = rpc(
+            &server,
+            "tools/call",
+            json!({ "name": name, "arguments": { "amount": 1, "businessId": "" } }),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(server.store.process_instances().is_empty());
     }
 
     #[tokio::test]
