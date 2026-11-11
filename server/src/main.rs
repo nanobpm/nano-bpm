@@ -26244,30 +26244,19 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    let mut pos = shard.exported_position();
-                    if pos > events.len() {
-                        // The store is ahead of the log (truncated/corrupt journal):
-                        // rebuild from scratch.
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
-                        )]
-                        shard.reset().expect("reset read store");
-                        pos = 0;
-                    }
-                    if pos < events.len() {
-                        let refs: Vec<&Event> = events[pos..].iter().collect();
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
-                        )]
-                        shard
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    // Open the journal (rebuilding the engine from the full log)
+                    // BEFORE the read-model catch-up, so a store migrated from an
+                    // older schema backfills its pending projections from the
+                    // recovered engine state first — the same rule the segmented
+                    // path applies in `catch_up_shard`.
                     let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to open journal {}: {e}", journal_path.display())
                     });
+                    if let Err(e) =
+                        seglog::catch_up_shard_legacy(&shard, &events, journal.engine_state())
+                    {
+                        panic!("failed to catch up the read model from the legacy journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 }

@@ -5877,3 +5877,44 @@ fn terminate_end_event_accepts_end_execution_listeners() {
     assert_eq!(kill.start_listeners.len(), 1, "{:?}", kill.start_listeners);
     assert_eq!(kill.end_listeners.len(), 1, "{:?}", kill.end_listeners);
 }
+
+#[test]
+fn should_not_attach_nested_sequence_flow_properties_to_the_enclosing_subprocess() {
+    // A sequenceFlow never enters the io_stack, so properties declared on a
+    // flow inside a subprocess must not fall through to (and overwrite) the
+    // subprocess's own metadata. Flows carry no properties slot: ignore them.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="edge" />
+                      <zeebe:property name="extra" value="edge" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:sequenceFlow>
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
+}

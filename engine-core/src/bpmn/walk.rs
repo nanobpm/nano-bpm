@@ -1202,6 +1202,12 @@ pub(crate) fn parse_with_captures(
                                     let value = attr(attrs, "value").unwrap_or("").to_string();
                                     if let Some(boundary) = cur_boundary.as_mut() {
                                         boundary.properties.insert(name.to_string(), value);
+                                    } else if cur_flow.is_some() {
+                                        // A `<sequenceFlow>` is an edge with no
+                                        // properties slot and never enters the
+                                        // io_stack: ignore its properties rather
+                                        // than mis-attach them to the enclosing
+                                        // subprocess.
                                     } else if let Some(&idx) = io_stack.last() {
                                         acc.nodes[idx].properties.insert(name.to_string(), value);
                                     }

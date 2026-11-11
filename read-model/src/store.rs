@@ -2121,6 +2121,7 @@ impl ReadStore {
                 "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
                 params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
             )?;
+            rekey_legacy_start_correlations(conn)?;
         }
         if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
             conn.execute(
@@ -3590,6 +3591,38 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
         business_id: r.get(7)?,
     })
+}
+
+/// Re-keys pre-v14 start-event correlation history (#1499) to the canonical
+/// derived [`message_start_subscription_key`], preserving every other column
+/// (notably `correlation_time_ms`). Before v14 a `MessageStartEventCorrelated`
+/// row stored the event's definition-key placeholder as its `subscription_key`
+/// (start correlations are the only rows with `element_instance_key = 0`), so
+/// filtering by a `START_EVENT` row's derived key would miss them and a
+/// replayed old correlation would insert a duplicate under the new key instead
+/// of conflicting with the retained row. Derived keys live in `[2^62, 2^63)`,
+/// so already-migrated rows are skipped and the step is idempotent.
+fn rekey_legacy_start_correlations(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT message_key, subscription_key, message_name \
+             FROM correlated_message_subscriptions \
+             WHERE element_instance_key = 0 AND subscription_key < ?1",
+        )?;
+        stmt.query_map(params![1i64 << 62], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut update = conn.prepare(
+        "UPDATE correlated_message_subscriptions SET subscription_key = ?3 \
+         WHERE message_key = ?1 AND subscription_key = ?2",
+    )?;
+    for (message_key, definition_key, message_name) in legacy {
+        let derived = message_start_subscription_key(definition_key as Key, &message_name) as i64;
+        update.execute(params![message_key, definition_key, derived])?;
+    }
+    Ok(())
 }
 
 /// The canonical `messageSubscriptionKey` of a definition-scoped message start
@@ -9617,6 +9650,63 @@ mod definition_xml_tests {
         // A genuine later deployment replaces it.
         replay_at(&store, &start_created(30, "newer"), 2, 7_000);
         assert_eq!(row(&store), (30, Some("newer".into()), 7_000));
+    }
+
+    /// Regression (#1540 review): a warm v13→v14 upgrade must re-key retained
+    /// start-correlation history from the definition-key placeholder to the
+    /// derived start-subscription key — so filtering by a `START_EVENT` row's
+    /// key finds it — while preserving its timestamp, and a replayed old
+    /// correlation must conflict with (not duplicate) the migrated row.
+    #[test]
+    fn upgrading_to_v14_rekeys_legacy_start_correlations() {
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-start-corr-rekey-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                 correlation_time_ms, partition_id, business_id) \
+                 VALUES (55, 900, 7001, 0, 'start', 'order-placed', 'c-1', 1234, 1, NULL); \
+                 DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        let derived = super::message_start_subscription_key(900, "order-placed");
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].subscription_key, derived);
+        assert_eq!(corr[0].correlation_time_ms, 1234, "timestamp preserved");
+
+        // Overlapping replay of the old correlation: conflicts, no duplicate.
+        store
+            .export(&[&Event::MessageStartEventCorrelated {
+                message_key: 55,
+                subscription_key: 900,
+                process_definition_key: 900,
+                process_id: "p".into(),
+                instance_key: 7001,
+                element_id: "start".into(),
+                message_name: "order-placed".into(),
+                correlation_key: "c-1".into(),
+            }])
+            .unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].correlation_time_ms, 1234);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
