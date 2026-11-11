@@ -480,6 +480,15 @@ struct NanoRun<'a> {
     /// scope's element-INSTANCE key, not its BPMN element id: two instances of
     /// one process (or a re-entered scope) each get their own CREATED records.
     known: BTreeMap<Key, BTreeSet<String>>,
+    /// Each live multi-instance body's `outputCollection` accumulator:
+    /// body element-instance key -> (collection variable name, per-index slots).
+    /// Zeebe seeds the collection on the BODY scope as a list of nulls when the
+    /// body activates (VARIABLE CREATED) and rewrites slot `index` as each child
+    /// completes (VARIABLE UPDATED on the body scope); nano records the same
+    /// values in `MultiInstanceActivated` / `MultiInstanceChildCompleted`, so the
+    /// adapter renders Zeebe's records from them. Only bodies NAMING an
+    /// `outputCollection` appear here.
+    mi_output: HashMap<Key, (String, Vec<J>)>,
 }
 
 fn event(value_type: &str, intent: &str, value: J) -> J {
@@ -520,6 +529,7 @@ impl<'a> NanoRun<'a> {
             subscriptions: HashMap::new(),
             subscription_scopes: HashMap::new(),
             known: BTreeMap::new(),
+            mi_output: HashMap::new(),
         }
     }
 
@@ -696,6 +706,9 @@ impl<'a> NanoRun<'a> {
     /// VARIABLE records for one scope. `scope_key` decides CREATED vs UPDATED
     /// (per runtime scope); `scope_label` is the BPMN element id the golden
     /// compares, mirroring how Zeebe's capture labels `scopeElementId`.
+    /// Delegates each variable to `variable_record` — the ONE canonical
+    /// construction of a VARIABLE record (fields + CREATED/UPDATED
+    /// bookkeeping), shared with the multi-instance paths.
     fn variable_records(
         &mut self,
         scope_key: Key,
@@ -704,28 +717,84 @@ impl<'a> NanoRun<'a> {
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
-        let known = self.known.entry(scope_key).or_default();
         sorted
             .into_iter()
             .map(|(name, v)| {
-                let intent = if known.insert(name.clone()) {
-                    "CREATED"
-                } else {
-                    "UPDATED"
-                };
-                event(
-                    "VARIABLE",
-                    intent,
-                    json!({
-                        "name": name,
-                        "value": to_json(v),
-                        "scopeElementId": scope_label,
-                        "processInstanceKey": instance,
-                        "scopeKey": scope_key,
-                    }),
-                )
+                self.variable_record(scope_key, scope_label.clone(), name, to_json(v), instance)
             })
             .collect()
+    }
+
+    /// One VARIABLE record (CREATED or UPDATED) for a single named variable in
+    /// `scope_key`, keeping `known` so the CREATED/UPDATED split stays honest
+    /// for later writes to the same scope.
+    fn variable_record(
+        &mut self,
+        scope_key: Key,
+        scope_label: String,
+        name: &str,
+        value: J,
+        instance: Key,
+    ) -> J {
+        let known = self.known.entry(scope_key).or_default();
+        let intent = if known.insert(name.to_string()) {
+            "CREATED"
+        } else {
+            "UPDATED"
+        };
+        event(
+            "VARIABLE",
+            intent,
+            json!({
+                "name": name,
+                "value": value,
+                "scopeElementId": scope_label,
+                "processInstanceKey": instance,
+                "scopeKey": scope_key,
+            }),
+        )
+    }
+
+    /// A multi-instance child's scope bindings as Zeebe VARIABLE records.
+    /// `variable_records` sorts by name, but Zeebe writes a child's `loopCounter`
+    /// LAST (`MultiInstanceBodyProcessor` binds the input element and seeds the
+    /// output element before writing the counter), so the child's records are
+    /// the alphabetically-sorted non-counter bindings followed by `loopCounter`.
+    /// The counter record carries the event's OWN binding — never a value
+    /// re-derived from the fan-out index: the engine installs `local_variables`
+    /// into the child's scope verbatim, so substituting `index + 1` would hide
+    /// an incorrect counter from the differential check.
+    fn render_mi_child_variables(
+        &mut self,
+        child_key: Key,
+        scope_label: String,
+        vars: &HashMap<String, Value>,
+        instance: Key,
+    ) -> Vec<J> {
+        let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
+        let mut out = Vec::new();
+        for (name, v) in &sorted {
+            if name.as_str() == "loopCounter" {
+                continue;
+            }
+            out.push(self.variable_record(
+                child_key,
+                scope_label.clone(),
+                name,
+                to_json(v),
+                instance,
+            ));
+        }
+        if let Some(counter) = sorted.get(&"loopCounter".to_string()) {
+            out.push(self.variable_record(
+                child_key,
+                scope_label,
+                "loopCounter",
+                to_json(counter),
+                instance,
+            ));
+        }
+        out
     }
 
     fn job_value(&self, key: Key, retries: Option<i64>) -> J {
@@ -932,6 +1001,8 @@ impl<'a> NanoRun<'a> {
             Event::MultiInstanceActivated {
                 instance_key,
                 body_key,
+                items,
+                output_collection,
                 ..
             } => {
                 // The authoritative body key (its lifecycle events carry the
@@ -940,7 +1011,32 @@ impl<'a> NanoRun<'a> {
                 // by the `ElementActivating` arm above; kept as the belt-and-
                 // braces record for a listener-deferred fan-out.
                 self.mi_bodies.insert(*body_key, *instance_key);
-                Vec::new()
+                // Zeebe seeds a named `outputCollection` on the BODY scope as a
+                // list of nulls (one per child) when the body activates
+                // (`MultiInstanceBodyProcessor` — either a nil variable or an
+                // `=results` expression initialised from nil), so the golden has
+                // a body-scope VARIABLE CREATED nano has no event for. Render it
+                // here and track the accumulator for the per-child updates.
+                match output_collection {
+                    Some(name) => {
+                        let slots = vec![J::Null; items.len()];
+                        self.mi_output
+                            .insert(*body_key, (name.clone(), slots.clone()));
+                        let label = self
+                            .element_ids
+                            .get(body_key)
+                            .cloned()
+                            .unwrap_or_else(|| format!("?{body_key}"));
+                        vec![self.variable_record(
+                            *body_key,
+                            label,
+                            name,
+                            J::Array(slots),
+                            *instance_key,
+                        )]
+                    }
+                    None => Vec::new(),
+                }
             }
             Event::SequenceFlowTaken {
                 instance_key,
@@ -997,7 +1093,46 @@ impl<'a> NanoRun<'a> {
                     .get(child_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{child_key}"));
-                self.variable_records(*child_key, scope, local_variables, *instance_key)
+                self.render_mi_child_variables(*child_key, scope, local_variables, *instance_key)
+            }
+            // A multi-instance child's completion records its output at `index`
+            // in the body's `outputCollection`: Zeebe writes the updated
+            // collection to the BODY scope (VARIABLE UPDATED) — but only when
+            // the completing child actually CHANGES its slot. A null output
+            // into a slot still holding its seeded null is no write in Zeebe
+            // (the `g-9` golden has no body-scope update for it), so emitting
+            // one here would fabricate a divergence. Nano carries the same
+            // value in the event, so the adapter renders Zeebe's record from
+            // the tracked accumulator.
+            Event::MultiInstanceChildCompleted {
+                instance_key,
+                body_key,
+                index,
+                output,
+                ..
+            } => {
+                let Some((name, slots)) = self.mi_output.get_mut(body_key) else {
+                    return Vec::new();
+                };
+                let new = output.as_ref().map(to_json).unwrap_or(J::Null);
+                let changed = match slots.get_mut(*index) {
+                    Some(slot) => {
+                        let changed = *slot != new;
+                        *slot = new;
+                        changed
+                    }
+                    None => true,
+                };
+                if !changed {
+                    return Vec::new();
+                }
+                let (name, slots) = (name.clone(), slots.clone());
+                let label = self
+                    .element_ids
+                    .get(body_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{body_key}"));
+                vec![self.variable_record(*body_key, label, &name, J::Array(slots), *instance_key)]
             }
             Event::ScopedVariablesUpdated {
                 instance_key,
@@ -1503,9 +1638,47 @@ fn mask_records(steps: &[J], ignore: &[J]) -> Vec<J> {
         .collect()
 }
 
+/// `steps` with, in each step whose index is in `step_ids`, every record
+/// matching one of `matchers` moved to the end of the step in a canonical
+/// (serialised) order. Matched records are KEPT, so a missing, extra or
+/// changed record still diverges — only their ORDER (and position relative to
+/// unmatched records) is tolerated, and only in the listed steps.
+fn reorder_records(steps: &[J], step_ids: &[u64], matchers: &[J]) -> Vec<J> {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let mut step = step.clone();
+            if !step_ids.contains(&(i as u64)) {
+                return step;
+            }
+            if let Some(rs) = step["records"].as_array_mut() {
+                let (mut hit, keep): (Vec<J>, Vec<J>) = rs
+                    .drain(..)
+                    .partition(|r| matchers.iter().any(|m| record_matches(r, m)));
+                hit.sort_by_key(|r| r.to_string());
+                rs.extend(keep);
+                rs.extend(hit);
+            }
+            step
+        })
+        .collect()
+}
+
+/// Is `matchers` a non-empty array of non-empty objects?
+fn valid_matchers(matchers: &J) -> Option<&Vec<J>> {
+    matchers.as_array().filter(|a| {
+        !a.is_empty()
+            && a.iter()
+                .all(|m| m.as_object().is_some_and(|o| !o.is_empty()))
+    })
+}
+
 /// Narrow allow-listing: an entry may carry `ignoreRecords` (record-field
-/// matchers). Its scenario is then allowed to diverge ONLY in records those
-/// matchers select — with them masked out of both sides, every step must
+/// matchers masked out of every step) and/or `reorderRecords`
+/// (`{"steps": [i, ..], "match": [matchers]}` — in ONLY those steps, the
+/// matched records are compared as a multiset, i.e. only their order may
+/// differ). With those narrowings applied to both sides, every step must
 /// still equal Zeebe exactly. Returns one error per residual divergence.
 fn masked_residuals(
     allowlist: &J,
@@ -1514,9 +1687,23 @@ fn masked_residuals(
     let mut errors = Vec::new();
     for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
         let scenario = entry["scenario"].as_str().unwrap_or_default();
-        let ignore = match entry.get("ignoreRecords") {
-            None => continue,
-            Some(J::Array(ignore)) => ignore,
+        if entry.get("ignoreRecords").is_none() && entry.get("reorderRecords").is_none() {
+            continue;
+        }
+        let ignore: &[J] = match entry.get("ignoreRecords") {
+            None => &[],
+            Some(J::Array(ignore)) => {
+                if ignore
+                    .iter()
+                    .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
+                {
+                    errors.push(format!(
+                        "allow-list entry `{scenario}`: every ignoreRecords matcher must be a non-empty object"
+                    ));
+                    continue;
+                }
+                ignore
+            }
             Some(_) => {
                 errors.push(format!(
                     "allow-list entry `{scenario}`: ignoreRecords must be an array of matchers"
@@ -1524,29 +1711,46 @@ fn masked_residuals(
                 continue;
             }
         };
-        if ignore
-            .iter()
-            .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
-        {
-            errors.push(format!(
-                "allow-list entry `{scenario}`: every ignoreRecords matcher must be a non-empty object"
-            ));
-            continue;
-        }
+        let reorder: Option<(Vec<u64>, &[J])> = match entry.get("reorderRecords") {
+            None => None,
+            Some(r) => {
+                let steps: Option<Vec<u64>> = r["steps"]
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                    .and_then(|a| a.iter().map(J::as_u64).collect());
+                match (steps, valid_matchers(&r["match"])) {
+                    (Some(steps), Some(m)) => Some((steps, m.as_slice())),
+                    _ => {
+                        errors.push(format!(
+                            "allow-list entry `{scenario}`: reorderRecords must be \
+                             {{\"steps\": [non-empty step indices], \"match\": [non-empty matcher objects]}}"
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+        let narrow = |steps: &[J]| {
+            let masked = mask_records(steps, ignore);
+            match &reorder {
+                Some((ids, m)) => reorder_records(&masked, ids, m),
+                None => masked,
+            }
+        };
         match traces.get(scenario) {
             Some((golden, Some(nano))) => {
-                if let Some(d) = diff(&mask_records(golden, ignore), &mask_records(nano, ignore)) {
+                if let Some(d) = diff(&narrow(golden), &narrow(nano)) {
                     errors.push(format!(
                         "scenario `{scenario}` diverges from Zeebe beyond its allow-listed \
-                         ignoreRecords:\n{d}"
+                         ignoreRecords/reorderRecords:\n{d}"
                     ));
                 }
             }
-            // Record masking only narrows a divergence in a successfully
-            // replayed trace; it never exempts a scenario nano could not run.
+            // Record narrowing only applies to a successfully replayed trace;
+            // it never exempts a scenario nano could not run.
             _ => errors.push(format!(
-                "scenario `{scenario}` has ignoreRecords but no nano trace to compare \
-                 (replay failed, rejection mismatch, or unknown scenario)"
+                "scenario `{scenario}` has ignoreRecords/reorderRecords but no nano trace to \
+                 compare (replay failed, rejection mismatch, or unknown scenario)"
             )),
         }
     }
@@ -2237,6 +2441,67 @@ fn nano_trace_pin_freezes_an_allowlisted_divergence() {
     assert_eq!(trace_fingerprint(&nano), pin);
 }
 
+/// `reorderRecords` tolerates ONLY reordering of the matched records, ONLY in
+/// the listed steps: a missing/changed matched record, or any divergence in
+/// another step, still fails (#1527 review).
+#[test]
+fn reorder_records_tolerates_only_order_in_listed_steps() {
+    let rec = |e: &str| json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": e});
+    let job = json!({"valueType": "JOB", "intent": "CREATED", "elementId": "t"});
+    let golden = vec![
+        json!({"op": "create", "step": 0, "records": [rec("a"), job.clone(), rec("b")]}),
+        json!({"op": "complete", "step": 1, "records": [rec("a"), rec("b")]}),
+    ];
+    let run = |nano: Vec<J>, r: J| {
+        let traces = BTreeMap::from([("s".to_string(), (golden.clone(), Some(nano)))]);
+        masked_residuals(
+            &json!({"entries": [{"scenario": "s", "issue": "#1539", "reorderRecords": r}]}),
+            &traces,
+        )
+    };
+    let pi = json!({"steps": [0], "match": [{"valueType": "PROCESS_INSTANCE"}]});
+    // Pure reorder in step 0 is tolerated.
+    let ok = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), rec("a"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(ok, pi.clone()).is_empty());
+    // A missing matched record in step 0 still fails.
+    let missing = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(missing, pi.clone())[0].contains("beyond its allow-listed"));
+    // A changed matched record in step 0 still fails.
+    let changed = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), rec("x"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(changed, pi.clone())[0].contains("beyond its allow-listed"));
+    // Reorder in a step NOT listed still fails.
+    let later = vec![
+        golden[0].clone(),
+        json!({"op": "complete", "step": 1, "records": [rec("b"), rec("a")]}),
+    ];
+    assert!(run(later.clone(), pi.clone())[0].contains("beyond its allow-listed"));
+    // A lifecycle record dropped in a later step still fails.
+    let dropped = vec![
+        golden[0].clone(),
+        json!({"op": "complete", "step": 1, "records": [rec("a")]}),
+    ];
+    assert!(run(dropped, pi)[0].contains("beyond its allow-listed"));
+    // Malformed shapes fail closed rather than widening.
+    for bad in [
+        json!({"match": [{"valueType": "PROCESS_INSTANCE"}]}),
+        json!({"steps": [], "match": [{"valueType": "PROCESS_INSTANCE"}]}),
+        json!({"steps": [0], "match": []}),
+        json!({"steps": [0], "match": [{}]}),
+        json!({"steps": ["0"], "match": [{"valueType": "PROCESS_INSTANCE"}]}),
+    ] {
+        assert!(run(later.clone(), bad)[0].contains("reorderRecords must be"));
+    }
+}
+
 /// A null-valued matcher field matches only a record that CARRIES the field
 /// with value null — never a record where the field is absent (indexing a
 /// missing field yields `Null`, which used to match and silently widen the
@@ -2467,6 +2732,293 @@ fn records_of<'a>(step: &'a J, value_type: &str, intent: &str) -> Vec<&'a J> {
         .iter()
         .filter(|r| r["valueType"] == value_type && r["intent"] == intent)
         .collect()
+}
+
+/// A parallel multi-instance service task with an `outputCollection`, so the
+/// adapter's body-local collection rendering and per-child variable ordering
+/// have something to bite on.
+const MI_OUTPUT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_mio" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="mio" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="each">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="handle" retries="3" />
+        <zeebe:ioMapping><zeebe:output source="=result" target="result" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" outputCollection="results" outputElement="=result" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="each" />
+    <bpmn:sequenceFlow id="f2" sourceRef="each" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="mio">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="each_di" bpmnElement="each"><dc:Bounds x="250" y="78" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="412" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="196" y="118" /><di:waypoint x="250" y="118" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="350" y="118" /><di:waypoint x="412" y="118" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// Zeebe seeds a named `outputCollection` on the multi-instance BODY scope as a
+/// list of nulls when the body activates, and writes each completing child's
+/// slot as a body-scope UPDATE. The adapter must render both from
+/// `MultiInstanceActivated` / `MultiInstanceChildCompleted` (nano has no
+/// discrete event for the body-local write), and must order each child's local
+/// bindings with `loopCounter` LAST (Zeebe binds the input/output elements
+/// before the counter).
+#[test]
+fn mi_output_collection_is_body_local_and_loop_counter_last() {
+    let trace = run_scratch(
+        "miout",
+        MI_OUTPUT_XML,
+        r#"{"description": "mi output collection", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "mio", "variables": {"items": ["a", "b"]}}
+        ]}"#,
+    );
+    // The body-scope `results` is CREATED as a list of nulls, one per item.
+    let created = records_of(&trace[0], "VARIABLE", "CREATED");
+    let body_results = created
+        .iter()
+        .find(|r| r["name"] == "results")
+        .unwrap_or_else(|| panic!("body-scope results CREATED: {}", trace[0]));
+    assert_eq!(
+        body_results["value"],
+        json!([null, null]),
+        "results seeded as a list of nulls, one per item: {body_results}"
+    );
+    // Each child's three locals are emitted item, result, loopCounter (counter last).
+    let child_scopes: BTreeSet<u64> = created
+        .iter()
+        .filter(|r| r["name"] == "loopCounter")
+        .map(|r| r["scopeKey"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        child_scopes.len(),
+        2,
+        "two children, two scopes: {}",
+        trace[0]
+    );
+    for scope in child_scopes {
+        let names: Vec<&str> = created
+            .iter()
+            .filter(|r| r["scopeKey"].as_u64() == Some(scope))
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["item", "result", "loopCounter"],
+            "child locals in Zeebe's order (loopCounter last): {names:?}"
+        );
+    }
+}
+
+/// The adapter must render a child's `loopCounter` record with the event's OWN
+/// binding, never a value re-derived from the fan-out index: the engine
+/// installs `local_variables` into the child's scope verbatim, so substituting
+/// `index + 1` would report `1` for a child whose jobs and FEEL actually see a
+/// binding of 99 — masking an incorrect counter from the differential check.
+#[test]
+fn mi_child_loop_counter_carries_the_event_binding() {
+    let tmp = std::env::temp_dir().join(format!(
+        "nano-trace-counter-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("process.bpmn"), MI_OUTPUT_XML).unwrap();
+    fs::write(
+        tmp.join("script.json"),
+        r#"{"description": "counter", "steps": []}"#,
+    )
+    .unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    fs::remove_dir_all(&tmp).unwrap();
+    let mut run = NanoRun::new(&sc);
+    let vars = HashMap::from([
+        ("item".to_string(), Value::Int(7)),
+        ("result".to_string(), Value::Null),
+        // A WRONG counter: index 0 would derive 1, but the event binds 99 —
+        // the rendered record must show 99, or the divergence stays hidden.
+        ("loopCounter".to_string(), Value::Int(99)),
+    ]);
+    let records = run.render(&Event::MultiInstanceChildActivated {
+        instance_key: 1,
+        body_key: 2,
+        child_key: 3,
+        index: 0,
+        local_variables: vars,
+    });
+    let names: Vec<&str> = records
+        .iter()
+        .map(|r| r["value"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["item", "result", "loopCounter"],
+        "loopCounter still renders LAST: {names:?}"
+    );
+    let counter = records
+        .iter()
+        .find(|r| r["value"]["name"] == "loopCounter")
+        .unwrap_or_else(|| panic!("loopCounter record: {records:?}"));
+    assert_eq!(
+        counter["value"]["value"],
+        json!(99),
+        "the event's own binding, not index + 1: {counter}"
+    );
+}
+
+/// The general multi-variable path (`variable_records`) and the single-record
+/// MI path (`variable_record`) must be ONE canonical projection: a drift
+/// between them (record fields, or the per-scope CREATED/UPDATED bookkeeping)
+/// would let the same variable render differently depending on which code
+/// path emitted it. Drive both paths against one fresh `NanoRun` and assert
+/// the general path's record for a name is byte-identical to the MI path's,
+/// and that the general path still splits CREATED then UPDATED per scope.
+#[test]
+fn variable_records_delegates_to_the_single_record_helper() {
+    let tmp = std::env::temp_dir().join(format!(
+        "nano-trace-vrec-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("process.bpmn"), MI_OUTPUT_XML).unwrap();
+    fs::write(
+        tmp.join("script.json"),
+        r#"{"description": "vrec", "steps": []}"#,
+    )
+    .unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    fs::remove_dir_all(&tmp).unwrap();
+    let mut run = NanoRun::new(&sc);
+
+    // General path: two variables on scope 7, one written twice.
+    let first = run.render(&Event::ScopedVariablesUpdated {
+        instance_key: 1,
+        scope_key: 7,
+        variables: HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+        ]),
+    });
+    let second = run.render(&Event::ScopedVariablesUpdated {
+        instance_key: 1,
+        scope_key: 7,
+        variables: HashMap::from([("a".to_string(), Value::Int(3))]),
+    });
+    assert_eq!(
+        first
+            .iter()
+            .map(|r| r["intent"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["CREATED", "CREATED"],
+        "first write to a scope creates: {first:?}"
+    );
+    assert_eq!(
+        second[0]["intent"], "UPDATED",
+        "rewrite updates: {second:?}"
+    );
+
+    // MI single-record path on a FRESH scope with the same name/value set:
+    // each record must equal the general path's record for that name.
+    let mi = run.render(&Event::MultiInstanceChildActivated {
+        instance_key: 1,
+        body_key: 8,
+        child_key: 9,
+        index: 0,
+        local_variables: HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+        ]),
+    });
+    for name in ["a", "b"] {
+        let general = first
+            .iter()
+            .find(|r| r["value"]["name"] == name)
+            .unwrap_or_else(|| panic!("general record for {name}: {first:?}"));
+        let single = mi
+            .iter()
+            .find(|r| r["value"]["name"] == name)
+            .unwrap_or_else(|| panic!("MI record for {name}: {mi:?}"));
+        // Same projection, modulo the scope the record was written to
+        // (`scopeKey`/`scopeElementId` necessarily differ: 7 vs 9 here).
+        assert_eq!(
+            general["intent"], single["intent"],
+            "CREATED/UPDATED bookkeeping agrees for {name}"
+        );
+        for field in ["name", "value", "processInstanceKey"] {
+            assert_eq!(
+                general["value"][field], single["value"][field],
+                "one canonical VARIABLE projection: field {field} of {name}"
+            );
+        }
+    }
+}
+
+/// Zeebe writes the body-scope `outputCollection` UPDATE only when a
+/// completing child CHANGES its slot: a null output into a slot still holding
+/// its seeded null is no write (the `g-9` golden's step 1 has no body-scope
+/// `out1` update). The adapter must suppress that unchanged update — emitting
+/// it fabricates a divergence — while a changed slot still renders.
+#[test]
+fn mi_child_completion_suppresses_an_unchanged_collection_update() {
+    let trace = run_scratch(
+        "miout-null",
+        MI_OUTPUT_XML,
+        r#"{"description": "mi null output", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "mio", "variables": {"items": ["a", "b"]}},
+            {"op": "completeJob", "jobType": "handle", "variables": {"result": null}}
+        ]}"#,
+    );
+    // Step 1 completes one child with `result: null`: its slot was seeded null,
+    // so NO body-scope `results` record appears in this step at all.
+    let body_updates: Vec<&J> = records_of(&trace[1], "VARIABLE", "UPDATED")
+        .into_iter()
+        .chain(records_of(&trace[1], "VARIABLE", "CREATED"))
+        .filter(|r| r["name"] == "results")
+        .collect();
+    assert_eq!(
+        body_updates.len(),
+        0,
+        "null output into a null slot writes no body-scope record: {}",
+        trace[1]
+    );
+    // The slot accumulator still tracked the write: a later CHANGED output
+    // renders the update with both slots populated (the completed child's slot
+    // carries its output; the still-running sibling's stays null).
+    let trace = run_scratch(
+        "miout-changed",
+        MI_OUTPUT_XML,
+        r#"{"description": "mi changed output", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "mio", "variables": {"items": ["a", "b"]}},
+            {"op": "completeJob", "jobType": "handle", "variables": {"result": 1}}
+        ]}"#,
+    );
+    let update = records_of(&trace[1], "VARIABLE", "UPDATED")
+        .into_iter()
+        .find(|r| r["name"] == "results")
+        .unwrap_or_else(|| panic!("changed slot renders the body-scope update: {}", trace[1]));
+    let slots = update["value"].as_array().unwrap();
+    assert_eq!(slots.len(), 2, "both slots tracked: {update}");
+    assert!(
+        slots.contains(&json!(1)) && slots.contains(&J::Null),
+        "one written slot, one null: {update}"
+    );
 }
 
 /// A two-service-task model whose tasks share the job type `work`.

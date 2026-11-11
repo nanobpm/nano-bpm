@@ -1,35 +1,50 @@
 {
-  "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?, nanoTrace?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe. `nanoTrace` (#1521) pins the fingerprint of nano's divergent trace: any change in nano's behaviour on that scenario fails until re-reviewed and re-pinned; generated-budget (g-*) entries must carry it (or ignoreRecords).",
+  "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?, reorderRecords?, nanoTrace?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe. `reorderRecords` ({steps: [i..], match: [matchers]}) tolerates only the ORDER of matching records, only in the listed steps — they are still compared as a multiset. `nanoTrace` (#1521) pins the fingerprint of nano's divergent trace: any change in nano's behaviour on that scenario fails until re-reviewed and re-pinned; generated-budget (g-*) entries must carry it (or ignoreRecords).",
   "entries": [
+    {
+      "scenario": "mi-parallel-output-element-scope",
+      "issue": "#1539",
+      "reason": "Step 0 (createInstance) only: nano runs each parallel-MI child's inner flow depth-first (child 0's whole flow before child 1 activates); Zeebe's worklist is FIFO (MultiInstanceBodyProcessor activates every child, then drains each behaviour), so the children interleave. Both emit the SAME 27 PROCESS_INSTANCE records (verified multiset-equal) — only their order differs. This is a record-ordering/scheduling difference, not a scoping or correctness defect; the variable scoping (#1518, fixed by #1519) and the body-local outputCollection + per-child updates (#1534, rendered by the trace adapter) all match. Narrowed with reorderRecords: only the ORDER of step-0 PROCESS_INSTANCE records may differ (compared as a multiset, so a missing/changed record still fails); every other record and all of steps 1-4 must still equal Zeebe exactly.",
+      "reorderRecords": {
+        "steps": [
+          0
+        ],
+        "match": [
+          {
+            "valueType": "PROCESS_INSTANCE"
+          }
+        ]
+      }
+    },
     {
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed + call-activity input mapping not local (#1536)",
-      "nanoTrace": "3c55fb3c2ffe340a"
+      "nanoTrace": "56e771be5fcfe3f8"
     },
     {
       "scenario": "g-2",
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "0516c0469315ad70"
+      "nanoTrace": "a77d18eb16f54817"
     },
     {
       "scenario": "g-3",
       "issue": "#1535",
       "reason": "interrupting boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "e23dd15a40851b2e"
+      "nanoTrace": "4b9f8ac0c1585f7f"
     },
     {
       "scenario": "g-4",
       "issue": "#1533",
       "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "8d00eae69592e6e5"
+      "nanoTrace": "21ffb97c5076468a"
     },
     {
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "75142656594f34e6"
+      "nanoTrace": "1a65ba1bf2a1f72f"
     },
     {
       "scenario": "g-6",
@@ -41,13 +56,13 @@
       "scenario": "g-8",
       "issue": "#1535",
       "reason": "interrupting timer boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "ab1c3bab8be6f965"
+      "nanoTrace": "2eddf682a5d964ed"
     },
     {
       "scenario": "g-9",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "cbe26d8fe95a2a7b"
+      "nanoTrace": "377355ba7d6482e7"
     },
     {
       "scenario": "g-10",
@@ -59,7 +74,7 @@
       "scenario": "g-11",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "2bd8e9c32c5b7189"
+      "nanoTrace": "4d2f10a516f32e3a"
     },
     {
       "scenario": "g-12",
@@ -71,13 +86,13 @@
       "scenario": "g-13",
       "issue": "#1533",
       "reason": "output-mapped user task completion leaks to the process scope; MI outputCollection not body-local (#1534) + #1518",
-      "nanoTrace": "ebc94d52f4ef3d44"
+      "nanoTrace": "a67e5b6fd510c471"
     },
     {
       "scenario": "g-14",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "d1f421a8b53eb876"
+      "nanoTrace": "78b0ec40385478f7"
     },
     {
       "scenario": "g-15",
@@ -89,7 +104,7 @@
       "scenario": "g-16",
       "issue": "#1533",
       "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "5ca2ac9deee2e967"
+      "nanoTrace": "9c220727647d0c57"
     },
     {
       "scenario": "g-17",
@@ -101,7 +116,7 @@
       "scenario": "g-18",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "f9dd2a906826cbb2"
+      "nanoTrace": "c078f0e0d25fb6d4"
     },
     {
       "scenario": "g-20",
@@ -113,7 +128,7 @@
       "scenario": "g-22",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "af8c736a3f6afc06"
+      "nanoTrace": "8e7f8638abcb5850"
     },
     {
       "scenario": "g-24",
@@ -125,25 +140,25 @@
       "scenario": "g-25",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "5b4321e59bd199d7"
+      "nanoTrace": "34a630974d83f5d5"
     },
     {
       "scenario": "g-26",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local",
-      "nanoTrace": "48e88fd3331f36a4"
+      "nanoTrace": "71fe7175028838fa"
     },
     {
       "scenario": "g-28",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local",
-      "nanoTrace": "ae826b48a611a9e6"
+      "nanoTrace": "267117b7e9b371cd"
     },
     {
       "scenario": "g-30",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "32663abe639dbb76"
+      "nanoTrace": "b770fc0f46de7b03"
     }
   ]
 }
