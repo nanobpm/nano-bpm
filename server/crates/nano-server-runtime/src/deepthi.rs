@@ -163,6 +163,12 @@ struct MailboxInner {
     /// Live [`DeepthiHandle`] count. When it hits zero with both queues drained,
     /// the consumer loop exits (mirrors an mpsc channel disconnect).
     producers: usize,
+    /// Set (under this mutex) by [`Mailbox::fail_pending`] when the engine
+    /// thread dies. Once closed, [`Mailbox::push`] rejects every submission by
+    /// dropping the job — releasing its reply sender — so a request that passed
+    /// an `is_alive` check just before the death can never land in an
+    /// already-drained queue with no consumer (#1473 review).
+    closed: bool,
 }
 
 impl Mailbox {
@@ -173,14 +179,24 @@ impl Mailbox {
                 hi: VecDeque::new(),
                 lo: VecDeque::new(),
                 producers: 1,
+                closed: false,
             }),
             signal: Condvar::new(),
             stats: ActorStats::new(partition),
         })
     }
 
+    /// Enqueues `job`, or — when the mailbox is closed (the engine thread is
+    /// dead) — drops it, so its reply sender is released and the awaiting
+    /// caller terminates instead of hanging. Closure and enqueue are decided
+    /// under the same mutex as the drain, so no ordering can strand a job.
     fn push(&self, priority: Priority, job: Job) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            drop(g);
+            drop(job);
+            return;
+        }
         match priority {
             Priority::High => {
                 g.hi.push_back(job);
@@ -227,6 +243,7 @@ impl Mailbox {
     /// rebuild's `retire()` against the dead actor (#1473 review).
     fn fail_pending(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.closed = true;
         g.hi.clear();
         g.lo.clear();
         self.stats.hi_depth.store(0, Ordering::Relaxed);
@@ -702,10 +719,11 @@ mod tests {
         wait_until(|| !stats.alive.load(Ordering::Relaxed));
         assert!(!stats.alive.load(Ordering::Relaxed));
         // The panic happened with the mailbox lock released, so producers can
-        // still enqueue (mutex is NOT poisoned) — enqueue must not panic even
-        // though the consumer is gone.
+        // still submit (mutex is NOT poisoned) — submission must not panic even
+        // though the consumer is gone. The closed mailbox rejects the job rather
+        // than stranding it in a queue nobody drains (#1473 review).
         h.spawn_job(|_journal| {});
-        assert!(h.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+        assert_eq!(h.stats().hi_depth.load(Ordering::Relaxed), 0);
     }
 
     /// A poisoned mailbox mutex (a panic while the guard is held) must not
@@ -847,5 +865,38 @@ mod tests {
             .join()
             .expect("try_with never panics on a dead actor");
         assert_eq!(answered, None, "a queued try_with resolves to None");
+    }
+
+    /// #1473 (review): the check-before-death / enqueue-after-drain ordering.
+    /// A request that passed `is_alive` just before the actor died is pushed
+    /// AFTER `fail_pending` drained the queue. The closed mailbox must reject
+    /// it (dropping its reply sender) rather than strand it with no consumer.
+    #[test]
+    fn push_after_the_drain_is_rejected_not_stranded() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+        h.spawn_job(|_journal| panic!("boom"));
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+
+        // Simulate the late enqueue directly (bypassing the is_alive fast path).
+        let (reply_tx, mut reply_rx) = oneshot::channel::<u32>();
+        h.mb.push(
+            Priority::High,
+            Box::new(move |_journal| {
+                let _ = reply_tx.send(3);
+            }),
+        );
+        assert_eq!(
+            h.stats().hi_depth.load(Ordering::Relaxed),
+            0,
+            "a closed mailbox never queues"
+        );
+        assert!(
+            matches!(
+                reply_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the rejected job's reply sender is released, so the caller terminates"
+        );
     }
 }
