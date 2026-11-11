@@ -15732,17 +15732,29 @@ impl ServerImpl {
     /// the durable `ProcessDeployed` into every owned partition, so the
     /// definition survives this node's independent restart on all of them.
     /// Invoked by the `InstallDeployment` falcon frame handler.
+    ///
+    /// Every install holds that engine's lifecycle lock SHARED (#1473): a
+    /// concurrent rebuild's durable read → journal swap holds it exclusive, so
+    /// each install lands before the read or in the swapped-in engine — never
+    /// in between, where the swap would silently discard an acknowledged
+    /// definition. The durable owner's guard is released BEFORE the sibling
+    /// fan-out (the durable commit is the serialized part; the in-memory
+    /// sibling copies need no mutual ordering against each other).
     pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
         let handles = self.engine.all();
         let events = Arc::new(events);
         let durable = {
             let events = Arc::clone(&events);
+            // Owner's durable commit under its shared guard.
+            let _lifecycle = handles[0].lifecycle_shared().await;
             handles[0]
                 .with(move |journal| journal.install_deployment_durable(&events))
                 .await
         };
         for handle in handles.iter().skip(1) {
             let events = Arc::clone(&events);
+            // Each sibling install under its own shared guard.
+            let _lifecycle = handle.lifecycle_shared().await;
             handle
                 .with(move |journal| journal.install_deployment(&events))
                 .await;
@@ -30253,6 +30265,54 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await
+    }
+
+    /// #1473 (review): `install_replicated_deployment` holds the owner's
+    /// lifecycle lock SHARED across its durable commit, so a rebuild's
+    /// exclusive acquisition (retire → durable read → journal swap) cannot
+    /// interleave with it — a broadcast landing mid-rebuild can no longer slip
+    /// an acknowledged definition between the read and the swap, where the swap
+    /// would silently discard it.
+    ///
+    /// Deterministic: with the owner partition's lifecycle held EXCLUSIVE (the
+    /// rebuild's hold), the install's durable commit cannot acquire its shared
+    /// guard, so it does not complete; once the exclusive hold releases, the
+    /// install proceeds and the definition lands.
+    #[tokio::test]
+    async fn replicated_install_is_serialized_with_an_owned_partition_rebuild() {
+        let node1 = clustered_node(1);
+        let events = demo_deployment_events().await;
+        assert!(!events.is_empty());
+        // The first owned partition is the durable owner (handles[0]).
+        let owner = node1.engine.all()[0].clone();
+
+        // Hold the owner's lifecycle EXCLUSIVE — the rebuild's hold during its
+        // durable read → journal swap.
+        let exclusive = owner.lifecycle_exclusive().await;
+
+        // The install cannot complete its durable commit while the rebuild
+        // holds the lock: poll it in-line and assert it is still pending.
+        let mut install = Box::pin(node1.install_replicated_deployment(events));
+        use std::future::Future;
+        use std::task::Poll;
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(install.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending,
+            "the durable commit must wait for the rebuild's exclusive hold"
+        );
+
+        // Release the rebuild hold: the install proceeds and the definition
+        // lands on every owned partition.
+        drop(exclusive);
+        install.await;
+        for handle in node1.engine.all() {
+            let n = handle.with(|j| j.state().processes.len()).await;
+            assert!(
+                n >= 1,
+                "the broadcast definition landed on an owned partition"
+            );
+        }
     }
 
     #[tokio::test]

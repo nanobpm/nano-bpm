@@ -1768,15 +1768,24 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
-        // Lifecycle fence (#1473): a retired member must not start receiving a
-        // new snapshot into a directory its successor may already own.
-        if self.is_retired() {
-            return Err(PartitionStateMachine::retired_error(
+        // Engine lifecycle lock (#1473): held SHARED across the sweep AND the
+        // file open below — not just a one-shot probe. A predecessor receive
+        // that passed a bare `is_retired()` check could still be parked in the
+        // `truncate(true)` open while retirement constructs a durable successor
+        // on the SAME snapshot dir; both members derive their receive path from
+        // the same partition id and process id (`incoming-<pid>-<seq>.tmp`) and
+        // each member's `recv_idx` restarts at 0, so the predecessor's delayed
+        // open would truncate the successor's just-received incoming snapshot.
+        // Holding the epoch-checked guard means retirement cannot complete
+        // until this open has finished, and a receive that starts after
+        // retirement is refused before it touches the dir.
+        let _lifecycle = self.enter_lifecycle().await.ok_or_else(|| {
+            PartitionStateMachine::retired_error(
                 ErrorSubject::Snapshot(None),
                 ErrorVerb::Read,
                 "receive a Raft snapshot",
-            ));
-        }
+            )
+        })?;
         // Reclaim any orphaned partials from previously-aborted installs in this
         // dir before starting a fresh receive. openraft never resumes a prior
         // `begin_receiving_snapshot` file, so any leftover `incoming-*.tmp` is dead
@@ -6185,5 +6194,121 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), engine.lifecycle_shared())
                 .await
                 .expect("fan-out proceeds after the swap");
+    }
+
+    /// #1473 (review): `begin_receiving_snapshot` holds the member's
+    /// epoch-checked lifecycle guard across its orphan sweep AND the
+    /// `truncate(true)` file open — not a bare `is_retired()` probe — so a
+    /// predecessor receive parked in that open cannot truncate the successor's
+    /// incoming snapshot on the shared dir (both members derive
+    /// `incoming-<pid>-<seq>.tmp` from the same partition + process id, and
+    /// each member's `recv_idx` restarts at 0, so the names collide).
+    ///
+    /// The interleaving this guards, deterministically: a receive is parked
+    /// INSIDE the state machine's receive (an in-flight shared guard held by a
+    /// detached task — the same shape as openraft's sm worker, which
+    /// `Raft::shutdown` does NOT join) → retirement's exclusive acquisition
+    /// must wait for it (it cannot construct the successor over the parked
+    /// open) → the receive completes → retirement drains and retires the epoch
+    /// → the successor's receive on the same dir is admitted under the new
+    /// epoch, its file intact.
+    #[tokio::test]
+    async fn receive_holds_the_lifecycle_guard_through_the_sweep_and_file_open() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let member = RaftPartition::bootstrap_single(0, 0, "127.0.0.1:0".into(), engine.clone())
+            .await
+            .expect("boot a volatile single voter");
+        // A predecessor state machine on a DURABLE-style dir (survives retire).
+        let dir = unique_log_dir("1473-recv");
+        std::fs::create_dir_all(&dir).expect("recv dir");
+        let mut predecessor: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                engine.clone(),
+                0,
+                dir.clone(),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("predecessor sm"),
+        );
+
+        // Park a receive INSIDE the sweep+open on a detached task (the sm-worker
+        // shape): it takes the member's shared lifecycle guard — exactly what
+        // `begin_receiving_snapshot` now holds across the sweep + file open —
+        // and keeps it held open-ended, modelling the predecessor suspended in
+        // its file open. A barrier reports it parked.
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let parked = {
+            let sm = Arc::clone(&predecessor);
+            tokio::spawn(async move {
+                let mut sm = sm;
+                // Hold the shared guard across the receive's sweep + file open,
+                // as the #1473 fix does, and keep it held past the open.
+                let _guard = sm.enter_lifecycle().await.expect("live epoch admitted");
+                let _file = sm
+                    .begin_receiving_snapshot()
+                    .await
+                    .expect("receive opens its incoming file");
+                let _ = opened_tx.send(());
+                let _ = release_rx.await;
+            })
+        };
+        opened_rx
+            .await
+            .expect("the receive parked with its file open");
+
+        // While that receive's guard is in flight, retirement's exclusive
+        // acquisition cannot complete — the rebuild's successor construction is
+        // never interleaved with the parked open.
+        let blocked = member
+            .retire_within(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            blocked.is_err(),
+            "retirement must wait for a receive parked in its file open"
+        );
+
+        // Complete the parked receive; retirement now drains and retires.
+        let _ = release_tx.send(());
+        parked.await.expect("the parked receive finished");
+        let exclusive = member
+            .retire_within(std::time::Duration::from_secs(5))
+            .await
+            .expect("retire succeeds once the parked receive left");
+        assert!(member.is_retired());
+        drop(exclusive);
+
+        // A SUCCESSOR bound to the new epoch receives into the same dir without
+        // any predecessor open still able to truncate its file.
+        let mut successor: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                engine.clone(),
+                0,
+                dir.clone(),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("successor sm on the predecessor's durable dir"),
+        );
+        let incoming = successor
+            .begin_receiving_snapshot()
+            .await
+            .expect("the successor receives under the new epoch");
+        let incoming_path = incoming.path.clone();
+        assert!(
+            incoming_path.starts_with(&dir),
+            "the successor's incoming file lives in the shared dir"
+        );
+        assert!(
+            incoming_path.is_file(),
+            "no predecessor open truncated the successor's incoming snapshot"
+        );
+        drop(incoming);
+        // And the RETIRED predecessor is refused before it touches the dir.
+        assert!(predecessor.begin_receiving_snapshot().await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

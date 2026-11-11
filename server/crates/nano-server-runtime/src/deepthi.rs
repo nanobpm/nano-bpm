@@ -217,6 +217,21 @@ impl Mailbox {
             g = self.signal.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// Drops every queued job, releasing each one's resources — a `with` job's
+    /// reply sender, so its awaiting caller terminates (its `reply_rx` resolves
+    /// to `Err`) instead of hanging, and with it any engine-lifecycle guard that
+    /// caller holds. Called when the engine thread dies: no consumer will ever
+    /// drain these, so a queued apply / snapshot-capture would otherwise park
+    /// its caller (and its shared lifecycle guard) forever, deadlocking a
+    /// rebuild's `retire()` against the dead actor (#1473 review).
+    fn fail_pending(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.hi.clear();
+        g.lo.clear();
+        self.stats.hi_depth.store(0, Ordering::Relaxed);
+        self.stats.lo_depth.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The single per-engine LIFECYCLE LOCK (#1473).
@@ -298,15 +313,29 @@ impl Drop for DeepthiHandle {
 /// can never again masquerade as a mysterious completion-freeze. The panic's
 /// payload/location is captured separately by the process-wide panic hook
 /// installed in `main`.
-struct AliveGuard(Arc<ActorStats>);
+///
+/// It also DRAINS every still-queued request ([`Mailbox::fail_pending`]): a
+/// `with` job queued behind the dead consumer would otherwise never run, so its
+/// caller's `reply_rx` would never resolve — parking the caller (and any
+/// engine-lifecycle guard it holds) forever and deadlocking a rebuild's
+/// `retire()` against the dead actor (#1473 review). Dropping the queued jobs
+/// releases their reply senders, so each pending caller terminates (its
+/// `reply_rx` resolves to `Err`) and releases its guard.
+struct AliveGuard {
+    stats: Arc<ActorStats>,
+    mb: Arc<Mailbox>,
+}
 
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        self.0.alive.store(false, Ordering::Relaxed);
+        self.stats.alive.store(false, Ordering::Relaxed);
+        // Terminate every pending request BEFORE logging, so a waiting caller's
+        // guard is released even if the log sink blocks.
+        self.mb.fail_pending();
         let panicking = thread::panicking();
         tracing::error!(
-            partition = self.0.partition,
-            jobs = self.0.jobs.load(Ordering::Relaxed),
+            partition = self.stats.partition,
+            jobs = self.stats.jobs.load(Ordering::Relaxed),
             panicking,
             "engine actor thread exited: the single writer for this partition is \
              DOWN — every subsequent create/complete on it will hang forever \
@@ -346,9 +375,13 @@ impl DeepthiHandle {
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
-                // Clears `alive` + logs on exit/panic-unwind (drop-guard, so it
-                // fires even when a command panics through the loop).
-                let _alive = AliveGuard(Arc::clone(&consumer.stats));
+                // Clears `alive` + drains pending requests + logs on
+                // exit/panic-unwind (drop-guard, so it fires even when a
+                // command panics through the loop).
+                let _alive = AliveGuard {
+                    stats: Arc::clone(&consumer.stats),
+                    mb: Arc::clone(&consumer),
+                };
                 if profile || controller.is_some() {
                     Self::run_instrumented(&consumer, &mut journal, profile, controller);
                 } else {
@@ -662,5 +695,69 @@ mod tests {
         let (job, prio) = mb.pop().expect("job enqueued before poison is served");
         assert_eq!(prio, Priority::High);
         drop(job);
+    }
+
+    /// #1473 (review): when the engine actor dies with a `with` request still
+    /// QUEUED, the pending request is terminated — its reply sender is dropped,
+    /// so the awaiting caller's `reply_rx` resolves (to `Err`, surfacing as a
+    /// panic at the `expect`) instead of hanging forever, and any
+    /// engine-lifecycle guard the caller holds is released with it. This is
+    /// what lets a rebuild's `retire()` drain past a dead actor instead of
+    /// timing out on a guard that can never leave.
+    #[test]
+    fn actor_death_terminates_a_queued_request_and_releases_its_guard() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+
+        // A job that parks the actor until released, then PANICS — dying while
+        // the `with` below is still queued behind it. The park guarantees the
+        // `with` is enqueued (not yet served) at the moment of the unwind.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        h.spawn_job(move |_journal| {
+            let _ = started_tx.send(()); // the actor is now INSIDE this job
+            let _ = block_rx.recv(); // park until the test releases us
+            panic!("boom"); // die with the `with` still queued behind us
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking job is running");
+
+        // The queued request: its caller holds a lifecycle guard across the
+        // await — the exact shape the rebuild's retire() must be able to drain.
+        let guard_holder = h.clone();
+        let caller = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            // The `with` await panics once the actor is dead (its pending job's
+            // reply sender is dropped, closing the oneshot). Catch that panic so
+            // the thread returns normally; the caller's guard drops with the
+            // frame either way — it is NOT held forever.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(async move {
+                    let _guard = guard_holder.lifecycle_shared().await;
+                    // Queues behind the parked job; terminated by the actor's
+                    // death rather than hanging on a reply that can never arrive.
+                    guard_holder.with(|_j| ()).await;
+                });
+            }));
+        });
+        // Wait until the `with` request is actually QUEUED behind the parked job
+        // (the parked job was already popped, so depth 1 == the `with`).
+        wait_until(|| h.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+
+        // Release the parked job: it panics, unwinding the actor with the
+        // caller's `with` still queued behind it.
+        let _ = block_tx.send(());
+        wait_until(|| !stats.alive.load(Ordering::Relaxed));
+        assert!(!stats.alive.load(Ordering::Relaxed));
+
+        // The queued request's caller terminated (its guard released) rather
+        // than hanging on a reply that can never arrive.
+        caller
+            .join()
+            .expect("a queued request is terminated when the actor dies");
     }
 }
