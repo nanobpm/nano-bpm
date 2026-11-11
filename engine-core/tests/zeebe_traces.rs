@@ -480,6 +480,20 @@ struct NanoRun<'a> {
     /// scope's element-INSTANCE key, not its BPMN element id: two instances of
     /// one process (or a re-entered scope) each get their own CREATED records.
     known: BTreeMap<Key, BTreeSet<String>>,
+    /// Each live multi-instance body's `outputCollection` accumulator:
+    /// body element-instance key -> (collection variable name, per-index slots).
+    /// Zeebe seeds the collection on the BODY scope as a list of nulls when the
+    /// body activates (VARIABLE CREATED) and rewrites slot `index` as each child
+    /// completes (VARIABLE UPDATED on the body scope); nano records the same
+    /// values in `MultiInstanceActivated` / `MultiInstanceChildCompleted`, so the
+    /// adapter renders Zeebe's records from them. Only bodies NAMING an
+    /// `outputCollection` appear here.
+    mi_output: HashMap<Key, (String, Vec<J>)>,
+    /// The 0-based fan-out index of each multi-instance child element instance
+    /// (child key -> index), from `MultiInstanceChildActivated`. A child's
+    /// `loopCounter` is that index + 1; the child's other local bindings sort
+    /// before it in Zeebe's record order (see `render_mi_child_variables`).
+    mi_child_index: HashMap<Key, usize>,
 }
 
 fn event(value_type: &str, intent: &str, value: J) -> J {
@@ -520,6 +534,8 @@ impl<'a> NanoRun<'a> {
             subscriptions: HashMap::new(),
             subscription_scopes: HashMap::new(),
             known: BTreeMap::new(),
+            mi_output: HashMap::new(),
+            mi_child_index: HashMap::new(),
         }
     }
 
@@ -728,6 +744,82 @@ impl<'a> NanoRun<'a> {
             .collect()
     }
 
+    /// One VARIABLE record (CREATED or UPDATED) for a single named variable in
+    /// `scope_key`, keeping `known` so the CREATED/UPDATED split stays honest
+    /// for later writes to the same scope.
+    fn variable_record(
+        &mut self,
+        scope_key: Key,
+        scope_label: String,
+        name: &str,
+        value: J,
+        instance: Key,
+    ) -> J {
+        let known = self.known.entry(scope_key).or_default();
+        let intent = if known.insert(name.to_string()) {
+            "CREATED"
+        } else {
+            "UPDATED"
+        };
+        event(
+            "VARIABLE",
+            intent,
+            json!({
+                "name": name,
+                "value": value,
+                "scopeElementId": scope_label,
+                "processInstanceKey": instance,
+                "scopeKey": scope_key,
+            }),
+        )
+    }
+
+    /// A multi-instance child's scope bindings as Zeebe VARIABLE records.
+    /// `variable_records` sorts by name, but Zeebe writes a child's `loopCounter`
+    /// LAST (`MultiInstanceBodyProcessor` binds the input element and seeds the
+    /// output element before writing the counter), so the child's records are
+    /// the alphabetically-sorted non-counter bindings followed by `loopCounter`.
+    fn render_mi_child_variables(
+        &mut self,
+        child_key: Key,
+        scope_label: String,
+        vars: &HashMap<String, Value>,
+        instance: Key,
+    ) -> Vec<J> {
+        let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
+        let mut out = Vec::new();
+        for (name, v) in &sorted {
+            if name.as_str() == "loopCounter" {
+                continue;
+            }
+            out.push(self.variable_record(
+                child_key,
+                scope_label.clone(),
+                name,
+                to_json(v),
+                instance,
+            ));
+        }
+        if sorted.contains_key(&"loopCounter".to_string()) {
+            let counter = self
+                .mi_child_index
+                .get(&child_key)
+                .map(|i| *i as i64 + 1)
+                .unwrap_or_else(|| match vars.get("loopCounter") {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                });
+            out.push(self.variable_record(
+                child_key,
+                scope_label,
+                "loopCounter",
+                json!(counter),
+                instance,
+            ));
+        }
+        out
+    }
+
     fn job_value(&self, key: Key, retries: Option<i64>) -> J {
         let (el, ty, r) = self.jobs.get(&key).cloned().unwrap_or_default();
         let (pik, eik) = self.job_scopes.get(&key).copied().unwrap_or_default();
@@ -932,6 +1024,8 @@ impl<'a> NanoRun<'a> {
             Event::MultiInstanceActivated {
                 instance_key,
                 body_key,
+                items,
+                output_collection,
                 ..
             } => {
                 // The authoritative body key (its lifecycle events carry the
@@ -940,7 +1034,32 @@ impl<'a> NanoRun<'a> {
                 // by the `ElementActivating` arm above; kept as the belt-and-
                 // braces record for a listener-deferred fan-out.
                 self.mi_bodies.insert(*body_key, *instance_key);
-                Vec::new()
+                // Zeebe seeds a named `outputCollection` on the BODY scope as a
+                // list of nulls (one per child) when the body activates
+                // (`MultiInstanceBodyProcessor` — either a nil variable or an
+                // `=results` expression initialised from nil), so the golden has
+                // a body-scope VARIABLE CREATED nano has no event for. Render it
+                // here and track the accumulator for the per-child updates.
+                match output_collection {
+                    Some(name) => {
+                        let slots = vec![J::Null; items.len()];
+                        self.mi_output
+                            .insert(*body_key, (name.clone(), slots.clone()));
+                        let label = self
+                            .element_ids
+                            .get(body_key)
+                            .cloned()
+                            .unwrap_or_else(|| format!("?{body_key}"));
+                        vec![self.variable_record(
+                            *body_key,
+                            label,
+                            name,
+                            J::Array(slots),
+                            *instance_key,
+                        )]
+                    }
+                    None => Vec::new(),
+                }
             }
             Event::SequenceFlowTaken {
                 instance_key,
@@ -989,15 +1108,43 @@ impl<'a> NanoRun<'a> {
             Event::MultiInstanceChildActivated {
                 instance_key,
                 child_key,
+                index,
                 local_variables,
                 ..
             } => {
+                self.mi_child_index.insert(*child_key, *index);
                 let scope = self
                     .element_ids
                     .get(child_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{child_key}"));
-                self.variable_records(*child_key, scope, local_variables, *instance_key)
+                self.render_mi_child_variables(*child_key, scope, local_variables, *instance_key)
+            }
+            // A multi-instance child's completion records its output at `index`
+            // in the body's `outputCollection`: Zeebe writes the updated
+            // collection to the BODY scope (VARIABLE UPDATED). Nano carries the
+            // same value in the event, so the adapter renders Zeebe's record
+            // from the tracked accumulator.
+            Event::MultiInstanceChildCompleted {
+                instance_key,
+                body_key,
+                index,
+                output,
+                ..
+            } => {
+                let Some((name, slots)) = self.mi_output.get_mut(body_key) else {
+                    return Vec::new();
+                };
+                if let Some(slot) = slots.get_mut(*index) {
+                    *slot = output.as_ref().map(to_json).unwrap_or(J::Null);
+                }
+                let (name, slots) = (name.clone(), slots.clone());
+                let label = self
+                    .element_ids
+                    .get(body_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{body_key}"));
+                vec![self.variable_record(*body_key, label, &name, J::Array(slots), *instance_key)]
             }
             Event::ScopedVariablesUpdated {
                 instance_key,
@@ -2467,6 +2614,98 @@ fn records_of<'a>(step: &'a J, value_type: &str, intent: &str) -> Vec<&'a J> {
         .iter()
         .filter(|r| r["valueType"] == value_type && r["intent"] == intent)
         .collect()
+}
+
+/// A parallel multi-instance service task with an `outputCollection`, so the
+/// adapter's body-local collection rendering and per-child variable ordering
+/// have something to bite on.
+const MI_OUTPUT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_mio" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="mio" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="each">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="handle" retries="3" />
+        <zeebe:ioMapping><zeebe:output source="=result" target="result" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" outputCollection="results" outputElement="=result" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="each" />
+    <bpmn:sequenceFlow id="f2" sourceRef="each" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="mio">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="each_di" bpmnElement="each"><dc:Bounds x="250" y="78" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="412" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="196" y="118" /><di:waypoint x="250" y="118" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="350" y="118" /><di:waypoint x="412" y="118" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// Zeebe seeds a named `outputCollection` on the multi-instance BODY scope as a
+/// list of nulls when the body activates, and writes each completing child's
+/// slot as a body-scope UPDATE. The adapter must render both from
+/// `MultiInstanceActivated` / `MultiInstanceChildCompleted` (nano has no
+/// discrete event for the body-local write), and must order each child's local
+/// bindings with `loopCounter` LAST (Zeebe binds the input/output elements
+/// before the counter).
+#[test]
+fn mi_output_collection_is_body_local_and_loop_counter_last() {
+    let trace = run_scratch(
+        "miout",
+        MI_OUTPUT_XML,
+        r#"{"description": "mi output collection", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "mio", "variables": {"items": ["a", "b"]}}
+        ]}"#,
+    );
+    // The body-scope `results` is CREATED as a list of nulls, one per item.
+    let created = records_of(&trace[0], "VARIABLE", "CREATED");
+    let body_results = created
+        .iter()
+        .find(|r| r["name"] == "results")
+        .unwrap_or_else(|| panic!("body-scope results CREATED: {}", trace[0]));
+    assert_eq!(
+        body_results["value"],
+        json!([null, null]),
+        "results seeded as a list of nulls, one per item: {body_results}"
+    );
+    // Each child's three locals are emitted item, result, loopCounter (counter last).
+    let child_scopes: BTreeSet<u64> = created
+        .iter()
+        .filter(|r| r["name"] == "loopCounter")
+        .map(|r| r["scopeKey"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        child_scopes.len(),
+        2,
+        "two children, two scopes: {}",
+        trace[0]
+    );
+    for scope in child_scopes {
+        let names: Vec<&str> = created
+            .iter()
+            .filter(|r| r["scopeKey"].as_u64() == Some(scope))
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["item", "result", "loopCounter"],
+            "child locals in Zeebe's order (loopCounter last): {names:?}"
+        );
+    }
 }
 
 /// A two-service-task model whose tasks share the job type `work`.
