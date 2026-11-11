@@ -5918,3 +5918,42 @@ fn should_not_attach_nested_sequence_flow_properties_to_the_enclosing_subprocess
     assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
     assert!(!sub.properties.contains_key("extra"));
 }
+
+#[test]
+fn should_not_attach_nested_data_object_properties_to_the_enclosing_subprocess() {
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataObject id="d">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data" />
+                      <zeebe:property name="extra" value="data" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataObject>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
+}

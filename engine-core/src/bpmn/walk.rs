@@ -137,6 +137,13 @@ pub(crate) fn parse_with_captures(
     // `is_ignorable_tag` already treats as noise) would be misread as an
     // extension property.
     let mut in_properties = false;
+    // The flow node that directly owns the currently-open `<extensionElements>`
+    // (the top of `flow_node_stack` when it opened), or `None` when the owner
+    // is not a flow node (a sequenceFlow, dataObject, process, …). Properties
+    // bind to this exact owner rather than "whatever is innermost on the
+    // io_stack", so a non-flow owner nested in a subprocess can never leak its
+    // properties onto the subprocess (#1499).
+    let mut ext_owner: Option<usize> = None;
     // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
     // container; each link attaches to the innermost open activity on the
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
@@ -1157,6 +1164,7 @@ pub(crate) fn parse_with_captures(
                             // A self-closing container has no children, so only a
                             // real open element enters the subtree.
                             "extensionElements" => {
+                                ext_owner = flow_node_stack.last().copied().flatten();
                                 if !self_closing {
                                     extension_depth += 1;
                                 }
@@ -1202,13 +1210,11 @@ pub(crate) fn parse_with_captures(
                                     let value = attr(attrs, "value").unwrap_or("").to_string();
                                     if let Some(boundary) = cur_boundary.as_mut() {
                                         boundary.properties.insert(name.to_string(), value);
-                                    } else if cur_flow.is_some() {
-                                        // A `<sequenceFlow>` is an edge with no
-                                        // properties slot and never enters the
-                                        // io_stack: ignore its properties rather
-                                        // than mis-attach them to the enclosing
-                                        // subprocess.
-                                    } else if let Some(&idx) = io_stack.last() {
+                                    } else if let Some(idx) = ext_owner {
+                                        // Bound to the exact flow node owning
+                                        // this extensionElements; a non-flow
+                                        // owner (sequenceFlow, dataObject, …)
+                                        // has `None` and is ignored.
                                         acc.nodes[idx].properties.insert(name.to_string(), value);
                                     }
                                 }
@@ -1741,6 +1747,7 @@ pub(crate) fn parse_with_captures(
                 "ioMapping" => in_io_mapping = false,
                 "extensionElements" => {
                     extension_depth = extension_depth.saturating_sub(1);
+                    ext_owner = None;
                 }
                 "taskHeaders" => in_task_headers = false,
                 "properties" => in_properties = false,
