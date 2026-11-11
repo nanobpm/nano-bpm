@@ -57,7 +57,7 @@ use std::io::Write as _;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -72,7 +72,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::deepthi::DeepthiHandle;
+use crate::deepthi::{DeepthiHandle, LifecycleExclusive, LifecycleShared};
 #[cfg(test)]
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
@@ -899,30 +899,14 @@ pub struct PartitionStateMachine {
     /// observe that adoption reached the wait BEFORE touching the engine.
     #[cfg(test)]
     adoption_permit_waiting: Arc<tokio::sync::Notify>,
-    /// Retirement fence (#1473): set by [`RaftPartition::retire`] once this state
-    /// machine's Raft core has shut down. A detached in-flight snapshot build
-    /// (openraft spawns `build_snapshot` and never joins it — vendored
-    /// `core/sm/worker.rs`) checks this before publishing, so a build that
-    /// finishes after the successor member reopened the same durable snapshot
-    /// directory can no longer overwrite its snapshot pointer or collide with
-    /// its reset `snap-1.bin` name. Receiving a new snapshot into a retired
-    /// member is likewise refused.
-    retired: Arc<AtomicBool>,
-    /// Count of in-flight detached snapshot builds this state machine has
-    /// spawned but not yet finished. [`RaftPartition::retire`] drains it before
-    /// reclaiming a volatile snapshot directory, so no build can still be
-    /// writing into a directory that is being removed.
-    inflight_builds: Arc<AtomicUsize>,
-    /// The checkpoint gate this member's snapshot installs publish under
-    /// (#1473). A PRIVATE per-member gate (NOT the journal's `SegShared` gate):
-    /// `install_snapshot` holds it across its whole mutate → publish cycle, and
-    /// [`RaftPartition::retire`] drains it before reclaiming a volatile
-    /// snapshot directory, so no install can still be publishing into a
-    /// directory that is being removed. It is deliberately separate from the
-    /// journal's real checkpoint gate (which the adoption inside the install
-    /// also acquires) — sharing one non-reentrant gate would self-deadlock the
-    /// install.
-    checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The engine lifecycle epoch this member was constructed in (#1473). Every
+    /// engine-touching operation (apply, snapshot capture/build/install) enters
+    /// the engine's single lifecycle lock SHARED with this epoch
+    /// ([`DeepthiHandle::lifecycle_enter`]) and is refused once the epoch has
+    /// been retired by [`RaftPartition::retire`] — one lock for the whole class
+    /// of "predecessor work races retirement / engine reuse", instead of a
+    /// bespoke fence per operation.
+    epoch: u64,
     /// Monotonic generation of this state machine's snapshot file names
     /// (#1473). Derived from the durable snapshot pointer's file name at
     /// construction, so a member that REOPENS a durable snapshot directory
@@ -982,6 +966,10 @@ impl PartitionStateMachine {
         // durable snapshot dir never reuses a name a predecessor generation may
         // still have in flight. A fresh dir (or a pre-#1473 un-tagged pointer)
         // starts at generation 1.
+        // Bind this member to the engine's CURRENT lifecycle epoch (#1473): a
+        // successor is always constructed after its predecessor's retirement
+        // bumped the epoch, so the two can never both be admitted.
+        let epoch = engine.lifecycle_epoch();
         let generation = restored
             .as_ref()
             .and_then(|s| {
@@ -1008,9 +996,7 @@ impl PartitionStateMachine {
             leader,
             #[cfg(test)]
             adoption_permit_waiting: Arc::default(),
-            retired: Arc::new(AtomicBool::new(false)),
-            inflight_builds: Arc::new(AtomicUsize::new(0)),
-            checkpoint_gate: Arc::new(tokio::sync::Mutex::new(())),
+            epoch,
             generation,
         })
     }
@@ -1029,47 +1015,42 @@ impl PartitionStateMachine {
         ))
     }
 
-    /// The retirement handles [`RaftPartition`] needs to fence and drain this
-    /// state machine's detached snapshot work when the member is retired
-    /// (#1473): the retirement flag, the in-flight build counter, and the
-    /// snapshot directory the builds write into. All `Arc`-shared, so they stay
-    /// valid after the state machine moved into openraft's worker.
-    fn retirement_handles(&self) -> (Arc<AtomicBool>, Arc<AtomicUsize>, PathBuf) {
-        (
-            Arc::clone(&self.retired),
-            Arc::clone(&self.inflight_builds),
-            self.snapshot_dir.clone(),
-        )
+    /// What [`RaftPartition`] needs to retire this member (#1473): the engine
+    /// whose lifecycle lock it takes, the epoch this member is bound to, and
+    /// the snapshot directory (reclaimed when volatile).
+    fn retirement_handles(&self) -> (DeepthiHandle, u64, PathBuf) {
+        (self.engine.clone(), self.epoch, self.snapshot_dir.clone())
     }
 
-    /// Whether this state machine has been retired (its Raft core shut down and
-    /// [`RaftPartition::retire`] ran). A retired member must not publish or
-    /// receive snapshots.
+    /// Enters the engine lifecycle lock SHARED for this member (#1473), or
+    /// `None` when the member has been retired. Hold the guard for the whole
+    /// engine-touching operation: retirement cannot complete while it is held,
+    /// and the epoch cannot change under it.
+    async fn enter_lifecycle(&self) -> Option<LifecycleShared> {
+        self.engine.lifecycle_enter(self.epoch).await
+    }
+
+    /// Whether this member's lifecycle epoch has been retired (non-blocking
+    /// probe; authoritative checks go through [`Self::enter_lifecycle`]).
     fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::SeqCst)
+        self.engine.lifecycle_epoch() != self.epoch
     }
 
-    /// The checkpoint gate this member's snapshot installs publish under
-    /// (#1473): a private per-member gate, cloned into the `RaftPartition` at
-    /// boot so [`RaftPartition::retire`] can drain in-flight installs before
-    /// reclaiming a volatile snapshot directory.
-    fn checkpoint_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.checkpoint_gate)
-    }
-
-    /// Registers one in-flight state-machine operation (a detached snapshot
-    /// build/install, or an `apply` batch that may park on a durability
-    /// barrier), returning the guard that deregisters it on drop.
-    /// [`RaftPartition::retire`] fences, then drains this counter before
-    /// reclaiming a volatile snapshot dir or letting a successor reuse the
-    /// engine, so an operation still holding its guard keeps the directory and
-    /// engine alive — and an apply that registered before the fence check can
-    /// never be missed by a drain that observed zero.
-    fn track_build(self: &Arc<Self>) -> BuildGuard {
-        self.inflight_builds.fetch_add(1, Ordering::SeqCst);
-        BuildGuard {
-            inflight: Arc::clone(&self.inflight_builds),
-        }
+    /// The typed refusal every lifecycle-fenced operation returns once its
+    /// member is retired (#1473).
+    fn retired_error(
+        subject: ErrorSubject<NodeId>,
+        verb: ErrorVerb,
+        what: &str,
+    ) -> StorageError<NodeId> {
+        StorageError::from_io_error(
+            subject,
+            verb,
+            std::io::Error::other(format!(
+                "refusing to {what}: the state machine was retired (its engine lifecycle \
+                 epoch ended) (#1473)"
+            )),
+        )
     }
 
     /// [`new`](Self::new) with a fresh temp snapshot directory. Used by the
@@ -1311,21 +1292,6 @@ pub fn sweep_orphaned_snapshot_dirs() {
     }
 }
 
-/// Deregisters one in-flight detached snapshot build on drop
-/// ([`PartitionStateMachine::track_build`]). Held for the whole
-/// [`build_snapshot`](RaftSnapshotBuilder::build_snapshot) run so
-/// [`RaftPartition::retire`] can drain the set before reclaiming a volatile
-/// snapshot directory (#1473).
-struct BuildGuard {
-    inflight: Arc<AtomicUsize>,
-}
-
-impl Drop for BuildGuard {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// A point-in-time snapshot builder: holds an [`EngineSnapshot`] and metadata
 /// captured atomically (relative to `apply`) when the state-machine worker minted
 /// it, so [`build_snapshot`](RaftSnapshotBuilder::build_snapshot) only has to
@@ -1366,10 +1332,6 @@ pub struct PartitionSnapshotBuilder {
     )>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
-    /// Keeps this build registered in the state machine's in-flight set for the
-    /// whole serialize+publish, so [`RaftPartition::retire`] can drain it before
-    /// reclaiming a volatile snapshot directory (#1473).
-    _build_guard: BuildGuard,
 }
 
 impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
@@ -1434,6 +1396,19 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             1
         };
         let _build_permit = snapshot_build_sem().acquire_many(build_permits).await.ok();
+        // Enter the engine lifecycle lock (#1473) AFTER the build semaphore (the
+        // documented lock order) and hold it across the whole serialize +
+        // publish: this build is a DETACHED task openraft never joins, so
+        // without it a build could write into a snapshot dir its successor
+        // reopened. A retired member is refused HERE, before any file I/O; and
+        // retirement cannot complete while this guard is held.
+        let _lifecycle = self.sm.enter_lifecycle().await.ok_or_else(|| {
+            PartitionStateMachine::retired_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                "build a Raft snapshot",
+            )
+        })?;
         // Generation-stamped name (#1473): a predecessor build that outlives its
         // member can never collide with the successor's `snap-g<N+1>-…` names on
         // the reopened durable dir.
@@ -1476,26 +1451,6 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // Fail closed: an unreadable off-heap row aborts the build before the
         // durable pointer is written and before openraft purges the covered log.
         write_result.map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-
-        // Retirement fence (#1473): this build is a DETACHED task openraft never
-        // joins, so it can finish after its Raft core was shut down and the
-        // successor member reopened the same durable snapshot directory (which
-        // reset its own `snapshot_idx` to `snap-1.bin`). Publishing now would
-        // overwrite the successor's snapshot pointer / collide on the file name.
-        // A retired state machine abandons the build: remove the serialized
-        // artifact and return an error WITHOUT writing the durable pointer, so
-        // the (already dead) core never purges the covered log on its strength.
-        if self.sm.is_retired() {
-            let _ = std::fs::remove_file(&path);
-            return Err(StorageError::from_io_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Write,
-                std::io::Error::other(
-                    "refusing to publish a Raft snapshot: the state machine was retired \
-                     (its Raft core shut down) while this build was in flight (#1473)",
-                ),
-            ));
-        }
 
         let file = std::fs::File::open(&path)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
@@ -1568,14 +1523,17 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     where
         I: IntoIterator<Item = Entry<RaftConfig>> + Send,
     {
-        // Retirement lifetime (#1473): register this apply in the member's
-        // in-flight operation set BEFORE checking the fence, so `retire` (which
-        // sets the fence, then drains the set) can never observe zero in-flight
-        // operations while an apply parked on a durability barrier is about to
-        // resume and submit further entries to an engine a successor now owns.
-        // SeqCst on both sides makes the register/check vs fence/drain pair a
-        // total order (no interleaving lets both sides miss each other).
-        let _op_guard = self.track_build();
+        // Engine lifecycle lock (#1473): hold it SHARED for the whole batch, so a
+        // retirement (exclusive) can neither land mid-batch nor be followed by
+        // an apply that resumes from a durability barrier and submits entries
+        // to an engine a successor now owns. A retired member is refused.
+        let _lifecycle = self.enter_lifecycle().await.ok_or_else(|| {
+            PartitionStateMachine::retired_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                "apply a Raft entry",
+            )
+        })?;
         let mut responses = Vec::new();
         // Each Normal entry is a BATCH of commands. We apply the whole batch in a
         // single engine-actor round-trip (the actor runs them in submission order),
@@ -1584,18 +1542,6 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // batch into one write+fsync instead of one fsync per command. We never hold
         // the std::Mutex across an engine `.await`.
         for entry in entries {
-            // Re-check the fence before EVERY entry: an apply that resumes from
-            // a barrier after retirement must not submit the remainder of its
-            // batch to the (possibly reused) engine (#1473).
-            if self.is_retired() {
-                return Err(StorageError::from_io_error(
-                    ErrorSubject::StateMachine,
-                    ErrorVerb::Write,
-                    std::io::Error::other(
-                        "refusing to apply a Raft entry on a retired state machine (#1473)",
-                    ),
-                ));
-            }
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {
@@ -1796,14 +1742,17 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // during `build_snapshot`'s streaming serialize, which fails closed (a
         // `StorageError`, so the covered log is never purged) if any row will
         // not read.
-        // Register in the in-flight set BEFORE the capture (#1473), so a
-        // retirement that drains to zero can never be followed by a builder that
-        // was already capturing and later writes into the reused directory.
-        let build_guard = self.track_build();
-        let captured = self
-            .engine
-            .with(|journal| journal.streaming_snapshot_parts())
-            .await;
+        // Capture under the engine lifecycle lock (#1473). A retired member (a
+        // queued `BuildSnapshot` that runs after retirement) captures NOTHING,
+        // so its `build_snapshot` fails closed before any file I/O.
+        let captured = match self.enter_lifecycle().await {
+            Some(_lifecycle) => {
+                self.engine
+                    .with(|journal| journal.streaming_snapshot_parts())
+                    .await
+            }
+            None => None,
+        };
         let (last_applied, last_membership) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             (inner.last_applied, inner.last_membership.clone())
@@ -1813,22 +1762,19 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             captured,
             last_applied,
             last_membership,
-            _build_guard: build_guard,
         }
     }
 
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
-        // Retirement fence (#1473): a retired member must not start receiving a
+        // Lifecycle fence (#1473): a retired member must not start receiving a
         // new snapshot into a directory its successor may already own.
         if self.is_retired() {
-            return Err(StorageError::from_io_error(
+            return Err(PartitionStateMachine::retired_error(
                 ErrorSubject::Snapshot(None),
                 ErrorVerb::Read,
-                std::io::Error::other(
-                    "refusing to receive a Raft snapshot: the state machine was retired (#1473)",
-                ),
+                "receive a Raft snapshot",
             ));
         }
         // Reclaim any orphaned partials from previously-aborted installs in this
@@ -1872,30 +1818,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<NodeId>> {
-        // Retirement fence (#1473): never install into a retired member — its
-        // engine is no longer the live one and its snapshot dir may already be
-        // reclaimed or reopened by the successor.
-        if self.is_retired() {
-            return Err(StorageError::from_io_error(
+        // Engine lifecycle lock (#1473): held SHARED across the WHOLE install —
+        // deserialize, adopt into the engine, publish the pointer. A retired
+        // member is refused BEFORE deserialization or adoption (so an old
+        // snapshot can never overwrite the engine a successor reuses), and
+        // retirement cannot complete while an install is mid-flight. Lock
+        // order: lifecycle → the journal's checkpoint permit (the adoption).
+        let _lifecycle = self.enter_lifecycle().await.ok_or_else(|| {
+            PartitionStateMachine::retired_error(
                 ErrorSubject::Snapshot(None),
                 ErrorVerb::Write,
-                std::io::Error::other(
-                    "refusing to install a Raft snapshot: the state machine was retired (#1473)",
-                ),
-            ));
-        }
+                "install a Raft snapshot",
+            )
+        })?;
         let SnapshotFile { file, path } = *snapshot;
-
-        // Hold this member's private publish gate across the WHOLE
-        // mutate → publish cycle (#1473): `RaftPartition::retire` drains this
-        // gate before reclaiming a volatile snapshot dir, so an install that
-        // passed the fence above but then parked on deserialization or the
-        // adoption permit can no longer resume after retirement and overwrite
-        // the successor's engine and snapshot pointer. This is the member's
-        // PRIVATE gate (not the journal's checkpoint gate, which the adoption
-        // below acquires separately) — sharing one non-reentrant gate would
-        // self-deadlock the install.
-        let _publish_permit = self.checkpoint_gate.lock().await;
 
         // Stream-deserialize the received chunked snapshot (#1337) from a
         // blocking task: read the control skeleton, then restore each instance
@@ -1935,24 +1871,6 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     &std::io::Error::other(e.to_string()),
                 )
             })?;
-
-        // Re-check the retirement fence (#1473) AFTER the adoption: retirement
-        // may have landed while this install was parked on deserialization or
-        // the adoption permit. The adopted engine state is already in place
-        // (harmless — the retired member's engine is no longer the live one and
-        // its successor rebuilt from durable state), but the durable pointer
-        // and file promotion below must never publish into a directory the
-        // successor may already own.
-        if self.is_retired() {
-            return Err(StorageError::from_io_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Write,
-                std::io::Error::other(
-                    "refusing to publish an installed Raft snapshot: the state machine was \
-                     retired while the install was in flight (#1473)",
-                ),
-            ));
-        }
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2480,15 +2398,12 @@ pub struct RaftPartition {
     /// ([`snapshot_bytes_sent`](Self::snapshot_bytes_sent)) to extend the deadline
     /// while a snapshot install is actively transferring.
     snapshot_progress: Arc<SnapshotSendProgress>,
-    /// Retirement fence for this member's state machine (#1473): set by
-    /// [`retire`](Self::retire) after the Raft core shuts down, so a detached
-    /// in-flight snapshot build can no longer publish into the snapshot dir the
-    /// successor reopened.
-    sm_retired: Arc<AtomicBool>,
-    /// In-flight detached snapshot builds of this member's state machine
-    /// (#1473). [`retire`](Self::retire) drains it before reclaiming a volatile
-    /// snapshot directory.
-    sm_inflight_builds: Arc<AtomicUsize>,
+    /// The engine actor this member's state machine drives, and the lifecycle
+    /// epoch it was bound to (#1473). [`retire`](Self::retire) takes that
+    /// engine's lifecycle lock EXCLUSIVE, which retires the epoch and drains
+    /// every in-flight apply / snapshot build / install of this member.
+    sm_engine: DeepthiHandle,
+    sm_epoch: u64,
     /// This member's snapshot directory (durable under the log dir, or a fresh
     /// per-boot temp dir for a volatile-log member). Retired with the member.
     sm_snapshot_dir: PathBuf,
@@ -2497,12 +2412,6 @@ pub struct RaftPartition {
     /// dir). Only a volatile dir is reclaimed on retire; a durable recovery
     /// directory is never touched.
     sm_volatile_snap: bool,
-    /// The checkpoint gate this member's snapshot installs publish under
-    /// (#1473). [`retire`](Self::retire) drains it before reclaiming a volatile
-    /// snapshot directory, so no install can still be publishing into a
-    /// directory that is being removed. Resolved from the state machine (which
-    /// lazily mirrors the journal's `SegShared` gate) at boot.
-    sm_checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RaftPartition {
@@ -2524,8 +2433,7 @@ impl RaftPartition {
         let log_store = MemLogStore::default();
         let stamp_engine = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
-        let (sm_retired, sm_inflight_builds, sm_snapshot_dir) = state_machine.retirement_handles();
-        let sm_checkpoint_gate = state_machine.checkpoint_gate();
+        let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(
             Arc::new(NullTransport),
@@ -2546,12 +2454,11 @@ impl RaftPartition {
             batcher,
             log_bytes: Arc::new(AtomicI64::new(0)),
             snapshot_progress,
-            sm_retired,
-            sm_inflight_builds,
+            sm_engine,
+            sm_epoch,
             sm_snapshot_dir,
             // A single in-memory voter anchors its snapshots in a temp dir.
             sm_volatile_snap: true,
-            sm_checkpoint_gate,
         })
     }
 
@@ -2582,8 +2489,7 @@ impl RaftPartition {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
-        let (sm_retired, sm_inflight_builds, sm_snapshot_dir) = state_machine.retirement_handles();
-        let sm_checkpoint_gate = state_machine.checkpoint_gate();
+        let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         // A durable journal-backed engine already holds every entry its journal
         // recorded: boot from the newer of journal and snapshot so openraft
         // re-applies neither's entries (#1405).
@@ -2612,12 +2518,11 @@ impl RaftPartition {
             batcher,
             log_bytes,
             snapshot_progress,
-            sm_retired,
-            sm_inflight_builds,
+            sm_engine,
+            sm_epoch,
             sm_snapshot_dir,
             // Snapshots anchor next to the durable log — never reclaimed on retire.
             sm_volatile_snap: false,
-            sm_checkpoint_gate,
         })
     }
 
@@ -2665,8 +2570,7 @@ impl RaftPartition {
             evict_eligible,
             leader.clone(),
         )?);
-        let (sm_retired, sm_inflight_builds, sm_snapshot_dir) = state_machine.retirement_handles();
-        let sm_checkpoint_gate = state_machine.checkpoint_gate();
+        let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         // Restore the engine from the durable current snapshot (if any) BEFORE
         // openraft is constructed: with a compacted log the snapshot holds the
         // purged prefix, and the state machine already carries its applied
@@ -2729,11 +2633,10 @@ impl RaftPartition {
             batcher,
             log_bytes,
             snapshot_progress,
-            sm_retired,
-            sm_inflight_builds,
+            sm_engine,
+            sm_epoch,
             sm_snapshot_dir,
             sm_volatile_snap: volatile_snap,
-            sm_checkpoint_gate,
         })
     }
 
@@ -2985,117 +2888,77 @@ impl RaftPartition {
         self.raft.metrics().borrow().state == openraft::ServerState::Shutdown
     }
 
-    /// Fully retires this member (#1473): fences the state machine against any
-    /// detached snapshot work that outlives the core, shuts the Raft core down,
-    /// drains in-flight snapshot builds and installs, and — for a volatile
-    /// (temp-dir) member — reclaims its snapshot staging directory.
+    /// Fully retires this member (#1473) and returns the engine's lifecycle
+    /// lock held EXCLUSIVE.
     ///
     /// `Raft::shutdown()` joins the core and the ticker, but NOT the
     /// state-machine worker's detached `build_snapshot` tasks (vendored openraft
-    /// `core/sm/worker.rs` spawns them and never joins them) nor an
-    /// `install_snapshot` parked on deserialization or the adoption permit. A
-    /// build or install that finishes after the successor member reopened the
-    /// same durable snapshot directory would overwrite its snapshot pointer or
-    /// collide with its artifact names, so retirement:
+    /// `core/sm/worker.rs` spawns them and never joins them), an `apply` parked
+    /// on a durability barrier, or an `install_snapshot` parked on
+    /// deserialization / the adoption permit. Every one of those holds the
+    /// engine's single lifecycle lock SHARED for its whole run (see
+    /// [`DeepthiHandle::lifecycle_enter`]), so retirement is just:
     ///
-    /// 1. Sets the `retired` fence FIRST — before the core is even asked to
-    ///    shut down — so a build/install that finishes at any point from now on
-    ///    abandons its artifact instead of publishing (see `build_snapshot` /
-    ///    `install_snapshot`), including one that passed its entry fence check
-    ///    and is parked mid-install.
-    /// 2. Shuts the Raft core down (joins the core + ticker).
-    /// 3. Drains the in-flight build counter, so no build is still writing into
-    ///    the snapshot dir when it is reclaimed.
-    /// 4. Drains the checkpoint gate, so no install is still publishing into
-    ///    the snapshot dir when it is reclaimed.
-    /// 5. For a VOLATILE member (no durable log dir), removes the temp snapshot
-    ///    dir once drained. The boot-time [`sweep_orphaned_snapshot_dirs`] skips
-    ///    the live PID, so without this every rebuild leaked its staging dir for
-    ///    the life of the process. A DURABLE snapshot dir (under the log dir) is
-    ///    a recovery point and is never touched — and its generation-stamped
-    ///    names (#1473) mean a late predecessor artifact can never collide with
-    ///    the successor's.
+    /// 1. Shut the Raft core down (no new state-machine work is dispatched).
+    /// 2. Take the engine's lifecycle lock EXCLUSIVE (bounded by
+    ///    [`RETIRE_DRAIN_BOUND`]). Acquiring it retires this member's epoch and
+    ///    waits until no shared holder is in flight; any operation that starts
+    ///    later is refused before it touches the engine or the snapshot dir.
+    /// 3. For a VOLATILE member (no durable log dir), remove its temp snapshot
+    ///    dir — nothing can still be writing into it. A DURABLE snapshot dir is
+    ///    a recovery point and is never touched.
     ///
-    /// Bounded: the drains wait at most [`RETIRE_DRAIN_BOUND`]. Returns `Err`
-    /// (fail closed) when a build or install is still in flight past the bound:
-    /// the caller must NOT let a durable successor reuse the directory yet —
-    /// the supervisor retries the rebuild on its next tick. A volatile member
-    /// whose drain timed out leaves its dir for the next boot's orphan sweep
-    /// and still returns `Err` (the rebuild is unsafe while a predecessor
-    /// writes into the shared temp namespace).
-    pub async fn retire(&self) -> std::io::Result<()> {
-        // Fence FIRST: a build or install that finishes after this abandons its
-        // artifact, even one that passed its entry fence check before shutdown.
-        self.sm_retired.store(true, Ordering::SeqCst);
+    /// The returned guard must be held by the caller through the rebuild's
+    /// engine resolution (health probe, durable reconstruction, journal swap)
+    /// so deployment fan-out and any other shared holder cannot interleave with
+    /// it; drop it BEFORE constructing the successor member (whose construction
+    /// may dispatch applies that enter the lock shared).
+    ///
+    /// Fails closed (`Err`) when a shared holder is still in flight past the
+    /// bound: the caller must NOT rebuild over it — the supervisor retries.
+    pub async fn retire(&self) -> std::io::Result<LifecycleExclusive> {
+        self.retire_within(RETIRE_DRAIN_BOUND).await
+    }
+
+    /// [`retire`](Self::retire) with an explicit drain bound.
+    pub async fn retire_within(
+        &self,
+        bound: std::time::Duration,
+    ) -> std::io::Result<LifecycleExclusive> {
         self.raft.shutdown().await.ok();
-        // Drain in-flight builds (bounded). Each finished build drops its
-        // `BuildGuard`, decrementing the counter.
-        let builds_drained = self.drain_snapshot_builds(RETIRE_DRAIN_BOUND).await;
-        // Drain in-flight installs (bounded): hold the checkpoint gate until no
-        // install can still be publishing into the snapshot dir.
-        let installs_drained = self.drain_snapshot_installs(RETIRE_DRAIN_BOUND).await;
-        let drained = builds_drained && installs_drained;
-        if self.sm_volatile_snap {
-            if drained {
-                // Only reclaim once no build or install can still be writing
-                // into the dir.
-                let _ = std::fs::remove_dir_all(&self.sm_snapshot_dir);
-            } else {
+        let Ok(exclusive) = tokio::time::timeout(bound, self.sm_engine.lifecycle_exclusive()).await
+        else {
+            if self.sm_volatile_snap {
                 tracing::warn!(
                     partition = self.partition_id,
                     dir = ?self.sm_snapshot_dir,
-                    "raft: retiring a member with snapshot work still in flight past the \
+                    "raft: retiring a member with state-machine work still in flight past the \
                      drain bound; leaving its volatile snapshot dir for the next boot's \
                      orphan sweep (#1473)"
                 );
             }
-        }
-        if drained {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "raft: partition {} still has snapshot work in flight {}s after retirement \
-                 (builds drained: {builds_drained}, installs drained: {installs_drained}); \
-                 refusing to let a successor reuse its snapshot directory yet (#1473)",
+            return Err(std::io::Error::other(format!(
+                "raft: partition {} still has state-machine work (apply / snapshot build / \
+                 install) holding the engine lifecycle lock {}ms after retirement; refusing \
+                 to rebuild over it yet (#1473)",
                 self.partition_id,
-                RETIRE_DRAIN_BOUND.as_secs(),
-            )))
+                bound.as_millis(),
+            )));
+        };
+        if self.sm_volatile_snap {
+            let _ = std::fs::remove_dir_all(&self.sm_snapshot_dir);
         }
+        Ok(exclusive)
     }
 
-    /// Waits until this member's in-flight detached snapshot builds have drained
-    /// (counter reaches zero), bounded by `budget`. Returns whether the set
-    /// drained within the budget. Polls on a short interval — builds are
-    /// infrequent and retirement is a cold path, so a 10 ms poll is ample and
-    /// far cheaper than the fsync a build is usually finishing.
-    async fn drain_snapshot_builds(&self, budget: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            if self.sm_inflight_builds.load(Ordering::SeqCst) == 0 {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+    /// The engine actor this member's state machine drives (#1473).
+    pub fn sm_engine(&self) -> &DeepthiHandle {
+        &self.sm_engine
     }
 
-    /// Waits until no `install_snapshot` is still publishing into this member's
-    /// snapshot dir, bounded by `budget`: acquires the member's checkpoint gate
-    /// (which every install holds across its mutate → publish cycle) with a
-    /// timeout. Returns whether the gate was free within the budget.
-    async fn drain_snapshot_installs(&self, budget: std::time::Duration) -> bool {
-        let gate = self.sm_checkpoint_gate.clone();
-        tokio::time::timeout(budget, gate.lock_owned())
-            .await
-            .is_ok()
-    }
-
-    /// Test-only: whether this member's state machine has been retired.
-    #[cfg(test)]
-    pub(crate) fn is_retired(&self) -> bool {
-        self.sm_retired.load(Ordering::SeqCst)
+    /// Whether this member's lifecycle epoch has been retired.
+    pub fn is_retired(&self) -> bool {
+        self.sm_engine.lifecycle_epoch() != self.sm_epoch
     }
 
     /// Test-only: this member's snapshot directory (for the volatile-reclaim
@@ -3103,12 +2966,6 @@ impl RaftPartition {
     #[cfg(test)]
     pub(crate) fn snapshot_dir(&self) -> &Path {
         &self.sm_snapshot_dir
-    }
-
-    /// Test-only: this member's in-flight detached snapshot build count.
-    #[cfg(test)]
-    pub(crate) fn inflight_snapshot_builds(&self) -> usize {
-        self.sm_inflight_builds.load(Ordering::SeqCst)
     }
 
     /// Test-only: whether this member's snapshot dir is volatile (temp-anchored).
@@ -4165,7 +4022,6 @@ mod tests {
             captured: None,
             last_applied: None,
             last_membership: StoredMembership::default(),
-            _build_guard: src_sm.track_build(),
         };
         let err = match builder.build_snapshot().await {
             Ok(_) => panic!("an incomplete capture must fail the snapshot build"),
@@ -4196,7 +4052,6 @@ mod tests {
             captured,
             last_applied: None,
             last_membership: StoredMembership::default(),
-            _build_guard: src_sm.track_build(),
         };
         ok_builder
             .build_snapshot()
@@ -6024,11 +5879,9 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// #1473 (defect 2): a snapshot build that is STILL IN FLIGHT when its member
-    /// is retired must never publish into the snapshot dir the successor reopens.
-    /// Barrier-driven, not sleep-based: the build is deterministically blocked on
-    /// the shared build semaphore while `retire` runs, then released — and must
-    /// abandon its artifact (no durable pointer, no published current snapshot).
+    /// #1473 (defect 2): a snapshot build that is STILL IN FLIGHT (parked on the
+    /// build semaphore) when its member is retired must never publish into the
+    /// snapshot dir the successor reopens. Barrier-driven, not sleep-based.
     #[tokio::test]
     async fn a_build_in_flight_during_retire_never_publishes() {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
@@ -6038,65 +5891,42 @@ mod tests {
             })
             .await;
         let sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new_temp(engine, 0).expect("snapshot dir"));
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
         let snap_dir = sm.snapshot_dir.clone();
 
-        // Deterministically block the build at the shared build semaphore: hold
-        // every permit so the build's `acquire_many` parks until we release.
-        let sem = snapshot_build_sem();
-        let permits = sem
+        // Hold every build permit so the build parks after its capture.
+        let permits = snapshot_build_sem()
             .acquire_many(snapshot_build_concurrency().max(1))
             .await
             .expect("hold every build permit");
-
-        // Start the build on a detached task (as openraft's sm worker does). It
-        // captures, then parks on the semaphore — verifiably in flight.
         let mut builder = Arc::clone(&sm).get_snapshot_builder().await;
-        assert_eq!(
-            sm.inflight_builds.load(Ordering::Relaxed),
-            1,
-            "the builder registered itself in the in-flight set"
-        );
+        assert!(builder.captured.is_some(), "a live member captures");
         let build = tokio::spawn(async move { builder.build_snapshot().await });
 
-        // Retire the member WHILE the build is parked: fence + drain. The drain
-        // must NOT return until the build finishes, so run retire on a task and
-        // confirm it is still waiting (the build holds its guard).
-        let (retired_flag, inflight, _dir) = sm.retirement_handles();
-        // Fence SYNCHRONOUSLY before releasing the build (as `retire` does), so
-        // retirement is guaranteed visible when the build resumes.
-        retired_flag.store(true, Ordering::SeqCst);
-        let retire = tokio::spawn({
-            let snap_dir = snap_dir.clone();
-            async move {
-                // Drain with the same bound `RaftPartition::retire` uses.
-                let deadline = std::time::Instant::now() + RETIRE_DRAIN_BOUND;
-                while inflight.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                let _ = std::fs::remove_dir_all(&snap_dir);
-                inflight.load(Ordering::Relaxed)
-            }
-        });
+        // Retire: the parked build holds no lifecycle guard, so the exclusive
+        // lock is granted at once and the member's epoch ends.
+        drop(engine.lifecycle_exclusive().await);
 
-        // Release the semaphore: the parked build now runs to completion — but
-        // the retired fence is set, so it must ABANDON its artifact.
+        // Release the build: it re-enters the lifecycle lock, is refused, and
+        // fails before any file I/O.
         drop(permits);
         let result = build.await.expect("the build task ran");
         assert!(
             result.is_err(),
-            "a build that finishes after retirement must fail, not publish"
+            "a build resumed after retirement must fail"
         );
-        let leftover = retire.await.expect("the retire drain completed");
-        assert_eq!(leftover, 0, "every in-flight build drained");
-
-        // The retired build published nothing before the dir was reclaimed: no
-        // durable pointer ever landed.
         assert!(
             !snapshot_ptr_path(&snap_dir).is_file(),
             "a retired build must never write the durable snapshot pointer"
         );
+        let leftovers: Vec<_> = std::fs::read_dir(&snap_dir)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "a retired build writes no artifact, found {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&snap_dir);
     }
 
     /// #1473 (defect 3): retiring a volatile member reclaims its temp snapshot
@@ -6202,20 +6032,101 @@ mod tests {
         );
     }
 
-    /// #1473 (defect 2, fence): a retired state machine refuses to receive or
-    /// install a snapshot into a directory its successor may already own.
+    /// #1473 DEFECT-CLASS GUARD: every engine-touching state-machine operation
+    /// (apply, snapshot capture/build, receive, install) that runs or resumes
+    /// after its member was retired is refused BEFORE it touches the engine or
+    /// the snapshot dir — including an install whose receive began before the
+    /// retirement (the "passed the fence, then parked" interleaving). One lock,
+    /// one epoch: no operation needs a bespoke fence.
     #[tokio::test]
-    async fn a_retired_state_machine_refuses_snapshot_receive_and_install() {
-        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
-        let mut sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new_temp(engine, 0).expect("snapshot dir"));
-        sm.retired.store(true, Ordering::SeqCst);
+    async fn every_state_machine_operation_is_refused_after_retirement() {
+        // A source with a deployed definition, to produce a real snapshot.
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        src.with(|j| {
+            let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+        })
+        .await;
+        let src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(src, 0).expect("src dir"));
+        let mut src_builder = Arc::clone(&src_sm).get_snapshot_builder().await;
+        let snap = src_builder.build_snapshot().await.expect("source snapshot");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read snapshot");
+        }
 
-        let recv = sm.begin_receiving_snapshot().await;
-        assert!(
-            recv.is_err(),
-            "a retired state machine must refuse to receive a snapshot"
+        // The member under test: begin receiving BEFORE retirement.
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("dst dir"));
+        let mut received = sm.begin_receiving_snapshot().await.expect("begin receive");
+        {
+            use tokio::io::AsyncWriteExt;
+            received.write_all(&bytes).await.expect("write body");
+            received.flush().await.expect("flush body");
+        }
+
+        // Retire the member (the exclusive lifecycle lock ends its epoch).
+        drop(dst.lifecycle_exclusive().await);
+
+        // install: refused before deserialization/adoption — engine untouched.
+        let install = sm.install_snapshot(&snap.meta, received).await;
+        assert!(install.is_err(), "a retired member must refuse an install");
+        let processes = dst.with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            processes, 0,
+            "a refused install never adopts into the engine"
         );
+        assert!(!snapshot_ptr_path(&sm.snapshot_dir).is_file());
+
+        // receive: refused.
+        assert!(sm.begin_receiving_snapshot().await.is_err());
+
+        // apply: refused, engine untouched.
+        let applied = apply_entry(
+            &sm,
+            1,
+            vec![ReplicatedCommand {
+                command: deploy_command(),
+                now: 1,
+            }],
+        )
+        .await;
+        assert!(applied.is_err(), "a retired member must refuse an apply");
+        let processes = dst.with(|j| j.state().processes.len()).await;
+        assert_eq!(processes, 0, "a refused apply never reaches the engine");
+
+        // capture/build: no capture, so the build fails before file I/O.
+        let mut builder = Arc::clone(&sm).get_snapshot_builder().await;
+        assert!(
+            builder.captured.is_none(),
+            "a retired member captures nothing"
+        );
+        assert!(builder.build_snapshot().await.is_err());
+        assert!(!snapshot_ptr_path(&sm.snapshot_dir).is_file());
+
+        // A SUCCESSOR bound to the new epoch on the same engine is admitted.
+        let successor: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("successor dir"));
+        apply_entry(
+            &successor,
+            1,
+            vec![ReplicatedCommand {
+                command: deploy_command(),
+                now: 1,
+            }],
+        )
+        .await
+        .expect("the successor applies");
+        for dir in [
+            &src_sm.snapshot_dir,
+            &sm.snapshot_dir,
+            &successor.snapshot_dir,
+        ] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// #1473 (review): a member that REOPENS a durable snapshot dir continues in
@@ -6232,46 +6143,47 @@ mod tests {
         assert_eq!(snapshot_generation_of("unrelated.bin"), 0);
     }
 
-    /// #1473 (review): retiring a member whose snapshot work does not drain in
-    /// time returns `Err` (fail closed) — the caller must NOT let a durable
-    /// successor reuse the directory while a predecessor may still write into it.
+    /// #1473 DEFECT-CLASS GUARD (drain): retirement waits for every in-flight
+    /// shared holder of the engine lifecycle lock (a parked apply / build /
+    /// install) and fails CLOSED past its bound, so a rebuild never proceeds
+    /// over predecessor work still touching the engine. Once the holder leaves,
+    /// retirement succeeds.
     #[tokio::test]
-    async fn retire_fails_closed_when_a_build_outlives_the_drain_bound() {
+    async fn retire_drains_in_flight_work_and_fails_closed_past_the_bound() {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
-        engine
-            .with(|j| {
-                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
-            })
-            .await;
-        let sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new_temp(engine, 0).expect("snapshot dir"));
-
-        // Hold every build permit so the spawned build parks, still in flight.
-        let sem = snapshot_build_sem();
-        let permits = sem
-            .acquire_many(snapshot_build_concurrency().max(1))
+        let member = RaftPartition::bootstrap_single(0, 0, "127.0.0.1:0".into(), engine.clone())
             .await
-            .expect("hold every build permit");
-        let mut builder = Arc::clone(&sm).get_snapshot_builder().await;
-        let build = tokio::spawn(async move { builder.build_snapshot().await });
-
-        // Fence the member and drain with a near-zero budget: the parked build
-        // cannot finish in time, so the drain reports not-drained (fail closed).
-        sm.retired.store(true, Ordering::SeqCst);
-        let (_r, inflight, _d) = sm.retirement_handles();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-        while inflight.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_ne!(
-            inflight.load(Ordering::Relaxed),
-            0,
-            "the parked build is still in flight past the (tiny) drain budget"
+            .expect("boot a volatile single voter");
+        // Simulate a parked apply/install: hold the member's epoch shared.
+        let in_flight = engine
+            .lifecycle_enter(engine.lifecycle_epoch())
+            .await
+            .expect("the live member's epoch is admitted");
+        let blocked = member
+            .retire_within(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            blocked.is_err(),
+            "retire must fail closed while work is in flight"
         );
-
-        // Release the build; the fence makes it abandon its artifact.
-        drop(permits);
-        let result = build.await.expect("the build task ran");
-        assert!(result.is_err(), "a retired build abandons its artifact");
+        drop(in_flight);
+        let exclusive = member
+            .retire_within(std::time::Duration::from_secs(5))
+            .await
+            .expect("retire succeeds once the in-flight work drained");
+        assert!(member.is_retired());
+        // While the rebuild holds the exclusive guard, epoch-agnostic fan-out
+        // (lifecycle_shared) cannot interleave with its engine resolution.
+        let fan_out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            engine.lifecycle_shared(),
+        )
+        .await;
+        assert!(fan_out.is_err(), "fan-out must wait for the rebuild's swap");
+        drop(exclusive);
+        let _fan_out =
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine.lifecycle_shared())
+                .await
+                .expect("fan-out proceeds after the swap");
     }
 }

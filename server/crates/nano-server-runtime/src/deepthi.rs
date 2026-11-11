@@ -147,6 +147,8 @@ pub enum Priority {
 /// boxed closure (never across the engine work itself), so — unlike the old
 /// `RwLock<Journal>` — it never parks a tokio worker on a contended lock.
 struct Mailbox {
+    /// The engine's lifecycle lock (#1473) — see [`EngineLifecycle`].
+    lifecycle: Arc<EngineLifecycle>,
     inner: Mutex<MailboxInner>,
     signal: Condvar,
     /// Heartbeat/liveness telemetry for this partition's engine thread. The
@@ -166,6 +168,7 @@ struct MailboxInner {
 impl Mailbox {
     fn new(partition: u64) -> Arc<Self> {
         Arc::new(Self {
+            lifecycle: Arc::new(EngineLifecycle::default()),
             inner: Mutex::new(MailboxInner {
                 hi: VecDeque::new(),
                 lo: VecDeque::new(),
@@ -215,6 +218,46 @@ impl Mailbox {
         }
     }
 }
+
+/// The single per-engine LIFECYCLE LOCK (#1473).
+///
+/// An engine actor outlives the Raft member that drives it: a partition rebuild
+/// retires the predecessor member and hands the same engine (or a journal
+/// swapped into it from durable state) to the successor. Every operation that
+/// must never interleave with that hand-over takes this one lock, instead of
+/// each operation carrying its own bespoke fence/counter/gate:
+///
+/// - **Shared** ([`DeepthiHandle::lifecycle_enter`] for a Raft member bound to
+///   an epoch, [`DeepthiHandle::lifecycle_shared`] for epoch-agnostic work):
+///   Raft `apply`, snapshot capture / build+publish / install, and deployment
+///   fan-out into the engine. A member-bound entry is refused (`None`) once the
+///   epoch it was constructed in has been retired, so a late predecessor
+///   operation can never touch the engine or the snapshot dir again.
+/// - **Exclusive** ([`DeepthiHandle::lifecycle_exclusive`]): retiring the
+///   member (fence + drain) and the rebuild's engine resolution — the health
+///   probe, the durable reconstruction, and the journal swap. Acquiring it
+///   retires the current epoch (every member bound to it is fenced) and waits
+///   until no shared holder is in flight; tokio's `RwLock` is write-preferring,
+///   so new shared entries queue behind it and then observe the new epoch.
+///
+/// **Lock order** (deadlock freedom): engine lifecycle lock → the journal's
+/// segmented checkpoint permit. A snapshot build takes the build semaphore
+/// BEFORE the lifecycle lock and never waits on the semaphore while holding it.
+/// No holder of the lifecycle lock ever waits on another engine's lifecycle
+/// lock, and the exclusive holder never waits on a Raft
+/// apply (the member's core is shut down first). Callers bound the exclusive
+/// acquisition with a timeout so a wedged shared holder fails the rebuild
+/// closed (the supervisor retries) rather than hanging it.
+#[derive(Default)]
+pub struct EngineLifecycle {
+    lock: Arc<tokio::sync::RwLock<()>>,
+    epoch: AtomicU64,
+}
+
+/// A shared hold on an engine's lifecycle lock ([`EngineLifecycle`]).
+pub type LifecycleShared = tokio::sync::OwnedRwLockReadGuard<()>;
+/// An exclusive hold on an engine's lifecycle lock ([`EngineLifecycle`]).
+pub type LifecycleExclusive = tokio::sync::OwnedRwLockWriteGuard<()>;
 
 /// A cloneable handle to the engine actor. All engine mutation and engine-state
 /// reads go through here; the [`Journal`] lives on a single dedicated thread, so
@@ -497,6 +540,43 @@ impl DeepthiHandle {
     /// never arrive.
     pub fn is_alive(&self) -> bool {
         self.mb.stats.alive.load(Ordering::Relaxed)
+    }
+
+    /// The engine's current lifecycle epoch ([`EngineLifecycle`]). A Raft
+    /// member records it at construction and passes it to
+    /// [`lifecycle_enter`](Self::lifecycle_enter) for every operation.
+    pub fn lifecycle_epoch(&self) -> u64 {
+        self.mb.lifecycle.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Enters the lifecycle lock SHARED on behalf of a member bound to `epoch`.
+    /// `None` when that epoch has been retired — the caller must not touch the
+    /// engine or its snapshot dir. The epoch only changes under the exclusive
+    /// lock, so it cannot change while the returned guard is held.
+    pub async fn lifecycle_enter(&self, epoch: u64) -> Option<LifecycleShared> {
+        let guard = Arc::clone(&self.mb.lifecycle.lock).read_owned().await;
+        (self.lifecycle_epoch() == epoch).then_some(guard)
+    }
+
+    /// Enters the lifecycle lock SHARED for epoch-agnostic engine work
+    /// (deployment fan-out): excluded only from a concurrent rebuild's engine
+    /// resolution, so the work lands either before the durable read or in the
+    /// swapped-in engine — never in between.
+    pub async fn lifecycle_shared(&self) -> LifecycleShared {
+        Arc::clone(&self.mb.lifecycle.lock).read_owned().await
+    }
+
+    /// Enters the lifecycle lock EXCLUSIVE and retires the current epoch. Wrap
+    /// in a timeout: it waits for every shared holder to leave.
+    pub async fn lifecycle_exclusive(&self) -> LifecycleExclusive {
+        let guard = Arc::clone(&self.mb.lifecycle.lock).write_owned().await;
+        self.mb.lifecycle.epoch.fetch_add(1, Ordering::SeqCst);
+        guard
+    }
+
+    /// Whether `self` and `other` drive the same engine lifecycle.
+    pub fn same_lifecycle(&self, other: &DeepthiHandle) -> bool {
+        Arc::ptr_eq(&self.mb.lifecycle, &other.mb.lifecycle)
     }
 }
 
