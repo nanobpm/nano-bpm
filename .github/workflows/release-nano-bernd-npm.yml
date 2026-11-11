@@ -43,7 +43,9 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install binaryen (wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+        uses: ./.github/actions/build-tools
+        with:
+          binaryen: 'true'
 
       # Build the wasm from source in the release job so the published tarball
       # is provably built from the tag, not lifted from a CI run.
