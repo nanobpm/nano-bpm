@@ -168,7 +168,11 @@ pub(crate) fn build_input_schema(props: &BTreeMap<String, String>) -> Value {
             continue;
         }
         let mut schema = Map::new();
-        if let Some(ty) = prop(props, &format!("input_{n}_type")) {
+        // Only JSON-Schema primitive types are advertised; an unknown type is
+        // left unconstrained so clients compiling the schema never reject it.
+        if let Some(ty) =
+            prop(props, &format!("input_{n}_type")).filter(|ty| JSON_SCHEMA_TYPES.contains(ty))
+        {
             schema.insert("type".into(), json!(ty));
         }
         if let Some(desc) = prop(props, &format!("input_{n}_description")) {
@@ -191,6 +195,12 @@ pub(crate) fn build_input_schema(props: &BTreeMap<String, String>) -> Value {
     }
     schema
 }
+
+/// The JSON-Schema primitive type names: the single source of truth for
+/// which declared input types are advertised and enforced.
+const JSON_SCHEMA_TYPES: [&str; 7] = [
+    "string", "integer", "number", "boolean", "object", "array", "null",
+];
 
 /// Validate tool `arguments` against an input schema produced by
 /// [`build_input_schema`]: every `required` property must be present and
@@ -217,7 +227,14 @@ pub(crate) fn validate_arguments(
         };
         let matches = match ty {
             "string" => value.is_string(),
-            "integer" => value.is_i64() || value.is_u64(),
+            // JSON Schema `integer` includes integral floats (`3.0`, `3e0`).
+            "integer" => {
+                value.is_i64()
+                    || value.is_u64()
+                    || value
+                        .as_f64()
+                        .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+            }
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "object" => value.is_object(),
@@ -605,8 +622,15 @@ mod tests {
             props.insert(format!("{TOOL_PROPERTY_PREFIX}{k}"), v.to_string());
         }
         let schema = build_input_schema(&props);
+        // A non-JSON-Schema type is never advertised (left unconstrained).
+        assert_eq!(schema["properties"]["free"].get("type"), None, "{schema}");
+        assert_eq!(schema["properties"]["amount"]["type"], json!("integer"));
         let check = |v: Value| validate_arguments(&schema, v.as_object().unwrap());
         assert!(check(json!({})).unwrap_err().contains("amount"));
+        // Integral floats are JSON-Schema integers.
+        assert!(check(json!({ "amount": 3.0 })).is_ok());
+        let e: Value = serde_json::from_str(r#"{"amount":3e0}"#).unwrap();
+        assert!(check(e).is_ok());
         assert!(check(json!({ "amount": "x" })).is_err());
         assert!(check(json!({ "amount": 1.5 })).is_err());
         assert!(check(json!({ "amount": 1, "flag": "yes" })).is_err());
