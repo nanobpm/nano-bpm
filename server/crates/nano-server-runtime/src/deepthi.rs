@@ -487,6 +487,17 @@ impl DeepthiHandle {
     pub fn stats(&self) -> &Arc<ActorStats> {
         &self.mb.stats
     }
+
+    /// Whether this handle's engine actor thread is still running (#1473).
+    /// `false` the instant the actor's command loop exits for ANY reason (clean
+    /// shutdown or a panic inside a command — the `AliveGuard` clears it). A
+    /// caller about to reuse a handle for a long-lived rebuild MUST check this
+    /// first: [`with`](Self::with) on a dead actor queues work onto a mailbox no
+    /// consumer drains, so the caller hangs forever waiting for a reply that can
+    /// never arrive.
+    pub fn is_alive(&self) -> bool {
+        self.mb.stats.alive.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

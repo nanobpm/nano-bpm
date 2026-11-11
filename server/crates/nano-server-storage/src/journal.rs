@@ -1164,6 +1164,40 @@ impl Journal {
         self.fresh = false;
     }
 
+    /// Replaces this journal's engine with one rebuilt from authoritative
+    /// durable state, clearing the #1405 abort fence (#1473). Used by the Raft
+    /// partition-rebuild path when the predecessor's journal was fenced by an
+    /// aborted Raft entry: the live engine may hold the entry's partial,
+    /// non-durable effects, so the whole engine is swapped for the
+    /// disk-reconstructed one rather than merely clearing the fence.
+    ///
+    /// Like [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot),
+    /// this preserves everything the journal carries that is NOT engine state:
+    /// the writer/exporter/seg wiring, the spill tiers, the var store, and the
+    /// host-injected cluster variables are all re-linked onto the fresh engine.
+    /// The cold routing index is cleared (the rebuilt engine is fully resident
+    /// from its durable replay; any stale cold rows are reaped by the
+    /// post-recovery GC).
+    pub fn replace_engine(&mut self, engine: Engine) {
+        let lenient = self.engine.lenient_completion();
+        self.engine = engine;
+        self.engine.set_lenient_completion(lenient);
+        self.engine
+            .set_cluster_variables(self.cluster_variables.clone());
+        if self.varstore.is_some() {
+            self.engine.set_track_dirty_vars(true);
+            self.engine.mark_all_dirty();
+        }
+        if let Some(cold) = self.cold.as_mut() {
+            cold.index = ColdIndex::default();
+        }
+        // The rebuild IS the durable state: the fence and any armed (aborted)
+        // raft-entry buffer are predecessor state that must not outlive it.
+        self.raft_entry = None;
+        self.fenced = false;
+        self.fresh = false;
+    }
+
     /// Reads and deserializes every event from the journal log at `path` (an
     /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
     /// replay into the engine) and the boot-time read-model catch-up.
