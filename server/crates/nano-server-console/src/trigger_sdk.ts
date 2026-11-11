@@ -37,6 +37,8 @@ export interface EmitOptions {
   maxDelayMs?: number;
   /** Sleep override (tests inject a no-op). */
   sleep?: (ms: number) => Promise<void>;
+  /** Fetch override (tests inject a stub transport). */
+  fetchFn?: typeof fetch;
 }
 
 /** The error {@link emitEvent} throws once every attempt failed. Carries the
@@ -72,8 +74,13 @@ export async function emitEvent(
 ): Promise<unknown> {
   const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
   const baseDelay = Math.max(0, opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS);
-  const maxDelay = Math.max(baseDelay, opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS);
+  // The cap is clamped to zero independently — NOT raised to `baseDelay`:
+  // `Math.min` in the retry loop enforces it even below the base delay, so a
+  // caller asking for `maxDelayMs: 100` with the default 250 ms base gets a
+  // genuine 100 ms ceiling, not a silent override of its advertised cap.
+  const maxDelay = Math.max(0, opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS);
   const sleep = opts.sleep ?? defaultSleep;
+  const fetchImpl = opts.fetchFn ?? fetch;
 
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (opts.token) headers["x-webhook-token"] = opts.token;
@@ -84,17 +91,25 @@ export async function emitEvent(
   let lastDetail = "no attempt made";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(url, { method: "POST", headers, body: payload });
-      const text = await res.text();
+      const res = await fetchImpl(url, { method: "POST", headers, body: payload });
+      // Check the status BEFORE touching the body: a 2xx already confirms the
+      // event is durably persisted (persist-before-ack), so an interrupted or
+      // unparseable acknowledgement body must never trigger a retrying second
+      // POST — reading it is strictly best-effort.
       if (res.ok) {
         try {
+          // `arrayBuffer()` (not `text()`): undici rejects a text() decode when
+          // the socket dies mid-body, but a 2xx is already durable, so the read
+          // must tolerate the truncation instead of failing the emit.
+          const buf = await res.arrayBuffer();
+          const text = new TextDecoder().decode(buf);
           return text ? JSON.parse(text) : {};
         } catch {
           return {};
         }
       }
       lastStatus = res.status;
-      lastDetail = `HTTP ${res.status}: ${text.slice(0, 200)}`;
+      lastDetail = `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`;
     } catch (err) {
       lastStatus = 0;
       lastDetail = `transport: ${String((err as Error)?.message ?? err)}`;

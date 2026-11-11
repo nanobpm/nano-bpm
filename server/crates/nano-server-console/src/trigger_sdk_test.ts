@@ -183,3 +183,49 @@ test("emitEvent preserves an explicit JSON null body; only undefined defaults to
     await stub.close();
   }
 });
+
+test("emitEvent honors a maxDelayMs below the base delay (the cap is not raised to base)", async () => {
+  const stub = await stubIngress([[500, "busy"]]);
+  const delays: number[] = [];
+  try {
+    await assertRejects(
+      () =>
+        emitEvent(stub.url, { n: 7 }, {
+          maxAttempts: 3,
+          // Deliberately leave baseDelayMs at its 250 ms default and ask for a
+          // 100 ms cap: every retry wait must be 100 ms, never the base.
+          maxDelayMs: 100,
+          sleep: (ms) => {
+            delays.push(ms);
+            return Promise.resolve();
+          },
+        }),
+      EmitError,
+    );
+    assertEquals(delays, [100, 100], "the requested cap wins over the larger base delay");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("emitEvent treats a 2xx as durable even when the ack body is interrupted", async () => {
+  // The ingress has already persisted the event when it sends a 2xx
+  // (persist-before-ack), so a connection that dies mid-body must NOT cause a
+  // second POST — the emit resolves instead of retrying a durable event.
+  let posts = 0;
+  const interrupted = (async () => {
+    posts++;
+    // Status/headers arrive (202 = durable), then the socket dies mid-body.
+    return new Response('{"enqueued":tru', {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const ack = await emitEvent("http://trigger.invalid/hook", { n: 8 }, {
+    maxAttempts: 3,
+    sleep: noSleep,
+    fetchFn: interrupted,
+  });
+  assertEquals(ack, {}, "a best-effort ack read falls back to {}");
+  assertEquals(posts, 1, "exactly one POST — no retry of a durable 2xx");
+});
