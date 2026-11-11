@@ -9141,13 +9141,23 @@ impl Engine {
     /// (padding uncollected slots with `null`) into the instance scope, applies
     /// the activity's output mappings, and takes its outgoing flow.
     /// The per-child bindings absent at an MI body's level, whose output
-    /// mappings the body skips (the per-child pass applies them).
+    /// mappings the body skips (the per-child pass applies them): `loopCounter`,
+    /// the `inputElement`, and the root variable of the `outputElement` — the
+    /// child seeds that root as a local (#1518), so it is per-child too and a
+    /// body-level read would publish `null` (review r4535034038).
     fn mi_body_tolerated_bindings(
-        input_element: Option<&str>,
+        mi: &crate::state::MultiInstanceState,
     ) -> std::collections::HashSet<String> {
         let mut tolerated = std::collections::HashSet::from(["loopCounter".to_string()]);
-        if let Some(name) = input_element {
-            tolerated.insert(name.to_string());
+        if let Some(name) = &mi.input_element {
+            tolerated.insert(name.clone());
+        }
+        if let Some(root) = mi
+            .output_element
+            .as_deref()
+            .and_then(crate::feel::variable_reference_root)
+        {
+            tolerated.insert(root);
         }
         tolerated
     }
@@ -9189,7 +9199,11 @@ impl Engine {
         instance_key: Key,
         body_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (element_id, input_element, active): (ElementId, Option<String>, Vec<Key>) = match self
+        let (element_id, tolerated, active): (
+            ElementId,
+            std::collections::HashSet<String>,
+            Vec<Key>,
+        ) = match self
             .state
             .instances
             .get(&instance_key)
@@ -9197,7 +9211,7 @@ impl Engine {
         {
             Some(mi) => (
                 mi.element_id.clone(),
-                mi.input_element.clone(),
+                Self::mi_body_tolerated_bindings(mi),
                 mi.active.iter().copied().collect(),
             ),
             None => return (Vec::new(), Vec::new()),
@@ -9226,11 +9240,7 @@ impl Engine {
             // for any other reason is a genuine failure: park the body on an
             // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
             // completion (#946), rather than silently completing with no incident.
-            match self.eval_io_mappings_tolerating(
-                &ctx,
-                &outputs,
-                &Self::mi_body_tolerated_bindings(input_element.as_deref()),
-            ) {
+            match self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated) {
                 Ok(updates) => updates,
                 Err(failure) => {
                     let event = self.io_mapping_incident(
@@ -12262,7 +12272,7 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .and_then(|i| i.multi_instances.get(&element_instance_key))
-                    .map(|mi| Self::mi_body_tolerated_bindings(mi.input_element.as_deref()));
+                    .map(Self::mi_body_tolerated_bindings);
                 let projected = match tolerated {
                     Some(tolerated) => {
                         let mut ctx = vars.clone();

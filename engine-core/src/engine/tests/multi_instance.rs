@@ -1828,3 +1828,68 @@ fn mi_subprocess_dmn_result_reaches_the_seeded_child_local() {
     );
     assert_eq!(inst.variables.get("result"), None, "result leaked to root");
 }
+
+/// #1530 review r4535034038 — an MI activity whose output mapping reads the
+/// child-local `outputElement` variable must not publish `null` to the root at
+/// body completion: that name is a per-child binding (seeded local), absent at
+/// the body level, so the body pass must tolerate (skip) it exactly like
+/// `inputElement`/`loopCounter`.
+#[test]
+fn mi_body_output_mapping_of_child_local_output_element_does_not_publish_null() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:subProcess id="Each">
+            <bpmn:extensionElements>
+              <zeebe:ioMapping>
+                <zeebe:output source="=result" target="result" />
+              </zeebe:ioMapping>
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item"
+                  outputCollection="results" outputElement="=result" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:startEvent id="ss" />
+            <bpmn:scriptTask id="calc">
+              <bpmn:extensionElements>
+                <zeebe:script expression="=item * 2" resultVariable="result" />
+              </bpmn:extensionElements>
+            </bpmn:scriptTask>
+            <bpmn:endEvent id="se" />
+            <bpmn:sequenceFlow id="i1" sourceRef="ss" targetRef="calc" />
+            <bpmn:sequenceFlow id="i2" sourceRef="calc" targetRef="se" />
+          </bpmn:subProcess>
+          <bpmn:serviceTask id="sink">
+            <bpmn:extensionElements><zeebe:taskDefinition type="sink" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Each" targetRef="sink" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(10), Value::Int(20)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let inst = engine.instance(key).unwrap();
+    assert_eq!(
+        inst.variables.get("results"),
+        Some(&Value::List(vec![Value::Int(20), Value::Int(40)]))
+    );
+    assert_ne!(
+        inst.variables.get("result"),
+        Some(&Value::Null),
+        "body completion published the child-local outputElement as null"
+    );
+}
