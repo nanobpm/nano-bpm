@@ -205,6 +205,16 @@ fn reject_unsupported(args: &Value, keys: &[&str]) -> Result<(), Value> {
     Ok(())
 }
 
+/// Like [`reject_unsupported`], for advertised `filter.*` keys the shared REST
+/// filter model lacks: deserializing would silently drop the condition and
+/// widen the search, so fail closed instead.
+fn reject_unsupported_filter(args: &Value, keys: &[&str]) -> Result<(), Value> {
+    match args.get("filter") {
+        Some(f) => reject_unsupported(f, keys),
+        None => Ok(()),
+    }
+}
+
 // --- process instances ---------------------------------------------------------
 
 async fn create_process_instance(server: &ServerImpl, args: Value) -> Value {
@@ -270,7 +280,14 @@ async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
     if let Some(a) = args.get("assignee") {
         body_json["assignee"] = a.clone();
     }
-    if let Some(opts) = args.get("assignmentOptions").and_then(Value::as_object) {
+    let opts = match args.get("assignmentOptions") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => Some(o),
+        Some(_) => {
+            return tool_error_result("`assignmentOptions` must be an object", 400);
+        }
+    };
+    if let Some(opts) = opts {
         if let Some(action) = opts.get("action") {
             body_json["action"] = action.clone();
         }
@@ -317,6 +334,9 @@ async fn get_user_task(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_user_tasks(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_filter(&args, &["isSuspended"]) {
+        return e;
+    }
     let body: Option<models::UserTaskSearchQuery> = match optional_body(args) {
         Ok(b) => b,
         Err(e) => return e,
@@ -342,6 +362,9 @@ async fn get_variable(server: &ServerImpl, args: Value) -> Value {
 
 async fn search_variables(server: &ServerImpl, args: Value) -> Value {
     // `truncateValues` is a query param; the rest is the search body.
+    if let Err(e) = reject_unsupported_filter(&args, &["protectionMode"]) {
+        return e;
+    }
     let truncate = args.get("truncateValues").and_then(Value::as_bool);
     let query = models::SearchVariablesQueryParams {
         truncate_values: truncate,

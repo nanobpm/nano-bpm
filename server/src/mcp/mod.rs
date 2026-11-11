@@ -150,7 +150,7 @@ pub(crate) fn mcp_router(server: ServerImpl) -> axum::Router {
 /// - **Content-Type must be `application/json`.** A hostile page can send a
 ///   CORS-"simple" `text/plain` POST without a preflight; requiring JSON forces
 ///   a preflight, which the gateway's CORS policy then governs.
-/// - **Origin, when present, must be same-origin or loopback.** Browsers always
+/// - **Origin, when present, must be loopback.** Browsers always
 ///   attach `Origin` to cross-origin POSTs, so this blocks DNS-rebinding /
 ///   drive-by pages from reaching an unauthenticated local gateway. Non-browser
 ///   MCP clients send no `Origin` and are unaffected.
@@ -169,19 +169,20 @@ fn check_transport(
             "Content-Type must be application/json",
         ));
     }
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-        if !origin_allowed(origin.to_str().unwrap_or(""), host) {
-            return Err((StatusCode::FORBIDDEN, "Origin not allowed"));
-        }
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && !origin_allowed(origin.to_str().unwrap_or(""))
+    {
+        return Err((StatusCode::FORBIDDEN, "Origin not allowed"));
     }
     Ok(())
 }
 
-/// An `Origin` is allowed iff its authority is a loopback host or exactly the
-/// request's own `Host` (same-origin). Anything unparseable (incl. `null`) is
+/// An `Origin` is allowed iff its authority is a loopback host. The request's
+/// `Host` header is deliberately NOT trusted: under DNS rebinding an attacker
+/// controls both `Origin` and `Host` (`attacker.example` → gateway IP), so
+/// header equality proves nothing. Anything unparseable (incl. `null`) is
 /// rejected.
-fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
+fn origin_allowed(origin: &str) -> bool {
     let Some(authority) = origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
@@ -190,9 +191,6 @@ fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
     };
     if authority.is_empty() || authority.contains('/') {
         return false;
-    }
-    if host.is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
-        return true;
     }
     let hostname = if let Some(rest) = authority.strip_prefix('[') {
         match rest.split_once(']') {
@@ -785,6 +783,41 @@ mod tests {
         }
     }
 
+    /// Advertised-but-unsupported search filters fail closed, never widen.
+    #[tokio::test]
+    async fn search_rejects_unsupported_filters_instead_of_dropping() {
+        let server = ServerImpl::default();
+        for (tool, key, val) in [
+            ("searchUserTasks", "isSuspended", json!(true)),
+            ("searchVariables", "protectionMode", json!("REDACT")),
+        ] {
+            let mut filter = json!({});
+            filter[key] = val;
+            let result = call(&server, tool, json!({ "filter": filter })).await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(key), "{key} named in error: {text}");
+        }
+    }
+
+    /// A non-object `assignmentOptions` is rejected, not ignored (ignoring it
+    /// would default `allowOverride` to true).
+    #[tokio::test]
+    async fn assign_rejects_non_object_assignment_options() {
+        let server = ServerImpl::default();
+        for opts in [json!([{ "allowOverride": false }]), json!("x"), json!(1)] {
+            let result = call(
+                &server,
+                "assignUserTask",
+                json!({ "userTaskKey": "1", "assignee": "bob", "assignmentOptions": opts }),
+            )
+            .await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{opts}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("assignmentOptions"), "{text}");
+        }
+    }
+
     /// A null/omitted assignee unassigns (it does not store `""`), so a later
     /// `allowOverride: false` assignment succeeds.
     #[tokio::test]
@@ -982,7 +1015,8 @@ mod tests {
     }
 
     /// HTTP-level: non-JSON content types and foreign Origins are rejected
-    /// before dispatch; loopback / same-origin / absent Origin pass.
+    /// before dispatch; loopback / absent Origin pass. A non-loopback Origin
+    /// matching the (attacker-controlled) Host is rejected (DNS rebinding).
     #[tokio::test]
     async fn http_rejects_non_json_and_foreign_origin() {
         let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
@@ -1013,11 +1047,21 @@ mod tests {
             .await;
             assert_eq!(st, axum::http::StatusCode::FORBIDDEN, "{origin}");
         }
+        // DNS rebinding: Origin and Host both attacker-controlled and equal.
+        let (st, _) = post(
+            &[
+                ("content-type", "application/json"),
+                ("origin", "http://attacker.example:8080"),
+                ("host", "attacker.example:8080"),
+            ],
+            frame.clone(),
+        )
+        .await;
+        assert_eq!(st, axum::http::StatusCode::FORBIDDEN, "rebinding");
         for origin in [
             "http://localhost:3000",
             "http://127.0.0.1:8080",
             "http://[::1]:9",
-            "https://gw.example:8080",
         ] {
             let (st, _) = post(
                 &[
