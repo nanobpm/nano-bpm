@@ -706,6 +706,9 @@ impl<'a> NanoRun<'a> {
     /// VARIABLE records for one scope. `scope_key` decides CREATED vs UPDATED
     /// (per runtime scope); `scope_label` is the BPMN element id the golden
     /// compares, mirroring how Zeebe's capture labels `scopeElementId`.
+    /// Delegates each variable to `variable_record` — the ONE canonical
+    /// construction of a VARIABLE record (fields + CREATED/UPDATED
+    /// bookkeeping), shared with the multi-instance paths.
     fn variable_records(
         &mut self,
         scope_key: Key,
@@ -714,26 +717,10 @@ impl<'a> NanoRun<'a> {
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
-        let known = self.known.entry(scope_key).or_default();
         sorted
             .into_iter()
             .map(|(name, v)| {
-                let intent = if known.insert(name.clone()) {
-                    "CREATED"
-                } else {
-                    "UPDATED"
-                };
-                event(
-                    "VARIABLE",
-                    intent,
-                    json!({
-                        "name": name,
-                        "value": to_json(v),
-                        "scopeElementId": scope_label,
-                        "processInstanceKey": instance,
-                        "scopeKey": scope_key,
-                    }),
-                )
+                self.variable_record(scope_key, scope_label.clone(), name, to_json(v), instance)
             })
             .collect()
     }
@@ -2893,6 +2880,94 @@ fn mi_child_loop_counter_carries_the_event_binding() {
         json!(99),
         "the event's own binding, not index + 1: {counter}"
     );
+}
+
+/// The general multi-variable path (`variable_records`) and the single-record
+/// MI path (`variable_record`) must be ONE canonical projection: a drift
+/// between them (record fields, or the per-scope CREATED/UPDATED bookkeeping)
+/// would let the same variable render differently depending on which code
+/// path emitted it. Drive both paths against one fresh `NanoRun` and assert
+/// the general path's record for a name is byte-identical to the MI path's,
+/// and that the general path still splits CREATED then UPDATED per scope.
+#[test]
+fn variable_records_delegates_to_the_single_record_helper() {
+    let tmp = std::env::temp_dir().join(format!(
+        "nano-trace-vrec-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("process.bpmn"), MI_OUTPUT_XML).unwrap();
+    fs::write(
+        tmp.join("script.json"),
+        r#"{"description": "vrec", "steps": []}"#,
+    )
+    .unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    fs::remove_dir_all(&tmp).unwrap();
+    let mut run = NanoRun::new(&sc);
+
+    // General path: two variables on scope 7, one written twice.
+    let first = run.render(&Event::ScopedVariablesUpdated {
+        instance_key: 1,
+        scope_key: 7,
+        variables: HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+        ]),
+    });
+    let second = run.render(&Event::ScopedVariablesUpdated {
+        instance_key: 1,
+        scope_key: 7,
+        variables: HashMap::from([("a".to_string(), Value::Int(3))]),
+    });
+    assert_eq!(
+        first
+            .iter()
+            .map(|r| r["intent"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["CREATED", "CREATED"],
+        "first write to a scope creates: {first:?}"
+    );
+    assert_eq!(
+        second[0]["intent"], "UPDATED",
+        "rewrite updates: {second:?}"
+    );
+
+    // MI single-record path on a FRESH scope with the same name/value set:
+    // each record must equal the general path's record for that name.
+    let mi = run.render(&Event::MultiInstanceChildActivated {
+        instance_key: 1,
+        body_key: 8,
+        child_key: 9,
+        index: 0,
+        local_variables: HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+        ]),
+    });
+    for name in ["a", "b"] {
+        let general = first
+            .iter()
+            .find(|r| r["value"]["name"] == name)
+            .unwrap_or_else(|| panic!("general record for {name}: {first:?}"));
+        let single = mi
+            .iter()
+            .find(|r| r["value"]["name"] == name)
+            .unwrap_or_else(|| panic!("MI record for {name}: {mi:?}"));
+        // Same projection, modulo the scope the record was written to
+        // (`scopeKey`/`scopeElementId` necessarily differ: 7 vs 9 here).
+        assert_eq!(
+            general["intent"], single["intent"],
+            "CREATED/UPDATED bookkeeping agrees for {name}"
+        );
+        for field in ["name", "value", "processInstanceKey"] {
+            assert_eq!(
+                general["value"][field], single["value"][field],
+                "one canonical VARIABLE projection: field {field} of {name}"
+            );
+        }
+    }
 }
 
 /// Zeebe writes the body-scope `outputCollection` UPDATE only when a
