@@ -218,9 +218,75 @@ confined to identifiable records.
 3. Run the nano runner. If nano diverges, fix nano (red/green), or file an
    issue and add an allow-list entry for it.
 
+## Generative differential testing (#1521)
+
+The hand-written and harvested scenarios only cover shapes someone thought of.
+`fuzz/` generates the rest: random, well-formed, executable BPMN (with DI) plus
+a valid driver script, from a **seed**, and runs each case through both engines
+— the same capture and the same nano runner as every other scenario, so the full
+normalised streams are compared, **VARIABLE records with their scope keys
+included** (the #1518 class: a value landing in the wrong scope).
+
+- **`fuzz/generate.mjs`** — seeded PRNG → block tree → BPMN + DI + script.
+  Element mix: service and user tasks; exclusive, parallel and inclusive
+  gateways; embedded sub-processes; parallel and sequential multi-instance
+  (input collection, input/output element, output collection — mostly the bare
+  `=result` reference of #1518); interrupting timer and message boundaries;
+  intermediate timer and message catches; input/output mappings; call
+  activities (into a generated child process). The driver is a token-flow
+  simulator: it only issues commands valid at that point (job/user-task
+  completions, message publishes, timer ticks, variable updates) in a
+  PRNG-interleaved order, and every completion/publish/update writes one of the
+  **colliding** names `result`/`v`/`note`, so parallel branches and MI children
+  race on them. Two deliberate constraints keep both engines' streams
+  comparable: every command document carries **one** variable (Zeebe creates a
+  multi-variable document's variables in internal hash order; nano in name
+  order), and all routing inputs ride in the single `cfg` creation variable.
+  Inside a multi-instance body job types are `<task>_<loopCounter>` FEEL
+  expressions: both runners complete the latest job of a type, so types are
+  unique.
+- **The per-PR budget** — the seeds in `fuzz/budget.json` are committed as
+  `scenarios/g-<seed>/` with captured goldens, so `corpus_matches_zeebe_goldens`
+  gates them deterministically on every PR (no retries). The formal CI job runs
+  `node --test formal/traces/fuzz/*.test.mjs`, whose drift guard regenerates every
+  budget seed and fails unless the committed files are byte-identical; and
+  `fuzz/ratchet.mjs`, which refuses a NEW `g-*` allowlist entry for a seed that
+  already passed on the target branch (a regression being masked). Known
+  divergences are allowed only through `allowlist.json` entries with an issue —
+  stale entries fail the runner, so fixing the defect forces the entry out.
+- **The nightly sweep** — `.github/workflows/zeebe-fuzz-nightly.yml` runs
+  `fuzz/sweep.mjs` over a rotating seed window (`1000000 + day × 64`, printed in
+  the log). Each divergence is **minimised** (cut the script at the first
+  diverging step, then greedily drop blocks / hoist branches / drop MI items /
+  boundaries / mappings while it still diverges) and **filed** as an issue keyed
+  by a divergence signature (a known signature gets a comment, not a duplicate).
+  It fails only on a new signature.
+
+Reproduce or extend locally (needs what `capture.sh` needs, plus cargo):
+
+```bash
+node formal/traces/fuzz/sweep.mjs --seeds 1000123          # one seed, minimised report
+node formal/traces/fuzz/sweep.mjs --seeds 1..64 --no-shrink # a window, no shrinking
+node formal/traces/fuzz/sweep.mjs --seeds 1000123 --emit   # write the minimised case as
+                                                          # scenarios/fuzz-<seed> + golden
+node formal/traces/fuzz/generate.mjs 7 --out /tmp/cases    # just look at seed 7
+```
+
+`--emit` produces a ready-to-commit scenario + golden: add an `allowlist.json`
+entry citing the filed issue (or fix nano red/green and commit it as a
+regression scenario). To change the budget, edit `fuzz/budget.json`, then
+
+```bash
+node formal/traces/fuzz/generate.mjs --budget        # rewrite scenarios/g-*
+formal/traces/capture.sh $(node -p "require('./formal/traces/fuzz/budget.json').seeds.map(s=>'g-'+s).join(' ')")
+```
+
+A generator change that alters any budget seed's output is a budget change: it
+must recapture those goldens (the drift guard says which).
+
 ## Divergences this harness found but did not seed
 
-The seeded corpus is all-passing with an empty allowlist (#1424 retired the last masked entry). Two real
+The hand-written corpus is all-passing (#1424 retired the last masked entry); the allowlist carries only generated-budget divergences (above), each with its issue. Two real
 divergences were found while building the harness. They are tracked
 separately, and their scenarios should be added once the fixes land:
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_fuzz_25" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="fuzz" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="mi1"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;mi1_&quot; + string(loopCounter)" /></bpmn:extensionElements><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items1" inputElement="item" outputCollection="out1" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics></bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="x2" default="f3" />
+    <bpmn:userTask id="t4"><bpmn:extensionElements><zeebe:userTask /><zeebe:ioMapping><zeebe:output source="=result" target="o4" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:userTask>
+    <bpmn:serviceTask id="t5"><bpmn:extensionElements><zeebe:taskDefinition type="t5" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="xj3" />
+    <bpmn:sequenceFlow id="f1" sourceRef="x2" targetRef="t4"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x3 = 0</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f2" sourceRef="t4" targetRef="xj3" />
+    <bpmn:sequenceFlow id="f3" sourceRef="x2" targetRef="t5" />
+    <bpmn:sequenceFlow id="f4" sourceRef="t5" targetRef="xj3" />
+    <bpmn:sequenceFlow id="f5" sourceRef="mi1" targetRef="x2" />
+    <bpmn:subProcess id="mi6"><bpmn:multiInstanceLoopCharacteristics><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items9" inputElement="item" outputCollection="out9" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss7" /><bpmn:serviceTask id="t8"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t8_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:output source="=result" target="o8" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se9" /><bpmn:sequenceFlow id="f6" sourceRef="ss7" targetRef="t8" /><bpmn:sequenceFlow id="f7" sourceRef="t8" targetRef="se9" /></bpmn:subProcess>
+    <bpmn:sequenceFlow id="f8" sourceRef="xj3" targetRef="mi6" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f9" sourceRef="start" targetRef="mi1" />
+    <bpmn:sequenceFlow id="f10" sourceRef="mi6" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="fuzz">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="mi1_di" bpmnElement="mi1"><dc:Bounds x="246" y="160" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="x2_di" bpmnElement="x2"><dc:Bounds x="396" y="175" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t4_di" bpmnElement="t4"><dc:Bounds x="496" y="100" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t5_di" bpmnElement="t5"><dc:Bounds x="496" y="220" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="xj3_di" bpmnElement="xj3"><dc:Bounds x="646" y="175" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ss7_di" bpmnElement="ss7"><dc:Bounds x="776" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t8_di" bpmnElement="t8"><dc:Bounds x="862" y="160" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="se9_di" bpmnElement="se9"><dc:Bounds x="1012" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="mi6_di" bpmnElement="mi6" isExpanded="true"><dc:Bounds x="746" y="130" width="332" height="140" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="1128" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="421" y="175" /><di:waypoint x="421" y="140" /><di:waypoint x="496" y="140" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="596" y="140" /><di:waypoint x="671" y="140" /><di:waypoint x="671" y="175" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="421" y="225" /><di:waypoint x="421" y="260" /><di:waypoint x="496" y="260" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4"><di:waypoint x="596" y="260" /><di:waypoint x="671" y="260" /><di:waypoint x="671" y="225" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5"><di:waypoint x="346" y="200" /><di:waypoint x="396" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6"><di:waypoint x="812" y="200" /><di:waypoint x="862" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f7_di" bpmnElement="f7"><di:waypoint x="962" y="200" /><di:waypoint x="1012" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f8_di" bpmnElement="f8"><di:waypoint x="696" y="200" /><di:waypoint x="746" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f9_di" bpmnElement="f9"><di:waypoint x="196" y="200" /><di:waypoint x="246" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f10_di" bpmnElement="f10"><di:waypoint x="1078" y="200" /><di:waypoint x="1128" y="200" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

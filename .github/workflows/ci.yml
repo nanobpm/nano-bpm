@@ -773,6 +773,22 @@ jobs:
         run: node --test formal/parity/*.test.mjs
       - name: Trace parser tests
         run: node --test formal/tla/trace/*.test.mjs
+      - name: Generative Zeebe differential (#1521) — generator tests + budget drift guard
+        # Regenerates every fixed-seed budget case and fails unless the
+        # committed scenarios/g-* are byte-identical (the budget itself is gated
+        # against Zeebe goldens by the engine-core job's zeebe_traces suite).
+        run: node --test formal/traces/fuzz/*.test.mjs
+      - name: Generative budget allowlist ratchet
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          # A budget seed that passed on the target branch may not be newly
+          # allow-listed (a masked regression). Absent files on the base read as
+          # "no budget yet", which accepts anything.
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          git show FETCH_HEAD:formal/traces/allowlist.json > "$RUNNER_TEMP/base-allowlist.json" 2>/dev/null || rm -f "$RUNNER_TEMP/base-allowlist.json"
+          git show FETCH_HEAD:formal/traces/fuzz/budget.json > "$RUNNER_TEMP/base-budget.json" 2>/dev/null || rm -f "$RUNNER_TEMP/base-budget.json"
+          node formal/traces/fuzz/ratchet.mjs --base-allowlist "$RUNNER_TEMP/base-allowlist.json" --base-budget "$RUNNER_TEMP/base-budget.json"
       - name: Parity coverage guard
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}

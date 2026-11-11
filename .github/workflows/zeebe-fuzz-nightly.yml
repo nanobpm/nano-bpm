@@ -1,0 +1,109 @@
+# Nightly generative differential sweep against the pinned Zeebe (#1521).
+#
+# formal/traces/fuzz/sweep.mjs generates random well-formed BPMN processes +
+# driver scripts from ROTATING seeds (a fresh window every night, derived from
+# the date so a run is reproducible from its log), captures each on the pinned
+# Zeebe engine (formal/traces/capture.sh) and replays it on nano
+# (engine-core/tests/zeebe_traces.rs), comparing the full normalised record
+# streams including VARIABLE records with scope keys. Every divergence is
+# minimised and filed as an issue (deduplicated by divergence signature: a known
+# one gets a comment, never a duplicate issue).
+#
+# The PER-PR budget is the committed fixed-seed g-* corpus (formal/traces/fuzz/
+# budget.json), gated deterministically by the engine-core job. This sweep is
+# NOT a PR gate: a red run is a parity defect (or a harness defect) to
+# root-cause. No retries.
+#
+# Repro any reported seed locally: node formal/traces/fuzz/sweep.mjs --seeds <seed>
+
+name: Zeebe fuzz (generative differential, nightly)
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Seeds to sweep (A..B or A,B,C); empty = tonight''s rotating window'
+        required: false
+        default: ''
+  # Validate changes to the harness itself before they reach the nightly run.
+  # Non-required (not in branch protection / .mergify.yml).
+  pull_request:
+    paths:
+      - '.github/workflows/zeebe-fuzz-nightly.yml'
+      - 'formal/traces/fuzz/**'
+      - 'formal/traces/capture.sh'
+      - 'formal/traces/capture/**'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: zeebe-fuzz-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: zeebe-fuzz (nano vs pinned Zeebe, rotating seeds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Size of the nightly window (a PR validation run sweeps a small one).
+      WINDOW: ${{ github.event_name == 'pull_request' && '8' || '64' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+      # The pinned camunda checkout + engine build (capture.sh caches it),
+      # cached TOGETHER with the Maven repository its saved classpath points
+      # into: restoring the build stamp + `.nano-traces-classpath` without
+      # ~/.m2 makes capture.sh skip Maven and hand javac missing JAR paths.
+      # The `-m2` key suffix invalidates older caches that lacked ~/.m2.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/nano-zeebe-traces
+            ~/.m2/repository
+          key: zeebe-traces-m2-${{ hashFiles('formal/parity/zeebe-pin.json') }}
+      - name: Resolve seeds
+        id: seeds
+        run: |
+          if [ -n "${{ github.event.inputs.seeds }}" ]; then
+            echo "seeds=${{ github.event.inputs.seeds }}" >> "$GITHUB_OUTPUT"
+          else
+            # Rotating window: day number since the epoch x window size, offset
+            # past the committed fixed-seed budget (seeds < 1000000).
+            day=$(( $(date -u +%s) / 86400 ))
+            lo=$(( 1000000 + day * WINDOW ))
+            echo "seeds=${lo}..$(( lo + WINDOW - 1 ))" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sweep
+        env:
+          ZEEBE_TRACES_JAVA_HOME: ${{ env.JAVA_HOME }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "::notice::sweeping seeds ${{ steps.seeds.outputs.seeds }} (repro: node formal/traces/fuzz/sweep.mjs --seeds <seed>)"
+          file=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then file="--file"; fi
+          node formal/traces/fuzz/sweep.mjs --seeds "${{ steps.seeds.outputs.seeds }}" \
+            --work "$RUNNER_TEMP/fuzz" $file
+      - name: Upload the minimised cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeebe-fuzz-cases
+          path: |
+            ${{ runner.temp }}/fuzz/min-*/scenarios
+            ${{ runner.temp }}/fuzz/min-*/goldens
+            ${{ runner.temp }}/fuzz/**/*.log
