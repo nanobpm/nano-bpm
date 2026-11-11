@@ -58,6 +58,29 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// The scope a task's completion variables (job result / user-task
+    /// completion) start propagating from. Normally the task's enclosing flow
+    /// scope; but a multi-instance inner instance owns a real variable scope
+    /// (its `inputElement` / `loopCounter` / seeded `outputElement` locals), so
+    /// for an MI child propagation starts at the child itself — matching Zeebe,
+    /// which merges completion variables from the element instance's own scope
+    /// upward. Without this a direct MI task's result bypasses the child-local
+    /// `outputElement` seed (#1518).
+    pub(crate) fn completion_scope(&self, instance_key: Key, element_instance_key: Key) -> Key {
+        let flow_scope = self.scope_of(instance_key, element_instance_key);
+        let is_mi_child = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&flow_scope))
+            .is_some_and(|mi| mi.child_indices.contains_key(&element_instance_key));
+        if is_mi_child {
+            element_instance_key
+        } else {
+            flow_scope
+        }
+    }
+
     /// Every ancestor scope element instance of `element_instance_key`,
     /// **innermost first**, excluding the process root (`0`). Cycle-safe.
     pub(crate) fn ancestor_element_instances(

@@ -143,6 +143,25 @@ pub fn referenced_variables(expr: &str) -> std::collections::HashSet<String> {
     out
 }
 
+/// The root variable of an expression that is *just* a variable or a nested
+/// property of one (`result`, `=a.b.c` → `a`); `None` for anything else
+/// (literals, calls, index access, operators) or an unparseable expression.
+///
+/// Zeebe seeds a multi-instance `outputElement` of this shape as a local null
+/// variable of each inner instance, so the child's writes stay in its own scope
+/// (#1518).
+pub fn variable_reference_root(expr: &str) -> Option<String> {
+    fn root(node: &ast::Node) -> Option<&str> {
+        match node {
+            ast::Node::Var(name) => Some(name),
+            ast::Node::Member(base, _) => root(base),
+            _ => None,
+        }
+    }
+    let node = parser::parse(lexer::tokenize(strip_marker(expr)).ok()?).ok()?;
+    root(&node).map(str::to_owned)
+}
+
 /// Walks a FEEL AST, collecting the name of every [`ast::Node::Var`] it contains.
 /// A dotted path `a.b` parses to `Member(Var("a"), "b")`, so recursing into the
 /// base of a member/index access naturally yields the root variable. Names bound
@@ -403,6 +422,23 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn variable_reference_root_accepts_only_bare_variables_and_paths() {
+        // #1518: these are the MI outputElement shapes Zeebe seeds locally.
+        assert_eq!(
+            variable_reference_root("=result").as_deref(),
+            Some("result")
+        );
+        assert_eq!(variable_reference_root("result").as_deref(), Some("result"));
+        assert_eq!(variable_reference_root("=a.b.c").as_deref(), Some("a"));
+        // Anything computed is not a variable to seed.
+        for expr in [
+            "=a[1]", "=a + 1", "=f(a)", "={x: a}", "=\"a\"", "=1", "=", "=a +",
+        ] {
+            assert_eq!(variable_reference_root(expr), None, "{expr}");
+        }
+    }
 
     fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
         pairs
