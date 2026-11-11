@@ -1,17 +1,47 @@
 // Single source of truth for the Nano Agent Graph Engine claims on nanobpm.io
 // (home hero + install tabs, nav, architecture). A module rather than a function
 // inside build.mjs so the tests can derive their expectations from it too.
-// Hosts and commands mirror the "Install" table of the
-// nanobpm/nano-agent-graph-engine README; `tested` marks the hosts we have
-// verified end to end (the rest render as "also works with").
+//
+// Published facts (version, CLI name, Node requirement) are DERIVED from the
+// published package as locked by website/snippets/package-lock.json (npm records
+// the package's `bin` and `engines` there), so a NAGE bump that changes them
+// flows to the site with no hand edit. Every install command is built from the
+// derived package + CLI names. The host list itself is site presentation: the
+// package publishes no machine-readable host manifest (only its README table),
+// and `tested` marks the hosts we have verified end to end (the rest render as
+// "also works with").
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const PKG = "@nanobpm/nano-agent-graph-engine";
+const LOCK = join(dirname(fileURLToPath(import.meta.url)), "snippets", "package-lock.json");
+
+/** The published package's locked metadata; fails closed if any fact is missing. */
+export function publishedNage(lockPath = LOCK) {
+  const entry = JSON.parse(readFileSync(lockPath, "utf8")).packages?.[`node_modules/${PKG}`];
+  if (!entry) throw new Error(`${PKG} is not in ${lockPath}`);
+  const version = entry.version;
+  const nodeRange = entry.engines?.node;
+  const m = /^>=\s*(\d+(?:\.\d+)*)$/.exec(nodeRange ?? "");
+  // The CLI the README documents is `nage`; take it from `bin` so a rename fails here.
+  const cli = Object.keys(entry.bin ?? {}).find((b) => b === "nage");
+  if (!version || !m || !cli) {
+    throw new Error(`${PKG} lock entry lacks version / engines.node (>=x.y) / bin.nage: ${JSON.stringify(entry)}`);
+  }
+  return { version, node: `Node ${m[1]} or newer`, cli };
+}
+
 export function nageFacts() {
-  const pkg = "@nanobpm/nano-agent-graph-engine";
+  const pkg = PKG;
+  const { version, node, cli } = publishedNage();
   return {
     name: "Nano Agent Graph Engine",
     short: "NAGE",
     pkg,
-    cli: "nage",
-    node: "Node 22.15 or newer",
+    version,
+    cli,
+    node,
     repo: "https://github.com/nanobpm/nano-agent-graph-engine",
     hosts: [
       {
@@ -48,7 +78,7 @@ export function nageFacts() {
         label: "Terminal",
         tested: true,
         prompt: true,
-        commands: [`npm install -g ${pkg}`, "nage"],
+        commands: [`npm install -g ${pkg}`, cli],
         note: "The <code>nage</code> CLI: check, start and inspect flows from a shell.",
       },
       { id: "codex", label: "Codex", tested: false, commands: [`npx -y ${pkg} install codex`] },

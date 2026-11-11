@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BpmnRuntimeView, useBojtos } from "@nanobpm/bojtos-react";
 import { ParticleField } from "./ParticleField";
-import { SCENARIOS, initialScenario, type LogKind, type Scenario } from "./scenarios";
+import { Cancelled, SCENARIOS, initialScenario, type LogKind, type Scenario } from "./scenarios";
 
 /** Pace of the animation, ms per token beat. */
 const BEAT = 1400;
@@ -80,6 +80,7 @@ export function App() {
     const beat = async () => {
       await sleep(BEAT);
       await waitWhilePaused();
+      if (cancelled) throw new Cancelled();
     };
 
     (async () => {
@@ -87,22 +88,31 @@ export function App() {
         await waitWhilePaused();
         if (cancelled) break;
         setLog([]);
+        // A new instance starts with no variables: drop the previous run's held
+        // ones here, not via the render's `!snapshot` branch — reset() and
+        // createInstance() land in one batched render, so that branch never runs.
+        lastVarsRef.current = {};
         // Wipe the engine before each run so `completedInstances` starts at 0 —
         // otherwise a prior run's completed instance makes the next one "finish" at once.
         reset();
-        await scenario.drive({
-          // The hook's commands are stable callbacks over its session ref.
-          bojtos: bojtosRef.current,
-          processId: processIdRef.current,
-          log: (kind, text) => {
-            if (!cancelled) pushLog(kind, text);
-          },
-          noteVars: (v) => {
-            lastVarsRef.current = { ...lastVarsRef.current, ...v };
-          },
-          beat,
-          cancelled: () => cancelled,
-        });
+        try {
+          await scenario.drive({
+            // The hook's commands are stable callbacks over its session ref.
+            bojtos: bojtosRef.current,
+            processId: processIdRef.current,
+            log: (kind, text) => {
+              if (!cancelled) pushLog(kind, text);
+            },
+            noteVars: (v) => {
+              if (!cancelled) lastVarsRef.current = { ...lastVarsRef.current, ...v };
+            },
+            beat,
+            cancelled: () => cancelled,
+          });
+        } catch (e) {
+          if (e instanceof Cancelled) break;
+          throw e;
+        }
         await sleep(RESTART_DELAY);
       }
     })();

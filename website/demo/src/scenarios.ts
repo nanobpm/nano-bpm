@@ -18,7 +18,12 @@ export interface DriveCtx {
    * instance's variables leave the snapshot.
    */
   noteVars(vars: Record<string, unknown>): void;
-  /** Sleep one animation beat, holding while paused. */
+  /**
+   * Sleep one animation beat, holding while paused. Rejects with
+   * {@link Cancelled} once the run is cancelled, so no driver can act on a
+   * replacement session after a wait — every `await beat()` is a cancellation
+   * point by construction, not by a per-call-site check.
+   */
   beat(): Promise<void>;
   cancelled(): boolean;
 }
@@ -39,6 +44,13 @@ export interface Scenario {
   wide?: boolean;
   /** Runs one instance to completion (or until cancelled). */
   drive(ctx: DriveCtx): Promise<void>;
+}
+
+/** Thrown by {@link DriveCtx.beat} when the run was cancelled during the wait. */
+export class Cancelled extends Error {
+  constructor() {
+    super("scenario run cancelled");
+  }
 }
 
 /** Safety bound on worker rounds per run, so a model change can't spin forever. */
@@ -68,6 +80,7 @@ const prReview: Scenario = {
     let guard = 0;
     while (!cancelled() && snap && snap.completedInstances < 1 && guard++ < MAX_ROUNDS_PER_RUN) {
       snap = (await bojtos.stepWorkers(workers))?.snapshot ?? snap;
+      if (cancelled()) return;
       await beat();
       // Auto-publish the messages a real app would, keyed by prKey.
       if (snap.activeElementIds.includes("wait-review")) {
@@ -118,13 +131,17 @@ async function driveFlow(
   },
 ) {
   const asked: Record<string, number> = {};
-  // Note what each worker returns too: the job that ends the instance sets
-  // variables no later snapshot shows (DriveCtx.noteVars).
+  // Collect what each worker returns in the current step. Only the step that
+  // ENDS the instance is noted (DriveCtx.noteVars): its root writes are the
+  // ones no later snapshot shows. While the instance runs, the engine snapshot
+  // is the source of truth, so branch-local outputs of multi-instance children
+  // (e.g. review's `found` / `verdict`) never reach the root variables panel.
+  let stepResults: Record<string, unknown>[] = [];
   const workers: Record<string, JobHandler> = {};
   for (const [type, handler] of Object.entries(run.workers)) {
     workers[type] = async (job) => {
       const result = await handler(job);
-      if (result && typeof result === "object") noteVars(result as Record<string, unknown>);
+      if (result && typeof result === "object") stepResults.push(result as Record<string, unknown>);
       return result;
     };
   }
@@ -133,7 +150,10 @@ async function driveFlow(
   await beat();
   let guard = 0;
   while (!cancelled() && snap && snap.completedInstances < 1 && guard++ < MAX_ROUNDS_PER_RUN) {
+    stepResults = [];
     snap = (await bojtos.stepWorkers(workers))?.snapshot ?? snap;
+    if (cancelled()) return;
+    if (done(snap)) for (const r of stepResults) noteVars(r);
     await beat();
     const task = snap.userTasks.find((t) => t.state === "Created" && run.answers[t.elementId]);
     if (task) {
@@ -143,7 +163,7 @@ async function driveFlow(
       const answer = list[Math.min(n, list.length - 1)];
       log("msg", answer.log);
       snap = bojtos.completeUserTask(task.key, JSON.stringify(answer.vars)) ?? snap;
-      noteVars(answer.vars);
+      if (done(snap)) noteVars(answer.vars);
       await beat();
     }
   }

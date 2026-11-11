@@ -616,11 +616,14 @@ ${videosSectionHtml(loadVideos(join(here, "data", "videos.json")))}
       });
       var panel = document.getElementById(tab.getAttribute("aria-controls"));
       if (panel) {
-        var frame = panel.querySelector("iframe[data-src]");
-        if (frame) {
+        // Only the selected panel's OWN iframes: one nested in a still-hidden
+        // descendant tabpanel (an example card's Running model tab while its
+        // Code tab is selected) must not start a demo nobody can see.
+        Array.prototype.forEach.call(panel.querySelectorAll("iframe[data-src]"), function (frame) {
+          if (frame.closest('[role="tabpanel"]') !== panel) return;
           frame.setAttribute("src", frame.getAttribute("data-src"));
           frame.removeAttribute("data-src");
-        }
+        });
       }
     }
     tabs.forEach(function (tab, i) {
