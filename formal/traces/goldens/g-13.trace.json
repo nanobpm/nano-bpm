@@ -1,0 +1,1196 @@
+{
+  "scenario" : "g-13",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "fuzz",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "fuzz",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f21",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "w1",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "w1",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CREATED",
+      "targetElementId" : "w1",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "cfg",
+      "value" : {
+        "ck" : "k1",
+        "items13" : [ 1 ],
+        "items20" : [ 1 ]
+      },
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "advanceClock",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "w1",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "w1",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f1",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t2",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t2",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "CREATED",
+      "elementId" : "t2",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "TRIGGERED",
+      "targetElementId" : "w1",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "local",
+      "value" : "k1",
+      "scopeElementId" : "t2",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    } ]
+  }, {
+    "step" : 2,
+    "op" : "completeUserTask",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "t2",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "t2",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f20",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "p3",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "p3",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "p3",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "p3",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f18",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f16",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f14",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t21",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t21",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "mi15",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "mi15",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "mi5",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "mi5",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "mi15",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 4
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "mi15",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 4
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "mi5",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 5
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "mi5",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 5
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "ss16",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "ss16",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "ss6",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "ss6",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "ss16",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "ss16",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f12",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "ss6",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "ss6",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f7",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t17",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t17",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t7",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t7",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "t21",
+      "type" : "t21",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 8
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "t17",
+      "type" : "t17_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 9
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "t7",
+      "type" : "t7_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 10
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "COMPLETED",
+      "elementId" : "t2",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CREATED",
+      "targetElementId" : "b18",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 9
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CREATED",
+      "targetElementId" : "b8",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 10
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "v",
+      "value" : 81,
+      "scopeElementId" : "t2",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "o2",
+      "value" : null,
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "local",
+      "value" : "k1",
+      "scopeElementId" : "t21",
+      "processInstanceKey" : 1,
+      "scopeKey" : 8
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "out20",
+      "value" : [ null ],
+      "scopeElementId" : "mi15",
+      "processInstanceKey" : 1,
+      "scopeKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "out13",
+      "value" : [ null ],
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 5
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "item",
+      "value" : 1,
+      "scopeElementId" : "mi15",
+      "processInstanceKey" : 1,
+      "scopeKey" : 6
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "result",
+      "value" : null,
+      "scopeElementId" : "mi15",
+      "processInstanceKey" : 1,
+      "scopeKey" : 6
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "loopCounter",
+      "value" : 1,
+      "scopeElementId" : "mi15",
+      "processInstanceKey" : 1,
+      "scopeKey" : 6
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "item",
+      "value" : 1,
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 7
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "result",
+      "value" : null,
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 7
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "loopCounter",
+      "value" : 1,
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 7
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "local",
+      "value" : "k1",
+      "scopeElementId" : "t17",
+      "processInstanceKey" : 1,
+      "scopeKey" : 9
+    } ]
+  }, {
+    "step" : 3,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "t7",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "t7",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f2",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "m9",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "m9",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "m9",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "m9",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f6",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t10",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t10",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "t7",
+      "type" : "t7_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 10
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "t10",
+      "type" : "t10_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 11
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CANCELED",
+      "targetElementId" : "b8",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 10
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CREATED",
+      "targetElementId" : "b11",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 11
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "result",
+      "value" : 7,
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 7
+    } ]
+  }, {
+    "step" : 4,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "t21",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "t21",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f19",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "t21",
+      "type" : "t21",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 8
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "note",
+      "value" : 56,
+      "scopeElementId" : "t21",
+      "processInstanceKey" : 1,
+      "scopeKey" : 8
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "o21",
+      "value" : null,
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "recordType" : "COMMAND_REJECTION",
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ACTIVATE_ELEMENT",
+      "rejectionType" : "INVALID_STATE"
+    } ]
+  }, {
+    "step" : 5,
+    "op" : "advanceClock",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_TERMINATING",
+      "elementId" : "t17",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_TERMINATED",
+      "elementId" : "t17",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "b18",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "b18",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "b18",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "b18",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f11",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "m19",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "m19",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "m19",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "m19",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f13",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "se20",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "se20",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "se20",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "se20",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 6
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "mi15",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 4
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "mi15",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 4
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "mi15",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "mi15",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f17",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CANCELED",
+      "elementId" : "t17",
+      "type" : "t17_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 9
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "TRIGGERED",
+      "targetElementId" : "b18",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 9
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "out20",
+      "value" : [ null ],
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "recordType" : "COMMAND_REJECTION",
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ACTIVATE_ELEMENT",
+      "rejectionType" : "INVALID_STATE"
+    } ]
+  }, {
+    "step" : 6,
+    "op" : "advanceClock",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_TERMINATING",
+      "elementId" : "t10",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_TERMINATED",
+      "elementId" : "t10",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "b11",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "b11",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "b11",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "b11",
+      "bpmnElementType" : "BOUNDARY_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f5",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "m12",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "m12",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "m12",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "m12",
+      "bpmnElementType" : "EXCLUSIVE_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f8",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "se13",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "se13",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "se13",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "se13",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 7
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "mi5",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 5
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "mi5",
+      "bpmnElementType" : "SUB_PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 5
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "mi5",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "mi5",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f9",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "t14",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "t14",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CANCELED",
+      "elementId" : "t10",
+      "type" : "t10_1",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 11
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "CREATED",
+      "elementId" : "t14",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 12
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "TRIGGERED",
+      "targetElementId" : "b11",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 11
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "out13",
+      "value" : [ 7 ],
+      "scopeElementId" : "mi5",
+      "processInstanceKey" : 1,
+      "scopeKey" : 5
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "out13",
+      "value" : [ 7 ],
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "local",
+      "value" : "k1",
+      "scopeElementId" : "t14",
+      "processInstanceKey" : 1,
+      "scopeKey" : 12
+    } ]
+  }, {
+    "step" : 7,
+    "op" : "completeUserTask",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "t14",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "t14",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f15",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "pj4",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "pj4",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "pj4",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "pj4",
+      "bpmnElementType" : "PARALLEL_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f22",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "fuzz",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "fuzz",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "COMPLETED",
+      "elementId" : "t14",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 12
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "v",
+      "value" : 21,
+      "scopeElementId" : "fuzz",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  } ]
+}

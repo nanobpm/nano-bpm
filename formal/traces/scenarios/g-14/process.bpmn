@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_fuzz_14" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:message id="Message_msg13" name="msg13"><bpmn:extensionElements><zeebe:subscription correlationKey="=cfg.ck" /></bpmn:extensionElements></bpmn:message>
+  <bpmn:process id="fuzz" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:exclusiveGateway id="x1" default="f8" />
+    <bpmn:serviceTask id="t3"><bpmn:extensionElements><zeebe:taskDefinition type="t3" /><zeebe:ioMapping><zeebe:output source="=result" target="o3" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="w4"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="ss6" targetRef="t7" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t7" targetRef="se8" />
+    <bpmn:subProcess id="mi5"><bpmn:multiInstanceLoopCharacteristics isSequential="true"><bpmn:extensionElements><zeebe:loopCharacteristics inputCollection="=cfg.items8" inputElement="item" outputCollection="out8" outputElement="=result" /></bpmn:extensionElements></bpmn:multiInstanceLoopCharacteristics><bpmn:startEvent id="ss6" /><bpmn:serviceTask id="t7"><bpmn:extensionElements><zeebe:taskDefinition type="=&quot;t7_&quot; + string(loopCounter)" /><zeebe:ioMapping><zeebe:output source="=result" target="o7" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="se8" /></bpmn:subProcess>
+    <bpmn:sequenceFlow id="f3" sourceRef="w4" targetRef="mi5" />
+    <bpmn:callActivity id="ca9"><bpmn:extensionElements><zeebe:calledElement processId="fuzz_ca9" propagateAllParentVariables="false" propagateAllChildVariables="false" /><zeebe:ioMapping><zeebe:input source="=cfg" target="cfg" /><zeebe:output source="=result" target="o9" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:callActivity>
+    <bpmn:exclusiveGateway id="xj2" />
+    <bpmn:sequenceFlow id="f4" sourceRef="x1" targetRef="t3"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x2 = 0</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f5" sourceRef="t3" targetRef="xj2" />
+    <bpmn:sequenceFlow id="f6" sourceRef="x1" targetRef="w4"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x2 = 1</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f7" sourceRef="mi5" targetRef="xj2" />
+    <bpmn:sequenceFlow id="f8" sourceRef="x1" targetRef="ca9" />
+    <bpmn:sequenceFlow id="f9" sourceRef="ca9" targetRef="xj2" />
+    <bpmn:intermediateCatchEvent id="c13"><bpmn:messageEventDefinition messageRef="Message_msg13" /></bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="f10" sourceRef="xj2" targetRef="c13" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f11" sourceRef="start" targetRef="x1" />
+    <bpmn:sequenceFlow id="f12" sourceRef="c13" targetRef="end" />
+  </bpmn:process>
+  <bpmn:process id="fuzz_ca9" isExecutable="true">
+    <bpmn:startEvent id="cs10" />
+    <bpmn:serviceTask id="ct11"><bpmn:extensionElements><zeebe:taskDefinition type="ct11" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="ce12" />
+    <bpmn:sequenceFlow id="f13" sourceRef="cs10" targetRef="ct11" />
+    <bpmn:sequenceFlow id="f14" sourceRef="ct11" targetRef="ce12" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="fuzz">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="x1_di" bpmnElement="x1"><dc:Bounds x="246" y="265" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t3_di" bpmnElement="t3"><dc:Bounds x="346" y="100" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="w4_di" bpmnElement="w4"><dc:Bounds x="346" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ss6_di" bpmnElement="ss6"><dc:Bounds x="462" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t7_di" bpmnElement="t7"><dc:Bounds x="548" y="250" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="se8_di" bpmnElement="se8"><dc:Bounds x="698" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="mi5_di" bpmnElement="mi5" isExpanded="true"><dc:Bounds x="432" y="220" width="332" height="140" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ca9_di" bpmnElement="ca9"><dc:Bounds x="346" y="400" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="xj2_di" bpmnElement="xj2"><dc:Bounds x="814" y="265" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="c13_di" bpmnElement="c13"><dc:Bounds x="914" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="1000" y="272" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="498" y="290" /><di:waypoint x="548" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="648" y="290" /><di:waypoint x="698" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="382" y="290" /><di:waypoint x="432" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4"><di:waypoint x="271" y="265" /><di:waypoint x="271" y="140" /><di:waypoint x="346" y="140" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5"><di:waypoint x="446" y="140" /><di:waypoint x="839" y="140" /><di:waypoint x="839" y="265" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6"><di:waypoint x="296" y="290" /><di:waypoint x="346" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f7_di" bpmnElement="f7"><di:waypoint x="764" y="290" /><di:waypoint x="814" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f8_di" bpmnElement="f8"><di:waypoint x="271" y="315" /><di:waypoint x="271" y="440" /><di:waypoint x="346" y="440" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f9_di" bpmnElement="f9"><di:waypoint x="446" y="440" /><di:waypoint x="839" y="440" /><di:waypoint x="839" y="315" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f10_di" bpmnElement="f10"><di:waypoint x="864" y="290" /><di:waypoint x="914" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f11_di" bpmnElement="f11"><di:waypoint x="196" y="290" /><di:waypoint x="246" y="290" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f12_di" bpmnElement="f12"><di:waypoint x="950" y="290" /><di:waypoint x="1000" y="290" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_2">
+    <bpmndi:BPMNPlane id="BPMNPlane_2" bpmnElement="fuzz_ca9">
+      <bpmndi:BPMNShape id="cs10_di" bpmnElement="cs10"><dc:Bounds x="160" y="122" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ct11_di" bpmnElement="ct11"><dc:Bounds x="246" y="100" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ce12_di" bpmnElement="ce12"><dc:Bounds x="396" y="122" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f13_di" bpmnElement="f13"><di:waypoint x="196" y="140" /><di:waypoint x="246" y="140" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f14_di" bpmnElement="f14"><di:waypoint x="346" y="140" /><di:waypoint x="396" y="140" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -10,6 +10,10 @@
 #   formal/traces/capture.sh <name>...  # capture only these scenarios
 #   formal/traces/capture.sh test       # unit-test the harness (site -> cell ids)
 #
+# NANO_TRACES_CAPTURE_DIR=<dir> captures the scenarios of ANOTHER traces root
+# (same layout: normaliser.json, scenarios/, goldens/) — the generative sweep
+# (fuzz/sweep.mjs, #1521) captures throw-away generated cases that way.
+#
 # After a pin bump, run it and commit the goldens diff: every changed Zeebe
 # trace shows up as a reviewable diff of a *.trace.json / *.cells.json file.
 #
@@ -97,4 +101,4 @@ fi
 "$java" -XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true \
   --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
   --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --enable-native-access=ALL-UNNAMED \
-  -cp "$classes:$cp" io.nanobpm.traces.Capture "$here" "$sha" "$@"
+  -cp "$classes:$cp" io.nanobpm.traces.Capture "${NANO_TRACES_CAPTURE_DIR:-$here}" "$sha" "$@"

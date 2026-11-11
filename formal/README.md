@@ -592,6 +592,27 @@ result differs from the committed file, or if the surface, `gaps.json` or
 5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
    behaviour changes that Nano may need to follow.
 
+## Generative differential testing against Zeebe (#1521)
+
+`traces/fuzz/` generates random well-formed BPMN (with DI) and valid driver
+scripts from a seed, captures each on the pinned Zeebe and replays it on nano,
+comparing the full normalised record streams including VARIABLE records with
+scope keys. Details: [`traces/README.md`](traces/README.md#generative-differential-testing-1521).
+
+- **Seeds.** The per-PR budget is `traces/fuzz/budget.json` (committed as
+  `traces/scenarios/g-<seed>` + goldens; gated by the engine-core job, no
+  retries). The nightly sweep (`.github/workflows/zeebe-fuzz-nightly.yml`) uses
+  the rotating window `1000000 + day × 64 … + 63`, where `day` is the UTC day
+  number since the epoch; the run log prints the window.
+- **Repro.** `node formal/traces/fuzz/sweep.mjs --seeds <seed>` regenerates,
+  captures, replays and minimises that seed; `--emit` writes the minimised case
+  as a ready-to-commit scenario + golden.
+- **The #1518 acceptance check.** Budget seeds exercise a multi-instance whose
+  `outputElement` is the bare `=result`, with job completions writing `result`;
+  reverting #1519's local seeding makes them diverge on the VARIABLE scope keys.
+  Until #1519 lands they are allow-listed against #1518 — the runner fails the
+  entries as stale the moment the fix makes them pass.
+
 ## Harvesting the Zeebe engine-test corpus (#1249)
 
 `zeebe/engine/src/test` builds thousands of processes with the fluent builder

@@ -43,6 +43,9 @@ public final class Capture {
       new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
   static final JsonNodeFactory NODES = JsonNodeFactory.instance;
 
+  /** Ceiling for one client wait on the recording exporter (see {@code Run.execute}). */
+  static final long CLIENT_WAIT_MILLIS = Duration.ofSeconds(60).toMillis();
+
   private Capture() {}
 
   public static void main(final String[] args) throws Throwable {
@@ -50,6 +53,7 @@ public final class Capture {
       throw new IllegalArgumentException("usage: Capture <tracesDir> <pinSha> [scenario...]");
     }
     Sites.install();
+    preloadEngineClasses();
     final Path dir = Path.of(args[0]);
     final String pin = args[1];
     final List<String> only = List.of(args).subList(2, args.length);
@@ -81,6 +85,51 @@ public final class Capture {
     }
     write(out.resolve("PIN"), null, pin + "\n");
     System.exit(0);
+  }
+
+  /**
+   * Load — and so let the {@link Sites} agent instrument — every Zeebe engine class BEFORE the
+   * first {@link EngineRule} starts. Zeebe's test stream processor must open within a hard-coded
+   * 15 s ({@code TestStreams.buildStreamProcessor}); loading and instrumenting the engine's
+   * processors lazily inside that window made a capture on a loaded host die with a
+   * {@code TimeoutException} (#1521: the generative sweep captures many cases on shared workers).
+   * A class that cannot be loaded (an optional dependency absent from the test classpath) is skipped:
+   * it then loads lazily exactly as before.
+   */
+  static void preloadEngineClasses() throws IOException {
+    final Path root;
+    try {
+      root =
+          Path.of(
+              io.camunda.zeebe.engine.Engine.class
+                  .getProtectionDomain()
+                  .getCodeSource()
+                  .getLocation()
+                  .toURI());
+    } catch (final java.net.URISyntaxException e) {
+      throw new IOException(e);
+    }
+    if (!Files.isDirectory(root)) {
+      return;
+    }
+    final List<Path> classes;
+    try (Stream<Path> files = Files.walk(root)) {
+      classes = files.filter(f -> f.toString().endsWith(".class")).toList();
+    }
+    final ClassLoader loader = Capture.class.getClassLoader();
+    for (final Path f : classes) {
+      final String rel = root.relativize(f).toString();
+      final String name =
+          rel.substring(0, rel.length() - ".class".length()).replace(java.io.File.separatorChar, '.');
+      if (name.endsWith("module-info") || name.endsWith("package-info")) {
+        continue;
+      }
+      try {
+        Class.forName(name, false, loader);
+      } catch (final ClassNotFoundException | LinkageError e) {
+        // optional dependency missing: the class keeps loading lazily
+      }
+    }
   }
 
   static void write(final Path path, final JsonNode node) throws IOException {
@@ -117,6 +166,10 @@ public final class Capture {
 
     void execute(final EngineRule engine) throws Exception {
       RecordingExporter.reset();
+      // The client waits (deploy, create, ...) default to 5 s; on a loaded host the first
+      // deployment alone (lazy FEEL/BPMN-model initialisation) can exceed that (#1521). A longer
+      // ceiling only bounds a wait for records that DO arrive — it never changes a trace.
+      RecordingExporter.setMaximumWaitTime(CLIENT_WAIT_MILLIS);
       final byte[] xml = Files.readAllBytes(scenario.resolve("process.bpmn"));
       Scenarios.requireDi(new String(xml, StandardCharsets.UTF_8), scenario);
       engine.deployment().withXmlResource(xml, "process.bpmn").deploy();

@@ -28,12 +28,19 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::xml::{local_name, tokenize, Token};
 use nanobpmn_engine_core::{
     Command, Engine, EngineError, Event, IncidentKind, JobActivationOptions, Key,
-    MessageSubscriptionKind, Value,
+    MessageSubscriptionKind, TimerKind, Value,
 };
 use serde_json::{json, Map, Value as J};
 
+/// The traces root. `NANO_TRACES_DIR` points the runner at another root with
+/// the same layout (`normaliser.json`, `scenarios/`, `goldens/`): the
+/// generative sweep (`formal/traces/fuzz/sweep.mjs`, #1521) captures
+/// throw-away generated cases there. CI's committed-corpus run never sets it.
 fn traces_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../formal/traces")
+    match std::env::var_os("NANO_TRACES_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../formal/traces"),
+    }
 }
 
 fn read_json(path: &Path) -> J {
@@ -461,6 +468,8 @@ struct NanoRun<'a> {
     incident_info: HashMap<Key, (String, &'static str)>,
     /// incident key -> (process-instance key, element-instance key).
     incident_scopes: HashMap<Key, (Key, Key)>,
+    /// timer key -> Zeebe `targetElementId` (the boundary event for a boundary
+    /// timer — see `TimerCreated`).
     timers: HashMap<Key, String>,
     /// timer key -> (process-instance key, target element-instance key).
     timer_scopes: HashMap<Key, (Key, Key)>,
@@ -729,6 +738,14 @@ impl<'a> NanoRun<'a> {
             "processInstanceKey": pik,
             "elementInstanceKey": eik,
         })
+    }
+
+    /// Zeebe's `targetElementId` of a timer, as recorded at `TimerCreated`.
+    fn timer_target(&self, timer_key: Key, element_id: &str) -> String {
+        self.timers
+            .get(&timer_key)
+            .cloned()
+            .unwrap_or_else(|| element_id.to_string())
     }
 
     /// Render one nano event as zero or more RAW Zeebe-shaped records.
@@ -1202,8 +1219,21 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 element_instance_key,
                 element_id,
+                kind,
                 ..
             } => {
+                // Zeebe's TIMER `targetElementId` is the CATCHING element: for a
+                // boundary timer that is the boundary event, not the attached
+                // activity nano's `element_id` names (#1521 found the drift).
+                let element_id = match kind {
+                    TimerKind::InterruptingBoundary {
+                        boundary_element_id,
+                    }
+                    | TimerKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    } => boundary_element_id,
+                    _ => element_id,
+                };
                 self.timers.insert(*timer_key, element_id.to_string());
                 self.timer_scopes
                     .insert(*timer_key, (*instance_key, *element_instance_key));
@@ -1230,7 +1260,7 @@ impl<'a> NanoRun<'a> {
                     "TIMER",
                     "TRIGGERED",
                     json!({
-                        "targetElementId": element_id,
+                        "targetElementId": self.timer_target(*timer_key, element_id),
                         "processInstanceKey": instance_key,
                         "elementInstanceKey": element_instance_key,
                     }),
@@ -1249,7 +1279,7 @@ impl<'a> NanoRun<'a> {
                     "TIMER",
                     "CANCELED",
                     json!({
-                        "targetElementId": element_id,
+                        "targetElementId": self.timer_target(*timer_key, element_id),
                         "processInstanceKey": instance_key,
                         "elementInstanceKey": element_instance_key,
                     }),
@@ -1523,6 +1553,58 @@ fn masked_residuals(
     errors
 }
 
+/// A stable fingerprint of a nano trace (FNV-1a 64 over its canonical JSON):
+/// the `nanoTrace` pin of an allow-list entry (#1521).
+fn trace_fingerprint(steps: &[J]) -> String {
+    let text = J::Array(steps.to_vec()).to_string();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Pinned divergences (#1521): a whole-scenario allow-list entry may carry
+/// `nanoTrace`, the fingerprint of nano's (divergent) trace. The divergence is
+/// then frozen — ANY change in nano's behaviour on that scenario fails until
+/// the entry is re-reviewed (a fix makes it stale; an unrelated change, or a
+/// regression such as reverting #1519's seeding, changes the fingerprint).
+/// Generated-budget entries (`g-*`) must be pinned or narrowed by
+/// `ignoreRecords`: a whole-scenario mask would hide every later regression.
+fn pinned_divergences(
+    allowlist: &J,
+    traces: &BTreeMap<String, (Vec<J>, Option<Vec<J>>)>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
+        let scenario = entry["scenario"].as_str().unwrap_or_default();
+        let pin = entry.get("nanoTrace");
+        let actual = traces
+            .get(scenario)
+            .and_then(|(_, nano)| nano.as_deref())
+            .map_or_else(|| "<no nano trace>".to_string(), trace_fingerprint);
+        if pin.is_none() {
+            if scenario.starts_with("g-") && entry.get("ignoreRecords").is_none() {
+                errors.push(format!(
+                    "allow-list entry `{scenario}` (generated budget) needs a `nanoTrace` pin \
+                     (now {actual}) or `ignoreRecords`"
+                ));
+            }
+            continue;
+        }
+        if pin.and_then(J::as_str) != Some(actual.as_str()) {
+            errors.push(format!(
+                "nano's behaviour on allow-listed `{scenario}` changed: `nanoTrace` pins {}, \
+                 the trace now fingerprints {actual}. Re-review the divergence against the \
+                 golden (a regression? an unrelated change?) before re-pinning.",
+                pin.map_or_else(|| "?".into(), J::to_string)
+            ));
+        }
+    }
+    errors
+}
+
 fn load_spec() -> J {
     read_json(&traces_dir().join("normaliser.json"))
 }
@@ -1573,6 +1655,55 @@ fn run_corpus_traces(spec: &J) -> BTreeMap<String, (Option<String>, (Vec<J>, Opt
         .collect()
 }
 
+/// The generative sweep's verdict hook (#1521, `formal/traces/fuzz/sweep.mjs`):
+/// with `NANO_TRACES_OUTCOMES=<file>` set, write every scenario's verdict under
+/// `traces_dir()` as `{ name: null | { step, diff } }`, where `step` is the
+/// first diverging step index (the shrinker cuts the script there). A no-op
+/// otherwise, so the committed-corpus run is unaffected: the gate itself stays
+/// `corpus_matches_zeebe_goldens`.
+#[test]
+fn fuzz_sweep_outcomes() {
+    let Some(out) = std::env::var_os("NANO_TRACES_OUTCOMES") else {
+        return;
+    };
+    let outcomes: Map<String, J> = run_corpus(&load_spec())
+        .into_iter()
+        .map(|(name, d)| {
+            let verdict = match d {
+                None => J::Null,
+                Some(diff) => json!({ "step": first_diverging_step(&diff), "diff": diff }),
+            };
+            (name, verdict)
+        })
+        .collect();
+    fs::write(
+        &out,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&J::Object(outcomes)).unwrap()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", Path::new(&out).display()));
+}
+
+/// The step index of a `diff()` report (`"step N:\n..."`), if it has one.
+fn first_diverging_step(diff: &str) -> Option<u64> {
+    diff.strip_prefix("step ")?.split(':').next()?.parse().ok()
+}
+
+#[test]
+fn first_diverging_step_reads_the_diff_report() {
+    let d = diff(
+        &[json!({"a": 1}), json!({"b": 1})],
+        &[json!({"a": 1}), json!({"b": 2})],
+    );
+    assert_eq!(first_diverging_step(&d.unwrap()), Some(1));
+    assert_eq!(
+        first_diverging_step("nano could not replay the script: x"),
+        None
+    );
+}
+
 // ───────────────────────────── the gate ──────────────────────────────
 
 /// THE differential gate: every scenario's nano trace equals its Zeebe golden,
@@ -1600,6 +1731,7 @@ fn corpus_matches_zeebe_goldens() {
     let traces = runs.into_iter().map(|(n, (_, t))| (n, t)).collect();
     let mut errors = verdict(&outcomes, &allowlist).err().unwrap_or_default();
     errors.extend(masked_residuals(&allowlist, &traces));
+    errors.extend(pinned_divergences(&allowlist, &traces));
     if !errors.is_empty() {
         panic!(
             "Zeebe differential traces failed:\n\n{}\n\nSee formal/traces/README.md.",
@@ -2061,6 +2193,48 @@ fn ignore_records_masks_only_the_matched_records() {
     // into a whole-scenario exemption that masks every record.
     let err = masked_residuals(&entry(json!([{"noSuchField": null}])), &traces);
     assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
+}
+
+/// A `nanoTrace` pin freezes an allow-listed divergence (#1521): the same
+/// nano trace passes, ANY change to it fails, and a generated-budget entry
+/// cannot be a bare whole-scenario mask.
+#[test]
+fn nano_trace_pin_freezes_an_allowlisted_divergence() {
+    let (spec, sc, golden) = first_scenario();
+    let nano = nano_trace(&spec, &sc);
+    let pin = trace_fingerprint(&nano);
+    let traces = BTreeMap::from([(sc.name.clone(), (golden.clone(), Some(nano.clone())))]);
+    let entry = |name: &str, extra: J| {
+        let mut e = json!({"scenario": name, "issue": "#1518", "reason": "r"});
+        e.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({ "entries": [e] })
+    };
+    assert!(pinned_divergences(&entry(&sc.name, json!({"nanoTrace": pin})), &traces).is_empty());
+    // One changed record anywhere in nano's trace breaks the pin.
+    let mut changed = nano.clone();
+    changed[0]["records"].as_array_mut().unwrap().pop();
+    let moved = BTreeMap::from([(sc.name.clone(), (golden.clone(), Some(changed)))]);
+    let err = pinned_divergences(&entry(&sc.name, json!({"nanoTrace": pin})), &moved);
+    assert!(err[0].contains("behaviour on allow-listed"), "{err:?}");
+    // A pin never exempts a scenario nano could not replay.
+    let failed = BTreeMap::from([(sc.name.clone(), (golden.clone(), None))]);
+    assert_eq!(
+        pinned_divergences(&entry(&sc.name, json!({"nanoTrace": pin})), &failed).len(),
+        1
+    );
+    // Generated entries must be pinned or narrowed; hand-written ones need not.
+    let err = pinned_divergences(&entry("g-7", json!({})), &traces);
+    assert!(err[0].contains("needs a `nanoTrace` pin"), "{err:?}");
+    assert!(pinned_divergences(
+        &entry("g-7", json!({"ignoreRecords": [{"name": "x"}]})),
+        &traces
+    )
+    .is_empty());
+    assert!(pinned_divergences(&entry(&sc.name, json!({})), &traces).is_empty());
+    // The fingerprint is a pure function of the trace.
+    assert_eq!(trace_fingerprint(&nano), pin);
 }
 
 /// A null-valued matcher field matches only a record that CARRIES the field
@@ -2977,4 +3151,74 @@ fn multi_instance_body_outgoing_flow_uses_the_enclosing_scope() {
         to: "next".into(),
     });
     assert_eq!(out[0]["value"]["flowScopeKey"], json!(sub), "{out:?}");
+}
+
+/// #1521 — Zeebe's TIMER record names the CATCHING element as
+/// `targetElementId`: for a boundary timer that is the boundary event, never
+/// the attached activity (which is what nano's `TimerCreated.element_id`
+/// carries). Found by the generative sweep (seed 8) — every boundary-timer
+/// trace diverged on this projection before.
+#[test]
+fn boundary_timer_targets_the_boundary_event() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d" targetNamespace="t">
+  <bpmn:process id="bt" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="late" attachedToRef="work">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:endEvent id="e2" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="late" targetRef="e2" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="dia" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+      xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+    <bpmndi:BPMNPlane id="plane" bpmnElement="bt">
+      <bpmndi:BPMNShape id="s_di" bpmnElement="s"><dc:Bounds x="0" y="22" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="work_di" bpmnElement="work"><dc:Bounds x="80" y="0" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="late_di" bpmnElement="late"><dc:Bounds x="112" y="62" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_di" bpmnElement="e"><dc:Bounds x="230" y="22" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e2_di" bpmnElement="e2"><dc:Bounds x="230" y="130" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="36" y="40" /><di:waypoint x="80" y="40" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="180" y="40" /><di:waypoint x="230" y="40" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="130" y="98" /><di:waypoint x="130" y="148" /><di:waypoint x="230" y="148" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>"#;
+    let trace = run_scratch(
+        "boundary-timer",
+        xml,
+        r#"{"description": "boundary timer target", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "bt"},
+            {"op": "advanceClock", "millis": 60000}
+        ]}"#,
+    );
+    let timers: Vec<(String, String)> = trace
+        .iter()
+        .flat_map(|s| s["records"].as_array().cloned().unwrap_or_default())
+        .filter(|r| r["valueType"] == "TIMER")
+        .map(|r| {
+            (
+                r["intent"].as_str().unwrap_or_default().to_string(),
+                r["targetElementId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        timers,
+        vec![
+            ("CREATED".to_string(), "late".to_string()),
+            ("TRIGGERED".to_string(), "late".to_string())
+        ],
+        "{trace:?}"
+    );
 }

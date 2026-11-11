@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_fuzz_15" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:message id="Message_msg4" name="msg4"><bpmn:extensionElements><zeebe:subscription correlationKey="=cfg.ck" /></bpmn:extensionElements></bpmn:message>
+  <bpmn:process id="fuzz" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:exclusiveGateway id="x1" default="f5" />
+    <bpmn:serviceTask id="t3"><bpmn:extensionElements><zeebe:taskDefinition type="t3" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="b4" attachedToRef="t3"><bpmn:messageEventDefinition messageRef="Message_msg4" /></bpmn:boundaryEvent>
+    <bpmn:exclusiveGateway id="m5" />
+    <bpmn:sequenceFlow id="f1" sourceRef="t3" targetRef="m5" />
+    <bpmn:sequenceFlow id="f2" sourceRef="b4" targetRef="m5" />
+    <bpmn:userTask id="t6"><bpmn:extensionElements><zeebe:userTask /><zeebe:ioMapping><zeebe:output source="=result" target="o6" /></zeebe:ioMapping></bpmn:extensionElements></bpmn:userTask>
+    <bpmn:exclusiveGateway id="xj2" />
+    <bpmn:sequenceFlow id="f3" sourceRef="x1" targetRef="t3"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=cfg.x2 = 0</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f4" sourceRef="m5" targetRef="xj2" />
+    <bpmn:sequenceFlow id="f5" sourceRef="x1" targetRef="t6" />
+    <bpmn:sequenceFlow id="f6" sourceRef="t6" targetRef="xj2" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f7" sourceRef="start" targetRef="x1" />
+    <bpmn:sequenceFlow id="f8" sourceRef="xj2" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="fuzz">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="224" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="x1_di" bpmnElement="x1"><dc:Bounds x="246" y="217" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t3_di" bpmnElement="t3"><dc:Bounds x="346" y="100" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="b4_di" bpmnElement="b4"><dc:Bounds x="378" y="162" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="m5_di" bpmnElement="m5"><dc:Bounds x="496" y="115" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t6_di" bpmnElement="t6"><dc:Bounds x="346" y="303" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="xj2_di" bpmnElement="xj2"><dc:Bounds x="596" y="217" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="696" y="224" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="446" y="140" /><di:waypoint x="496" y="140" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="396" y="198" /><di:waypoint x="396" y="238" /><di:waypoint x="521" y="238" /><di:waypoint x="521" y="165" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="271" y="217" /><di:waypoint x="271" y="140" /><di:waypoint x="346" y="140" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4"><di:waypoint x="546" y="140" /><di:waypoint x="621" y="140" /><di:waypoint x="621" y="217" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5"><di:waypoint x="271" y="267" /><di:waypoint x="271" y="343" /><di:waypoint x="346" y="343" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6"><di:waypoint x="446" y="343" /><di:waypoint x="621" y="343" /><di:waypoint x="621" y="267" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f7_di" bpmnElement="f7"><di:waypoint x="196" y="242" /><di:waypoint x="246" y="242" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f8_di" bpmnElement="f8"><di:waypoint x="646" y="242" /><di:waypoint x="696" y="242" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
