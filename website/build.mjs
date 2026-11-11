@@ -30,6 +30,9 @@ import { dirname, join, resolve } from "node:path";
 
 import { loadVideos, videosSectionHtml } from "./videos.mjs";
 import { writeFileAtomic } from "./atomic-write.mjs";
+import { nageFacts } from "./nage-facts.mjs";
+import { diagramThumbSvg } from "./bpmn-thumb.mjs";
+import { DEMO_FLOWS } from "./demo-flows.mjs";
 
 const DOMAIN = "nanobpm.io";
 const ORIGIN = `https://${DOMAIN}`;
@@ -289,6 +292,7 @@ function langChips() {
     ["python", "Python"],
     ["csharp", "C#"],
     ["go", "Go"],
+    ["php", "PHP"],
   ];
   return langs
     .map(([id, label]) => {
@@ -337,9 +341,11 @@ bindInstallCopy(document, navigator.clipboard);
 </script>`;
 }
 
-function installCommand(label, cmd = "curl -fsSL https://nanobpm.io/install.sh | sh") {
+// `prompt: false` drops the "$ " shell prompt, for commands typed into an agent
+// (Claude Code's /plugin commands) rather than a shell.
+function installCommand(label, cmd = "curl -fsSL https://nanobpm.io/install.sh | sh", { prompt = true } = {}) {
   return `<div class="install-copy" data-install-copy>
-    <div class="install install-command" role="group" aria-label="${esc(label)}">
+    <div class="install install-command${prompt ? "" : " noprompt"}" role="group" aria-label="${esc(label)}">
       <code>${esc(cmd)}</code>
       <button type="button" class="install-copy-button" aria-label="Copy install command" title="Copy install command" hidden>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" focusable="false">
@@ -352,236 +358,305 @@ function installCommand(label, cmd = "curl -fsSL https://nanobpm.io/install.sh |
   </div>`;
 }
 
+// The host install tabs under the hero. Tabs come from nageFacts().hosts (tested
+// hosts only); untested hosts render as an "also works with" line, so the site
+// never claims more than we have verified.
+/**
+ * The home page's flow examples (website/demo-flows.mjs), "See it in action": a
+ * card per example (a thumbnail drawn from the compiled BPMN the demo runs, the
+ * label and the short caption). Selecting a card shows what the flow does, then a
+ * switcher between its code (the snippet's `flow` region, verbatim) and the same
+ * flow executing live in the browser demo (/demo/?embed=1&scenario=<id>, whose
+ * BPMN is compiled from that snippet).
+ */
+function flowExamples() {
+  const tab = (id, panel, label, on, cls = "tab") =>
+    `<button class="${cls}" role="tab" id="${id}" aria-controls="${panel}" aria-selected="${on}" tabindex="${on ? 0 : -1}">${label}</button>`;
+  const cards = DEMO_FLOWS.map((f, i) =>
+    tab(
+      `tab-ex-${f.id}`,
+      `panel-ex-${f.id}`,
+      `${diagramThumbSvg(readFileSync(join(here, "demo", "src", `${f.id}.bpmn`), "utf8"))}
+      <span class="example-card-text"><b>${esc(f.label)}</b><span>${esc(f.caption)}</span></span>`,
+      i === 0,
+      "example-card",
+    ),
+  );
+  const examples = DEMO_FLOWS.map((f, i) => {
+    const x = `ex-${f.id}`;
+    return `  <div class="tabpanel example" id="panel-${x}" role="tabpanel" aria-labelledby="tab-${x}"${i === 0 ? "" : " hidden"}>
+    <h4 class="example-title">${esc(f.label)}</h4>
+    <p class="example-summary">${f.summary}</p>
+    <div class="tablist view-switch" role="tablist" aria-label="${esc(f.label)}: view">
+      ${tab(`tab-${x}-code`, `panel-${x}-code`, "{ } The code", true)}
+      ${tab(`tab-${x}-run`, `panel-${x}-run`, "▶ The running model", false)}
+    </div>
+    <div class="tabpanel" id="panel-${x}-code" role="tabpanel" aria-labelledby="tab-${x}-code">
+      <figure class="code pop">
+        <figcaption>${esc(f.caption)}</figcaption>
+        <pre><code>${highlightTs(readSnippetRegion(`snippets/${f.snippet}`, "flow"))}</code></pre>
+      </figure>
+    </div>
+    <div class="tabpanel" id="panel-${x}-run" role="tabpanel" aria-labelledby="tab-${x}-run" hidden>
+      <iframe class="demo-frame" title="${esc(f.label)}: the flow executing live on the wasm engine"
+        data-src="/demo/?embed=1&amp;scenario=${f.id}" loading="lazy" allow="fullscreen" allowfullscreen></iframe>
+      <p class="tab-note">This flow, compiled to BPMN and running on the same WebAssembly engine
+      ${esc(nageFacts().name)} runs, here in your browser. Agents and people are scripted; the engine is real.
+      <a href="/demo/?scenario=${f.id}">Open it full-page →</a></p>
+    </div>
+  </div>`;
+  });
+  return `  <h3 class="examples-title">See it in action</h3>
+  <div class="example-cards" role="tablist" aria-label="Example flow">
+    ${cards.join("\n    ")}
+  </div>
+${examples.join("\n")}
+  <p class="code-note">Ask your agent to write one: it reads the flow guide, then saves, checks
+  and deploys the flow in one step. Or start one from the <code>/flows</code> pane.</p>`;
+}
+
+function nageInstallTabs() {
+  const F = nageFacts();
+  const tested = F.hosts.filter((h) => h.tested);
+  const untested = F.hosts.filter((h) => !h.tested);
+  const tabs = tested
+    .map(
+      (h, i) =>
+        `    <button class="tab" role="tab" id="tab-host-${h.id}" aria-controls="panel-host-${h.id}" aria-selected="${i === 0}" tabindex="${i === 0 ? 0 : -1}">${esc(h.label)}</button>`,
+    )
+    .join("\n");
+  const panels = tested
+    .map((h, i) => {
+      // One copy control per command (step-numbered when a host needs several).
+      const cmds = h.commands
+        .map((c, n) =>
+          installCommand(
+            h.commands.length === 1 ? `Install for ${h.label}` : `Install for ${h.label}, step ${n + 1}`,
+            c,
+            { prompt: h.prompt },
+          ),
+        )
+        .join("\n    ");
+      return `  <div class="tabpanel" id="panel-host-${h.id}" role="tabpanel" aria-labelledby="tab-host-${h.id}"${i === 0 ? "" : " hidden"}>
+    ${cmds}
+    <p class="install-note">${h.note}</p>
+  </div>`;
+    })
+    .join("\n");
+  const also = untested.length
+    ? `<p class="install-note">Also works with ${untested
+        .map((h) => `${esc(h.label)} (<code>${esc(h.commands[0].replace(`npx -y ${F.pkg} `, "nage "))}</code>)`)
+        .join(" and ")}: not yet tested by us. Needs ${esc(F.node)}.</p>`
+    : `<p class="install-note">Needs ${esc(F.node)}.</p>`;
+  return `<div class="host-tabs" id="install">
+  <div class="tablist" role="tablist" aria-label="Install for">
+${tabs}
+  </div>
+${panels}
+  ${also}
+</div>`;
+}
+
 function homeHtml() {
-  // The Code-first tab renders the `hero` region of website/snippets/hero-pr-review.ts
-  // VERBATIM — a real, compilable `defineFlow` example type-checked against the
-  // published @nanobpm/workflow in CI ("website snippet (typecheck)" job), so the
-  // landing hero can never drift from the actual API. It's the SAME urban-pr-review
-  // convergence loop the Model-first tab runs live (same task ids / signal / key).
-  const heroCode = readSnippetRegion("snippets/hero-pr-review.ts", "hero");
+  // The flow example renders the `flow` region of website/snippets/nage-review.ts
+  // VERBATIM: a real, compilable Nano Agent Graph Engine flow type-checked against
+  // the published @nanobpm/nano-agent-graph-engine in CI ("website snippet
+  // (typecheck)" job), so the landing example can never drift from the real API.
+  const F = nageFacts();
 
   const body = `${siteNav()}
 
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
-  <h1>Agent Graph Orchestration<br><span class="hl-sub">for the Developer Workstation.</span></h1>
-  <p class="subhead">Graphs that run the loops. An entropy sink for agent fleets.</p>
-  <p class="lede">A RAAD — Rapid Agent Application Development — environment that runs on
-  your machine. Compose coding agents, tools, and human approvals into durable workflows.
-  Code-first or Model-first Graphs, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
+  <h1>${esc(F.name)}<br><span class="hl-sub">Agent graphs inside Claude and OpenCode.</span></h1>
+  <p class="subhead">Run an agent fleet on your laptop, with one plugin.</p>
+  <p class="lede">(Get an agent to) write a flow in TypeScript. It fans out headless agents, runs real code, waits
+  for you or a timer, and keeps going after the chat ends. Every flow compiles to a BPMN diagram
+  that you can watch run.</p>
+${nageInstallTabs()}
   <div class="cta">
-    <a class="btn primary" href="#try">See it live ↓</a>
+    <a class="btn primary" href="#flows">See a flow ↓</a>
     <a class="btn ghost" href="/demo/">Open the browser demo →</a>
-  </div>
-  ${installCommand("Install a Nano Workforce")}
-  <p class="install-note">One command: installs the CLI, hires your coding agents,
-  and brings up a Nano engine, a workforce, and the app.</p>
-  <details class="install-manual">
-    <summary>Or set it up by hand</summary>
-    <div class="install multi" aria-label="Install and start the Nano engine by hand">
-      <code>npm i -g @camunda8/cli</code>
-      <code>c8ctl load plugin c8ctl-plugin-nano</code>
-      <code>c8ctl nano start</code>
-    </div>
-    <p class="install-note">Just the engine. See the full manual sequence in
-    <a href="/docs/get-started-with-c8ctl">Get started with c8ctl →</a></p>
-  </details>
-</section>
-
-<section id="try" class="demo-tabs wrap">
-  <h2 class="tabs-title">Code-first <span class="grad">or</span> Model-first Graphs.</h2>
-  <p class="tabs-sub">One app — two authoring surfaces, the same engine.</p>
-  <div class="tablist" role="tablist" aria-label="Authoring surface">
-    <button class="tab" role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code-first</button>
-    <button class="tab" role="tab" id="tab-model" aria-controls="panel-model" aria-selected="false" tabindex="-1">Model-first</button>
-  </div>
-
-  <div class="tabpanel" id="panel-code" role="tabpanel" aria-labelledby="tab-code">
-    <figure class="code pop">
-      <figcaption>A loop where local coding agents iterate to convergence against GitHub Copilot’s adversarial PR reviews — authored as code.</figcaption>
-      <pre><code>${highlightTs(heroCode)}</code></pre>
-      <p class="code-note">Nano derives the executable model, the job types, the message
-      correlation, and a generic worker. You write steps and handlers — nothing else.</p>
-    </figure>
-  </div>
-
-  <div class="tabpanel" id="panel-model" role="tabpanel" aria-labelledby="tab-model" hidden>
-    <iframe class="demo-frame" title="Live Model-first urban-pr-review demo on the wasm engine"
-      data-src="/demo/?embed=1" loading="lazy" allow="fullscreen" allowfullscreen></iframe>
-    <p class="tab-note">The real <code>urban-pr-review</code> BPMN model, executing live on the
-    WebAssembly build of the engine — no server. Or <a href="/demo/">open it full-page →</a></p>
   </div>
 </section>
 
 <section class="band problem">
   <div class="wrap">
     <h2>Reasoning is an LLM concern. Durability isn't.</h2>
-    <p>A primary agent orchestrating subagents is a good pattern — reasoning about what to run
-    next is exactly what an LLM is for. But <em>holding</em> the dependency graph and the run state
+    <p>A primary agent orchestrating subagents is a good pattern: reasoning about what to run
+    next is exactly what an LLM is for. But <em>holding</em> the plan and the run state
     <b>in context</b> is not. That's durable state living in the most volatile, most expensive place
-    you have: one compaction and the plan is gone; one overnight reboot and the run dies, the state
-    with it, the tokens re-spent. And every token spent bookkeeping <em>what's done, what's blocked,
-    what's next</em> is a token not spent on the code. It degrades both. Nano takes the orchestration
-    out of context — durable, inspectable primitives that drive work to convergence instead of drift.
-    The agent designs the graph; the engine runs it.</p>
+    you have: one compaction and the plan is gone; close the chat and the run dies, the tokens
+    re-spent. And every token spent bookkeeping <em>what's done, what's blocked, what's next</em> is
+    a token not spent on the code. ${esc(F.name)} takes the orchestration out of context and into
+    a durable engine on your machine. The agent designs the graph; the engine runs it.</p>
   </div>
+</section>
+
+<section id="flows" class="demo-tabs wrap">
+  <h2 class="tabs-title">Orchestrate <span class="grad">scripts, agents, people, and time.</span></h2>
+  <p class="tabs-sub">Loops, switches, branches and parallel steps, in plain TypeScript with <code>defineFlow</code>.</p>
+  <div class="caps">
+    <article><h3>Scripts</h3><p><code>w.run</code> with Node code and <code>sh()</code>, in your project.</p></article>
+    <article><h3>Headless agents</h3><p><code>w.task</code> runs a prompt on the agent CLI you bring: Claude Code, Copilot, Qwen Code, Kimi, OpenCode, nano-coder, or any ACP agent.</p></article>
+    <article><h3>Your live session</h3><p>Hand a step to the Claude or OpenCode session you're chatting in.</p></article>
+    <article><h3>People</h3><p><code>w.human</code> asks you with a form, in the chat, the <code>/flows</code> pane or the explorer.</p></article>
+    <article><h3>Time and events</h3><p><code>w.timer</code> and <code>w.signal</code>: wait an hour, or for a webhook.</p></article>
+  </div>
+${flowExamples()}
+</section>
+
+<section class="how wrap">
+  <h2>Right where you work.</h2>
+  <p class="how-sub">No new app to learn. The engine shows up inside Claude Code, Claude Desktop and OpenCode.</p>
+  <ol class="steps">
+    <li><span>1</span><div><b>A band above the prompt.</b> <code>⚙ Agent Graph · 2 flows running · 1 task
+      waiting for you</code>, while anything is going on.</div></li>
+    <li><span>2</span><div><b>The <code>/flows</code> pane.</b> Answer forms, start flows, retry or cancel
+      runs, or ask Claude to fix an incident, without leaving the session.</div></li>
+    <li><span>3</span><div><b>The explorer.</b> Live diagrams with token counts, variables, jobs and a
+      step-by-step trace: in your browser, or inline in Claude Desktop's chat.</div></li>
+    <li><span>4</span><div><b>It wakes the agent.</b> When a flow hands work to your session, the
+      agent picks it up. When a flow needs you, you get a notification.</div></li>
+  </ol>
 </section>
 
 <section class="pillars wrap">
   <article>
-    <h3>DRY your agent SDLC</h3>
-    <p>Declare durable steps with <code>w.run</code> and durable waits with <code>w.signal</code>.
-    Nano derives the model, job types, correlation, and workers — one source of truth, no copy-paste
-    orchestration across every workflow.</p>
-    <p class="proof">Author once. Nano derives the rest.</p>
-  </article>
-  <article>
-    <h3>Code-first or Model-first Graphs</h3>
-    <p>Write the workflow as code, or draw it as BPMN — the same durable engine runs both. Switch
-    surfaces without re-platforming; the model and the code are two views of one runtime.</p>
-    <p class="proof">Same engine. Same app. Your choice of surface.</p>
-  </article>
-  <article>
     <h3>Durable by default</h3>
-    <p>Survives crashes and forced reboots. On restart a workflow resumes at the exact step it left
-    off — completed steps aren't replayed. Delivery is at-least-once: make your activities idempotent
-    (e.g. with idempotency keys) and they run effectively once.</p>
-    <p class="proof">SIGKILL → cold restart → completed steps are never replayed. With a negative control.</p>
+    <p>State is an event log on disk. Close the chat, restart the laptop: runs resume where they
+    left off, and jobs that were mid-run are handed back out.</p>
+    <p class="proof">Tested by killing the engine mid-flow.</p>
+  </article>
+  <article>
+    <h3>A fleet on your laptop</h3>
+    <p>Fan out with <code>w.parallel</code> and <code>w.forEach</code>. Each agent step is its own
+    durable subagent, with its own context, tools and cost line. The engine joins the branches.</p>
+    <p class="proof">Retry one branch without losing the others.</p>
+  </article>
+  <article>
+    <h3>One engine, every project</h3>
+    <p>One engine per user. Each project keeps its flows in <code>flows/</code>; a global library is
+    offered everywhere. Nothing is written into your repos.</p>
+    <p class="proof">See work waiting in every project, in one place.</p>
   </article>
 </section>
 
 <section class="band providers">
   <div class="wrap">
-    <h2>Provider-agnostic. <span class="grad">Mix frontier with local.</span></h2>
-    <p>Blend frontier models with local LLMs — on one workstation or across many. Route the expensive
-    steps to a frontier model and keep the rest private and free. Bring the coding harness you already use:</p>
-    <div class="provs" aria-label="Supported agent harnesses">
-${agentHarnesses().map((h) => `      <span>${esc(h)}</span>`).join("\n")}
-      <span class="more">and more</span>
-    </div>
+    <h2>Bring your own agents. <span class="grad">Mix frontier with local.</span></h2>
+    <p>A flow names a rank and a task, never a CLI. You choose which agent CLI and model serve each
+    step, so the expensive steps can go to a frontier model and the rest stay local and free.</p>
   </div>
 </section>
 
-<section class="band polyglot">
-  <div class="wrap">
-    <h2>Polyglot by design. <span class="grad">Meet your stack.</span></h2>
-    <p>Because Nano speaks the Camunda 8 REST API, it inherits Camunda's polyglot SDK surface —
-    drive workflows and workers from the language your team already ships in, with first-class
-    Camunda 8 SDKs across the stack — plus the wider ecosystem of tooling built on that API, which
-    works against Nano unchanged:</p>
-    <div class="provs langs" aria-label="Supported SDK languages">
-${langChips()}
-    </div>
-  </div>
-</section>
-
-<section class="how wrap">
-  <h2>Add an agent + coding harness to your workforce.</h2>
-  <p class="how-sub">Turn any interactive CLI agent harness into a durable Nano job worker.
-  <b>Hire</b> persists an agent profile; <b>work</b> polls the cluster and runs jobs through it.</p>
-  <div class="install multi" aria-label="Hire and run an agent worker">
-    <code>c8ctl nano hire copilot</code>
-    <code>c8ctl nano work copilot</code>
-  </div>
-  <ol class="steps">
-    <li><span>1</span><div><b>Hire.</b> Persist an agent profile — a name, a rank, and the CLI
-      command (e.g. <code>copilot</code>) that backs it.</div></li>
-    <li><span>2</span><div><b>Work.</b> The harness polls for jobs and runs them, so a coding agent
-      becomes a first-class, durable worker in your orchestration.</div></li>
-    <li><span>3</span><div><b>It just resumes.</b> Every run is an ordinary durable Nano instance —
-      crash-resume is implicit, and you never think about the journal.</div></li>
-  </ol>
-</section>
-
-${compareHtml()}
-
-<section class="band problem" id="nano-coder">
+<section class="band problem coder" id="nano-coder">
   <div class="wrap">
     <p class="eyebrow"><code>@nanobpm/nano-coder</code></p>
     <h2>Your fleet's workers, at ${esc(nanoCoderFacts().rss)} each.</h2>
-    <p>nano-coder is a Rust coding agent built to be the worker your graphs fan out. Node-based agent
-    CLIs take ${esc(nanoCoderFacts().nodeRss)} apiece; nano-coder takes about ${esc(nanoCoderFacts().rss)}, so a
-    laptop runs a fleet instead of a handful. Interactive in your terminal, or headless over ACP
-    under Nano Workforce.</p>
+    <p><b>Bring your own agent CLI.</b> Agent steps run on the CLI you already use: Claude Code,
+    Copilot, Qwen Code, Kimi, OpenCode, or anything else that speaks ACP. Choose one per flow, per
+    step, or per run.</p>
+    <p>We run nano-coder because it is optimised for size. It is a Rust coding agent built to be the
+    worker your graphs fan out. Node-based agent CLIs take ${esc(nanoCoderFacts().nodeRss)} apiece;
+    nano-coder takes ${esc(nanoCoderFacts().rss)}, so a laptop runs a fleet instead of a handful.
+    Interactive in your terminal, or headless over ACP as a flow's agent step.</p>
     ${installCommand("Install nano-coder", nanoCoderFacts().install)}
     <p><a href="/nano-coder/">Meet nano-coder →</a> · <a href="/blog/a-6mb-coding-agent/">Why the worker's size matters →</a></p>
   </div>
 </section>
 
-<section class="band backbone">
+<section class="band backbone" id="distributed">
   <div class="wrap">
-    <h2>RAAD.<br><span class="grad">Rapid Agent Application Development.</span></h2>
-    <p class="raad-sub">An Advanced Research Prototype for agent graph orchestration on the developer
-    workstation. Start in one line.</p>
-    ${installCommand("Get started")}
-    <p class="install-note center">Prefer to do it by hand?
+    <h2>Outgrown one machine?<br><span class="grad">Go distributed.</span></h2>
+    <p class="raad-sub">The plugin runs everything on one machine. The Nano server is the same engine,
+    standalone: it orchestrates agents across many machines, and runs as a cluster when it has to stay
+    up. Nano Workforce runs on it and adds PR review loops, time limits and escalations. The server
+    speaks the Camunda 8 REST API, so Camunda's SDKs and tools work unchanged. It takes more setup than
+    the plugin, so start here when one laptop isn't enough.</p>
+    ${installCommand("Install a Nano Workforce")}
+    <p class="install-note center">Installs the CLI, hires your coding agents, and brings up a Nano
+    engine, a workforce and the app. Prefer to do it by hand?
     <a href="/docs/get-started-with-c8ctl">Manual setup →</a></p>
-    <div class="cta">
-      <a class="btn primary" href="/demo/">Try it in your browser →</a>
+    <div class="provs langs" aria-label="Camunda 8 SDK languages">
+${langChips()}
+    </div>
+    <div class="cta spaced">
+      <a class="btn ghost" href="/architecture/">How the stack fits together →</a>
     </div>
   </div>
 </section>
+
+${compareHtml()}
 
 <div class="band wrap">
 ${videosSectionHtml(loadVideos(join(here, "data", "videos.json")))}
 </div>
 
 <footer class="site-foot wrap">
-  <p><a href="/architecture/">Architecture</a> · <a href="/demo/">Browser demo</a>${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
-  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
+  <p><a href="${F.repo}">${esc(F.name)} on GitHub</a> · <a href="https://github.com/nanobpm">All Nano repos</a> · <a href="/architecture/">Architecture</a> · <a href="/#videos">Videos</a>${whitepaperPresent ? ' · <a href="/whitepaper/">Whitepaper</a>' : ""}${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
+  <p class="muted">Nano is an Advanced Research Prototype. Nano Agent Graph Engine is Apache-2.0; the Nano server is free for personal or evaluation use.</p>
 </footer>
 
 <script>
-// Accessible tabs for the Code-first / Model-first panel. Lazy-loads the demo
-// iframe (data-src -> src) only when the Model-first tab is first selected, so
-// the home page never eagerly loads /demo/ (keeps first paint light).
+// Accessible tabs: every [role=tablist] drives the tabpanels its tabs control
+// (the host install tabs and the flow / live-run tabs). Lazy-loads a panel's
+// iframe (data-src -> src) only when it is first selected, so the home page
+// never eagerly loads /demo/ (keeps first paint light).
 (function () {
-  var tabs = Array.prototype.slice.call(document.querySelectorAll(".demo-tabs .tab"));
-  if (!tabs.length) return;
-  function select(tab) {
-    tabs.forEach(function (t) {
-      var on = t === tab;
-      t.setAttribute("aria-selected", on ? "true" : "false");
-      t.tabIndex = on ? 0 : -1;
-      var panel = document.getElementById(t.getAttribute("aria-controls"));
-      if (panel) panel.hidden = !on;
-    });
-    var panel = document.getElementById(tab.getAttribute("aria-controls"));
-    if (panel) {
-      var frame = panel.querySelector("iframe[data-src]");
-      if (frame) {
-        frame.setAttribute("src", frame.getAttribute("data-src"));
-        frame.removeAttribute("data-src");
+  Array.prototype.forEach.call(document.querySelectorAll('[role="tablist"]'), function (list) {
+    var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
+    function select(tab) {
+      tabs.forEach(function (t) {
+        var on = t === tab;
+        t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
+        var panel = document.getElementById(t.getAttribute("aria-controls"));
+        if (panel) panel.hidden = !on;
+      });
+      var panel = document.getElementById(tab.getAttribute("aria-controls"));
+      if (panel) {
+        // Only the selected panel's OWN iframes: one nested in a still-hidden
+        // descendant tabpanel (an example card's Running model tab while its
+        // Code tab is selected) must not start a demo nobody can see.
+        Array.prototype.forEach.call(panel.querySelectorAll("iframe[data-src]"), function (frame) {
+          if (frame.closest('[role="tabpanel"]') !== panel) return;
+          frame.setAttribute("src", frame.getAttribute("data-src"));
+          frame.removeAttribute("data-src");
+        });
       }
     }
-  }
-  tabs.forEach(function (tab, i) {
-    tab.addEventListener("click", function () { select(tab); });
-    tab.addEventListener("keydown", function (e) {
-      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-        e.preventDefault();
-        var n = e.key === "ArrowRight" ? (i + 1) % tabs.length : (i - 1 + tabs.length) % tabs.length;
-        tabs[n].focus(); select(tabs[n]);
-      }
+    tabs.forEach(function (tab, i) {
+      tab.addEventListener("click", function () { select(tab); });
+      tab.addEventListener("keydown", function (e) {
+        if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+          e.preventDefault();
+          var n = e.key === "ArrowRight" ? (i + 1) % tabs.length : (i - 1 + tabs.length) % tabs.length;
+          tabs[n].focus(); select(tabs[n]);
+        }
+      });
     });
   });
 })();
 </script>
 ${installCopyScript()}`;
 
-  return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
+  return homePage(`nanobpm.io — ${F.name}: agent graphs inside Claude and OpenCode`, body);
 }
 
 // A landscape comparison grid, rendered from a single source of truth so the
-// header set and every row stay aligned. Nano Workforce is the first product
-// column and is visually highlighted (`col-nano`) — the column each peer is
-// read against. Cells carry an optional tone (`yes` / `partial` / `no`) that decorates
+// header set and every row stay aligned. Nano Agent Graph Engine is the first
+// product column and is visually highlighted (`col-nano`) — the column each peer
+// is read against; Nano Workforce follows it as the distributed option. Cells carry an optional tone (`yes` / `partial` / `no`) that decorates
 // them with a ✓ / ~ / — marker; plain cells are descriptive. Every claim traces
-// to the tool's own docs (onorca.dev, herdr.dev, code.claude.com/docs) and is
+// to the tool's own docs (the nano-agent-graph-engine README, onorca.dev,
+// herdr.dev, code.claude.com/docs) and is
 // kept deliberately fair — these tools solve overlapping-but-distinct problems.
 function compareHtml() {
-  // Product columns, in render order. Nano first (highlighted), then the peers.
+  // Product columns, in render order. NAGE first (highlighted), Nano Workforce
+  // (the distributed option), then the peers.
   const cols = [
+    { key: "nage", label: "Nano Agent Graph Engine", brand: true, highlight: true },
     { key: "nano", label: "Nano Workforce", brand: true },
     { key: "orca", label: "Orca" },
     { key: "herdr", label: "Herdr" },
@@ -594,6 +669,7 @@ function compareHtml() {
     {
       label: "What it is",
       cells: [
+        ["Durable agent graphs in your agent"],
         ["Durable agent-workflow engine"],
         ["Desktop orchestrator IDE"],
         ["Terminal runtime for agents"],
@@ -604,6 +680,7 @@ function compareHtml() {
       label: "Orchestration lives in",
       cells: [
         ["The durable graph"],
+        ["The durable graph"],
         ["You, in the GUI"],
         ["You / agents via socket"],
         ["The JavaScript the model writes"],
@@ -612,6 +689,7 @@ function compareHtml() {
     {
       label: "Authoring surface",
       cells: [
+        ["TypeScript flows, drawn as BPMN"],
         ["Code-first & Model-first (BPMN)"],
         ["Manual, worktree GUI"],
         ["Interactive + socket API"],
@@ -621,6 +699,7 @@ function compareHtml() {
     {
       label: "Survives crash / reboot",
       cells: [
+        ["Event log on disk; runs resume", "yes"],
         ["Journal-backed step resume", "yes"],
         ["Scrollback only", "partial"],
         ["Terminals reattach", "partial"],
@@ -630,6 +709,7 @@ function compareHtml() {
     {
       label: "Human approval steps",
       cells: [
+        ["Forms in chat, pane or explorer", "yes"],
         ["First-class durable waits", "yes"],
         ["", "no"],
         ["Flags a blocked agent", "partial"],
@@ -639,6 +719,7 @@ function compareHtml() {
     {
       label: "Agent harnesses",
       cells: [
+        ["Claude, OpenCode, any ACP agent"],
         ["Provider-agnostic"],
         ["Codex, Claude, OpenCode, Pi"],
         ["Claude, Codex, Cursor, Grok…"],
@@ -648,6 +729,7 @@ function compareHtml() {
     {
       label: "Frontier + local models",
       cells: [
+        ["Pick the CLI and model per step", "yes"],
         ["Mix both on one box", "yes"],
         ["Via the harness", "partial"],
         ["Via the harness", "partial"],
@@ -657,6 +739,7 @@ function compareHtml() {
     {
       label: "Headless / server / CI",
       cells: [
+        ["Local daemon; runs on after the chat", "partial"],
         ["Engine + Camunda 8 REST", "yes"],
         ["Desktop app", "no"],
         ["Background server", "partial"],
@@ -666,6 +749,7 @@ function compareHtml() {
     {
       label: "Distributed fleet",
       cells: [
+        ["A fleet on one laptop", "partial"],
         ["Any mix of hardware, local to fleet", "yes"],
         ["One desktop (+ SSH box)", "partial"],
         ["One host, reattach over SSH", "partial"],
@@ -675,6 +759,7 @@ function compareHtml() {
     {
       label: "Footprint",
       cells: [
+        ["One plugin; no server to run"],
         ["Small — runs on a Raspberry Pi"],
         ["Electron desktop"],
         ["One Rust binary"],
@@ -684,6 +769,7 @@ function compareHtml() {
     {
       label: "License",
       cells: [
+        ["Apache-2.0"],
         ["Free to evaluate & personal use"],
         ["MIT"],
         ["Apache-2.0"],
@@ -726,7 +812,7 @@ function compareHtml() {
     });
   });
 
-  const colClass = (c) => (c?.key === "nano" ? " col-nano" : "");
+  const colClass = (c) => (c?.highlight ? " col-nano" : "");
   const head =
     `      <th scope="col"><span class="visually-hidden">Capability</span></th>\n` +
     cols
@@ -762,8 +848,8 @@ function compareHtml() {
   return `<section class="band compare wrap" id="compare">
   <h2>How Nano compares.</h2>
   <p class="compare-sub">The agent-tooling landscape spans desktop IDEs, terminal runtimes, and in-model
-  scripting. Nano Workforce is the durable engine underneath — the one that keeps running when the
-  machine doesn't.</p>
+  scripting. Nano Agent Graph Engine puts a durable engine inside the agent you already use; Nano
+  Workforce runs the same idea as a distributed fleet.</p>
   <div class="compare-scroll" role="region" aria-label="How Nano compares, horizontally scrollable table" tabindex="0">
     <table class="compare-table">
       <thead>
@@ -903,16 +989,15 @@ function siteNav() {
   return `<header class="nav">
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
   <nav>
-    <a href="/architecture/">Architecture</a>
-    <a href="/architecture/#landscape">Compare</a>
+    <a href="/#install">Install</a>
+    <a href="/#flows">Flows</a>
     <a href="/nano-coder/">nano-coder</a>
-    <a href="/blog/">Blog</a>
-    <a href="/#videos">Videos</a>
+    <a href="/#distributed">Distributed</a>
+    <a href="/architecture/">Architecture</a>
     <a href="/demo/">Demo</a>
-    ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
+    <a href="/blog/">Blog</a>
     ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
-    <a href="/schemas/">Schemas</a>
-    <a class="ext" href="https://github.com/nanobpm" rel="noopener noreferrer" target="_blank" aria-label="Nano BPM on GitHub">${ICON_GITHUB}<span>GitHub</span></a>
+    <a class="ext" href="${nageFacts().repo}" rel="noopener noreferrer" target="_blank" aria-label="${nageFacts().name} on GitHub">${ICON_GITHUB}<span>GitHub</span></a>
     <a class="ext" href="https://discord.gg/W5dBe2D8y" rel="noopener noreferrer" target="_blank" aria-label="Nano BPM on Discord">${ICON_DISCORD}<span>Discord</span></a>
   </nav>
 </header>`;
@@ -926,11 +1011,24 @@ function siteNav() {
 function architectureHtml() {
   const ARCH_LAYERS = [
     {
+      name: nageFacts().name,
+      href: "/",
+      role: "Application · on your laptop",
+      tagline: "Agent graphs inside Claude and OpenCode",
+      desc:
+        "The main way to run Nano. A plugin for Claude Code, Claude Desktop and OpenCode that " +
+        "embeds the engine (as WebAssembly) on your machine: write flows in TypeScript, fan out " +
+        "headless agents, wait for people and timers, and watch every run as a live BPMN diagram. " +
+        "An agent fleet on one laptop, with no server to run.",
+      tags: ["Claude Code", "Claude Desktop", "OpenCode", "One plugin"],
+      rung: "goes distributed as",
+    },
+    {
       name: "Nano Workforce",
-      role: "Application",
+      role: "Application · distributed",
       tagline: "Agent-powered SDLC Orchestration",
       desc:
-        "The application at the top of the stack. Hire agents and coding harnesses, " +
+        "The distributed application, on the Nano server. Hire agents and coding harnesses across machines, " +
         "then orchestrate the whole software-development lifecycle — plan, implement, " +
         "review, test, merge, QA, and run retrospectives — as durable graphs that resume " +
         "across crashes and reboots.",
@@ -976,9 +1074,11 @@ function architectureHtml() {
     {
       name: "Nano",
       role: "Engine · foundation",
-      tagline: "Durable Agent Graph engine",
+      tagline: "The durable engine, native or WebAssembly",
       desc:
-        "The load-bearing runtime, written in Rust and compatible with the Camunda 8 API. " +
+        "The load-bearing runtime, written in Rust. It runs as WebAssembly inside " +
+        nageFacts().name +
+        " on your laptop, and as the distributed engine behind Nano Workforce, compatible with the Camunda 8 API. " +
         "Durable by default: on restart a graph resumes at the exact step it left off — " +
         "completed (journal-committed) steps are never replayed. Delivery is at-least-once, " +
         "so activities must be idempotent. Small enough to start on a Raspberry Pi.",
@@ -1579,7 +1679,7 @@ matchTags(result.error, {
   <p><strong>1. Bundle weight against a polyglot, embed-everywhere surface.</strong> Urban’s
   published value isn’t a TS runtime — it’s a portable app model plus a client renderer that
   ships to <em>many</em> runtimes: Node, and embedded hosts on the JVM, GraalVM, and more,
-  feeding language kits for Java, Rust, Python, C# and more. The imperative glue that benefits
+  feeding language kits for Java, Rust, Python, C#, PHP and more. The imperative glue that benefits
   from Effect’s ergonomics is a <em>thin seam</em> around a declarative core. Pulling a full
   effect runtime into that seam is weight in exactly the place we work hardest to keep light.</p>
   <p><strong>2. The viral paradigm.</strong> Effect’s greatest strength —
@@ -1639,7 +1739,7 @@ function homePage(title, body) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="Nano is an Advanced Research Prototype for agent graph orchestration on the developer workstation: a RAAD — Rapid Agent Application Development — environment that composes coding agents, tools, and human approvals into durable, code-first or model-first workflows, provider-agnostic across frontier and local LLMs.">
+<meta name="description" content="Nano Agent Graph Engine runs agent graphs inside Claude Code, Claude Desktop and OpenCode: durable TypeScript flows that fan out headless agents, run real code, wait for people and timers, and keep going after the chat ends. An agent fleet on your laptop, with one plugin. The Nano server takes it distributed.">
 <style>
   :root {
     --bg: #08080a; --panel: rgba(22,24,30,.55); --line: rgba(120,130,150,.16);
@@ -1720,14 +1820,19 @@ function homePage(title, body) {
   .install.multi { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; max-width: max-content; margin-inline: auto; }
   .install.multi.center { align-items: center; }
   .install.multi code { text-align: left; }
-  .install-copy { width: fit-content; max-width: 100%; margin: 1.4rem auto 0; }
+  .install-copy { width: max-content; max-width: 100%; overflow-x: auto; margin: 1.4rem auto 0; }
+  /* A command never wraps (a wrapped command reads as two commands and copies badly);
+     when it is wider than the screen the wrapper scrolls sideways instead. The code
+     keeps its full width (flex: none). The copy button needs an explicit width, not just
+     flex-basis: WebKit sizes a width: max-content box from the button's content (~21px),
+     not its 44px basis, and so clipped the end of every command. */
   .install.install-command {
-    display: flex; align-items: stretch; margin: 0; text-align: left;
+    display: flex; align-items: stretch; width: max-content; margin: 0; text-align: left;
     background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 8px;
   }
-  .install-command code { background: none; border: 0; min-width: 0; overflow-wrap: anywhere; align-self: center; }
+  .install-command code { background: none; border: 0; flex: none; white-space: nowrap; align-self: center; }
   .install-copy-button {
-    display: grid; place-items: center; flex: 0 0 44px; min-height: 44px; padding: 0;
+    display: grid; place-items: center; flex: 0 0 44px; width: 44px; min-height: 44px; padding: 0;
     color: var(--muted); background: transparent; border: 0; border-left: 1px solid var(--line);
     border-radius: 0 7px 7px 0; cursor: pointer;
   }
@@ -1763,8 +1868,47 @@ function homePage(title, body) {
     box-shadow: 0 8px 24px rgba(56,189,248,.28);
   }
   .tabpanel[hidden] { display: none; }
+  /* Flow examples: a tab per example, then what it does, then code / live run. */
+  /* "See it in action": a card per example flow, then what it does, then code / running model. */
+  .examples-title { font-size: 1.5rem; margin: 3rem 0 1.2rem; text-align: center; }
+  .example-cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); max-width: 52rem; margin: 0 auto 2rem; }
+  .example-card {
+    display: flex; flex-direction: column; gap: .8rem; padding: 1rem; text-align: left; cursor: pointer;
+    font: inherit; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    transition: border-color .15s, box-shadow .15s, transform .15s;
+  }
+  .example-card:hover { border-color: rgba(56,189,248,.45); transform: translateY(-2px); }
+  .example-card[aria-selected="true"] { border-color: var(--sky); box-shadow: 0 0 0 1px var(--sky), 0 12px 32px rgba(56,189,248,.18); }
+  .example-card:focus-visible { outline: 2px solid var(--sky); outline-offset: 3px; }
+  .example-card-text { display: flex; flex-direction: column; gap: .3rem; line-height: 1.45; font-size: .92rem; }
+  .example-card-text b { color: var(--ink); font-size: 1.05rem; }
+  .flow-thumb { width: 100%; height: 6.5rem; background: rgba(255,255,255,.025); border-radius: 10px; padding: .4rem; box-sizing: border-box; }
+  .flow-thumb .t-flow { fill: none; stroke: rgba(148,163,184,.55); stroke-width: 2.5; stroke-linejoin: round; }
+  .flow-thumb .t-box { fill: rgba(56,189,248,.05); stroke: rgba(56,189,248,.45); stroke-width: 2; stroke-dasharray: 6 4; }
+  .flow-thumb .t-task { fill: rgba(16,185,129,.16); stroke: var(--emerald); stroke-width: 2.5; }
+  .flow-thumb .t-userTask { fill: rgba(56,189,248,.16); stroke: var(--sky); }
+  .flow-thumb .t-gw { fill: rgba(250,204,21,.12); stroke: #facc15; stroke-width: 2.5; }
+  .flow-thumb .t-event { fill: var(--panel); stroke: var(--ink); stroke-width: 2.5; }
+  .flow-thumb .t-event.t-end { stroke-width: 5; }
+  .example-card[aria-selected="true"] .flow-thumb { background: rgba(56,189,248,.06); }
+  .example-title { font-size: 1.25rem; margin: 0 auto .6rem; max-width: 46rem; text-align: left; }
+  .example-summary { max-width: 46rem; margin: 0 auto 1.4rem; color: var(--muted); line-height: 1.6; text-align: left; }
+  .example-summary code { background: rgba(255,255,255,.05); padding: .08em .35em; border-radius: 5px; font-size: .9em; color: var(--sky); }
+  .view-switch { display: flex; width: max-content; max-width: 100%; margin: 0 auto 1.2rem; padding: .3rem; font-size: 1.02rem; }
+  .view-switch .tab { padding: .6rem 1.4rem; }
+  .host-tabs { max-width: 44rem; margin: 1.6rem auto 1.6rem; }
+  .host-tabs .tablist { justify-content: center; flex-wrap: wrap; max-width: 100%; }
+  .host-tabs .install-copy { margin-top: .7rem; }
+  .install.noprompt code::before { content: none; }
+  .band.coder .install-copy { margin: 1.4rem 0; }
+  .cta.spaced { margin-top: 1.8rem; }
+  .caps { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); margin: 0 0 2rem; text-align: left; }
+  .caps article { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem 1.1rem; }
+  .caps h3 { font-size: 1rem; margin: 0 0 .35rem; }
+  .caps p { margin: 0; color: var(--muted); font-size: .92rem; }
+  .caps code { background: rgba(255,255,255,.05); padding: .05em .3em; border-radius: 5px; font-size: .88em; }
   .demo-frame {
-    width: 100%; height: 560px; border: 1px solid rgba(120,130,150,.2); border-radius: var(--radius);
+    width: 100%; height: 680px; border: 1px solid rgba(120,130,150,.2); border-radius: var(--radius);
     background: var(--code-bg); box-shadow: 0 24px 60px -24px rgba(0,0,0,.7); display: block;
   }
   .tab-note { font-size: .92rem; color: var(--muted); margin: .8rem .2rem 0; }
