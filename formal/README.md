@@ -609,9 +609,12 @@ scope keys. Details: [`traces/README.md`](traces/README.md#generative-differenti
   as a ready-to-commit scenario + golden.
 - **The #1518 acceptance check.** Budget seeds exercise a multi-instance whose
   `outputElement` is the bare `=result`, with job completions writing `result`;
-  reverting #1519's local seeding makes them diverge on the VARIABLE scope keys.
-  Until #1519 lands they are allow-listed against #1518 — the runner fails the
-  entries as stale the moment the fix makes them pass.
+  #1519's local seeding is applied, so reverting it makes them diverge on the
+  VARIABLE scope keys. Budget seeds that still diverge for other reasons are
+  allow-listed against their own issues (#1533–#1536), each with a pinned
+  `nanoTrace` fingerprint in `traces/allowlist.json`: reverting the seeding
+  changes nano's trace, so the pinned fingerprint no longer matches and the
+  runner fails until the change is re-reviewed and re-pinned.
 
 ## Harvesting the Zeebe engine-test corpus (#1249)
 
