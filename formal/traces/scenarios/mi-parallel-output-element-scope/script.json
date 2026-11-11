@@ -1,0 +1,34 @@
+{
+  "description": "#1520 (defect class behind #1518): a parallel multi-instance sub-process [t1 -> t2] with outputElement `=result`. Zeebe's MultiInstanceBodyProcessor seeds a LOCAL nil `result` on every inner instance, so a job result of that name stays in the child's own scope and each child collects its OWN value (results=[a,b], no root leak). The per-item job types interleave the two-step bodies: both `first-*` jobs write `result` = their own item before either `second-*` job completes its child — exactly the scoping #1518 got wrong.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "mi-parallel-output-element-scope",
+      "variables": {
+        "items": ["a", "b"]
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first-a",
+      "variables": {
+        "result": "a"
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first-b",
+      "variables": {
+        "result": "b"
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "second-a"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "second-b"
+    }
+  ]
+}

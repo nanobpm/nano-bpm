@@ -210,6 +210,12 @@ every step must still equal Zeebe exactly — a divergence anywhere else fails
 the gate. Prefer it over a whole-scenario entry whenever the divergence is
 confined to identifiable records.
 
+`reorderRecords` (`{"steps": [0], "match": [ {...} ]}`) is optional and
+narrower still: only in the listed step indices, the matched records are
+compared as a multiset — their ORDER may differ, but a missing, extra or
+changed record still fails. Prefer it over `ignoreRecords` for a pure
+record-ordering divergence.
+
 ## Adding a scenario
 
 1. Create `scenarios/<name>/process.bpmn` (with DI) and
@@ -217,6 +223,16 @@ confined to identifiable records.
 2. Run `capture.sh <name>` and review `goldens/<name>.*`.
 3. Run the nano runner. If nano diverges, fix nano (red/green), or file an
    issue and add an allow-list entry for it.
+
+**One job per step.** `completeJob` activates and completes a *single* job of
+its `jobType` (both runners pick one job by type). To drive several jobs of one
+logical task — e.g. the parallel inner instances of a multi-instance body —
+give each a distinct type with a FEEL expression
+(`type="= \"first-\" + item"`), so the script addresses them one step at a time
+(`first-a`, `first-b`, …). `mi-parallel-output-element-scope` uses this to
+interleave a parallel MI's two-step bodies: both `first-*` jobs write the
+`outputElement` variable before either `second-*` job completes its child —
+the variable-scoping defect class of #1518.
 
 ## Generative differential testing (#1521)
 
