@@ -125,17 +125,21 @@ crate that is failing it — these are the traps the fleet hit:
 
 ## Long builds and test runs (agent sessions)
 
-Agent harnesses kill a single tool command after a fixed timeout (nano-coder:
-600 s), and a killed or idle-killed run loses everything not yet pushed (#1514).
-A cold `server` build, a full `cargo nextest run`, or a bundled-DuckDB
-`processos` build can each exceed that. Therefore:
+Agent harnesses bound a single tool command by a configured execution limit
+(check your harness's configured command timeout), and separately may idle-kill
+a run that goes silent — e.g. the c8ctl-nano worker idle-kills after 300 s of
+no output while nano-coder's provider-stream read timeout defaults to 600 s, so
+a stalled LLM request loses the whole run before a retry (#1514). A killed or
+idle-killed run loses everything not yet pushed. A cold `server` build, a full
+`cargo nextest run`, or a bundled-DuckDB `processos` build can each exceed the
+command limit. Therefore:
 
 - **Scope first, widen last.** Run the crate/test you touched
   (`cargo nextest run -p <crate> <filter>`, `cargo check -p <crate>`) while
   iterating; run the full suite once, at the end.
 - **processos:** always build/run with `DUCKDB_DOWNLOAD_LIB=1 …
   --no-default-features` (above) — never the default bundled feature, which
-  compiles DuckDB's C++ from source and alone outlasts the tool timeout.
+  compiles DuckDB's C++ from source and alone outlasts the command limit.
 - **Keep the full log.** Write long output to a file and read the end
   (`cargo nextest run > /tmp/test.log 2>&1; echo "exit $?"; tail -40 /tmp/test.log`)
   rather than `| tail`, so a failure can be inspected without re-running.
