@@ -15,6 +15,11 @@ export { default as InstanceDetail } from "./InstanceDetail.tsx";
 // Building blocks the views are made of, for hosts that compose their own.
 export { default as BpmnViewer, type ElementBadge } from "./BpmnViewer.tsx";
 export { default as AgentSessionPanel } from "./AgentSessionPanel.tsx";
+export {
+  foldTranscript,
+  type LiveBlock,
+  type TranscriptPage,
+} from "./liveTranscript.ts";
 export { TraceTimeline, msFmt, type TraceTimeFmt } from "./TraceTimeline.tsx";
 export { fmtClock, fmtDuration } from "./traceTime.ts";
 export { IncidentReason } from "./IncidentReason.tsx";

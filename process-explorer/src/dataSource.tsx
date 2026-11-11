@@ -32,6 +32,7 @@ import type {
   AgentInstanceHistoryItemResult,
   AgentInstanceResult,
 } from "./gen-c8/types.gen";
+import type { TranscriptPage } from "./liveTranscript.ts";
 
 /** The list query: paging plus the Explorer's state / incident filters. */
 export type InstanceListQuery = NonNullable<ListInstancesData["query"]>;
@@ -77,6 +78,13 @@ export interface ExplorerDataSource {
     getAgentHistory(
       agentInstanceKey: string,
     ): Promise<AgentInstanceHistoryItemResult[]>;
+    /** Optional live tail of an in-flight run: the producer's transcript stream
+     *  (Nano Workforce transcript format) from `from` on, or null when it has none.
+     *  When given, the agent panel shows text and tool calls as they happen. */
+    followTranscript?(
+      agentInstanceKey: string,
+      from: number,
+    ): Promise<TranscriptPage | null>;
   };
 }
 
