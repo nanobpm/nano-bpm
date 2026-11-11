@@ -3593,6 +3593,319 @@ fn should_parse_a_message_start_event() {
 }
 
 #[test]
+fn should_parse_zeebe_properties_on_a_message_start_event() {
+    // Camunda marks a BPMN process as an MCP tool via `zeebe:properties` /
+    // `zeebe:property` extension elements on the message start event
+    // (`io.camunda.tool:name`, `io.camunda.tool:purpose`,
+    // `io.camunda.tool:input_N_*`, …). The parser must carry them onto the
+    // element (`Element::properties`) rather than dropping them, so the engine
+    // can project the tool metadata onto the message start subscription (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="io.camunda.tool:name" value="searchFlights" />
+                    <zeebe:property name="io.camunda.tool:purpose" value="Search for flights" />
+                    <zeebe:property name="io.camunda.tool:input_1_name" value="destination" />
+                    <zeebe:property name="io.camunda.tool:input_1_type" value="string" />
+                    <zeebe:property name="io.camunda.tool:input_1_required" value="true" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="search-flights" />
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let start = def.element("s").unwrap();
+    assert_eq!(
+        start.kind,
+        ElementKind::MessageStartEvent {
+            message_name: "search-flights".to_string(),
+        }
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:name")
+            .map(String::as_str),
+        Some("searchFlights")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:purpose")
+            .map(String::as_str),
+        Some("Search for flights")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:input_1_name")
+            .map(String::as_str),
+        Some("destination")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:input_1_required")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(start.properties.len(), 5);
+    // An element without extension properties carries an empty map.
+    assert!(def.element("e").unwrap().properties.is_empty());
+}
+
+#[test]
+fn should_parse_zeebe_properties_on_a_service_task() {
+    // Extension properties are not start-event-specific: any element that
+    // carries `zeebe:properties` keeps them (the IR must not be lossy).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="payment" />
+                  <zeebe:properties>
+                    <zeebe:property name="inbound.type" value="webhook" />
+                    <zeebe:property name="custom" value="" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let task = def.element("charge").unwrap();
+    assert!(matches!(task.kind, ElementKind::ServiceTask { .. }));
+    assert_eq!(
+        task.properties.get("inbound.type").map(String::as_str),
+        Some("webhook")
+    );
+    // A property with an empty value is retained (empty string, not dropped).
+    assert_eq!(task.properties.get("custom").map(String::as_str), Some(""));
+    assert_eq!(task.properties.len(), 2);
+}
+
+#[test]
+fn should_attach_zeebe_properties_to_a_top_level_boundary_event() {
+    // A boundary event is buffered outside the io_stack: its properties must
+    // land on the boundary itself, not be dropped (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="work" />
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="task" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:boundaryEvent id="b" attachedToRef="t">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="boundary" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+              <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+    let task = def.element("t").unwrap();
+    assert_eq!(
+        task.properties.get("owner").map(String::as_str),
+        Some("task")
+    );
+}
+
+#[test]
+fn should_not_attach_nested_data_output_properties_to_a_boundary_event() {
+    // Properties inside a boundary's nested `dataOutput/extensionElements`
+    // belong to the data output, not the boundary (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="work" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:boundaryEvent id="b" attachedToRef="t">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="boundary" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataOutput id="do">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data-output" />
+                      <zeebe:property name="extra" value="x" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataOutput>
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+              <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+    assert!(!boundary.properties.contains_key("extra"));
+}
+
+#[test]
+fn should_not_attach_nested_boundary_event_properties_to_the_enclosing_subprocess() {
+    // A boundary nested in a subprocess: with the subprocess on the io_stack,
+    // its properties must not be attached to (and overwrite) the subprocess's.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:serviceTask id="t">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="work" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:boundaryEvent id="b" attachedToRef="t">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="boundary" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                  <bpmn:timerEventDefinition>
+                    <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                  </bpmn:timerEventDefinition>
+                </bpmn:boundaryEvent>
+                <bpmn:endEvent id="se" />
+                <bpmn:endEvent id="se2" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="t" />
+                <bpmn:sequenceFlow id="sf2" sourceRef="t" targetRef="se" />
+                <bpmn:sequenceFlow id="sf3" sourceRef="b" targetRef="se2" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+}
+
+#[test]
+fn should_parse_the_camunda_mcp_fixture_tool_markers() {
+    // Round-trip the vendored Camunda e2e fixture
+    // (`camunda/camunda` qa/c8-orchestration-cluster-e2e-test-suite): its tool
+    // markers must survive parsing onto the message start event.
+    let xml = include_str!("../../tests/fixtures/mcp-process-with-inputs.bpmn");
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    assert_eq!(def.id, "mcpProcessWithInputs");
+    let start = def.element("StartEvent_1").unwrap();
+    assert_eq!(
+        start.kind,
+        ElementKind::MessageStartEvent {
+            message_name: "mcp-process-with-inputs".to_string(),
+        }
+    );
+    let expected: [(&str, &str); 9] = [
+        ("io.camunda.tool:name", "mcp-process-with-inputs"),
+        (
+            "io.camunda.tool:purpose",
+            "Tool for executing a process with typed inputs triggered by MCP.",
+        ),
+        ("io.camunda.tool:input_1_name", "firstName"),
+        ("io.camunda.tool:input_1_type", "string"),
+        (
+            "io.camunda.tool:input_1_description",
+            "The first name of the person.",
+        ),
+        ("io.camunda.tool:input_2_name", "amount"),
+        ("io.camunda.tool:input_2_type", "integer"),
+        (
+            "io.camunda.tool:input_2_description",
+            "The amount to process.",
+        ),
+        ("io.camunda.tool:input_2_required", "true"),
+    ];
+    assert_eq!(start.properties.len(), expected.len());
+    for (key, value) in expected {
+        assert_eq!(
+            start.properties.get(key).map(String::as_str),
+            Some(value),
+            "tool property {key}"
+        );
+    }
+}
+
+#[test]
 fn should_parse_a_one_shot_timer_start_event() {
     // given
     let xml = r#"
@@ -5613,4 +5926,84 @@ fn terminate_end_event_accepts_end_execution_listeners() {
     assert!(matches!(kill.kind, ElementKind::TerminateEndEvent));
     assert_eq!(kill.start_listeners.len(), 1, "{:?}", kill.start_listeners);
     assert_eq!(kill.end_listeners.len(), 1, "{:?}", kill.end_listeners);
+}
+
+#[test]
+fn should_not_attach_nested_sequence_flow_properties_to_the_enclosing_subprocess() {
+    // A sequenceFlow never enters the io_stack, so properties declared on a
+    // flow inside a subprocess must not fall through to (and overwrite) the
+    // subprocess's own metadata. Flows carry no properties slot: ignore them.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="edge" />
+                      <zeebe:property name="extra" value="edge" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:sequenceFlow>
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
+}
+
+#[test]
+fn should_not_attach_nested_data_object_properties_to_the_enclosing_subprocess() {
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataObject id="d">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data" />
+                      <zeebe:property name="extra" value="data" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataObject>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
 }

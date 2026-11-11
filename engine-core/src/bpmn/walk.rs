@@ -130,6 +130,26 @@ pub(crate) fn parse_with_captures(
     // Gates `zeebe:header` reads to a real `zeebe:taskHeaders` container; each
     // header attaches to the innermost open activity on the io_stack.
     let mut in_task_headers = false;
+    // Gates `zeebe:property` reads to a real `zeebe:properties` container; each
+    // property attaches to the innermost open flow node on the io_stack (#1499).
+    // Without this gate a stray `<zeebe:property>` elsewhere in
+    // `extensionElements` (or the standard BPMN `<property>` data element, which
+    // `is_ignorable_tag` already treats as noise) would be misread as an
+    // extension property.
+    let mut in_properties = false;
+    // The flow node that directly owns the currently-open `<extensionElements>`
+    // (the top of `flow_node_stack` when it opened), or `None` when the owner
+    // is not a flow node (a sequenceFlow, dataObject, process, …). Properties
+    // bind to this exact owner rather than "whatever is innermost on the
+    // io_stack", so a non-flow owner nested in a subprocess can never leak its
+    // properties onto the subprocess (#1499).
+    let mut ext_owner: Option<usize> = None;
+    // `flow_node_stack` depth of the open pending boundary event, and whether
+    // the currently-open `<extensionElements>` is a *direct* child of it. A
+    // boundary's nested `dataOutput/extensionElements` must not populate the
+    // boundary's own properties (#1499).
+    let mut boundary_depth: Option<usize> = None;
+    let mut ext_boundary_direct = false;
     // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
     // container; each link attaches to the innermost open activity on the
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
@@ -512,6 +532,7 @@ pub(crate) fn parse_with_captures(
                                 // never a real boundary — not buffering it is safe.
                                 if !self_closing {
                                     if let Some(id) = attr(attrs, "id") {
+                                        boundary_depth = Some(flow_node_stack.len());
                                         cur_boundary = Some(PendingBoundary {
                                             id: id.to_string(),
                                             attached_to: attr(attrs, "attachedToRef")
@@ -531,6 +552,7 @@ pub(crate) fn parse_with_captures(
                                             escalation_dup: false,
                                             start_listeners: Vec::new(),
                                             end_listeners: Vec::new(),
+                                            properties: std::collections::BTreeMap::new(),
                                         });
                                     }
                                 }
@@ -1149,6 +1171,9 @@ pub(crate) fn parse_with_captures(
                             // A self-closing container has no children, so only a
                             // real open element enters the subtree.
                             "extensionElements" => {
+                                ext_owner = flow_node_stack.last().copied().flatten();
+                                ext_boundary_direct = cur_boundary.is_some()
+                                    && boundary_depth.map(|d| d + 1) == Some(flow_node_stack.len());
                                 if !self_closing {
                                     extension_depth += 1;
                                 }
@@ -1168,6 +1193,44 @@ pub(crate) fn parse_with_captures(
                                 // `true` and wrongly capture later `zeebe:header`s.
                                 if !self_closing {
                                     in_task_headers = true;
+                                }
+                            }
+                            // zeebe:properties and its nested zeebe:property
+                            // entries (#1499): generic vendor metadata
+                            // (`<zeebe:property name="…" value="…"/>`) attached to
+                            // the innermost open flow node on the io_stack —
+                            // Camunda's MCP tool markers (`io.camunda.tool:*`) and
+                            // inbound connector type (`inbound.type`) ride this
+                            // channel. Same container gate as `taskHeaders`: a
+                            // self-closing `<zeebe:properties />` has no children
+                            // and emits no end tag.
+                            "properties" => {
+                                if !self_closing {
+                                    in_properties = true;
+                                }
+                            }
+                            "property" if in_properties => {
+                                // A boundary event is buffered in `cur_boundary`
+                                // (never on the io_stack), so check it first;
+                                // falling back to the io_stack would drop a
+                                // top-level boundary's properties or attach a
+                                // nested one's to the enclosing subprocess.
+                                if let Some(name) = attr(attrs, "name") {
+                                    let value = attr(attrs, "value").unwrap_or("").to_string();
+                                    if let Some(boundary) = cur_boundary.as_mut() {
+                                        // Only the boundary's own direct
+                                        // extensionElements; nested owners
+                                        // (dataOutput, …) are ignored.
+                                        if ext_boundary_direct {
+                                            boundary.properties.insert(name.to_string(), value);
+                                        }
+                                    } else if let Some(idx) = ext_owner {
+                                        // Bound to the exact flow node owning
+                                        // this extensionElements; a non-flow
+                                        // owner (sequenceFlow, dataObject, …)
+                                        // has `None` and is ignored.
+                                        acc.nodes[idx].properties.insert(name.to_string(), value);
+                                    }
                                 }
                             }
                             // zeebe:header key="…" value="…" inside a
@@ -1624,6 +1687,7 @@ pub(crate) fn parse_with_captures(
                     in_io_mapping = false;
                     in_execution_listeners = false;
                     in_task_listeners = false;
+                    in_properties = false;
                     extension_depth = 0;
                 }
                 "serviceTask" => {
@@ -1697,8 +1761,11 @@ pub(crate) fn parse_with_captures(
                 "ioMapping" => in_io_mapping = false,
                 "extensionElements" => {
                     extension_depth = extension_depth.saturating_sub(1);
+                    ext_owner = None;
+                    ext_boundary_direct = false;
                 }
                 "taskHeaders" => in_task_headers = false,
+                "properties" => in_properties = false,
                 "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,

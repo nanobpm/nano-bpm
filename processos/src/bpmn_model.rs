@@ -3043,6 +3043,7 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -3870,6 +3871,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -3928,6 +3930,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -4095,6 +4098,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             Ok(format!(

@@ -63,6 +63,14 @@
 //! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
+//! * `zeebe:properties` / nested `zeebe:property name="…" value="…"` on any flow
+//!   node (#1499): generic vendor extension metadata, carried verbatim onto the
+//!   element's [`Element::properties`](crate::model::Element::properties). This
+//!   is the channel Camunda uses to mark a process as an MCP tool
+//!   (`io.camunda.tool:name` / `:purpose` / `:input_N_*` on a message start
+//!   event) or an inbound connector (`inbound.type`); the engine projects the
+//!   tool markers onto the message start subscription (`toolName` /
+//!   `toolProperties` on `searchMessageSubscriptions`).
 //! * A service task's job type is taken from a nested
 //!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id. A
 //!   FEEL expression (`type="=jobType"`, `type='="worker-" + region'`) is
