@@ -1650,9 +1650,47 @@ fn mask_records(steps: &[J], ignore: &[J]) -> Vec<J> {
         .collect()
 }
 
+/// `steps` with, in each step whose index is in `step_ids`, every record
+/// matching one of `matchers` moved to the end of the step in a canonical
+/// (serialised) order. Matched records are KEPT, so a missing, extra or
+/// changed record still diverges — only their ORDER (and position relative to
+/// unmatched records) is tolerated, and only in the listed steps.
+fn reorder_records(steps: &[J], step_ids: &[u64], matchers: &[J]) -> Vec<J> {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let mut step = step.clone();
+            if !step_ids.contains(&(i as u64)) {
+                return step;
+            }
+            if let Some(rs) = step["records"].as_array_mut() {
+                let (mut hit, keep): (Vec<J>, Vec<J>) = rs
+                    .drain(..)
+                    .partition(|r| matchers.iter().any(|m| record_matches(r, m)));
+                hit.sort_by_key(|r| r.to_string());
+                rs.extend(keep);
+                rs.extend(hit);
+            }
+            step
+        })
+        .collect()
+}
+
+/// Is `matchers` a non-empty array of non-empty objects?
+fn valid_matchers(matchers: &J) -> Option<&Vec<J>> {
+    matchers.as_array().filter(|a| {
+        !a.is_empty()
+            && a.iter()
+                .all(|m| m.as_object().is_some_and(|o| !o.is_empty()))
+    })
+}
+
 /// Narrow allow-listing: an entry may carry `ignoreRecords` (record-field
-/// matchers). Its scenario is then allowed to diverge ONLY in records those
-/// matchers select — with them masked out of both sides, every step must
+/// matchers masked out of every step) and/or `reorderRecords`
+/// (`{"steps": [i, ..], "match": [matchers]}` — in ONLY those steps, the
+/// matched records are compared as a multiset, i.e. only their order may
+/// differ). With those narrowings applied to both sides, every step must
 /// still equal Zeebe exactly. Returns one error per residual divergence.
 fn masked_residuals(
     allowlist: &J,
@@ -1661,9 +1699,23 @@ fn masked_residuals(
     let mut errors = Vec::new();
     for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
         let scenario = entry["scenario"].as_str().unwrap_or_default();
-        let ignore = match entry.get("ignoreRecords") {
-            None => continue,
-            Some(J::Array(ignore)) => ignore,
+        if entry.get("ignoreRecords").is_none() && entry.get("reorderRecords").is_none() {
+            continue;
+        }
+        let ignore: &[J] = match entry.get("ignoreRecords") {
+            None => &[],
+            Some(J::Array(ignore)) => {
+                if ignore
+                    .iter()
+                    .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
+                {
+                    errors.push(format!(
+                        "allow-list entry `{scenario}`: every ignoreRecords matcher must be a non-empty object"
+                    ));
+                    continue;
+                }
+                ignore
+            }
             Some(_) => {
                 errors.push(format!(
                     "allow-list entry `{scenario}`: ignoreRecords must be an array of matchers"
@@ -1671,29 +1723,46 @@ fn masked_residuals(
                 continue;
             }
         };
-        if ignore
-            .iter()
-            .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
-        {
-            errors.push(format!(
-                "allow-list entry `{scenario}`: every ignoreRecords matcher must be a non-empty object"
-            ));
-            continue;
-        }
+        let reorder: Option<(Vec<u64>, &[J])> = match entry.get("reorderRecords") {
+            None => None,
+            Some(r) => {
+                let steps: Option<Vec<u64>> = r["steps"]
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                    .and_then(|a| a.iter().map(J::as_u64).collect());
+                match (steps, valid_matchers(&r["match"])) {
+                    (Some(steps), Some(m)) => Some((steps, m.as_slice())),
+                    _ => {
+                        errors.push(format!(
+                            "allow-list entry `{scenario}`: reorderRecords must be \
+                             {{\"steps\": [non-empty step indices], \"match\": [non-empty matcher objects]}}"
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+        let narrow = |steps: &[J]| {
+            let masked = mask_records(steps, ignore);
+            match &reorder {
+                Some((ids, m)) => reorder_records(&masked, ids, m),
+                None => masked,
+            }
+        };
         match traces.get(scenario) {
             Some((golden, Some(nano))) => {
-                if let Some(d) = diff(&mask_records(golden, ignore), &mask_records(nano, ignore)) {
+                if let Some(d) = diff(&narrow(golden), &narrow(nano)) {
                     errors.push(format!(
                         "scenario `{scenario}` diverges from Zeebe beyond its allow-listed \
-                         ignoreRecords:\n{d}"
+                         ignoreRecords/reorderRecords:\n{d}"
                     ));
                 }
             }
-            // Record masking only narrows a divergence in a successfully
-            // replayed trace; it never exempts a scenario nano could not run.
+            // Record narrowing only applies to a successfully replayed trace;
+            // it never exempts a scenario nano could not run.
             _ => errors.push(format!(
-                "scenario `{scenario}` has ignoreRecords but no nano trace to compare \
-                 (replay failed, rejection mismatch, or unknown scenario)"
+                "scenario `{scenario}` has ignoreRecords/reorderRecords but no nano trace to \
+                 compare (replay failed, rejection mismatch, or unknown scenario)"
             )),
         }
     }
@@ -2382,6 +2451,65 @@ fn nano_trace_pin_freezes_an_allowlisted_divergence() {
     assert!(pinned_divergences(&entry(&sc.name, json!({})), &traces).is_empty());
     // The fingerprint is a pure function of the trace.
     assert_eq!(trace_fingerprint(&nano), pin);
+/// `reorderRecords` tolerates ONLY reordering of the matched records, ONLY in
+/// the listed steps: a missing/changed matched record, or any divergence in
+/// another step, still fails (#1527 review).
+#[test]
+fn reorder_records_tolerates_only_order_in_listed_steps() {
+    let rec = |e: &str| json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": e});
+    let job = json!({"valueType": "JOB", "intent": "CREATED", "elementId": "t"});
+    let golden = vec![
+        json!({"op": "create", "step": 0, "records": [rec("a"), job.clone(), rec("b")]}),
+        json!({"op": "complete", "step": 1, "records": [rec("a"), rec("b")]}),
+    ];
+    let run = |nano: Vec<J>, r: J| {
+        let traces = BTreeMap::from([("s".to_string(), (golden.clone(), Some(nano)))]);
+        masked_residuals(
+            &json!({"entries": [{"scenario": "s", "issue": "#1539", "reorderRecords": r}]}),
+            &traces,
+        )
+    };
+    let pi = json!({"steps": [0], "match": [{"valueType": "PROCESS_INSTANCE"}]});
+    // Pure reorder in step 0 is tolerated.
+    let ok = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), rec("a"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(ok, pi.clone()).is_empty());
+    // A missing matched record in step 0 still fails.
+    let missing = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(missing, pi.clone())[0].contains("beyond its allow-listed"));
+    // A changed matched record in step 0 still fails.
+    let changed = vec![
+        json!({"op": "create", "step": 0, "records": [rec("b"), rec("x"), job.clone()]}),
+        golden[1].clone(),
+    ];
+    assert!(run(changed, pi.clone())[0].contains("beyond its allow-listed"));
+    // Reorder in a step NOT listed still fails.
+    let later = vec![
+        golden[0].clone(),
+        json!({"op": "complete", "step": 1, "records": [rec("b"), rec("a")]}),
+    ];
+    assert!(run(later.clone(), pi.clone())[0].contains("beyond its allow-listed"));
+    // A lifecycle record dropped in a later step still fails.
+    let dropped = vec![
+        golden[0].clone(),
+        json!({"op": "complete", "step": 1, "records": [rec("a")]}),
+    ];
+    assert!(run(dropped, pi)[0].contains("beyond its allow-listed"));
+    // Malformed shapes fail closed rather than widening.
+    for bad in [
+        json!({"match": [{"valueType": "PROCESS_INSTANCE"}]}),
+        json!({"steps": [], "match": [{"valueType": "PROCESS_INSTANCE"}]}),
+        json!({"steps": [0], "match": []}),
+        json!({"steps": [0], "match": [{}]}),
+        json!({"steps": ["0"], "match": [{"valueType": "PROCESS_INSTANCE"}]}),
+    ] {
+        assert!(run(later.clone(), bad)[0].contains("reorderRecords must be"));
+    }
 }
 
 /// A null-valued matcher field matches only a record that CARRIES the field

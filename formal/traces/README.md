@@ -210,6 +210,12 @@ every step must still equal Zeebe exactly — a divergence anywhere else fails
 the gate. Prefer it over a whole-scenario entry whenever the divergence is
 confined to identifiable records.
 
+`reorderRecords` (`{"steps": [0], "match": [ {...} ]}`) is optional and
+narrower still: only in the listed step indices, the matched records are
+compared as a multiset — their ORDER may differ, but a missing, extra or
+changed record still fails. Prefer it over `ignoreRecords` for a pure
+record-ordering divergence.
+
 ## Adding a scenario
 
 1. Create `scenarios/<name>/process.bpmn` (with DI) and
