@@ -66,3 +66,35 @@ test('VariableScopes fixture: a state missing the vocabulary fails loudly', asyn
   assert.throws(() => variableScopesFixture('VariableScopes', 'M', { n: 1 },
     [{ step: 1, action: 'Init', vars: { phase: 'init' } }]), /observable variables/);
 });
+
+test('CLI runs when parse.mjs lives under a path containing spaces', async () => {
+  // Regression guard for the direct-execution check: a naive
+  // `import.meta.url === 'file://' + argv[1]` comparison fails under a
+  // directory with spaces (import.meta.url is percent-encoded), so main()
+  // silently never ran and fixtures came out empty. Run a copy of the CLI
+  // from such a directory and assert main() actually executed.
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  // realpath: macOS tmpdir is a symlink, and import.meta.url is resolved.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'nano parse spaces ')));
+  try {
+    const script = path.join(dir, 'parse.mjs');
+    fs.copyFileSync(fileURLToPath(new URL('./parse.mjs', import.meta.url)), script);
+    // Usage path: no args -> main() must run and exit 2 with usage text.
+    const usage = spawnSync(process.execPath, [script], { input: '', encoding: 'utf8' });
+    assert.equal(usage.status, 2, usage.stderr);
+    assert.match(usage.stderr, /usage: parse\.mjs/);
+    // Non-witness input -> main() must run and fail loudly (exit 1).
+    const bad = spawnSync(process.execPath, [script, '--spec', 'VariableScopes', '--model', 'M'], {
+      input: 'no witness here\n',
+      encoding: 'utf8',
+    });
+    assert.equal(bad.status, 1, bad.stderr);
+    assert.match(bad.stderr, /did not produce a completing witness behaviour for M/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
