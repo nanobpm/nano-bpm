@@ -1046,7 +1046,7 @@ impl PartitionStateMachine {
     /// [`RaftPartition::retire`] ran). A retired member must not publish or
     /// receive snapshots.
     fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Relaxed)
+        self.retired.load(Ordering::SeqCst)
     }
 
     /// The checkpoint gate this member's snapshot installs publish under
@@ -1057,12 +1057,16 @@ impl PartitionStateMachine {
         Arc::clone(&self.checkpoint_gate)
     }
 
-    /// Registers one detached in-flight snapshot build, returning the guard that
-    /// deregisters it on drop. [`RaftPartition::retire`] drains the counter
-    /// before reclaiming a volatile snapshot dir, so a build still holding its
-    /// guard keeps the directory alive.
+    /// Registers one in-flight state-machine operation (a detached snapshot
+    /// build/install, or an `apply` batch that may park on a durability
+    /// barrier), returning the guard that deregisters it on drop.
+    /// [`RaftPartition::retire`] fences, then drains this counter before
+    /// reclaiming a volatile snapshot dir or letting a successor reuse the
+    /// engine, so an operation still holding its guard keeps the directory and
+    /// engine alive — and an apply that registered before the fence check can
+    /// never be missed by a drain that observed zero.
     fn track_build(self: &Arc<Self>) -> BuildGuard {
-        self.inflight_builds.fetch_add(1, Ordering::Relaxed);
+        self.inflight_builds.fetch_add(1, Ordering::SeqCst);
         BuildGuard {
             inflight: Arc::clone(&self.inflight_builds),
         }
@@ -1318,7 +1322,7 @@ struct BuildGuard {
 
 impl Drop for BuildGuard {
     fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1564,6 +1568,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     where
         I: IntoIterator<Item = Entry<RaftConfig>> + Send,
     {
+        // Retirement lifetime (#1473): register this apply in the member's
+        // in-flight operation set BEFORE checking the fence, so `retire` (which
+        // sets the fence, then drains the set) can never observe zero in-flight
+        // operations while an apply parked on a durability barrier is about to
+        // resume and submit further entries to an engine a successor now owns.
+        // SeqCst on both sides makes the register/check vs fence/drain pair a
+        // total order (no interleaving lets both sides miss each other).
+        let _op_guard = self.track_build();
         let mut responses = Vec::new();
         // Each Normal entry is a BATCH of commands. We apply the whole batch in a
         // single engine-actor round-trip (the actor runs them in submission order),
@@ -1572,6 +1584,18 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // batch into one write+fsync instead of one fsync per command. We never hold
         // the std::Mutex across an engine `.await`.
         for entry in entries {
+            // Re-check the fence before EVERY entry: an apply that resumes from
+            // a barrier after retirement must not submit the remainder of its
+            // batch to the (possibly reused) engine (#1473).
+            if self.is_retired() {
+                return Err(StorageError::from_io_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    std::io::Error::other(
+                        "refusing to apply a Raft entry on a retired state machine (#1473)",
+                    ),
+                ));
+            }
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {
@@ -1772,6 +1796,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // during `build_snapshot`'s streaming serialize, which fails closed (a
         // `StorageError`, so the covered log is never purged) if any row will
         // not read.
+        // Register in the in-flight set BEFORE the capture (#1473), so a
+        // retirement that drains to zero can never be followed by a builder that
+        // was already capturing and later writes into the reused directory.
+        let build_guard = self.track_build();
         let captured = self
             .engine
             .with(|journal| journal.streaming_snapshot_parts())
@@ -1785,7 +1813,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             captured,
             last_applied,
             last_membership,
-            _build_guard: self.track_build(),
+            _build_guard: build_guard,
         }
     }
 
@@ -2998,7 +3026,7 @@ impl RaftPartition {
     pub async fn retire(&self) -> std::io::Result<()> {
         // Fence FIRST: a build or install that finishes after this abandons its
         // artifact, even one that passed its entry fence check before shutdown.
-        self.sm_retired.store(true, Ordering::Relaxed);
+        self.sm_retired.store(true, Ordering::SeqCst);
         self.raft.shutdown().await.ok();
         // Drain in-flight builds (bounded). Each finished build drops its
         // `BuildGuard`, decrementing the counter.
@@ -3043,7 +3071,7 @@ impl RaftPartition {
     async fn drain_snapshot_builds(&self, budget: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + budget;
         loop {
-            if self.sm_inflight_builds.load(Ordering::Relaxed) == 0 {
+            if self.sm_inflight_builds.load(Ordering::SeqCst) == 0 {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -3067,7 +3095,7 @@ impl RaftPartition {
     /// Test-only: whether this member's state machine has been retired.
     #[cfg(test)]
     pub(crate) fn is_retired(&self) -> bool {
-        self.sm_retired.load(Ordering::Relaxed)
+        self.sm_retired.load(Ordering::SeqCst)
     }
 
     /// Test-only: this member's snapshot directory (for the volatile-reclaim
@@ -3080,7 +3108,7 @@ impl RaftPartition {
     /// Test-only: this member's in-flight detached snapshot build count.
     #[cfg(test)]
     pub(crate) fn inflight_snapshot_builds(&self) -> usize {
-        self.sm_inflight_builds.load(Ordering::Relaxed)
+        self.sm_inflight_builds.load(Ordering::SeqCst)
     }
 
     /// Test-only: whether this member's snapshot dir is volatile (temp-anchored).
@@ -6035,10 +6063,12 @@ mod tests {
         // must NOT return until the build finishes, so run retire on a task and
         // confirm it is still waiting (the build holds its guard).
         let (retired_flag, inflight, _dir) = sm.retirement_handles();
+        // Fence SYNCHRONOUSLY before releasing the build (as `retire` does), so
+        // retirement is guaranteed visible when the build resumes.
+        retired_flag.store(true, Ordering::SeqCst);
         let retire = tokio::spawn({
             let snap_dir = snap_dir.clone();
             async move {
-                retired_flag.store(true, Ordering::Relaxed);
                 // Drain with the same bound `RaftPartition::retire` uses.
                 let deadline = std::time::Instant::now() + RETIRE_DRAIN_BOUND;
                 while inflight.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline
@@ -6179,7 +6209,7 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         let mut sm: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new_temp(engine, 0).expect("snapshot dir"));
-        sm.retired.store(true, Ordering::Relaxed);
+        sm.retired.store(true, Ordering::SeqCst);
 
         let recv = sm.begin_receiving_snapshot().await;
         assert!(
@@ -6227,7 +6257,7 @@ mod tests {
 
         // Fence the member and drain with a near-zero budget: the parked build
         // cannot finish in time, so the drain reports not-drained (fail closed).
-        sm.retired.store(true, Ordering::Relaxed);
+        sm.retired.store(true, Ordering::SeqCst);
         let (_r, inflight, _d) = sm.retirement_handles();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         while inflight.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline {

@@ -16900,8 +16900,9 @@ impl ServerImpl {
         // reusing a handle whose mailbox is never drained (which would hang the
         // rebuild) or whose journal refuses every apply (#1405).
         let engine = match self.retire_predecessor_core(p).await {
-            Some(h) => h,
-            None => match self.rebuild_engine_from_durable(p).await {
+            Err(_) => return,
+            Ok(Some(h)) => h,
+            Ok(None) => match self.rebuild_engine_from_durable(p).await {
                 Some(h) => h,
                 None => {
                     tracing::error!(
@@ -17782,11 +17783,14 @@ impl ServerImpl {
     ///
     /// Fail closed on a drain timeout (#1473): when a predecessor snapshot
     /// build or install is still in flight past the drain bound, retiring its
-    /// member returns `Err` and this returns `None` — the caller must NOT let a
+    /// member returns `Err` and this propagates it — the caller must NOT let a
     /// durable successor reuse the snapshot directory yet (a late predecessor
-    /// artifact could still be writing into it). The supervisor retries the
+    /// artifact could still be writing into it). That is a DISTINCT `Err`, not
+    /// the `Ok(None)` of an unhealthy engine: every caller must abort the
+    /// rebuild on it rather than reconstruct the engine and bootstrap a
+    /// successor while predecessor work still runs. The supervisor retries the
     /// rebuild on its next tick, by when the predecessor has finished.
-    async fn retire_predecessor_core(&self, p: u64) -> Option<DeepthiHandle> {
+    async fn retire_predecessor_core(&self, p: u64) -> std::io::Result<Option<DeepthiHandle>> {
         if let Some(old) = self.raft.get(p) {
             if let Err(e) = old.retire().await {
                 tracing::warn!(
@@ -17794,7 +17798,7 @@ impl ServerImpl {
                     "raft rebuild: the predecessor's retirement did not drain: {e}; NOT \
                      rebuilding over it yet — the supervisor retries (#1473)"
                 );
-                return None;
+                return Err(e);
             }
             // Test-only: record any predecessor still live after teardown, so a
             // test fails if a rebuild constructs a successor next to a live core.
@@ -17805,7 +17809,7 @@ impl ServerImpl {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        self.healthy_engine_for_rebuild(p).await
+        Ok(self.healthy_engine_for_rebuild(p).await)
     }
 
     /// The partition `p` engine actor to carry into a rebuild, or `None` when it
@@ -17912,8 +17916,8 @@ impl ServerImpl {
     /// (a wedged actor must not hang the serial recovery pass — #1473).
     async fn rebuild_owned_engine_from_durable(&self, p: u64) -> Option<DeepthiHandle> {
         let handle = self.engine.local_for_partition(p)?.clone();
-        let rebuilt = match self.durable_engine_for(p).await {
-            Ok(engine) => engine,
+        let (rebuilt, seed) = match self.durable_engine_for(p).await {
+            Ok(rebuilt) => rebuilt,
             Err(e) => {
                 tracing::error!(
                     partition = p,
@@ -17927,9 +17931,12 @@ impl ServerImpl {
         // The canonical deployment seed (#1473): definitions journaled under
         // this node's first-owned partition and fanned out to siblings only in
         // memory are NOT in `p`'s durable replay, so the rebuilt engine must be
-        // reseeded from the authoritative state or its creates fail with
-        // `ProcessNotFound` (mirrors the boot reseed in `ServerImpl::new`).
-        let seed = self.current_deployment_events().await;
+        // reseeded or its creates fail with `ProcessNotFound` (mirrors the boot
+        // reseed in `ServerImpl::new`). The seed is derived from the DURABLY
+        // recovered deployment owner (returned by `durable_engine_for`), never
+        // from a live actor: the live owner may be the very fenced journal being
+        // discarded, holding a deployment from an aborted, non-durable entry, and
+        // awaiting it would be an unbounded read of a possibly wedged actor.
         // Swap the journal on the engine thread: the actor is alive, so this is
         // a single bounded turn. The rebuilt engine replaces the fenced one; the
         // journal's writer/exporter/seg wiring is preserved by the swap because
@@ -17973,7 +17980,15 @@ impl ServerImpl {
     /// rewrites the shared snapshot from a subset and drops the siblings, and
     /// supplies the authoritative VarStore so a lean snapshot's variables are
     /// restored before the tail replays.
-    async fn durable_engine_for(&self, p: u64) -> std::io::Result<nanobpmn_engine_core::Engine> {
+    ///
+    /// Returns the rebuilt engine together with the canonical deployment seed
+    /// derived from the durably recovered deployment owner (the first locally
+    /// owned partition). The seed is empty where `p`'s own durable replay
+    /// already carries every deployment (single-partition and legacy layouts).
+    async fn durable_engine_for(
+        &self,
+        p: u64,
+    ) -> std::io::Result<(nanobpmn_engine_core::Engine, Vec<Event>)> {
         let (journal_path, _) = resolve_data_paths();
         let journal_path = journal_path.ok_or_else(|| {
             std::io::Error::other(
@@ -18000,9 +18015,20 @@ impl ServerImpl {
                         "partition {p} is not locally owned; cannot rebuild it from durable state"
                     ))
                 })?;
-                let (seg, varstore) = handle
-                    .with(|journal| (journal.seg_shared(), journal.varstore()))
-                    .await;
+                // BOUNDED (#1473): this actor may be the dead or wedged one the
+                // health probe just rejected; never block the serial recovery
+                // pass on it.
+                let (seg, varstore) = tokio::time::timeout(
+                    ENGINE_HEALTH_PROBE_BOUND,
+                    handle.with(|journal| (journal.seg_shared(), journal.varstore())),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::other(format!(
+                        "partition {p}'s engine actor did not answer the recovery metadata read \
+                         within {ENGINE_HEALTH_PROBE_BOUND:?}"
+                    ))
+                })?;
                 let _permit = match seg.as_ref() {
                     Some(seg) => Some(seg.checkpoint_permit().await),
                     None => None,
@@ -18014,16 +18040,23 @@ impl ServerImpl {
                 let owned = self.engine.topology().local_partitions();
                 let recovery =
                     seglog::recover_multi(&dir, &owned, num_partitions, varstore.as_deref())?;
-                return Ok(recovery
-                    .engines
-                    .into_iter()
-                    .find(|(pid, _)| *pid == p)
-                    .map(|(_, e)| e)
-                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p)));
+                let mut engines = recovery.engines;
+                // Seed from the DURABLY recovered deployment owner (#1473).
+                let seed = owned
+                    .first()
+                    .and_then(|owner| engines.iter().find(|(pid, _)| pid == owner))
+                    .map(|(_, e)| deployment_replication_events_from_state(e.state()))
+                    .unwrap_or_default();
+                let engine = engines
+                    .iter()
+                    .position(|(pid, _)| *pid == p)
+                    .map(|i| engines.swap_remove(i).1)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                return Ok((engine, seed));
             }
-            // Single-partition segmented.
+            // Single-partition segmented: `p`'s replay carries every deployment.
             let (engine, _recovery) = seglog::recover(&dir)?;
-            return Ok(engine);
+            return Ok((engine, Vec::new()));
         }
         // Legacy single-file: demux partition `p`'s events by key partition and
         // replay them (the same split the legacy boot path uses).
@@ -18042,7 +18075,11 @@ impl ServerImpl {
                     )
             })
             .collect();
-        Ok(nanobpmn_engine_core::Engine::replay_partition(p, p_events))
+        // Legacy: the deployment events are replayed into `p` above.
+        Ok((
+            nanobpmn_engine_core::Engine::replay_partition(p, p_events),
+            Vec::new(),
+        ))
     }
     /// Reconstructs partition `p`'s engine for a RECEIVER rebuild whose
     /// predecessor engine is dead or fenced (#1473), returning the fresh actor
@@ -18090,8 +18127,9 @@ impl ServerImpl {
         // reconstructed from durable state (never reused — a dead actor's
         // mailbox is never drained, and a fenced journal refuses every apply).
         let engine = match self.retire_predecessor_core(p).await {
-            Some(h) => h,
-            None => match self.rebuild_engine_for_receiver(p).await {
+            Err(_) => return false,
+            Ok(Some(h)) => h,
+            Ok(None) => match self.rebuild_engine_for_receiver(p).await {
                 Some(h) => h,
                 None => {
                     tracing::error!(
@@ -18248,8 +18286,9 @@ impl ServerImpl {
         // reusing it would hang the rebuild; a fenced journal refuses every
         // apply even after the environmental fault heals).
         let engine = match self.retire_predecessor_core(p).await {
-            Some(h) => h,
-            None => match self.rebuild_engine_for_receiver(p).await {
+            Err(_) => return false,
+            Ok(Some(h)) => h,
+            Ok(None) => match self.rebuild_engine_for_receiver(p).await {
                 Some(h) => h,
                 None => {
                     tracing::error!(
