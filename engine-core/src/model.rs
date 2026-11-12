@@ -1088,6 +1088,19 @@ pub enum ElementKind {
 }
 
 impl ElementKind {
+    /// Whether an instance of this kind owns an inner **token scope** that its
+    /// own start event activates in — an embedded sub-process or an event
+    /// sub-process (#1555). The single source of truth for "tearing this down
+    /// must tear down its inner scope" and "it completes when its scope
+    /// drains": activation, interruption, modification and the drain sweep all
+    /// classify through it, so a new scope-owning kind cannot be half-wired.
+    pub fn owns_token_scope(&self) -> bool {
+        matches!(
+            self,
+            ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. }
+        )
+    }
+
     /// Whether this is a start-event kind (none, message or timer start). A
     /// process has exactly one process-entry start ([`ProcessDefinition::start_event`],
     /// where a CreateInstance begins) but may declare several process-level starts

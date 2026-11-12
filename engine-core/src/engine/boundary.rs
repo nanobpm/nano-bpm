@@ -578,7 +578,14 @@ impl Engine {
     /// sweep, which sees the `ProcessInstanceTerminated` this emits).
     pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
         let descendants = self.scope_descendants(instance_key, scope_eik);
-        let mut events = self.element_teardown_events(instance_key, &descendants);
+        // An event sub-process trigger rests on its host **scope** (#1555) —
+        // on `scope_eik` itself, not on a descendant — so the descendant sweep
+        // never reaches it, and once the scope token is gone the drain sweep
+        // cannot disarm it either. Every teardown of a scope (interrupting
+        // boundary, modification terminate, error / terminate-end throw)
+        // routes through here, so disarm the scope's own triggers first.
+        let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
+        events.extend(self.element_teardown_events(instance_key, &descendants));
         self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
         events
     }
@@ -1320,13 +1327,14 @@ impl Engine {
         })
     }
 
-    /// Whether `element_id` is an embedded sub-process (interrupting it must tear
-    /// down its whole inner token scope, not just cancel a job).
+    /// Whether `element_id` owns an inner token scope — an embedded sub-process
+    /// or an event sub-process (interrupting or terminating it must tear down
+    /// its whole inner token scope, not just cancel a job). Delegates to the
+    /// canonical [`ElementKind::owns_token_scope`].
     pub(crate) fn is_subprocess(&self, instance_key: Key, element_id: &str) -> bool {
-        matches!(
-            self.element_kind(instance_key, element_id),
-            Some(ElementKind::SubProcess { .. })
-        )
+        self.element_kind(instance_key, element_id)
+            .as_ref()
+            .is_some_and(ElementKind::owns_token_scope)
     }
 
     /// Whether `element_instance_key` is a live ad-hoc sub-process container —

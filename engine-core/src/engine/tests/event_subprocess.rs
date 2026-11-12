@@ -817,3 +817,318 @@ fn interrupting_event_subprocess_disarms_sibling_event_subprocesses() {
     complete_one(&mut engine, "esp");
     assert!(engine.is_completed(inst));
 }
+
+// ---- Copilot review round 2 (#1579): defect-class regressions --------------
+
+/// A non-interrupting ESP inside embedded `sub`, plus an interrupting signal
+/// boundary `kill` on `sub` routed to `killed`.
+fn esp_model_with_boundary(t: T) -> ProcessDefinition {
+    let b = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e")
+        .event_sub_process("esp", "esp_start", trig_of(t), false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .end_event("sub_e")
+        .connect("s", "sub")
+        .connect("sub_s", "work")
+        .connect("work", "sub_e")
+        .connect("sub", "e")
+        .contained_in("sub_s", "sub")
+        .contained_in("work", "sub")
+        .contained_in("sub_e", "sub")
+        .contained_in("esp", "sub")
+        .signal_boundary_event("kill", "sub", "kill")
+        .end_event("killed")
+        .connect("kill", "killed");
+    b.build().unwrap()
+}
+
+#[test]
+fn boundary_interruption_of_the_host_disarms_event_subprocess_triggers() {
+    // Every trigger family: a boundary event interrupting the embedded host
+    // sub-process must disarm the host's ESP trigger too, so it can never
+    // fire into a torn-down scope.
+    for t in ALL {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, esp_model_with_boundary(t));
+        assert_eq!(
+            armed(&engine, inst),
+            2,
+            "{t:?}: ESP trigger + boundary armed"
+        );
+        engine
+            .apply_command(Command::BroadcastSignal {
+                signal_name: "kill".into(),
+                variables: HashMap::new(),
+            })
+            .unwrap();
+        assert_eq!(armed(&engine, inst), 0, "{t:?}: ESP trigger disarmed");
+        assert!(
+            engine.is_completed(inst),
+            "{t:?}: instance completed via boundary"
+        );
+        let late = fire(&mut engine, inst, t, 5_000);
+        assert!(
+            !late.iter().any(
+                |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp")
+            ),
+            "{t:?}: no ESP activation after the host was interrupted"
+        );
+    }
+}
+
+#[test]
+fn interrupting_event_subprocess_purges_queued_sibling_activations() {
+    // A non-interrupting and an interrupting timer ESP due in the same batch:
+    // the interrupting one must leave nothing of the other running.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .event_sub_process(
+            "esp_a",
+            "a_start",
+            timer(TimerDefKind::Duration, "PT5S"),
+            false,
+        )
+        .start_event("a_start")
+        .service_task("a_work", "ni")
+        .end_event("a_end")
+        .connect("a_start", "a_work")
+        .connect("a_work", "a_end")
+        .contained_in("a_start", "esp_a")
+        .contained_in("a_work", "esp_a")
+        .contained_in("a_end", "esp_a")
+        .event_sub_process(
+            "esp_b",
+            "b_start",
+            timer(TimerDefKind::Duration, "PT5S"),
+            true,
+        )
+        .start_event("b_start")
+        .service_task("b_work", "int")
+        .end_event("b_end")
+        .connect("b_start", "b_work")
+        .connect("b_work", "b_end")
+        .contained_in("b_start", "esp_b")
+        .contained_in("b_work", "esp_b")
+        .contained_in("b_end", "esp_b")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    engine.trigger_timers(5_000);
+    assert_eq!(job_count(&mut engine, "w"), 0, "main flow torn down");
+    assert_eq!(job_count(&mut engine, "int"), 1, "interrupting ESP runs");
+    assert_eq!(
+        job_count(&mut engine, "ni"),
+        0,
+        "no non-interrupting work survives the interrupting ESP"
+    );
+    complete_one(&mut engine, "int");
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn terminating_a_running_event_subprocess_tears_down_its_children() {
+    // `owns_token_scope` covers EventSubProcess: modification teardown of a
+    // running ESP cancels its inner job instead of leaking it.
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, esp_model(sig(), false, false));
+    let fired = fire(&mut engine, inst, T::Signal, 0);
+    let esp_eik = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == "esp" => Some(*element_instance_key),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(job_count(&mut engine, "esp"), 1);
+    engine
+        .apply_command(Command::modify_instance(inst, vec![], vec![esp_eik]))
+        .unwrap();
+    assert_eq!(job_count(&mut engine, "esp"), 0, "ESP child job cancelled");
+    assert_eq!(job_count(&mut engine, "w"), 1, "main flow untouched");
+}
+
+#[test]
+fn redelivered_message_continuation_starts_one_non_interrupting_run() {
+    // A persistent (non-interrupting) ESP subscription parked off-partition
+    // (`Opening`) never settles, so it dedupes routed continuations by message
+    // key: a redelivered correlation must not start a second run, while a
+    // genuinely new message does.
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| crate::state::subscription_partition(k, N) == 1)
+        .unwrap();
+    let mut engine = Engine::with_partition(0);
+    engine.set_num_partitions(N);
+    engine
+        .apply_command(Command::DeployProcess(esp_model(msg(), false, false)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("orderId", Value::Str(order))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let (sub, eik, element_id, kind) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                element_instance_key,
+                element_id,
+                kind,
+                ..
+            } => Some((
+                *subscription_key,
+                *element_instance_key,
+                element_id.clone(),
+                kind.clone(),
+            )),
+            _ => None,
+        })
+        .expect("off-partition Opening record");
+    let deliver = |engine: &mut Engine, message_key| {
+        engine
+            .apply_command(Command::CorrelateMessageSubscription {
+                subscription_key: sub,
+                message_key,
+                instance_key: inst,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+                kind: kind.clone(),
+                variables: HashMap::new(),
+            })
+            .unwrap()
+    };
+    deliver(&mut engine, 77);
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        1,
+        "first delivery runs the ESP"
+    );
+    deliver(&mut engine, 77);
+    assert_eq!(job_count(&mut engine, "esp"), 1, "redelivery ignored");
+    deliver(&mut engine, 78);
+    assert_eq!(job_count(&mut engine, "esp"), 2, "a new message runs again");
+}
+
+#[test]
+fn event_subprocess_triggers_resolve_against_post_input_mapping_variables() {
+    // The embedded host's input mapping rebinds `orderId`; the ESP message
+    // correlation key must see the mapped value, not the outer one.
+    let mut def = esp_model(msg(), false, true);
+    def.elements.get_mut("sub").unwrap().io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=99".into(),
+            target: "orderId".into(),
+        }],
+        outputs: vec![],
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    let keys: Vec<String> = engine
+        .state
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst)
+        .map(|s| s.correlation_key.clone())
+        .collect();
+    assert_eq!(keys, vec!["99".to_string()]);
+}
+
+#[test]
+fn conditional_event_subprocess_true_on_entry_fires_before_scope_drains() {
+    // `s -> e` ends immediately; a conditional ESP whose condition already
+    // holds must be evaluated before the scope's drain sweep disarms it.
+    for (interrupting, embedded) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut b = esp_builder(cond(), interrupting);
+        if embedded {
+            // Same shape one level down: `s -> sub[sub_s -> sub_e] -> e` with
+            // the ESP inside `sub`.
+            b = crate::model::ProcessBuilder::new("p")
+                .start_event("s")
+                .end_event("e")
+                .sub_process("sub", "sub_s")
+                .start_event("sub_s")
+                .end_event("sub_e")
+                .connect("s", "sub")
+                .connect("sub_s", "sub_e")
+                .connect("sub", "e")
+                .contained_in("sub_s", "sub")
+                .contained_in("sub_e", "sub")
+                .event_sub_process("esp", "esp_start", cond(), interrupting)
+                .start_event("esp_start")
+                .end_event("esp_end")
+                .connect("esp_start", "esp_end")
+                .contained_in("esp_start", "esp")
+                .contained_in("esp_end", "esp")
+                .contained_in("esp", "sub");
+        }
+        let def = b.build().unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "p",
+                vars(&[("flag", Value::Bool(true))]),
+            ))
+            .unwrap();
+        assert!(
+            created.iter().any(
+                |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp")
+            ),
+            "interrupting={interrupting} embedded={embedded}: conditional ESP fired on entry"
+        );
+    }
+}
+
+#[test]
+fn migrating_an_instance_with_armed_event_subprocess_triggers_is_rejected() {
+    // Scope-owned ESP triggers are not reconciled by migration yet (#1379):
+    // reject explicitly rather than keep a stale trigger armed.
+    for t in ALL {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, esp_model(trig_of(t), false, false));
+        // A changed target (interrupting flag flipped) so the redeploy is a new
+        // version.
+        let target_key = deploy_for_migration(&mut engine, esp_model(trig_of(t), true, false));
+        let err = engine
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![("work".into(), "work".into())],
+            ))
+            .unwrap_err();
+        match err {
+            EngineError::UnsupportedMigration {
+                element_id, reason, ..
+            } => {
+                assert_eq!(element_id, "esp", "{t:?}");
+                assert!(reason.contains("#1379"), "{t:?}: {reason}");
+            }
+            other => panic!("{t:?}: expected UnsupportedMigration, got {other:?}"),
+        }
+        assert_eq!(armed(&engine, inst), 1, "{t:?}: nothing changed");
+    }
+}

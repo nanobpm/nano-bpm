@@ -1667,6 +1667,22 @@ pub struct MessageSubscription {
     pub state: MessageSubscriptionState,
     /// What the subscription guards, and so what correlating it does.
     pub kind: MessageSubscriptionKind,
+    /// The `message_key`s already correlated to this subscription — recorded
+    /// only for a kind that [`stays_open_after_trigger`](MessageSubscriptionKind::stays_open_after_trigger)
+    /// (a one-shot kind settles on its first correlation, which already makes a
+    /// redelivered continuation a no-op). A routed
+    /// [`crate::Command::CorrelateMessageSubscription`] is delivered
+    /// at-least-once, so a persistent subscription must recognise a
+    /// redelivered `message_key` and ignore it, while still accepting every
+    /// *distinct* message. Bounded by the distinct messages the subscription
+    /// actually correlated, and dropped with the subscription. Additive
+    /// (`serde(default)`, omitted when empty), so older snapshots decode
+    /// unchanged and one-shot subscriptions serialize byte-identically.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub correlated_message_keys: std::collections::BTreeSet<Key>,
 }
 
 /// An open **signal** subscription holding a token on a signal catch element (or

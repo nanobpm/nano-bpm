@@ -446,6 +446,7 @@ mod tests {
             correlation_key: "A".into(),
             state: MessageSubscriptionState::Open,
             kind: MessageSubscriptionKind::IntermediateCatch,
+            correlated_message_keys: Default::default(),
         });
         snap.timers.push(Timer {
             key: 320,

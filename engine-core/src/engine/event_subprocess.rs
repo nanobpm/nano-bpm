@@ -32,12 +32,12 @@
 //! `esp-error-escalation` slice). [`Engine::arm_event_subprocesses`] skips
 //! them explicitly — that match arm is the hook.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use super::{expression, Engine, Step};
 use crate::{
     model::{ElementKind, EventSubProcessTrigger, TimerDef},
-    state, Event, Key,
+    state, Event, Key, Value,
 };
 
 /// One armable event sub-process of a scope, cloned out of the definition so
@@ -75,7 +75,11 @@ impl Engine {
     /// Arms the start-event triggers of every event sub-process directly
     /// contained in the scope `scope_eik` (element `scope_element`; `0` /
     /// `None` for the process root), evaluating their expressions (timer,
-    /// message name, correlation key) against the scope's variables. Returns
+    /// message name, correlation key) against `vars` — the scope's
+    /// **post-input** view. The caller passes the view its own activation body
+    /// evaluates against: the scope's input mappings / multi-instance item
+    /// bindings are journaled but not yet applied when arming runs, so reading
+    /// persisted variables here would miss them. Returns
     /// the creation events; an expression failure is returned for the caller
     /// to raise as an incident on the activating element (minted keys are the
     /// caller's to rewind, as with boundary arming).
@@ -84,12 +88,12 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
         scope_element: Option<&str>,
+        vars: &HashMap<String, Value>,
     ) -> Result<Vec<Event>, expression::Failure> {
         let esps = self.armable_event_subprocesses(instance_key, scope_element);
         if esps.is_empty() {
             return Ok(Vec::new());
         }
-        let vars = self.variables_for_element(instance_key, scope_eik);
         let mut events = Vec::new();
         for esp in esps {
             let kind = state::MessageSubscriptionKind::EventSubProcess {
@@ -98,7 +102,7 @@ impl Engine {
             };
             match &esp.trigger {
                 EventSubProcessTrigger::Timer(def) => {
-                    let (due_at, _) = self.resolve_timer(&vars, Some(def), self.now, 0)?;
+                    let (due_at, _) = self.resolve_timer(vars, Some(def), self.now, 0)?;
                     let timer_key = self.mint_key();
                     events.push(Event::TimerCreated {
                         timer_key,
@@ -116,9 +120,9 @@ impl Engine {
                     message_name,
                     correlation_key,
                 } => {
-                    let message_name = self.resolve_event_name(&vars, message_name)?;
+                    let message_name = self.resolve_event_name(vars, message_name)?;
                     let correlation_value =
-                        self.resolve_correlation_value(&vars, correlation_key)?;
+                        self.resolve_correlation_value(vars, correlation_key)?;
                     let subscription_key = self.mint_key();
                     let element_id = esp.start_id.clone();
                     events.push(
@@ -146,7 +150,7 @@ impl Engine {
                     );
                 }
                 EventSubProcessTrigger::Signal { signal_name } => {
-                    let signal_name = self.resolve_event_name(&vars, signal_name)?;
+                    let signal_name = self.resolve_event_name(vars, signal_name)?;
                     let subscription_key = self.mint_key();
                     events.push(Event::SignalSubscriptionCreated {
                         subscription_key,
@@ -276,6 +280,57 @@ impl Engine {
         events
     }
 
+    /// The event sub-process element ids (sorted, deduplicated) of every
+    /// still-armed event sub-process trigger of `instance_key`, across all four
+    /// trigger families. Migration rejects an instance with any (#1379).
+    pub(super) fn armed_event_subprocess_ids(&self, instance_key: Key) -> Vec<String> {
+        let esp_of = |k: &state::MessageSubscriptionKind| match k {
+            state::MessageSubscriptionKind::EventSubProcess { esp_element_id, .. } => {
+                Some(esp_element_id.clone())
+            }
+            _ => None,
+        };
+        let open = |st: state::MessageSubscriptionState| {
+            matches!(
+                st,
+                state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
+            )
+        };
+        let s = &self.state;
+        let mut ids: Vec<String> = s
+            .timers
+            .values()
+            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
+            .filter_map(|t| match &t.kind {
+                state::TimerKind::EventSubProcess { esp_element_id, .. } => {
+                    Some(esp_element_id.clone())
+                }
+                _ => None,
+            })
+            .chain(
+                s.message_subscriptions
+                    .values()
+                    .filter(|x| x.instance_key == instance_key && open(x.state))
+                    .filter_map(|x| esp_of(&x.kind)),
+            )
+            .chain(
+                s.signal_subscriptions
+                    .values()
+                    .filter(|x| x.instance_key == instance_key && open(x.state))
+                    .filter_map(|x| esp_of(&x.kind)),
+            )
+            .chain(
+                s.conditional_subscriptions
+                    .values()
+                    .filter(|x| x.instance_key == instance_key && open(x.state))
+                    .filter_map(|x| esp_of(&x.kind)),
+            )
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// Every element instance inside scope `scope_eik` of `instance_key`
     /// (transitively). For the process root (`0`) that is every live element
     /// instance — root children carry no `scopes` entry, so
@@ -324,6 +379,30 @@ impl Engine {
             // A still-queued activation inside a torn-down nested scope must
             // not recreate a token there (the per-drain dead-scope guard).
             self.torn_down_scopes.extend(members);
+            // The host scope itself survives (the event sub-process runs in
+            // it), so the dead-scope guard cannot reject work still queued
+            // *directly* in it — e.g. a non-interrupting sibling event
+            // sub-process triggered earlier in the same timer / conditional
+            // batch, or a token mid-flow on a host-level sequence flow. Purge
+            // those activations now (revoking any join arrival they already
+            // counted), so the interrupting handler runs alone in the scope.
+            let mut kept = VecDeque::with_capacity(queue.len());
+            while let Some(step) = queue.pop_front() {
+                let in_host = matches!(
+                    &step,
+                    Step::Activate { instance_key: ik, scope, .. }
+                    | Step::ActivateSeededJoin { instance_key: ik, scope, .. }
+                        if *ik == instance_key && *scope == scope_eik
+                );
+                if in_host {
+                    for event in self.revoke_dropped_join_arrival(&step) {
+                        self.emit(log, event);
+                    }
+                } else {
+                    kept.push_back(step);
+                }
+            }
+            *queue = kept;
         }
         queue.push_back(Step::Activate {
             instance_key,

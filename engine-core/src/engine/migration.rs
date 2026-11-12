@@ -443,10 +443,10 @@ impl Engine {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
                 continue;
             };
-            if matches!(
-                source.element(&source_id).map(|e| &e.kind),
-                Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
-            ) {
+            if source
+                .element(&source_id)
+                .is_some_and(|e| e.kind.owns_token_scope())
+            {
                 plan.migrated_flow_scopes.push(MigratedElementInstance {
                     element_instance_key: eik,
                     source_element_id: source_id.clone(),

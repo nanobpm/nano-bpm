@@ -3904,13 +3904,11 @@ impl Engine {
                             // still-drained sub-process and re-projects the
                             // now-fixed output mapping.
                             Some(state::IoMappingRedrive::Completion) => {
-                                if matches!(
-                                    self.element_kind(instance_key, &element_id),
-                                    Some(
-                                        ElementKind::SubProcess { .. }
-                                            | ElementKind::EventSubProcess { .. }
-                                    )
-                                ) {
+                                if self
+                                    .element_kind(instance_key, &element_id)
+                                    .as_ref()
+                                    .is_some_and(ElementKind::owns_token_scope)
+                                {
                                     // Re-driven by the drain sweep, not a step.
                                     None
                                 } else {
@@ -4400,13 +4398,21 @@ impl Engine {
                 // message model is unbuffered, so a dropped correlation does not
                 // re-correlate on resume — drop-on-suspend is the documented
                 // suspension semantics for messages.
-                let advance = matches!(
-                    self.state
-                        .message_subscriptions
-                        .get(&subscription_key)
-                        .map(|s| s.state),
-                    Some(state::MessageSubscriptionState::Opening)
-                ) && !self.instance_is_suspended(instance_key);
+                //
+                // A persistent subscription (non-interrupting boundary / event
+                // sub-process) never settles, so it instead dedupes on delivery
+                // identity: a `message_key` it already correlated is a
+                // redelivery and is ignored, while each distinct message still
+                // advances.
+                let advance = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| {
+                        s.state == state::MessageSubscriptionState::Opening
+                            && !s.correlated_message_keys.contains(&message_key)
+                    })
+                    && !self.instance_is_suspended(instance_key);
                 if advance {
                     // The continuation metadata the canonical (message-partition)
                     // record forwards can be stale: a migration re-points the
@@ -4919,6 +4925,25 @@ impl Engine {
                         element_id,
                         reason: "instances with compensation subscriptions or an \
                                  in-flight compensation are not migratable yet"
+                            .to_string(),
+                    });
+                }
+
+                // 4b. Event sub-process triggers (#1555) rest on their host
+                //     *scope* (`0` for the process root), not on an active
+                //     element, so the per-element catch-event reconciliation
+                //     below never sees them: a migration that removed an event
+                //     sub-process or changed its trigger would silently keep the
+                //     stale timer / subscription armed. Reject explicitly until
+                //     scope-owned trigger reconciliation lands (#1379) — never
+                //     drop or keep them silently.
+                if let Some(element_id) = self.armed_event_subprocess_ids(instance_key).first() {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id: element_id.clone(),
+                        reason: "instances with armed event sub-process triggers are not \
+                                 migratable yet (scope-owned trigger reconciliation is \
+                                 tracked in #1379)"
                             .to_string(),
                     });
                 }
@@ -5486,14 +5511,28 @@ impl Engine {
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
             let drain_from = log.len();
-            let followups = self.complete_drained_subprocesses(log);
-            queue.extend(followups);
             // Re-evaluate any conditional-event subscriptions whose condition may
             // now hold: those opened, or whose referenced variables changed, since
             // the last pass. A satisfied condition fires (advancing a catch token,
             // interrupting an activity, or spawning a non-interrupting token),
             // which enqueues more work — so this runs inside the same fixpoint loop.
+            //
+            // It runs BEFORE the drained-scope sweep: a scope whose inner flow
+            // has already drained is still live here, so a trigger it owns (a
+            // conditional event sub-process armed with the scope, #1555) gets its
+            // initial evaluation before the sweep completes the scope and
+            // disarms it. A fire enqueues work, which the loop drains before the
+            // sweep reconsiders the scope.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            let mut swept = false;
+            if queue.is_empty() {
+                let sweep_from = log.len();
+                let followups = self.complete_drained_subprocesses(log);
+                queue.extend(followups);
+                // The sweep's own events (a completed scope's output mappings)
+                // may satisfy a conditional: loop to re-evaluate them.
+                swept = log.len() > sweep_from;
+            }
             // Consult the driver on the events the drain sweep itself emitted
             // (a sub-process's own `ElementCompleted`, a conditional/boundary
             // firing) — these do not pass through `process_step`, so without this a
@@ -5507,7 +5546,7 @@ impl Engine {
                     return Some(Paused { queue, cursor });
                 }
             }
-            if !queue.is_empty() {
+            if !queue.is_empty() || swept {
                 continue;
             }
             // Token quiescence. Complete any instance whose tokens have all
@@ -5972,10 +6011,10 @@ impl Engine {
                 continue;
             };
             for (eik, element_id) in &instance.active {
-                let is_subprocess = matches!(
-                    process.definition.element(element_id).map(|e| &e.kind),
-                    Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
-                );
+                let is_subprocess = process
+                    .definition
+                    .element(element_id)
+                    .is_some_and(|e| e.kind.owns_token_scope());
                 if !is_subprocess {
                     continue;
                 }
@@ -7028,10 +7067,7 @@ impl Engine {
         // activation, BEFORE the input mappings run; a resolved input-mapping
         // incident re-runs only `activate_body`, which sees the scope already
         // registered and does not re-create it.
-        let is_sub_process = matches!(
-            kind,
-            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
-        );
+        let is_sub_process = kind.as_ref().is_some_and(ElementKind::owns_token_scope);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
         // #1437 (Zeebe parity): an element declaring execution listeners is a
@@ -7117,10 +7153,7 @@ impl Engine {
         // inner flow, not propagated to the parent, and dropped when the element
         // completes.
         let kind = self.element_kind(instance_key, &element_id);
-        let is_sub_process = matches!(
-            kind,
-            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
-        );
+        let is_sub_process = kind.as_ref().is_some_and(ElementKind::owns_token_scope);
         let is_call_activity = matches!(kind, Some(ElementKind::CallActivity { .. }));
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
@@ -7585,7 +7618,8 @@ impl Engine {
         // (#1555). (An event sub-process's own start event activates in the
         // event sub-process scope, never scope 0.)
         if scope == 0 && kind.as_ref().is_some_and(ElementKind::is_start_event) {
-            events.extend(self.arm_event_subprocesses(instance_key, 0, None)?);
+            let root_vars = self.variables_for_element(instance_key, 0);
+            events.extend(self.arm_event_subprocesses(instance_key, 0, None, &root_vars)?);
         }
 
         match kind {
@@ -7926,6 +7960,7 @@ impl Engine {
                     instance_key,
                     element_instance_key,
                     Some(&element_id),
+                    &element_vars,
                 )?);
                 followups.push(Step::Activate {
                     instance_key,
@@ -7943,6 +7978,7 @@ impl Engine {
                     instance_key,
                     element_instance_key,
                     Some(&element_id),
+                    &element_vars,
                 )?);
                 followups.push(Step::Activate {
                     instance_key,
@@ -8881,6 +8917,7 @@ impl Engine {
                     instance_key,
                     child_key,
                     Some(&element_id),
+                    child_vars,
                 )?);
                 followups.push(Step::Activate {
                     instance_key,

@@ -4352,11 +4352,8 @@ fn project_engine_state(
             nanobpmn_engine_core::MessageSubscriptionState::Open
                 | nanobpmn_engine_core::MessageSubscriptionState::Opening
         );
-        if open && sub.element_instance_key != 0 {
-            let non_interrupting = matches!(
-                sub.kind,
-                nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
-            );
+        if open && is_tracked_message_wait(sub.element_instance_key, &sub.kind) {
+            let non_interrupting = is_non_interrupting(&sub.kind);
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                  element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
@@ -4393,7 +4390,7 @@ fn project_event_waits_from_state(
     tx: &rusqlite::Transaction,
     state: &nanobpmn_engine_core::State,
 ) -> rusqlite::Result<()> {
-    use nanobpmn_engine_core::{MessageSubscriptionState, TimerKind, TimerState};
+    use nanobpmn_engine_core::{MessageSubscriptionState, TimerState};
     let open = |s: MessageSubscriptionState| {
         matches!(
             s,
@@ -4411,7 +4408,7 @@ fn project_event_waits_from_state(
                 &t.element_id,
                 "",
                 Some(t.due_at),
-                matches!(t.kind, TimerKind::NonInterruptingBoundary { .. }),
+                is_non_interrupting_timer(&t.kind),
             )?;
         }
     }
@@ -4458,10 +4455,38 @@ fn project_event_waits_from_state(
 /// persisted before that normalization existed, and when *seeding* from a
 /// pre-normalization snapshot in `project_engine_state`.
 fn is_non_interrupting(kind: &nanobpmn_engine_core::MessageSubscriptionKind) -> bool {
+    // Derived from the engine's own retention rule (a non-interrupting
+    // boundary or a non-interrupting event sub-process start stays open after
+    // it triggers), so the projection cannot drift from the engine (#1555).
+    kind.stays_open_after_trigger()
+}
+
+/// Whether a timer is non-interrupting (projected as such). Mirrors
+/// [`is_non_interrupting`] for the timer kinds.
+fn is_non_interrupting_timer(kind: &nanobpmn_engine_core::TimerKind) -> bool {
     matches!(
         kind,
-        nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+        nanobpmn_engine_core::TimerKind::NonInterruptingBoundary { .. }
+            | nanobpmn_engine_core::TimerKind::EventSubProcess {
+                interrupting: false,
+                ..
+            }
     )
+}
+
+/// Whether a message subscription is an instance wait state the read model
+/// tracks. Every engine message subscription belongs to a running instance;
+/// the only one resting on element instance `0` is a process-level event
+/// sub-process start (#1555), which rests on the process scope itself.
+fn is_tracked_message_wait(
+    element_instance_key: Key,
+    kind: &nanobpmn_engine_core::MessageSubscriptionKind,
+) -> bool {
+    element_instance_key != 0
+        || matches!(
+            kind,
+            nanobpmn_engine_core::MessageSubscriptionKind::EventSubProcess { .. }
+        )
 }
 
 /// Upserts one open timer / signal / conditional wait row — the single insert
@@ -4895,10 +4920,7 @@ fn project_event(
             element_id,
             "",
             Some(*due_at),
-            matches!(
-                kind,
-                nanobpmn_engine_core::TimerKind::NonInterruptingBoundary { .. }
-            ),
+            is_non_interrupting_timer(kind),
         )?,
         Event::SignalSubscriptionCreated {
             subscription_key,
@@ -4983,11 +5005,8 @@ fn project_event(
             correlation_key,
             kind,
         } => {
-            if *element_instance_key != 0 {
-                let non_interrupting = matches!(
-                    kind,
-                    nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                );
+            if is_tracked_message_wait(*element_instance_key, kind) {
+                let non_interrupting = is_non_interrupting(kind);
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                      element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
@@ -5038,9 +5057,12 @@ fn project_event(
             element_id,
             ..
         } => {
-            // Instance-scoped correlations (a running element instance parked on a
-            // catch) are the only ones the open read model tracks; mirror that.
-            if *element_instance_key != 0 {
+            // Only a subscription the open read model tracks (see
+            // `is_tracked_message_wait`) has an open row to recover the message
+            // name / key / flag from; the row lookup below is that check, so a
+            // process-level event sub-process wait (element instance `0`) is
+            // recorded too (#1555).
+            {
                 // Recover the message name / correlation key / interrupting flag
                 // from the open row. If the open row is absent (out-of-order replay
                 // or partial seeding), skip the history insert entirely rather than
@@ -13030,6 +13052,171 @@ mod element_instance_tests {
             jobs[&7001].read_set,
             vec!["a".to_string(), "c".to_string()],
             "a declaration-free re-activation preserves the last declared read-set"
+        );
+    }
+
+    #[test]
+    fn event_subprocess_message_waits_are_tracked_and_retained_per_interrupting_flag() {
+        // #1555: a process-level event sub-process subscription rests on the
+        // process scope (element instance 0) yet is a live wait; a
+        // non-interrupting one stays open after each correlation while an
+        // interrupting one settles.
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let esp = |interrupting| MessageSubscriptionKind::EventSubProcess {
+            esp_element_id: "esp".to_string(),
+            interrupting,
+        };
+        let created_sub = |key, interrupting| Event::MessageSubscriptionCreated {
+            subscription_key: key,
+            instance_key: INST,
+            element_instance_key: 0,
+            element_id: "esp_start".to_string(),
+            message_name: "Ping".to_string(),
+            correlation_key: "K1".to_string(),
+            kind: esp(interrupting),
+        };
+        let correlate = |key, message_key| Event::MessageCorrelated {
+            subscription_key: key,
+            message_key,
+            instance_key: INST,
+            element_instance_key: 0,
+            element_id: "esp_start".to_string(),
+        };
+        store
+            .export(&[&created_sub(5001, false), &created_sub(5002, true)])
+            .unwrap();
+        assert_eq!(
+            store.message_subscriptions().len(),
+            2,
+            "root ESP waits projected"
+        );
+        store
+            .export(&[
+                &correlate(5001, 21),
+                &correlate(5001, 22),
+                &correlate(5002, 23),
+            ])
+            .unwrap();
+        let open: Vec<_> = store
+            .message_subscriptions()
+            .into_iter()
+            .map(|s| s.subscription_key)
+            .collect();
+        assert_eq!(
+            open,
+            vec![5001],
+            "non-interrupting stays open, interrupting settles"
+        );
+        assert_eq!(
+            store.correlated_message_subscriptions().len(),
+            3,
+            "every correlation recorded in history"
+        );
+    }
+
+    #[test]
+    fn event_subprocess_waits_reseed_from_engine_state() {
+        // The #732 reseed must project the same ESP rows the event projector
+        // does: a root (element instance 0) message wait, and non-interrupting
+        // signal / conditional / timer waits flagged as such.
+        use nanobpmn_engine_core::{
+            ConditionalSubscription, MessageSubscription, MessageSubscriptionKind as SubKind,
+            MessageSubscriptionState as S, SignalSubscription, State, Timer, TimerKind, TimerState,
+        };
+        let ni = SubKind::EventSubProcess {
+            esp_element_id: "esp".into(),
+            interrupting: false,
+        };
+        let mut state = State::default();
+        state.message_subscriptions.insert(
+            1,
+            MessageSubscription {
+                key: 1,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                message_name: "Ping".into(),
+                correlation_key: "K1".into(),
+                state: S::Open,
+                kind: ni.clone(),
+                correlated_message_keys: Default::default(),
+            },
+        );
+        state.signal_subscriptions.insert(
+            2,
+            SignalSubscription {
+                key: 2,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                signal_name: "go".into(),
+                state: S::Open,
+                kind: ni.clone(),
+            },
+        );
+        state.conditional_subscriptions.insert(
+            3,
+            ConditionalSubscription {
+                key: 3,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                condition: "=x".into(),
+                referenced_vars: vec!["x".into()],
+                state: S::Open,
+                kind: ni,
+            },
+        );
+        state.timers.insert(
+            4,
+            Timer {
+                key: 4,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                due_at: 5_000,
+                state: TimerState::Created,
+                kind: TimerKind::EventSubProcess {
+                    esp_element_id: "esp".into(),
+                    interrupting: false,
+                },
+            },
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1, "root ESP message wait reseeded");
+        assert_eq!(
+            store.event_waits().len(),
+            3,
+            "ESP signal/conditional/timer waits reseeded"
+        );
+        // Reseeded as non-interrupting: firing the signal / condition keeps the
+        // wait open (the ESP can fire again).
+        store
+            .export(&[
+                &Event::SignalCorrelated {
+                    subscription_key: 2,
+                    signal_key: 90,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".into(),
+                },
+                &Event::ConditionalTriggered {
+                    subscription_key: 3,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            store.event_waits().len(),
+            3,
+            "non-interrupting ESP signal / conditional waits stay open"
         );
     }
 
