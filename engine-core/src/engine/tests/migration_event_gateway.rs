@@ -400,3 +400,97 @@ fn migration_race_check_treats_each_scope_as_its_own_race() {
     withdrawn.sort();
     assert_eq!(withdrawn, [(11, "t2".to_string()), (21, "t2".to_string())]);
 }
+
+/// Copilot #1564: a standalone catch mapped into a target race must not merge
+/// with a live source race landing on the same target gateway in its scope.
+#[test]
+fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
+    let source = ProcessBuilder::new("source")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .event_based_gateway("gwA")
+        .timer_intermediate_catch_event("a1", 5_000)
+        .timer_intermediate_catch_event("a2", 9_000)
+        .timer_intermediate_catch_event("s", 7_000)
+        .end_event("ea1")
+        .end_event("ea2")
+        .end_event("es")
+        .connect("start", "fork")
+        .connect("fork", "gwA")
+        .connect("fork", "s")
+        .connect("gwA", "a1")
+        .connect("gwA", "a2")
+        .connect("a1", "ea1")
+        .connect("a2", "ea2")
+        .connect("s", "es")
+        .build()
+        .unwrap();
+    let target = two_timer_race("target");
+    let mapped: HashMap<String, String> = pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
+    let active = vec![
+        (10, "a1".to_string()),
+        (11, "a2".to_string()),
+        (12, "s".to_string()),
+    ];
+    let err =
+        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |_| 1)
+            .unwrap_err();
+    assert!(
+        matches!(err, EngineError::UnsupportedMigration { .. }),
+        "{err:?}"
+    );
+}
+
+/// Copilot #1564: two gateways paused before arming (start listener) mapped
+/// onto one target gateway in one scope would arm one merged race.
+#[test]
+fn migration_race_check_rejects_paused_gateways_merged_onto_one_target() {
+    let source = two_races("source");
+    let target = two_timer_race("target");
+    let mapped: HashMap<String, String> =
+        pairs(&[("gwA", "gw"), ("gwB", "gw")]).into_iter().collect();
+    let active = vec![(10, "gwA".to_string()), (11, "gwB".to_string())];
+    let err =
+        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |_| 1)
+            .unwrap_err();
+    assert!(
+        matches!(err, EngineError::UnsupportedMigration { .. }),
+        "{err:?}"
+    );
+    // In separate scopes they are separate races.
+    Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |k| k)
+        .unwrap();
+}
+
+/// Copilot #1564: the migration fact reports a withdrawn member's
+/// subscription as deleted.
+#[test]
+fn migration_reports_withdrawn_member_subscription_deleted() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, race("source", "", "reply"));
+    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("orderId", Value::Str("o1".into()))]),
+    );
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("onTimer", "onTimer2"), ("onSig", "onSig2")]),
+        ))
+        .unwrap();
+    let subs = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceMigrated { subscriptions, .. } => Some(subscriptions),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        subs.iter().any(|s| s.element_id == "onMsg"
+            && s.action == crate::event::SubscriptionMigrationAction::Deleted),
+        "{subs:?}"
+    );
+}

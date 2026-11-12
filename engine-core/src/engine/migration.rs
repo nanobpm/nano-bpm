@@ -210,8 +210,29 @@ impl Engine {
                     .push((*eik, eid.as_str()));
             }
         }
-        // (scope, target gateway) -> the source gateway whose race claimed it.
-        let mut claimed: BTreeMap<(Key, String), &str> = BTreeMap::new();
+        // (scope, target gateway) -> the live origin that claimed it: a source
+        // race (its gateway id), a standalone catch, or a gateway paused before
+        // arming (its element id). Two origins in one scope must never land on
+        // one target race, or a win in either withdraws the other's catches.
+        let mut claimed: BTreeMap<(Key, String), String> = BTreeMap::new();
+        let claim = |claimed: &mut BTreeMap<(Key, String), String>,
+                     scope: Key,
+                     tg: String,
+                     origin: &str|
+         -> Result<(), EngineError> {
+            if let Some(other) = claimed.get(&(scope, tg.clone())) {
+                return Err(EngineError::UnsupportedMigration {
+                    instance_key,
+                    element_id: origin.to_string(),
+                    reason: format!(
+                        "`{other}` and `{origin}` in one scope would merge into the \
+                         single target event-based gateway race `{tg}`"
+                    ),
+                });
+            }
+            claimed.insert((scope, tg), origin.to_string());
+            Ok(())
+        };
         let mut withdraw = Vec::new();
         for ((scope, gateway), members) in races {
             let mapped_members: Vec<(&str, &String)> = members
@@ -254,16 +275,7 @@ impl Engine {
                 });
             }
             if let Some(tg) = target_gateway {
-                if let Some(other) = claimed.insert((scope, tg.clone()), gateway) {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id: gateway.to_string(),
-                        reason: format!(
-                            "event-based gateway races `{other}` and `{gateway}` in one \
-                             scope would merge into the single target race `{tg}`"
-                        ),
-                    });
-                }
+                claim(&mut claimed, scope, tg, gateway)?;
             }
             withdraw.extend(
                 members
@@ -271,6 +283,33 @@ impl Engine {
                     .filter(|(_, eid)| !mapped.contains_key(*eid))
                     .map(|(k, eid)| (*k, eid.to_string())),
             );
+        }
+        // Live origins outside any source race that still land in a target
+        // race: a gateway paused before arming its catches (start listener /
+        // incident) mapped onto a target gateway, or a standalone catch mapped
+        // onto a target race member.
+        for (eik, eid) in active {
+            if event_gateway_race_owner(source, eid).is_some() {
+                continue;
+            }
+            let Some(tgt) = mapped.get(eid) else {
+                continue;
+            };
+            let source_is_gateway = matches!(
+                source.element(eid).map(|e| &e.kind),
+                Some(ElementKind::EventBasedGateway)
+            );
+            let tg = if source_is_gateway {
+                target
+                    .element(tgt)
+                    .filter(|e| matches!(e.kind, ElementKind::EventBasedGateway))
+                    .map(|e| e.id.clone())
+            } else {
+                event_gateway_race_owner(target, tgt).map(|o| o.id.clone())
+            };
+            if let Some(tg) = tg {
+                claim(&mut claimed, scope_of(*eik), tg, eid)?;
+            }
         }
         Ok(withdraw)
     }
@@ -546,6 +585,19 @@ impl Engine {
         let not_armable = self.hosts_not_armable_now(&hosts);
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
+                // An unmapped host still active here is a withdrawn race member
+                // (#1554; every other unmapped host was rejected): its withdrawal
+                // cancels the triggers, the migration fact reports them deleted.
+                for armed in armed_by_host.remove(&eik).unwrap_or_default() {
+                    if let Some(trigger) = armed.report {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: eik,
+                            element_id: armed.catch_id,
+                            action: SubscriptionMigrationAction::Deleted,
+                            trigger,
+                        });
+                    }
+                }
                 continue;
             };
             if matches!(
