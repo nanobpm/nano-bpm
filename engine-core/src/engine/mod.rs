@@ -4877,6 +4877,7 @@ impl Engine {
                     &target.definition,
                     &mapped,
                     &active_elements,
+                    |eik| self.scope_of(instance_key, eik),
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
@@ -12937,7 +12938,9 @@ impl Engine {
         eik: Key,
         eid: String,
     ) -> Vec<Event> {
-        let mut events = Vec::new();
+        // A catch parked on a start-listener job or an activation incident
+        // carries that work on its root: cancel/resolve it too (#1554).
+        let mut events = self.boundary_root_teardown_events(instance_key, eik);
         events.extend(self.cancel_all_timers_on(eik));
         events.extend(self.cancel_all_subscriptions_on(eik));
         events.extend(self.cancel_all_signal_subscriptions_on(eik));

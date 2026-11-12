@@ -184,6 +184,14 @@ impl Engine {
     ///   sibling is mapped; a race with no mapped member is left for the
     ///   unmapped-active-element rejection.
     ///
+    /// A race is identified by its owning gateway **and** its token scope
+    /// (`scope_of`), exactly as the runtime withdrawal scopes a race, so two
+    /// live subprocess scopes resting at the same gateway are two races. Two
+    /// distinct source races in one scope must not land on the same target
+    /// gateway: the runtime would then treat them as one race and a win in
+    /// either would withdraw the other's catches
+    /// ([`EngineError::UnsupportedMigration`]).
+    ///
     /// Returns the active `(element instance key, element id)`s to withdraw.
     pub(crate) fn check_migrated_event_gateway_races(
         instance_key: Key,
@@ -191,18 +199,21 @@ impl Engine {
         target: &ProcessDefinition,
         mapped: &HashMap<String, String>,
         active: &[(Key, String)],
+        scope_of: impl Fn(Key) -> Key,
     ) -> Result<Vec<(Key, String)>, EngineError> {
-        let mut races: BTreeMap<&str, Vec<(Key, &str)>> = BTreeMap::new();
+        let mut races: BTreeMap<(Key, &str), Vec<(Key, &str)>> = BTreeMap::new();
         for (eik, eid) in active {
             if let Some(owner) = event_gateway_race_owner(source, eid) {
                 races
-                    .entry(owner.id.as_str())
+                    .entry((scope_of(*eik), owner.id.as_str()))
                     .or_default()
                     .push((*eik, eid.as_str()));
             }
         }
+        // (scope, target gateway) -> the source gateway whose race claimed it.
+        let mut claimed: BTreeMap<(Key, String), &str> = BTreeMap::new();
         let mut withdraw = Vec::new();
-        for (gateway, members) in races {
+        for ((scope, gateway), members) in races {
             let mapped_members: Vec<(&str, &String)> = members
                 .iter()
                 .filter_map(|(_, eid)| mapped.get(*eid).map(|t| (*eid, t)))
@@ -241,6 +252,18 @@ impl Engine {
                     target_catch_event_id: tgt.to_string(),
                     source_catch_event_ids: sources,
                 });
+            }
+            if let Some(tg) = target_gateway {
+                if let Some(other) = claimed.insert((scope, tg.clone()), gateway) {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id: gateway.to_string(),
+                        reason: format!(
+                            "event-based gateway races `{other}` and `{gateway}` in one \
+                             scope would merge into the single target race `{tg}`"
+                        ),
+                    });
+                }
             }
             withdraw.extend(
                 members

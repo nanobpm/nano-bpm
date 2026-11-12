@@ -11,6 +11,10 @@ fn pairs(p: &[(&str, &str)]) -> Vec<(String, String)> {
 /// A gateway racing a timer, a message and a signal catch. `sfx` suffixes
 /// every element id so source and target ids differ.
 fn race(id: &str, sfx: &str, msg: &str) -> ProcessDefinition {
+    race_builder(id, sfx, msg).build().unwrap()
+}
+
+fn race_builder(id: &str, sfx: &str, msg: &str) -> ProcessBuilder {
     let e = |n: &str| format!("{n}{sfx}");
     ProcessBuilder::new(id)
         .start_event("start")
@@ -28,8 +32,6 @@ fn race(id: &str, sfx: &str, msg: &str) -> ProcessDefinition {
         .connect(e("onTimer"), e("endTimer"))
         .connect(e("onMsg"), e("endMsg"))
         .connect(e("onSig"), e("endSig"))
-        .build()
-        .unwrap()
 }
 
 fn full_mapping() -> Vec<(String, String)> {
@@ -266,4 +268,135 @@ fn migration_rejects_race_members_split_across_target_gateways() {
         matches!(err, EngineError::MigrationCatchEventDetached { .. }),
         "{err:?}"
     );
+}
+
+/// Copilot #1564: a withdrawn race member parked on its start-listener job
+/// must have that job cancelled, not left live on the completed catch.
+#[test]
+fn migration_withdrawal_cancels_a_parked_start_listener_job() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        race_builder("source", "", "reply")
+            .with_listeners(
+                "onMsg",
+                vec![el(ListenerEventType::Start, "audit")],
+                Vec::new(),
+            )
+            .build()
+            .unwrap(),
+    );
+    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("orderId", Value::Str("o1".into()))]),
+    );
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("onTimer", "onTimer2"), ("onSig", "onSig2")]),
+        ))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::JobCanceled { .. })),
+        "the parked listener job is cancelled"
+    );
+    assert!(engine.activate_jobs("audit", "W", 10, 1_000, 0).is_empty());
+    let events = engine.broadcast_signal("go", HashMap::new(), 0);
+    assert_completed_via(&engine, inst, &events, "endSig2");
+}
+
+/// start -> fork -> {gwA -> a1|a2, gwB -> b1|b2}: two independent races.
+fn two_races(id: &str) -> ProcessDefinition {
+    ProcessBuilder::new(id)
+        .start_event("start")
+        .parallel_gateway("fork")
+        .event_based_gateway("gwA")
+        .event_based_gateway("gwB")
+        .timer_intermediate_catch_event("a1", 5_000)
+        .timer_intermediate_catch_event("a2", 9_000)
+        .timer_intermediate_catch_event("b1", 5_000)
+        .timer_intermediate_catch_event("b2", 9_000)
+        .end_event("ea1")
+        .end_event("ea2")
+        .end_event("eb1")
+        .end_event("eb2")
+        .connect("start", "fork")
+        .connect("fork", "gwA")
+        .connect("fork", "gwB")
+        .connect("gwA", "a1")
+        .connect("gwA", "a2")
+        .connect("gwB", "b1")
+        .connect("gwB", "b2")
+        .connect("a1", "ea1")
+        .connect("a2", "ea2")
+        .connect("b1", "eb1")
+        .connect("b2", "eb2")
+        .build()
+        .unwrap()
+}
+
+/// Copilot #1564: two independent source races in one scope must not collapse
+/// onto one target gateway, or a win in one would withdraw the other.
+#[test]
+fn migration_rejects_two_source_races_merged_onto_one_target_gateway() {
+    let target = ProcessBuilder::new("target")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .timer_intermediate_catch_event("x1", 5_000)
+        .timer_intermediate_catch_event("x2", 9_000)
+        .end_event("e1")
+        .end_event("e2")
+        .connect("start", "gw")
+        .connect("gw", "x1")
+        .connect("gw", "x2")
+        .connect("x1", "e1")
+        .connect("x2", "e2")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, two_races("source"));
+    let target_key = deploy_for_migration(&mut engine, target);
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a1", "x1"), ("b1", "x2")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::UnsupportedMigration { .. }),
+        "{err:?}"
+    );
+    assert_eq!(engine.instance(inst).unwrap().process_id, "source");
+}
+
+/// Copilot #1564: the same race live in two token scopes (as a race inside
+/// two live sub-process scopes would be) is two races, so a one-to-one mapping
+/// must not be mistaken for a merge, and each scope's unmapped member is
+/// withdrawn. Driven through the race check directly: no migratable process
+/// shape yet holds one gateway live in two scopes.
+#[test]
+fn migration_race_check_treats_each_scope_as_its_own_race() {
+    let source = two_timer_race("source");
+    let target = two_timer_race("target");
+    let mapped: HashMap<String, String> = pairs(&[("t1", "t1")]).into_iter().collect();
+    let active = vec![
+        (10, "t1".to_string()),
+        (11, "t2".to_string()),
+        (20, "t1".to_string()),
+        (21, "t2".to_string()),
+    ];
+    let mut withdrawn =
+        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |eik| {
+            eik / 10
+        })
+        .unwrap();
+    withdrawn.sort();
+    assert_eq!(withdrawn, [(11, "t2".to_string()), (21, "t2".to_string())]);
 }
