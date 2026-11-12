@@ -62,6 +62,9 @@ impl Engine {
         call_eiks: &std::collections::HashSet<Key>,
     ) -> std::collections::HashMap<Key, Key> {
         let mut out = std::collections::HashMap::new();
+        if call_eiks.is_empty() {
+            return out;
+        }
         for (parent, child) in self.live_call_activity_children() {
             if call_eiks.contains(&parent) {
                 out.entry(parent)
