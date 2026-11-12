@@ -74,7 +74,13 @@ test("simulation trace: an unfinished job headlines elapsed steps, not wall cloc
       job_key: "100",
       job_type: "t",
     },
-    { seq: 5, type: "JobActivated", instance_key: "1", job_key: "100", worker: "w" },
+    {
+      seq: 5,
+      type: "JobActivated",
+      instance_key: "1",
+      job_key: "100",
+      worker: "w",
+    },
   ] as unknown as WasmEvent[];
   const trace = foldSimTrace(events, "1", "p");
   const html = renderToStaticMarkup(
@@ -99,11 +105,25 @@ test("simulation trace: a later event advances the elapsed step headline", () =>
       job_key: "100",
       job_type: "t",
     },
-    { seq: 5, type: "JobActivated", instance_key: "1", job_key: "100", worker: "w" },
-    { seq: 9, type: "ElementActivated", instance_key: "1", element_instance_key: "11", element_id: "next" },
+    {
+      seq: 5,
+      type: "JobActivated",
+      instance_key: "1",
+      job_key: "100",
+      worker: "w",
+    },
+    {
+      seq: 9,
+      type: "ElementActivated",
+      instance_key: "1",
+      element_instance_key: "11",
+      element_id: "next",
+    },
   ] as unknown as WasmEvent[];
   const trace = foldSimTrace(events, "1", "p");
-  const html = renderToStaticMarkup(createElement(TraceTimeline, { trace, fmt: stepFmt }));
+  const html = renderToStaticMarkup(
+    createElement(TraceTimeline, { trace, fmt: stepFmt }),
+  );
   // now = last folded step (9); activated at 5 → 4 steps elapsed.
   assert.match(html, /4 steps …/);
 });
@@ -115,9 +135,65 @@ test("production trace: a canceled job in an ENDED trace stops at the trace end"
     outcome: "terminated",
     elements: [runningJobElement(0, 500)],
   });
-  const html = renderToStaticMarkup(createElement(TraceTimeline, { trace, fmt: msFmt }));
+  const html = renderToStaticMarkup(
+    createElement(TraceTimeline, { trace, fmt: msFmt }),
+  );
   // endedAt (2_500) − activatedAt (500) = 2.00 s, and NOT a count-up to
   // Date.now() (which would be minutes/hours and still carry the running "…").
   assert.match(html, /2\.00 s/);
   assert.doesNotMatch(html, /2\.00 s …/);
+});
+
+test("simulation trace: an event that moves no endpoint (JobFailed) still advances the step clock", () => {
+  const events: WasmEvent[] = [
+    { seq: 1, type: "ProcessInstanceCreated", instance_key: "1" },
+    {
+      seq: 2,
+      type: "JobCreated",
+      instance_key: "1",
+      element_instance_key: "10",
+      element_id: "task",
+      job_key: "100",
+      job_type: "t",
+    },
+    {
+      seq: 5,
+      type: "JobActivated",
+      instance_key: "1",
+      job_key: "100",
+      worker: "w",
+    },
+    { seq: 9, type: "JobFailed", instance_key: "1", job_key: "100" },
+  ] as unknown as WasmEvent[];
+  const trace = foldSimTrace(events, "1", "p");
+  const html = renderToStaticMarkup(
+    createElement(TraceTimeline, { trace, fmt: stepFmt }),
+  );
+  assert.match(html, /4 steps …/);
+});
+
+test("production trace: a job canceled by an interrupting boundary stops at the element exit", () => {
+  const canceled = { ...runningJobElement(0, 500), exitedAt: 1_500 };
+  const other = {
+    ...runningJobElement(1_500, 1_600),
+    elementId: "next",
+    elementInstanceKey: "11",
+  };
+  // Instance still active: the canceled row must not count up to now.
+  const active = baseTrace({ elements: [canceled, other] });
+  const html = renderToStaticMarkup(
+    createElement(TraceTimeline, { trace: active, fmt: msFmt }),
+  );
+  assert.match(html, /1\.00 s/);
+  assert.doesNotMatch(html, /1\.00 s …/);
+  // Ended later: still measures to its own exit, not the trace end.
+  const ended = baseTrace({
+    endedAt: 9_000,
+    outcome: "completed",
+    elements: [canceled, other],
+  });
+  const html2 = renderToStaticMarkup(
+    createElement(TraceTimeline, { trace: ended, fmt: msFmt }),
+  );
+  assert.match(html2, /1\.00 s/);
 });

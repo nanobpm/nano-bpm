@@ -38,6 +38,7 @@ export function foldSimTrace(
   const path: string[] = [];
 
   let startedAt = 0;
+  let lastSeq = 0;
   let endedAt: number | null = null;
   let outcome: TraceOutcome = "active";
 
@@ -63,6 +64,7 @@ export function foldSimTrace(
   for (const e of events) {
     if (s(e.instance_key) !== instanceKey) continue;
     const at = e.seq;
+    lastSeq = Math.max(lastSeq, at);
     switch (e.type) {
       case "ProcessInstanceCreated":
         startedAt = at;
@@ -165,7 +167,7 @@ export function foldSimTrace(
     }
   }
 
-  return {
+  const trace: InstanceTrace = {
     instanceKey,
     processId,
     version: null,
@@ -179,7 +181,15 @@ export function foldSimTrace(
     incidents,
     path,
   };
+  LAST_STEP.set(trace, Math.max(lastSeq, startedAt));
+  return trace;
 }
+
+/// The latest folded event sequence per simulation trace. Every event (even
+/// one that moves no element/job endpoint, e.g. `JobFailed`) advances the
+/// simulation clock, so it is recorded at fold time rather than reconstructed
+/// from endpoints.
+const LAST_STEP = new WeakMap<InstanceTrace, number>();
 
 /// Step formatter for the simulation timeline: logical steps, not milliseconds.
 /// `now` is the trace's current step (its last event's sequence index), so an
@@ -195,19 +205,7 @@ export const stepFmt = {
   now: (trace: InstanceTrace): number => trace.endedAt ?? lastStep(trace),
 };
 
-/// The current simulation step: the highest timestamp the trace has folded.
+/// The current simulation step: the latest folded event's sequence index.
 function lastStep(trace: InstanceTrace): number {
-  let max = trace.startedAt;
-  for (const el of trace.elements) {
-    max = Math.max(max, el.enteredAt, el.exitedAt ?? el.enteredAt);
-    if (el.job) {
-      max = Math.max(
-        max,
-        el.job.createdAt,
-        el.job.activatedAt ?? el.job.createdAt,
-        el.job.completedAt ?? el.job.createdAt,
-      );
-    }
-  }
-  return max;
+  return LAST_STEP.get(trace) ?? trace.startedAt;
 }

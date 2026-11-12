@@ -49,6 +49,8 @@ export interface HeadlineJob {
 /** The structural subset of `TraceElement` the headline needs. */
 export interface HeadlineElement {
   durationMs: number | null;
+  /** When the element exited (completed or was terminated), if it has. */
+  exitedAt?: number | null;
   job?: HeadlineJob | null;
 }
 
@@ -107,9 +109,13 @@ export function headlineDuration(
   const queueNote = queueMs != null ? ` · queue ${fmt(queueMs)}` : "";
   if (job.completedAt == null) {
     const since = job.activatedAt ?? job.createdAt;
-    if (traceEndedAt != null) {
-      // Ended trace (canceled job): stop at the trace end, never count to now.
-      const ms = Math.max(0, traceEndedAt - since);
+    // A job left unfinished whose element EXITED (e.g. canceled by an
+    // interrupting boundary while the instance continues) stops at the
+    // element's exit; otherwise, if the trace ended, at the trace end. Only a
+    // job whose element is still live counts up to `now`.
+    const stopAt = el.exitedAt ?? traceEndedAt;
+    if (stopAt != null) {
+      const ms = Math.max(0, stopAt - since);
       const label = fmt(ms);
       const what =
         job.activatedAt != null ? "ended" : "ended (not yet activated)";

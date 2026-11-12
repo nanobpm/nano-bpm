@@ -83,7 +83,10 @@ export function TraceTimeline({
   // notifications, not a timer). An ended trace's rows are frozen, so no tick.
   const anyRunning =
     trace.endedAt == null &&
-    trace.elements.some((el) => el.job != null && el.job.completedAt == null);
+    trace.elements.some(
+      (el) =>
+        el.job != null && el.job.completedAt == null && el.exitedAt == null,
+    );
   const ticking = fmt.now == null && fmt.tickWhenRunning === true && anyRunning;
   const [tick, setTick] = useState(0);
   useEffect(() => {
