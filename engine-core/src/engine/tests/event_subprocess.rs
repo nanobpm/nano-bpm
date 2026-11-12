@@ -204,3 +204,75 @@ fn bpmn_sequence_flow_into_or_out_of_event_subprocess_is_rejected() {
         assert!(err.contains("event sub-process esp"), "{extra}: {err}");
     }
 }
+
+#[test]
+fn flow_from_outside_into_event_subprocess_child_is_rejected() {
+    assert_esp_rejected(
+        esp_builder(signal(), true).connect("s", "esp_end"),
+        "crosses",
+    );
+}
+
+#[test]
+fn flow_from_event_subprocess_child_to_outside_is_rejected() {
+    assert_esp_rejected(
+        esp_builder(signal(), true).connect("esp_start", "e"),
+        "crosses",
+    );
+}
+
+#[test]
+fn flow_into_nested_descendant_of_event_subprocess_is_rejected() {
+    let b = esp_builder(signal(), true)
+        .sub_process("inner", "inner_start")
+        .start_event("inner_start")
+        .end_event("inner_end")
+        .connect("inner_start", "inner_end")
+        .contained_in("inner", "esp")
+        .contained_in("inner_start", "inner")
+        .contained_in("inner_end", "inner")
+        .connect("s", "inner_end");
+    assert_esp_rejected(b, "crosses");
+    let b = esp_builder(signal(), true)
+        .sub_process("inner", "inner_start")
+        .start_event("inner_start")
+        .end_event("inner_end")
+        .connect("inner_start", "inner_end")
+        .contained_in("inner", "esp")
+        .contained_in("inner_start", "inner")
+        .contained_in("inner_end", "inner")
+        .connect("inner_end", "e");
+    assert_esp_rejected(b, "crosses");
+}
+
+#[test]
+fn second_start_event_in_event_subprocess_is_rejected() {
+    let b = esp_builder(signal(), true)
+        .start_event("esp_start2")
+        .contained_in("esp_start2", "esp");
+    assert_esp_rejected(b, "exactly one start event");
+}
+
+#[test]
+fn typed_start_event_in_event_subprocess_is_rejected() {
+    let b = crate::model::ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .event_sub_process("esp", "esp_start", signal(), true)
+        .message_start_event("esp_start", "other")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_end", "esp");
+    assert_esp_rejected(b, "plain start event");
+}
+
+#[test]
+fn bpmn_message_event_subprocess_start_is_a_plain_start_event() {
+    let def = crate::bpmn::parse_bpmn(&esp_message_xml()).unwrap();
+    assert!(matches!(
+        def[0].elements["esp_start"].kind,
+        crate::model::ElementKind::StartEvent
+    ));
+}

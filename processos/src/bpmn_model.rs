@@ -5589,6 +5589,45 @@ mod tests {
     }
 
     #[test]
+    fn definition_to_xml_round_trips_message_and_timer_esp_elements_exactly() {
+        // The start's event definition is derived from the container trigger;
+        // every ESP element (container + start) must survive XML -> model
+        // unchanged, for each trigger kind whose start used to be typed.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, TimerDef, TimerDefKind};
+        for trigger in [
+            EventSubProcessTrigger::Message {
+                message_name: "ping".to_string(),
+                correlation_key: "= key".to_string(),
+            },
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "PT5M".to_string(),
+            }),
+        ] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process("Esp", "EspStart", trigger, false)
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+            for id in ["Esp", "EspStart", "EspEnd"] {
+                let (a, b) = (&def.elements[id], &reparsed[0].elements[id]);
+                assert_eq!(a.kind, b.kind, "{id} kind preserved:\n{xml}");
+                assert_eq!(a.parent, b.parent, "{id} parent preserved");
+                assert_eq!(a.timer, b.timer, "{id} timer preserved");
+            }
+        }
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_a_gateway_default_flow() {
         // The original motivating bug: a gateway `default` fallback was DROPPED by the serializer
         // (no `default="…"` attribute emitted), so an authored default flow silently degraded to a

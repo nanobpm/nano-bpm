@@ -3140,14 +3140,58 @@ pub(crate) fn validate_event_subprocesses(
                 )))
             }
             Some(start)
-                if !start.kind.is_start_event()
+                if !matches!(start.kind, ElementKind::StartEvent)
                     || start.parent.as_deref() != Some(esp.id.as_str()) =>
             {
                 return Err(invalid(format!(
-                    "start event {start_event} must be a start event directly contained in the event sub-process"
+                    "start event {start_event} must be a plain start event directly contained in the event sub-process (the trigger lives on the container)"
                 )))
             }
             Some(_) => {}
+        }
+        let mut extra: Vec<&ElementId> = elements
+            .values()
+            .filter(|e| {
+                e.kind.is_start_event()
+                    && e.parent.as_deref() == Some(esp.id.as_str())
+                    && &e.id != start_event
+            })
+            .map(|e| &e.id)
+            .collect();
+        extra.sort();
+        if let Some(other) = extra.first() {
+            return Err(invalid(format!(
+                "must have exactly one start event, found additional start event {other}"
+            )));
+        }
+        // No sequence flow may cross the containment boundary (in either
+        // direction, including from/to nested descendants): the inner work is
+        // entered only through the trigger.
+        let inside = |id: &str| -> bool {
+            let mut cur = elements.get(id).and_then(|e| e.parent.as_deref());
+            let mut hops = 0usize;
+            while let Some(p) = cur {
+                if p == esp.id.as_str() {
+                    return true;
+                }
+                hops += 1;
+                if hops > elements.len() {
+                    return false;
+                }
+                cur = elements.get(p).and_then(|e| e.parent.as_deref());
+            }
+            false
+        };
+        let mut crossing: Vec<(&ElementId, &ElementId)> = elements
+            .values()
+            .flat_map(|e| e.outgoing.iter().map(move |f| (&e.id, &f.to)))
+            .filter(|(from, to)| inside(from) != inside(to))
+            .collect();
+        crossing.sort();
+        if let Some((from, to)) = crossing.first() {
+            return Err(invalid(format!(
+                "sequence flow {from} -> {to} crosses the event sub-process boundary"
+            )));
         }
         if matches!(trigger, EventSubProcessTrigger::Error { .. }) && !interrupting {
             return Err(invalid(

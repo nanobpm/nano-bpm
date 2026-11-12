@@ -1616,8 +1616,17 @@ impl ProcessAcc {
                 NodeKind::Start => {
                     // A messageRef makes it a message start; a timer_repeating
                     // flag makes it a timer start (cycle or one-shot); otherwise
-                    // a plain none start event.
-                    if let Some(message_ref) = node.message_ref {
+                    // a plain none start event. A start event nested in an
+                    // event sub-process is always a plain `StartEvent`: its
+                    // trigger lives on the container (`EventSubProcessTrigger`),
+                    // the single source of truth the emitter derives the start's
+                    // event definition from, so the start kind round-trips.
+                    if parent
+                        .as_deref()
+                        .is_some_and(|p| event_subprocess_ids.contains(p))
+                    {
+                        builder.start_event(node.id)
+                    } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
                             ParseError::InvalidMessageEvent {
                                 process_id: self.id.clone(),
