@@ -19557,7 +19557,11 @@ impl ServerImpl {
                 journal.maybe_var_spill_pressure();
                 journal.maybe_cold_spill();
                 let state = journal.engine().state();
-                let timers_due = state.timers.values().any(|t| t.due_at <= now);
+                // Hot ∪ cold (#1483): a cold-spilled instance's armed timer is
+                // invisible in `state.timers`, and `TriggerTimers` is the only
+                // path that rehydrates it — gating on hot timers alone never
+                // proposes the command, so those timers never fire.
+                let timers_due = journal.has_due_timers(now);
                 // Only `Activated` jobs hold a lease deadline, and `ExpireJobs`
                 // reclaims exactly that set (it iterates `activated_jobs`). Gate on
                 // the same index rather than scanning every job: this pre-check runs
@@ -39506,11 +39510,9 @@ mod clustered_startup_tests {
                 tally.created += 1;
             }
         }
-        // Fire the timers while their instances are still hot. (The Raft tick's
-        // pre-check only sees HOT timers, so a timer whose instance is cold on
-        // the leader is never proposed — a liveness defect tracked in #1483;
-        // it cannot cause replica divergence because nothing is
-        // proposed.)
+        // Fire the timers while their instances are still hot. (The cold-on-
+        // the-leader tick path is exercised separately by
+        // `raft_tick_fires_timers_of_cold_spilled_instances` — #1483.)
         let far_future = now_millis() + 600_000;
         parity_tick(nodes, far_future).await;
         // Create/tick acks are leader-durable: they do NOT wait for the
@@ -39716,6 +39718,44 @@ mod clustered_startup_tests {
         assert!(
             active < tally.created,
             "the parity comparison covers completed instances too"
+        );
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #1483 guard: the Raft tick pre-check must see a timer whose instance is
+    /// COLD on the leader. Spilling before the tick used to leave the hot-only
+    /// gate blind, so `TriggerTimers` was never proposed and the timer never
+    /// fired (`do-timed` jobs never created). Now the hot ∪ cold probe proposes
+    /// the tick, which rehydrates the instance and fires the timer on every
+    /// replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raft_tick_fires_timers_of_cold_spilled_instances() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        for node in nodes {
+            node.create_for_stream(Some("timed".into()), None, Default::default())
+                .await
+                .expect("timed create acks");
+        }
+        // Spill BEFORE the tick: every timed instance is cold on every replica,
+        // so the leader's pre-check sees no hot timer at all.
+        let spill = parity_force_spill(nodes).await;
+        assert!(
+            spill.cold >= 3,
+            "every timed instance spilled (cold={}, var={})",
+            spill.cold,
+            spill.var
+        );
+        let far_future = now_millis() + 600_000;
+        parity_tick(nodes, far_future).await;
+        parity_barrier(nodes).await;
+        let mut timed_completed = 0;
+        for node in nodes {
+            timed_completed += parity_activate_complete(node, "do-timed", 3).await;
+        }
+        assert_eq!(
+            timed_completed, 3,
+            "the tick fired the cold-spilled timers, so every do-timed job completes"
         );
         parity_shutdown(nodes, handles).await;
     }
