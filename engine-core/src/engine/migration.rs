@@ -167,6 +167,91 @@ impl Engine {
         Ok(())
     }
 
+    /// Event-based gateway race preconditions (#1554, Zeebe migrates an active
+    /// event-based gateway together with its armed catch events). The engine
+    /// models the gateway as a pass-through whose catch events are each an
+    /// active element instance, so a resting race is a set of active catch
+    /// events sharing one owning gateway ([`event_gateway_race_owner`] — the
+    /// same race definition the runtime withdrawal uses). Per source race:
+    ///
+    /// * every mapped member must be a race member of one target event-based
+    ///   gateway — the mapped target of the source gateway when that is mapped
+    ///   — otherwise [`EngineError::MigrationCatchEventDetached`];
+    /// * no two members may map onto the same target catch event
+    ///   ([`EngineError::MigrationCatchEventsMerged`]);
+    /// * an unmapped member is withdrawn (its subscriptions deleted, as Zeebe
+    ///   deletes an unmapped catch event's subscription) provided at least one
+    ///   sibling is mapped; a race with no mapped member is left for the
+    ///   unmapped-active-element rejection.
+    ///
+    /// Returns the active `(element instance key, element id)`s to withdraw.
+    pub(crate) fn check_migrated_event_gateway_races(
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &HashMap<String, String>,
+        active: &[(Key, String)],
+    ) -> Result<Vec<(Key, String)>, EngineError> {
+        let mut races: BTreeMap<&str, Vec<(Key, &str)>> = BTreeMap::new();
+        for (eik, eid) in active {
+            if let Some(owner) = event_gateway_race_owner(source, eid) {
+                races
+                    .entry(owner.id.as_str())
+                    .or_default()
+                    .push((*eik, eid.as_str()));
+            }
+        }
+        let mut withdraw = Vec::new();
+        for (gateway, members) in races {
+            let mapped_members: Vec<(&str, &String)> = members
+                .iter()
+                .filter_map(|(_, eid)| mapped.get(*eid).map(|t| (*eid, t)))
+                .collect();
+            let Some((_, first_target)) = mapped_members.first() else {
+                continue;
+            };
+            let target_gateway = mapped
+                .get(gateway)
+                .cloned()
+                .or_else(|| event_gateway_race_owner(target, first_target).map(|o| o.id.clone()));
+            let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (src, tgt) in &mapped_members {
+                let owner = event_gateway_race_owner(target, tgt).map(|o| o.id.as_str());
+                if owner.is_none() || owner != target_gateway.as_deref() {
+                    return Err(EngineError::MigrationCatchEventDetached {
+                        instance_key,
+                        element_id: gateway.to_string(),
+                        target_element_id: target_gateway
+                            .clone()
+                            .unwrap_or_else(|| gateway.to_string()),
+                        catch_event_id: src.to_string(),
+                        target_catch_event_id: tgt.to_string(),
+                    });
+                }
+                by_target
+                    .entry(tgt.as_str())
+                    .or_default()
+                    .push(src.to_string());
+            }
+            if let Some((tgt, mut sources)) = by_target.into_iter().find(|(_, s)| s.len() > 1) {
+                sources.sort();
+                return Err(EngineError::MigrationCatchEventsMerged {
+                    instance_key,
+                    element_id: gateway.to_string(),
+                    target_catch_event_id: tgt.to_string(),
+                    source_catch_event_ids: sources,
+                });
+            }
+            withdraw.extend(
+                members
+                    .iter()
+                    .filter(|(_, eid)| !mapped.contains_key(*eid))
+                    .map(|(k, eid)| (*k, eid.to_string())),
+            );
+        }
+        Ok(withdraw)
+    }
+
     /// Every armed trigger resting on any of `hosts` (element-instance key ->
     /// host element id), grouped by host and sorted by key. One pass over each
     /// partition-wide trigger table per migration, not one per active element.

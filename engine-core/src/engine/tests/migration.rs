@@ -1043,7 +1043,10 @@ fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
             "{kind:?} is migratable"
         );
     }
-    assert!(unsupported_migration_reason(&ElementKind::EventBasedGateway).is_some());
+    assert_eq!(
+        unsupported_migration_reason(&ElementKind::EventBasedGateway),
+        None
+    );
 }
 
 #[test]
