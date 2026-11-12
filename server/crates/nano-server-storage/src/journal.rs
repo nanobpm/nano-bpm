@@ -2753,7 +2753,7 @@ impl Journal {
         for key in self.engine.spillable_instances(over) {
             if let Some(vars) = self.engine.spill_variables(key) {
                 let ok = if let Some(vstore) = varstore.as_ref() {
-                    vstore.put_current(key, &vars).is_ok()
+                    vstore.put_current(self.partition_id, key, &vars).is_ok()
                 } else if let Some(spill) = spill_store.as_ref() {
                     // Total: the early return above guarantees at least one of
                     // varstore / spill_store is `Some`; with varstore `None`
@@ -4389,6 +4389,12 @@ impl Journal {
                 self.raise_quarantine_incident(key, "lean snapshot");
             }
             (snap, cold_upserts, _) = self.lean_snapshot_and_cold_upserts()?;
+        }
+        // Mark the var store's pending-spill watermark at this capture (#1487):
+        // instances spilled now are skipped by the drain below, so the matching
+        // checkpoint must promote exactly the spill rows written before it.
+        if let Some(vs) = self.varstore.as_ref() {
+            vs.mark_capture(self.partition_id).ok()?;
         }
         // Drain BEFORE the seal so the delta reflects exactly the state the
         // control-only snapshot captures.
@@ -6348,6 +6354,89 @@ mod tests {
         }
         assert_eq!(view(&snap), expected);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1487 RED/GREEN: a lean variable spill taken while a Raft entry is being
+    /// applied (before its frame is durable) must not reach the variables
+    /// recovery loads. Crash with the frame torn (never written), restart lean:
+    /// the recovered variables must be the pre-entry state, so openraft's
+    /// re-apply of the entry leaves them equal to a peer that applied it once.
+    #[test]
+    fn lean_spill_before_raft_entry_is_durable_does_not_double_apply() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-journal-1487-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
+        let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
+        let counter = |vars: &HashMap<String, Value>| match vars.get("counter") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("counter missing: {other:?}"),
+        };
+
+        let key = {
+            let (writer, recovery) =
+                SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
+            let mut engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
+            j0.set_exporter(export_tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let mut init = HashMap::new();
+            init.insert("counter".to_string(), Value::Int(1));
+            let (events, commit) = j0
+                .apply_command(Command::create_instance_with("demo", init))
+                .unwrap();
+            commit.blocking_wait();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+            // Lean checkpoint (capture + store checkpoint + snapshot publish).
+            let (snap, covered, upserts, forgets) = j0.snapshot_and_rotate_lean().unwrap();
+            let ups: Vec<(Key, &HashMap<String, Value>)> =
+                upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+            varstore.checkpoint(0, covered, &ups, &forgets).unwrap();
+            crate::seglog::write_multi_snapshot_lean(&dir, vec![(0, covered, snap)]).unwrap();
+
+            // Apply a Raft entry that increments the counter, and spill the
+            // instance mid-apply (as the per-command cap / pressure sweep does).
+            j0.begin_raft_entry();
+            let mut inc = HashMap::new();
+            inc.insert("counter".to_string(), Value::Int(2));
+            let _ = j0
+                .apply_command_at(Command::set_variables(key, inc), 0)
+                .unwrap();
+            assert_eq!(
+                j0.shed_variables(0),
+                1,
+                "precondition: the instance spilled"
+            );
+            // Crash before the entry's frame is durable: it is never written
+            // (equivalent to a torn frame, which recovery drops whole).
+            key
+        };
+
+        let recovery = crate::seglog::recover_multi(&dir, &[0], 1, Some(&varstore)).unwrap();
+        let engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let recovered = counter(&engines[&0].instance(key).unwrap().variables);
+        // openraft re-applies the entry (an increment of the recovered value);
+        // a peer applied it exactly once: 1 -> 2.
+        assert_eq!(
+            recovered + 1,
+            2,
+            "entry double-applied: recovered counter {recovered}"
+        );
+        assert_eq!(
+            varstore.try_get(key).unwrap().map(|v| counter(&v)),
+            Some(1),
+            "the non-durable spill row was discarded on recovery"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

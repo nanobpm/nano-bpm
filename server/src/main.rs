@@ -18191,10 +18191,19 @@ impl ServerImpl {
             // Recover the COMPLETE locally owned set, then select `p`: a replay
             // migration rewrites the shared combined snapshot and prunes the
             // cold archive, so recovering only `[p]` would drop the sibling
-            // partitions' state and history (#1473).
+            // partitions' state and history (#1473). The pending-spill discard
+            // is scoped to `p` ALONE (#1575 review): only `p`'s engine is being
+            // replaced, so only its not-yet-checkpointed spill rows are stale —
+            // a healthy sibling's pending rows are its LIVE spilled payloads
+            // (the only copy rehydration reads) and must survive the repair.
             let owned = self.engine.topology().local_partitions();
-            let recovery =
-                seglog::recover_multi(&dir, &owned, num_partitions, varstore.as_deref())?;
+            let recovery = seglog::recover_multi_scoped(
+                &dir,
+                &owned,
+                num_partitions,
+                varstore.as_deref(),
+                &[p],
+            )?;
             let mut engines = recovery.engines;
             // Seed from the DURABLY recovered deployment owner (#1473).
             let seed = owned
