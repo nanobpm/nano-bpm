@@ -6390,7 +6390,10 @@ mod tests {
         let (snap, cold_upserts, cold_orphans) = journal
             .lean_snapshot_and_cold_upserts()
             .expect("cold fold succeeds");
-        assert!(cold_orphans.is_empty(), "a healthy cold row is not an orphan");
+        assert!(
+            cold_orphans.is_empty(),
+            "a healthy cold row is not an orphan"
+        );
         let inst = snap
             .state
             .instances
