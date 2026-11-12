@@ -5339,6 +5339,9 @@ impl Engine {
             Command::QuarantineOffheapOrphan { instance_key } => {
                 self.process_quarantine_offheap_orphan(&mut log, instance_key);
             }
+            Command::QuarantineColdOrphan { instance_key } => {
+                self.process_quarantine_cold_orphan(&mut log, instance_key);
+            }
         }
 
         Ok((log, queue))
@@ -7318,6 +7321,44 @@ impl Engine {
                 kind: state::IncidentKind::VariablesLost,
                 redrive: None,
                 reason: "variables lost: spill row missing".to_string(),
+                job_key: None,
+                created_at: self.now,
+            },
+        );
+    }
+
+    /// Process a [`Command::QuarantineColdOrphan`] (#1481): record a durable
+    /// `VariablesLost` incident for a cold (non-resident) instance whose cold row
+    /// is definitively lost. A resident instance defers to
+    /// [`process_quarantine_offheap_orphan`](Self::process_quarantine_offheap_orphan).
+    /// Idempotent: an active `VariablesLost` incident already naming the
+    /// instance makes this a no-op.
+    fn process_quarantine_cold_orphan(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        if self.state.instances.contains_key(&instance_key) {
+            self.process_quarantine_offheap_orphan(log, instance_key);
+            return;
+        }
+        let already_raised = self.state.incidents.values().any(|i| {
+            i.instance_key == instance_key
+                && i.state == state::IncidentState::Active
+                && i.kind == state::IncidentKind::VariablesLost
+        });
+        if already_raised {
+            return;
+        }
+        let incident_key = self.mint_key();
+        self.emit(
+            log,
+            Event::IncidentRaised {
+                incident_key,
+                instance_key,
+                element_instance_key: instance_key,
+                element_id: String::new(),
+                kind: state::IncidentKind::VariablesLost,
+                redrive: None,
+                reason: "variables lost: cold instance row missing from the spill store; \
+                         the whole instance is unrecoverable"
+                    .to_string(),
                 job_key: None,
                 created_at: self.now,
             },

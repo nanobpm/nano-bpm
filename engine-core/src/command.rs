@@ -691,6 +691,21 @@ pub enum Command {
     /// (the orphan may have been cancelled between the quarantine note and this
     /// command landing). Additive brand-new variant — old journals never carry it.
     QuarantineOffheapOrphan { instance_key: Key },
+    /// Raise a durable [`crate::Event::IncidentRaised`]
+    /// ([`crate::IncidentKind::VariablesLost`]) for a **cold** (wholly off-heap)
+    /// instance whose cold row the host's storage layer found definitively
+    /// absent (#1481). Unlike [`Command::QuarantineOffheapOrphan`] it does not
+    /// require the instance to be resident: a cold instance is absent from
+    /// engine state by construction, so the incident is recorded against the
+    /// bare `instance_key` (with an empty `element_id` — the instance's model is
+    /// lost with its row). This is the only durable record of the loss once the
+    /// covered journal prefix compacts away, so it must survive restart.
+    ///
+    /// If the instance is in fact resident, this behaves exactly like
+    /// [`Command::QuarantineOffheapOrphan`]. **Idempotent** — a no-op when an
+    /// active `VariablesLost` incident already names the instance. Additive
+    /// brand-new variant — old journals never carry it.
+    QuarantineColdOrphan { instance_key: Key },
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -831,6 +846,7 @@ impl Command {
             Command::UpdateAgentInstance { .. } => "update_agent_instance",
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
             Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
+            Command::QuarantineColdOrphan { .. } => "quarantine_cold_orphan",
         }
     }
 

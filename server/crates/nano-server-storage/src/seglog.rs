@@ -3555,6 +3555,119 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1481: a COLD (wholly off-heap) instance whose spill-store row is
+    /// definitively absent is quarantined by the rotation fold — and its loss
+    /// must be durably journaled BEFORE the seal, so that once the covered prefix
+    /// compacts away a reopen still reports a `VariablesLost` incident for it.
+    /// Previously the resident-only quarantine command was a no-op for the
+    /// non-resident cold instance, and the loss vanished on restart.
+    #[test]
+    fn cold_orphan_loss_survives_snapshot_compaction_and_reopen() {
+        use nanobpmn_engine_core::{IncidentKind, IncidentState};
+
+        let dir = temp_dir("cold-orphan-durable");
+        let key = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let store =
+                Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+            journal.set_cold_spill(Arc::clone(&store), 1, 0);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
+            assert!(journal.instance(key).is_none(), "precondition: off-heap");
+            store.forget(&[key]).unwrap();
+
+            let (snap, covered) = journal
+                .snapshot_and_rotate()
+                .expect("rotation proceeds past a definitive cold orphan");
+            assert_eq!(journal.quarantined_orphans(), vec![key]);
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "covered prefix compacted");
+
+            // A second rotation does not re-raise (idempotent, index dropped).
+            let (snap2, _) = journal.snapshot_and_rotate().expect("second rotation");
+            assert_eq!(
+                snap2
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| i.instance_key == key)
+                    .count(),
+                1
+            );
+            key
+        };
+
+        let (reopened, _) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(
+            reopened.state().incidents.values().any(|i| {
+                i.instance_key == key
+                    && i.kind == IncidentKind::VariablesLost
+                    && i.state == IncidentState::Active
+            }),
+            "the cold orphan's VariablesLost incident must survive compaction + restart"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1481 review: a cold orphan DISCOVERED by rehydration (a poll / tick /
+    /// command paging it in) BEFORE any rotation drops its cold-index entry, so
+    /// the sealing fold can never rediscover it. Its `VariablesLost` incident
+    /// must therefore be journaled at discovery, or compaction + restart lose it.
+    #[test]
+    fn cold_orphan_found_by_rehydration_before_rotation_survives_reopen() {
+        use nanobpmn_engine_core::{IncidentKind, IncidentState};
+
+        let dir = temp_dir("cold-orphan-rehydrate");
+        let key = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let store =
+                Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+            journal.set_cold_spill(Arc::clone(&store), 1, 0);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
+            store.forget(&[key]).unwrap();
+
+            // Discovery via rehydration, before any rotation.
+            let (_, failed) = journal.rehydrate_all_cold();
+            assert_eq!(failed, 1, "the orphan cannot be restored");
+            assert_eq!(journal.cold_count(), 0, "routing entry dropped");
+
+            let (snap, covered) = journal.snapshot_and_rotate().expect("rotation");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "covered prefix compacted");
+            key
+        };
+
+        let (reopened, _) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(
+            reopened.state().incidents.values().any(|i| {
+                i.instance_key == key
+                    && i.kind == IncidentKind::VariablesLost
+                    && i.state == IncidentState::Active
+            }),
+            "a cold orphan found by rehydration must keep its incident across restart"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #1385 disk guard input: the uncompacted footprint counts every segment
     /// still on disk (sealed + active) and their bytes, and shrinks exactly by
     /// what compaction deletes — the gauge a stalled snapshot pipeline grows.
