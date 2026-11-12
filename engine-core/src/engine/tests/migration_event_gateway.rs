@@ -494,3 +494,52 @@ fn migration_reports_withdrawn_member_subscription_deleted() {
         "{subs:?}"
     );
 }
+
+/// Copilot #1564: the indexed race lookup must agree with the naive per-catch
+/// graph scan on every element of a definition carrying the ambiguous shapes
+/// (a catch fed by two gateways, a gateway with two incoming flows) that make
+/// a catch not an unambiguous race member.
+#[test]
+fn race_index_matches_naive_scan() {
+    let def = race_builder("p", "", "reply")
+        .event_based_gateway("gw2")
+        .timer_intermediate_catch_event("shared", 3_000)
+        .end_event("endShared")
+        .connect("gw", "shared")
+        .connect("gw2", "shared")
+        .connect("shared", "endShared")
+        .connect("start", "gw2")
+        .build()
+        .unwrap();
+    let index = event_gateway_race_index(&def);
+    let naive = |catch_id: &str| {
+        if !is_intermediate_catch(&def, catch_id) || def.incoming_count(catch_id) != 1 {
+            return None;
+        }
+        let owners: Vec<&crate::model::Element> = def
+            .elements
+            .values()
+            .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
+            .filter(|element| element.outgoing.iter().any(|f| f.to == catch_id))
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        (def.incoming_count(&owner.id) == 1).then_some(*owner)
+    };
+    for id in def.elements.keys() {
+        assert_eq!(
+            index.owner_of(id).map(|o| o.id.as_str()),
+            naive(id).map(|o| o.id.as_str()),
+            "owner of {id}"
+        );
+    }
+    // The ambiguous catch is no race member; the gateway with two incoming
+    // flows owns no race.
+    assert!(index.owner_of("shared").is_none());
+    assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
+    assert!(index.members_of(def.element("gw2").unwrap()).is_empty());
+    let mut members = index.members_of(def.element("gw").unwrap());
+    members.sort_unstable();
+    assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
+}

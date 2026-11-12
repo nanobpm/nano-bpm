@@ -12892,10 +12892,14 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
-        let Some(owner) = event_gateway_race_owner(def, winner_element_id) else {
+        // One indexed pass over the definition, shared by the winner lookup
+        // and sibling discovery (O(V + E), not a full rescan per branch).
+        let race_index = event_gateway_race_index(def);
+        let Some(owner) = race_index.owner_of(winner_element_id) else {
             return Vec::new();
         };
-        let sibling_ids: Vec<&str> = event_gateway_race_members(def, owner)
+        let sibling_ids: Vec<&str> = race_index
+            .members_of(owner)
             .into_iter()
             .filter(|id| *id != winner_element_id)
             .collect();
@@ -16243,10 +16247,13 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
     )
 }
 
-/// The event-based gateway whose deferred choice `catch_id` races in, or
-/// `None` when `catch_id` is not an unambiguous race member. The single
-/// definition of "race membership", shared by the runtime withdrawal of losing
-/// siblings and by migration (#1554), so the two can never disagree:
+/// One O(V + E) pass over a definition's flow graph indexing which catch
+/// events race in which event-based gateway's deferred choice, so a caller
+/// resolving many catches (runtime sibling withdrawal, migration) pays the
+/// scan once instead of per catch. `None` entries are ambiguous catches (no
+/// single owning gateway) — the one definition of "race membership" shared by
+/// the runtime withdrawal of losing siblings and by migration (#1554), so the
+/// two can never disagree:
 ///
 /// * `catch_id` must be an intermediate catch event (a malformed model routing a
 ///   gateway into e.g. a service task must never have that node force-completed,
@@ -16258,43 +16265,69 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
 /// * that gateway must itself have exactly one incoming flow — otherwise several
 ///   concurrent activations could arm several instances of each sibling in one
 ///   scope, and siblings (matched by element id + scope) could not be isolated.
-pub(crate) fn event_gateway_race_owner<'a>(
-    def: &'a crate::model::ProcessDefinition,
-    catch_id: &str,
-) -> Option<&'a crate::model::Element> {
-    if !is_intermediate_catch(def, catch_id) || def.incoming_count(catch_id) != 1 {
-        return None;
-    }
-    let owners: Vec<&crate::model::Element> = def
-        .elements
-        .values()
-        .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
-        .filter(|element| element.outgoing.iter().any(|f| f.to == catch_id))
-        .collect();
-    let [owner] = owners.as_slice() else {
-        return None;
-    };
-    (def.incoming_count(&owner.id) == 1).then_some(*owner)
+pub(crate) struct EventGatewayRaceIndex<'a> {
+    owners: HashMap<&'a str, Option<&'a crate::model::Element>>,
 }
 
-/// The catch events racing in `owner`'s deferred choice: its outgoing targets
-/// that are themselves unambiguous race members of `owner`, in declaration
-/// order (non-catch targets are never part of the race).
-pub(crate) fn event_gateway_race_members<'a>(
-    def: &'a crate::model::ProcessDefinition,
-    owner: &crate::model::Element,
-) -> Vec<&'a str> {
-    let mut members: Vec<&'a str> = Vec::new();
-    for flow in &owner.outgoing {
-        if let Some((id, _)) = def.elements.get_key_value(flow.to.as_str()) {
-            if event_gateway_race_owner(def, id).is_some_and(|o| o.id == owner.id)
-                && !members.contains(&id.as_str())
+impl<'a> EventGatewayRaceIndex<'a> {
+    /// The gateway `catch_id` races in, or `None` when it is not an
+    /// unambiguous race member.
+    pub(crate) fn owner_of(&self, catch_id: &str) -> Option<&'a crate::model::Element> {
+        self.owners.get(catch_id).copied().flatten()
+    }
+
+    /// The catch events racing in `owner`'s deferred choice, in declaration
+    /// order (non-catch targets are never part of the race).
+    pub(crate) fn members_of(&self, owner: &crate::model::Element) -> Vec<&'a str> {
+        let mut members: Vec<&'a str> = Vec::new();
+        for flow in &owner.outgoing {
+            if let Some((id, _)) = self
+                .owners
+                .get_key_value(flow.to.as_str())
+                .filter(|(_, o)| o.is_some_and(|o| o.id == owner.id))
             {
-                members.push(id.as_str());
+                if !members.contains(id) {
+                    members.push(id);
+                }
             }
         }
+        members
     }
-    members
+}
+
+/// Indexes every catch element's owning event-based gateway in one pass over
+/// the definition: incoming-flow counts first, then one owner resolution per
+/// catch — O(V + E) total, where per-catch owner lookups would each rescan
+/// the whole graph.
+pub(crate) fn event_gateway_race_index(
+    def: &crate::model::ProcessDefinition,
+) -> EventGatewayRaceIndex<'_> {
+    let mut incoming: HashMap<&str, usize> = HashMap::with_capacity(def.elements.len());
+    for element in def.elements.values() {
+        for flow in &element.outgoing {
+            *incoming.entry(flow.to.as_str()).or_default() += 1;
+        }
+    }
+    let mut owners = HashMap::with_capacity(def.elements.len());
+    for element in def.elements.values() {
+        let id = element.id.as_str();
+        if !is_intermediate_catch(def, id) || incoming.get(id).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let mut candidates = def.elements.values().filter(|candidate| {
+            matches!(candidate.kind, ElementKind::EventBasedGateway)
+                && candidate.outgoing.iter().any(|f| f.to == id)
+        });
+        let owner = match (candidates.next(), candidates.next()) {
+            (Some(owner), None) => Some(owner),
+            _ => None,
+        };
+        owners.insert(
+            id,
+            owner.filter(|owner| incoming.get(owner.id.as_str()).copied().unwrap_or(0) == 1),
+        );
+    }
+    EventGatewayRaceIndex { owners }
 }
 
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's

@@ -171,7 +171,7 @@ impl Engine {
     /// event-based gateway together with its armed catch events). The engine
     /// models the gateway as a pass-through whose catch events are each an
     /// active element instance, so a resting race is a set of active catch
-    /// events sharing one owning gateway ([`event_gateway_race_owner`] — the
+    /// events sharing one owning gateway ([`event_gateway_race_index`] — the
     /// same race definition the runtime withdrawal uses). Per source race:
     ///
     /// * every mapped member must be a race member of one target event-based
@@ -201,9 +201,13 @@ impl Engine {
         active: &[(Key, String)],
         scope_of: impl Fn(Key) -> Key,
     ) -> Result<Vec<(Key, String)>, EngineError> {
+        // One indexed pass per definition, shared by every ownership lookup in
+        // this check (O(V + E) each, not a full rescan per active element).
+        let source_races = event_gateway_race_index(source);
+        let target_races = event_gateway_race_index(target);
         let mut races: BTreeMap<(Key, &str), Vec<(Key, &str)>> = BTreeMap::new();
         for (eik, eid) in active {
-            if let Some(owner) = event_gateway_race_owner(source, eid) {
+            if let Some(owner) = source_races.owner_of(eid) {
                 races
                     .entry((scope_of(*eik), owner.id.as_str()))
                     .or_default()
@@ -245,10 +249,10 @@ impl Engine {
             let target_gateway = mapped
                 .get(gateway)
                 .cloned()
-                .or_else(|| event_gateway_race_owner(target, first_target).map(|o| o.id.clone()));
+                .or_else(|| target_races.owner_of(first_target).map(|o| o.id.clone()));
             let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
             for (src, tgt) in &mapped_members {
-                let owner = event_gateway_race_owner(target, tgt).map(|o| o.id.as_str());
+                let owner = target_races.owner_of(tgt).map(|o| o.id.as_str());
                 if owner.is_none() || owner != target_gateway.as_deref() {
                     return Err(EngineError::MigrationCatchEventDetached {
                         instance_key,
@@ -289,7 +293,7 @@ impl Engine {
         // incident) mapped onto a target gateway, or a standalone catch mapped
         // onto a target race member.
         for (eik, eid) in active {
-            if event_gateway_race_owner(source, eid).is_some() {
+            if source_races.owner_of(eid).is_some() {
                 continue;
             }
             let Some(tgt) = mapped.get(eid) else {
@@ -305,7 +309,7 @@ impl Engine {
                     .filter(|e| matches!(e.kind, ElementKind::EventBasedGateway))
                     .map(|e| e.id.clone())
             } else {
-                event_gateway_race_owner(target, tgt).map(|o| o.id.clone())
+                target_races.owner_of(tgt).map(|o| o.id.clone())
             };
             if let Some(tg) = tg {
                 claim(&mut claimed, scope_of(*eik), tg, eid)?;
