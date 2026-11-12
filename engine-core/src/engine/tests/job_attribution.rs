@@ -235,26 +235,53 @@ fn terminal_deadline(events: &[Event], job_key: Key) -> Option<Option<u64>> {
 /// #1494: a SOFT (leader-local) job's terminal deadline is stamped by the
 /// proposer, so `JobCompleted.deadline` and the retained `Job::terminal_end`
 /// agree on every replica — and carry the real lock deadline, not `None`.
+///
+/// The whole flow runs at a NONZERO instant: at `0` `stamp_terminal_end`
+/// leaves `Job::terminal_end` unset, which would let the agreement check pass
+/// on the per-command scratch alone and never exercise the retained record.
 #[test]
 fn a_soft_jobs_stamped_terminal_deadline_agrees_on_every_replica() {
-    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.set_lenient_completion(true);
+            e.apply_command_at(Command::DeployProcess(linear_with_task()), 1)
+                .unwrap();
+            e.apply_command_at(Command::create_instance("order"), 1)
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let job_key = leader.pending_jobs()[0].key;
+    let activated = leader.activate_jobs("payment", "W", 1, 1_000, 1);
+    assert_eq!(activated.len(), 1, "leader soft-activates the job");
     let lock = leader.state().jobs[&job_key].deadline;
-    assert_eq!(lock, Some(1_000), "leader holds the soft lock");
+    assert_eq!(lock, Some(1_001), "leader holds the soft lock");
     assert_eq!(follower.state().jobs[&job_key].deadline, None);
 
     let mut command = Command::complete_job(job_key);
     leader.stamp_terminal_attribution(&mut command);
-    let on_leader = leader.apply_command(command.clone()).unwrap();
-    let on_follower = follower.apply_command(command).unwrap();
+    let on_leader = leader.apply_command_at(command.clone(), 1).unwrap();
+    let on_follower = follower.apply_command_at(command, 1).unwrap();
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(lock));
     assert_eq!(
         terminal_deadline(&on_follower, job_key),
         Some(lock),
         "follower persists the leader-stamped deadline"
     );
+    // The RETAINED terminal record — not the per-command scratch — is what a
+    // snapshot or cascade restates, so assert it directly on both replicas.
+    let expected = Some(crate::state::JobTerminalEnd {
+        at: 1,
+        deadline: lock,
+    });
+    assert_eq!(leader.state().jobs[&job_key].terminal_end, expected);
     assert_eq!(
-        leader.job_terminal_deadline(job_key),
-        follower.job_terminal_deadline(job_key)
+        follower.state().jobs[&job_key].terminal_end,
+        expected,
+        "the retained terminal deadline persists identically on the follower"
     );
 }
 
@@ -310,6 +337,75 @@ fn a_timeout_update_between_stamping_and_completion_wins_over_the_stamp() {
             .and_then(|t| t.deadline),
         updated
     );
+}
+
+/// #1494 review: the same stamp-vs-update interleaving for a durable
+/// activation WITHOUT a fencing token — `ActivateJobsByKey` with
+/// `with_lease: false` still journals the activation (`durable: true`), so its
+/// deadline is replicated and a journaled `UpdateJobTimeout` advances it on
+/// every replica. The retained terminal record must restate that replicated
+/// deadline even though `lease_token` is `None`: durability, not the fencing
+/// token, is what makes the deadline authoritative.
+#[test]
+fn an_unleased_durable_activation_restates_its_replicated_deadline() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    // Expire the leader-local soft lock, then activate durably by key on BOTH
+    // replicas (the replicated write path) — durable, but lease-less. Every
+    // command runs at an explicit instant: `apply_command` reuses the engine's
+    // sticky `now`, which would silently mis-stamp the journaled deadline.
+    leader.expire_jobs(1_000);
+    let activate = Command::activate_jobs_by_key(
+        vec![job_key],
+        "W",
+        1_000,
+        0,
+        crate::JobActivationOptions {
+            fetch_variables: vec![],
+            with_lease: false,
+        },
+    );
+    leader.apply_command_at(activate.clone(), 0).unwrap();
+    follower.apply_command_at(activate, 0).unwrap();
+    for replica in [&leader, &follower] {
+        let job = &replica.state().jobs[&job_key];
+        assert_eq!(job.deadline, Some(1_000), "activation deadline journaled");
+        assert_eq!(job.lease_token, None, "no fencing token requested");
+        assert!(job.durable_activation, "durable despite no lease token");
+    }
+    // The proposer stamps the completion against the journaled deadline…
+    let mut command = Command::complete_job(job_key);
+    leader.stamp_terminal_attribution(&mut command);
+    // …but a replicated timeout update (lease-less, like the activation)
+    // lands BEFORE the completion applies.
+    let update = Command::UpdateJobTimeout {
+        job_key,
+        lease_token: None,
+        timeout: 99_000,
+        operation_reference: None,
+    };
+    leader.apply_command_at(update.clone(), 0).unwrap();
+    follower.apply_command_at(update, 0).unwrap();
+    assert_eq!(leader.state().jobs[&job_key].deadline, Some(99_000));
+    // Complete at/after the updated deadline so the retained terminal record
+    // is well-formed; the stamped command is identical on both replicas.
+    let on_leader = leader.apply_command_at(command.clone(), 100_000).unwrap();
+    let on_follower = follower.apply_command_at(command, 100_000).unwrap();
+    for (name, events) in [("leader", &on_leader), ("follower", &on_follower)] {
+        assert_eq!(
+            terminal_deadline(events, job_key),
+            Some(Some(99_000)),
+            "{name}: the terminal deadline is the replicated update, not the stamp"
+        );
+    }
+    for (name, replica) in [("leader", &leader), ("follower", &follower)] {
+        assert_eq!(
+            replica.state().jobs[&job_key]
+                .terminal_end
+                .and_then(|t| t.deadline),
+            Some(99_000),
+            "{name}: the retained terminal record restates the replicated deadline"
+        );
+    }
 }
 
 /// An UNSTAMPED (legacy) command never reads replica-local soft state for the

@@ -661,8 +661,8 @@ impl Engine {
 
 impl Engine {
     /// The deadline stamped onto a job's terminal `JobCompleted`/`JobCanceled`
-    /// event (#1440) — `Some` ONLY for a DURABLE (leased) activation, one whose
-    /// lock is journaled and therefore identical on every replica. A
+    /// event (#1440) — `Some` ONLY for a DURABLE (journaled) activation, one
+    /// whose lock is replicated and therefore identical on every replica. A
     /// leader-local (soft) activation is unreplicated by design (ADR 0002): its
     /// deadline is replica-local, so a soft job records NO terminal deadline
     /// (`None`) — UNLESS the command terminating it carries the proposer's
@@ -677,11 +677,16 @@ impl Engine {
     /// cascade re-cancel of an ALREADY-terminal job must restate the deadline
     /// its first terminal transition recorded, not `None`.
     ///
-    /// The CURRENT live durable lease is checked BEFORE the proposer's stamp:
-    /// the stamp is taken at proposal time, so a journaled `UpdateJobTimeout`
-    /// landing between stamping and completion advances the replicated lease
-    /// past it — the terminal record must restate the deadline the job
-    /// actually held at completion, not the proposal-time one.
+    /// The CURRENT live durable activation is checked BEFORE the proposer's
+    /// stamp: the stamp is taken at proposal time, so a journaled
+    /// `UpdateJobTimeout` landing between stamping and completion advances the
+    /// replicated deadline past it — the terminal record must restate the
+    /// deadline the job actually held at completion, not the proposal-time
+    /// one. Durability, not the fencing token, is what makes the deadline
+    /// authoritative: an `ActivateJobsByKey` plan with `with_lease: false`
+    /// still journals its activation (`durable: true`, no token), so its
+    /// deadline — and any journaled update to it — is identical on every
+    /// replica.
     pub fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
         let job = self.state.jobs.get(&job_key)?;
         if let Some(terminal_end) = job.terminal_end {
@@ -690,10 +695,12 @@ impl Engine {
             // first-terminal-wins over any stamp.
             return terminal_end.deadline;
         }
-        if job.lease_token.is_some() {
-            // A durable (journaled) lease: the lock is replicated, so its
+        if job.lease_token.is_some() || job.durable_activation {
+            // A durable (journaled) activation: the lock is replicated, so its
             // CURRENT deadline is identical on every replica — including any
-            // `UpdateJobTimeout` applied after the proposer stamped.
+            // `UpdateJobTimeout` applied after the proposer stamped. The
+            // fencing token is orthogonal (ADR 0005-810-job-lease): a durable
+            // activation without one still journals its deadline.
             job.deadline
         } else {
             // The current command's proposer-stamped deadline (#1494): carried
