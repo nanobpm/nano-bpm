@@ -44,6 +44,7 @@ inductive BpmnTag where
   | intermediateCatchEvent
   | intermediateThrowEvent
   | subProcess
+  | eventSubProcess
   | task
   | scriptTask
   | callActivity
@@ -96,6 +97,7 @@ def toBpmn : Kind → BpmnShape
   | .messageStartEvent => ⟨.startEvent, .message⟩
   | .timerStartEvent => ⟨.startEvent, .timer⟩
   | .subProcess => ⟨.subProcess, .none⟩
+  | .eventSubProcess => ⟨.eventSubProcess, .none⟩
   | .escalationThrowEvent => ⟨.intermediateThrowEvent, .escalation⟩
   | .escalationBoundaryEvent => ⟨.boundaryEvent, .escalation⟩
   | .intermediateThrowEvent => ⟨.intermediateThrowEvent, .none⟩
@@ -157,6 +159,7 @@ def fromBpmn : BpmnShape → Option Kind
   | ⟨.endEvent, .escalation⟩ => some .escalationThrowEvent
   | ⟨.endEvent, .compensate⟩ => some .compensationThrowEvent
   | ⟨.subProcess, .none⟩ => some .subProcess
+  | ⟨.eventSubProcess, .none⟩ => some .eventSubProcess
   | ⟨.task, .none⟩ => some .task
   | ⟨.scriptTask, .none⟩ => some .scriptTask
   | ⟨.callActivity, .none⟩ => some .callActivity
