@@ -12770,6 +12770,23 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+                        // `suspendedDate`: read straight from the read-model's
+                        // `suspended_date_ms` (the single source of truth for
+                        // suspension) — a datetime while suspended, absent otherwise.
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Nano is single-tenant: every instance's `tenantId` is the
+                        // `<default>` constant, so honour the filter against it.
+                        && query::match_string(&f.tenant_id, "<default>")
+                        // `processDefinitionName` / `processDefinitionVersionTag` are
+                        // never projected (always null in `process_instance_result`),
+                        // so match against an absent value: equality / `$like` /
+                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
+                        // matches.
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
                         // Call-activity hierarchy filters (C8 parity, issue
                         // #977): a bare parent key enumerates the direct children
                         // of that instance; `$exists:false` selects top-level
@@ -21733,6 +21750,24 @@ impl ServerImpl {
                     )
                     && query::match_date_time_ms(&filter.end_date, None)
                     && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
+                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
+                    // single source of truth. A batch is ACTIVE-only, so a matched
+                    // instance is never suspended and the value is always absent —
+                    // `$exists: true` / value operators then correctly exclude
+                    // every candidate (fail closed) instead of silently broadening.
+                    && query::match_date_time_ms(
+                        &filter.suspended_date,
+                        inst.suspended_date_ms.map(|ms| ms as i64),
+                    )
+                    // Nano is single-tenant: every instance's `tenantId` is the
+                    // `<default>` constant, so honour the filter against it.
+                    && query::match_string(&filter.tenant_id, "<default>")
+                    // `processDefinitionName` / `processDefinitionVersionTag` are
+                    // never projected (always null in `process_instance_result`), so
+                    // match against an absent value: equality / `$like` / `$in` /
+                    // `$exists: true` correctly exclude, `$exists: false` matches.
+                    && query::match_string_opt(&filter.process_definition_name, None)
+                    && query::match_string_opt(&filter.process_definition_version_tag, None)
                     // Call-activity hierarchy filters (C8 parity, issue #977),
                     // gated per the per-operation contract above.
                     && hierarchy_matches
@@ -47751,6 +47786,174 @@ mod search_process_instances_tags_filter_tests {
 }
 
 #[cfg(test)]
+mod search_process_instances_tenant_suspended_unprojected_filter_tests {
+    //! Regression coverage for the `tenantId` / `suspendedDate` /
+    //! `processDefinitionName` / `processDefinitionVersionTag` filters on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler previously
+    //! parsed all four off the wire and discarded them, returning the full
+    //! unfiltered set — the same silent-broadening failure mode the batch matcher
+    //! had. These drive the actual handler against a populated read model so the
+    //! predicates can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created(instance_key: u64) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn string_filter(s: &str) -> models::StringFilterProperty {
+        models::StringFilterProperty::String(s.to_string())
+    }
+
+    fn exists_string(exists: bool) -> models::StringFilterProperty {
+        models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedStringFilter::new()
+        })
+    }
+
+    fn exists_date(exists: bool) -> models::DateTimeFilterProperty {
+        models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedDateTimeFilter::new()
+        })
+    }
+
+    #[tokio::test]
+    async fn tenant_id_is_honoured_against_the_default_tenant() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // Nano is single-tenant: the `<default>` tenant matches every instance,
+        // any other tenant matches none (not silently ignored).
+        let default = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("<default>")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(default.page.total_items, 2, "the <default> tenant matches");
+
+        let other = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("acme")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            other.page.total_items, 0,
+            "a non-default tenantId excludes everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_date_filter_selects_only_suspended_instances() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+        // Suspend instance 2.
+        shard
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 2,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // `$exists: true` selects exactly the suspended instance (its
+        // `suspended_date_ms` is set); the ACTIVE instance is excluded.
+        let suspended = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(true)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "2");
+
+        // `$exists: false` selects the non-suspended instance.
+        let active = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(false)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(active.page.total_items, 1);
+        assert_eq!(active.items[0].process_instance_key.0, "1");
+    }
+
+    #[tokio::test]
+    async fn unprojected_name_and_version_tag_fail_honestly() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are never
+        // projected (always null), so an equality / `$exists: true` filter
+        // excludes every row while `$exists: false` matches.
+        for field_setter in [
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_name = Some(v)
+            },
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_version_tag = Some(v)
+            },
+        ] {
+            let mut eq = models::ProcessInstanceFilter::new();
+            field_setter(&mut eq, string_filter("x"));
+            assert_eq!(
+                run(&server, eq).await.page.total_items,
+                0,
+                "equality on an unprojected field is not silently ignored"
+            );
+
+            let mut absent = models::ProcessInstanceFilter::new();
+            field_setter(&mut absent, exists_string(false));
+            assert_eq!(
+                run(&server, absent).await.page.total_items,
+                2,
+                "$exists:false on an unprojected field matches"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod search_process_instances_suspend_resume_tests {
     //! Camunda-parity coverage for `suspendedDate` (issue #1147): every
     //! `/process-instances/search` result item ALWAYS carries a `suspendedDate`
@@ -50415,6 +50618,144 @@ mod call_activity_hierarchy_read_model_tests {
                 none.is_empty(),
                 "an absent tag fails honestly (honour_hierarchy={honour_hierarchy:?})"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_tenant_suspended_and_unprojected_filters() {
+        // #1551 review: the batch matcher must evaluate `tenantId`,
+        // `suspendedDate`, `processDefinitionName` and
+        // `processDefinitionVersionTag` rather than silently dropping them — a
+        // dropped constraint *broadens* a mutating batch to instances the caller
+        // asked to exclude (e.g. `suspendedDate: { $exists: true }` must not
+        // select ACTIVE instances, whose suspension timestamp is null). Seeds the
+        // read model directly and drives the matcher both batch operations
+        // consume, so the predicates cannot silently regress for cancellation /
+        // incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        let string_filter = |s: &str| models::StringFilterProperty::String(s.to_string());
+        let exists_string = |exists: bool| {
+            models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedStringFilter::new()
+            })
+        };
+        let exists_date = |exists: bool| {
+            models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedDateTimeFilter::new()
+            })
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2], "baseline selects all instances");
+
+            // `suspendedDate: { $exists: true }` matches nothing: a batch is
+            // ACTIVE-only, so no candidate carries a suspension timestamp (the
+            // finding's exact example).
+            let suspended_exists = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(true)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                suspended_exists.is_empty(),
+                "suspendedDate $exists:true excludes ACTIVE instances (honour_hierarchy={honour_hierarchy:?})"
+            );
+            // `$exists: false` matches every (non-suspended) candidate.
+            let not_suspended = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(false)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                not_suspended,
+                vec![1, 2],
+                "suspendedDate $exists:false matches all (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `tenantId` is honoured against Nano's single `<default>` tenant: the
+            // default matches, any other tenant excludes.
+            let default_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("<default>")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                default_tenant,
+                vec![1, 2],
+                "tenantId <default> matches (honour_hierarchy={honour_hierarchy:?})"
+            );
+            let other_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("acme")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                other_tenant.is_empty(),
+                "a non-default tenantId excludes everything (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `processDefinitionName` / `processDefinitionVersionTag` are never
+            // projected (always null), so an equality / `$exists: true` filter
+            // excludes every candidate while `$exists: false` matches.
+            for field_setter in [
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_name = Some(v)
+                },
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_version_tag = Some(v)
+                },
+            ] {
+                let mut eq = models::ProcessInstanceFilter::new();
+                field_setter(&mut eq, string_filter("x"));
+                let matched = server.batch_matched_process_instances(&eq, honour_hierarchy);
+                assert!(
+                    matched.is_empty(),
+                    "equality on an unprojected field is not silently ignored (honour_hierarchy={honour_hierarchy:?})"
+                );
+
+                let mut absent = models::ProcessInstanceFilter::new();
+                field_setter(&mut absent, exists_string(false));
+                let matched = server.batch_matched_process_instances(&absent, honour_hierarchy);
+                assert_eq!(
+                    matched,
+                    vec![1, 2],
+                    "$exists:false on an unprojected field matches (honour_hierarchy={honour_hierarchy:?})"
+                );
+            }
         }
     }
 
