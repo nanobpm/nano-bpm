@@ -4780,8 +4780,8 @@ impl Engine {
                 }
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
-                //    active element instance whose own kind is a call activity or
-                //    event-based gateway (`unsupported_migration_reason`).
+                //    active element instance whose own kind is a call activity
+                //    (`unsupported_migration_reason`).
                 //    Embedded sub-processes and boundary / intermediate catch
                 //    events are migrated (#1374): their flow scopes and
                 //    subscriptions are planned in `engine/migration.rs`.
@@ -4867,6 +4867,20 @@ impl Engine {
                             .to_string(),
                     });
                 }
+
+                // 4a. Event-based gateway races (#1554): validate where mapped
+                //     catch events land and collect unmapped race members to
+                //     withdraw (exempt from the step-5 mapping requirement).
+                let withdrawn = Self::check_migrated_event_gateway_races(
+                    instance_key,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &active_elements,
+                    |eik| self.scope_of(instance_key, eik),
+                )?;
+                active_elements.retain(|e| !withdrawn.contains(e));
+                active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
 
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
@@ -5147,7 +5161,11 @@ impl Engine {
                     &target_definition,
                     &mapped,
                 )?;
-                for event in plan.before {
+                let withdrawals: Vec<Event> = withdrawn
+                    .into_iter()
+                    .flat_map(|(eik, eid)| self.withdraw_catch_instance(instance_key, eik, eid))
+                    .collect();
+                for event in withdrawals.into_iter().chain(plan.before) {
                     self.emit(&mut log, event);
                 }
                 self.emit(
@@ -12915,85 +12933,21 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
-        // An event-based gateway's deferred choice is a race between intermediate
-        // catch events only. `is_catch_event` gates both the winner (below) and
-        // each losing sibling: it keeps the completion hot path O(1) for the
-        // common (non-catch) completion, and — should a malformed model route a
-        // gateway into a non-catch node (e.g. a service task) — prevents this
-        // code from force-completing that node's element instance via
-        // `ElementCompleted` while leaving its job/user-task uncancelled (which
-        // would orphan work). Withdrawal only ever cancels timers/subscriptions
-        // resting on genuine catch siblings.
-        let is_catch_event = |element_id: &str| {
-            matches!(
-                def.elements.get(element_id).map(|e| &e.kind),
-                Some(
-                    ElementKind::TimerIntermediateCatchEvent { .. }
-                        | ElementKind::MessageIntermediateCatchEvent { .. }
-                        | ElementKind::SignalIntermediateCatchEvent { .. }
-                        | ElementKind::ConditionalIntermediateCatchEvent { .. }
-                )
-            )
-        };
-        if !is_catch_event(winner_element_id) {
+        // Cheap kind check first: a completing task, gateway, or start/end
+        // event is never a race winner, so it must not pay for the index.
+        if !is_intermediate_catch(def, winner_element_id) {
             return Vec::new();
         }
-        // A catch event downstream of an event-based gateway has exactly one
-        // incoming flow — from the gateway. If the winner has any *other*
-        // incoming path (a malformed graph where a non-gateway node also routes
-        // into it), we cannot be sure this token arrived via the gateway, so we
-        // conservatively withdraw nothing rather than risk cancelling an
-        // unrelated race in the same scope.
-        let incoming_count = def
-            .elements
-            .values()
-            .flat_map(|element| element.outgoing.iter())
-            .filter(|f| f.to == winner_element_id)
-            .count();
-        if incoming_count != 1 {
-            return Vec::new();
-        }
-        // Find the event-based gateway(s) that route into the winning catch
-        // event. In a well-formed model a catch event has exactly one incoming
-        // flow, so at most one gateway owns the race. If more than one gateway
-        // routes into the same catch event the owning race is ambiguous — we
-        // cannot tell which gateway's siblings to withdraw without risking the
-        // cancellation of an unrelated gateway's branch — so we conservatively
-        // do nothing.
-        let owners: Vec<&crate::model::Element> = def
-            .elements
-            .values()
-            .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
-            .filter(|element| element.outgoing.iter().any(|f| f.to == winner_element_id))
-            .collect();
-        let [owner] = owners.as_slice() else {
+        // One indexed pass over the definition, shared by the winner lookup
+        // and sibling discovery (O(V + E), not a full rescan per branch).
+        let race_index = event_gateway_race_index(def);
+        let Some(owner) = race_index.owner_of(winner_element_id) else {
             return Vec::new();
         };
-        // The owning gateway must itself have exactly one incoming flow. A
-        // gateway reachable via multiple incoming flows (e.g. fed by both arms of
-        // a parallel split) can be activated concurrently in the same scope,
-        // arming several live instances of each sibling element id at once. Since
-        // losers are matched by element id + scope, withdrawing here could cancel
-        // a sibling instance belonging to a *different* concurrent activation of
-        // the same gateway. When the owner's static in-degree is not exactly 1 we
-        // cannot isolate a single race, so we conservatively withdraw nothing.
-        let owner_incoming = def
-            .elements
-            .values()
-            .flat_map(|element| element.outgoing.iter())
-            .filter(|f| f.to == owner.id)
-            .count();
-        if owner_incoming != 1 {
-            return Vec::new();
-        }
-        // The sibling targets are the owning gateway's *other* outgoing catch
-        // events. Any non-catch target is skipped (see `is_catch_event` above).
-        let sibling_ids: Vec<&str> = owner
-            .outgoing
-            .iter()
-            .filter(|f| f.to != winner_element_id)
-            .map(|f| f.to.as_str())
-            .filter(|id| is_catch_event(id))
+        let sibling_ids: Vec<&str> = race_index
+            .members_of(owner)
+            .into_iter()
+            .filter(|id| *id != winner_element_id)
             .collect();
         if sibling_ids.is_empty() {
             return Vec::new();
@@ -13017,21 +12971,40 @@ impl Engine {
 
         let mut events = Vec::new();
         for (eik, eid) in losers {
-            events.extend(self.cancel_all_timers_on(eik));
-            events.extend(self.cancel_all_subscriptions_on(eik));
-            events.extend(self.cancel_all_signal_subscriptions_on(eik));
-            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: eik,
-                element_id: eid.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: eik,
-                element_id: eid,
-            });
+            events.extend(self.withdraw_catch_instance(instance_key, eik, eid));
         }
+        events
+    }
+
+    /// Withdraws one armed intermediate-catch element instance: cancels every
+    /// timer and (message/signal/conditional) subscription resting on it, then
+    /// completes it without taking an outgoing flow. The single implementation
+    /// shared by the event-based gateway's deferred choice (a losing sibling)
+    /// and migration (an unmapped race member, whose subscriptions Zeebe
+    /// deletes).
+    pub(crate) fn withdraw_catch_instance(
+        &self,
+        instance_key: Key,
+        eik: Key,
+        eid: String,
+    ) -> Vec<Event> {
+        // A catch parked on a start-listener job or an activation incident
+        // carries that work on its root: cancel/resolve it too (#1554).
+        let mut events = self.boundary_root_teardown_events(instance_key, eik);
+        events.extend(self.cancel_all_timers_on(eik));
+        events.extend(self.cancel_all_subscriptions_on(eik));
+        events.extend(self.cancel_all_signal_subscriptions_on(eik));
+        events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid,
+        });
         events
     }
     /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
@@ -16306,6 +16279,109 @@ impl Engine {
     }
 }
 
+/// Whether `element_id` is an intermediate catch event — the only element
+/// class that takes part in an event-based gateway's deferred choice.
+fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str) -> bool {
+    matches!(
+        def.elements.get(element_id).map(|e| &e.kind),
+        Some(
+            ElementKind::TimerIntermediateCatchEvent { .. }
+                | ElementKind::MessageIntermediateCatchEvent { .. }
+                | ElementKind::SignalIntermediateCatchEvent { .. }
+                | ElementKind::ConditionalIntermediateCatchEvent { .. }
+        )
+    )
+}
+
+/// One O(V + E) pass over a definition's flow graph indexing which catch
+/// events race in which event-based gateway's deferred choice, so a caller
+/// resolving many catches (runtime sibling withdrawal, migration) pays the
+/// scan once instead of per catch. Catches with no unambiguous owning gateway
+/// are simply absent from the map — the one definition of "race membership"
+/// shared by the runtime withdrawal of losing siblings and by migration
+/// (#1554), so the two can never disagree:
+///
+/// * `catch_id` must be an intermediate catch event (a malformed model routing a
+///   gateway into e.g. a service task must never have that node force-completed,
+///   which would orphan its job);
+/// * it must have exactly one incoming flow — otherwise its token may not have
+///   arrived via the gateway;
+/// * exactly one event-based gateway may route into it — otherwise the owning
+///   race is ambiguous;
+/// * that gateway must itself have exactly one incoming flow — otherwise several
+///   concurrent activations could arm several instances of each sibling in one
+///   scope, and siblings (matched by element id + scope) could not be isolated.
+pub(crate) struct EventGatewayRaceIndex<'a> {
+    owners: HashMap<&'a str, &'a crate::model::Element>,
+}
+
+impl<'a> EventGatewayRaceIndex<'a> {
+    /// The gateway `catch_id` races in, or `None` when it is not an
+    /// unambiguous race member.
+    pub(crate) fn owner_of(&self, catch_id: &str) -> Option<&'a crate::model::Element> {
+        self.owners.get(catch_id).copied()
+    }
+
+    /// The catch events racing in `owner`'s deferred choice, in declaration
+    /// order (non-catch targets are never part of the race).
+    pub(crate) fn members_of(&self, owner: &crate::model::Element) -> Vec<&'a str> {
+        let mut members: Vec<&'a str> = Vec::new();
+        for flow in &owner.outgoing {
+            if let Some((id, _)) = self
+                .owners
+                .get_key_value(flow.to.as_str())
+                .filter(|(_, o)| o.id == owner.id)
+            {
+                if !members.contains(id) {
+                    members.push(id);
+                }
+            }
+        }
+        members
+    }
+}
+
+/// Indexes every catch element's owning event-based gateway in one traversal
+/// of the definition: incoming-flow counts first, then a single pass over the
+/// gateways' outgoing flows recording each catch's owner — O(V + E) total,
+/// where per-catch owner lookups would each rescan the whole graph (O(C ×
+/// (V + E)) on catch-heavy models).
+pub(crate) fn event_gateway_race_index(
+    def: &crate::model::ProcessDefinition,
+) -> EventGatewayRaceIndex<'_> {
+    let mut incoming: HashMap<&str, usize> = HashMap::with_capacity(def.elements.len());
+    for element in def.elements.values() {
+        for flow in &element.outgoing {
+            *incoming.entry(flow.to.as_str()).or_default() += 1;
+        }
+    }
+    let mut owners: HashMap<&str, &crate::model::Element> = HashMap::new();
+    for gateway in def.elements.values() {
+        if !matches!(gateway.kind, ElementKind::EventBasedGateway)
+            || incoming.get(gateway.id.as_str()).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
+        for flow in &gateway.outgoing {
+            let catch = flow.to.as_str();
+            if !is_intermediate_catch(def, catch) || incoming.get(catch).copied().unwrap_or(0) != 1
+            {
+                continue;
+            }
+            // incoming(catch) == 1 makes this gateway's flow the catch's only
+            // incoming flow, so no second gateway can claim it — a second
+            // claimant would itself be a second incoming flow. The ambiguity
+            // checks therefore reduce to the two incoming-count requirements.
+            let previous = owners.insert(catch, gateway);
+            debug_assert!(
+                previous.is_none(),
+                "catch {catch} claimed by two event-based gateways"
+            );
+        }
+    }
+    EventGatewayRaceIndex { owners }
+}
+
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
 /// "not supported yet" migration rejections. Returns `Some(reason)` when a
 /// migration touching an active element (or armed boundary runtime) of this kind
@@ -16314,7 +16390,6 @@ fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'st
     use crate::model::ElementKind;
     match kind {
         ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
-        ElementKind::EventBasedGateway => Some("event-based gateways are not migratable yet"),
         _ => None,
     }
 }
