@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import type { InstanceTrace, TraceElement } from "./gen";
 import { SectionLabel } from "./ui";
 import { IncidentReason } from "./IncidentReason";
-import { fmtClock, fmtDuration } from "./traceTime.ts";
+import { fmtClock, fmtDuration, headlineDuration } from "./traceTime.ts";
 
 // Re-exported so existing importers of `../components/TraceTimeline` keep
 // working; the implementations live in the JSX-free `traceTime.ts` so they are
@@ -128,6 +128,7 @@ function ElementRow({
   const end =
     el.exitedAt ?? Math.max(el.enteredAt, job?.completedAt ?? el.enteredAt);
 
+  const headline = headlineDuration(el, Date.now(), fmt.duration);
   const left = pct(start);
   const width = Math.max(pct(end) - left, 0.6);
 
@@ -144,16 +145,15 @@ function ElementRow({
         <div
           className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-edge-strong"
           style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${el.elementId} · ${fmt.duration(el.durationMs)}`}
+          title={`${el.elementId} · ${headline.title}`}
         />
         {job && <JobBars job={job} pct={pct} fmt={fmt} />}
       </div>
-      <div className="w-28 shrink-0 text-right font-mono text-[11px] text-fg-faint">
-        {job
-          ? job.queueMs != null
-            ? `${fmt.duration(job.queueMs)} q`
-            : fmt.duration(job.waitMs)
-          : fmt.duration(el.durationMs)}
+      <div
+        className="w-28 shrink-0 text-right font-mono text-[11px] text-fg-faint"
+        title={headline.title}
+      >
+        {headline.label}
       </div>
     </div>
   );

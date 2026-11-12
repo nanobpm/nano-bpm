@@ -35,3 +35,95 @@ export function fmtClock(ms: number): string {
     .replace(/[^a-z]/g, "");
   return `${get("hour")}:${get("minute")}${period} ${get("month")} ${get("day")}`;
 }
+
+/** The job-timing fields the headline needs (structural subset of `TraceJob`). */
+export interface HeadlineJob {
+  createdAt: number;
+  activatedAt: number | null;
+  completedAt: number | null;
+  waitMs: number | null;
+  queueMs: number | null;
+  serviceMs: number | null;
+}
+
+/** The structural subset of `TraceElement` the headline needs. */
+export interface HeadlineElement {
+  durationMs: number | null;
+  job?: HeadlineJob | null;
+}
+
+export interface HeadlineDuration {
+  /** How long the step took (or has been running), in ms. */
+  ms: number | null;
+  /** `true` when the job was activated but has not completed yet. */
+  running: boolean;
+  /** Secondary detail: queue time (created → activated), never the headline. */
+  queueMs: number | null;
+  /** The right-hand column label. */
+  label: string;
+  /** The row tooltip — derived from the same values as `label`. */
+  title: string;
+}
+
+/**
+ * The single canonical "how long did this step take" for a trace row (#1557).
+ * Jobs: service time (activated → completed) when activation was observed, else
+ * wait time (created → completed); an activated-but-incomplete job shows
+ * elapsed time since activation, marked running. Queue time is secondary detail
+ * only. Non-job elements: `durationMs`.
+ */
+export function headlineDuration(
+  el: HeadlineElement,
+  now: number = Date.now(),
+  fmt: (ms: number | null) => string = fmtDuration,
+): HeadlineDuration {
+  const job = el.job;
+  if (!job) {
+    const label = fmt(el.durationMs);
+    return {
+      ms: el.durationMs,
+      running: false,
+      queueMs: null,
+      label,
+      title: label,
+    };
+  }
+  const queueMs =
+    job.queueMs ??
+    (job.activatedAt != null ? job.activatedAt - job.createdAt : null);
+  const queueNote = queueMs != null ? ` · queue ${fmt(queueMs)}` : "";
+  if (job.completedAt == null) {
+    const since = job.activatedAt ?? job.createdAt;
+    const ms = Math.max(0, now - since);
+    const label = `${fmt(ms)} …`;
+    const what =
+      job.activatedAt != null ? "running" : "waiting (not yet activated)";
+    return {
+      ms,
+      running: true,
+      queueMs,
+      label,
+      title: `${what} ${fmt(ms)}${queueNote}`,
+    };
+  }
+  if (job.activatedAt != null) {
+    const ms = job.serviceMs ?? job.completedAt - job.activatedAt;
+    const label = fmt(ms);
+    return {
+      ms,
+      running: false,
+      queueMs,
+      label,
+      title: `service ${label}${queueNote}`,
+    };
+  }
+  const ms = job.waitMs ?? job.completedAt - job.createdAt;
+  const label = fmt(ms);
+  return {
+    ms,
+    running: false,
+    queueMs,
+    label,
+    title: `wait ${label} (activation not observed)`,
+  };
+}
