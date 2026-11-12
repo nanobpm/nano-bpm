@@ -331,8 +331,7 @@ impl BatchOperationStore {
         let Some(rec) = inner.ops.get_mut(&key) else {
             return;
         };
-        if Self::is_terminal(&rec.state) || rec.items.iter().any(|i| matches!(i.state, I::Active))
-        {
+        if Self::is_terminal(&rec.state) || rec.items.iter().any(|i| matches!(i.state, I::Active)) {
             return;
         }
         let failed = rec
@@ -35209,8 +35208,7 @@ mod clustered_startup_tests {
     #[tokio::test]
     async fn migrate_process_instances_batch_operation_migrates_and_records_failures() {
         use apis::batch_operation::{
-            GetBatchOperationResponse as GetResp,
-            SearchBatchOperationItemsResponse as ItemsResp,
+            GetBatchOperationResponse as GetResp, SearchBatchOperationItemsResponse as ItemsResp,
         };
         use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
 
@@ -35354,9 +35352,7 @@ mod clustered_startup_tests {
         };
         let failed = items
             .iter()
-            .find(|i| {
-                i.batch_operation_key == batch_key && i.item_key == ineligible.to_string()
-            })
+            .find(|i| i.batch_operation_key == batch_key && i.item_key == ineligible.to_string())
             .expect("ineligible item recorded");
         assert_eq!(failed.state, "FAILED");
         assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
