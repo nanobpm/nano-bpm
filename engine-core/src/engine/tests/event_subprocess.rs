@@ -365,3 +365,50 @@ fn modification_cannot_activate_an_event_subprocess_or_its_descendants() {
         );
     }
 }
+
+#[test]
+fn modification_with_cyclic_containment_does_not_hang() {
+    // A malformed model can declare a containment cycle (`a` contained in `b`,
+    // `b` contained in `a`) — the builder and the ESP validator both accept it
+    // when no event sub-process exists. The ESP ancestor walk in
+    // `plan_modification` must be cycle-bounded (it reuses
+    // `element_flow_scope_chain`), or the modification hangs forever before
+    // ever reaching the bounded scope resolver.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("a", "w")
+        .task("b")
+        .end_event("e")
+        .connect("s", "a")
+        .connect("a", "e")
+        .contained_in("a", "b")
+        .contained_in("b", "a")
+        .build()
+        .expect("the builder accepts cyclic containment when no ESP exists");
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with("p", HashMap::new()))
+        .unwrap();
+    let inst = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .unwrap();
+
+    // Terminates (no hang); the outcome itself is unspecified — the model is
+    // malformed — but the modification must return promptly one way or the
+    // other.
+    let _ = engine.apply_command(Command::ModifyInstance {
+        instance_key: inst,
+        activate_instructions: vec![crate::command::ActivateElementInstruction {
+            element_id: "a".into(),
+            ..Default::default()
+        }],
+        terminate_instructions: vec![],
+        terminate_element_ids: vec![],
+        move_instructions: vec![],
+    });
+}
