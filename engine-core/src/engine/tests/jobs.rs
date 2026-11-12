@@ -3108,6 +3108,97 @@ fn job_error_metadata_is_retained_on_engine_state_for_snapshot_recovery() {
 }
 
 #[test]
+fn retries_left_flag_tracks_retry_updates_and_terminal_transitions() {
+    // #1551 review — `has_failed_with_retries_left` describes whether the job is
+    // retry-eligible NOW, not whether its last failure record had retries left:
+    // the process-instance `hasRetriesLeft` filter (search + batch migration)
+    // keys off it, so a stale flag selects or excludes the wrong instances. It
+    // must track `JobRetriesUpdated` in both directions (a retryable failure
+    // drained to 0 stops matching; a parked zero-retry failure topped up starts
+    // matching) and clear on the terminal transitions (a completed or canceled
+    // job is never retry-eligible).
+    //
+    // Direction 1: retryable failure, retries later drained to zero.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "flaky"))
+        .unwrap();
+    assert!(engine.state().jobs[&job_key].has_failed_with_retries_left);
+    engine
+        .apply_command(Command::update_job_retries(job_key, 1))
+        .unwrap();
+    assert!(
+        engine.state().jobs[&job_key].has_failed_with_retries_left,
+        "still retry-eligible with one retry left"
+    );
+    // The command API validates retries >= 1; the drain-to-zero record exists
+    // on the journal (a fail with retries: 0), so drive the reducer directly.
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    state::apply(
+        engine.state_mut(),
+        &Event::JobRetriesUpdated {
+            job_key,
+            instance_key,
+            retries: 0,
+            operation_reference: None,
+        },
+    );
+    assert!(
+        !engine.state().jobs[&job_key].has_failed_with_retries_left,
+        "a failure whose retries were drained to zero must stop matching hasRetriesLeft"
+    );
+
+    // Direction 2: zero-retry failure topped up (the incident-resolution flow).
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 0, "gave up"))
+        .unwrap();
+    assert!(!engine.state().jobs[&job_key].has_failed_with_retries_left);
+    engine
+        .apply_command(Command::update_job_retries(job_key, 3))
+        .unwrap();
+    assert!(
+        engine.state().jobs[&job_key].has_failed_with_retries_left,
+        "a parked zero-retry failure topped up must start matching hasRetriesLeft"
+    );
+
+    // Terminal transitions: a retryable failure that then completes or is
+    // canceled is no longer retry-eligible.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "flaky"))
+        .unwrap();
+    assert!(engine.state().jobs[&job_key].has_failed_with_retries_left);
+    // Re-activate the retryable failure (it returned to the pool) and complete.
+    let job_key = engine.activate_jobs("payment", "w2", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    assert!(
+        !engine.state().jobs[&job_key].has_failed_with_retries_left,
+        "a completed job must not keep matching hasRetriesLeft"
+    );
+
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "flaky"))
+        .unwrap();
+    assert!(engine.state().jobs[&job_key].has_failed_with_retries_left);
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    engine
+        .apply_command(Command::cancel_instance(instance_key))
+        .unwrap();
+    assert!(
+        !engine.state().jobs[&job_key].has_failed_with_retries_left,
+        "a canceled job must not keep matching hasRetriesLeft"
+    );
+}
+
+#[test]
 fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
     // #1328 review — events serialized before `error_message` existed decode with
     // `error_message: None` (serde default). The reducer must then KEEP the job's

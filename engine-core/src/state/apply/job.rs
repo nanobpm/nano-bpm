@@ -332,6 +332,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                // A completed job is no longer retry-eligible (#1551 review):
+                // clear the flag a prior retryable failure set so the
+                // `hasRetriesLeft` filter stops matching it.
+                job.has_failed_with_retries_left = false;
             }
             resync_job_index(state, *job_key);
         }
@@ -374,6 +378,20 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.retries = *retries;
+                // Keep the retries-left flag in sync with the retry update
+                // (#1551 review): it feeds the process-instance `hasRetriesLeft`
+                // filter, so a failure whose retries are later drained to zero
+                // must stop matching and a parked zero-retry failure topped up
+                // (the incident-resolution flow) must start matching. The flag
+                // derives from the failure-bearing states (Failed/Errored) plus
+                // the CURRENT retries: a job that returned to the activatable
+                // pool keeps the flag its retryable failure set (it can only
+                // lose retries here, never gain them), and the engine rejects
+                // retries updates on Completed/Canceled jobs, so a terminal job
+                // can never re-arm it.
+                job.has_failed_with_retries_left = *retries > 0
+                    && (job.has_failed_with_retries_left
+                        || matches!(job.state, JobState::Failed | JobState::Errored));
             }
         }
 
@@ -451,6 +469,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.activated_at = None;
                 job.activation_timeout = None;
                 job.lease_token = None;
+                // A canceled job is no longer retry-eligible (#1551 review):
+                // clear the flag a prior retryable failure set so the
+                // `hasRetriesLeft` filter stops matching it.
+                job.has_failed_with_retries_left = false;
             }
             resync_job_index(state, *job_key);
         }
