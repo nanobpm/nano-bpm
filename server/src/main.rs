@@ -12791,6 +12791,7 @@ impl ServerImpl {
                             &f.variables,
                             variables_index.get(&inst.key),
                         )
+                        && match_instance_tags(&f.tags, &inst.tags)
                 }
             })
             .collect();
@@ -21739,6 +21740,7 @@ impl ServerImpl {
                         &filter.variables,
                         variables_index.get(&inst.key),
                     )
+                    && match_instance_tags(&filter.tags, &inst.tags)
             })
             .map(|inst| inst.key)
             .collect();
@@ -22682,6 +22684,22 @@ fn match_instance_variables(
             let value = vars.and_then(|m| m.get(&entry.name)).map(String::as_str);
             query::match_string_property(&entry.value, value)
         }),
+    }
+}
+
+/// Matches the `tags` filter against an instance's carried tags. Every
+/// requested tag must be present on the instance (AND semantics — a tag set
+/// constrains to instances carrying the whole set, Camunda-style). An empty
+/// filter set matches everything; an instance with no tags matches only an
+/// absent/empty filter, never a non-empty one (so the field is honoured, not
+/// silently ignored — the class that let a `tags: ["canary"]` migration select
+/// untagged instances, #1551 review).
+fn match_instance_tags(filter: &Option<Vec<models::Tag>>, instance_tags: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(tags) => tags
+            .iter()
+            .all(|want| instance_tags.iter().any(|have| have == &want.0)),
     }
 }
 
@@ -47241,6 +47259,125 @@ mod batch_operation_tests {
     }
 
     #[tokio::test]
+    async fn executor_honours_suspend_resume_and_cancel_between_items() {
+        // #1551 review (execution-level coverage): the batch executor
+        // (`drive_process_instance_batch`) must honour the lifecycle *between*
+        // items — suspension blocks the next item, resumption continues
+        // processing, and cancellation leaves the remaining items unprocessed
+        // without the final `finish` overwriting CANCELED. The store-level state
+        // machine is covered above; this drives the real executor loop with a
+        // gated per-item closure so the behaviour is pinned deterministically.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = ServerImpl::default();
+        // A gate the executor must wait on before applying each item, so the
+        // test controls exactly when item N is processed.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let apply_gate = gate.clone();
+        let apply_started = started.clone();
+        let key = server.drive_process_instance_batch(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![1, 2, 3],
+            move |_server, _item| {
+                let gate = apply_gate.clone();
+                let started = apply_started.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    // Park until the test releases this item.
+                    gate.notified().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // Poll the store until `want` items have been *started* (bounded).
+        let wait_started = |want: usize| {
+            let started = started.clone();
+            async move {
+                for _ in 0..200 {
+                    if started.load(Ordering::SeqCst) >= want {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("timed out waiting for {want} item(s) to start");
+            }
+        };
+        let state = |k: u64| server.batch_operations.state(k);
+
+        // --- Suspend before the first item: nothing may start. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        // Give the executor ample opportunity to (incorrectly) start item 1.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "a suspended batch must not start any item"
+        );
+
+        // --- Resume: item 1 starts; release it and let it complete. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Active);
+        wait_started(1).await;
+        gate.notify_one();
+        // Wait for item 1 to be recorded COMPLETED and item 2 to start.
+        wait_started(2).await;
+
+        // --- Suspend again: item 2 is parked on the gate; even after releasing
+        // the gate the executor must not start item 3 while suspended. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        gate.notify_one(); // release item 2
+        // Item 2 completes, then the executor parks on the suspended state.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a re-suspended batch must not start item 3"
+        );
+
+        // --- Cancel while suspended: item 3 never starts, and the terminal
+        // CANCELED state is not overwritten by finish(). ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Canceled);
+        // The executor is parked in its suspend-poll; the next poll observes the
+        // terminal CANCELED state and returns (the `_ => return` arm), so the
+        // loop exits without driving item 3 or reaching finish(). Give it time
+        // to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a canceled batch must not start the remaining item"
+        );
+        assert_eq!(
+            state(key),
+            Some(models::BatchOperationStateEnum::Canceled),
+            "finish() must not overwrite the terminal CANCELED state"
+        );
+
+        // The two processed items are COMPLETED; the unprocessed item stays
+        // ACTIVE (never driven to a terminal item state).
+        let rec = server.batch_operations.get(key).expect("batch present");
+        let item_state = |k: u64| rec.items.iter().find(|i| i.item_key == k).map(|i| i.state);
+        use models::BatchOperationItemStateEnum as I;
+        assert!(matches!(item_state(1), Some(I::Completed)));
+        assert!(matches!(item_state(2), Some(I::Completed)));
+        assert!(
+            matches!(item_state(3), Some(I::Active)),
+            "the unprocessed item stays ACTIVE, never completed/failed"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_and_unknown_keys_map_to_400_and_404() {
         use apis::batch_operation::GetBatchOperationResponse as GetResp;
         use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
@@ -47502,6 +47639,114 @@ mod search_process_instances_variable_filter_tests {
             keys(&matched),
             vec!["1".to_string(), "2".to_string(), "3".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_tags_filter_tests {
+    //! Regression coverage for the `tags` filter on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler
+    //! previously parsed `filter.tags` off the wire and discarded it, returning
+    //! the full unfiltered set — the same silent-broadening failure mode the
+    //! batch matcher had. These drive the actual handler against a populated
+    //! read model so the predicate can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created_with_tags(instance_key: u64, tags: &[&str]) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn tag_filter(tags: &[&str]) -> models::ProcessInstanceFilter {
+        models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        }
+    }
+
+    fn keys(result: &models::ProcessInstanceSearchQueryResult) -> Vec<String> {
+        let mut ks: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    fn seed(server: &ServerImpl) {
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tag_filter_isolates_matching_instances() {
+        let server = ServerImpl::default();
+        seed(&server);
+
+        // Baseline: no filter returns every seeded instance.
+        let all = run(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 4, "baseline should see all instances");
+
+        // The tag filter narrows to exactly the instances carrying `canary` —
+        // not the full set (the pre-fix bug returned all 4).
+        let matched = run(&server, tag_filter(&["canary"])).await;
+        assert_eq!(matched.page.total_items, 2);
+        assert_eq!(keys(&matched), vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multiple_tags_are_anded() {
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["canary", "blue"])).await;
+        assert_eq!(matched.page.total_items, 1);
+        assert_eq!(keys(&matched), vec!["2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn absent_tag_fails_honestly() {
+        // A tag no instance carries must exclude everything rather than being
+        // silently ignored.
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["ghost"])).await;
+        assert_eq!(matched.page.total_items, 0);
     }
 }
 
@@ -50085,6 +50330,90 @@ mod call_activity_hierarchy_read_model_tests {
             assert!(
                 none.is_empty(),
                 "an absent variable name fails honestly (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_tags_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.tags` against
+        // each instance's carried tags — dropping it silently *broadens* the
+        // batch (a migration filtered to `tags = ["canary"]` would also migrate
+        // every untagged ACTIVE instance). Seeds the read model directly (same
+        // pattern as the variable-filter test above) and drives the matcher both
+        // batch operations consume, so the predicate cannot silently regress for
+        // cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+
+        let tag_filter = |tags: &[&str]| models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no tag filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // A single tag narrows to exactly the instances carrying it — not
+            // the full set (the pre-fix matcher ignored `tags` and returned all
+            // 4).
+            let matched =
+                server.batch_matched_process_instances(&tag_filter(&["canary"]), honour_hierarchy);
+            assert_eq!(
+                matched,
+                vec![1, 2],
+                "batch matcher honours the tags filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // Multiple tags are ANDed: only the instance carrying the whole set
+            // matches.
+            let all_tags = server.batch_matched_process_instances(
+                &tag_filter(&["canary", "blue"]),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                all_tags,
+                vec![2],
+                "multiple tags are ANDed (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A tag no instance carries excludes everything (matched against an
+            // absent tag) rather than being ignored.
+            let none =
+                server.batch_matched_process_instances(&tag_filter(&["ghost"]), honour_hierarchy);
+            assert!(
+                none.is_empty(),
+                "an absent tag fails honestly (honour_hierarchy={honour_hierarchy:?})"
             );
         }
     }
