@@ -997,8 +997,9 @@ fn migration_deletes_the_armed_timer_of_an_unmapped_boundary_event() {
 fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
     // #1374: boundary events and embedded sub-processes are migratable (their
     // runtime is planned in `engine/migration.rs`), so no boundary kind and no
-    // sub-process may be rejected by the element-class guard any more. Call
-    // activities and event-based gateways stay rejected until their slice lands.
+    // sub-process may be rejected by the element-class guard any more; #1553
+    // added call activities (the child instance keeps its parent link).
+    // Event-based gateways stay rejected until their slice lands.
     use crate::model::ElementKind;
     let supported = [
         ElementKind::ErrorBoundaryEvent {
@@ -1034,6 +1035,11 @@ fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
         },
         ElementKind::SubProcess {
             start_event: "s".to_string(),
+        },
+        ElementKind::CallActivity {
+            called_process_id: "callee".to_string(),
+            propagate_all_parent_variables: true,
+            propagate_all_child_variables: true,
         },
     ];
     for kind in supported {
@@ -1300,4 +1306,464 @@ fn migration_rejects_instance_with_compensation_runtime() {
         ),
         "got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #1553 — migration of an active call activity (Zeebe `MigrateCallActivityTest`
+// parity): the parent's call-activity element instance is remapped; the child
+// process instance is untouched and keeps its parent link, so its completion
+// still releases the parent's (now remapped) call-activity token, which
+// continues on the TARGET model.
+// ---------------------------------------------------------------------------
+
+/// A call-activity parent `id`: start -> `call` (calling `callee`) -> `after`
+/// (a service task on job type `after-work`) -> end. Naming the trailing task
+/// per-model lets a test prove the parent continued on the TARGET's flow.
+fn call_activity_parent(id: &str, call: &str, callee: &str, after: &str) -> ProcessDefinition {
+    ProcessBuilder::new(id)
+        .start_event("start")
+        .call_activity(call, callee)
+        .service_task(after, "after-work")
+        .end_event("end")
+        .connect("start", call)
+        .connect(call, after)
+        .connect(after, "end")
+        .build()
+        .unwrap()
+}
+
+/// Creates an instance of `parent_id` parked in its call activity and returns
+/// `(parent_instance_key, call_eik, child_instance_key)`.
+fn create_calling_instance(
+    engine: &mut Engine,
+    parent_id: &str,
+    call: &str,
+    callee_id: &str,
+) -> (Key, Key, Key) {
+    let created = engine
+        .apply_command(Command::create_instance(parent_id))
+        .unwrap();
+    let parent = parent_key_of(&created, parent_id);
+    let call_eik = active_eik_of(engine, parent, call);
+    let child = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                parent_process_instance_key,
+                parent_element_instance_key,
+                ..
+            } if process_id == callee_id => Some((
+                *instance_key,
+                *parent_process_instance_key,
+                *parent_element_instance_key,
+            )),
+            _ => None,
+        })
+        .map(|(key, ppik, peik)| {
+            assert_eq!(ppik, Some(parent), "child links back to the parent");
+            assert_eq!(
+                peik,
+                Some(call_eik),
+                "child links back to the call activity"
+            );
+            key
+        })
+        .expect("a child instance of the callee was created");
+    (parent, call_eik, child)
+}
+
+#[test]
+fn migration_remaps_active_call_activity_and_keeps_child_attached() {
+    // Zeebe `MigrateCallActivityTest.shouldMigrateCallActivity` /
+    // `shouldAllowToContinueFlowAfterMigratingParentProcessInstance`: an
+    // instance waiting in call activity `a` migrates onto a target whose call
+    // activity is `b` (calling the same child). The child instance is NOT
+    // migrated — it stays on its own definition and keeps its parent link;
+    // when it completes afterwards, the parent's remapped token completes and
+    // takes the TARGET's outgoing flow.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, phase_process("child", "child-work"));
+    deploy_for_migration(
+        &mut engine,
+        call_activity_parent("source", "a", "child", "done_a"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        call_activity_parent("target", "b", "child", "done_b"),
+    );
+
+    let (parent, call_eik, child) = create_calling_instance(&mut engine, "source", "a", "child");
+    assert_eq!(
+        engine.instance(child).unwrap().process_id,
+        "child",
+        "precondition: the child runs the callee definition"
+    );
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            parent,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+
+    // The migration fact names the kept-attached child (Zeebe's
+    // `childInstanceKeys` audit on `ProcessInstanceMigrated`).
+    let migrated = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceMigrated {
+                child_instances, ..
+            } => Some(child_instances.clone()),
+            _ => None,
+        })
+        .expect("a ProcessInstanceMigrated fact is emitted");
+    assert_eq!(
+        migrated,
+        vec![crate::event::MigratedChildInstance {
+            call_activity_element_instance_key: call_eik,
+            child_instance_key: child,
+            target_element_id: "b".to_string(),
+        }],
+        "the child instance is reported as kept attached to the migrated call activity"
+    );
+
+    // The parent's token moved to the target call activity; the child is
+    // untouched — same instance, same definition, same parent linkage.
+    let instance = engine.instance(parent).unwrap();
+    assert_eq!(instance.process_id, "target");
+    assert_eq!(
+        instance.process_definition_key, target_key,
+        "the parent is re-pinned to the target definition"
+    );
+    assert_eq!(
+        instance.active.get(&call_eik).map(String::as_str),
+        Some("b")
+    );
+    let child_instance = engine.instance(child).unwrap();
+    assert_eq!(child_instance.process_id, "child");
+    assert_eq!(child_instance.parent_process_instance_key, Some(parent));
+    assert_eq!(
+        child_instance.parent_element_instance_key,
+        Some(call_eik),
+        "the child keeps its parent link across the migration"
+    );
+
+    // The child completes afterwards; the parent's remapped call-activity token
+    // is released and continues on the TARGET model (`b -> done_b`), running the
+    // parent to completion under its new definition.
+    let events = complete_one(&mut engine, "child-work");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceCompleted { instance_key } if *instance_key == child
+        )),
+        "the child instance completed"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "b" && to == "done_b"
+        )),
+        "the parent continues on the target model's flow out of the remapped call activity"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ElementActivated { element_id, .. } if element_id == "done_b"
+        )),
+        "the target's follow-up task is activated"
+    );
+    complete_one(&mut engine, "after-work");
+    assert!(
+        engine.is_completed(parent),
+        "the parent completes under the target definition"
+    );
+}
+
+#[test]
+fn migration_of_call_activity_survives_replay() {
+    // The migration is journaled: replaying the log must rebuild the remapped
+    // parent AND the untouched child link, so a child completing after a
+    // snapshot/restart still releases the parent's parked token.
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    for def in [
+        phase_process("child", "child-work"),
+        call_activity_parent("source", "a", "child", "done_a"),
+        call_activity_parent("target", "b", "child", "done_b"),
+    ] {
+        log.extend(engine.apply_command(Command::DeployProcess(def)).unwrap());
+    }
+    let target_key = {
+        let mut k = None;
+        for e in &log {
+            if let Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } = e
+            {
+                k = Some(*process_definition_key);
+            }
+        }
+        k.unwrap()
+    };
+
+    let created = engine
+        .apply_command(Command::create_instance("source"))
+        .unwrap();
+    let parent = parent_key_of(&created, "source");
+    let child = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                ..
+            } if process_id == "child" => Some(*instance_key),
+            _ => None,
+        })
+        .expect("child created");
+    log.extend(created);
+    log.extend(
+        engine
+            .apply_command(Command::migrate_instance(
+                parent,
+                target_key,
+                vec![("a".to_string(), "b".to_string())],
+            ))
+            .unwrap(),
+    );
+
+    // Replay from the journal: the rebuilt engine must hold the migrated state.
+    let mut recovered = Engine::replay(log);
+    let instance = recovered.instance(parent).unwrap();
+    assert_eq!(instance.process_id, "target");
+    assert!(instance.active.values().any(|e| e == "b"));
+    let child_instance = recovered.instance(child).unwrap();
+    assert_eq!(child_instance.parent_process_instance_key, Some(parent));
+
+    // And the rebuilt engine drives the completion end to end.
+    let events = complete_one(&mut recovered, "child-work");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "b" && to == "done_b"
+    )));
+    complete_one(&mut recovered, "after-work");
+    assert!(recovered.is_completed(parent));
+}
+
+#[test]
+fn migration_rejects_call_activity_mapped_to_a_non_call_activity() {
+    // Zeebe `MigrateProcessInstanceRejectionTest
+    // .shouldRejectCommandWhenAnyElementsMappedToADifferentBpmnElementType`:
+    // the generic same-type precondition covers call activities too — mapping
+    // the active call activity onto a service task is rejected and nothing is
+    // migrated.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, phase_process("child", "child-work"));
+    deploy_for_migration(
+        &mut engine,
+        call_activity_parent("source", "a", "child", "done_a"),
+    );
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+
+    let (parent, _call_eik, _child) = create_calling_instance(&mut engine, "source", "a", "child");
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            parent,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::MappedElementTypeChanged {
+                source_element_id,
+                target_element_id,
+                ..
+            } if source_element_id == "a" && target_element_id == "b"
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        engine.instance(parent).unwrap().process_id,
+        "source",
+        "the rejection is all-or-nothing: the instance is untouched"
+    );
+}
+
+#[test]
+fn migration_rejects_unmapped_active_call_activity() {
+    // Zeebe `shouldRejectCommandWhenActiveElementIsNotMapped`: every active
+    // element needs a mapping — an active call activity is no exception.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, phase_process("child", "child-work"));
+    deploy_for_migration(
+        &mut engine,
+        call_activity_parent("source", "a", "child", "done_a"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        call_activity_parent("target", "b", "child", "done_b"),
+    );
+
+    let (parent, _call_eik, _child) = create_calling_instance(&mut engine, "source", "a", "child");
+
+    let err = engine
+        .apply_command(Command::migrate_instance(parent, target_key, vec![]))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::UnmappedActiveElement {
+            instance_key: parent,
+            element_id: "a".to_string(),
+        }
+    );
+}
+
+#[test]
+fn migration_rejects_call_activity_flow_scope_change() {
+    // Zeebe `requireUnchangedFlowScope`: the mapped target call activity must
+    // sit in the mapped target of the source call activity's flow scope — a
+    // target whose call activity moved inside a sub-process is rejected.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, phase_process("child", "child-work"));
+    deploy_for_migration(
+        &mut engine,
+        call_activity_parent("source", "a", "child", "done_a"),
+    );
+    // Target: the call activity `b` lives INSIDE sub-process `sub`.
+    let target = ProcessBuilder::new("target")
+        .start_event("start")
+        .sub_process("sub", "s_start")
+        .start_event("s_start")
+        .contained_in("s_start", "sub")
+        .call_activity("b", "child")
+        .contained_in("b", "sub")
+        .end_event("s_end")
+        .contained_in("s_end", "sub")
+        .end_event("end")
+        .connect("start", "sub")
+        .connect("s_start", "b")
+        .connect("b", "s_end")
+        .connect("sub", "end")
+        .build()
+        .unwrap();
+    let target_key = deploy_for_migration(&mut engine, target);
+
+    let (parent, _call_eik, _child) = create_calling_instance(&mut engine, "source", "a", "child");
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            parent,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::MigrationFlowScopeChanged { element_id, .. } if element_id == "a"
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(engine.instance(parent).unwrap().process_id, "source");
+}
+
+#[test]
+fn migration_of_call_activity_with_spawn_incident_redrives_against_the_target() {
+    // Zeebe `MigrateCallActivityTest.shouldMigrateCallActivityWithIncident`: a
+    // call activity parked on a recoverable spawn incident (unknown callee)
+    // migrates with its incident; the incident is re-pointed at the target
+    // element, and resolving it re-drives the spawn against the TARGET
+    // definition's `calledElement` (#1381's element-scoped retry resolves the
+    // callee id through `element_kind`, which reads the migrated definition).
+    let mut engine = Engine::new();
+    // The source calls a callee that does not exist; the target calls one that
+    // does — resolving the parked incident after migration must spawn it.
+    deploy_for_migration(
+        &mut engine,
+        call_activity_parent("source", "a", "missing", "done_a"),
+    );
+    deploy_for_migration(&mut engine, phase_process("child", "child-work"));
+    let target_key = deploy_for_migration(
+        &mut engine,
+        call_activity_parent("target", "b", "child", "done_b"),
+    );
+
+    let created = engine
+        .apply_command(Command::create_instance("source"))
+        .unwrap();
+    let parent = parent_key_of(&created, "source");
+    let call_eik = active_eik_of(&engine, parent, "a");
+    // No child was created; the call activity is parked on a CalledElementError.
+    assert!(engine
+        .instance(parent)
+        .unwrap()
+        .active
+        .values()
+        .any(|e| e == "a"));
+    let incident_key = engine
+        .state()
+        .incidents
+        .values()
+        .find(|i| {
+            i.instance_key == parent
+                && i.element_instance_key == call_eik
+                && i.state == state::IncidentState::Active
+        })
+        .map(|i| i.key)
+        .expect("a spawn incident is parked on the call activity");
+
+    engine
+        .apply_command(Command::migrate_instance(
+            parent,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+
+    // The incident moved with the element (Zeebe's IncidentIntent.MIGRATED).
+    let incident = &engine.state().incidents[&incident_key];
+    assert_eq!(incident.element_id, "b");
+    assert_eq!(incident.state, state::IncidentState::Active);
+    // No child yet — the incident only re-points, it does not spawn.
+    assert!(engine
+        .state()
+        .instances
+        .values()
+        .all(|i| i.parent_process_instance_key != Some(parent)));
+
+    // Resolving it re-drives the spawn against the TARGET's callee (`child`):
+    // the child is created, linked to the remapped call activity, and its
+    // completion releases the parent onto the target's flow.
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let child = engine
+        .state()
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key == Some(parent))
+        .map(|i| i.key)
+        .expect("resolving the incident spawned the target's callee");
+    assert_eq!(engine.instance(child).unwrap().process_id, "child");
+    assert_eq!(
+        engine.instance(child).unwrap().parent_element_instance_key,
+        Some(call_eik)
+    );
+
+    let events = complete_one(&mut engine, "child-work");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "b" && to == "done_b"
+    )));
+    complete_one(&mut engine, "after-work");
+    assert!(engine.is_completed(parent));
 }
