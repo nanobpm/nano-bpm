@@ -110,12 +110,15 @@ impl Engine {
             } => (*job_key, attribution),
             _ => return,
         };
+        let job = self.state.jobs.get(&job_key);
         *attribution = Some(JobAttribution {
-            worker: self
-                .state
-                .jobs
-                .get(&job_key)
-                .and_then(|job| job.attribution_worker()),
+            worker: job.and_then(|job| job.attribution_worker()),
+            // The proposer's live lock (soft or durable) — or, for an already
+            // terminal job, its retained first-terminal deadline (#1494).
+            deadline: job.and_then(|job| match job.terminal_end {
+                Some(end) => end.deadline,
+                None => job.deadline,
+            }),
         });
     }
 
@@ -662,8 +665,9 @@ impl Engine {
     /// lock is journaled and therefore identical on every replica. A
     /// leader-local (soft) activation is unreplicated by design (ADR 0002): its
     /// deadline is replica-local, so a soft job records NO terminal deadline
-    /// (`None`). Making terminal metadata authoritative for soft jobs is the
-    /// architectural follow-up tracked in #963.
+    /// (`None`) — UNLESS the command terminating it carries the proposer's
+    /// stamp ([`crate::JobAttribution::deadline`], #1494), which is replicated
+    /// and therefore authoritative on every replica.
     ///
     /// The retained first-terminal record is checked BEFORE the live lease:
     /// `JobCompleted` clears `job.deadline` but leaves `job.lease_token`
@@ -676,14 +680,26 @@ impl Engine {
         let job = self.state.jobs.get(&job_key)?;
         if let Some(terminal_end) = job.terminal_end {
             // Already terminal: only the retained first-terminal record (itself
-            // replicated) is authoritative — the live lock is cleared.
-            terminal_end.deadline
+            // replicated) is authoritative — the live lock is cleared, and
+            // first-terminal-wins over any stamp.
+            return terminal_end.deadline;
+        }
+        let stamped = self
+            .terminal_deadline_stamp
+            .filter(|(stamped_key, _)| *stamped_key == job_key)
+            .and_then(|(_, deadline)| deadline);
+        if stamped.is_some() {
+            // The current command's proposer-stamped deadline (#1494): carried
+            // on the replicated command, so identical on every replica even
+            // for a soft lock this replica never saw.
+            stamped
         } else if job.lease_token.is_some() {
             // A durable (journaled) lease: the lock is replicated, so its
             // deadline is identical on every replica.
             job.deadline
         } else {
-            // A soft (leader-local) activation: nothing replicated to restate.
+            // An unstamped soft (leader-local) activation: nothing replicated
+            // to restate.
             None
         }
     }

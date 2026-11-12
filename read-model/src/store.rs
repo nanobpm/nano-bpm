@@ -1067,6 +1067,18 @@ fn terminal_instant(event_at: u64, now_ms: u64) -> u64 {
     if event_at != 0 { event_at } else { now_ms }
 }
 
+/// The single backward-clock policy for a job's `creationTime` (#1494), shared
+/// by the event-driven terminal projection (`MIN(created_at_ms, terminal)` in
+/// the `JobCompleted`/`JobCanceled` SQL) and the snapshot reseed: the engine
+/// does not enforce clock monotonicity, so a creation recorded after the
+/// terminal instant (backward clock adjustment, or a legacy batch-time
+/// fallback) is bounded by that instant. `creationTime <= endTime` therefore
+/// holds on both paths, and they agree. A live (non-terminal) job keeps its
+/// recorded creation.
+fn bounded_creation(created_ms: u64, end_ms: Option<u64>) -> u64 {
+    end_ms.map_or(created_ms, |end| created_ms.min(end))
+}
+
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
     match kind {
         JobKind::BpmnElement => (0, 0),
@@ -4214,7 +4226,7 @@ fn project_engine_state(
         } else {
             end_ms.unwrap_or(now_ms)
         };
-        let creation_ms = last_update;
+        let creation_ms = bounded_creation(last_update, end_ms);
         let last_update = end_ms.unwrap_or(last_update);
         let deadline = job.deadline.or(terminal_end.and_then(|t| t.deadline));
         let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
@@ -4232,6 +4244,8 @@ fn project_engine_state(
              error_code = excluded.error_code, \
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
              end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
+             created_at_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
+                 THEN MIN(jobs.created_at_ms, excluded.end_ms) ELSE jobs.created_at_ms END, \
              last_update_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
                  THEN excluded.last_update_ms ELSE jobs.last_update_ms END, \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
@@ -5663,17 +5677,17 @@ fn project_event(
             // (`?6`); only a pre-field record (`completed_at == 0`, `?5 == 0`)
             // falls back to keeping the row's value.
             //
-            // `created_at_ms` is NOT clamped here (#1440 review): the engine
-            // stamps `JobCreated.created_at` and `JobCompleted.completed_at`
-            // from the same wall clock without enforcing monotonicity, so a
-            // backward clock adjustment can leave a GENUINE creation after the
-            // completion instant. Clamping would rewrite that real creation
-            // timestamp and diverge from a snapshot reseed (which preserves
-            // `job.created_at`). The projection therefore keeps the recorded
-            // creation, matching the reseed; a single backward-clock policy for
-            // BOTH paths is part of the #963 follow-up.
+            // Backward-clock policy (#1494, shared with the snapshot reseed via
+            // `bounded_creation`): the engine stamps `JobCreated.created_at` and
+            // the terminal instant from the same wall clock without enforcing
+            // monotonicity, so a backward clock adjustment (or a legacy
+            // batch-time creation fallback) can leave creation AFTER the
+            // terminal instant. BOTH paths bound creation by the terminal
+            // instant at the first terminal transition, so `creationTime <=
+            // endTime` always holds and live and reseeded rows agree.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?4) ELSE created_at_ms END, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
@@ -5698,12 +5712,13 @@ fn project_event(
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
             // Instant and deadline come from the event exactly as for
             // `JobCompleted` (#1440) — including the modern-record deadline
-            // authority — and `created_at_ms` is likewise NOT clamped (see
-            // there). Guard on the first terminal transition so a re-delivery
+            // authority and the shared backward-clock creation bound (#1494,
+            // see there). Guard on the first terminal transition so a re-delivery
             // is a no-op; a job that was already FAILED/ERRORED (no `end_ms`)
             // still gets its cancellation `endTime` here (#1344).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?3) ELSE created_at_ms END, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
@@ -8517,8 +8532,67 @@ mod definition_xml_tests {
         legacy.created_at = 0;
         state.jobs.insert(8_601, legacy);
 
+        // A GENUINE creation recorded after the terminal instant (backward
+        // clock adjustment, #1494): bounded by the terminal instant under the
+        // single backward-clock policy shared with the event projection.
+        let mut backward = state.jobs.get(&8_600).unwrap().clone();
+        backward.key = 8_602;
+        backward.created_at = 900;
+        state.jobs.insert(8_602, backward);
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
+
+        let backward = job_row(&store, 8_602);
+        assert_eq!(backward.end_ms, Some(600));
+        assert_eq!(
+            backward.created_at_ms, 600,
+            "a backward-clock creation is bounded by endTime on reseed"
+        );
+
+        // The event-driven projection applies the SAME policy (#1494).
+        let projected = ReadStore::open(None).unwrap();
+        apply_at(
+            &projected,
+            &Event::JobCreated {
+                job_key: 8_602,
+                instance_key: 7_600,
+                element_instance_key: 7_601,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 900,
+                priority: 0,
+                retries: 3,
+            },
+            900,
+        );
+        apply_at(
+            &projected,
+            &Event::JobCompleted {
+                job_key: 8_602,
+                instance_key: 7_600,
+                created_at: 900,
+                job_type: "worker".to_string(),
+                worker: None,
+                completed_at: 600,
+                deadline: Some(70_000),
+            },
+            950,
+        );
+        let projected = job_row(&projected, 8_602);
+        assert_eq!(
+            (
+                projected.created_at_ms,
+                projected.end_ms,
+                projected.last_update_ms
+            ),
+            (
+                backward.created_at_ms,
+                backward.end_ms,
+                backward.last_update_ms
+            ),
+            "event projection and reseed agree on a backward clock"
+        );
 
         let legacy = job_row(&store, 8_601);
         assert_eq!(legacy.end_ms, Some(600));
@@ -13525,13 +13599,9 @@ mod read_surface_tests {
     /// Defect-class guard (#1440 review): a MIXED-VERSION replay projects a
     /// legacy `JobCreated` (`created_at == 0`) at its batch observation time,
     /// then a MODERN terminal event whose command instant is EARLIER (export
-    /// lag). The projection must NOT clamp the recorded creation down to the
-    /// terminal instant: the engine stamps both from the same wall clock without
-    /// enforcing monotonicity, so a backward clock adjustment can leave a
-    /// genuine creation after the terminal instant, and clamping would rewrite
-    /// it and diverge from a snapshot reseed (which preserves `job.created_at`).
-    /// The projection keeps the recorded creation, matching the reseed; a single
-    /// backward-clock policy for both paths is part of the #963 follow-up. A
+    /// lag). Under the single backward-clock policy (#1494, `bounded_creation`)
+    /// BOTH the projection and the snapshot reseed bound creation by the
+    /// terminal instant, so `creationTime <= endTime` holds and they agree. A
     /// re-delivery of the terminal event must stay a no-op. Both terminal
     /// projectors share the class.
     #[test]
@@ -13582,18 +13652,11 @@ mod read_surface_tests {
             let row = job_row(&store, 8350);
             assert_eq!(row.state, want_state);
             assert_eq!(row.end_ms, Some(5_000));
-            // The projection does NOT clamp creation down to the terminal
-            // instant (#1440 review): the engine stamps `JobCreated.created_at`
-            // and the terminal instant from the same wall clock without
-            // enforcing monotonicity, so a backward clock adjustment can leave
-            // a genuine creation after the terminal instant. Clamping would
-            // rewrite that real timestamp and diverge from a snapshot reseed
-            // (which preserves `job.created_at`). The projection keeps the
-            // recorded creation, matching the reseed; a single backward-clock
-            // policy for both paths is part of the #963 follow-up.
+            // Creation is bounded by the terminal instant (#1494), exactly
+            // as the snapshot reseed seeds it.
             assert_eq!(
-                row.created_at_ms, 9_000,
-                "creation is preserved (not clamped), matching the snapshot reseed"
+                row.created_at_ms, 5_000,
+                "creation bounded by the terminal instant, matching the reseed"
             );
             assert_eq!(row.last_update_ms, Some(5_000));
 
@@ -13601,7 +13664,7 @@ mod read_surface_tests {
             // guarded by `end_ms IS NULL`).
             apply_at(&store, &terminal, 9_900);
             let again = job_row(&store, 8350);
-            assert_eq!(again.created_at_ms, 9_000);
+            assert_eq!(again.created_at_ms, 5_000);
             assert_eq!(again.end_ms, Some(5_000));
             assert_eq!(again.last_update_ms, Some(5_000));
         }

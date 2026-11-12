@@ -190,6 +190,13 @@ pub struct Engine {
     /// snapshot, so it never affects replay/snapshot determinism. Defaults to
     /// `false` — the strict single-node/RF=1 behaviour is unchanged.
     lenient_completion: bool,
+    /// The current command's proposer-stamped terminal deadline (#1494):
+    /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
+    /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
+    /// at the [`Engine::emit`] choke point. Per-command scratch: reset by every
+    /// `plan_command_at`, so a rejected command's stamp can never leak into a
+    /// later one. Never snapshotted.
+    terminal_deadline_stamp: Option<(Key, Option<u64>)>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -615,6 +622,7 @@ impl Engine {
             now: 0,
             start_dispatch_rr: 0,
             lenient_completion: false,
+            terminal_deadline_stamp: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -773,6 +781,7 @@ impl Engine {
             now: 0,
             start_dispatch_rr,
             lenient_completion: false,
+            terminal_deadline_stamp: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -2115,6 +2124,26 @@ impl Engine {
         // scope invalidated by a previous command's terminate must not leak into
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
+        // Per-command terminal-deadline stamp (#1494): set from THIS command
+        // only (or cleared), never inherited from a previous one.
+        self.terminal_deadline_stamp = match &command {
+            Command::CompleteJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::FailJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::ThrowJobError {
+                job_key,
+                attribution,
+                ..
+            } => attribution.as_ref().map(|a| (*job_key, a.deadline)),
+            _ => None,
+        };
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -15318,14 +15347,12 @@ impl Engine {
         // last lock deadline identically, and no site can drift to reading
         // replica-local state directly.
         //
-        // A terminal event carries a deadline ONLY for a DURABLE (leased)
-        // activation — one whose lock is journaled and therefore identical on
-        // every replica. A leader-local (soft) activation is unreplicated by
-        // design (ADR 0002): a follower never sees it, so a soft job's deadline
-        // is replica-local and a terminal event stamped from it would diverge
-        // across replicas. Soft jobs therefore record NO deadline. Making
-        // terminal metadata authoritative for soft jobs is the architectural
-        // follow-up tracked in #963 — do NOT stamp a soft deadline here.
+        // A terminal event carries a deadline ONLY from replicated inputs: a
+        // DURABLE (leased) activation, whose lock is journaled, or the
+        // proposer's stamp on the terminating command (#1494). A leader-local
+        // (soft) activation is unreplicated by design (ADR 0002), so an
+        // UNSTAMPED soft job records NO deadline — never read the replica-local
+        // soft lock here, or replicas diverge.
         let event = match event {
             Event::JobCompleted {
                 job_key,

@@ -7,7 +7,6 @@
 //! soft state — otherwise leader and follower persist different terminal
 //! events for the same log entry.
 use super::*;
-#[cfg(feature = "serde")]
 use crate::JobAttribution;
 
 /// A leader and a lenient follower that both applied the same replicated
@@ -208,10 +207,129 @@ fn the_attribution_stamp_round_trips_and_unstamped_stays_byte_identical() {
         if let Command::FailJob { attribution, .. } = &mut stamped {
             *attribution = Some(JobAttribution {
                 worker: worker.clone(),
+                deadline: None,
             });
         }
         let json = serde_json::to_string(&stamped).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(back, stamped, "stamp {worker:?} round-trips");
     }
+}
+
+fn terminal_deadline(events: &[Event], job_key: Key) -> Option<Option<u64>> {
+    events.iter().find_map(|e| match e {
+        Event::JobCompleted {
+            job_key: k,
+            deadline,
+            ..
+        }
+        | Event::JobCanceled {
+            job_key: k,
+            deadline,
+            ..
+        } if *k == job_key => Some(*deadline),
+        _ => None,
+    })
+}
+
+/// #1494: a SOFT (leader-local) job's terminal deadline is stamped by the
+/// proposer, so `JobCompleted.deadline` and the retained `Job::terminal_end`
+/// agree on every replica — and carry the real lock deadline, not `None`.
+#[test]
+fn a_soft_jobs_stamped_terminal_deadline_agrees_on_every_replica() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let lock = leader.state().jobs[&job_key].deadline;
+    assert_eq!(lock, Some(1_000), "leader holds the soft lock");
+    assert_eq!(follower.state().jobs[&job_key].deadline, None);
+
+    let mut command = Command::complete_job(job_key);
+    leader.stamp_terminal_attribution(&mut command);
+    let on_leader = leader.apply_command(command.clone()).unwrap();
+    let on_follower = follower.apply_command(command).unwrap();
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(lock));
+    assert_eq!(
+        terminal_deadline(&on_follower, job_key),
+        Some(lock),
+        "follower persists the leader-stamped deadline"
+    );
+    assert_eq!(
+        leader.job_terminal_deadline(job_key),
+        follower.job_terminal_deadline(job_key)
+    );
+}
+
+/// An UNSTAMPED (legacy) command never reads replica-local soft state for the
+/// deadline: leader and follower both record `None`, exactly as before.
+#[test]
+fn an_unstamped_completion_records_no_soft_deadline_on_any_replica() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let command = Command::complete_job(job_key);
+    let on_leader = leader.apply_command(command.clone()).unwrap();
+    let on_follower = follower.apply_command(command).unwrap();
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(None));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(None));
+}
+
+/// A stale stamp from a REJECTED command must not leak into a later command
+/// that terminates the same job (the stamp is per-command scratch).
+#[test]
+fn a_rejected_stamped_command_does_not_leak_its_deadline() {
+    // A strict engine (no lenient completion) rejects completing a job that
+    // was never activated — after the stamp was installed for this command.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+    let mut bad = Command::complete_job(job_key);
+    if let Command::CompleteJob { attribution, .. } = &mut bad {
+        *attribution = Some(JobAttribution {
+            worker: None,
+            deadline: Some(999),
+        });
+    }
+    assert!(engine.apply_command(bad).is_err());
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    let events = engine
+        .apply_command(Command::CancelInstance { instance_key })
+        .unwrap();
+    assert_eq!(terminal_deadline(&events, job_key), Some(None));
+}
+
+/// Defect-class guard (#1494 item 2): a cancel cascade (`CancelInstance`)
+/// terminating a SOFT job derives its metadata from replicated state only, so
+/// leader (holding the soft lock) and follower (not) persist identical events.
+#[test]
+fn a_cancel_cascade_of_a_soft_job_is_replica_identical() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+    let cancel = Command::CancelInstance { instance_key };
+    let on_leader = leader.apply_command(cancel.clone()).unwrap();
+    let on_follower = follower.apply_command(cancel).unwrap();
+    assert_eq!(on_leader, on_follower);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn the_deadline_stamp_round_trips_and_a_pre_deadline_stamp_still_decodes() {
+    let mut stamped = Command::complete_job(7);
+    if let Command::CompleteJob { attribution, .. } = &mut stamped {
+        *attribution = Some(JobAttribution {
+            worker: Some("W".into()),
+            deadline: Some(1_000),
+        });
+    }
+    let json = serde_json::to_string(&stamped).unwrap();
+    assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), stamped);
+
+    let legacy: JobAttribution = serde_json::from_str(r#"{"worker":"W"}"#).unwrap();
+    assert_eq!(legacy.deadline, None, "pre-#1494 stamp decodes additively");
+    let json = serde_json::to_string(&JobAttribution::default()).unwrap();
+    assert!(
+        !json.contains("deadline"),
+        "absent deadline is byte-unchanged"
+    );
 }
