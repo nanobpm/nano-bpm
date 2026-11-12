@@ -12745,13 +12745,12 @@ impl ServerImpl {
 
         // Pre-index the instance's element-instance / job / incident child rows
         // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`).
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
         let cross_index = match filter {
             Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
                 f,
-                &self.store.element_instances(),
-                &self.store.jobs(),
-                &self.store.incidents(),
+                &InstanceCrossEntityIndex::sources_for(f, &self.store),
             ),
             _ => InstanceCrossEntityIndex::default(),
         };
@@ -21721,13 +21720,12 @@ impl ServerImpl {
         };
         // Pre-index the instance's element-instance / job / incident child rows
         // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`).
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
         let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
             InstanceCrossEntityIndex::new(
                 filter,
-                &self.store.element_instances(),
-                &self.store.jobs(),
-                &self.store.incidents(),
+                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
             )
         } else {
             InstanceCrossEntityIndex::default()
@@ -21886,11 +21884,28 @@ impl ServerImpl {
     /// request's `migrationPlan` (via the same [`Self::migrate_instance_core`]
     /// as the single-instance endpoint). Ineligible instances are recorded as
     /// `FAILED` items carrying the engine's rejection reason.
+    ///
+    /// The filter schema (spec/process-instances.yaml) deprecates
+    /// `batchOperationId` in favour of `batchOperationKey` and requires a 400
+    /// when BOTH are supplied; that contract is enforced up front, before any
+    /// batch is minted.
     async fn migrate_process_instances_batch_operation_impl(
         &self,
         body: &models::ProcessInstanceMigrationBatchOperationRequest,
     ) -> Result<apis::process_instance::MigrateProcessInstancesBatchOperationResponse, ()> {
         use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        // The filter schema (spec/process-instances.yaml) deprecates
+        // `batchOperationId` in favour of `batchOperationKey` and requires a
+        // 400 when BOTH are supplied. Enforce that here, before any batch is
+        // minted — the matcher's fail-closed absent-value matching of the two
+        // unprojected fields is not a substitute for the contract validation.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(problem(
+                "INVALID_ARGUMENT",
+                400,
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            )));
+        }
         let target = match crate::falcon::parse_migration_target_key(
             &body.migration_plan.target_process_definition_key.0,
         ) {
@@ -22746,19 +22761,20 @@ fn decision_instance_get_result(
 /// `instance_key` once per query — only when at least one such filter is
 /// actually present, so the common path pays nothing for the extra scans.
 ///
-/// Built lazily via [`InstanceCrossEntityIndex::new`]; the per-field maps are
-/// populated only when the corresponding filter is supplied, mirroring the
-/// `variables_index` construction in `search_process_instances_impl`.
+/// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
+/// (element instances, jobs, incidents) is scanned only when a filter that
+/// reads it is supplied, mirroring the `variables_index` construction in
+/// `search_process_instances_impl`.
 #[derive(Default)]
 struct InstanceCrossEntityIndex {
-    /// `instance_key → element ids of its element instances` (for `elementId`).
-    element_ids: std::collections::HashMap<u64, Vec<String>>,
-    /// `instance_key → element-instance state wire spellings` (for
-    /// `elementInstanceState`).
-    element_states: std::collections::HashMap<u64, Vec<String>>,
-    /// `instance_key → true when any element instance carries an incident` (for
-    /// `hasElementInstanceIncident`).
-    element_has_incident: std::collections::HashMap<u64, bool>,
+    /// `instance_key → its element instances` (for the element predicates).
+    /// The whole row is kept per element — not a per-field map — so the
+    /// `elementId` / `elementInstanceState` / `hasElementInstanceIncident`
+    /// predicates stay correlated: they must hold of the **same** element
+    /// instance, not of three independent rows (a COMPLETED `review` plus an
+    /// ACTIVE `approve` must not satisfy `elementId: "review",
+    /// elementInstanceState: "ACTIVE"`).
+    elements: std::collections::HashMap<u64, Vec<IndexedElement>>,
     /// `instance_key → worker/incident error messages` (for `errorMessage`):
     /// the last `errorMessage` of each failed/errored job plus each incident's
     /// reason — the two places a process-level error message is projected.
@@ -22768,40 +22784,59 @@ struct InstanceCrossEntityIndex {
     has_retries_left: std::collections::HashMap<u64, bool>,
 }
 
+/// One element instance as carried by [`InstanceCrossEntityIndex::elements`].
+struct IndexedElement {
+    element_id: String,
+    /// The element-instance state wire spelling (`ACTIVE` / `COMPLETED` /
+    /// `TERMINATED`).
+    state: String,
+    has_incident: bool,
+}
+
+/// The child-row sources an [`InstanceCrossEntityIndex`] is built from. Each
+/// field is loaded by the caller **only when a supplied filter reads it** (see
+/// [`InstanceCrossEntityIndex::needs_elements`] / `needs_jobs` /
+/// `needs_incidents`), so an `elementId`-only query never materializes the job
+/// or incident tables. `None` sources are treated as empty; construction
+/// asserts the filter only reads sources that were loaded.
+#[derive(Default)]
+struct CrossEntitySources {
+    element_instances: Option<Vec<readstore::ElementInstanceRow>>,
+    jobs: Option<Vec<readstore::JobRow>>,
+    incidents: Option<Vec<readstore::IncidentRow>>,
+}
+
 impl InstanceCrossEntityIndex {
-    /// Builds the index from the read model, populating only the maps the
-    /// supplied `filter` actually constrains on.
-    fn new(
-        filter: &models::ProcessInstanceFilter,
-        element_instances: &[readstore::ElementInstanceRow],
-        jobs: &[readstore::JobRow],
-        incidents: &[readstore::IncidentRow],
-    ) -> Self {
+    /// Builds the index, populating only the maps the supplied `filter`
+    /// actually constrains on and reading only the sources in `sources`.
+    #[allow(
+        clippy::expect_used,
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+    )]
+    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
         let mut idx = InstanceCrossEntityIndex::default();
-        let want_element_ids = filter.element_id.is_some();
-        let want_element_states = filter.element_instance_state.is_some();
-        let want_element_incident = filter.has_element_instance_incident.is_some();
-        if want_element_ids || want_element_states || want_element_incident {
-            for e in element_instances {
-                if want_element_ids {
-                    idx.element_ids
-                        .entry(e.instance_key)
-                        .or_default()
-                        .push(e.element_id.clone());
-                }
-                if want_element_states {
-                    idx.element_states
-                        .entry(e.instance_key)
-                        .or_default()
-                        .push(element_instance_state_enum(e.state).to_string());
-                }
-                if want_element_incident && e.has_incident {
-                    idx.element_has_incident.insert(e.instance_key, true);
-                }
+        if Self::needs_elements(filter) {
+            let rows = sources
+                .element_instances
+                .as_deref()
+                .expect("element predicates require the element-instance source");
+            for e in rows {
+                idx.elements
+                    .entry(e.instance_key)
+                    .or_default()
+                    .push(IndexedElement {
+                        element_id: e.element_id.clone(),
+                        state: element_instance_state_enum(e.state).to_string(),
+                        has_incident: e.has_incident,
+                    });
             }
         }
         if filter.error_message.is_some() {
-            for j in jobs {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("errorMessage requires the job source")
+            {
                 if let Some(msg) = &j.error_message {
                     idx.error_messages
                         .entry(j.instance_key)
@@ -22809,7 +22844,11 @@ impl InstanceCrossEntityIndex {
                         .push(msg.clone());
                 }
             }
-            for i in incidents {
+            for i in sources
+                .incidents
+                .as_deref()
+                .expect("errorMessage requires the incident source")
+            {
                 idx.error_messages
                     .entry(i.instance_key)
                     .or_default()
@@ -22817,7 +22856,11 @@ impl InstanceCrossEntityIndex {
             }
         }
         if filter.has_retries_left.is_some() {
-            for j in jobs {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("hasRetriesLeft requires the job source")
+            {
                 if j.has_failed_with_retries_left {
                     idx.has_retries_left.insert(j.instance_key, true);
                 }
@@ -22826,14 +22869,47 @@ impl InstanceCrossEntityIndex {
         idx
     }
 
-    /// Whether any cross-entity filter is present (so the caller can skip
-    /// building the index entirely when none is).
-    fn is_needed(filter: &models::ProcessInstanceFilter) -> bool {
+    /// Whether any element predicate (`elementId` / `elementInstanceState` /
+    /// `hasElementInstanceIncident`) is present, so the caller loads the
+    /// element-instance source only then.
+    fn needs_elements(filter: &models::ProcessInstanceFilter) -> bool {
         filter.element_id.is_some()
             || filter.element_instance_state.is_some()
             || filter.has_element_instance_incident.is_some()
-            || filter.error_message.is_some()
-            || filter.has_retries_left.is_some()
+    }
+
+    /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
+    /// is present.
+    fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some() || filter.has_retries_left.is_some()
+    }
+
+    /// Whether any incident-reading predicate (`errorMessage`) is present.
+    fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some()
+    }
+
+    /// Whether any cross-entity filter is present (so the caller can skip
+    /// building the index entirely when none is).
+    fn is_needed(filter: &models::ProcessInstanceFilter) -> bool {
+        Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
+    }
+
+    /// Loads exactly the child-row sources `filter` reads: the element-instance
+    /// table only when an element predicate is present, jobs only for
+    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
+    /// so an `elementId`-only query never scans the job or incident tables.
+    /// Shared by the search and batch-selection paths so both honour the same
+    /// lazy-source contract.
+    fn sources_for(
+        filter: &models::ProcessInstanceFilter,
+        store: &readstore::ReadModel,
+    ) -> CrossEntitySources {
+        CrossEntitySources {
+            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
+            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
+            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+        }
     }
 }
 
@@ -22842,10 +22918,13 @@ impl InstanceCrossEntityIndex {
 /// pre-indexed `index`. Each is an **existential** predicate over the
 /// instance's child rows:
 ///
-/// - `elementId` — the instance has an element instance whose id matches.
-/// - `elementInstanceState` — it has an element instance in a matching state.
-/// - `hasElementInstanceIncident` — it has an element instance carrying an
-///   incident (`false` selects instances with no incidented element).
+/// - `elementId` / `elementInstanceState` / `hasElementInstanceIncident` — the
+///   instance has **one** element instance satisfying all supplied element
+///   predicates at once (they are correlated: a COMPLETED `review` plus an
+///   ACTIVE `approve` must not satisfy `elementId: "review",
+///   elementInstanceState: "ACTIVE"`). `hasElementInstanceIncident: false`
+///   inverts the whole existential: it selects instances with **no** element
+///   satisfying the supplied id/state predicates that carries an incident.
 /// - `errorMessage` — it has a failed/errored job or incident whose message
 ///   matches.
 /// - `hasRetriesLeft` — it has a job that failed with retries left (`false`
@@ -22864,39 +22943,58 @@ fn match_instance_cross_entity_filters(
     instance_key: u64,
     index: &InstanceCrossEntityIndex,
 ) -> bool {
-    // `elementId`: existential over the instance's element-instance ids. An
-    // instance with no element instances matches against an absent value.
-    let element_id_matches = match &filter.element_id {
-        None => true,
-        Some(f) => match index.element_ids.get(&instance_key) {
-            Some(ids) => ids
-                .iter()
-                .any(|id| query::match_string_property(f, Some(id.as_str()))),
-            None => query::match_string_property(f, None),
-        },
-    };
-    // `elementInstanceState`: existential over the instance's element-instance
-    // states (wire spellings ACTIVE/COMPLETED/TERMINATED).
-    let element_state_matches = match &filter.element_instance_state {
-        None => true,
-        Some(f) => match index.element_states.get(&instance_key) {
-            Some(states) => states
-                .iter()
-                .any(|s| query::match_element_instance_state(&Some(f.clone()), s.as_str())),
-            None => false,
-        },
-    };
-    // `hasElementInstanceIncident`: `true` requires an incidented element;
-    // `false` requires none.
-    let element_incident_matches = match filter.has_element_instance_incident {
-        None => true,
-        Some(want) => {
-            index
-                .element_has_incident
-                .get(&instance_key)
-                .copied()
-                .unwrap_or(false)
-                == want
+    // The element predicates are evaluated together, existentially over the
+    // instance's element rows, so an id/state/incident combination must hold of
+    // the SAME element instance. An instance with no element instances matches
+    // an `elementId` filter only against an absent value (so `$exists: false`
+    // still matches) and never matches a state or `hasElementInstanceIncident:
+    // true` predicate.
+    let element_matches = {
+        let has_element_predicates = filter.element_id.is_some()
+            || filter.element_instance_state.is_some()
+            || filter.has_element_instance_incident.is_some();
+        if !has_element_predicates {
+            true
+        } else {
+            let elements = index.elements.get(&instance_key);
+            let row_matches = |e: &IndexedElement| {
+                let id_ok = match &filter.element_id {
+                    None => true,
+                    Some(f) => query::match_string_property(f, Some(e.element_id.as_str())),
+                };
+                let state_ok = match &filter.element_instance_state {
+                    None => true,
+                    Some(f) => {
+                        query::match_element_instance_state(&Some(f.clone()), e.state.as_str())
+                    }
+                };
+                id_ok && state_ok
+            };
+            match filter.has_element_instance_incident {
+                None => match elements {
+                    Some(rows) => rows.iter().any(row_matches),
+                    // No element rows: `elementId` still matches against an
+                    // absent value (the `$exists: false` case); a state
+                    // predicate can never be satisfied.
+                    None => {
+                        let id_ok = match &filter.element_id {
+                            None => true,
+                            Some(f) => query::match_string_property(f, None),
+                        };
+                        id_ok && filter.element_instance_state.is_none()
+                    }
+                },
+                // `true`: some element satisfying the id/state predicates
+                // carries an incident. `false`: none does (the inverted
+                // existential — an instance with no element instances has no
+                // incidented element, so it matches).
+                Some(want) => {
+                    let any_incidented = elements
+                        .map(|rows| rows.iter().any(|e| row_matches(e) && e.has_incident))
+                        .unwrap_or(false);
+                    any_incidented == want
+                }
+            }
         }
     };
     // `errorMessage`: existential over the instance's job/incident messages.
@@ -22921,9 +23019,7 @@ fn match_instance_cross_entity_filters(
                 == want
         }
     };
-    element_id_matches
-        && element_state_matches
-        && element_incident_matches
+    element_matches
         && error_message_matches
         && retries_matches
         // Not projected per-instance → matched against an absent value (fail
@@ -35789,6 +35885,45 @@ mod clustered_startup_tests {
             Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
         ));
         assert!(server.batch_operations.all().is_empty());
+    }
+
+    /// #1551 review (Copilot): the filter schema (spec/process-instances.yaml)
+    /// deprecates `batchOperationId` in favour of `batchOperationKey` and
+    /// requires a `400` when BOTH are supplied. The migration endpoint must
+    /// enforce that up front — minting no batch — rather than fail-closed
+    /// matching the two unprojected fields into an empty (but registered)
+    /// batch.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_id_and_key_together() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let filter = models::ProcessInstanceFilter {
+            batch_operation_id: Some(s("2251799813685249")),
+            batch_operation_key: Some(s("2251799813685249")),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            filter,
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("1".to_string()),
+                Vec::new(),
+            ),
+        );
+        match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for id+key together, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
     }
 
     /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
@@ -50967,6 +51102,115 @@ mod call_activity_hierarchy_read_model_tests {
                     "absent-value filter fails closed ({policy:?})"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_correlates_element_predicates_on_one_row() {
+        // #1551 review (Copilot): the element predicates must hold of the SAME
+        // element instance. An instance whose COMPLETED `review` and ACTIVE
+        // `approve` are different rows must NOT satisfy
+        // `elementId: "review", elementInstanceState: "ACTIVE"` — the pre-fix
+        // matcher evaluated each predicate against an independent per-field
+        // list, so it selected the instance (and would have migrated it) even
+        // though no ACTIVE `review` exists.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let completed =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                // Instance 1: `review` COMPLETED (historical), `approve` ACTIVE —
+                // the split-rows trap.
+                &created(1),
+                &activated(1, 11, "review"),
+                &completed(1, 11, "review"),
+                &activated(1, 12, "approve"),
+                // Instance 2: `review` genuinely ACTIVE — the positive control.
+                &created(2),
+                &activated(2, 21, "review"),
+                // Instance 3: `review` COMPLETED only — historical, not active.
+                &created(3),
+                &activated(3, 31, "review"),
+                &completed(3, 31, "review"),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let active_state = || {
+            models::ElementInstanceStateFilterProperty::ElementInstanceStateEnum(
+                models::ElementInstanceStateEnum::Active,
+            )
+        };
+
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // The correlated predicate selects ONLY instance 2: instance 1's
+            // ACTIVE element is `approve` (its `review` is COMPLETED) and
+            // instance 3's `review` is historical.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![2],
+                "elementId + elementInstanceState correlate on one row ({policy:?})"
+            );
+            // State alone still behaves existentially: instances 1 and 2 both
+            // carry an ACTIVE element.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2],
+                "elementInstanceState alone is existential ({policy:?})"
+            );
+            // Id alone matches historical rows too: instances 1, 2 and 3 all
+            // carried a `review` element at some point.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2, 3],
+                "elementId alone matches historical rows ({policy:?})"
+            );
         }
     }
 
