@@ -1382,6 +1382,13 @@ impl PartitionStateMachine {
         // permit, a different lock domain that must never be held together
         // with the publication lock.
         let publish_guard: SnapshotPublishGuard = self.engine.snapshot_publish_lock().await;
+        // Never regress the published snapshot (#1488 review): if a newer
+        // snapshot is already published, this install is stale — discard its
+        // file and leave the pointer, cache and engine untouched.
+        if published_snapshot_supersedes(&self.current_snapshot, meta).is_some() {
+            let _ = std::fs::remove_file(&current_path);
+            return Ok(());
+        }
         let stored = StoredSnapshot {
             meta: meta.clone(),
             path: current_path,
@@ -1564,6 +1571,12 @@ pub struct PartitionSnapshotBuilder {
     /// lock protects against.
     #[cfg(test)]
     test_writer_barrier: Option<Arc<tokio::sync::Barrier>>,
+    /// Test-only `(reached, release)` barrier pair (#1488 review regression):
+    /// parks the build INSIDE the publication lock — after the pointer +
+    /// cache publish, before the reap — so a test can prove a competing
+    /// publisher cannot publish until this one releases the lock.
+    #[cfg(test)]
+    test_publish_barrier: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
@@ -1730,6 +1743,26 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             barrier.wait().await;
         }
         let _publish = self.sm.engine.snapshot_publish_lock().await;
+        // Never regress the published snapshot (#1488 review): a build
+        // captured at index N that reaches publication after a concurrent
+        // install already published M > N must not replace the pointer/cache
+        // (OpenRaft may already purge through M). Discard this stale build and
+        // hand back the newer published snapshot instead.
+        let newer = published_snapshot_supersedes(&self.sm.current_snapshot, &meta);
+        if let Some(newer) = newer {
+            let _ = std::fs::remove_file(&path);
+            let tokio_file = tokio::fs::File::open(&newer.path)
+                .await
+                .map_err(|e| StorageIOError::read_snapshot(Some(newer.meta.signature()), &e))?;
+            return Ok(Snapshot {
+                meta: newer.meta,
+                snapshot: Box::new(SnapshotFile {
+                    file: tokio_file,
+                    path: newer.path,
+                    in_flight: None,
+                }),
+            });
+        }
         let stored = StoredSnapshot {
             meta: meta.clone(),
             path: path.clone(),
@@ -1746,6 +1779,11 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .replace(stored);
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
+        }
+        #[cfg(test)]
+        if let Some((reached, release)) = self.test_publish_barrier.take() {
+            reached.wait().await;
+            release.wait().await;
         }
         // #1488: publish the per-partition/per-replica snapshot size (+ the
         // oversize alert) and reap every OTHER superseded artifact still in the
@@ -2034,6 +2072,8 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             last_membership,
             #[cfg(test)]
             test_writer_barrier: None,
+            #[cfg(test)]
+            test_publish_barrier: None,
         }
     }
 
@@ -2199,6 +2239,23 @@ fn observe_snapshot_file_size(partition_id: u64, node_id: NodeId, bytes: u64) {
              follower snapshot divergence before the disk fills"
         );
     }
+}
+
+/// The single non-regression rule for snapshot publication (#1488 review):
+/// returns the currently published snapshot iff it is strictly NEWER than
+/// `candidate`, in which case publishing `candidate` would move the durable
+/// recovery point backwards. Must be called under the snapshot publication
+/// lock so the check and the publish are atomic.
+fn published_snapshot_supersedes(
+    current: &Mutex<Option<StoredSnapshot>>,
+    candidate: &SnapshotMeta<NodeId, BasicNode>,
+) -> Option<StoredSnapshot> {
+    current
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cur| cur.meta.last_log_id > candidate.last_log_id)
+        .cloned()
 }
 
 /// Reap every superseded snapshot artifact in `snapshot_dir` that is not the
@@ -4133,6 +4190,163 @@ mod tests {
         );
     }
 
+    /// Shared fixture for the publication-race regressions (#1488 review): a
+    /// replica with a published donor snapshot, a continuation member to run
+    /// the racing build on, and a received (not yet installed) copy of the
+    /// donor body.
+    async fn publication_race_fixture() -> (
+        Arc<PartitionStateMachine>,
+        PathBuf,
+        SnapshotMeta<NodeId, BasicNode>,
+        Arc<PartitionStateMachine>,
+        Box<SnapshotFile>,
+    ) {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let mut donor_builder = sm.get_snapshot_builder().await;
+        let mut donor = donor_builder.build_snapshot().await.expect("donor build");
+        let donor_meta = donor.meta.clone();
+        let mut donor_bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            donor
+                .snapshot
+                .read_to_end(&mut donor_bytes)
+                .await
+                .expect("read donor snapshot");
+        }
+        let build_member = Arc::new(
+            sm.new_continuation_for_test(engine)
+                .expect("continuation snapshot dir"),
+        );
+        let mut received = sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&donor_bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+        (sm, dir, donor_meta, build_member, received)
+    }
+
+    #[tokio::test]
+    async fn a_competing_publisher_waits_for_the_publication_lock() {
+        // #1488 review regression: park a build INSIDE the publication lock
+        // (pointer + cache published, reap not yet run) and prove a concurrent
+        // install cannot publish until the build releases the lock. Removing
+        // either `snapshot_publish_lock` acquisition makes the install finish
+        // inside the window and fails this test.
+        let (sm, dir, donor_meta, build_member, received) = publication_race_fixture().await;
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (b_reached, b_release) = (Arc::clone(&reached), Arc::clone(&release));
+        let build = tokio::spawn(async move {
+            let mut sm = build_member;
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.test_publish_barrier = Some((b_reached, b_release));
+            builder.build_snapshot().await.expect("racing build");
+            sm
+        });
+        reached.wait().await;
+
+        let install_sm = sm.clone();
+        let install = tokio::spawn(async move {
+            install_sm
+                .install_snapshot_skip_adoption_for_test(&donor_meta, received)
+                .await
+                .expect("install snapshot");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !install.is_finished(),
+            "the install must not publish while the build holds the publication lock"
+        );
+        release.wait().await;
+        let _build_sm = build.await.expect("build task");
+        install.await.expect("install task");
+
+        let ptr = read_snapshot_ptr(&dir).expect("a durable pointer is published");
+        assert!(
+            ptr.path.exists(),
+            "the pointer's snapshot file survives every reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_build_never_regresses_a_newer_installed_snapshot() {
+        // #1488 review regression: a build captured at index N reaches
+        // publication after an install at M > N published. The build must not
+        // replace the pointer/cache nor reap the installed file (OpenRaft may
+        // already purge through M); it hands back the newer snapshot instead.
+        let (sm, dir, donor_meta, _build_member, received) = publication_race_fixture().await;
+        let mut newer_meta = donor_meta.clone();
+        // The donor build captured no applied log id (None); any Some(..) is
+        // strictly newer than both it and the racing build's capture.
+        newer_meta.last_log_id = Some(LogId::new(openraft::CommittedLeaderId::new(1, 0), 100));
+        newer_meta.snapshot_id = format!("{}-newer", newer_meta.snapshot_id);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let build_barrier = Arc::clone(&barrier);
+        let build_sm = sm.clone();
+        let build = tokio::spawn(async move {
+            // Build on the SAME state machine the install publishes to: the
+            // non-regression check reads its published-snapshot cache.
+            let mut sm = build_sm;
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.test_writer_barrier = Some(build_barrier);
+            builder.build_snapshot().await.expect("racing build")
+        });
+
+        sm.install_snapshot_skip_adoption_for_test(&newer_meta, received)
+            .await
+            .expect("install snapshot");
+        let installed = sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path.clone())
+            .expect("the install published");
+
+        barrier.wait().await;
+        let built = build.await.expect("build task");
+        assert_eq!(
+            built.meta.last_log_id, newer_meta.last_log_id,
+            "the stale build hands back the newer published snapshot"
+        );
+        let ptr = read_snapshot_ptr(&dir).expect("a durable pointer is published");
+        assert_eq!(ptr.path, installed, "the pointer never regresses");
+        assert!(
+            installed.exists(),
+            "the newer installed snapshot is never reaped"
+        );
+        let current = sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.meta.last_log_id);
+        assert_eq!(
+            current,
+            Some(newer_meta.last_log_id),
+            "the cache never regresses"
+        );
+    }
+
     #[test]
     fn snapshot_alert_threshold_defaults_positive() {
         // #1488: the alert threshold helper. The env var is read per call; the
@@ -4740,6 +4954,7 @@ mod tests {
             last_applied: None,
             last_membership: StoredMembership::default(),
             test_writer_barrier: None,
+            test_publish_barrier: None,
         };
         let err = match builder.build_snapshot().await {
             Ok(_) => panic!("an incomplete capture must fail the snapshot build"),
@@ -4771,6 +4986,7 @@ mod tests {
             last_applied: None,
             last_membership: StoredMembership::default(),
             test_writer_barrier: None,
+            test_publish_barrier: None,
         };
         ok_builder
             .build_snapshot()
