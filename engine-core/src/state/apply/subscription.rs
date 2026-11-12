@@ -46,6 +46,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             message_name,
             correlation_key,
             kind,
+            ..
         } => {
             state.message_subscriptions.insert(
                 *subscription_key,
@@ -189,6 +190,25 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         // buffered); carries the minted `signal_key` to restore the key
         // generator on replay, exactly like `MessagePublished`.
         Event::SignalBroadcast { .. } => {}
+
+        // The routed-delivery ledger record (#1497): fold the source-minted
+        // delivery into this partition's dedup / close-tombstone set, bounded
+        // by the ledger cap.
+        Event::RoutedDeliveryRecorded {
+            delivery_key,
+            subscription_key,
+            close_tombstone,
+        } => {
+            record_routed_delivery(
+                state,
+                RoutedDelivery {
+                    delivery_key: *delivery_key,
+                    subscription_key: *subscription_key,
+                    close_tombstone: *close_tombstone,
+                },
+                ROUTED_DELIVERY_LEDGER_CAP,
+            );
+        }
 
         // The instance partition tearing down a cross-partition parked
         // placeholder: mark it cancelled locally exactly like

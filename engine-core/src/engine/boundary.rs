@@ -875,7 +875,11 @@ impl Engine {
     /// any other (local, `Open`) subscription emits a plain
     /// `MessageSubscriptionCanceled`. Single-partition runs only ever hold
     /// `Open` subs, so they always take the latter branch and stay
-    /// byte-identical.
+    /// byte-identical. The routable `Closing` leaves its `delivery_key` `0`
+    /// here; [`Engine::emit`](crate::engine::Engine::emit) — the single
+    /// `&mut self` event choke point — mints the real source-partition delivery
+    /// identity (#1497) as the event goes out, exactly as it stamps job
+    /// terminal deadlines (#1440).
     pub(crate) fn disarm_subscription_event(s: &state::MessageSubscription) -> Event {
         if s.state == state::MessageSubscriptionState::Opening {
             Event::MessageSubscriptionClosing {
@@ -885,6 +889,7 @@ impl Engine {
                 element_id: s.element_id.clone(),
                 message_name: s.message_name.clone(),
                 correlation_key: s.correlation_key.clone(),
+                delivery_key: 0, // minted centrally in `emit` (#1497)
             }
         } else {
             Event::MessageSubscriptionCanceled {
@@ -1135,7 +1140,9 @@ impl Engine {
                 // Placement matches the intermediate catch: a boundary subscription
                 // whose correlation key hashes off-partition is opened on the message
                 // partition; locally we keep only an `Opening` record (the host routes
-                // the open). Single-partition always opens locally.
+                // the open). Single-partition always opens locally. The cross-partition
+                // record carries a source-minted `delivery_key` (#1497) so the message
+                // partition dedups a re-driven open after a lost ack.
                 Ok(Some(
                     if self.subscription_partition(&correlation_value) == self.partition_id {
                         Event::MessageSubscriptionCreated {
@@ -1148,6 +1155,7 @@ impl Engine {
                             kind,
                         }
                     } else {
+                        let delivery_key = self.mint_key();
                         Event::MessageSubscriptionOpening {
                             subscription_key,
                             instance_key,
@@ -1156,6 +1164,7 @@ impl Engine {
                             message_name,
                             correlation_key: correlation_value,
                             kind,
+                            delivery_key,
                         }
                     },
                 ))
@@ -1247,7 +1256,9 @@ impl Engine {
                 // partition owning `hash(correlation_key)`. When that is this
                 // partition (always so single-partition), open it locally; else
                 // park the token on an `Opening` record and let the host route an
-                // `OpenMessageSubscription` to the message partition.
+                // `OpenMessageSubscription` to the message partition. The
+                // cross-partition record carries a source-minted `delivery_key`
+                // (#1497) so the message partition dedups a re-driven open.
                 if self.subscription_partition(&correlation_value) == self.partition_id {
                     vec![Event::MessageSubscriptionCreated {
                         subscription_key,
@@ -1259,6 +1270,7 @@ impl Engine {
                         kind,
                     }]
                 } else {
+                    let delivery_key = self.mint_key();
                     vec![Event::MessageSubscriptionOpening {
                         subscription_key,
                         instance_key,
@@ -1267,6 +1279,7 @@ impl Engine {
                         message_name,
                         correlation_key: correlation_value,
                         kind,
+                        delivery_key,
                     }]
                 }
             }

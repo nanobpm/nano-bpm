@@ -1097,6 +1097,7 @@ fn cross_partition_cancel_emits_a_routable_closing() {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => Some(Command::OpenMessageSubscription {
                 subscription_key: *subscription_key,
                 instance_key: *instance_key,
@@ -1105,6 +1106,7 @@ fn cross_partition_cancel_emits_a_routable_closing() {
                 message_name: message_name.clone(),
                 correlation_key: correlation_key.clone(),
                 kind: kind.clone(),
+                delivery_key: *delivery_key,
             }),
             _ => None,
         })
@@ -1130,10 +1132,12 @@ fn cross_partition_cancel_emits_a_routable_closing() {
                 element_id,
                 message_name,
                 correlation_key,
+                delivery_key,
             } => Some(Command::CloseMessageSubscription {
                 subscription_key: *subscription_key,
                 instance_key: *instance_key,
                 element_instance_key: *element_instance_key,
+                delivery_key: *delivery_key,
                 element_id: {
                     assert_eq!(message_name, "payment-received");
                     assert_eq!(correlation_key, &order);
@@ -1173,6 +1177,377 @@ fn cross_partition_cancel_emits_a_routable_closing() {
             .iter()
             .any(|e| matches!(e, Event::RemoteMessageCorrelation { .. })),
         "the disarmed canonical sub correlates nothing"
+    );
+}
+
+/// #1497 (Copilot review, high): a delayed `OpenMessageSubscription` that lands
+/// AFTER its `CloseMessageSubscription` — the instance was cancelled while the
+/// open was still backing off in the re-drive — must NOT resurrect a live
+/// subscription for the dead instance. The close records a **close tombstone**
+/// (its `delivery_key` in the routed-delivery ledger) even when no canonical
+/// record exists yet, and the late open carrying the same `delivery_key` is
+/// rejected.
+#[test]
+fn close_before_open_leaves_the_subscription_closed() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+
+    let mut instance_engine = Engine::with_partition(0);
+    instance_engine.set_num_partitions(N);
+    instance_engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    let mut message_engine = Engine::with_partition(1);
+    message_engine.set_num_partitions(N);
+
+    // Park the instance on partition 0 with a cross-partition Opening. The host
+    // would route the open to partition 1 — but say that forward fails
+    // transiently and parks in the re-drive's backoff.
+    let created = instance_engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str(order.clone()))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let (sub_key, eik, eid, name, ckey, kind, open_delivery) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key,
+                ..
+            } => Some((
+                *subscription_key,
+                *element_instance_key,
+                element_id.clone(),
+                message_name.clone(),
+                correlation_key.clone(),
+                kind.clone(),
+                *delivery_key,
+            )),
+            _ => None,
+        })
+        .expect("an Opening was emitted");
+    assert_ne!(open_delivery, 0, "the Opening carries a delivery key");
+
+    // The instance is cancelled while the open is parked: the close is routed
+    // and lands on partition 1 FIRST (no canonical record exists there yet).
+    let canceled = instance_engine
+        .apply_command(Command::cancel_instance(instance_key))
+        .unwrap();
+    let close_delivery = canceled
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionClosing {
+                subscription_key,
+                delivery_key,
+                ..
+            } if *subscription_key == sub_key => Some(*delivery_key),
+            _ => None,
+        })
+        .expect("a routable Closing was emitted");
+    assert_ne!(close_delivery, 0, "the Closing carries a delivery key");
+    message_engine
+        .apply_command(Command::CloseMessageSubscription {
+            subscription_key: sub_key,
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid.clone(),
+            delivery_key: close_delivery,
+        })
+        .unwrap();
+    // The close tombstone is recorded even though no canonical record existed.
+    assert!(
+        message_engine
+            .state()
+            .routed_deliveries
+            .contains(close_delivery),
+        "the close records a tombstone"
+    );
+
+    // The delayed open finally arrives. The tombstone rejects it: no
+    // subscription is created for the cancelled instance.
+    let reopened = message_engine
+        .apply_command(Command::OpenMessageSubscription {
+            subscription_key: sub_key,
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid,
+            message_name: name,
+            correlation_key: ckey,
+            kind,
+            delivery_key: open_delivery,
+        })
+        .unwrap();
+    assert!(
+        !reopened
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionCreated { .. })),
+        "the late open is rejected by the close tombstone: {reopened:?}"
+    );
+    assert!(
+        message_engine.state().message_subscriptions.is_empty(),
+        "no live subscription is resurrected for the cancelled instance"
+    );
+}
+
+/// #1497 (Copilot review, high): a re-driven `OpenMessageSubscription` after a
+/// lost acknowledgement is acknowledged WITHOUT being re-applied — the
+/// recipient's routed-delivery ledger dedups it, so the open is applied exactly
+/// once even though the transport is at-least-once.
+#[test]
+fn redriven_open_after_a_lost_ack_is_applied_exactly_once() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+
+    let mut instance_engine = Engine::with_partition(0);
+    instance_engine.set_num_partitions(N);
+    instance_engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    let mut message_engine = Engine::with_partition(1);
+    message_engine.set_num_partitions(N);
+
+    let created = instance_engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str(order.clone()))]),
+        ))
+        .unwrap();
+    let (sub_key, inst, eik, eid, name, ckey, kind, delivery) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key,
+            } => Some((
+                *subscription_key,
+                *instance_key,
+                *element_instance_key,
+                element_id.clone(),
+                message_name.clone(),
+                correlation_key.clone(),
+                kind.clone(),
+                *delivery_key,
+            )),
+            _ => None,
+        })
+        .expect("an Opening was emitted");
+
+    let open = Command::OpenMessageSubscription {
+        subscription_key: sub_key,
+        instance_key: inst,
+        element_instance_key: eik,
+        element_id: eid,
+        message_name: name,
+        correlation_key: ckey,
+        kind,
+        delivery_key: delivery,
+    };
+
+    // First delivery applies and records the ledger entry.
+    let first = message_engine.apply_command(open.clone()).unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionCreated { .. })),
+        "the first open applies"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::RoutedDeliveryRecorded { delivery_key, .. } if *delivery_key == delivery)),
+        "the first open records the delivery"
+    );
+    assert_eq!(message_engine.message_subscriptions().len(), 1);
+
+    // The ack is lost; the re-drive re-delivers the SAME delivery key. It is
+    // acknowledged but NOT re-applied (no second create, no second ledger
+    // record) — exactly once.
+    let redelivered = message_engine.apply_command(open).unwrap();
+    assert!(
+        redelivered.is_empty(),
+        "the re-driven open is deduplicated to a no-op: {redelivered:?}"
+    );
+    assert_eq!(message_engine.message_subscriptions().len(), 1);
+}
+
+/// #1497 (Copilot review, high): a re-driven `DispatchStartInstance` after a
+/// lost acknowledgement is acknowledged WITHOUT minting a second process
+/// instance — the duplicate the un-guarded retry would otherwise create.
+#[test]
+fn redriven_dispatch_start_after_a_lost_ack_mints_exactly_one_instance() {
+    let mut target = Engine::with_partition(2);
+    target.set_num_partitions(4);
+    target
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    assert!(target.state().instances.is_empty());
+
+    let dispatch = Command::DispatchStartInstance {
+        process_id: "order-flow".into(),
+        start_element_id: "start".into(),
+        variables: HashMap::new(),
+        tags: Vec::new(),
+        business_id: None,
+        message_start: None,
+        delivery_key: 777,
+    };
+
+    // First delivery mints the instance and records the delivery.
+    let first = target.apply_command(dispatch.clone()).unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })),
+        "the first dispatch mints an instance"
+    );
+    assert_eq!(target.state().instances.len(), 1);
+
+    // The ack is lost; the re-drive re-delivers the SAME delivery key. It is
+    // acknowledged but NOT re-applied: still exactly one instance.
+    let redelivered = target.apply_command(dispatch).unwrap();
+    assert!(
+        !redelivered
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })),
+        "the re-driven dispatch is deduplicated: {redelivered:?}"
+    );
+    assert_eq!(
+        target.state().instances.len(),
+        1,
+        "no second instance is minted"
+    );
+}
+
+/// #1497 (Copilot review, high): a re-driven `CorrelateMessageSubscription`
+/// continuation for a **non-interrupting** boundary — whose `Opening` record
+/// intentionally stays open, so the state check alone would re-fire it — is
+/// deduplicated by the recipient's ledger, so a lost ack does not spawn a
+/// second token.
+#[test]
+fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
+    const N: u64 = 2;
+    // The boundary correlates on `orderId`; pick a key hashing to partition 1.
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+
+    let mut instance_engine = Engine::with_partition(0);
+    instance_engine.set_num_partitions(N);
+    instance_engine
+        .apply_command(Command::DeployProcess(
+            process_with_non_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let mut message_engine = Engine::with_partition(1);
+    message_engine.set_num_partitions(N);
+
+    // Park the instance on partition 0; the boundary subscription's canonical
+    // record opens on partition 1.
+    let created = instance_engine
+        .apply_command(Command::create_instance_with(
+            "notifiable",
+            vars(&[("orderId", Value::Str(order.clone()))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let (sub_key, eik, delivery_open) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                element_instance_key,
+                delivery_key,
+                ..
+            } => Some((*subscription_key, *element_instance_key, *delivery_key)),
+            _ => None,
+        })
+        .expect("an Opening was emitted for the boundary");
+    message_engine
+        .apply_command(Command::OpenMessageSubscription {
+            subscription_key: sub_key,
+            instance_key,
+            element_instance_key: eik,
+            element_id: "notify".into(),
+            message_name: "reminder".into(),
+            correlation_key: order.clone(),
+            kind: state::MessageSubscriptionKind::NonInterruptingBoundary {
+                boundary_element_id: "notify".into(),
+            },
+            delivery_key: delivery_open,
+        })
+        .unwrap();
+
+    // Publish on the message partition: it settles nothing (non-interrupting
+    // stays open) and emits the routable continuation.
+    let published = message_engine
+        .apply_command(Command::correlate_message_with(
+            "reminder",
+            order.clone(),
+            HashMap::new(),
+        ))
+        .unwrap();
+    let (r_msg, r_kind, r_delivery) = published
+        .iter()
+        .find_map(|e| match e {
+            Event::RemoteMessageCorrelation {
+                message_key,
+                kind,
+                delivery_key,
+                ..
+            } => Some((*message_key, kind.clone(), *delivery_key)),
+            _ => None,
+        })
+        .expect("a RemoteMessageCorrelation was emitted");
+
+    let continuation = Command::CorrelateMessageSubscription {
+        subscription_key: sub_key,
+        message_key: r_msg,
+        instance_key,
+        element_instance_key: eik,
+        element_id: "notify".into(),
+        kind: r_kind,
+        variables: HashMap::new(),
+        delivery_key: r_delivery,
+    };
+
+    // First delivery fires the boundary once (a token runs to `notified`).
+    let first = instance_engine.apply_command(continuation.clone()).unwrap();
+    let first_fires = first
+        .iter()
+        .filter(|e| matches!(e, Event::MessageCorrelated { .. }))
+        .count();
+    assert_eq!(first_fires, 1, "the first correlation fires the boundary");
+
+    // The ack is lost; the re-drive re-delivers the SAME delivery key. The
+    // `Opening` record is still open (non-interrupting), so without the ledger
+    // this would fire a SECOND token — the dedup must swallow it.
+    let redelivered = instance_engine.apply_command(continuation).unwrap();
+    assert!(
+        !redelivered
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })),
+        "the re-driven continuation is deduplicated, not re-fired: {redelivered:?}"
     );
 }
 
@@ -2742,6 +3117,7 @@ fn dispatch_start_instance_mints_the_instance_locally() {
             tags: Vec::new(),
             business_id: None,
             message_start: None,
+            delivery_key: 0,
         })
         .unwrap();
 
@@ -7704,6 +8080,7 @@ fn dispatched_message_start_records_the_correlation_on_the_target() {
                 message_name: "order-placed".into(),
                 correlation_key: "c".into(),
             }),
+            delivery_key: 0,
         })
         .unwrap();
     assert!(fired.iter().any(|e| matches!(
@@ -7755,6 +8132,7 @@ fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
                 message_name: "order-placed".into(),
                 correlation_key: "c".into(),
             }),
+            delivery_key: 0,
         })
         .unwrap();
     let created = fired
@@ -7768,4 +8146,156 @@ fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
         })
         .unwrap();
     assert_eq!(created, v1);
+}
+
+/// #1497 (Copilot review, high): recovery must advance the allocator past the
+/// source-minted `delivery_key` of a routable `MessageSubscriptionClosing`.
+/// The close's key is minted LAST (at emit) and is larger than every other key
+/// on the event, so a `max_key`-only fold re-issues it after a restart — and the
+/// recipient then drops the next genuine delivery minted with it as a
+/// duplicate. Covers journal-only replay and snapshot + tail replay.
+#[test]
+fn recovery_never_reissues_a_closing_delivery_key() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+    let mut engine = Engine::with_partition(0);
+    engine.set_num_partitions(N);
+    let mut journal = engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    #[cfg(feature = "serde")]
+    let snap = engine.snapshot();
+    let mut tail = engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str(order))]),
+        ))
+        .unwrap();
+    let instance_key = tail.iter().find_map(|e| e.instance_key()).unwrap();
+    tail.extend(
+        engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap(),
+    );
+    let close_delivery = tail
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionClosing { delivery_key, .. } => Some(*delivery_key),
+            _ => None,
+        })
+        .expect("a routable Closing was emitted");
+    assert_ne!(close_delivery, 0);
+    journal.extend(tail.iter().cloned());
+
+    let fresh_key_after = |mut e: Engine| -> Key {
+        e.set_num_partitions(N);
+        let ev = e
+            .apply_command(Command::create_instance("await-payment"))
+            .unwrap();
+        ev.iter().find_map(|e| e.instance_key()).unwrap()
+    };
+    let replayed = Engine::replay_partition(0, journal);
+    assert!(
+        fresh_key_after(replayed) > close_delivery,
+        "journal replay re-issued the Closing's delivery key"
+    );
+    #[cfg(feature = "serde")]
+    {
+        let mut restored = Engine::from_snapshot(snap);
+        restored.apply_replayed_events(tail);
+        assert!(
+            fresh_key_after(restored) > close_delivery,
+            "snapshot + tail replay re-issued the Closing's delivery key"
+        );
+    }
+}
+
+/// #1497: the allocator fold considers a source `delivery_key` on its own, so a
+/// higher FOREIGN key on the same event (a `RemoteMessageCorrelation` naming an
+/// instance on a higher partition) cannot mask it.
+#[test]
+fn allocator_fold_is_not_masked_by_a_foreign_max_key() {
+    let local = state::compose_key(0, 40);
+    let foreign = state::compose_key(1, 7);
+    let event = Event::RemoteMessageCorrelation {
+        subscription_key: foreign,
+        message_key: state::compose_key(0, 39),
+        instance_key: foreign,
+        element_instance_key: foreign,
+        element_id: "catch".into(),
+        kind: state::MessageSubscriptionKind::IntermediateCatch,
+        variables: HashMap::new(),
+        delivery_key: local,
+    };
+    let mut next_local = 0;
+    event.advance_allocator(0, &mut next_local);
+    assert_eq!(next_local, 40);
+}
+
+/// #1497 (Copilot review, high): the ledger evicts in the recipient's APPLIED
+/// order, never by key value. Keys sort by source partition first, so with a
+/// full ledger of high-partition deliveries a fresh low-partition delivery must
+/// survive its own insertion (key-order eviction evicted it immediately).
+#[test]
+fn routed_delivery_ledger_evicts_in_applied_order() {
+    let mut ledger = state::RoutedDeliveries::default();
+    let cap = 4;
+    let entry = |k, close: bool| state::RoutedDelivery {
+        delivery_key: k,
+        subscription_key: Some(k + 1000),
+        close_tombstone: close,
+    };
+    for i in 1..=cap as u64 {
+        ledger.record(entry(state::compose_key(3, i), true), cap);
+    }
+    let fresh_low = state::compose_key(0, 1);
+    ledger.record(entry(fresh_low, false), cap);
+    assert!(ledger.contains(fresh_low), "fresh delivery evicted itself");
+    assert_eq!(ledger.len(), cap, "bounded");
+    // The earliest-applied entry (and its tombstone index) went instead.
+    let oldest = state::compose_key(3, 1);
+    assert!(!ledger.contains(oldest));
+    assert!(
+        !ledger.is_tombstoned(oldest + 1000),
+        "stale tombstone index"
+    );
+    assert!(ledger.is_tombstoned(state::compose_key(3, 2) + 1000));
+    // A duplicate record is a no-op (no reorder, no growth).
+    ledger.record(entry(state::compose_key(3, 2), true), cap);
+    assert_eq!(ledger.len(), cap);
+    assert_eq!(
+        ledger.iter().next().map(|e| e.delivery_key),
+        Some(state::compose_key(3, 2))
+    );
+    // Only a close tombstones its subscription.
+    assert!(!ledger.is_tombstoned(fresh_low + 1000));
+}
+
+/// #1497: the ledger's snapshot form is its applied-order list; loading it
+/// rebuilds the dedup and tombstone indexes identically.
+#[cfg(feature = "serde")]
+#[test]
+fn routed_delivery_ledger_round_trips_with_indexes() {
+    let mut ledger = state::RoutedDeliveries::default();
+    for (k, close) in [(9, false), (3, true), (7, false)] {
+        ledger.record(
+            state::RoutedDelivery {
+                delivery_key: k,
+                subscription_key: Some(k * 10),
+                close_tombstone: close,
+            },
+            usize::MAX,
+        );
+    }
+    let json = serde_json::to_string(&ledger).unwrap();
+    let back: state::RoutedDeliveries = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ledger);
+    assert!(back.contains(3) && back.is_tombstoned(30) && !back.is_tombstoned(90));
+    assert_eq!(
+        back.iter().map(|e| e.delivery_key).collect::<Vec<_>>(),
+        vec![9, 3, 7]
+    );
 }

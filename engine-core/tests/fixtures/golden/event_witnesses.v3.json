@@ -28,6 +28,7 @@
   {
     "StartInstanceDispatched": {
       "business_id": "b",
+      "delivery_key": 25,
       "message_start": {
         "correlation_key": "c",
         "message_key": 20,
@@ -39,6 +40,13 @@
       "tags": [],
       "target_partition": 1,
       "variables": {}
+    }
+  },
+  {
+    "RoutedDeliveryRecorded": {
+      "close_tombstone": true,
+      "delivery_key": 25,
+      "subscription_key": 6
     }
   },
   {

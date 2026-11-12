@@ -446,6 +446,13 @@ pub enum Command {
         message_name: String,
         correlation_key: String,
         kind: MessageSubscriptionKind,
+        /// The source partition's stable delivery identity (#1497), carried from
+        /// the routing [`crate::Event::MessageSubscriptionOpening`]. `0` means
+        /// "no identity" (a legacy or hand-issued open): applied without dedup.
+        /// Non-zero is deduplicated against the recipient's routed-delivery
+        /// ledger and rejected when it matches a close tombstone.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Deliver a correlation back to the **instance** partition: advance the token
     /// parked on an `Opening` subscription (the counterpart of a
@@ -461,6 +468,14 @@ pub enum Command {
         element_id: String,
         kind: MessageSubscriptionKind,
         variables: HashMap<String, Value>,
+        /// The message partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::RemoteMessageCorrelation`]. `0`
+        /// means "no identity" (legacy): applied without dedup. Non-zero is
+        /// deduplicated against the recipient's routed-delivery ledger — the
+        /// guard that keeps a retried **non-interrupting** boundary correlation
+        /// (whose `Opening` record stays open) from spawning a second token.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
@@ -472,6 +487,15 @@ pub enum Command {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// The instance partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::MessageSubscriptionClosing`]. `0`
+        /// means "no identity" (legacy): applied without a tombstone. Non-zero
+        /// records a **close tombstone** in the recipient's routed-delivery
+        /// ledger even when no canonical record exists yet, so a delayed
+        /// `OpenMessageSubscription` that lands after this close is rejected
+        /// instead of resurrecting a subscription for a cancelled instance.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Cancel a running process instance. Every token is discarded: pending jobs
     /// are cancelled, armed timers and open message subscriptions are cancelled,
@@ -573,6 +597,14 @@ pub enum Command {
         /// the instance's partition records the correlation.
         #[cfg_attr(feature = "serde", serde(default))]
         message_start: Option<crate::MessageStartCorrelation>,
+        /// The deploy partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::StartInstanceDispatched`]. `0` means
+        /// "no identity" (legacy): applied without dedup. Non-zero is
+        /// deduplicated against the recipient's routed-delivery ledger — the
+        /// guard that keeps a retried dispatch from minting a SECOND process
+        /// instance after a lost acknowledgement.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// External "activate ad-hoc activities" command (#614 gap 3, Zeebe
     /// `AdHocSubProcessInstructionActivateProcessor` — REST

@@ -373,6 +373,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => Some((
                 *subscription_key,
                 *instance_key,
@@ -381,6 +382,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
                 message_name.clone(),
                 correlation_key.clone(),
                 kind.clone(),
+                *delivery_key,
             )),
             _ => None,
         })
@@ -395,8 +397,12 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
 
     // Host routes the open to the message partition: it records the canonical
     // Open subscription.
-    let (sub_key, inst_key, eik, eid, name, ckey, kind) = opening;
+    let (sub_key, inst_key, eik, eid, name, ckey, kind, open_delivery) = opening;
     assert_eq!(ckey, order);
+    assert_ne!(
+        open_delivery, 0,
+        "the Opening carries a delivery key (#1497)"
+    );
     message_engine
         .apply_command(Command::OpenMessageSubscription {
             subscription_key: sub_key,
@@ -406,6 +412,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             message_name: name,
             correlation_key: ckey,
             kind,
+            delivery_key: open_delivery,
         })
         .unwrap();
     assert_eq!(
@@ -423,6 +430,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             message_name: "payment-received".into(),
             correlation_key: order.clone(),
             kind: state::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: 0,
         })
         .unwrap();
     assert_eq!(message_engine.message_subscriptions().len(), 1);
@@ -450,6 +458,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
                 element_id,
                 kind,
                 variables,
+                delivery_key,
             } => Some((
                 *subscription_key,
                 *message_key,
@@ -458,6 +467,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
                 element_id.clone(),
                 kind.clone(),
                 variables.clone(),
+                *delivery_key,
             )),
             _ => None,
         })
@@ -469,9 +479,13 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
 
     // Host routes the continuation back to the instance partition: the token
     // advances and the instance completes, merging the message variables.
-    let (r_sub, r_msg, r_inst, r_eik, r_eid, r_kind, r_vars) = remote;
+    let (r_sub, r_msg, r_inst, r_eik, r_eid, r_kind, r_vars, r_delivery) = remote;
     assert_eq!(r_sub, sub_key);
     assert_eq!(crate::partition_of(r_inst), 0);
+    assert_ne!(
+        r_delivery, 0,
+        "the correlation carries a delivery key (#1497)"
+    );
     let advanced = instance_engine
         .apply_command(Command::CorrelateMessageSubscription {
             subscription_key: r_sub,
@@ -481,6 +495,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             element_id: r_eid,
             kind: r_kind,
             variables: r_vars,
+            delivery_key: r_delivery,
         })
         .unwrap();
     assert!(advanced
@@ -502,6 +517,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             element_id: "await".into(),
             kind: state::MessageSubscriptionKind::IntermediateCatch,
             variables: HashMap::new(),
+            delivery_key: 0,
         })
         .unwrap();
     assert!(!again
