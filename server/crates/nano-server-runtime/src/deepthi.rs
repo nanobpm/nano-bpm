@@ -291,12 +291,25 @@ impl Mailbox {
 pub struct EngineLifecycle {
     lock: Arc<tokio::sync::RwLock<()>>,
     epoch: AtomicU64,
+    /// Serializes snapshot PUBLICATION with snapshot reaping across the local
+    /// build path and the follower install path (#1488 review): both paths
+    /// publish (the durable `current-snapshot.json` pointer + the
+    /// current-snapshot cache) and then reap every other `snap-*` artifact,
+    /// and each path's in-flight guard drops when it returns — so without
+    /// this lock a paused publisher's sweep could delete the file a
+    /// just-finished publisher made the durable recovery point, leaving
+    /// recovery without that snapshot after the covered log is purged.
+    /// Acquired AFTER the shared lifecycle read guard (lock order:
+    /// lifecycle → snapshot publish).
+    snapshot_publish: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A shared hold on an engine's lifecycle lock ([`EngineLifecycle`]).
 pub type LifecycleShared = tokio::sync::OwnedRwLockReadGuard<()>;
 /// An exclusive hold on an engine's lifecycle lock ([`EngineLifecycle`]).
 pub type LifecycleExclusive = tokio::sync::OwnedRwLockWriteGuard<()>;
+/// A hold on an engine's snapshot publication lock ([`EngineLifecycle`]).
+pub type SnapshotPublishGuard = tokio::sync::OwnedMutexGuard<()>;
 
 /// A cloneable handle to the engine actor. All engine mutation and engine-state
 /// reads go through here; the [`Journal`] lives on a single dedicated thread, so
@@ -669,6 +682,17 @@ impl DeepthiHandle {
         let guard = Arc::clone(&self.mb.lifecycle.lock).write_owned().await;
         self.mb.lifecycle.epoch.fetch_add(1, Ordering::SeqCst);
         guard
+    }
+
+    /// Acquires the engine's snapshot publication lock (#1488 review). A
+    /// snapshot build/install holds it across its publish (durable pointer +
+    /// current-snapshot cache) AND its superseded-artifact reap, so a reap
+    /// can never delete the file a concurrent publish just made the durable
+    /// recovery point. Lock order: lifecycle (shared) → snapshot publish.
+    pub async fn snapshot_publish_lock(&self) -> SnapshotPublishGuard {
+        Arc::clone(&self.mb.lifecycle.snapshot_publish)
+            .lock_owned()
+            .await
     }
 
     /// Whether `self` and `other` drive the same engine lifecycle.
