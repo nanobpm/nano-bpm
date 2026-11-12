@@ -25,6 +25,18 @@
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
+//! * `subProcess triggeredByEvent="true"` (an **event sub-process**, #1555): a
+//!   container never entered by token flow, activated when its single typed
+//!   start event's trigger fires while the enclosing scope (the process, or an
+//!   embedded sub-process) is active. The start event must carry exactly one of
+//!   `messageEventDefinition`, `timerEventDefinition`, `signalEventDefinition`,
+//!   `errorEventDefinition`, `escalationEventDefinition` or
+//!   `conditionalEventDefinition`; `isInterrupting="false"` marks it
+//!   non-interrupting (the default is interrupting; an error start is always
+//!   interrupting). This wave-0 slice *represents* the element
+//!   ([`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)) and its
+//!   trigger: deploying such a model
+//!   succeeds, but the event sub-process is not yet triggered at runtime.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`

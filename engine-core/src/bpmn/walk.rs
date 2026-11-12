@@ -241,6 +241,17 @@ pub(crate) fn parse_with_captures(
                         match tag {
                             "startEvent" => {
                                 let idx = acc.add_node(attrs, NodeKind::Start);
+                                // `isInterrupting="false"` on an event
+                                // sub-process's start event marks the event
+                                // sub-process non-interrupting (BPMN default
+                                // `true`). Recorded only as an explicit "false";
+                                // build applies the default (and rejects the
+                                // non-interrupting combinations Zeebe forbids).
+                                if let (Some(i), Some("false")) =
+                                    (idx, attr(attrs, "isInterrupting"))
+                                {
+                                    acc.nodes[i].esp_interrupting = Some(false);
+                                }
                                 // Push onto io_stack so a nested execution listener
                                 // attaches to the start event, not the enclosing
                                 // scope (#1197). A self-closing `<startEvent/>` has
@@ -539,6 +550,19 @@ pub(crate) fn parse_with_captures(
                                 let error_ref = attr(attrs, "errorRef").unwrap_or("").to_string();
                                 if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.error_ref = Some(error_ref);
+                                } else if let Some(idx) = cur_start {
+                                    // An error definition on a START event is an
+                                    // event sub-process's error trigger (#1555):
+                                    // record the raw `errorRef` (empty = no ref =
+                                    // catch-all) for build to resolve against the
+                                    // declared `<error>`s. A process-level error
+                                    // start is invalid, but the ESP build check
+                                    // rejects it naming the construct.
+                                    acc.nodes[idx].esp_error_ref = Some(if error_ref.is_empty() {
+                                        None
+                                    } else {
+                                        Some(error_ref)
+                                    });
                                 } else if let Some(idx) =
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
@@ -582,6 +606,22 @@ pub(crate) fn parse_with_captures(
                                             escalation_ref.to_string(),
                                         ));
                                     }
+                                } else if let Some(idx) = cur_start {
+                                    // An escalation definition on a START event is
+                                    // an event sub-process's escalation trigger
+                                    // (#1555): record the raw `escalationRef`
+                                    // (absent = catch-all) for build to resolve
+                                    // against the declared `<escalation>`s. The
+                                    // reference-integrity validator (#851) still
+                                    // sees a dangling ref via `escalation_refs`.
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs.push((
+                                            acc.nodes[idx].id.clone(),
+                                            escalation_ref.to_string(),
+                                        ));
+                                    }
+                                    acc.nodes[idx].esp_escalation_ref =
+                                        Some(escalation_ref.map(str::to_string));
                                 } else if let Some(idx) =
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
@@ -1085,10 +1125,14 @@ pub(crate) fn parse_with_captures(
                                 }
                             }
                             // A conditional event's FEEL `<condition>` (nested in
-                            // a `conditionalEventDefinition` on a catch or boundary
-                            // event). Distinct from a sequence flow's
-                            // `conditionExpression` above.
-                            "condition" if cur_intermediate.is_some() || cur_boundary.is_some() => {
+                            // a `conditionalEventDefinition` on a catch, boundary,
+                            // or event sub-process start event). Distinct from a
+                            // sequence flow's `conditionExpression` above.
+                            "condition"
+                                if cur_intermediate.is_some()
+                                    || cur_boundary.is_some()
+                                    || cur_start.is_some() =>
+                            {
                                 event_condition_text = Some(String::new());
                             }
                             // A `multiInstanceLoopCharacteristics` child of an
@@ -1768,6 +1812,10 @@ pub(crate) fn parse_with_captures(
                                 acc.nodes[idx].event_condition = Some(trimmed.to_string());
                             } else if let Some(boundary) = cur_boundary.as_mut() {
                                 boundary.condition = Some(trimmed.to_string());
+                            } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                // A `<condition>` on a START event is an event
+                                // sub-process's conditional trigger (#1555).
+                                acc.nodes[idx].esp_condition = Some(trimmed.to_string());
                             }
                         }
                     }
@@ -1850,9 +1898,15 @@ pub(crate) fn parse_with_captures(
                                 // A timer boundary event's duration.
                                 boundary.timer_duration_millis = millis;
                             } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
-                                // A one-shot timer start event's duration.
+                                // A one-shot timer start event's duration. The
+                                // literal text + kind are retained alongside the
+                                // millis so an event sub-process timer trigger can
+                                // carry the verbatim literal in its `TimerDef`.
                                 acc.nodes[idx].duration_millis = millis;
                                 acc.nodes[idx].timer_repeating = Some(false);
+                                acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                                acc.nodes[idx].timer_def_kind =
+                                    Some(crate::model::TimerDefKind::Duration);
                             }
                         }
                     }
@@ -1874,6 +1928,8 @@ pub(crate) fn parse_with_captures(
                             // A recurring timer start event's cycle.
                             acc.nodes[idx].duration_millis = parse_iso8601_cycle(trimmed);
                             acc.nodes[idx].timer_repeating = Some(true);
+                            acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                            acc.nodes[idx].timer_def_kind = Some(crate::model::TimerDefKind::Cycle);
                         } else if let Some(boundary) = cur_boundary.as_mut() {
                             // A recurring (cycle) timer boundary event.
                             boundary.timer_duration_millis = parse_iso8601_cycle(trimmed);
@@ -1897,6 +1953,9 @@ pub(crate) fn parse_with_captures(
                             } else if let Some(boundary) = cur_boundary.as_mut() {
                                 boundary.timer_expr = Some(def);
                             } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                                acc.nodes[idx].timer_def_kind =
+                                    Some(crate::model::TimerDefKind::Date);
                                 acc.nodes[idx].timer_expr = Some(def);
                                 acc.nodes[idx].timer_repeating = Some(false);
                             }

@@ -59,6 +59,45 @@ pub(super) struct NodeAcc {
     /// activatable embedded-subProcess tool (#872) and stays on the pruned-catalog
     /// path with its inner activities.
     pub(super) is_event_subprocess: bool,
+    /// For a start event nested in an event sub-process (`is_event_subprocess`
+    /// scope): the `errorRef` of its `errorEventDefinition`, resolved to an
+    /// error code at build (an [`EventSubProcessTrigger::Error`]). The
+    /// `Option<Option<String>>` distinguishes "no error definition" (outer
+    /// `None`) from "an error definition with no `errorRef`" (outer `Some`,
+    /// inner `None` — a catch-all trigger).
+    ///
+    /// [`EventSubProcessTrigger::Error`]: crate::model::EventSubProcessTrigger::Error
+    pub(super) esp_error_ref: Option<Option<String>>,
+    /// For a start event nested in an event sub-process: the `escalationRef` of
+    /// its `escalationEventDefinition`, resolved to an escalation code at build
+    /// (an [`EventSubProcessTrigger::Escalation`]). Same
+    /// `Option<Option<String>>` convention as `esp_error_ref`.
+    ///
+    /// [`EventSubProcessTrigger::Escalation`]: crate::model::EventSubProcessTrigger::Escalation
+    pub(super) esp_escalation_ref: Option<Option<String>>,
+    /// For a start event nested in an event sub-process: the FEEL `condition`
+    /// of its `conditionalEventDefinition` (an
+    /// [`EventSubProcessTrigger::Conditional`]).
+    ///
+    /// [`EventSubProcessTrigger::Conditional`]: crate::model::EventSubProcessTrigger::Conditional
+    pub(super) esp_condition: Option<String>,
+    /// For a start event nested in an event sub-process: its `isInterrupting`
+    /// attribute. `None` when absent (BPMN/Zeebe default `true`); only an
+    /// explicit `isInterrupting="false"` records `Some(false)`.
+    pub(super) esp_interrupting: Option<bool>,
+    /// For a timer start event: the raw text of its `timeDuration`/`timeCycle`/
+    /// `timeDate` when it is a static ISO-8601 literal (not a `=`-prefixed FEEL
+    /// expression, which populates `timer_expr` instead). Retained so an event
+    /// sub-process timer trigger can carry the literal verbatim in its
+    /// [`TimerDef`](crate::model::TimerDef) — an event sub-process timer is
+    /// armed per scope activation, never pre-resolved to millis at deploy.
+    pub(super) timer_literal: Option<String>,
+    /// For a timer start event carrying a static literal: which time* element
+    /// it came from (`timeDuration`/`timeCycle`/`timeDate`), populating the
+    /// [`TimerDefKind`](crate::model::TimerDefKind) of an event sub-process
+    /// timer trigger. `None` for a FEEL timer (whose `timer_expr` already
+    /// carries the kind).
+    pub(super) timer_def_kind: Option<crate::model::TimerDefKind>,
     /// `zeebe:adHoc outputCollection` on an ad-hoc container, if declared.
     pub(super) adhoc_output_collection: Option<String>,
     /// `zeebe:adHoc outputElement` FEEL expression on an ad-hoc container.
@@ -388,6 +427,12 @@ impl ProcessAcc {
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
             is_event_subprocess: false,
+            esp_error_ref: None,
+            esp_escalation_ref: None,
+            esp_condition: None,
+            esp_interrupting: None,
+            timer_literal: None,
+            timer_def_kind: None,
             adhoc_output_collection: None,
             adhoc_output_element: None,
             adhoc_active_elements: None,
@@ -1314,6 +1359,40 @@ impl ProcessAcc {
         // intermediate throw (#1173).
         let flow_source_ids: std::collections::HashSet<String> =
             self.flows.iter().filter_map(|f| f.source.clone()).collect();
+        // Ids of the event sub-processes (`subProcess triggeredByEvent="true"`),
+        // used to recognise a start event nested directly inside one (its
+        // trigger) and to reject a flow into/out of the event sub-process.
+        let event_subprocess_ids: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_event_subprocess)
+            .map(|n| n.id.clone())
+            .collect();
+        // The start events of each event sub-process (a Start node whose parent
+        // is an event sub-process), mapped esp id -> its start node ids (in
+        // document order, so a "multiple start events" rejection is
+        // deterministic).
+        let mut esp_starts: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if matches!(n.kind, NodeKind::Start)
+                && n.parent
+                    .as_deref()
+                    .is_some_and(|p| event_subprocess_ids.contains(p))
+            {
+                esp_starts
+                    .entry(n.parent.clone().unwrap_or_default())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        // The resolved trigger + interruptingness of each event sub-process,
+        // keyed by the esp id. Computed here — before the node-consumption loop
+        // moves `self.nodes` — so the `NodeKind::SubProcess` dispatch arm only
+        // looks the result up. Resolution validates against the declared
+        // messages/signals/errors/escalations (reference integrity, #851) and
+        // applies the Zeebe `isInterrupting` default (`true`).
+        let mut esp_triggers: HashMap<String, (crate::model::EventSubProcessTrigger, bool)> =
+            HashMap::new();
         // Ids of every node an escalation boundary event may legally attach to.
         // An escalation propagates *out* of the inner token scope it is raised
         // in, so only a container that opens such a scope — an embedded
@@ -1356,6 +1435,76 @@ impl ProcessAcc {
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect();
+        // Validate every event sub-process (`subProcess triggeredByEvent="true"`)
+        // BEFORE the node-consumption loop below (#1555): Zeebe's
+        // `EventSubProcessValidator` requires exactly one start event, that start
+        // event to carry exactly one typed trigger, and an error trigger to be
+        // interrupting. Checked here, against the raw nodes, so the rejection
+        // names the construct rather than surfacing as a generic build fallout.
+        // Iterate in document order for a deterministic error. On success the
+        // resolved trigger is recorded in `esp_triggers` for the dispatch arm.
+        for esp in self.nodes.iter().filter(|n| n.is_event_subprocess) {
+            let invalid = |reason: String| ParseError::InvalidProcess {
+                process_id: self.id.clone(),
+                reason,
+            };
+            let starts = esp_starts.get(&esp.id).cloned().unwrap_or_default();
+            if starts.len() != 1 {
+                return Err(invalid(format!(
+                    "event sub-process {} must have exactly one start event, found {}",
+                    esp.id,
+                    starts.len()
+                )));
+            }
+            let start = &self.nodes[starts[0]];
+            // Count the typed triggers on the start event. A timer start is
+            // recognised by `timer_repeating` (set for a timeDuration/timeCycle/
+            // timeDate); message/signal by their refs; error/escalation/
+            // conditional by the esp_* fields.
+            let trigger_count = start.message_ref.is_some() as u32
+                + start.timer_repeating.is_some() as u32
+                + start.signal_ref.is_some() as u32
+                + start.esp_error_ref.is_some() as u32
+                + start.esp_escalation_ref.is_some() as u32
+                + start.esp_condition.is_some() as u32;
+            if trigger_count == 0 {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} must have exactly one event \
+                     definition (message, timer, signal, error, escalation or \
+                     conditional); a none start event cannot trigger an event \
+                     sub-process",
+                    esp.id, start.id
+                )));
+            }
+            if trigger_count > 1 {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} declares more than one event \
+                     definition; exactly one trigger (message, timer, signal, error, \
+                     escalation or conditional) is supported",
+                    esp.id, start.id
+                )));
+            }
+            // Zeebe: an error event sub-process is always interrupting — a
+            // non-interrupting error start is rejected at deploy.
+            if start.esp_error_ref.is_some() && start.esp_interrupting == Some(false) {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} is an error start event and must \
+                     be interrupting (isInterrupting=\"false\" is not allowed)",
+                    esp.id, start.id
+                )));
+            }
+            let interrupting = start.esp_interrupting.unwrap_or(true);
+            let trigger = resolve_esp_trigger(
+                &self.id,
+                &esp.id,
+                start,
+                messages,
+                signals,
+                errors,
+                escalations,
+            )?;
+            esp_triggers.insert(esp.id.clone(), (trigger, interrupting));
+        }
         for mut node in self.nodes {
             let job_worker = node.is_job_worker_message_event();
             // Reject an `endEvent` / `intermediateThrowEvent` that carries more
@@ -1653,7 +1802,25 @@ impl ProcessAcc {
                             reason: format!("sub-process {} has no start event", node.id),
                         }
                     })?;
-                    builder.sub_process(node.id, start)
+                    if node.is_event_subprocess {
+                        // An event sub-process (`triggeredByEvent="true"`): the
+                        // trigger was resolved and validated above (exactly one
+                        // start event, exactly one trigger, error always
+                        // interrupting), so the lookup always succeeds.
+                        let (trigger, interrupting) = esp_triggers
+                            .get(&node.id)
+                            .cloned()
+                            .ok_or_else(|| ParseError::InvalidProcess {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "event sub-process {} has no resolved trigger",
+                                    node.id
+                                ),
+                            })?;
+                        builder.event_sub_process(node.id, start, trigger, interrupting)
+                    } else {
+                        builder.sub_process(node.id, start)
+                    }
                 }
                 NodeKind::Call => {
                     // The callee is required; an unresolved call activity is a
@@ -2075,4 +2242,121 @@ impl ProcessAcc {
         def.start_form_id = start_form_id;
         Ok(def)
     }
+}
+
+/// Resolves the [`EventSubProcessTrigger`] of an event sub-process from its
+/// start event `start` (a scanned [`NodeAcc`]). Called after the event
+/// sub-process pre-validation has established that `start` carries exactly one
+/// typed trigger, so exactly one arm of the cascade matches. Reference
+/// integrity (#851) is enforced here: a dangling `messageRef`/`signalRef`/
+/// `errorRef`/`escalationRef` is a parse error naming the element, never a
+/// silently dropped trigger.
+///
+/// [`EventSubProcessTrigger`]: crate::model::EventSubProcessTrigger
+fn resolve_esp_trigger(
+    process_id: &str,
+    esp_id: &str,
+    start: &NodeAcc,
+    messages: &HashMap<String, MessageDecl>,
+    signals: &HashMap<String, String>,
+    errors: &HashMap<String, String>,
+    escalations: &HashMap<String, String>,
+) -> Result<crate::model::EventSubProcessTrigger, ParseError> {
+    use crate::model::EventSubProcessTrigger as T;
+    if let Some(message_ref) = &start.message_ref {
+        let decl = messages.get(message_ref).ok_or_else(|| {
+            ParseError::InvalidMessageEvent {
+                process_id: process_id.to_string(),
+                reason: format!(
+                    "event sub-process {esp_id} start event {} references unknown message '{message_ref}'",
+                    start.id
+                ),
+            }
+        })?;
+        let correlation_key =
+            decl.correlation_key
+                .clone()
+                .ok_or_else(|| ParseError::InvalidMessageEvent {
+                    process_id: process_id.to_string(),
+                    reason: format!(
+                        "message '{message_ref}' has no zeebe:subscription correlationKey"
+                    ),
+                })?;
+        return Ok(T::Message {
+            message_name: decl.name.clone(),
+            correlation_key,
+        });
+    }
+    if start.timer_repeating.is_some() {
+        // A timer trigger is carried as a `TimerDef`: a FEEL expression when
+        // the model declared one (`timer_expr`), else the static ISO-8601
+        // literal text. The kind comes from which time* element was declared.
+        let def = start.timer_expr.clone().unwrap_or(crate::model::TimerDef {
+            kind: start
+                .timer_def_kind
+                .unwrap_or(crate::model::TimerDefKind::Duration),
+            expr: start.timer_literal.clone().unwrap_or_default(),
+        });
+        return Ok(T::Timer(def));
+    }
+    if let Some(signal_ref) = &start.signal_ref {
+        let name = signals.get(signal_ref).cloned().ok_or_else(|| {
+            ParseError::InvalidProcess {
+                process_id: process_id.to_string(),
+                reason: format!(
+                    "event sub-process {esp_id} start event {} references unknown signal '{signal_ref}'",
+                    start.id
+                ),
+            }
+        })?;
+        return Ok(T::Signal { signal_name: name });
+    }
+    if let Some(error_ref) = &start.esp_error_ref {
+        // `Some(None)` is a catch-all (an error definition with no errorRef);
+        // `Some(Some(ref))` resolves the ref to its declared error code.
+        let error_code = match error_ref {
+            None => None,
+            Some(r) => Some(
+                errors
+                    .get(r)
+                    .cloned()
+                    .ok_or_else(|| ParseError::InvalidProcess {
+                        process_id: process_id.to_string(),
+                        reason: format!(
+                        "event sub-process {esp_id} start event {} references unknown error '{r}'",
+                        start.id
+                    ),
+                    })?,
+            ),
+        };
+        return Ok(T::Error { error_code });
+    }
+    if let Some(escalation_ref) = &start.esp_escalation_ref {
+        let escalation_code = match escalation_ref {
+            None => None,
+            Some(r) => Some(escalations.get(r).cloned().ok_or_else(|| {
+                ParseError::InvalidProcess {
+                    process_id: process_id.to_string(),
+                    reason: format!(
+                        "event sub-process {esp_id} start event {} references unknown escalation '{r}'",
+                        start.id
+                    ),
+                }
+            })?),
+        };
+        return Ok(T::Escalation { escalation_code });
+    }
+    if let Some(condition) = &start.esp_condition {
+        return Ok(T::Conditional {
+            condition: condition.clone(),
+        });
+    }
+    // Unreachable: the pre-validation guarantees exactly one trigger.
+    Err(ParseError::InvalidProcess {
+        process_id: process_id.to_string(),
+        reason: format!(
+            "event sub-process {esp_id} start event {} has no resolvable trigger",
+            start.id
+        ),
+    })
 }

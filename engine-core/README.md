@@ -292,6 +292,19 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   inner scope (like the error boundary) before routing out the boundary, while a
   **non-interrupting** one spawns a parallel token and leaves the inner scope
   running.
+- An **event sub-process** (`<subProcess triggeredByEvent="true">`, #1555) is a
+  container like an embedded sub-process but **never entered by token flow**:
+  while its enclosing scope (the process, or an embedded sub-process) is active,
+  its single typed start event's trigger is armed, and the event's occurrence
+  activates the sub-process. The parser models it as
+  `ElementKind::EventSubProcess` carrying its start event's trigger — message,
+  timer, signal, error, escalation or conditional — and its `isInterrupting`
+  flag (default `true`; an error start is always interrupting). This wave-0
+  slice *represents* the element: deploying a model containing one succeeds, but
+  the event sub-process is **not yet triggered at runtime** (the arming /
+  interrupting / non-interrupting execution is the follow-up runtime slice).
+  `ProcessDefinition::event_subprocesses_in_scope` enumerates the event
+  sub-processes directly contained in a scope — the seam the runtime consumes.
 - A **call activity** invokes another deployed process as a distinct **child
   process instance** of its `calledElement` / `zeebe:calledElement processId`
   (Zeebe/C8 parity), linked back to the caller via `parentProcessInstanceKey` /

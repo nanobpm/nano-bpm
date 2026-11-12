@@ -5614,3 +5614,431 @@ fn terminate_end_event_accepts_end_execution_listeners() {
     assert_eq!(kill.start_listeners.len(), 1, "{:?}", kill.start_listeners);
     assert_eq!(kill.end_listeners.len(), 1, "{:?}", kill.end_listeners);
 }
+
+// ---------------------------------------------------------------------------
+// Event sub-processes (`subProcess triggeredByEvent="true"`) — #1555.
+//
+// The wave-0 model slice: the parser must turn an event sub-process into an
+// `ElementKind::EventSubProcess` carrying its start event's trigger and
+// interruptingness. The runtime never triggers it yet (that is the follow-up
+// runtime slice), so these tests pin the *model* surface only.
+// ---------------------------------------------------------------------------
+
+/// Wraps `body` (the process-level flow plus any event sub-processes) in a
+/// `<definitions>` that declares the reusable message/signal/error/escalation
+/// the event sub-process start events reference.
+fn esp_wrap(body: &str) -> String {
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+             <bpmn:message id="Msg" name="orderMsg">
+               <bpmn:extensionElements>
+                 <zeebe:subscription correlationKey="=orderId" />
+               </bpmn:extensionElements>
+             </bpmn:message>
+             <bpmn:signal id="Sig" name="abortSig" />
+             <bpmn:error id="Err" errorCode="E_FAIL" />
+             <bpmn:escalation id="Esc" escalationCode="ESC_UP" />
+             <bpmn:process id="p" isExecutable="true">{body}</bpmn:process>
+           </bpmn:definitions>"#
+    )
+}
+
+/// A minimal main flow: `s` (none start) -> `e` (end), with `extra` (the event
+/// sub-process under test) declared beside it.
+fn esp_process(extra: &str) -> String {
+    esp_wrap(&format!(
+        r#"<bpmn:startEvent id="s" />
+           <bpmn:endEvent id="e" />
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+           {extra}"#
+    ))
+}
+
+/// An event sub-process `esp` whose start event `esp_start` carries `def`
+/// (an event definition) and `interrupting_attr` (an optional
+/// `isInterrupting="…"` attribute string), with a single task inside.
+fn esp_decl(def: &str, interrupting_attr: &str) -> String {
+    format!(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:startEvent id="esp_start"{interrupting_attr}>{def}</bpmn:startEvent>
+             <bpmn:task id="esp_task" />
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_task" />
+             <bpmn:sequenceFlow id="ef2" sourceRef="esp_task" targetRef="esp_end" />
+           </bpmn:subProcess>"#
+    )
+}
+
+/// The same event sub-process, but nested inside an ordinary embedded
+/// sub-process `outer` that sits in the main flow.
+fn esp_nested_process(def: &str, interrupting_attr: &str) -> String {
+    esp_process(&format!(
+        r#"<bpmn:subProcess id="outer">
+             <bpmn:startEvent id="outer_start" />
+             <bpmn:task id="outer_task" />
+             <bpmn:endEvent id="outer_end" />
+             {}
+             <bpmn:sequenceFlow id="of1" sourceRef="outer_start" targetRef="outer_task" />
+             <bpmn:sequenceFlow id="of2" sourceRef="outer_task" targetRef="outer_end" />
+           </bpmn:subProcess>
+           <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="e" />"#,
+        esp_decl(def, interrupting_attr)
+    ))
+    // `f1` from esp_process targets `e` directly; rewire the main flow through
+    // `outer` by replacing it.
+    .replace(
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />"#,
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="outer" />"#,
+    )
+}
+
+/// The six trigger definitions, one per supported event sub-process start type.
+const ESP_TRIGGER_DEFS: [(&str, &str); 6] = [
+    (
+        "message",
+        r#"<bpmn:messageEventDefinition messageRef="Msg" />"#,
+    ),
+    (
+        "timer-duration",
+        r#"<bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "timer-cycle",
+        r#"<bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT1H</bpmn:timeCycle></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "timer-date",
+        r#"<bpmn:timerEventDefinition><bpmn:timeDate>2030-01-01T00:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "signal",
+        r#"<bpmn:signalEventDefinition signalRef="Sig" />"#,
+    ),
+    ("error", r#"<bpmn:errorEventDefinition errorRef="Err" />"#),
+];
+
+/// The escalation and conditional trigger definitions (kept separate so the
+/// interrupting/non-interrupting matrix can treat the always-interrupting
+/// error trigger differently).
+const ESP_ESCALATION_DEF: &str = r#"<bpmn:escalationEventDefinition escalationRef="Esc" />"#;
+const ESP_CONDITIONAL_DEF: &str = r#"<bpmn:conditionalEventDefinition><bpmn:condition>=x &gt; 5</bpmn:condition></bpmn:conditionalEventDefinition>"#;
+
+/// Parses `xml` and returns the `esp` element's kind, asserting it is an
+/// event sub-process.
+fn esp_kind(xml: &str) -> crate::model::EventSubProcessTrigger {
+    let def = &parse_bpmn(xml).unwrap()[0];
+    match &def.element("esp").unwrap().kind {
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            ..
+        } => {
+            assert_eq!(start_event, "esp_start");
+            trigger.clone()
+        }
+        other => panic!("esp must be an EventSubProcess, got {other:?}"),
+    }
+}
+
+#[test]
+fn event_subprocess_parses_every_trigger_interrupting_by_default() {
+    // Every trigger type, no `isInterrupting` attribute -> interrupting (the
+    // BPMN/Zeebe default), at process level.
+    let expected: [(&str, crate::model::EventSubProcessTrigger); 8] = [
+        (
+            "message",
+            crate::model::EventSubProcessTrigger::Message {
+                message_name: "orderMsg".into(),
+                correlation_key: "orderId".into(),
+            },
+        ),
+        (
+            "timer-duration",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "PT5M".into(),
+            }),
+        ),
+        (
+            "timer-cycle",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Cycle,
+                expr: "R3/PT1H".into(),
+            }),
+        ),
+        (
+            "timer-date",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Date,
+                expr: "2030-01-01T00:00:00Z".into(),
+            }),
+        ),
+        (
+            "signal",
+            crate::model::EventSubProcessTrigger::Signal {
+                signal_name: "abortSig".into(),
+            },
+        ),
+        (
+            "error",
+            crate::model::EventSubProcessTrigger::Error {
+                error_code: Some("E_FAIL".into()),
+            },
+        ),
+        (
+            "escalation",
+            crate::model::EventSubProcessTrigger::Escalation {
+                escalation_code: Some("ESC_UP".into()),
+            },
+        ),
+        (
+            "conditional",
+            crate::model::EventSubProcessTrigger::Conditional {
+                condition: "=x > 5".into(),
+            },
+        ),
+    ];
+    for (name, want_trigger) in expected {
+        let def = match name {
+            "escalation" => ESP_ESCALATION_DEF,
+            "conditional" => ESP_CONDITIONAL_DEF,
+            _ => ESP_TRIGGER_DEFS.iter().find(|(n, _)| *n == name).unwrap().1,
+        };
+        let xml = esp_process(&esp_decl(def, ""));
+        let def =
+            &parse_bpmn(xml.as_str()).unwrap_or_else(|e| panic!("{name} trigger parses: {e:?}"))[0];
+        match &def.element("esp").unwrap().kind {
+            ElementKind::EventSubProcess {
+                start_event,
+                trigger,
+                interrupting,
+            } => {
+                assert_eq!(start_event, "esp_start", "{name}");
+                assert_eq!(*trigger, want_trigger, "{name}");
+                assert!(*interrupting, "{name} defaults to interrupting");
+            }
+            other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_parses_non_interrupting_triggers() {
+    // `isInterrupting="false"` is honoured for every trigger that permits it
+    // (all but error, which Zeebe requires to be interrupting).
+    for (name, def) in ESP_TRIGGER_DEFS
+        .iter()
+        .filter(|(n, _)| *n != "error")
+        .map(|(n, d)| (*n, *d))
+        .chain([
+            ("escalation", ESP_ESCALATION_DEF),
+            ("conditional", ESP_CONDITIONAL_DEF),
+        ])
+    {
+        let xml = esp_process(&esp_decl(def, r#" isInterrupting="false""#));
+        let parsed = parse_bpmn(xml.as_str())
+            .unwrap_or_else(|e| panic!("non-interrupting {name} parses: {e:?}"));
+        match &parsed[0].element("esp").unwrap().kind {
+            ElementKind::EventSubProcess { interrupting, .. } => {
+                assert!(!interrupting, "{name} must be non-interrupting");
+            }
+            other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_parses_inside_an_embedded_subprocess() {
+    // An event sub-process scoped to an embedded sub-process: contained in it
+    // (parent set), with its trigger and interruptingness intact, while the
+    // outer sub-process stays an ordinary embedded SubProcess.
+    for (name, def) in ESP_TRIGGER_DEFS.iter().map(|(n, d)| (*n, *d)).chain([
+        ("escalation", ESP_ESCALATION_DEF),
+        ("conditional", ESP_CONDITIONAL_DEF),
+    ]) {
+        for interrupting_attr in ["", r#" isInterrupting="false""#] {
+            if name == "error" && !interrupting_attr.is_empty() {
+                continue; // error start must stay interrupting (tested below)
+            }
+            let xml = esp_nested_process(def, interrupting_attr);
+            let parsed = parse_bpmn(xml.as_str())
+                .unwrap_or_else(|e| panic!("nested {name} ({interrupting_attr}) parses: {e:?}"));
+            let def = &parsed[0];
+            let esp = def.element("esp").unwrap();
+            assert_eq!(esp.parent.as_deref(), Some("outer"), "{name}");
+            match &esp.kind {
+                ElementKind::EventSubProcess {
+                    start_event,
+                    interrupting,
+                    ..
+                } => {
+                    assert_eq!(start_event, "esp_start", "{name}");
+                    assert_eq!(
+                        *interrupting,
+                        interrupting_attr.is_empty(),
+                        "{name} interrupting"
+                    );
+                }
+                other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    def.element("outer").unwrap().kind,
+                    ElementKind::SubProcess { .. }
+                ),
+                "{name}: outer stays an embedded sub-process"
+            );
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_trigger_fields_are_resolved() {
+    // Spot-check the resolved fields of each trigger variant.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:messageEventDefinition messageRef="Msg" />"#,
+        "",
+    ));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Message {
+            message_name: "orderMsg".into(),
+            correlation_key: "orderId".into(),
+        }
+    );
+    let xml = esp_process(&esp_decl(ESP_ESCALATION_DEF, ""));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Escalation {
+            escalation_code: Some("ESC_UP".into()),
+        }
+    );
+    let xml = esp_process(&esp_decl(ESP_CONDITIONAL_DEF, ""));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Conditional {
+            condition: "=x > 5".into(),
+        }
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_non_interrupting_error_start() {
+    // Zeebe: an error event sub-process start event is always interrupting
+    // (`EventSubProcessValidator`); `isInterrupting="false"` must be rejected
+    // at deploy rather than silently accepted.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:errorEventDefinition errorRef="Err" />"#,
+        r#" isInterrupting="false""#,
+    ));
+    let err = parse_bpmn(&xml).expect_err("non-interrupting error start rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_none_start_event() {
+    // An event sub-process is triggered by its typed start event; a plain
+    // none start leaves it with no trigger (Zeebe rejects the model).
+    let xml = esp_process(&esp_decl("", ""));
+    let err = parse_bpmn(&xml).expect_err("none-start event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_missing_start_event() {
+    // No start event at all: no trigger to arm (Zeebe rejects the model).
+    let xml = esp_process(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:task id="esp_task" />
+           </bpmn:subProcess>"#,
+    );
+    let err = parse_bpmn(&xml).expect_err("start-less event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_multiple_start_events() {
+    // Two start events make the trigger ambiguous (Zeebe: exactly one).
+    let xml = esp_process(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:startEvent id="esp_start"><bpmn:signalEventDefinition signalRef="Sig" /></bpmn:startEvent>
+             <bpmn:startEvent id="esp_start2"><bpmn:signalEventDefinition signalRef="Sig" /></bpmn:startEvent>
+             <bpmn:task id="esp_task" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_task" />
+           </bpmn:subProcess>"#,
+    );
+    let err = parse_bpmn(&xml).expect_err("multi-start event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_an_unknown_message_ref() {
+    // The start event's messageRef must resolve against a declared <message>
+    // (same reference integrity as a message catch event).
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:messageEventDefinition messageRef="NoSuchMessage" />"#,
+        "",
+    ));
+    let err = parse_bpmn(&xml).expect_err("unknown messageRef rejected");
+    assert!(
+        matches!(
+            err,
+            ParseError::InvalidMessageEvent { .. } | ParseError::UnresolvedReference { .. }
+        ),
+        "expected a message reference error, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_start_event_with_multiple_definitions() {
+    // A start event carrying two event definitions has no single trigger.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:signalEventDefinition signalRef="Sig" /><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>"#,
+        "",
+    ));
+    let err = parse_bpmn(&xml).expect_err("multi-definition esp start rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_is_not_part_of_normal_flow() {
+    // The event sub-process and its inner elements stay out of the main
+    // token flow: no sequence flow may target or leave it, and the process
+    // entry start is unaffected.
+    let xml = esp_process(&esp_decl(ESP_ESCALATION_DEF, ""));
+    let def = &parse_bpmn(&xml).unwrap()[0];
+    assert_eq!(def.start_event, "s");
+    // The scope-enumeration seam: `esp` is directly contained in the process
+    // scope; nothing is contained in `esp` itself as an event sub-process.
+    let top: Vec<&str> = def
+        .event_subprocesses_in_scope(None)
+        .map(|(id, _, _, _)| id.as_str())
+        .collect();
+    assert_eq!(top, vec!["esp"]);
+    assert_eq!(def.event_subprocesses_in_scope(Some("esp")).count(), 0);
+    // Nested: `esp` is enumerated under `outer`, not at process level.
+    let xml = esp_nested_process(ESP_ESCALATION_DEF, "");
+    let def = &parse_bpmn(&xml).unwrap()[0];
+    assert_eq!(def.event_subprocesses_in_scope(None).count(), 0);
+    let inner: Vec<&str> = def
+        .event_subprocesses_in_scope(Some("outer"))
+        .map(|(id, _, _, _)| id.as_str())
+        .collect();
+    assert_eq!(inner, vec!["esp"]);
+}

@@ -425,6 +425,7 @@ fn callactivity_variant_witness_is_exhaustive() {
             CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
             CompensationThrowEvent => "compensationThrowEvent",
             AgentTask { .. } => "agentTask",
+            EventSubProcess { .. } => "eventSubProcess",
         }
     }
 

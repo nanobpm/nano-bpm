@@ -493,6 +493,74 @@ fn default_propagate() -> bool {
     true
 }
 
+/// The start-event trigger of an event sub-process
+/// ([`ElementKind::EventSubProcess`]) — which event, raised inside (or observed
+/// by) the enclosing scope, activates the sub-process.
+///
+/// This mirrors the six event definitions Zeebe permits on an event
+/// sub-process's start event. Every field carries the *resolved* reference
+/// (a message/signal/error/escalation name or code, not a BPMN `…Ref` id),
+/// exactly like the corresponding boundary/catch element kinds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum EventSubProcessTrigger {
+    /// A `messageEventDefinition`: the sub-process starts when a message named
+    /// `message_name` correlates to the enclosing scope. `correlation_key` is
+    /// the raw (un-evaluated) correlation-key expression declared via
+    /// `zeebe:subscription correlationKey` (typically `=`-prefixed FEEL),
+    /// resolved against the scope's variables when the subscription is opened —
+    /// same shape as [`ElementKind::MessageIntermediateCatchEvent`].
+    Message {
+        /// The BPMN message name this trigger subscribes to.
+        message_name: String,
+        /// The raw correlation-key expression (the variable/expression whose
+        /// value identifies the scope to correlate to).
+        correlation_key: String,
+    },
+    /// A `timerEventDefinition`: the sub-process starts when the timer becomes
+    /// due after the enclosing scope activates. The definition is always
+    /// carried as a [`TimerDef`] — a static ISO-8601 literal keeps its literal
+    /// text (unlike a process-level timer start, an event sub-process timer is
+    /// armed per *scope activation*, so it is never pre-resolved to millis at
+    /// deploy time); a `=`-prefixed FEEL expression is evaluated at arming.
+    /// `TimerDefKind::Cycle` re-arms after each fire while the scope lives.
+    Timer(TimerDef),
+    /// A `signalEventDefinition`: the sub-process starts when a signal named
+    /// `signal_name` is broadcast while the enclosing scope is active. Signals
+    /// correlate by name only (no correlation key).
+    Signal {
+        /// The BPMN signal name this trigger subscribes to.
+        signal_name: String,
+    },
+    /// An `errorEventDefinition`: the sub-process starts when an error whose
+    /// code matches `error_code` is thrown inside the enclosing scope (an error
+    /// end event, or a job error). `None` (no `errorRef`) is a **catch-all**
+    /// that matches any error not claimed by a more specific code at the same
+    /// scope. Always interrupting — Zeebe rejects a non-interrupting error
+    /// event sub-process at deploy.
+    Error {
+        /// The BPMN error code this trigger catches; `None` is a catch-all.
+        error_code: Option<String>,
+    },
+    /// An `escalationEventDefinition`: the sub-process starts when an
+    /// escalation whose code matches `escalation_code` is raised inside the
+    /// enclosing scope. `None` (no `escalationRef`) is a **catch-all**, same
+    /// convention as [`ElementKind::EscalationBoundaryEvent`]'s empty code.
+    Escalation {
+        /// The BPMN escalation code this trigger catches; `None` is a
+        /// catch-all.
+        escalation_code: Option<String>,
+    },
+    /// A `conditionalEventDefinition`: the sub-process starts when the FEEL
+    /// boolean `condition` becomes `true` in the enclosing scope — evaluated
+    /// when the scope activates and again whenever a referenced variable
+    /// changes while the scope is active.
+    Conditional {
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+    },
+}
+
 /// The kind of a BPMN flow node.
 ///
 /// The set is intentionally small. New element types plug in here and gain
@@ -717,6 +785,52 @@ pub enum ElementKind {
         /// Id of the sub-process's inner (none) start event, where its token
         /// scope begins.
         start_event: ElementId,
+    },
+    /// An event sub-process (`<subProcess triggeredByEvent="true">`): a
+    /// container, like [`SubProcess`], holding its own inner flow — but one
+    /// that is **never entered by token flow**. It has no incoming sequence
+    /// flow; instead, while its *enclosing* scope (the process instance, or an
+    /// embedded sub-process) is active, its start event's [`trigger`] is armed,
+    /// and the event's occurrence activates the sub-process.
+    ///
+    /// Zeebe runtime semantics (the contract the runtime slices implement; this
+    /// wave-0 model slice only *represents* the element — deploying a model
+    /// containing one succeeds, and until the runtime lands the sub-process is
+    /// simply never triggered):
+    ///
+    /// - **Arming**: when the enclosing scope activates (the process instance
+    ///   starts, or the containing embedded sub-process is entered), the start
+    ///   event's subscription is opened (message/signal/conditional) or its
+    ///   timer armed. It is disarmed when the scope completes or terminates.
+    /// - **Interrupting** (`interrupting == true`, the BPMN default): on
+    ///   trigger, every other active child of the scope is terminated, the
+    ///   scope's other event sub-process subscriptions are disarmed, and the
+    ///   event sub-process activates; the scope completes when it completes.
+    /// - **Non-interrupting** (`interrupting == false`): the event sub-process
+    ///   activates concurrently, repeatedly (a cycle timer re-arms; a
+    ///   message/signal subscription stays open), and the scope waits for the
+    ///   spawned instances before completing.
+    /// - An **error** trigger is always interrupting (Zeebe rejects a
+    ///   non-interrupting error event sub-process at deploy).
+    ///
+    /// The inner flow is wired exactly like an embedded sub-process's: inner
+    /// elements carry [`Element::parent`] equal to this element's id and the
+    /// inner start event is `start_event`. Use
+    /// [`ProcessDefinition::event_subprocesses_in_scope`] to enumerate the
+    /// event sub-processes directly contained in a given scope.
+    ///
+    /// [`trigger`]: ElementKind::EventSubProcess::trigger
+    EventSubProcess {
+        /// Id of the sub-process's inner (typed) start event, where its token
+        /// scope begins when the trigger fires.
+        start_event: ElementId,
+        /// The start event's trigger — which event activates this sub-process.
+        trigger: EventSubProcessTrigger,
+        /// Whether firing interrupts the enclosing scope's other work (`true`,
+        /// the BPMN default) or spawns a concurrent instance and leaves it
+        /// running (`false`). Always `true` for an
+        /// [`EventSubProcessTrigger::Error`] trigger.
+        interrupting: bool,
     },
     /// An escalation throw event: an `intermediateThrowEvent` or an `endEvent`
     /// carrying an `escalationEventDefinition`. On activation (completion) it
@@ -1015,6 +1129,7 @@ impl ElementKind {
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
             | ElementKind::SubProcess { .. }
+            | ElementKind::EventSubProcess { .. }
             | ElementKind::IntermediateThrowEvent
             | ElementKind::EscalationThrowEvent { .. }
             | ElementKind::CompensationThrowEvent
@@ -1043,6 +1158,7 @@ impl ElementKind {
             | ElementKind::Task
             | ElementKind::AgentTask { .. }
             | ElementKind::SubProcess { .. }
+            | ElementKind::EventSubProcess { .. }
             | ElementKind::CallActivity { .. } => true,
             ElementKind::StartEvent
             | ElementKind::EndEvent
@@ -1112,6 +1228,7 @@ impl ElementKind {
             ElementKind::InclusiveGateway => "INCLUSIVE_GATEWAY",
             ElementKind::EventBasedGateway => "EVENT_BASED_GATEWAY",
             ElementKind::SubProcess { .. } => "SUB_PROCESS",
+            ElementKind::EventSubProcess { .. } => "SUB_PROCESS",
             ElementKind::CallActivity { .. } => "CALL_ACTIVITY",
         }
     }
@@ -1545,6 +1662,43 @@ pub struct ProcessDefinition {
 }
 
 impl ProcessDefinition {
+    /// Enumerates the event sub-processes ([`ElementKind::EventSubProcess`])
+    /// **directly contained** in `scope`: pass `None` for the process-level
+    /// scope, or `Some(id)` for the embedded sub-process whose id is `id`.
+    ///
+    /// This is the seam the event sub-process *runtime* consumes (#1555): when
+    /// a scope activates, the engine arms the start-event [`trigger`] of every
+    /// event sub-process this iterator yields for that scope (and disarms them
+    /// when the scope completes or terminates). Yields
+    /// `(element id, start event id, trigger, interrupting)` tuples in
+    /// deterministic (element-id) order so key minting and replay stay in
+    /// lock-step. Only *direct* containment is reported — an event sub-process
+    /// nested inside an embedded sub-process belongs to that sub-process's
+    /// scope, not the process's, and is enumerated under
+    /// `Some(containing_sub_process_id)`.
+    ///
+    /// [`trigger`]: ElementKind::EventSubProcess::trigger
+    pub fn event_subprocesses_in_scope(
+        &self,
+        scope: Option<&str>,
+    ) -> impl Iterator<Item = (&ElementId, &ElementId, &EventSubProcessTrigger, bool)> {
+        let mut matched: Vec<(&ElementId, &ElementId, &EventSubProcessTrigger, bool)> = self
+            .elements
+            .values()
+            .filter(|e| e.parent.as_deref() == scope)
+            .filter_map(|e| match &e.kind {
+                ElementKind::EventSubProcess {
+                    start_event,
+                    trigger,
+                    interrupting,
+                } => Some((&e.id, start_event, trigger, *interrupting)),
+                _ => None,
+            })
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(b.0));
+        matched.into_iter()
+    }
+
     /// Upgrades the historical agent-only model shape without changing event
     /// frames or minting runtime state. Called for legacy deployments and snapshots.
     pub fn normalize_legacy_agent_tasks(&mut self) {
@@ -1747,6 +1901,15 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
     match kind {
         ElementKind::SubProcess { start_event } => ElementKind::SubProcess {
             start_event: pfx(start_event),
+        },
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => ElementKind::EventSubProcess {
+            start_event: pfx(start_event),
+            trigger: trigger.clone(),
+            interrupting: *interrupting,
         },
         ElementKind::ErrorBoundaryEvent {
             attached_to,
@@ -2242,6 +2405,33 @@ impl ProcessBuilder {
             id,
             ElementKind::SubProcess {
                 start_event: start_event.into(),
+            },
+        )
+    }
+
+    /// Adds an event sub-process (`<subProcess triggeredByEvent="true">`): a
+    /// container never entered by token flow, activated when its start event's
+    /// `trigger` fires while the enclosing scope is active. `start_event` is
+    /// the id of its inner (typed) start event; `interrupting` selects
+    /// Zeebe's interrupting (terminate the scope's other work) vs
+    /// non-interrupting (run concurrently) semantics. Contain it in an
+    /// embedded sub-process with [`contained_in`](ProcessBuilder::contained_in)
+    /// (as for any inner element); leave it parentless for the process scope.
+    /// Enumerate the event sub-processes of a scope with
+    /// [`ProcessDefinition::event_subprocesses_in_scope`].
+    pub fn event_sub_process(
+        self,
+        id: impl Into<String>,
+        start_event: impl Into<String>,
+        trigger: EventSubProcessTrigger,
+        interrupting: bool,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::EventSubProcess {
+                start_event: start_event.into(),
+                trigger,
+                interrupting,
             },
         )
     }

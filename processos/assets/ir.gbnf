@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-eventSubProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -133,6 +133,14 @@ elem-subProcess  ::= indent "subProcess" sp id (sp string)? (sp attrs-subProcess
 attrs-subProcess   ::= "{" nl (indent2 attr-line-subProcess nl)+ indent "}"
 attr-line-subProcess  ::= attr-subProcess-startEvent | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-subProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the sub-process's inner (none) start event.
+
+# eventSubProcess — Event sub-process (`triggeredByEvent`). Never entered by token flow; activated when its start event's trigger fires while the enclosing scope is active.
+elem-eventSubProcess  ::= indent "eventSubProcess" sp id (sp string)? (sp attrs-eventSubProcess)? nl
+attrs-eventSubProcess   ::= "{" nl (indent2 attr-line-eventSubProcess nl)+ indent "}"
+attr-line-eventSubProcess  ::= attr-eventSubProcess-startEvent | attr-eventSubProcess-trigger | attr-eventSubProcess-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-eventSubProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the event sub-process's inner (typed) start event.
+attr-eventSubProcess-trigger  ::= "trigger" sp attr-str   # The start event's trigger, e.g. `message "name"`, `timer duration "PT5M"`, `signal "name"`, `error "CODE"` / `error` (catch-all), `escalation "CODE"` / `escalation`, `conditional "=expr"`.
+attr-eventSubProcess-interrupting  ::= "interrupting" sp attr-bool   # `true` terminates the scope's other work on trigger (the default); `false` runs the event sub-process concurrently. Always `true` for an error trigger.
 
 # escalationThrowEvent — Escalation throw (intermediate throw or end event). Raises `escalationCode` up the enclosing scopes; non-critical, so the token always continues / drains (an uncaught escalation is ignored).
 elem-escalationThrowEvent  ::= indent "escalationThrowEvent" sp id (sp string)? (sp attrs-escalationThrowEvent)? nl

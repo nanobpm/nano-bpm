@@ -357,6 +357,35 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         }],
     },
     KindSpec {
+        keyword: "eventSubProcess",
+        doc: "Event sub-process (`triggeredByEvent`). Never entered by token flow; activated \
+              when its start event's trigger fires while the enclosing scope is active.",
+        attrs: &[
+            AttrSpec {
+                key: "startEvent",
+                required: true,
+                ty: AttrType::Id,
+                doc: "Id of the event sub-process's inner (typed) start event.",
+            },
+            AttrSpec {
+                key: "trigger",
+                required: true,
+                ty: AttrType::Str,
+                doc: "The start event's trigger, e.g. `message \"name\"`, `timer duration \"PT5M\"`, \
+                      `signal \"name\"`, `error \"CODE\"` / `error` (catch-all), \
+                      `escalation \"CODE\"` / `escalation`, `conditional \"=expr\"`.",
+            },
+            AttrSpec {
+                key: "interrupting",
+                required: true,
+                ty: AttrType::Bool,
+                doc: "`true` terminates the scope's other work on trigger (the default); \
+                      `false` runs the event sub-process concurrently. Always `true` for an \
+                      error trigger.",
+            },
+        ],
+    },
+    KindSpec {
         keyword: "escalationThrowEvent",
         doc: "Escalation throw (intermediate throw or end event). Raises `escalationCode` \
               up the enclosing scopes; non-critical, so the token always continues / drains \
@@ -932,6 +961,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         MessageStartEvent { .. } => "messageStartEvent",
         TimerStartEvent { .. } => "timerStartEvent",
         SubProcess { .. } => "subProcess",
+        EventSubProcess { .. } => "eventSubProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
         EscalationThrowEvent { .. } => "escalationThrowEvent",
         EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -1049,6 +1079,17 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             "subProcess",
             ElementKind::SubProcess {
                 start_event: "inner_start".into(),
+            },
+        ),
+        (
+            "eventSubProcess",
+            ElementKind::EventSubProcess {
+                start_event: "esp_start".into(),
+                trigger: nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                    message_name: "orderMsg".into(),
+                    correlation_key: "orderId".into(),
+                },
+                interrupting: true,
             },
         ),
         (

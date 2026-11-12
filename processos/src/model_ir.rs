@@ -161,6 +161,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
         ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -303,6 +304,15 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         }
         ElementKind::SubProcess { start_event } => {
             attrs.push(format!("startEvent {start_event}"));
+        }
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => {
+            attrs.push(format!("startEvent {start_event}"));
+            attrs.push(format!("trigger {}", quote(&render_esp_trigger(trigger))));
+            attrs.push(format!("interrupting {interrupting}"));
         }
         ElementKind::ScriptTask {
             expression,
@@ -455,6 +465,153 @@ fn quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Render an event sub-process trigger as a single-quoted-free IR token string,
+/// e.g. `message "orderMsg"`, `timer duration "PT5M"`, `error "E_FAIL"`,
+/// `error` (catch-all), `conditional "=x > 5"`. The whole thing is embedded as
+/// one quoted `trigger` attribute value by [`render_kind_attrs`]; the inner
+/// payloads use their own quoting, so the IR stays unambiguous and round-trips.
+fn render_esp_trigger(trigger: &nanobpmn_engine_core::EventSubProcessTrigger) -> String {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    match trigger {
+        T::Message {
+            message_name,
+            correlation_key,
+        } => format!(
+            "message {} correlationKey {}",
+            quote(message_name),
+            quote(correlation_key)
+        ),
+        T::Timer(def) => {
+            let kind = match def.kind {
+                nanobpmn_engine_core::TimerDefKind::Duration => "duration",
+                nanobpmn_engine_core::TimerDefKind::Cycle => "cycle",
+                nanobpmn_engine_core::TimerDefKind::Date => "date",
+            };
+            format!("timer {} {}", kind, quote(&def.expr))
+        }
+        T::Signal { signal_name } => format!("signal {}", quote(signal_name)),
+        T::Error {
+            error_code: Some(code),
+        } => format!("error {}", quote(code)),
+        T::Error { error_code: None } => "error".to_string(),
+        T::Escalation {
+            escalation_code: Some(code),
+        } => format!("escalation {}", quote(code)),
+        T::Escalation {
+            escalation_code: None,
+        } => "escalation".to_string(),
+        T::Conditional { condition } => format!("conditional {}", quote(condition)),
+    }
+}
+
+/// Parse the string produced by [`render_esp_trigger`] back into an
+/// [`EventSubProcessTrigger`](nanobpmn_engine_core::EventSubProcessTrigger).
+/// `id` is the owning element id, used only for error messages.
+fn parse_esp_trigger(
+    raw: &str,
+    id: &str,
+) -> Result<nanobpmn_engine_core::EventSubProcessTrigger, String> {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    // Split into the leading keyword and the rest, honouring the double-quoted
+    // payloads (which may contain spaces).
+    let mut tokens = split_ir_tokens(raw);
+    let kw = tokens
+        .next()
+        .ok_or_else(|| format!("element {id}: empty eventSubProcess trigger"))?;
+    let err = |m: &str| format!("element {id}: invalid eventSubProcess trigger: {m}");
+    match kw.as_str() {
+        "message" => {
+            let message_name = tokens.next().ok_or_else(|| err("message needs a name"))?;
+            let ck_kw = tokens
+                .next()
+                .ok_or_else(|| err("message needs `correlationKey`"))?;
+            if ck_kw != "correlationKey" {
+                return Err(err("message needs `correlationKey <expr>`"));
+            }
+            let correlation_key = tokens
+                .next()
+                .ok_or_else(|| err("message correlationKey needs a value"))?;
+            Ok(T::Message {
+                message_name,
+                correlation_key,
+            })
+        }
+        "timer" => {
+            let kind = tokens.next().ok_or_else(|| err("timer needs a kind"))?;
+            let expr = tokens
+                .next()
+                .ok_or_else(|| err("timer needs an expression"))?;
+            let kind = match kind.as_str() {
+                "duration" => nanobpmn_engine_core::TimerDefKind::Duration,
+                "cycle" => nanobpmn_engine_core::TimerDefKind::Cycle,
+                "date" => nanobpmn_engine_core::TimerDefKind::Date,
+                other => return Err(err(&format!("unknown timer kind '{other}'"))),
+            };
+            Ok(T::Timer(nanobpmn_engine_core::TimerDef { kind, expr }))
+        }
+        "signal" => {
+            let signal_name = tokens.next().ok_or_else(|| err("signal needs a name"))?;
+            Ok(T::Signal { signal_name })
+        }
+        "error" => Ok(T::Error {
+            error_code: tokens.next(),
+        }),
+        "escalation" => Ok(T::Escalation {
+            escalation_code: tokens.next(),
+        }),
+        "conditional" => {
+            let condition = tokens
+                .next()
+                .ok_or_else(|| err("conditional needs a condition"))?;
+            Ok(T::Conditional { condition })
+        }
+        other => Err(err(&format!("unknown trigger kind '{other}'"))),
+    }
+}
+
+/// Split an IR attribute payload into whitespace-separated tokens, treating a
+/// double-quoted span (with `\"` / `\\` escapes) as one token and unquoting it.
+fn split_ir_tokens(raw: &str) -> impl Iterator<Item = String> + '_ {
+    let mut tokens = Vec::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        if let Some(n) = chars.next() {
+                            tok.push(match n {
+                                'n' => '\n',
+                                other => other,
+                            });
+                        }
+                    }
+                    '"' => break,
+                    other => tok.push(other),
+                }
+            }
+            tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                chars.next();
+            }
+            tokens.push(tok);
+        }
+    }
+    tokens.into_iter()
 }
 
 // ===========================================================================================
@@ -1255,6 +1412,11 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         }
         "subProcess" => ElementKind::SubProcess {
             start_event: attrs.require("startEvent", id)?,
+        },
+        "eventSubProcess" => ElementKind::EventSubProcess {
+            start_event: attrs.require("startEvent", id)?,
+            trigger: parse_esp_trigger(&attrs.require("trigger", id)?, id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
         },
         "scriptTask" => ElementKind::ScriptTask {
             expression: attrs.require("expression", id)?,
