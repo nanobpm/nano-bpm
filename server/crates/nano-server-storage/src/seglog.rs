@@ -2714,11 +2714,35 @@ pub struct MultiSegRecovery {
 /// partition's engine from the combined snapshot + its surviving tail (or a full
 /// replay when there is no snapshot), and returns the shared state plus the
 /// surviving events for the caller's global read-model catch-up.
+///
+/// This is the COLD-start form: every owned partition's engine is being
+/// rebuilt, so every owned partition's not-yet-checkpointed spill rows are
+/// discarded (see [`recover_multi_scoped`]). An online repair that rebuilds
+/// only SOME partitions must call [`recover_multi_scoped`] with just those —
+/// otherwise it deletes a healthy sibling's LIVE spilled payloads (#1575).
 pub fn recover_multi(
     dir: &Path,
     owned: &[u64],
     num_partitions: usize,
     varstore: Option<&crate::varstore::VarStore>,
+) -> io::Result<MultiSegRecovery> {
+    recover_multi_scoped(dir, owned, num_partitions, varstore, owned)
+}
+
+/// [`recover_multi`] with an explicit pending-spill discard scope
+/// (#1487/#1575): recovery discards the not-yet-checkpointed spill rows of
+/// `discard_pending_for` only — exactly the partitions whose engines the
+/// caller is REPLACING with the rebuilt ones (a pending row is stale once the
+/// rebuilt engine holds every variable resident). A partition whose live
+/// engine keeps serving must NOT be in the scope: its pending rows are the
+/// only copy rehydration reads, so deleting them loses or rolls back its
+/// spilled variables.
+pub fn recover_multi_scoped(
+    dir: &Path,
+    owned: &[u64],
+    num_partitions: usize,
+    varstore: Option<&crate::varstore::VarStore>,
+    discard_pending_for: &[u64],
 ) -> io::Result<MultiSegRecovery> {
     fs::create_dir_all(dir)?;
     let active_path = dir.join(ACTIVE_NAME);
@@ -3018,10 +3042,15 @@ pub fn recover_multi(
     let stored_vars = varstore.map(|vs| vs.load_all());
     // Pending (not-yet-checkpointed) spill rows are never recovery input
     // (#1487): one may carry the effect of a torn, re-applied frame. The engines
-    // rebuilt below hold every owned instance's variables resident, so drop them
-    // before they could be promoted by a later checkpoint.
+    // rebuilt below hold every owned instance's variables resident, so drop the
+    // rebuilt partitions' rows before they could be promoted by a later
+    // checkpoint. The scope is the caller's: a cold boot rebuilds (and discards
+    // for) every owned partition, while an online repair discards ONLY for the
+    // partitions whose engines it actually swaps in — discarding a healthy
+    // sibling's rows would delete its live spilled payloads (#1575 review).
     if let Some(vs) = varstore {
-        vs.discard_pending(owned).map_err(io::Error::other)?;
+        vs.discard_pending(discard_pending_for)
+            .map_err(io::Error::other)?;
     }
     let engines: Vec<(u64, Engine)> = owned
         .iter()
@@ -4657,6 +4686,161 @@ mod tests {
             inst.variables.get("c"),
             Some(&Value::Int(3i64)),
             "post-checkpoint merge from the journal tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1487 / #1575 review RED/GREEN: an ONLINE repair rebuilds one fenced
+    /// partition's engine from durable state while its healthy siblings keep
+    /// serving — so the recovery-time discard of not-yet-checkpointed spill
+    /// rows must be scoped to the partitions whose engines are actually being
+    /// replaced. Discarding a sibling's pending rows deletes its LIVE spilled
+    /// payloads (the only copy rehydration reads), so its next rehydration
+    /// returns an older checkpointed value or reports the variables missing.
+    /// `recover_multi_scoped` carries the discard scope; a cold boot passes the
+    /// full owned set (every engine is being rebuilt), the online repair only
+    /// the partition it swaps in.
+    #[test]
+    fn scoped_recovery_discards_pending_spills_only_for_rebuilt_partitions() {
+        use std::collections::HashMap;
+
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("lean-scoped-discard");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            assert!(recovery.fresh);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            j1.set_varstore(Arc::clone(&varstore));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // One instance per partition, then a lean checkpoint on both so the
+            // post-checkpoint spills below are genuinely PENDING (never promoted).
+            // Each carries an initial variable so the checkpointed `vars` row is
+            // distinguishable from the pending spill row.
+            let mut init0 = HashMap::new();
+            init0.insert("base".to_string(), Value::Int(0i64));
+            let (e0, c0) = j0
+                .apply_command(Command::create_instance_with("demo", init0))
+                .unwrap();
+            c0.blocking_wait();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let mut init1 = HashMap::new();
+            init1.insert("base".to_string(), Value::Int(0i64));
+            let (e1, c1) = j1
+                .apply_command(Command::create_instance_with("demo", init1))
+                .unwrap();
+            c1.blocking_wait();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            let mut entries = Vec::new();
+            for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
+                let (snap, covered, upserts, forgets) =
+                    j.snapshot_and_rotate_lean().expect("lean checkpoint");
+                let ups: Vec<(nanobpmn_engine_core::Key, &HashMap<String, Value>)> =
+                    upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
+                entries.push((pid, covered, snap));
+            }
+            write_multi_snapshot(&dir, entries).expect("write lean snapshot");
+
+            // Post-checkpoint spills on BOTH partitions: each lands as a pending
+            // row — partition 1's models the healthy sibling's LIVE spill. (The
+            // spill write-through itself is `Journal`-internal, so the test
+            // stages the same pending row directly, exactly as
+            // `Journal::shed_variables` does via `VarStore::put_current`.)
+            let mut v0 = HashMap::new();
+            v0.insert("p0".to_string(), Value::Int(10i64));
+            let (_, c) = j0
+                .apply_command(Command::set_variables(key0, v0.clone()))
+                .unwrap();
+            c.blocking_wait();
+            varstore.put_current(0, key0, &v0).unwrap();
+            let mut v1 = HashMap::new();
+            v1.insert("p1".to_string(), Value::Int(11i64));
+            let (_, c) = j1
+                .apply_command(Command::set_variables(key1, v1.clone()))
+                .unwrap();
+            c.blocking_wait();
+            varstore.put_current(1, key1, &v1).unwrap();
+
+            (key0, key1)
+        };
+
+        // Online repair of partition 0 ONLY: its pending row is stale by
+        // construction (the rebuilt engine holds every variable resident), but
+        // partition 1's engine is NOT being replaced, so its pending row is the
+        // live spilled payload and must survive.
+        let recovery =
+            recover_multi_scoped(&dir, &[0, 1], 2, Some(&varstore), &[0]).expect("scoped recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let rebuilt0 = engines[&0].instance(key0).expect("partition 0 instance");
+        assert_eq!(
+            rebuilt0.variables.get("p0"),
+            Some(&Value::Int(10i64)),
+            "rebuilt from the durable journal tail"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key0)
+                .unwrap()
+                .and_then(|v| v.get("p0").cloned()),
+            None,
+            "rebuilt partition's pending row discarded (only the checkpointed base remains)"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key1)
+                .unwrap()
+                .and_then(|v| v.get("p1").cloned()),
+            Some(Value::Int(11i64)),
+            "untouched sibling's live spill preserved"
+        );
+
+        // A COLD boot rebuilds every owned engine, so the full-scope wrapper
+        // still discards both partitions' pending rows.
+        let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("cold recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert_eq!(
+            engines[&1]
+                .instance(key1)
+                .and_then(|i| i.variables.get("p1")),
+            Some(&Value::Int(11i64)),
+            "cold rebuild restores the sibling from its journal tail"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key1)
+                .unwrap()
+                .and_then(|v| v.get("p1").cloned()),
+            None,
+            "cold boot discards every owned partition's pending rows"
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -115,7 +115,13 @@ impl VarStore {
              CREATE TABLE IF NOT EXISTS vars (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS position (partition INTEGER PRIMARY KEY, pos INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS pending (seq INTEGER PRIMARY KEY AUTOINCREMENT, partition INTEGER NOT NULL, key INTEGER NOT NULL, vars TEXT NOT NULL);
-             CREATE INDEX IF NOT EXISTS pending_key ON pending (key, seq);",
+             CREATE INDEX IF NOT EXISTS pending_key ON pending (key, seq);
+             -- Every pending-table query is partition-scoped (the capture
+             -- watermark, promotion, and cleanup all filter `partition = ?`
+             -- with a `seq` bound). Without this index a capture on one
+             -- partition scans every other partition's pending rows while
+             -- holding the shared connection mutex (#1575 review).
+             CREATE INDEX IF NOT EXISTS pending_partition_seq ON pending (partition, seq);",
         )?;
         let version: Option<i64> = conn
             .query_row("SELECT version FROM schema LIMIT 1", [], |r| r.get(0))
