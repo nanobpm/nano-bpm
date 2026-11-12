@@ -4403,7 +4403,11 @@ impl Journal {
     /// [`fold_cold_into`](Journal::fold_cold_into)).
     fn lean_snapshot_and_cold_upserts(
         &self,
-    ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta, Vec<Key>)> {
+    ) -> Option<(
+        nanobpmn_engine_core::EngineSnapshot,
+        VarUpsertDelta,
+        Vec<Key>,
+    )> {
         let mut snap = self.engine.snapshot_control_only();
         self.begin_fold();
         let (cold_upserts, cold_orphans) =

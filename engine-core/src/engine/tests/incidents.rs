@@ -4050,14 +4050,12 @@ fn quarantine_cold_orphan_records_a_durable_incident_for_a_non_resident_instance
     assert_eq!(active[0].instance_key, cold_key);
 
     // Idempotent.
-    assert!(
-        engine
-            .apply_command(Command::QuarantineColdOrphan {
-                instance_key: cold_key
-            })
-            .unwrap()
-            .is_empty()
-    );
+    assert!(engine
+        .apply_command(Command::QuarantineColdOrphan {
+            instance_key: cold_key
+        })
+        .unwrap()
+        .is_empty());
     assert_eq!(engine.active_incidents().len(), 1);
 
     // Durable: replaying the journal and restoring a snapshot both keep it.
