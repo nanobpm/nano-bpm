@@ -25,6 +25,18 @@
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
+//! * `subProcess triggeredByEvent="true"` (an **event sub-process**, #1555): a
+//!   container never entered by token flow, activated when its single typed
+//!   start event's trigger fires while the enclosing scope (the process, or an
+//!   embedded sub-process) is active. The start event must carry exactly one of
+//!   `messageEventDefinition`, `timerEventDefinition`, `signalEventDefinition`,
+//!   `errorEventDefinition`, `escalationEventDefinition` or
+//!   `conditionalEventDefinition`; `isInterrupting="false"` marks it
+//!   non-interrupting (the default is interrupting; an error start is always
+//!   interrupting). This wave-0 slice *represents* the element
+//!   ([`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)) and its
+//!   trigger: deploying such a model
+//!   succeeds, but the event sub-process is not yet triggered at runtime.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`
@@ -310,7 +322,11 @@ pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
 /// Parses a `zeebe:subscription correlationKey` expression into the name of an
 /// instance variable: strips the leading FEEL `=` marker and trims. Returns
 /// `None` if the result is empty.
-fn parse_correlation_key(raw: &str) -> Option<String> {
+///
+/// This marker-free form is the canonical model representation of every
+/// `correlation_key`; emitters normalize through this same function (so a
+/// caller-supplied `"= key"` serializes as exactly one `=` marker).
+pub fn parse_correlation_key(raw: &str) -> Option<String> {
     let expr = raw.trim();
     let expr = expr.strip_prefix('=').unwrap_or(expr).trim();
     if expr.is_empty() {

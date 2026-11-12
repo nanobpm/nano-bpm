@@ -56,6 +56,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
         ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -486,6 +487,9 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
         if let ElementKind::SubProcess { start_event } = &el.kind {
             entry.push(start_event.clone());
         }
+        // An event sub-process is never entered by token flow, so it is not
+        // linked from its start event here (it is reachable only via its
+        // trigger, not the main-flow adjacency).
     }
     // Boundary events have no incoming flow; they become reachable through their host.
     for (id, el) in &def.elements {
@@ -1905,10 +1909,26 @@ fn millis_to_iso8601(ms: u64) -> String {
 fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
     let mut codes: BTreeMap<String, String> = BTreeMap::new();
     for el in def.elements.values() {
-        if let ElementKind::ErrorBoundaryEvent { error_code, .. } = &el.kind {
-            codes
-                .entry(error_code.clone())
-                .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+        match &el.kind {
+            ElementKind::ErrorBoundaryEvent { error_code, .. } => {
+                codes
+                    .entry(error_code.clone())
+                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+            }
+            // An event sub-process error trigger with a code needs a
+            // definitions-level `<bpmn:error>` for its start event's `errorRef`.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Error {
+                        error_code: Some(error_code),
+                    },
+                ..
+            } => {
+                codes
+                    .entry(error_code.clone())
+                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+            }
+            _ => {}
         }
     }
     codes
@@ -1949,6 +1969,19 @@ fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
             } => {
                 want.push((message_name.clone(), Some(correlation_key.clone())));
             }
+            // An event sub-process message trigger needs a `<bpmn:message>`
+            // (with its correlation-key subscription) for its start event's
+            // `messageRef`.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                        message_name,
+                        correlation_key,
+                    },
+                ..
+            } => {
+                want.push((message_name.clone(), Some(correlation_key.clone())));
+            }
             _ => {}
         }
     }
@@ -1976,6 +2009,12 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
         let name = match &el.kind {
             ElementKind::SignalIntermediateCatchEvent { signal_name }
             | ElementKind::SignalBoundaryEvent { signal_name, .. } => Some(signal_name),
+            // An event sub-process signal trigger needs a `<bpmn:signal>`
+            // declaration for its start event's `signalRef`.
+            ElementKind::EventSubProcess {
+                trigger: nanobpmn_engine_core::EventSubProcessTrigger::Signal { signal_name },
+                ..
+            } => Some(signal_name),
             _ => None,
         };
         if let Some(name) = name {
@@ -2011,6 +2050,18 @@ fn collect_escalations(
             | ElementKind::EscalationBoundaryEvent {
                 escalation_code, ..
             } if !escalation_code.is_empty() => {
+                codes.insert(escalation_code.clone());
+            }
+            // An event sub-process escalation trigger with a code needs a
+            // `<bpmn:escalation>` declaration for its start event's
+            // `escalationRef`. A catch-all (`None`) carries no ref.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Escalation {
+                        escalation_code: Some(escalation_code),
+                    },
+                ..
+            } => {
                 codes.insert(escalation_code.clone());
             }
             _ => {}
@@ -2117,6 +2168,17 @@ fn emit_io_mapping(el: &Element, out: &mut String) {
         ));
     }
     out.push_str("        </zeebe:ioMapping>\n");
+}
+
+/// Emit `el`'s `zeebe:ioMapping` wrapped in its own `<bpmn:extensionElements>`, for owners that
+/// carry no other extension elements. A no-op when the element has no mappings.
+fn emit_io_extension(el: &Element, out: &mut String) {
+    if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+        return;
+    }
+    out.push_str("      <bpmn:extensionElements>\n");
+    emit_io_mapping(el, out);
+    out.push_str("      </bpmn:extensionElements>\n");
 }
 
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
@@ -2801,6 +2863,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
         }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
+            emit_io_extension(el, out);
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
@@ -2821,8 +2884,158 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             }
             out.push_str("    </bpmn:subProcess>\n");
         }
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => {
+            // An event sub-process emits as `<subProcess triggeredByEvent="true">`
+            // with its typed start event (carrying the event definition) nested
+            // inside, so the document round-trips back to the same element kind.
+            out.push_str(&format!(
+                "    <bpmn:subProcess id=\"{eid}\"{na} triggeredByEvent=\"true\">\n"
+            ));
+            emit_io_extension(el, out);
+            emit_esp_start_event(
+                start_event,
+                def.elements.get(start_event),
+                trigger,
+                *interrupting,
+                errors,
+                messages,
+                signals,
+                escalations,
+                labels,
+                out,
+            );
+            if let Some(kids) = children_by_parent.get(id) {
+                for child in kids {
+                    // The start event is emitted above (with its trigger); emit the
+                    // remaining children by ordinary recursion.
+                    if child == start_event {
+                        continue;
+                    }
+                    emit_element(
+                        def,
+                        child,
+                        errors,
+                        messages,
+                        signals,
+                        escalations,
+                        children_by_parent,
+                        labels,
+                        default_flows,
+                        out,
+                    );
+                }
+            }
+            out.push_str("    </bpmn:subProcess>\n");
+        }
         ElementKind::AgentTask { .. } => unreachable!("legacy agent tasks are normalized"),
     }
+}
+
+/// Emit an event sub-process's typed start event (`start_event`) with the event
+/// definition matching `trigger`, so the emitted document re-parses to the same
+/// [`EventSubProcessTrigger`](nanobpmn_engine_core::EventSubProcessTrigger).
+/// `interrupting` is written as `isInterrupting="false"` only when
+/// non-interrupting (the BPMN default `true` is omitted). The trigger's
+/// message/signal/error/escalation `…Ref` resolves against the caller's
+/// collected definitions-level declaration maps (the same maps the other event
+/// kinds use), so the reference is never dangling.
+#[allow(clippy::too_many_arguments)]
+fn emit_esp_start_event(
+    start_event: &str,
+    start_el: Option<&Element>,
+    trigger: &nanobpmn_engine_core::EventSubProcessTrigger,
+    interrupting: bool,
+    errors: &BTreeMap<String, String>,
+    messages: &HashMap<(String, Option<String>), String>,
+    signals: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
+    labels: &HashMap<String, String>,
+    out: &mut String,
+) {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    let eid = xml_escape(start_event);
+    let na = format!(
+        " name=\"{}\"",
+        xml_escape(
+            labels
+                .get(start_event)
+                .map(String::as_str)
+                .unwrap_or(start_event)
+        )
+    );
+    let ia = if interrupting {
+        ""
+    } else {
+        " isInterrupting=\"false\""
+    };
+    let def_xml = match trigger {
+        T::Message {
+            message_name,
+            correlation_key,
+        } => {
+            let mid = messages
+                .get(&(message_name.clone(), Some(correlation_key.clone())))
+                .cloned()
+                .unwrap_or_default();
+            format!(
+                "<bpmn:messageEventDefinition messageRef=\"{}\"/>",
+                xml_escape(&mid)
+            )
+        }
+        T::Timer(def) => {
+            let tag = match def.kind {
+                nanobpmn_engine_core::TimerDefKind::Duration => "timeDuration",
+                nanobpmn_engine_core::TimerDefKind::Cycle => "timeCycle",
+                nanobpmn_engine_core::TimerDefKind::Date => "timeDate",
+            };
+            format!(
+                "<bpmn:timerEventDefinition><bpmn:{tag}>{}</bpmn:{tag}></bpmn:timerEventDefinition>",
+                xml_escape(&def.expr)
+            )
+        }
+        T::Signal { signal_name } => {
+            let sid = signals.get(signal_name).cloned().unwrap_or_default();
+            format!(
+                "<bpmn:signalEventDefinition signalRef=\"{}\"/>",
+                xml_escape(&sid)
+            )
+        }
+        T::Error { error_code } => match error_code {
+            Some(code) => {
+                let eid = errors.get(code).cloned().unwrap_or_default();
+                format!(
+                    "<bpmn:errorEventDefinition errorRef=\"{}\"/>",
+                    xml_escape(&eid)
+                )
+            }
+            None => "<bpmn:errorEventDefinition/>".to_string(),
+        },
+        T::Escalation { escalation_code } => match escalation_code {
+            Some(code) => {
+                let eid = escalations.get(code).cloned().unwrap_or_default();
+                format!(
+                    "<bpmn:escalationEventDefinition escalationRef=\"{}\"/>",
+                    xml_escape(&eid)
+                )
+            }
+            None => "<bpmn:escalationEventDefinition/>".to_string(),
+        },
+        T::Conditional { condition } => format!(
+            "<bpmn:conditionalEventDefinition><bpmn:condition>{}</bpmn:condition></bpmn:conditionalEventDefinition>",
+            xml_escape(condition)
+        ),
+    };
+    out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}{ia}>\n"));
+    // Round-trip the start event's own `zeebe:ioMapping` (the parser attaches
+    // io on a start event) before its event definition.
+    if let Some(start_el) = start_el {
+        emit_io_extension(start_el, out);
+    }
+    out.push_str(&format!("      {def_xml}\n    </bpmn:startEvent>\n"));
 }
 
 /// A hand-authored diagram-interchange sidecar extracted from an original BPMN document, so a pure
@@ -3177,7 +3390,9 @@ fn serialize_definition(
             out.push_str("    <bpmn:extensionElements>\n");
             out.push_str(&format!(
                 "      <zeebe:subscription correlationKey=\"={}\"/>\n",
-                xml_escape(key)
+                xml_escape(
+                    &nanobpmn_engine_core::bpmn::parse_correlation_key(key).unwrap_or_default()
+                )
             ));
             out.push_str("    </bpmn:extensionElements>\n");
             out.push_str("  </bpmn:message>\n");
@@ -3348,6 +3563,8 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
         | ElementKind::UserTask(_)
         | ElementKind::Task
         | ElementKind::CallActivity { .. }
+        // An event sub-process is a container box like an embedded sub-process.
+        | ElementKind::EventSubProcess { .. }
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
@@ -5319,6 +5536,136 @@ mod tests {
             1,
             "terminate-end output mapping preserved on round-trip"
         );
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_sub_process_and_esp_start_io() {
+        // Every container kind and an event sub-process's start event carry io
+        // the parser attaches; the serializer must not drop any of them.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, Mapping};
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Scoped")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .end_event("SubEnd")
+            .connect("SubStart", "SubEnd")
+            .contained_in("SubStart", "Sub")
+            .contained_in("SubEnd", "Sub")
+            .end_event("End")
+            .connect("Start", "Sub")
+            .connect("Sub", "End")
+            .event_sub_process(
+                "Esp",
+                "EspStart",
+                EventSubProcessTrigger::Signal {
+                    signal_name: "sig".to_string(),
+                },
+                true,
+            )
+            .start_event("EspStart")
+            .end_event("EspEnd")
+            .connect("EspStart", "EspEnd")
+            .contained_in("EspStart", "Esp")
+            .contained_in("EspEnd", "Esp")
+            .build()
+            .unwrap();
+        for id in ["Sub", "Esp", "EspStart"] {
+            def.elements.get_mut(id).unwrap().io.outputs.push(Mapping {
+                source: format!("= {}", id.to_lowercase()),
+                target: format!("{id}Out"),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for id in ["Sub", "Esp", "EspStart"] {
+            assert_eq!(
+                reparsed[0].elements[id].io, def.elements[id].io,
+                "{id} io preserved on round-trip:\n{xml}"
+            );
+        }
+        assert!(matches!(
+            reparsed[0].elements["Esp"].kind,
+            ElementKind::EventSubProcess { .. }
+        ));
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_message_and_timer_esp_elements_exactly() {
+        // The start's event definition is derived from the container trigger;
+        // every ESP element (container + start) must survive XML -> model
+        // unchanged, for each trigger kind whose start used to be typed.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, TimerDef, TimerDefKind};
+        for trigger in [
+            EventSubProcessTrigger::Message {
+                message_name: "ping".to_string(),
+                correlation_key: "key".to_string(),
+            },
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "PT5M".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Date,
+                expr: "2030-01-01T00:00:00Z".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "= delay".to_string(),
+            }),
+        ] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process("Esp", "EspStart", trigger, false)
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+            for id in ["Esp", "EspStart", "EspEnd"] {
+                let (a, b) = (&def.elements[id], &reparsed[0].elements[id]);
+                assert_eq!(a.kind, b.kind, "{id} kind preserved:\n{xml}");
+                assert_eq!(a.parent, b.parent, "{id} parent preserved");
+                assert_eq!(a.timer, b.timer, "{id} timer preserved");
+            }
+        }
+    }
+
+    #[test]
+    fn marked_correlation_key_emits_exactly_one_feel_marker() {
+        for key in ["key", "=key", "= key", " =  key "] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process(
+                    "Esp",
+                    "EspStart",
+                    nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                        message_name: "ping".to_string(),
+                        correlation_key: key.to_string(),
+                    },
+                    false,
+                )
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            assert!(
+                xml.contains("correlationKey=\"=key\""),
+                "{key:?} must emit a single marker:\n{xml}"
+            );
+        }
     }
 
     #[test]

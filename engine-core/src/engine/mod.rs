@@ -1684,6 +1684,19 @@ impl Engine {
             }
         }
 
+        // Structural preflight: a definition handed straight to
+        // `DeployProcess`/`DeployResources` bypasses `ProcessBuilder::build`
+        // and the BPMN parser, so re-run the shared event-sub-process
+        // validation here before anything is emitted (atomic for a batch).
+        for process in &processes {
+            process.validate_event_subprocesses().map_err(|e| {
+                EngineError::InvalidProcessModel {
+                    process_id: process.id.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+        }
+
         // Preflight EVERY process's typed start expressions before anything
         // is emitted or any key is minted: a later process with an invalid
         // start expression must reject the whole batch, never leave the
@@ -15867,6 +15880,10 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    /// `DeployProcess`/`DeployResources` was given a structurally invalid
+    /// process (e.g. a malformed event sub-process) that the builder or BPMN
+    /// parser would have rejected; direct deploys run the same validation.
+    InvalidProcessModel { process_id: String, reason: String },
     /// `CompleteJob` referenced a job key that does not exist.
     JobNotFound { job_key: Key },
     /// `CompleteJob`/`FailJob` referenced a job that is not in a state where it
@@ -16351,6 +16368,10 @@ impl std::fmt::Display for EngineError {
                 f,
                 "Expected to deploy process '{process_id}' but start event '{element_id}' has an invalid expression: {reason}"
             ),
+            EngineError::InvalidProcessModel { process_id, reason } => write!(
+                f,
+                "Expected to deploy process '{process_id}' but it is invalid: {reason}"
+            ),
             EngineError::NoStartEvent { process_id } => {
                 write!(
                     f,
@@ -16754,6 +16775,7 @@ impl EngineError {
             | EngineError::DecisionNotFound { .. }
             | EngineError::NoStartEvent { .. }
             | EngineError::StartEventExpressionInvalid { .. }
+            | EngineError::InvalidProcessModel { .. }
             | EngineError::JobNotFound { .. }
             | EngineError::JobNotActive { .. }
             | EngineError::JobLeaseMismatch { .. }

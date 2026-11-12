@@ -191,6 +191,28 @@ impl Engine {
                 )));
             }
 
+            // An event sub-process is only ever entered through its trigger;
+            // the runtime does not drive one yet (its drained scope would never
+            // complete, stranding the instance). Fail closed for the container
+            // and every descendant until runtime support lands.
+            //
+            // The walk over the element and its ancestors is cycle-bounded:
+            // `element_flow_scope_chain` caps the chain at the element count and
+            // breaks on a repeated id, so a malformed cyclic `parent` chain
+            // (accepted by the builder when no event sub-process exists) cannot
+            // hang the modification before the bounded scope resolver runs.
+            let chain = element_flow_scope_chain(def, &a.element_id);
+            if std::iter::once(element)
+                .chain(chain.iter().filter_map(|id| def.element(id)))
+                .any(|el| matches!(el.kind, crate::model::ElementKind::EventSubProcess { .. }))
+            {
+                return Err(not_activatable(format!(
+                    "The activation of elements inside an event sub-process '{}' \
+                     is not supported",
+                    element.id
+                )));
+            }
+
             // Zeebe's `-1` (and an absent key) = no ancestor selection.
             let ancestor = a.ancestor_element_instance_key;
             if let Some(body) =
@@ -228,7 +250,6 @@ impl Engine {
                 )));
             }
 
-            let chain = element_flow_scope_chain(def, &a.element_id);
             let mut global = Vec::new();
             if !a.variables.is_empty() {
                 global.push(a.variables.clone());
@@ -250,7 +271,7 @@ impl Engine {
                                 "variable instructions with a scope element id that could not \
                                  be found: '{id}'"
                             ),
-                        ))
+                        ));
                     }
                     Some(id) if id == a.element_id || chain.iter().any(|s| s == id) => {
                         scoped.push((id.to_string(), variables.clone()));
@@ -263,7 +284,7 @@ impl Engine {
                              the activating element's flow scope. These variables should be set \
                              before or after the modification."
                                 .to_string(),
-                        ))
+                        ));
                     }
                 }
             }

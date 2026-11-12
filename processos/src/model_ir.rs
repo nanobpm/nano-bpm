@@ -161,6 +161,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
         ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -303,6 +304,15 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         }
         ElementKind::SubProcess { start_event } => {
             attrs.push(format!("startEvent {start_event}"));
+        }
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => {
+            attrs.push(format!("startEvent {start_event}"));
+            attrs.push(format!("trigger {}", quote(&render_esp_trigger(trigger))));
+            attrs.push(format!("interrupting {interrupting}"));
         }
         ElementKind::ScriptTask {
             expression,
@@ -455,6 +465,169 @@ fn quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Render an event sub-process trigger as a single-quoted-free IR token string,
+/// e.g. `message "orderMsg"`, `timer duration "PT5M"`, `error "E_FAIL"`,
+/// `error` (catch-all), `conditional "=x > 5"`. The whole thing is embedded as
+/// one quoted `trigger` attribute value by [`render_kind_attrs`]; the inner
+/// payloads use their own quoting, so the IR stays unambiguous and round-trips.
+fn render_esp_trigger(trigger: &nanobpmn_engine_core::EventSubProcessTrigger) -> String {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    match trigger {
+        T::Message {
+            message_name,
+            correlation_key,
+        } => format!(
+            "message {} correlationKey {}",
+            quote(message_name),
+            quote(correlation_key)
+        ),
+        T::Timer(def) => {
+            let kind = match def.kind {
+                nanobpmn_engine_core::TimerDefKind::Duration => "duration",
+                nanobpmn_engine_core::TimerDefKind::Cycle => "cycle",
+                nanobpmn_engine_core::TimerDefKind::Date => "date",
+            };
+            format!("timer {} {}", kind, quote(&def.expr))
+        }
+        T::Signal { signal_name } => format!("signal {}", quote(signal_name)),
+        T::Error {
+            error_code: Some(code),
+        } => format!("error {}", quote(code)),
+        T::Error { error_code: None } => "error".to_string(),
+        T::Escalation {
+            escalation_code: Some(code),
+        } => format!("escalation {}", quote(code)),
+        T::Escalation {
+            escalation_code: None,
+        } => "escalation".to_string(),
+        T::Conditional { condition } => format!("conditional {}", quote(condition)),
+    }
+}
+
+/// Parse the string produced by [`render_esp_trigger`] back into an
+/// [`EventSubProcessTrigger`](nanobpmn_engine_core::EventSubProcessTrigger).
+/// `id` is the owning element id, used only for error messages.
+fn parse_esp_trigger(
+    raw: &str,
+    id: &str,
+) -> Result<nanobpmn_engine_core::EventSubProcessTrigger, String> {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    // Split into the leading keyword and the rest, honouring the double-quoted
+    // payloads (which may contain spaces).
+    let err = |m: &str| format!("element {id}: invalid eventSubProcess trigger: {m}");
+    let mut tokens = split_ir_tokens(raw).map_err(|m| err(&m))?.into_iter();
+    let kw = tokens
+        .next()
+        .ok_or_else(|| format!("element {id}: empty eventSubProcess trigger"))?;
+    let trigger = match kw.as_str() {
+        "message" => {
+            let message_name = tokens.next().ok_or_else(|| err("message needs a name"))?;
+            let ck_kw = tokens
+                .next()
+                .ok_or_else(|| err("message needs `correlationKey`"))?;
+            if ck_kw != "correlationKey" {
+                return Err(err("message needs `correlationKey <expr>`"));
+            }
+            let correlation_key = tokens
+                .next()
+                .ok_or_else(|| err("message correlationKey needs a value"))?;
+            Ok(T::Message {
+                message_name,
+                correlation_key,
+            })
+        }
+        "timer" => {
+            let kind = tokens.next().ok_or_else(|| err("timer needs a kind"))?;
+            let expr = tokens
+                .next()
+                .ok_or_else(|| err("timer needs an expression"))?;
+            let kind = match kind.as_str() {
+                "duration" => nanobpmn_engine_core::TimerDefKind::Duration,
+                "cycle" => nanobpmn_engine_core::TimerDefKind::Cycle,
+                "date" => nanobpmn_engine_core::TimerDefKind::Date,
+                other => return Err(err(&format!("unknown timer kind '{other}'"))),
+            };
+            Ok(T::Timer(nanobpmn_engine_core::TimerDef { kind, expr }))
+        }
+        "signal" => {
+            let signal_name = tokens.next().ok_or_else(|| err("signal needs a name"))?;
+            Ok(T::Signal { signal_name })
+        }
+        "error" => Ok(T::Error {
+            error_code: tokens.next(),
+        }),
+        "escalation" => Ok(T::Escalation {
+            escalation_code: tokens.next(),
+        }),
+        "conditional" => {
+            let condition = tokens
+                .next()
+                .ok_or_else(|| err("conditional needs a condition"))?;
+            Ok(T::Conditional { condition })
+        }
+        other => Err(err(&format!("unknown trigger kind '{other}'"))),
+    }?;
+    // Every token must be consumed: trailing input would otherwise be dropped
+    // silently and the IR rewritten into a different trigger.
+    if let Some(extra) = tokens.next() {
+        return Err(err(&format!("unexpected trailing token '{extra}'")));
+    }
+    Ok(trigger)
+}
+
+/// Split an IR attribute payload into whitespace-separated tokens, treating a
+/// double-quoted span (with `\"` / `\\` escapes) as one token and unquoting it.
+/// An unterminated quote or a dangling trailing `\\` is an error, never an
+/// implicit close at end of input.
+fn split_ir_tokens(raw: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        let n = chars
+                            .next()
+                            .ok_or_else(|| "dangling escape at end of input".to_string())?;
+                        tok.push(match n {
+                            'n' => '\n',
+                            other => other,
+                        });
+                    }
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    other => tok.push(other),
+                }
+            }
+            if !closed {
+                return Err("unterminated quoted string".to_string());
+            }
+            tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                chars.next();
+            }
+            tokens.push(tok);
+        }
+    }
+    Ok(tokens)
 }
 
 // ===========================================================================================
@@ -934,18 +1107,21 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(ParsedIr {
-            definition: ProcessDefinition {
-                id: process_id,
-                name: None,
-                elements,
-                start_event,
-                xml: String::new(),
-                adhoc: Vec::new(),
-                start_form_id: None,
-            },
-            names,
-        })
+        let definition = ProcessDefinition {
+            id: process_id,
+            name: None,
+            elements,
+            start_event,
+            xml: String::new(),
+            adhoc: Vec::new(),
+            start_form_id: None,
+        };
+        // Event sub-process structural constraints — the same canonical check
+        // `ProcessBuilder::build` (and so the BPMN parser) applies.
+        definition
+            .validate_event_subprocesses()
+            .map_err(|e| e.to_string())?;
+        Ok(ParsedIr { definition, names })
     }
 
     /// Parse one node statement: `<keyword> <id> ["<name>"] [{ <attrs> }]`.
@@ -1255,6 +1431,11 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         }
         "subProcess" => ElementKind::SubProcess {
             start_event: attrs.require("startEvent", id)?,
+        },
+        "eventSubProcess" => ElementKind::EventSubProcess {
+            start_event: attrs.require("startEvent", id)?,
+            trigger: parse_esp_trigger(&attrs.require("trigger", id)?, id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
         },
         "scriptTask" => ElementKind::ScriptTask {
             expression: attrs.require("expression", id)?,
@@ -2243,5 +2424,85 @@ mod cancel_remaining_instances_ir_tests {
             assert_eq!(mi.cancel_remaining_instances, cancel, "{ir1}");
             assert_eq!(ir1, definition_to_ir(&parsed.definition, &parsed.names));
         }
+    }
+}
+
+#[cfg(test)]
+mod esp_validation_tests {
+    use std::collections::HashMap;
+
+    use nanobpmn_engine_core::{EventSubProcessTrigger, ProcessBuilder};
+
+    use super::{definition_to_ir, ir_to_definition};
+
+    /// A valid model with an event sub-process, rendered to IR.
+    fn valid_ir(trigger: EventSubProcessTrigger) -> String {
+        let def = ProcessBuilder::new("P")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .event_sub_process("esp", "esp_start", trigger, true)
+            .start_event("esp_start")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_end", "esp")
+            .build()
+            .unwrap();
+        definition_to_ir(&def, &HashMap::new())
+    }
+
+    fn signal() -> EventSubProcessTrigger {
+        EventSubProcessTrigger::Signal {
+            signal_name: "sig".into(),
+        }
+    }
+
+    fn assert_rejected(ir: &str) {
+        let err = ir_to_definition(ir)
+            .err()
+            .unwrap_or_else(|| panic!("IR must be rejected:\n{ir}"));
+        assert!(err.contains("event sub-process esp"), "{err}\n{ir}");
+    }
+
+    #[test]
+    fn valid_event_subprocess_ir_parses() {
+        ir_to_definition(&valid_ir(signal())).unwrap();
+    }
+
+    #[test]
+    fn ir_rejects_event_subprocess_with_unknown_start() {
+        let ir = valid_ir(signal()).replace("    startEvent esp_start\n", "    startEvent ghost\n");
+        assert!(ir.contains("ghost"), "fixture rewrite failed:\n{ir}");
+        assert_rejected(&ir);
+    }
+
+    #[test]
+    fn ir_rejects_flows_into_or_out_of_event_subprocess() {
+        let base = valid_ir(signal());
+        for extra in ["s -> esp", "esp -> e"] {
+            let close = base.trim_end().rfind('}').expect("process block closes");
+            let ir = format!("{}  {extra}\n}}\n", &base[..close]);
+            assert_rejected(&ir);
+        }
+    }
+
+    #[test]
+    fn esp_trigger_rejects_malformed_or_partially_consumed_payloads() {
+        for bad in [
+            "signal \"abort",              // unterminated quote
+            "signal \"abort\\",            // dangling escape inside a quote
+            "signal \"abort\" unexpected", // trailing token
+            "error \"E\" extra",
+            "timer duration \"PT5M\" x",
+            "message \"m\" correlationKey \"k\" x",
+        ] {
+            assert!(
+                crate::model_ir::parse_esp_trigger(bad, "esp").is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        assert!(crate::model_ir::parse_esp_trigger("signal \"abort\"", "esp").is_ok());
+        assert!(crate::model_ir::parse_esp_trigger("error", "esp").is_ok());
     }
 }
