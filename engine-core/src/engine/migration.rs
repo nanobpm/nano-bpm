@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::event::{
-    MigratedElementInstance, MigratedSubscription, MigratedSubscriptionTrigger,
-    SubscriptionMigrationAction,
+    MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
+    MigratedSubscriptionTrigger, SubscriptionMigrationAction,
 };
 use crate::model::{Element, ProcessDefinition};
 
@@ -74,6 +74,13 @@ pub(crate) struct MigrationPlan {
     pub after: Vec<Event>,
     pub migrated_flow_scopes: Vec<MigratedElementInstance>,
     pub subscriptions: Vec<MigratedSubscription>,
+    /// Call-activity child instances kept attached to their migrated
+    /// call-activity element instance (#1553) — the Zeebe `childInstanceKeys`
+    /// audit on `ProcessInstanceMigrated`. The child itself is NOT migrated:
+    /// its parent linkage is by element-instance key, which migration
+    /// preserves, so a child completing afterwards still releases the parent's
+    /// (remapped) call-activity token.
+    pub child_instances: Vec<MigratedChildInstance>,
 }
 
 /// `Some(interrupting)` when `kind` is a boundary event.
@@ -613,6 +620,24 @@ impl Engine {
                     source_element_id: source_id.clone(),
                     target_element_id: target_id.clone(),
                 });
+            }
+            // A migrated call activity keeps its child process instance
+            // attached (Zeebe `MigrateCallActivityTest`: the child is NOT
+            // migrated — it keeps running its own definition and its parent
+            // link, keyed by element-instance key, survives the remap).
+            // Record the kept child for the `ProcessInstanceMigrated` audit
+            // (Zeebe's `childInstanceKeys`).
+            if matches!(
+                source.element(&source_id).map(|e| &e.kind),
+                Some(ElementKind::CallActivity { .. })
+            ) {
+                if let Some(child_instance_key) = self.call_activity_child_of(eik) {
+                    plan.child_instances.push(MigratedChildInstance {
+                        call_activity_element_instance_key: eik,
+                        child_instance_key,
+                        target_element_id: target_id.clone(),
+                    });
+                }
             }
             let scope = self.scope_of(instance_key, eik);
             // Boundaries evaluate against the enclosing scope (as at activation);
