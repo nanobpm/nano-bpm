@@ -3290,6 +3290,102 @@ fn retries_left_flag_survives_replayed_out_of_order_terminal_and_retries_records
 }
 
 #[test]
+fn retries_left_flag_clears_on_every_terminal_transition_under_nonzero_timestamps() {
+    // #1551 review — with a NONZERO clock the terminal stamp is recorded at the
+    // first completion, so gating the flag-clear on `terminal_end.is_none()`
+    // lets a replayed `JobCompleted → JobFailed(retries: 2) → JobCompleted`
+    // sequence leave a completed job with the flag still set: the re-arming
+    // failure sets it, and the re-delivered terminal event skips the clear
+    // because the stamp is already there. The flag is retry-eligibility NOW,
+    // not part of the first-transition-wins terminal stamp, so EVERY terminal
+    // transition must clear it (mirroring the read model's unconditional
+    // `has_failed_with_retries_left = 0`); only the timestamp keeps
+    // first-transition-wins.
+    //
+    // Completion: build the journal on a nonzero clock so the terminal stamp
+    // is genuinely recorded, then replay the out-of-order tail.
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(linear_with_task()), 1)
+        .unwrap();
+    let mut journal = engine
+        .apply_command_at(Command::create_instance("order"), 2)
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 3)[0].key;
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    journal.extend(
+        engine
+            .apply_command_at(Command::complete_job(job_key), 4)
+            .unwrap(),
+    );
+    let terminal = journal
+        .iter()
+        .find(|e| matches!(e, Event::JobCompleted { .. }))
+        .cloned()
+        .expect("the journal carries the completion");
+    assert!(
+        matches!(terminal, Event::JobCompleted { completed_at, .. } if completed_at != 0),
+        "the regression needs a nonzero terminal stamp to exercise the gate"
+    );
+    journal.push(Event::JobFailed {
+        job_key,
+        instance_key,
+        retries: 2,
+        worker: None,
+        error_message: None,
+    });
+    journal.push(terminal);
+    let replayed = Engine::replay(journal);
+    let job = &replayed.state().jobs[&job_key];
+    assert!(matches!(job.state, state::JobState::Completed));
+    assert!(
+        !job.has_failed_with_retries_left,
+        "a re-delivered completion must still clear the flag a later failure re-armed"
+    );
+
+    // Cancellation: same shape, driving the cancel through the reducer so the
+    // journal tail stays minimal (a full second instance is not needed — the
+    // canceled job's own instance shell retains it).
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(linear_with_task()), 1)
+        .unwrap();
+    let mut journal = engine
+        .apply_command_at(Command::create_instance("order"), 2)
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 3)[0].key;
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    let cancel = Event::JobCanceled {
+        job_key,
+        instance_key,
+        canceled_at: 4,
+        deadline: None,
+    };
+    state::apply(engine.state_mut(), &cancel);
+    assert!(matches!(
+        engine.state().jobs[&job_key].state,
+        state::JobState::Canceled
+    ));
+    assert!(engine.state().jobs[&job_key].terminal_end.is_some());
+    journal.push(cancel.clone());
+    journal.push(Event::JobFailed {
+        job_key,
+        instance_key,
+        retries: 2,
+        worker: None,
+        error_message: None,
+    });
+    journal.push(cancel);
+    let replayed = Engine::replay(journal);
+    let job = &replayed.state().jobs[&job_key];
+    assert!(matches!(job.state, state::JobState::Canceled));
+    assert!(
+        !job.has_failed_with_retries_left,
+        "a re-delivered cancellation must still clear the flag a later failure re-armed"
+    );
+}
+
+#[test]
 fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
     // #1328 review — events serialized before `error_message` existed decode with
     // `error_message: None` (serde default). The reducer must then KEEP the job's

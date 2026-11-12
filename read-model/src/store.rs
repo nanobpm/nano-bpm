@@ -4313,7 +4313,18 @@ fn project_engine_state(
                 // them to the compacted `JobFailed`/`JobErrorThrown` events.
                 job.error_message,
                 job.error_code,
-                i64::from(job.has_failed_with_retries_left),
+                // A terminal job is never retry-eligible (#1551 review): a
+                // snapshot recorded before the engine cleared the flag at the
+                // terminal transition can carry `true` on a Completed/Canceled
+                // job, and seeding it verbatim would let that terminal job
+                // select its instance for `hasRetriesLeft` searches and
+                // migration batches. Converge with the current reducer
+                // semantics (which clear the flag on every terminal
+                // transition) instead of preserving the pre-change value.
+                i64::from(
+                    job.has_failed_with_retries_left
+                        && !matches!(job.state, JobState::Completed | JobState::Canceled),
+                ),
                 creation_ms as i64,
                 last_update as i64,
                 replay_floor as i64,
@@ -12493,6 +12504,23 @@ mod element_instance_tests {
             j
         });
 
+        // Pre-#1551 snapshot shapes: a terminal job whose retries-left flag was
+        // never cleared (the engine only began clearing it at the terminal
+        // transition in #1551). Seeding must not let these select their
+        // instance for `hasRetriesLeft` searches / migration batches.
+        state.jobs.insert(9604, {
+            let mut j = base_job(9604, JobState::Completed);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+        state.jobs.insert(9605, {
+            let mut j = base_job(9605, JobState::Canceled);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
         let seeded: HashMap<Key, super::JobRow> =
@@ -12511,6 +12539,18 @@ mod element_instance_tests {
             Some("card declined")
         );
         assert!(seeded[&9603].has_failed_with_retries_left);
+
+        // #1551 review — the pre-change snapshot shapes seed with the flag
+        // CLEARED: a terminal job is never retry-eligible, so it must not
+        // select its instance for `hasRetriesLeft` searches / migration batches.
+        assert!(
+            !seeded[&9604].has_failed_with_retries_left,
+            "a completed job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
+        assert!(
+            !seeded[&9605].has_failed_with_retries_left,
+            "a canceled job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
     }
 
     #[test]

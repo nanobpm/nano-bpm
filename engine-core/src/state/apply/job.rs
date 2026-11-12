@@ -328,16 +328,17 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 // A completed job is no longer retry-eligible (#1551 review):
                 // clear the flag a prior retryable failure set so the
-                // `hasRetriesLeft` filter stops matching it. Gate on the
-                // terminal stamp being fresh: a replayed terminal event whose
-                // `terminal_end` an earlier one already recorded is a duplicate
-                // delivery (first-transition-wins), and clearing here would
-                // clobber the flag a LATER failure legitimately re-armed
-                // (archived-format journals replay exactly that ordering —
-                // `archived_format_journals_remain_replayable_after_version_bumps`).
-                if job.terminal_end.is_none() {
-                    job.has_failed_with_retries_left = false;
-                }
+                // `hasRetriesLeft` filter stops matching it. The clear is
+                // UNCONDITIONAL — retry-eligibility is a property of the job's
+                // current state, not of the terminal stamp, so it is NOT part
+                // of the first-transition-wins contract: a replayed
+                // `JobCompleted → JobFailed(retries: n) → JobCompleted`
+                // sequence re-arms the flag at the failure, and only clearing
+                // on every terminal transition leaves the completed job
+                // non-retry-eligible (the read model clears unconditionally
+                // too). Only the terminal INSTANT keeps first-transition-wins
+                // (`stamp_terminal_end`).
+                job.has_failed_with_retries_left = false;
                 stamp_terminal_end(job, *completed_at, *deadline);
                 job.state = JobState::Completed;
                 job.worker = None;
@@ -476,13 +477,12 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 // A canceled job is no longer retry-eligible (#1551 review):
                 // clear the flag a prior retryable failure set so the
-                // `hasRetriesLeft` filter stops matching it. Gate on the
-                // terminal stamp being fresh, as for `JobCompleted` above: a
-                // duplicate terminal delivery must not clobber the flag a
-                // later failure re-armed.
-                if job.terminal_end.is_none() {
-                    job.has_failed_with_retries_left = false;
-                }
+                // `hasRetriesLeft` filter stops matching it. Unconditional, as
+                // for `JobCompleted` above: the flag is current-state
+                // retry-eligibility, not part of the first-transition-wins
+                // terminal stamp, so a re-delivered cancellation must still
+                // clear what a replayed later failure re-armed.
+                job.has_failed_with_retries_left = false;
                 stamp_terminal_end(job, *canceled_at, *deadline);
                 job.state = JobState::Canceled;
                 job.worker = None;
