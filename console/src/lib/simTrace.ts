@@ -182,9 +182,32 @@ export function foldSimTrace(
 }
 
 /// Step formatter for the simulation timeline: logical steps, not milliseconds.
+/// `now` is the trace's current step (its last event's sequence index), so an
+/// unfinished simulated job headlines elapsed STEPS — never the browser's
+/// wall-clock `Date.now()` (which in this domain would read as ~1.8 trillion
+/// "steps"). No wall-clock tick: the simulation clock only moves when a new
+/// event folds in, which already re-renders.
 export const stepFmt = {
   duration: (n: number | null): string =>
     n == null ? "—" : `${n} step${n === 1 ? "" : "s"}`,
   clock: (n: number): string => `#${n}`,
   origin: "step 0",
+  now: (trace: InstanceTrace): number => trace.endedAt ?? lastStep(trace),
 };
+
+/// The current simulation step: the highest timestamp the trace has folded.
+function lastStep(trace: InstanceTrace): number {
+  let max = trace.startedAt;
+  for (const el of trace.elements) {
+    max = Math.max(max, el.enteredAt, el.exitedAt ?? el.enteredAt);
+    if (el.job) {
+      max = Math.max(
+        max,
+        el.job.createdAt,
+        el.job.activatedAt ?? el.job.createdAt,
+        el.job.completedAt ?? el.job.createdAt,
+      );
+    }
+  }
+  return max;
+}

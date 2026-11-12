@@ -71,11 +71,24 @@ export interface HeadlineDuration {
  * wait time (created → completed); an activated-but-incomplete job shows
  * elapsed time since activation, marked running. Queue time is secondary detail
  * only. Non-job elements: `durationMs`.
+ *
+ * `now` must come from the trace's own clock domain: wall-clock ms for a
+ * production trace, the current event-sequence index for a simulation (whose
+ * timestamps are logical steps — passing `Date.now()` there would headline
+ * ~1.8 trillion "steps").
+ *
+ * `traceEndedAt` is the trace's end timestamp in that same domain (`null` while
+ * the instance is active). A job left unfinished when its trace ENDED —
+ * canceled work: the trace store has no `JobCanceled` arm, so `completedAt`
+ * stays null — must not keep counting up to the viewer's clock: it measures to
+ * the trace end. While the trace is still active (`traceEndedAt == null`) an
+ * unfinished job is in flight and counts up to `now`, marked running.
  */
 export function headlineDuration(
   el: HeadlineElement,
   now: number = Date.now(),
   fmt: (ms: number | null) => string = fmtDuration,
+  traceEndedAt: number | null = null,
 ): HeadlineDuration {
   const job = el.job;
   if (!job) {
@@ -94,6 +107,20 @@ export function headlineDuration(
   const queueNote = queueMs != null ? ` · queue ${fmt(queueMs)}` : "";
   if (job.completedAt == null) {
     const since = job.activatedAt ?? job.createdAt;
+    if (traceEndedAt != null) {
+      // Ended trace (canceled job): stop at the trace end, never count to now.
+      const ms = Math.max(0, traceEndedAt - since);
+      const label = fmt(ms);
+      const what =
+        job.activatedAt != null ? "ended" : "ended (not yet activated)";
+      return {
+        ms,
+        running: false,
+        queueMs,
+        label,
+        title: `${what} ${label}${queueNote}`,
+      };
+    }
     const ms = Math.max(0, now - since);
     const label = `${fmt(ms)} …`;
     const what =
