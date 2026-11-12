@@ -1633,6 +1633,74 @@ fn call_activity_spawn_retry_keeps_element_locals() {
     assert_eq!(child.variables.get("childOrder"), Some(&Value::Int(42)));
 }
 
+/// A call activity seeded with element-local variables keeps them on a spawn
+/// retry after a CALLED-PROCESS-EXPRESSION incident (#1381): the re-driven
+/// `=calledElement` expression evaluates in the element's own (seeded) view,
+/// not the enclosing scope — a callee id that only the modification supplied
+/// must still resolve once the operator fixes the rest of the expression.
+#[test]
+fn call_activity_spawn_retry_keeps_element_locals_on_called_element_expression() {
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .service_task("work", "child-work")
+        .end_event("pend")
+        .connect("pstart", "work")
+        .connect("work", "pend")
+        .build()
+        .unwrap();
+    // The callee id is a FEEL expression reading `local`, which ONLY the
+    // modification seeds element-locally, and `missing`, which the operator
+    // supplies at the root after the incident.
+    let parent = ProcessBuilder::new("orch-expr")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .call_activity("c1", "=local + missing")
+        .end_event("end")
+        .connect("start", "a")
+        .connect("a", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(child)).unwrap();
+    let inst = start(&mut engine, parent, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![seeded("c1", &[("local", Value::Str("pha".into()))])],
+        ))
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(
+        incidents.len(),
+        1,
+        "the calledElement expression parks on `missing`"
+    );
+    let incident_key = incidents[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("missing", Value::Str("se".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the retry must see the element-local `local`: {:?}",
+        engine.active_incidents()
+    );
+    assert!(
+        engine
+            .state()
+            .instances
+            .values()
+            .any(|i| i.process_id == "phase"),
+        "child spawned on retry from the element-local callee id"
+    );
+}
+
 /// `start -> sub[ ss -> fork -> {a(ja), b(jb)} -> join(parallel) -> se ] -> end`.
 fn join_in_sub() -> ProcessDefinition {
     let mut b = ProcessBuilder::new("join-sub")
