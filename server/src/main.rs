@@ -282,6 +282,74 @@ impl BatchOperationStore {
         }
     }
 
+    /// Current lifecycle state of `key`, if registered. The batch executor
+    /// ([`ServerImpl::drive_process_instance_batch`]) polls this between items so
+    /// suspend/resume/cancel requests take effect mid-run.
+    fn state(&self, key: u64) -> Option<models::BatchOperationStateEnum> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ops
+            .get(&key)
+            .map(|rec| rec.state)
+    }
+
+    /// Records the outcome of processing one item of batch `key`: `Ok` marks
+    /// the item `COMPLETED`, `Err(message)` marks it `FAILED` with the message as
+    /// its `errorMessage`. Items already processed are left untouched (first
+    /// outcome wins). Unknown batch/item keys are ignored.
+    fn record_item(&self, key: u64, item_key: u64, outcome: Result<(), String>) {
+        use models::BatchOperationItemStateEnum as I;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        if let Some(item) = rec
+            .items
+            .iter_mut()
+            .find(|i| i.item_key == item_key && matches!(i.state, I::Active))
+        {
+            item.processed_date_ms = Some(now_millis());
+            match outcome {
+                Ok(()) => item.state = I::Completed,
+                Err(message) => {
+                    item.state = I::Failed;
+                    item.error_message = Some(message);
+                }
+            }
+        }
+    }
+
+    /// Settles batch `key` into its terminal state once every item has been
+    /// processed (Zeebe batch semantics): `COMPLETED` when no item failed (incl.
+    /// an empty batch), `FAILED` when every item failed, else
+    /// `PARTIALLY_COMPLETED`. A batch that is already terminal (e.g. `CANCELED`
+    /// mid-run) is left as is.
+    fn finish(&self, key: u64) {
+        use models::{BatchOperationItemStateEnum as I, BatchOperationStateEnum as S};
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        if Self::is_terminal(&rec.state) || rec.items.iter().any(|i| matches!(i.state, I::Active))
+        {
+            return;
+        }
+        let failed = rec
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, I::Failed))
+            .count();
+        rec.state = if failed == 0 {
+            S::Completed
+        } else if failed == rec.items.len() {
+            S::Failed
+        } else {
+            S::PartiallyCompleted
+        };
+        rec.end_date_ms = Some(now_millis());
+    }
+
     /// Whether `state` is a terminal (absorbing) batch-operation state: once a
     /// batch reaches one it cannot transition out of it.
     fn is_terminal(state: &models::BatchOperationStateEnum) -> bool {
@@ -21593,6 +21661,99 @@ impl ServerImpl {
         ))
     }
 
+    /// The shared batch-operation seam: mints a trackable batch of `op_type`
+    /// over `items` and drives it to a terminal state in the background, applying
+    /// `apply` to each item and recording a per-item `COMPLETED` / `FAILED`
+    /// outcome. Between items the executor honours the batch lifecycle — it
+    /// waits while the batch is `SUSPENDED` and stops when it is `CANCELED`
+    /// (remaining items stay unprocessed). Every executing process-instance batch
+    /// (migration, and the modification slice #1552) goes through here, so there
+    /// is exactly one batch-execution implementation.
+    fn drive_process_instance_batch<F, Fut>(
+        &self,
+        op_type: models::BatchOperationTypeEnum,
+        items: Vec<u64>,
+        apply: F,
+    ) -> u64
+    where
+        F: Fn(ServerImpl, u64) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let key = self.batch_operations.create(op_type, items.clone());
+        let server = self.clone();
+        tokio::spawn(async move {
+            for item in items {
+                loop {
+                    match server.batch_operations.state(key) {
+                        Some(models::BatchOperationStateEnum::Suspended) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Some(models::BatchOperationStateEnum::Active) => break,
+                        // Canceled (or otherwise terminal / gone): stop driving.
+                        _ => return,
+                    }
+                }
+                let outcome = apply(server.clone(), item).await;
+                server.batch_operations.record_item(key, item, outcome);
+            }
+            server.batch_operations.finish(key);
+        });
+        key
+    }
+
+    /// `POST /v2/process-instances/migration` — mint a
+    /// `MIGRATE_PROCESS_INSTANCE` batch operation over every ACTIVE process
+    /// instance matched by the request filter and migrate each one with the
+    /// request's `migrationPlan` (via the same [`Self::migrate_instance_core`]
+    /// as the single-instance endpoint). Ineligible instances are recorded as
+    /// `FAILED` items carrying the engine's rejection reason.
+    async fn migrate_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceMigrationBatchOperationRequest,
+    ) -> Result<apis::process_instance::MigrateProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let target = match crate::falcon::parse_migration_target_key(
+            &body.migration_plan.target_process_definition_key.0,
+        ) {
+            Ok(k) => k,
+            Err((_status, detail)) => {
+                return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                    problem("INVALID_ARGUMENT", 400, detail),
+                ));
+            }
+        };
+        let mappings: Vec<(String, String)> = body
+            .migration_plan
+            .mapping_instructions
+            .iter()
+            .map(|m| (m.source_element_id.clone(), m.target_element_id.clone()))
+            .collect();
+        let op_type = models::BatchOperationTypeEnum::MigrateProcessInstance;
+        // Migration honours the supplied filters; `state` is overridden to
+        // ACTIVE by the matcher (only ACTIVE instances can be migrated).
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
+            let mappings = mappings.clone();
+            async move {
+                match server
+                    .migrate_instance_core(instance, target, mappings)
+                    .await
+                {
+                    MigrateInstanceOutcome::Migrated => Ok(()),
+                    MigrateInstanceOutcome::BadRequest(d)
+                    | MigrateInstanceOutcome::NotFound(d)
+                    | MigrateInstanceOutcome::Conflict(d)
+                    | MigrateInstanceOutcome::Unavailable(d)
+                    | MigrateInstanceOutcome::Internal(d) => Err(d),
+                }
+            }
+        });
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
     /// `POST /v2/process-instances/incident-resolution` — mint a `RESOLVE_INCIDENT`
     /// batch operation over every process instance matched by the request filter.
     async fn resolve_incidents_batch_operation_impl(
@@ -35038,6 +35199,190 @@ mod clustered_startup_tests {
             server.cancel_instance_core(instance_key).await,
             CancelInstanceOutcome::NotFound(_)
         ));
+    }
+
+    /// #1551: `POST /v2/process-instances/migration` mints a trackable
+    /// `MIGRATE_PROCESS_INSTANCE` batch over every matched ACTIVE instance,
+    /// migrates the eligible ones with the request's plan, and records a FAILED
+    /// item (with the rejection reason) for each ineligible one, settling the
+    /// batch as `PARTIALLY_COMPLETED`.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_migrates_and_records_failures() {
+        use apis::batch_operation::{
+            GetBatchOperationResponse as GetResp,
+            SearchBatchOperationItemsResponse as ItemsResp,
+        };
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+        let build = |id: &str, task: &str, job: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .service_task(task, job)
+                .end_event("e")
+                .connect("s", task)
+                .connect(task, "e")
+                .build()
+                .expect("valid definition")
+        };
+        let mut target_key = 0u64;
+        for (id, task, job) in [
+            ("order-v1", "work", "src-work"),
+            ("audit-v1", "audit", "audit-work"),
+            ("order-v2", "fulfil", "tgt-work"),
+        ] {
+            let mut names = std::collections::HashMap::new();
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+            let (deploy, _) = server
+                .deploy_resources_locally(
+                    vec![build(id, task, job)],
+                    &names,
+                    Vec::new(),
+                    &std::collections::HashMap::new(),
+                    "<default>",
+                )
+                .await
+                .expect("deploy");
+            if id == "order-v2" {
+                target_key = deploy
+                    .deployments
+                    .iter()
+                    .find_map(|d| match &d.process_definition {
+                        types::Nullable::Present(p) => Some(p.process_definition_key.0.clone()),
+                        _ => None,
+                    })
+                    .expect("target definition")
+                    .parse()
+                    .expect("numeric key");
+            }
+        }
+
+        // Two eligible order-v1 instances, one ineligible audit-v1 instance
+        // (its active `audit` element has no mapping instruction).
+        let mut eligible = Vec::new();
+        let mut ineligible = 0u64;
+        for id in ["order-v1", "order-v1", "audit-v1"] {
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .await
+                .expect("create instance");
+            if id == "audit-v1" {
+                ineligible = key;
+            } else {
+                eligible.push(key);
+            }
+        }
+        let all: Vec<u64> = eligible.iter().copied().chain([ineligible]).collect();
+        let mut projected = false;
+        for _ in 0..200 {
+            let matched = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                BatchHierarchyPolicy::HonourFilters,
+            );
+            if all.iter().all(|k| matched.contains(k)) {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "all instances project as ACTIVE");
+
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey(target_key.to_string()),
+                vec![models::MigrateProcessInstanceMappingInstruction::new(
+                    "work".to_string(),
+                    "fulfil".to_string(),
+                )],
+            ),
+        );
+        let created = match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("response")
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200 created, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::MigrateProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // Poll the batch until it settles.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let mut got = None;
+        for _ in 0..500 {
+            let r = match server.get_batch_operation_impl(&path).await.unwrap() {
+                GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                other => panic!("expected 200 get, got {other:?}"),
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                got = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the batch settles");
+        assert_eq!(
+            got.state,
+            models::BatchOperationStateEnum::PartiallyCompleted
+        );
+        assert_eq!(got.operations_total_count, 3);
+        assert_eq!(got.operations_completed_count, 2);
+        assert_eq!(got.operations_failed_count, 1);
+        assert!(got.end_date.is_present());
+
+        // Eligible instances were actually migrated onto order-v2.
+        for key in &eligible {
+            let rec = server.store.process_instance(*key).expect("instance");
+            assert_eq!(rec.process_definition_id, "order-v2");
+        }
+
+        // The ineligible item is FAILED with an error message.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r.items,
+            other => panic!("expected 200 items, got {other:?}"),
+        };
+        let failed = items
+            .iter()
+            .find(|i| {
+                i.batch_operation_key == batch_key && i.item_key == ineligible.to_string()
+            })
+            .expect("ineligible item recorded");
+        assert_eq!(failed.state, "FAILED");
+        assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
+    }
+
+    /// #1551: a malformed `targetProcessDefinitionKey` is rejected up front with
+    /// `400`, and no batch is minted.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_bad_target_key() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("not-a-key".to_string()),
+                Vec::new(),
+            ),
+        );
+        assert!(matches!(
+            server
+                .migrate_process_instances_batch_operation_impl(&req)
+                .await
+                .unwrap(),
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+        ));
+        assert!(server.batch_operations.all().is_empty());
     }
 
     /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
