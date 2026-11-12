@@ -3199,6 +3199,97 @@ fn retries_left_flag_tracks_retry_updates_and_terminal_transitions() {
 }
 
 #[test]
+fn retries_left_flag_survives_replayed_out_of_order_terminal_and_retries_records() {
+    // #1551 — replay-compatibility of the flag-clearing reducer: an archived
+    // journal can order a `JobRetriesUpdated` AFTER the terminal record (a
+    // retries update journaled against the pre-terminal state replays behind
+    // the completion), and a duplicate terminal delivery can follow a failure
+    // that re-armed the flag. Replaying either ordering must still land on the
+    // terminal job being non-retry-eligible — the property
+    // `archived_format_journals_remain_replayable_after_version_bumps` pins
+    // against the checked-in v1/v2 corpora, exercised here in miniature so the
+    // invariant has a focused regression.
+    //
+    // Both scenarios share one shape: deploy the process, drive a job to
+    // completion on one instance, then park a SECOND instance on a thrown error
+    // so the completed job's instance shell (and with it the retained terminal
+    // job) stays live in state — mirroring the corpus, whose completed job 10
+    // is retained by its incident-parked instance 7.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let mut journal = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let completed_instance = journal
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("create emits the instance key");
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    journal.extend(
+        engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap(),
+    );
+    // Park a second instance so the first instance's shell is not the last
+    // thing the journal leaves live (and to mirror the corpus shape).
+    journal.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let parked_job = engine.activate_jobs("payment", "w3", 10, 60_000, 0)[0].key;
+    journal.extend(
+        engine
+            .apply_command(Command::throw_job_error(parked_job, "E42", "boom"))
+            .unwrap(),
+    );
+    assert!(
+        engine.state().jobs.contains_key(&job_key),
+        "the completed job is retained while its instance shell is live"
+    );
+
+    // Scenario 1: a retries update replayed after the terminal record.
+    let mut out_of_order = journal.clone();
+    out_of_order.push(Event::JobRetriesUpdated {
+        job_key,
+        instance_key: completed_instance,
+        retries: 5,
+        operation_reference: None,
+    });
+    let replayed = Engine::replay(out_of_order);
+    let job = &replayed.state().jobs[&job_key];
+    assert!(
+        !job.has_failed_with_retries_left,
+        "a retries update replayed after the terminal record must not re-arm the flag"
+    );
+    assert!(matches!(job.state, state::JobState::Completed));
+
+    // Scenario 2: a duplicate terminal delivery after a re-arming failure.
+    let mut dup = journal;
+    dup.push(Event::JobFailed {
+        job_key,
+        instance_key: completed_instance,
+        retries: 2,
+        worker: None,
+        error_message: None,
+    });
+    let terminal = dup
+        .iter()
+        .find(|e| matches!(e, Event::JobCompleted { .. }))
+        .cloned()
+        .expect("the journal carries the completion");
+    dup.push(terminal);
+    let replayed = Engine::replay(dup);
+    let job = &replayed.state().jobs[&job_key];
+    assert!(
+        !job.has_failed_with_retries_left,
+        "a duplicate terminal delivery must not clobber the flag back on"
+    );
+}
+
+#[test]
 fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
     // #1328 review — events serialized before `error_message` existed decode with
     // `error_message: None` (serde default). The reducer must then KEEP the job's

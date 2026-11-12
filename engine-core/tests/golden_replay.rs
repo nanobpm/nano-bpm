@@ -48,8 +48,8 @@
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, ProcessBuilder,
-    SNAPSHOT_FORMAT_VERSION,
+    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState,
+    ProcessBuilder, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus (owned by #1069), relative to
@@ -136,16 +136,46 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         let raw =
             std::fs::read_to_string(golden_path(&format!("event_corpus.v{version}.json"))).unwrap();
         let frames: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
-        let journal = frames
+        let journal: Vec<Event> = frames
             .into_iter()
-            .map(|frame| decode_event_json(&frame.to_string()).unwrap());
+            .map(|frame| decode_event_json(&frame.to_string()).unwrap())
+            .collect();
         let raw = std::fs::read_to_string(golden_path(&format!("engine_snapshot.v{version}.json")))
             .unwrap();
         let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
         let replayed = Engine::replay_partition(expected.partition_id, journal);
+
+        // Replay-compatibility is a NORMALIZED equality, not a byte-identical
+        // one: later builds legitimately derive some fields under semantics the
+        // archived snapshot predates. Each normalization below names the change
+        // whose replay-only divergence it absorbs; anything ELSE drifting still
+        // fails this assert, which is what keeps the #1065 class guarded.
+        let replayed_state = replayed.state().clone();
+        let mut expected_state = expected.state.clone();
+        if version < 3 {
+            // #1440 (landed at format v3) retains a job's first terminal
+            // instant/deadline; v1/v2 journals predate the event field that
+            // carries it, so replaying them yields `terminal_end: None` where a
+            // v3 live run would record a stamp. Normalize the pre-field
+            // snapshots to the replayable floor.
+            for job in expected_state.jobs.values_mut() {
+                job.terminal_end = None;
+            }
+        }
+        // #1551 clears `has_failed_with_retries_left` when a job goes terminal
+        // (a completed/canceled job is not retry-eligible). Archived snapshots
+        // recorded the pre-#1551 semantics — the flag surviving on a terminal
+        // job — and the v1/v2 journals do not carry the information to
+        // reconstruct the pre-clear value, so replay under current semantics
+        // converges on the cleared flag. Normalize the archived expectation to
+        // current terminal semantics.
+        for job in expected_state.jobs.values_mut() {
+            if matches!(job.state, JobState::Completed | JobState::Canceled) {
+                job.has_failed_with_retries_left = false;
+            }
+        }
         assert_eq!(
-            replayed.state(),
-            &expected.state,
+            &replayed_state, &expected_state,
             "archived format {version}"
         );
         assert_eq!(

@@ -326,16 +326,24 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
+                // A completed job is no longer retry-eligible (#1551 review):
+                // clear the flag a prior retryable failure set so the
+                // `hasRetriesLeft` filter stops matching it. Gate on the
+                // terminal stamp being fresh: a replayed terminal event whose
+                // `terminal_end` an earlier one already recorded is a duplicate
+                // delivery (first-transition-wins), and clearing here would
+                // clobber the flag a LATER failure legitimately re-armed
+                // (archived-format journals replay exactly that ordering —
+                // `archived_format_journals_remain_replayable_after_version_bumps`).
+                if job.terminal_end.is_none() {
+                    job.has_failed_with_retries_left = false;
+                }
                 stamp_terminal_end(job, *completed_at, *deadline);
                 job.state = JobState::Completed;
                 job.worker = None;
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
-                // A completed job is no longer retry-eligible (#1551 review):
-                // clear the flag a prior retryable failure set so the
-                // `hasRetriesLeft` filter stops matching it.
-                job.has_failed_with_retries_left = false;
             }
             resync_job_index(state, *job_key);
         }
@@ -386,10 +394,14 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 // derives from the failure-bearing states (Failed/Errored) plus
                 // the CURRENT retries: a job that returned to the activatable
                 // pool keeps the flag its retryable failure set (it can only
-                // lose retries here, never gain them), and the engine rejects
-                // retries updates on Completed/Canceled jobs, so a terminal job
-                // can never re-arm it.
+                // lose retries here, never gain them). A terminal job can never
+                // re-arm it live — the engine rejects retries updates on
+                // Completed/Canceled jobs — but a REPLAYED archived journal can
+                // order a retries update after the terminal event, so also
+                // require the job to be non-terminal here (a terminal job's
+                // flag is cleared once, at its terminal transition).
                 job.has_failed_with_retries_left = *retries > 0
+                    && !matches!(job.state, JobState::Completed | JobState::Canceled)
                     && (job.has_failed_with_retries_left
                         || matches!(job.state, JobState::Failed | JobState::Errored));
             }
@@ -462,6 +474,15 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
+                // A canceled job is no longer retry-eligible (#1551 review):
+                // clear the flag a prior retryable failure set so the
+                // `hasRetriesLeft` filter stops matching it. Gate on the
+                // terminal stamp being fresh, as for `JobCompleted` above: a
+                // duplicate terminal delivery must not clobber the flag a
+                // later failure re-armed.
+                if job.terminal_end.is_none() {
+                    job.has_failed_with_retries_left = false;
+                }
                 stamp_terminal_end(job, *canceled_at, *deadline);
                 job.state = JobState::Canceled;
                 job.worker = None;
@@ -469,10 +490,6 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.activated_at = None;
                 job.activation_timeout = None;
                 job.lease_token = None;
-                // A canceled job is no longer retry-eligible (#1551 review):
-                // clear the flag a prior retryable failure set so the
-                // `hasRetriesLeft` filter stops matching it.
-                job.has_failed_with_retries_left = false;
             }
             resync_job_index(state, *job_key);
         }
