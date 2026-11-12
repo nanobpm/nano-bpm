@@ -303,6 +303,16 @@ impl ColdIndex {
         }
         due.into_iter().collect()
     }
+
+    /// Whether any cold instance holds an armed timer due at or before `now`.
+    /// O(log n) — the Raft tick pre-check (#1483) runs this every tick, so it
+    /// must not collect the way [`ColdIndex::instances_due`] does.
+    pub fn has_due_timers(&self, now: u64) -> bool {
+        self.by_timer
+            .range(..=now)
+            .next()
+            .is_some_and(|(_, set)| !set.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -462,11 +472,15 @@ mod tests {
         assert!(idx.instances_for_message("approve", "B").is_empty());
         assert!(idx.instances_due(4_999).is_empty(), "not yet due");
         assert_eq!(idx.instances_due(5_000), vec![300], "due at boundary");
+        // The O(log n) tick pre-check probe (#1483) agrees with the scan.
+        assert!(!idx.has_due_timers(4_999), "not yet due");
+        assert!(idx.has_due_timers(5_000), "due at boundary");
         assert!(idx.contains(300));
 
         idx.remove(300);
         assert!(idx.instances_for_message("approve", "A").is_empty());
         assert!(idx.instances_due(10_000).is_empty());
+        assert!(!idx.has_due_timers(10_000));
         assert!(!idx.contains(300));
     }
 

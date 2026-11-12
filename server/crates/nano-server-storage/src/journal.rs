@@ -3200,6 +3200,27 @@ impl Journal {
         (events, commit)
     }
 
+    /// Whether any timer — hot or cold — is due at or before `now`. The Raft
+    /// tick pre-check (#1483) gates proposing `TriggerTimers` on this: gating
+    /// on hot timers alone strands a partition whose every due timer is
+    /// cold-spilled (the command that would rehydrate and fire them is never
+    /// proposed), so the check must cover the cold routing index too.
+    pub fn has_due_timers(&self, now: u64) -> bool {
+        // Mirror the engine's own due filter (`TriggerTimers` fires only
+        // `Created` timers — fired ones are retained so they never re-fire).
+        let hot_due = self
+            .engine
+            .state()
+            .timers
+            .values()
+            .any(|t| t.state == nanobpmn_engine_core::TimerState::Created && t.due_at <= now);
+        hot_due
+            || self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| cold.index.has_due_timers(now))
+    }
+
     /// Releases only token-free, volatile activation locks without journaling.
     /// Token-bearing leases must expire through a durable command.
     pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
@@ -6722,6 +6743,48 @@ mod tests {
         for p in paths {
             let _ = std::fs::remove_dir_all(p.parent().unwrap());
         }
+    }
+
+    // #1483: the Raft tick pre-check gates proposing `TriggerTimers` on "is
+    // anything due". Gating on HOT timers alone never proposes the command when
+    // every due timer is cold-spilled, and `TriggerTimers` is the only path that
+    // rehydrates them — the timers never fire. `Journal::has_due_timers` is the
+    // hot ∪ cold probe that gate must use.
+    #[test]
+    fn has_due_timers_covers_cold_spilled_instances() {
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        journal.set_cold_spill(store, 1, 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(timed_demo()))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command_at(Command::create_instance("timed"), 0)
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Hot: the timer (due at 10) is resident and visible to the probe.
+        assert!(journal.instance(key).is_some(), "instance is hot");
+        assert!(!journal.has_due_timers(9), "not yet due");
+        assert!(journal.has_due_timers(10), "hot timer due at boundary");
+
+        // Cold: the probe must still see the due timer through the routing
+        // index, and proposing the command must rehydrate the instance and
+        // fire the timer.
+        assert_eq!(journal.force_cold_spill_all(), 1, "instance spills cold");
+        assert!(journal.instance(key).is_none(), "instance is cold");
+        assert!(
+            journal.has_due_timers(10),
+            "cold timer still visible to the tick pre-check"
+        );
+        let (events, _) = journal
+            .apply_command_at(Command::TriggerTimers { now: 10 }, 10)
+            .unwrap();
+        assert!(!events.is_empty(), "the cold timer fires once triggered");
+        assert!(journal.instance(key).is_some(), "firing rehydrated it");
+        // The fired timer is retained (never re-fires); the probe must no
+        // longer see anything due — no hot timer and no cold index entry.
+        assert!(!journal.has_due_timers(u64::MAX), "no armed timer remains");
     }
 
     #[test]
