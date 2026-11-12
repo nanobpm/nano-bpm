@@ -1784,14 +1784,30 @@ impl Journal {
                 ColdRehydration::Restored
             }
             Ok(None) => {
-                if let Some(cold) = self.cold.as_mut() {
-                    cold.index.remove(key);
-                }
                 self.note_orphan(
                     key,
                     "cold rehydration: cold instance has no row in the spill store; it is \
                      lost — quarantined (routing entry dropped)",
                 );
+                // Journal the durable `VariablesLost` incident AT DISCOVERY
+                // (#1481 review): once the index entry is dropped below, no
+                // sealing fold can rediscover the key, so a loss found by a
+                // poll/tick before rotation would otherwise vanish on restart.
+                // `raise_quarantine_incident` routes it through
+                // `QuarantineColdOrphan` while the key is still indexed and
+                // drops the entry on success. Under replicated (Raft) apply a
+                // locally minted incident would diverge replicas, so observe
+                // only (same rule as the resident quarantine path, #1384).
+                // On a failed raise the entry is KEPT so the sealing fold
+                // retries the incident rather than losing it.
+                if self.strict_cold_reads() {
+                    crate::metrics::record_offheap_orphan_unreported();
+                    if let Some(cold) = self.cold.as_mut() {
+                        cold.index.remove(key);
+                    }
+                } else {
+                    self.raise_quarantine_incident(key, "cold rehydration");
+                }
                 ColdRehydration::Absent
             }
             Err(err) => {
@@ -6371,9 +6387,10 @@ mod tests {
 
         // Cut a lean checkpoint: the cold instance's CONTROL state lands in the
         // snapshot (variable-free), its variables in the upsert delta.
-        let (snap, cold_upserts) = journal
+        let (snap, cold_upserts, cold_orphans) = journal
             .lean_snapshot_and_cold_upserts()
             .expect("cold fold succeeds");
+        assert!(cold_orphans.is_empty(), "a healthy cold row is not an orphan");
         let inst = snap
             .state
             .instances
