@@ -1092,7 +1092,6 @@
         "element_instance_key": 9,
         "error_code": null,
         "error_message": "transient: upstream 503",
-        "has_failed_with_retries_left": true,
         "instance_key": 7,
         "job_type": "payment",
         "key": 10,

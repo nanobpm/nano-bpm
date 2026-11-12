@@ -157,6 +157,13 @@ struct BatchOperationRecord {
     start_date_ms: u64,
     end_date_ms: Option<u64>,
     items: Vec<BatchOperationItemRecord>,
+    /// `item_key → position in items`, built once at create. `items` is
+    /// append-never, reorder-never after creation (search/counts only read it),
+    /// so the index stays valid for the record's lifetime and makes each
+    /// [`BatchOperationStore::record_item`] outcome update constant-time —
+    /// without it, recording N outcomes scans the vector per item (O(N²) under
+    /// the registry-wide mutex).
+    item_index: std::collections::HashMap<u64, usize>,
 }
 
 /// One item (target process instance) of a batch operation.
@@ -196,7 +203,7 @@ impl BatchOperationStore {
         }
         inner.seq += 1;
         let key = inner.seq;
-        let items = item_keys
+        let items: Vec<BatchOperationItemRecord> = item_keys
             .into_iter()
             .map(|item_key| BatchOperationItemRecord {
                 item_key,
@@ -205,6 +212,11 @@ impl BatchOperationStore {
                 processed_date_ms: None,
                 error_message: None,
             })
+            .collect();
+        let item_index = items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| (item.item_key, pos))
             .collect();
         inner.ops.insert(
             key,
@@ -215,6 +227,7 @@ impl BatchOperationStore {
                 start_date_ms: now,
                 end_date_ms: None,
                 items,
+                item_index,
             },
         );
         key
@@ -280,6 +293,77 @@ impl BatchOperationStore {
                 BatchLifecycleOutcome::Ok
             }
         }
+    }
+
+    /// Current lifecycle state of `key`, if registered. The batch executor
+    /// ([`ServerImpl::drive_process_instance_batch`]) polls this between items so
+    /// suspend/resume/cancel requests take effect mid-run.
+    fn state(&self, key: u64) -> Option<models::BatchOperationStateEnum> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ops
+            .get(&key)
+            .map(|rec| rec.state)
+    }
+
+    /// Records the outcome of processing one item of batch `key`: `Ok` marks
+    /// the item `COMPLETED`, `Err(message)` marks it `FAILED` with the message as
+    /// its `errorMessage`. Items already processed are left untouched (first
+    /// outcome wins). Unknown batch/item keys are ignored.
+    ///
+    /// The item is located through the record's `item_index` (built at create),
+    /// so each outcome update is O(1) — a per-item vector scan would make
+    /// recording N outcomes O(N²) while holding the registry-wide mutex.
+    fn record_item(&self, key: u64, item_key: u64, outcome: Result<(), String>) {
+        use models::BatchOperationItemStateEnum as I;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        let Some(&pos) = rec.item_index.get(&item_key) else {
+            return;
+        };
+        let item = &mut rec.items[pos];
+        if matches!(item.state, I::Active) {
+            item.processed_date_ms = Some(now_millis());
+            match outcome {
+                Ok(()) => item.state = I::Completed,
+                Err(message) => {
+                    item.state = I::Failed;
+                    item.error_message = Some(message);
+                }
+            }
+        }
+    }
+
+    /// Settles batch `key` into its terminal state once every item has been
+    /// processed (Zeebe batch semantics): `COMPLETED` when no item failed (incl.
+    /// an empty batch), `FAILED` when every item failed, else
+    /// `PARTIALLY_COMPLETED`. A batch that is already terminal (e.g. `CANCELED`
+    /// mid-run) is left as is.
+    fn finish(&self, key: u64) {
+        use models::{BatchOperationItemStateEnum as I, BatchOperationStateEnum as S};
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        if Self::is_terminal(&rec.state) || rec.items.iter().any(|i| matches!(i.state, I::Active)) {
+            return;
+        }
+        let failed = rec
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, I::Failed))
+            .count();
+        rec.state = if failed == 0 {
+            S::Completed
+        } else if failed == rec.items.len() {
+            S::Failed
+        } else {
+            S::PartiallyCompleted
+        };
+        rec.end_date_ms = Some(now_millis());
     }
 
     /// Whether `state` is a terminal (absorbing) batch-operation state: once a
@@ -1587,6 +1671,55 @@ mod converted_lock_poison_tests {
             .is_err(),
             "the closure must panic while holding the lock to poison it"
         );
+    }
+
+    /// `record_item` locates the item through the record's `item_index` rather
+    /// than scanning the item vector: recording N outcomes must be O(N), not
+    /// O(N²) under the registry-wide mutex (#1551 review). Behavioural guard:
+    /// outcomes land on the right items, first outcome wins on a duplicate
+    /// delivery, and unknown batch/item keys are ignored.
+    #[test]
+    fn record_item_updates_items_in_constant_time_via_the_index() {
+        let store = BatchOperationStore::default();
+        let key = store.create(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![10, 20, 30],
+        );
+
+        store.record_item(key, 20, Err("no mapping for element".to_string()));
+        store.record_item(key, 10, Ok(()));
+        // A duplicate outcome for an already-processed item is ignored (first
+        // outcome wins).
+        store.record_item(key, 20, Ok(()));
+        // Unknown item / batch keys are ignored, not panics.
+        store.record_item(key, 999, Ok(()));
+        store.record_item(123_456_789, 10, Ok(()));
+
+        let rec = store.get(key).expect("record present");
+        let by_key = |item_key: u64| {
+            rec.items
+                .iter()
+                .find(|i| i.item_key == item_key)
+                .expect("item present")
+        };
+        assert!(matches!(
+            by_key(10).state,
+            models::BatchOperationItemStateEnum::Completed
+        ));
+        let failed = by_key(20);
+        assert!(matches!(
+            failed.state,
+            models::BatchOperationItemStateEnum::Failed
+        ));
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("no mapping for element"),
+            "the first (failed) outcome wins over the duplicate"
+        );
+        assert!(matches!(
+            by_key(30).state,
+            models::BatchOperationItemStateEnum::Active
+        ));
     }
 
     /// Batch-store: a panic while holding `BatchOperationStore::inner` must not
@@ -12610,6 +12743,18 @@ impl ServerImpl {
             _ => std::collections::HashMap::new(),
         };
 
+        // Pre-index the instance's element-instance / job / incident child rows
+        // only when an inherited cross-entity filter is actually present (same
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
+        let cross_index = match filter {
+            Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
+                f,
+                &InstanceCrossEntityIndex::sources_for(f, &self.store),
+            ),
+            _ => InstanceCrossEntityIndex::default(),
+        };
+
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
             .filter(|inst| match filter {
@@ -12637,6 +12782,23 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+                        // `suspendedDate`: read straight from the read-model's
+                        // `suspended_date_ms` (the single source of truth for
+                        // suspension) — a datetime while suspended, absent otherwise.
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Nano is single-tenant: every instance's `tenantId` is the
+                        // `<default>` constant, so honour the filter against it.
+                        && query::match_string(&f.tenant_id, "<default>")
+                        // `processDefinitionName` / `processDefinitionVersionTag` are
+                        // never projected (always null in `process_instance_result`),
+                        // so match against an absent value: equality / `$like` /
+                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
+                        // matches.
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
                         // Call-activity hierarchy filters (C8 parity, issue
                         // #977): a bare parent key enumerates the direct children
                         // of that instance; `$exists:false` selects top-level
@@ -12658,6 +12820,12 @@ impl ServerImpl {
                             &f.variables,
                             variables_index.get(&inst.key),
                         )
+                        && match_instance_tags(&f.tags, &inst.tags)
+                        // Inherited element / job / incident / batch-operation
+                        // filters (C8 parity): existential predicates over the
+                        // instance's child rows, evaluated against the
+                        // pre-indexed cross-entity index.
+                        && match_instance_cross_entity_filters(f, inst.key, &cross_index)
                 }
             })
             .collect();
@@ -21509,11 +21677,59 @@ impl ServerImpl {
     /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
     /// threading a per-call `state` policy) keeps the override in one place so a
     /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
+    ///
+    /// The `variables` filter is honoured exactly as
+    /// `search_process_instances_impl` honours it: matched against the
+    /// instance's process-scoped (root) variables via [`match_instance_variables`],
+    /// over a per-call index built only when a variable filter is present (the
+    /// common no-variable-filter path pays nothing for the extra scan). Dropping
+    /// it here would silently *broaden* the batch — a migration filtered to
+    /// `batch = "alpha"` would also migrate every other eligible instance.
     fn batch_matched_process_instances(
         &self,
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
+        // Pre-index root-scope variables by instance only when the filter
+        // actually constrains on them, restricted to the variable names the
+        // filter references (same construction as `search_process_instances_impl`).
+        let variables_index: std::collections::HashMap<
+            u64,
+            std::collections::HashMap<String, String>,
+        > = match &filter.variables {
+            Some(entries) if !entries.is_empty() => {
+                let requested: std::collections::HashSet<&str> =
+                    entries.iter().map(|entry| entry.name.as_str()).collect();
+                let mut idx: std::collections::HashMap<
+                    u64,
+                    std::collections::HashMap<String, String>,
+                > = std::collections::HashMap::new();
+                for v in self.store.variables() {
+                    // Root-scope (process-instance) variables only: a variable
+                    // held under a nested scope has `scope_key != instance_key`
+                    // and is not a process-instance-level variable.
+                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+                        idx.entry(v.instance_key)
+                            .or_default()
+                            .insert(v.name, v.value);
+                    }
+                }
+                idx
+            }
+            _ => std::collections::HashMap::new(),
+        };
+        // Pre-index the instance's element-instance / job / incident child rows
+        // only when an inherited cross-entity filter is actually present (same
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
+        let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
+            InstanceCrossEntityIndex::new(
+                filter,
+                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
+            )
+        } else {
+            InstanceCrossEntityIndex::default()
+        };
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
@@ -21563,9 +21779,38 @@ impl ServerImpl {
                     )
                     && query::match_date_time_ms(&filter.end_date, None)
                     && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
+                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
+                    // single source of truth. A batch is ACTIVE-only, so a matched
+                    // instance is never suspended and the value is always absent —
+                    // `$exists: true` / value operators then correctly exclude
+                    // every candidate (fail closed) instead of silently broadening.
+                    && query::match_date_time_ms(
+                        &filter.suspended_date,
+                        inst.suspended_date_ms.map(|ms| ms as i64),
+                    )
+                    // Nano is single-tenant: every instance's `tenantId` is the
+                    // `<default>` constant, so honour the filter against it.
+                    && query::match_string(&filter.tenant_id, "<default>")
+                    // `processDefinitionName` / `processDefinitionVersionTag` are
+                    // never projected (always null in `process_instance_result`), so
+                    // match against an absent value: equality / `$like` / `$in` /
+                    // `$exists: true` correctly exclude, `$exists: false` matches.
+                    && query::match_string_opt(&filter.process_definition_name, None)
+                    && query::match_string_opt(&filter.process_definition_version_tag, None)
                     // Call-activity hierarchy filters (C8 parity, issue #977),
                     // gated per the per-operation contract above.
                     && hierarchy_matches
+                    && match_instance_variables(
+                        &filter.variables,
+                        variables_index.get(&inst.key),
+                    )
+                    && match_instance_tags(&filter.tags, &inst.tags)
+                    // Inherited element / job / incident / batch-operation
+                    // filters (C8 parity): existential predicates over the
+                    // instance's child rows, evaluated against the pre-indexed
+                    // cross-entity index so a nonmatching instance is excluded
+                    // from the batch instead of silently broadening it.
+                    && match_instance_cross_entity_filters(filter, inst.key, &cross_index)
             })
             .map(|inst| inst.key)
             .collect();
@@ -21588,6 +21833,116 @@ impl ServerImpl {
         let items =
             self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
         let key = self.batch_operations.create(op_type, items);
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// The shared batch-operation seam: mints a trackable batch of `op_type`
+    /// over `items` and drives it to a terminal state in the background, applying
+    /// `apply` to each item and recording a per-item `COMPLETED` / `FAILED`
+    /// outcome. Between items the executor honours the batch lifecycle — it
+    /// waits while the batch is `SUSPENDED` and stops when it is `CANCELED`
+    /// (remaining items stay unprocessed). Every executing process-instance batch
+    /// (migration, and the modification slice #1552) goes through here, so there
+    /// is exactly one batch-execution implementation.
+    fn drive_process_instance_batch<F, Fut>(
+        &self,
+        op_type: models::BatchOperationTypeEnum,
+        items: Vec<u64>,
+        apply: F,
+    ) -> u64
+    where
+        F: Fn(ServerImpl, u64) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let key = self.batch_operations.create(op_type, items.clone());
+        let server = self.clone();
+        tokio::spawn(async move {
+            for item in items {
+                loop {
+                    match server.batch_operations.state(key) {
+                        Some(models::BatchOperationStateEnum::Suspended) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Some(models::BatchOperationStateEnum::Active) => break,
+                        // Canceled (or otherwise terminal / gone): stop driving.
+                        _ => return,
+                    }
+                }
+                let outcome = apply(server.clone(), item).await;
+                server.batch_operations.record_item(key, item, outcome);
+            }
+            server.batch_operations.finish(key);
+        });
+        key
+    }
+
+    /// `POST /v2/process-instances/migration` — mint a
+    /// `MIGRATE_PROCESS_INSTANCE` batch operation over every ACTIVE process
+    /// instance matched by the request filter and migrate each one with the
+    /// request's `migrationPlan` (via the same [`Self::migrate_instance_core`]
+    /// as the single-instance endpoint). Ineligible instances are recorded as
+    /// `FAILED` items carrying the engine's rejection reason.
+    ///
+    /// The filter schema (spec/process-instances.yaml) deprecates
+    /// `batchOperationId` in favour of `batchOperationKey` and requires a 400
+    /// when BOTH are supplied; that contract is enforced up front, before any
+    /// batch is minted.
+    async fn migrate_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceMigrationBatchOperationRequest,
+    ) -> Result<apis::process_instance::MigrateProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        // The filter schema (spec/process-instances.yaml) deprecates
+        // `batchOperationId` in favour of `batchOperationKey` and requires a
+        // 400 when BOTH are supplied. Enforce that here, before any batch is
+        // minted — the matcher's fail-closed absent-value matching of the two
+        // unprojected fields is not a substitute for the contract validation.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(problem(
+                "INVALID_ARGUMENT",
+                400,
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            )));
+        }
+        let target = match crate::falcon::parse_migration_target_key(
+            &body.migration_plan.target_process_definition_key.0,
+        ) {
+            Ok(k) => k,
+            Err((_status, detail)) => {
+                return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                    problem("INVALID_ARGUMENT", 400, detail),
+                ));
+            }
+        };
+        let mappings: Vec<(String, String)> = body
+            .migration_plan
+            .mapping_instructions
+            .iter()
+            .map(|m| (m.source_element_id.clone(), m.target_element_id.clone()))
+            .collect();
+        let op_type = models::BatchOperationTypeEnum::MigrateProcessInstance;
+        // Migration honours the supplied filters; `state` is overridden to
+        // ACTIVE by the matcher (only ACTIVE instances can be migrated).
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
+            let mappings = mappings.clone();
+            async move {
+                match server
+                    .migrate_instance_core(instance, target, mappings)
+                    .await
+                {
+                    MigrateInstanceOutcome::Migrated => Ok(()),
+                    MigrateInstanceOutcome::BadRequest(d)
+                    | MigrateInstanceOutcome::NotFound(d)
+                    | MigrateInstanceOutcome::Conflict(d)
+                    | MigrateInstanceOutcome::Unavailable(d)
+                    | MigrateInstanceOutcome::Internal(d) => Err(d),
+                }
+            }
+        });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -22397,6 +22752,283 @@ fn decision_instance_get_result(
     }
 }
 
+/// Per-instance cross-entity index backing the inherited element / job /
+/// incident filters on a process-instance query (`elementId`,
+/// `elementInstanceState`, `hasElementInstanceIncident`, `errorMessage`,
+/// `hasRetriesLeft`). These are **existential** predicates over an instance's
+/// child rows (element instances, jobs, incidents), not columns on
+/// [`readstore::ProcessInstanceRow`], so they are pre-indexed by
+/// `instance_key` once per query — only when at least one such filter is
+/// actually present, so the common path pays nothing for the extra scans.
+///
+/// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
+/// (element instances, jobs, incidents) is scanned only when a filter that
+/// reads it is supplied, mirroring the `variables_index` construction in
+/// `search_process_instances_impl`.
+#[derive(Default)]
+struct InstanceCrossEntityIndex {
+    /// `instance_key → its element instances` (for the element predicates).
+    /// The whole row is kept per element — not a per-field map — so the
+    /// `elementId` / `elementInstanceState` / `hasElementInstanceIncident`
+    /// predicates stay correlated: they must hold of the **same** element
+    /// instance, not of three independent rows (a COMPLETED `review` plus an
+    /// ACTIVE `approve` must not satisfy `elementId: "review",
+    /// elementInstanceState: "ACTIVE"`).
+    elements: std::collections::HashMap<u64, Vec<IndexedElement>>,
+    /// `instance_key → worker/incident error messages` (for `errorMessage`):
+    /// the last `errorMessage` of each failed/errored job plus each incident's
+    /// reason — the two places a process-level error message is projected.
+    error_messages: std::collections::HashMap<u64, Vec<String>>,
+    /// `instance_key → true when any job has failed with retries left` (for
+    /// `hasRetriesLeft`).
+    has_retries_left: std::collections::HashMap<u64, bool>,
+}
+
+/// One element instance as carried by [`InstanceCrossEntityIndex::elements`].
+struct IndexedElement {
+    element_id: String,
+    /// The element-instance state wire spelling (`ACTIVE` / `COMPLETED` /
+    /// `TERMINATED`).
+    state: String,
+    has_incident: bool,
+}
+
+/// The child-row sources an [`InstanceCrossEntityIndex`] is built from. Each
+/// field is loaded by the caller **only when a supplied filter reads it** (see
+/// [`InstanceCrossEntityIndex::needs_elements`] / `needs_jobs` /
+/// `needs_incidents`), so an `elementId`-only query never materializes the job
+/// or incident tables. `None` sources are treated as empty; construction
+/// asserts the filter only reads sources that were loaded.
+#[derive(Default)]
+struct CrossEntitySources {
+    element_instances: Option<Vec<readstore::ElementInstanceRow>>,
+    jobs: Option<Vec<readstore::JobRow>>,
+    incidents: Option<Vec<readstore::IncidentRow>>,
+}
+
+impl InstanceCrossEntityIndex {
+    /// Builds the index, populating only the maps the supplied `filter`
+    /// actually constrains on and reading only the sources in `sources`.
+    #[allow(
+        clippy::expect_used,
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+    )]
+    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
+        let mut idx = InstanceCrossEntityIndex::default();
+        if Self::needs_elements(filter) {
+            let rows = sources
+                .element_instances
+                .as_deref()
+                .expect("element predicates require the element-instance source");
+            for e in rows {
+                idx.elements
+                    .entry(e.instance_key)
+                    .or_default()
+                    .push(IndexedElement {
+                        element_id: e.element_id.clone(),
+                        state: element_instance_state_enum(e.state).to_string(),
+                        has_incident: e.has_incident,
+                    });
+            }
+        }
+        if filter.error_message.is_some() {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("errorMessage requires the job source")
+            {
+                if let Some(msg) = &j.error_message {
+                    idx.error_messages
+                        .entry(j.instance_key)
+                        .or_default()
+                        .push(msg.clone());
+                }
+            }
+            for i in sources
+                .incidents
+                .as_deref()
+                .expect("errorMessage requires the incident source")
+            {
+                idx.error_messages
+                    .entry(i.instance_key)
+                    .or_default()
+                    .push(i.reason.clone());
+            }
+        }
+        if filter.has_retries_left.is_some() {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("hasRetriesLeft requires the job source")
+            {
+                if j.has_failed_with_retries_left {
+                    idx.has_retries_left.insert(j.instance_key, true);
+                }
+            }
+        }
+        idx
+    }
+
+    /// Whether any element predicate (`elementId` / `elementInstanceState` /
+    /// `hasElementInstanceIncident`) is present, so the caller loads the
+    /// element-instance source only then.
+    fn needs_elements(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.element_id.is_some()
+            || filter.element_instance_state.is_some()
+            || filter.has_element_instance_incident.is_some()
+    }
+
+    /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
+    /// is present.
+    fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some() || filter.has_retries_left.is_some()
+    }
+
+    /// Whether any incident-reading predicate (`errorMessage`) is present.
+    fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some()
+    }
+
+    /// Whether any cross-entity filter is present (so the caller can skip
+    /// building the index entirely when none is).
+    fn is_needed(filter: &models::ProcessInstanceFilter) -> bool {
+        Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
+    }
+
+    /// Loads exactly the child-row sources `filter` reads: the element-instance
+    /// table only when an element predicate is present, jobs only for
+    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
+    /// so an `elementId`-only query never scans the job or incident tables.
+    /// Shared by the search and batch-selection paths so both honour the same
+    /// lazy-source contract.
+    fn sources_for(
+        filter: &models::ProcessInstanceFilter,
+        store: &readstore::ReadModel,
+    ) -> CrossEntitySources {
+        CrossEntitySources {
+            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
+            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
+            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+        }
+    }
+}
+
+/// Evaluates the inherited element / job / incident / batch-operation filters
+/// on a process-instance query against instance `instance_key`, using the
+/// pre-indexed `index`. Each is an **existential** predicate over the
+/// instance's child rows:
+///
+/// - `elementId` / `elementInstanceState` / `hasElementInstanceIncident` — the
+///   instance has **one** element instance satisfying all supplied element
+///   predicates at once (they are correlated: a COMPLETED `review` plus an
+///   ACTIVE `approve` must not satisfy `elementId: "review",
+///   elementInstanceState: "ACTIVE"`). `hasElementInstanceIncident: false`
+///   inverts the whole existential: it selects instances with **no** element
+///   satisfying the supplied id/state predicates that carries an incident.
+/// - `errorMessage` — it has a failed/errored job or incident whose message
+///   matches.
+/// - `hasRetriesLeft` — it has a job that failed with retries left (`false`
+///   selects instances with no such job).
+///
+/// `incidentErrorHashCode` and `batchOperationId` / `batchOperationKey` are
+/// declared on the filter schema but Nano does not project a per-instance value
+/// for them (no incident error-hash column; batch membership lives in the
+/// separate `BatchOperationStore`, not the read model), so they are matched
+/// against an **absent** value: equality / `$in` / `$exists: true` correctly
+/// exclude (fail closed — the field is honoured, not silently broadening a
+/// mutating batch) while `$exists: false` still matches. This mirrors the
+/// `endDate` / `processDefinitionName` convention.
+fn match_instance_cross_entity_filters(
+    filter: &models::ProcessInstanceFilter,
+    instance_key: u64,
+    index: &InstanceCrossEntityIndex,
+) -> bool {
+    // The element predicates are evaluated together, existentially over the
+    // instance's element rows, so an id/state/incident combination must hold of
+    // the SAME element instance. An instance with no element instances matches
+    // an `elementId` filter only against an absent value (so `$exists: false`
+    // still matches) and never matches a state or `hasElementInstanceIncident:
+    // true` predicate.
+    let element_matches = {
+        let has_element_predicates = filter.element_id.is_some()
+            || filter.element_instance_state.is_some()
+            || filter.has_element_instance_incident.is_some();
+        if !has_element_predicates {
+            true
+        } else {
+            let elements = index.elements.get(&instance_key);
+            let row_matches = |e: &IndexedElement| {
+                let id_ok = match &filter.element_id {
+                    None => true,
+                    Some(f) => query::match_string_property(f, Some(e.element_id.as_str())),
+                };
+                let state_ok = match &filter.element_instance_state {
+                    None => true,
+                    Some(f) => {
+                        query::match_element_instance_state(&Some(f.clone()), e.state.as_str())
+                    }
+                };
+                id_ok && state_ok
+            };
+            match filter.has_element_instance_incident {
+                None => match elements {
+                    Some(rows) => rows.iter().any(row_matches),
+                    // No element rows: `elementId` still matches against an
+                    // absent value (the `$exists: false` case); a state
+                    // predicate can never be satisfied.
+                    None => {
+                        let id_ok = match &filter.element_id {
+                            None => true,
+                            Some(f) => query::match_string_property(f, None),
+                        };
+                        id_ok && filter.element_instance_state.is_none()
+                    }
+                },
+                // `true`: some element satisfying the id/state predicates
+                // carries an incident. `false`: none does (the inverted
+                // existential — an instance with no element instances has no
+                // incidented element, so it matches).
+                Some(want) => {
+                    let any_incidented = elements
+                        .map(|rows| rows.iter().any(|e| row_matches(e) && e.has_incident))
+                        .unwrap_or(false);
+                    any_incidented == want
+                }
+            }
+        }
+    };
+    // `errorMessage`: existential over the instance's job/incident messages.
+    let error_message_matches = match &filter.error_message {
+        None => true,
+        Some(f) => match index.error_messages.get(&instance_key) {
+            Some(msgs) => msgs
+                .iter()
+                .any(|m| query::match_string_property(f, Some(m.as_str()))),
+            None => query::match_string_property(f, None),
+        },
+    };
+    // `hasRetriesLeft`: `true` requires a job that failed with retries left.
+    let retries_matches = match filter.has_retries_left {
+        None => true,
+        Some(want) => {
+            index
+                .has_retries_left
+                .get(&instance_key)
+                .copied()
+                .unwrap_or(false)
+                == want
+        }
+    };
+    element_matches
+        && error_message_matches
+        && retries_matches
+        // Not projected per-instance → matched against an absent value (fail
+        // closed; see the doc comment).
+        && query::match_integer(&filter.incident_error_hash_code, None)
+        && query::match_string_opt(&filter.batch_operation_id, None)
+        && query::match_string_opt(&filter.batch_operation_key, None)
+}
+
 /// Evaluates a process-instance `variables` filter against an instance's
 /// process-scoped (root) variables, provided as a `name → serialized-JSON value`
 /// map (absent when the instance has no root variables). Each
@@ -22416,6 +23048,22 @@ fn match_instance_variables(
             let value = vars.and_then(|m| m.get(&entry.name)).map(String::as_str);
             query::match_string_property(&entry.value, value)
         }),
+    }
+}
+
+/// Matches the `tags` filter against an instance's carried tags. Every
+/// requested tag must be present on the instance (AND semantics — a tag set
+/// constrains to instances carrying the whole set, Camunda-style). An empty
+/// filter set matches everything; an instance with no tags matches only an
+/// absent/empty filter, never a non-empty one (so the field is honoured, not
+/// silently ignored — the class that let a `tags: ["canary"]` migration select
+/// untagged instances, #1551 review).
+fn match_instance_tags(filter: &Option<Vec<models::Tag>>, instance_tags: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(tags) => tags
+            .iter()
+            .all(|want| instance_tags.iter().any(|have| have == &want.0)),
     }
 }
 
@@ -35040,6 +35688,244 @@ mod clustered_startup_tests {
         ));
     }
 
+    /// #1551: `POST /v2/process-instances/migration` mints a trackable
+    /// `MIGRATE_PROCESS_INSTANCE` batch over every matched ACTIVE instance,
+    /// migrates the eligible ones with the request's plan, and records a FAILED
+    /// item (with the rejection reason) for each ineligible one, settling the
+    /// batch as `PARTIALLY_COMPLETED`.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_migrates_and_records_failures() {
+        use apis::batch_operation::{
+            GetBatchOperationResponse as GetResp, SearchBatchOperationItemsResponse as ItemsResp,
+        };
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+        let build = |id: &str, task: &str, job: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .service_task(task, job)
+                .end_event("e")
+                .connect("s", task)
+                .connect(task, "e")
+                .build()
+                .expect("valid definition")
+        };
+        let mut target_key = 0u64;
+        for (id, task, job) in [
+            ("order-v1", "work", "src-work"),
+            ("audit-v1", "audit", "audit-work"),
+            ("order-v2", "fulfil", "tgt-work"),
+        ] {
+            let mut names = std::collections::HashMap::new();
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+            let (deploy, _) = server
+                .deploy_resources_locally(
+                    vec![build(id, task, job)],
+                    &names,
+                    Vec::new(),
+                    &std::collections::HashMap::new(),
+                    "<default>",
+                )
+                .await
+                .expect("deploy");
+            if id == "order-v2" {
+                target_key = deploy
+                    .deployments
+                    .iter()
+                    .find_map(|d| match &d.process_definition {
+                        types::Nullable::Present(p) => Some(p.process_definition_key.0.clone()),
+                        _ => None,
+                    })
+                    .expect("target definition")
+                    .parse()
+                    .expect("numeric key");
+            }
+        }
+
+        // Two eligible order-v1 instances, one ineligible audit-v1 instance
+        // (its active `audit` element has no mapping instruction).
+        let mut eligible = Vec::new();
+        let mut ineligible = 0u64;
+        for id in ["order-v1", "order-v1", "audit-v1"] {
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .await
+                .expect("create instance");
+            if id == "audit-v1" {
+                ineligible = key;
+            } else {
+                eligible.push(key);
+            }
+        }
+        let all: Vec<u64> = eligible.iter().copied().chain([ineligible]).collect();
+        let mut projected = false;
+        for _ in 0..200 {
+            let matched = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                BatchHierarchyPolicy::HonourFilters,
+            );
+            if all.iter().all(|k| matched.contains(k)) {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "all instances project as ACTIVE");
+
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey(target_key.to_string()),
+                vec![models::MigrateProcessInstanceMappingInstruction::new(
+                    "work".to_string(),
+                    "fulfil".to_string(),
+                )],
+            ),
+        );
+        let created = match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("response")
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200 created, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::MigrateProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // Poll the batch until it settles.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let mut got = None;
+        for _ in 0..500 {
+            let r = match server.get_batch_operation_impl(&path).await.unwrap() {
+                GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                other => panic!("expected 200 get, got {other:?}"),
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                got = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the batch settles");
+        assert_eq!(
+            got.state,
+            models::BatchOperationStateEnum::PartiallyCompleted
+        );
+        assert_eq!(got.operations_total_count, 3);
+        assert_eq!(got.operations_completed_count, 2);
+        assert_eq!(got.operations_failed_count, 1);
+        assert!(got.end_date.is_present());
+
+        // Eligible instances were actually migrated onto order-v2. A terminal
+        // batch state does not guarantee the migration events have reached the
+        // read model (the in-memory journal queues them for the exporter
+        // without awaiting projection), so poll for the re-home with a bounded
+        // timeout — as the adjacent single-instance migration test does —
+        // rather than asserting against a possibly-stale row.
+        let mut rehomed = false;
+        for _ in 0..200 {
+            if eligible.iter().all(|key| {
+                server
+                    .store
+                    .process_instance(*key)
+                    .is_some_and(|rec| rec.process_definition_id == "order-v2")
+            }) {
+                rehomed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            rehomed,
+            "eligible instances project onto order-v2 after the batch settles"
+        );
+
+        // The ineligible item is FAILED with an error message.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r.items,
+            other => panic!("expected 200 items, got {other:?}"),
+        };
+        let failed = items
+            .iter()
+            .find(|i| i.batch_operation_key == batch_key && i.item_key == ineligible.to_string())
+            .expect("ineligible item recorded");
+        assert_eq!(failed.state, "FAILED");
+        assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
+    }
+
+    /// #1551: a malformed `targetProcessDefinitionKey` is rejected up front with
+    /// `400`, and no batch is minted.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_bad_target_key() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("not-a-key".to_string()),
+                Vec::new(),
+            ),
+        );
+        assert!(matches!(
+            server
+                .migrate_process_instances_batch_operation_impl(&req)
+                .await
+                .unwrap(),
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+        ));
+        assert!(server.batch_operations.all().is_empty());
+    }
+
+    /// #1551 review (Copilot): the filter schema (spec/process-instances.yaml)
+    /// deprecates `batchOperationId` in favour of `batchOperationKey` and
+    /// requires a `400` when BOTH are supplied. The migration endpoint must
+    /// enforce that up front — minting no batch — rather than fail-closed
+    /// matching the two unprojected fields into an empty (but registered)
+    /// batch.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_id_and_key_together() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let filter = models::ProcessInstanceFilter {
+            batch_operation_id: Some(s("2251799813685249")),
+            batch_operation_key: Some(s("2251799813685249")),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            filter,
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("1".to_string()),
+                Vec::new(),
+            ),
+        );
+        match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for id+key together, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
     /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
     /// core the v2 REST API shares — end to end: a service-task instance waiting
     /// on a job is migrated onto a second definition, the read model re-homes
@@ -46776,6 +47662,125 @@ mod batch_operation_tests {
     }
 
     #[tokio::test]
+    async fn executor_honours_suspend_resume_and_cancel_between_items() {
+        // #1551 review (execution-level coverage): the batch executor
+        // (`drive_process_instance_batch`) must honour the lifecycle *between*
+        // items — suspension blocks the next item, resumption continues
+        // processing, and cancellation leaves the remaining items unprocessed
+        // without the final `finish` overwriting CANCELED. The store-level state
+        // machine is covered above; this drives the real executor loop with a
+        // gated per-item closure so the behaviour is pinned deterministically.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = ServerImpl::default();
+        // A gate the executor must wait on before applying each item, so the
+        // test controls exactly when item N is processed.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let apply_gate = gate.clone();
+        let apply_started = started.clone();
+        let key = server.drive_process_instance_batch(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![1, 2, 3],
+            move |_server, _item| {
+                let gate = apply_gate.clone();
+                let started = apply_started.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    // Park until the test releases this item.
+                    gate.notified().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // Poll the store until `want` items have been *started* (bounded).
+        let wait_started = |want: usize| {
+            let started = started.clone();
+            async move {
+                for _ in 0..200 {
+                    if started.load(Ordering::SeqCst) >= want {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("timed out waiting for {want} item(s) to start");
+            }
+        };
+        let state = |k: u64| server.batch_operations.state(k);
+
+        // --- Suspend before the first item: nothing may start. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        // Give the executor ample opportunity to (incorrectly) start item 1.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "a suspended batch must not start any item"
+        );
+
+        // --- Resume: item 1 starts; release it and let it complete. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Active);
+        wait_started(1).await;
+        gate.notify_one();
+        // Wait for item 1 to be recorded COMPLETED and item 2 to start.
+        wait_started(2).await;
+
+        // --- Suspend again: item 2 is parked on the gate; even after releasing
+        // the gate the executor must not start item 3 while suspended. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        gate.notify_one(); // release item 2
+        // Item 2 completes, then the executor parks on the suspended state.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a re-suspended batch must not start item 3"
+        );
+
+        // --- Cancel while suspended: item 3 never starts, and the terminal
+        // CANCELED state is not overwritten by finish(). ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Canceled);
+        // The executor is parked in its suspend-poll; the next poll observes the
+        // terminal CANCELED state and returns (the `_ => return` arm), so the
+        // loop exits without driving item 3 or reaching finish(). Give it time
+        // to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a canceled batch must not start the remaining item"
+        );
+        assert_eq!(
+            state(key),
+            Some(models::BatchOperationStateEnum::Canceled),
+            "finish() must not overwrite the terminal CANCELED state"
+        );
+
+        // The two processed items are COMPLETED; the unprocessed item stays
+        // ACTIVE (never driven to a terminal item state).
+        let rec = server.batch_operations.get(key).expect("batch present");
+        let item_state = |k: u64| rec.items.iter().find(|i| i.item_key == k).map(|i| i.state);
+        use models::BatchOperationItemStateEnum as I;
+        assert!(matches!(item_state(1), Some(I::Completed)));
+        assert!(matches!(item_state(2), Some(I::Completed)));
+        assert!(
+            matches!(item_state(3), Some(I::Active)),
+            "the unprocessed item stays ACTIVE, never completed/failed"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_and_unknown_keys_map_to_400_and_404() {
         use apis::batch_operation::GetBatchOperationResponse as GetResp;
         use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
@@ -47037,6 +48042,282 @@ mod search_process_instances_variable_filter_tests {
             keys(&matched),
             vec!["1".to_string(), "2".to_string(), "3".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_tags_filter_tests {
+    //! Regression coverage for the `tags` filter on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler
+    //! previously parsed `filter.tags` off the wire and discarded it, returning
+    //! the full unfiltered set — the same silent-broadening failure mode the
+    //! batch matcher had. These drive the actual handler against a populated
+    //! read model so the predicate can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created_with_tags(instance_key: u64, tags: &[&str]) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn tag_filter(tags: &[&str]) -> models::ProcessInstanceFilter {
+        models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        }
+    }
+
+    fn keys(result: &models::ProcessInstanceSearchQueryResult) -> Vec<String> {
+        let mut ks: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    fn seed(server: &ServerImpl) {
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tag_filter_isolates_matching_instances() {
+        let server = ServerImpl::default();
+        seed(&server);
+
+        // Baseline: no filter returns every seeded instance.
+        let all = run(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 4, "baseline should see all instances");
+
+        // The tag filter narrows to exactly the instances carrying `canary` —
+        // not the full set (the pre-fix bug returned all 4).
+        let matched = run(&server, tag_filter(&["canary"])).await;
+        assert_eq!(matched.page.total_items, 2);
+        assert_eq!(keys(&matched), vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multiple_tags_are_anded() {
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["canary", "blue"])).await;
+        assert_eq!(matched.page.total_items, 1);
+        assert_eq!(keys(&matched), vec!["2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn absent_tag_fails_honestly() {
+        // A tag no instance carries must exclude everything rather than being
+        // silently ignored.
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["ghost"])).await;
+        assert_eq!(matched.page.total_items, 0);
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_tenant_suspended_unprojected_filter_tests {
+    //! Regression coverage for the `tenantId` / `suspendedDate` /
+    //! `processDefinitionName` / `processDefinitionVersionTag` filters on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler previously
+    //! parsed all four off the wire and discarded them, returning the full
+    //! unfiltered set — the same silent-broadening failure mode the batch matcher
+    //! had. These drive the actual handler against a populated read model so the
+    //! predicates can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created(instance_key: u64) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn string_filter(s: &str) -> models::StringFilterProperty {
+        models::StringFilterProperty::String(s.to_string())
+    }
+
+    fn exists_string(exists: bool) -> models::StringFilterProperty {
+        models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedStringFilter::new()
+        })
+    }
+
+    fn exists_date(exists: bool) -> models::DateTimeFilterProperty {
+        models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedDateTimeFilter::new()
+        })
+    }
+
+    #[tokio::test]
+    async fn tenant_id_is_honoured_against_the_default_tenant() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // Nano is single-tenant: the `<default>` tenant matches every instance,
+        // any other tenant matches none (not silently ignored).
+        let default = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("<default>")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(default.page.total_items, 2, "the <default> tenant matches");
+
+        let other = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("acme")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            other.page.total_items, 0,
+            "a non-default tenantId excludes everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_date_filter_selects_only_suspended_instances() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+        // Suspend instance 2.
+        shard
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 2,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // `$exists: true` selects exactly the suspended instance (its
+        // `suspended_date_ms` is set); the ACTIVE instance is excluded.
+        let suspended = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(true)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "2");
+
+        // `$exists: false` selects the non-suspended instance.
+        let active = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(false)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(active.page.total_items, 1);
+        assert_eq!(active.items[0].process_instance_key.0, "1");
+    }
+
+    #[tokio::test]
+    async fn unprojected_name_and_version_tag_fail_honestly() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are never
+        // projected (always null), so an equality / `$exists: true` filter
+        // excludes every row while `$exists: false` matches.
+        for field_setter in [
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_name = Some(v)
+            },
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_version_tag = Some(v)
+            },
+        ] {
+            let mut eq = models::ProcessInstanceFilter::new();
+            field_setter(&mut eq, string_filter("x"));
+            assert_eq!(
+                run(&server, eq).await.page.total_items,
+                0,
+                "equality on an unprojected field is not silently ignored"
+            );
+
+            let mut absent = models::ProcessInstanceFilter::new();
+            field_setter(&mut absent, exists_string(false));
+            assert_eq!(
+                run(&server, absent).await.page.total_items,
+                2,
+                "$exists:false on an unprojected field matches"
+            );
+        }
     }
 }
 
@@ -49536,6 +50817,538 @@ mod call_activity_hierarchy_read_model_tests {
                 "batch matcher overrides state to ACTIVE and selects the active \
                  instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy:?})"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_variables_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.variables`
+        // against each instance's process-scoped (root) variables with the same
+        // algebra as `search_process_instances_impl` — dropping it silently
+        // *broadens* the batch (a migration filtered to `batch = "alpha"` would
+        // also migrate every other eligible instance). Seeds the read model
+        // directly (same pattern as the search-side variable-filter tests) and
+        // drives the matcher both batch operations consume, so the join cannot
+        // silently regress for cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::{Event, Value};
+        let created_with_vars =
+            |instance_key: u64, vars: &[(&str, Value)]| Event::ProcessInstanceCreated {
+                instance_key,
+                process_id: "p".to_string(),
+                variables: vars
+                    .iter()
+                    .map(|(n, v)| ((*n).to_string(), v.clone()))
+                    .collect(),
+                created_at: 0,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: 0,
+                version: 0,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_vars(1, &[("batch", Value::Str("alpha".into()))]),
+                &created_with_vars(2, &[("batch", Value::Str("beta".into()))]),
+                &created_with_vars(3, &[("batch", Value::Str("alpha".into()))]),
+                // Carries no `batch` variable at all.
+                &created_with_vars(4, &[("other", Value::Str("alpha".into()))]),
+            ])
+            .unwrap();
+
+        let var_filter = |name: &str, json_value: &str| models::ProcessInstanceFilter {
+            variables: Some(vec![models::VariableValueFilterProperty {
+                name: name.to_string(),
+                value: models::StringFilterProperty::String(json_value.to_string()),
+            }]),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        // Baseline: no variable filter selects every ACTIVE instance.
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // The variable filter narrows to exactly the instances whose
+            // root-scope `batch` equals the JSON-encoded string "alpha" — not
+            // the full set (the pre-fix matcher ignored `variables` and
+            // returned all 4).
+            let matched = server.batch_matched_process_instances(
+                &var_filter("batch", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                matched,
+                vec![1, 3],
+                "batch matcher honours the variables filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A filter on a variable no instance carries excludes everything
+            // (matched against an absent value) rather than being ignored.
+            let none = server.batch_matched_process_instances(
+                &var_filter("ghost", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert!(
+                none.is_empty(),
+                "an absent variable name fails honestly (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_tags_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.tags` against
+        // each instance's carried tags — dropping it silently *broadens* the
+        // batch (a migration filtered to `tags = ["canary"]` would also migrate
+        // every untagged ACTIVE instance). Seeds the read model directly (same
+        // pattern as the variable-filter test above) and drives the matcher both
+        // batch operations consume, so the predicate cannot silently regress for
+        // cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+
+        let tag_filter = |tags: &[&str]| models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no tag filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // A single tag narrows to exactly the instances carrying it — not
+            // the full set (the pre-fix matcher ignored `tags` and returned all
+            // 4).
+            let matched =
+                server.batch_matched_process_instances(&tag_filter(&["canary"]), honour_hierarchy);
+            assert_eq!(
+                matched,
+                vec![1, 2],
+                "batch matcher honours the tags filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // Multiple tags are ANDed: only the instance carrying the whole set
+            // matches.
+            let all_tags = server.batch_matched_process_instances(
+                &tag_filter(&["canary", "blue"]),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                all_tags,
+                vec![2],
+                "multiple tags are ANDed (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A tag no instance carries excludes everything (matched against an
+            // absent tag) rather than being ignored.
+            let none =
+                server.batch_matched_process_instances(&tag_filter(&["ghost"]), honour_hierarchy);
+            assert!(
+                none.is_empty(),
+                "an absent tag fails honestly (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_inherited_cross_entity_filters() {
+        // #1551 review: the inherited element / job / incident / batch-operation
+        // filters (`elementId`, `elementInstanceState`,
+        // `hasElementInstanceIncident`, `errorMessage`, `hasRetriesLeft`,
+        // `incidentErrorHashCode`, `batchOperationId`/`Key`) must constrain the
+        // batch: an otherwise-migratable ACTIVE instance without a `review`
+        // element must NOT be selected by `elementId: "review"`.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1),
+                &created(2),
+                &created(3),
+                &activated(1, 11, "review"),
+                &activated(2, 21, "approve"),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            assert_eq!(
+                server
+                    .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), policy),
+                vec![1, 2, 3],
+                "baseline selects all instances"
+            );
+            // elementId narrows to the instance carrying that element; the
+            // nonmatching (otherwise migratable) instances are excluded.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1],
+                "elementId is honoured ({policy:?})"
+            );
+            // No incidents / failed jobs seeded: `true` excludes all, `false`
+            // matches all.
+            for want in [true, false] {
+                let expect: Vec<u64> = if want { vec![] } else { vec![1, 2, 3] };
+                assert_eq!(
+                    server.batch_matched_process_instances(
+                        &models::ProcessInstanceFilter {
+                            has_element_instance_incident: Some(want),
+                            ..models::ProcessInstanceFilter::new()
+                        },
+                        policy
+                    ),
+                    expect,
+                    "hasElementInstanceIncident={want} ({policy:?})"
+                );
+                assert_eq!(
+                    server.batch_matched_process_instances(
+                        &models::ProcessInstanceFilter {
+                            has_retries_left: Some(want),
+                            ..models::ProcessInstanceFilter::new()
+                        },
+                        policy
+                    ),
+                    expect,
+                    "hasRetriesLeft={want} ({policy:?})"
+                );
+            }
+            // Unprojected / absent values fail closed on equality.
+            for f in [
+                models::ProcessInstanceFilter {
+                    error_message: Some(s("boom")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                models::ProcessInstanceFilter {
+                    batch_operation_id: Some(s("x")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                models::ProcessInstanceFilter {
+                    batch_operation_key: Some(s("x")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+            ] {
+                assert!(
+                    server
+                        .batch_matched_process_instances(&f, policy)
+                        .is_empty(),
+                    "absent-value filter fails closed ({policy:?})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_correlates_element_predicates_on_one_row() {
+        // #1551 review (Copilot): the element predicates must hold of the SAME
+        // element instance. An instance whose COMPLETED `review` and ACTIVE
+        // `approve` are different rows must NOT satisfy
+        // `elementId: "review", elementInstanceState: "ACTIVE"` — the pre-fix
+        // matcher evaluated each predicate against an independent per-field
+        // list, so it selected the instance (and would have migrated it) even
+        // though no ACTIVE `review` exists.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let completed =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                // Instance 1: `review` COMPLETED (historical), `approve` ACTIVE —
+                // the split-rows trap.
+                &created(1),
+                &activated(1, 11, "review"),
+                &completed(1, 11, "review"),
+                &activated(1, 12, "approve"),
+                // Instance 2: `review` genuinely ACTIVE — the positive control.
+                &created(2),
+                &activated(2, 21, "review"),
+                // Instance 3: `review` COMPLETED only — historical, not active.
+                &created(3),
+                &activated(3, 31, "review"),
+                &completed(3, 31, "review"),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let active_state = || {
+            models::ElementInstanceStateFilterProperty::ElementInstanceStateEnum(
+                models::ElementInstanceStateEnum::Active,
+            )
+        };
+
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // The correlated predicate selects ONLY instance 2: instance 1's
+            // ACTIVE element is `approve` (its `review` is COMPLETED) and
+            // instance 3's `review` is historical.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![2],
+                "elementId + elementInstanceState correlate on one row ({policy:?})"
+            );
+            // State alone still behaves existentially: instances 1 and 2 both
+            // carry an ACTIVE element.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2],
+                "elementInstanceState alone is existential ({policy:?})"
+            );
+            // Id alone matches historical rows too: instances 1, 2 and 3 all
+            // carried a `review` element at some point.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2, 3],
+                "elementId alone matches historical rows ({policy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_tenant_suspended_and_unprojected_filters() {
+        // #1551 review: the batch matcher must evaluate `tenantId`,
+        // `suspendedDate`, `processDefinitionName` and
+        // `processDefinitionVersionTag` rather than silently dropping them — a
+        // dropped constraint *broadens* a mutating batch to instances the caller
+        // asked to exclude (e.g. `suspendedDate: { $exists: true }` must not
+        // select ACTIVE instances, whose suspension timestamp is null). Seeds the
+        // read model directly and drives the matcher both batch operations
+        // consume, so the predicates cannot silently regress for cancellation /
+        // incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        let string_filter = |s: &str| models::StringFilterProperty::String(s.to_string());
+        let exists_string = |exists: bool| {
+            models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedStringFilter::new()
+            })
+        };
+        let exists_date = |exists: bool| {
+            models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedDateTimeFilter::new()
+            })
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2], "baseline selects all instances");
+
+            // `suspendedDate: { $exists: true }` matches nothing: a batch is
+            // ACTIVE-only, so no candidate carries a suspension timestamp (the
+            // finding's exact example).
+            let suspended_exists = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(true)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                suspended_exists.is_empty(),
+                "suspendedDate $exists:true excludes ACTIVE instances (honour_hierarchy={honour_hierarchy:?})"
+            );
+            // `$exists: false` matches every (non-suspended) candidate.
+            let not_suspended = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(false)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                not_suspended,
+                vec![1, 2],
+                "suspendedDate $exists:false matches all (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `tenantId` is honoured against Nano's single `<default>` tenant: the
+            // default matches, any other tenant excludes.
+            let default_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("<default>")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                default_tenant,
+                vec![1, 2],
+                "tenantId <default> matches (honour_hierarchy={honour_hierarchy:?})"
+            );
+            let other_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("acme")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                other_tenant.is_empty(),
+                "a non-default tenantId excludes everything (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `processDefinitionName` / `processDefinitionVersionTag` are never
+            // projected (always null), so an equality / `$exists: true` filter
+            // excludes every candidate while `$exists: false` matches.
+            for field_setter in [
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_name = Some(v)
+                },
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_version_tag = Some(v)
+                },
+            ] {
+                let mut eq = models::ProcessInstanceFilter::new();
+                field_setter(&mut eq, string_filter("x"));
+                let matched = server.batch_matched_process_instances(&eq, honour_hierarchy);
+                assert!(
+                    matched.is_empty(),
+                    "equality on an unprojected field is not silently ignored (honour_hierarchy={honour_hierarchy:?})"
+                );
+
+                let mut absent = models::ProcessInstanceFilter::new();
+                field_setter(&mut absent, exists_string(false));
+                let matched = server.batch_matched_process_instances(&absent, honour_hierarchy);
+                assert_eq!(
+                    matched,
+                    vec![1, 2],
+                    "$exists:false on an unprojected field matches (honour_hierarchy={honour_hierarchy:?})"
+                );
+            }
         }
     }
 

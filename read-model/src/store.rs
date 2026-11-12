@@ -4313,7 +4313,18 @@ fn project_engine_state(
                 // them to the compacted `JobFailed`/`JobErrorThrown` events.
                 job.error_message,
                 job.error_code,
-                i64::from(job.has_failed_with_retries_left),
+                // A terminal job is never retry-eligible (#1551 review): a
+                // snapshot recorded before the engine cleared the flag at the
+                // terminal transition can carry `true` on a Completed/Canceled
+                // job, and seeding it verbatim would let that terminal job
+                // select its instance for `hasRetriesLeft` searches and
+                // migration batches. Converge with the current reducer
+                // semantics (which clear the flag on every terminal
+                // transition) instead of preserving the pre-change value.
+                i64::from(
+                    job.has_failed_with_retries_left
+                        && !matches!(job.state, JobState::Completed | JobState::Canceled),
+                ),
                 creation_ms as i64,
                 last_update as i64,
                 replay_floor as i64,
@@ -5722,9 +5733,14 @@ fn project_event(
             // terminal instant. BOTH paths bound creation by the terminal
             // instant at the first terminal transition, so `creationTime <=
             // endTime` always holds and live and reseeded rows agree.
+            //
+            // The retries-left flag clears unconditionally (#1551 review): a
+            // completed job is no longer retry-eligible, so `hasRetriesLeft`
+            // must stop matching it even when the completion is a re-delivery.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
                  created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?4) ELSE created_at_ms END, \
+                 has_failed_with_retries_left = 0, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
@@ -5752,10 +5768,13 @@ fn project_event(
             // authority and the shared backward-clock creation bound (#1494,
             // see there). Guard on the first terminal transition so a re-delivery
             // is a no-op; a job that was already FAILED/ERRORED (no `end_ms`)
-            // still gets its cancellation `endTime` here (#1344).
+            // still gets its cancellation `endTime` here (#1344). The
+            // retries-left flag clears too (#1551 review): a canceled job is no
+            // longer retry-eligible, so `hasRetriesLeft` must stop matching it.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
                  created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?3) ELSE created_at_ms END, \
+                 has_failed_with_retries_left = 0, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
@@ -5796,11 +5815,31 @@ fn project_event(
             // legitimately receive a retries update (the engine rejects it), so
             // one observed there is always a replay, and `lastUpdateTime` stays
             // frozen at `endTime`.
+            //
+            // Retries-left flag (#1551 review): the column feeds the
+            // process-instance `hasRetriesLeft` filter, so it must track the
+            // update — a failure whose retries are drained to zero stops
+            // matching, a parked zero-retry failure topped up (the
+            // incident-resolution flow) starts matching. Derive it from the
+            // failure-bearing states (Failed/Errored) plus the NEW retries: a
+            // job that returned to the activatable pool keeps the flag its
+            // retryable failure set (it can only lose retries here), and the
+            // `end_ms IS NULL` guard keeps a replayed update from re-arming a
+            // Completed/Canceled row.
             tx.cexecute(
                 "UPDATE jobs SET retries = ?2, \
+                 has_failed_with_retries_left = CASE WHEN end_ms IS NULL THEN \
+                     ((?2 > 0) AND (has_failed_with_retries_left OR state IN (?4, ?5))) \
+                     ELSE has_failed_with_retries_left END, \
                  last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
                  WHERE key = ?1",
-                params![*job_key as i64, retries, now_ms as i64],
+                params![
+                    *job_key as i64,
+                    retries,
+                    now_ms as i64,
+                    job_state_code(JobState::Failed),
+                    job_state_code(JobState::Errored),
+                ],
             )?;
         }
 
@@ -12465,6 +12504,23 @@ mod element_instance_tests {
             j
         });
 
+        // Pre-#1551 snapshot shapes: a terminal job whose retries-left flag was
+        // never cleared (the engine only began clearing it at the terminal
+        // transition in #1551). Seeding must not let these select their
+        // instance for `hasRetriesLeft` searches / migration batches.
+        state.jobs.insert(9604, {
+            let mut j = base_job(9604, JobState::Completed);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+        state.jobs.insert(9605, {
+            let mut j = base_job(9605, JobState::Canceled);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
         let seeded: HashMap<Key, super::JobRow> =
@@ -12483,6 +12539,18 @@ mod element_instance_tests {
             Some("card declined")
         );
         assert!(seeded[&9603].has_failed_with_retries_left);
+
+        // #1551 review — the pre-change snapshot shapes seed with the flag
+        // CLEARED: a terminal job is never retry-eligible, so it must not
+        // select its instance for `hasRetriesLeft` searches / migration batches.
+        assert!(
+            !seeded[&9604].has_failed_with_retries_left,
+            "a completed job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
+        assert!(
+            !seeded[&9605].has_failed_with_retries_left,
+            "a canceled job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
     }
 
     #[test]
@@ -13203,6 +13271,135 @@ mod element_instance_tests {
         // Exporter parity: ERROR_THROWN with retries > 0 counts as "failed with
         // retries left" (JobHandler keys the flag off the record's retries).
         assert!(r.has_failed_with_retries_left);
+    }
+
+    #[test]
+    fn retries_left_flag_tracks_retry_updates_and_terminal_transitions() {
+        // #1551 review — the read-model `has_failed_with_retries_left` column
+        // feeds the process-instance `hasRetriesLeft` filter (search + batch
+        // migration), so it must describe retry eligibility NOW, not the last
+        // failure record: track `JobRetriesUpdated` in both directions and clear
+        // on the terminal transitions.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+        };
+        let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &job(7001),
+                &job(7002),
+                &job(7003),
+                &job(7004),
+            ])
+            .unwrap();
+
+        // Direction 1: retryable failure, retries later drained to zero.
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7001).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobRetriesUpdated {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 0,
+                operation_reference: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7001).has_failed_with_retries_left,
+            "a failure whose retries were drained to zero must stop matching hasRetriesLeft"
+        );
+
+        // Direction 2: zero-retry failure topped up (the incident-resolution flow).
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7002,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: Some("gave up".to_string()),
+            }])
+            .unwrap();
+        assert!(!row(&store, 7002).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobRetriesUpdated {
+                job_key: 7002,
+                instance_key: INST,
+                retries: 3,
+                operation_reference: None,
+            }])
+            .unwrap();
+        assert!(
+            row(&store, 7002).has_failed_with_retries_left,
+            "a parked zero-retry failure topped up must start matching hasRetriesLeft"
+        );
+
+        // Terminal transitions clear the flag on a retryable failure.
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7003,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7003).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobCompleted {
+                job_key: 7003,
+                instance_key: INST,
+                created_at: 1,
+                job_type: "worker".to_string(),
+                worker: None,
+                completed_at: 2,
+                deadline: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7003).has_failed_with_retries_left,
+            "a completed job must not keep matching hasRetriesLeft"
+        );
+
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7004,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7004).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobCanceled {
+                job_key: 7004,
+                instance_key: INST,
+                canceled_at: 2,
+                deadline: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7004).has_failed_with_retries_left,
+            "a canceled job must not keep matching hasRetriesLeft"
+        );
     }
 
     #[test]
