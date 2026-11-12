@@ -12892,6 +12892,11 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
+        // Cheap kind check first: a completing task, gateway, or start/end
+        // event is never a race winner, so it must not pay for the index.
+        if !is_intermediate_catch(def, winner_element_id) {
+            return Vec::new();
+        }
         // One indexed pass over the definition, shared by the winner lookup
         // and sibling discovery (O(V + E), not a full rescan per branch).
         let race_index = event_gateway_race_index(def);
@@ -16250,10 +16255,10 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
 /// One O(V + E) pass over a definition's flow graph indexing which catch
 /// events race in which event-based gateway's deferred choice, so a caller
 /// resolving many catches (runtime sibling withdrawal, migration) pays the
-/// scan once instead of per catch. `None` entries are ambiguous catches (no
-/// single owning gateway) — the one definition of "race membership" shared by
-/// the runtime withdrawal of losing siblings and by migration (#1554), so the
-/// two can never disagree:
+/// scan once instead of per catch. Catches with no unambiguous owning gateway
+/// are simply absent from the map — the one definition of "race membership"
+/// shared by the runtime withdrawal of losing siblings and by migration
+/// (#1554), so the two can never disagree:
 ///
 /// * `catch_id` must be an intermediate catch event (a malformed model routing a
 ///   gateway into e.g. a service task must never have that node force-completed,
@@ -16266,14 +16271,14 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
 ///   concurrent activations could arm several instances of each sibling in one
 ///   scope, and siblings (matched by element id + scope) could not be isolated.
 pub(crate) struct EventGatewayRaceIndex<'a> {
-    owners: HashMap<&'a str, Option<&'a crate::model::Element>>,
+    owners: HashMap<&'a str, &'a crate::model::Element>,
 }
 
 impl<'a> EventGatewayRaceIndex<'a> {
     /// The gateway `catch_id` races in, or `None` when it is not an
     /// unambiguous race member.
     pub(crate) fn owner_of(&self, catch_id: &str) -> Option<&'a crate::model::Element> {
-        self.owners.get(catch_id).copied().flatten()
+        self.owners.get(catch_id).copied()
     }
 
     /// The catch events racing in `owner`'s deferred choice, in declaration
@@ -16284,7 +16289,7 @@ impl<'a> EventGatewayRaceIndex<'a> {
             if let Some((id, _)) = self
                 .owners
                 .get_key_value(flow.to.as_str())
-                .filter(|(_, o)| o.is_some_and(|o| o.id == owner.id))
+                .filter(|(_, o)| o.id == owner.id)
             {
                 if !members.contains(id) {
                     members.push(id);
@@ -16295,10 +16300,11 @@ impl<'a> EventGatewayRaceIndex<'a> {
     }
 }
 
-/// Indexes every catch element's owning event-based gateway in one pass over
-/// the definition: incoming-flow counts first, then one owner resolution per
-/// catch — O(V + E) total, where per-catch owner lookups would each rescan
-/// the whole graph.
+/// Indexes every catch element's owning event-based gateway in one traversal
+/// of the definition: incoming-flow counts first, then a single pass over the
+/// gateways' outgoing flows recording each catch's owner — O(V + E) total,
+/// where per-catch owner lookups would each rescan the whole graph (O(C ×
+/// (V + E)) on catch-heavy models).
 pub(crate) fn event_gateway_race_index(
     def: &crate::model::ProcessDefinition,
 ) -> EventGatewayRaceIndex<'_> {
@@ -16308,24 +16314,29 @@ pub(crate) fn event_gateway_race_index(
             *incoming.entry(flow.to.as_str()).or_default() += 1;
         }
     }
-    let mut owners = HashMap::with_capacity(def.elements.len());
-    for element in def.elements.values() {
-        let id = element.id.as_str();
-        if !is_intermediate_catch(def, id) || incoming.get(id).copied().unwrap_or(0) != 1 {
+    let mut owners: HashMap<&str, &crate::model::Element> = HashMap::new();
+    for gateway in def.elements.values() {
+        if !matches!(gateway.kind, ElementKind::EventBasedGateway)
+            || incoming.get(gateway.id.as_str()).copied().unwrap_or(0) != 1
+        {
             continue;
         }
-        let mut candidates = def.elements.values().filter(|candidate| {
-            matches!(candidate.kind, ElementKind::EventBasedGateway)
-                && candidate.outgoing.iter().any(|f| f.to == id)
-        });
-        let owner = match (candidates.next(), candidates.next()) {
-            (Some(owner), None) => Some(owner),
-            _ => None,
-        };
-        owners.insert(
-            id,
-            owner.filter(|owner| incoming.get(owner.id.as_str()).copied().unwrap_or(0) == 1),
-        );
+        for flow in &gateway.outgoing {
+            let catch = flow.to.as_str();
+            if !is_intermediate_catch(def, catch) || incoming.get(catch).copied().unwrap_or(0) != 1
+            {
+                continue;
+            }
+            // incoming(catch) == 1 makes this gateway's flow the catch's only
+            // incoming flow, so no second gateway can claim it — a second
+            // claimant would itself be a second incoming flow. The ambiguity
+            // checks therefore reduce to the two incoming-count requirements.
+            let previous = owners.insert(catch, gateway);
+            debug_assert!(
+                previous.is_none(),
+                "catch {catch} claimed by two event-based gateways"
+            );
+        }
     }
     EventGatewayRaceIndex { owners }
 }

@@ -543,3 +543,31 @@ fn race_index_matches_naive_scan() {
     members.sort_unstable();
     assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
 }
+
+/// Copilot #1564: a catch routed into by two event-based gateways where one
+/// is itself race-ineligible (two incoming flows) is still no race member —
+/// the single-traversal index must not let the eligible claimant win by
+/// default.
+#[test]
+fn race_index_marks_catch_ambiguous_when_one_claimant_is_ineligible() {
+    let def = race_builder("p", "", "reply")
+        .event_based_gateway("gw2")
+        .timer_intermediate_catch_event("contested", 3_000)
+        .end_event("endContested")
+        .start_event("start2")
+        // gw2 has two incoming flows, so it owns no race; but it still routes
+        // into `contested`, making the catch's owner ambiguous.
+        .connect("start2", "gw2")
+        .connect("gw", "contested")
+        .connect("gw2", "contested")
+        .connect("contested", "endContested")
+        .build()
+        .unwrap();
+    let index = event_gateway_race_index(&def);
+    assert!(index.owner_of("contested").is_none());
+    // The eligible gateway's own unambiguous members are unaffected.
+    assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
+    let mut members = index.members_of(def.element("gw").unwrap());
+    members.sort_unstable();
+    assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
+}
