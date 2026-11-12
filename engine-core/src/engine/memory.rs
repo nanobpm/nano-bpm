@@ -74,6 +74,7 @@ impl Engine {
             now: snapshot.now,
             start_dispatch_rr: snapshot.start_dispatch_rr,
             lenient_completion: false,
+            terminal_deadline_stamp: None,
             track_dirty_vars: false,
             dirty_vars: std::collections::HashSet::new(),
             forgotten_vars: std::collections::HashSet::new(),
