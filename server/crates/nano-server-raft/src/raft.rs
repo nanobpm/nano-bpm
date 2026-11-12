@@ -871,6 +871,13 @@ pub struct PartitionStateMachine {
     /// (one partition can receive successive snapshots over its lifetime).
     recv_idx: AtomicU64,
     current_snapshot: Mutex<Option<StoredSnapshot>>,
+    /// Snapshot files a build or install is still writing / promoting and has
+    /// not yet published (#1488). [`reap_superseded_snapshots`] never removes a
+    /// path in this set, so an install's prompt reap cannot delete the file a
+    /// concurrent DETACHED `build_snapshot` is mid-writing (or an install's
+    /// promoted-but-unpublished file) out from under it. Registered via
+    /// [`InFlightSnapshot`] BEFORE the file exists, removed on drop.
+    in_flight_snapshots: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
@@ -990,6 +997,7 @@ impl PartitionStateMachine {
             snapshot_idx: AtomicU64::new(0),
             recv_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(restored),
+            in_flight_snapshots: Arc::default(),
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -1424,6 +1432,9 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .sm
             .snapshot_dir
             .join(format!("snap-g{}-{snapshot_idx}.bin", self.sm.generation));
+        // Register the path as in flight BEFORE the file exists (#1488), so a
+        // concurrent install's reap never deletes it mid-write / pre-publish.
+        let _in_flight = InFlightSnapshot::register(&self.sm.in_flight_snapshots, &path);
         let covered = self.last_applied.map(|l| l.index).unwrap_or(0);
         let serialize_start = std::time::Instant::now();
         // The streaming serialize blocks on file I/O and the spill-store reads;
@@ -1505,7 +1516,13 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // accumulate until the next process restart sweeps it.
         let partition_id = self.sm.partition_id();
         observe_snapshot_file_size(partition_id, self.sm.node_id, snapshot_bytes);
-        reap_superseded_snapshots(&self.sm.snapshot_dir, &path, partition_id, self.sm.node_id);
+        reap_superseded_snapshots(
+            &self.sm.snapshot_dir,
+            &path,
+            &self.sm.in_flight_snapshots,
+            partition_id,
+            self.sm.node_id,
+        );
 
         let tokio_file = tokio::fs::File::open(&path)
             .await
@@ -1911,6 +1928,9 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             "snap-installed-g{}-{snapshot_idx}.bin",
             self.generation
         ));
+        // In flight until published (#1488): a concurrent build's reap must not
+        // delete the promoted-but-unpublished file.
+        let _in_flight = InFlightSnapshot::register(&self.in_flight_snapshots, &current_path);
         std::fs::rename(&path, &current_path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         // fsync the promoted file, then record it as the durable current snapshot
@@ -1936,7 +1956,13 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .map(|m| m.len())
             .unwrap_or(0);
         observe_snapshot_file_size(partition_id, self.node_id, installed_bytes);
-        reap_superseded_snapshots(&self.snapshot_dir, &stored.path, partition_id, self.node_id);
+        reap_superseded_snapshots(
+            &self.snapshot_dir,
+            &stored.path,
+            &self.in_flight_snapshots,
+            partition_id,
+            self.node_id,
+        );
         let previous = self
             .current_snapshot
             .lock()
@@ -2046,8 +2072,16 @@ fn observe_snapshot_file_size(partition_id: u64, node_id: NodeId, bytes: u64) {
 /// reaped here, the moment a newer snapshot becomes current, rather than at
 /// the next boot. Only recognized snapshot artifacts (`snap-*.bin` /
 /// `snap-installed-*.bin`) are touched; the durable pointer and foreign files
-/// are left alone. Best-effort: a removal failure is logged, never fatal.
-fn reap_superseded_snapshots(snapshot_dir: &Path, keep: &Path, partition_id: u64, node_id: NodeId) {
+/// are left alone, as is every path still registered in `in_flight` (a
+/// concurrent build/install that has not yet published it). Best-effort: a
+/// removal failure is logged, never fatal.
+fn reap_superseded_snapshots(
+    snapshot_dir: &Path,
+    keep: &Path,
+    in_flight: &Mutex<std::collections::HashSet<PathBuf>>,
+    partition_id: u64,
+    node_id: NodeId,
+) {
     let entries = match std::fs::read_dir(snapshot_dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -2073,6 +2107,15 @@ fn reap_superseded_snapshots(snapshot_dir: &Path, keep: &Path, partition_id: u64
         if !ours {
             continue;
         }
+        // Registration precedes file creation, so a listed file a concurrent
+        // build/install is still producing is always visible here.
+        if in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&path)
+        {
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 tracing::info!(
@@ -2092,6 +2135,35 @@ fn reap_superseded_snapshots(snapshot_dir: &Path, keep: &Path, partition_id: u64
                 );
             }
         }
+    }
+}
+
+/// RAII registration of a snapshot file a build/install is still producing
+/// (#1488): while alive, [`reap_superseded_snapshots`] skips the path. Dropped
+/// on every exit path (success or error), so a failed build never pins a path.
+struct InFlightSnapshot {
+    set: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl InFlightSnapshot {
+    fn register(set: &Arc<Mutex<std::collections::HashSet<PathBuf>>>, path: &Path) -> Self {
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+        Self {
+            set: Arc::clone(set),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for InFlightSnapshot {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
     }
 }
 
@@ -3697,7 +3769,38 @@ mod tests {
         let incoming = dir.join(format!("incoming-{}-0.tmp", std::process::id()));
         std::fs::write(&incoming, b"partial").expect("write in-flight partial");
 
-        reap_superseded_snapshots(&dir, &keep, 0, 0);
+        let in_flight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // A file a concurrent build is still writing (registered in flight)
+        // must survive the reap; once its guard drops it is reapable again.
+        let building = dir.join("snap-g3-10.bin");
+        std::fs::write(&building, b"partial build").expect("write in-flight build");
+        let guard = InFlightSnapshot::register(&in_flight, &building);
+        // Likewise an install's promoted-but-unpublished file.
+        let promoted = dir.join("snap-installed-g3-11.bin");
+        std::fs::write(&promoted, b"promoted").expect("write promoted install");
+        let promoted_guard = InFlightSnapshot::register(&in_flight, &promoted);
+
+        reap_superseded_snapshots(&dir, &keep, &in_flight, 0, 0);
+        assert!(building.exists(), "an in-flight build is never reaped");
+        assert!(promoted.exists(), "an unpublished install is never reaped");
+        drop(guard);
+        drop(promoted_guard);
+        assert!(
+            in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "guards deregister on drop"
+        );
+        reap_superseded_snapshots(&dir, &keep, &in_flight, 0, 0);
+        assert!(
+            !building.exists(),
+            "a superseded build is reaped once published"
+        );
+        assert!(
+            !promoted.exists(),
+            "a superseded install is reaped once published"
+        );
 
         assert!(keep.exists(), "the current snapshot survives");
         for path in &stale {
@@ -3754,10 +3857,28 @@ mod tests {
 
         // The follower: an empty replica whose snapshot dir already holds a
         // superseded artifact (as a lagging follower's would after earlier
-        // installs / crashed receives).
+        // installs / crashed receives). Its replica label is unique to this
+        // test, so neither the source build's `{node="0"}` series nor any
+        // parallel test can satisfy (or clobber) the destination assertion.
+        const DST_NODE: NodeId = 1_488_550_001;
         let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
-        let mut dst_sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("snapshot dir"));
+        let mut dst_sm: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                dst.clone(),
+                0,
+                PartitionStateMachine::temp_snapshot_dir(0),
+                DST_NODE,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("snapshot dir"),
+        );
+        let series =
+            format!("nanobpm_raft_snapshot_file_bytes{{node=\"{DST_NODE}\",partition=\"0\"}}");
+        assert!(
+            !crate::metrics::gather().contains(&series),
+            "the destination series must be absent before install"
+        );
         let stale = dst_sm.snapshot_dir.join("snap-g1-1.bin");
         std::fs::write(&stale, b"stale").expect("write stale snapshot");
 
@@ -3801,10 +3922,7 @@ mod tests {
             "exactly the installed snapshot remains, got {remaining:?}"
         );
         let gauge = crate::metrics::gather();
-        let expected = format!(
-            "nanobpm_raft_snapshot_file_bytes{{node=\"0\",partition=\"0\"}} {}",
-            bytes.len()
-        );
+        let expected = format!("{series} {}", bytes.len());
         assert!(
             gauge.contains(&expected),
             "the per-replica size series is published ({expected}):\n{gauge}"
