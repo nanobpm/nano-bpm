@@ -21,7 +21,7 @@
 //!
 //! All flow-scope tree walks go through [`super::flow_scope`].
 
-use super::flow_scope::{FlowScopeResolution, element_flow_scope_chain};
+use super::flow_scope::{element_flow_scope_chain, FlowScopeResolution};
 use super::*;
 use crate::command::{ActivateElementInstruction, VariableInstruction};
 
