@@ -594,6 +594,17 @@ impl Engine {
         let hosts: HashMap<Key, ElementId> = active.iter().cloned().collect();
         let mut armed_by_host = self.armed_triggers_on(&hosts, source);
         let not_armable = self.hosts_not_armable_now(&hosts);
+        let call_eiks: std::collections::HashSet<Key> = active
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    source.element(e).map(|el| &el.kind),
+                    Some(ElementKind::CallActivity { .. })
+                )
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        let children = self.call_activity_children_of(&call_eiks);
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
                 // An unmapped host still active here is a withdrawn race member
@@ -631,7 +642,7 @@ impl Engine {
                 source.element(&source_id).map(|e| &e.kind),
                 Some(ElementKind::CallActivity { .. })
             ) {
-                if let Some(child_instance_key) = self.call_activity_child_of(eik) {
+                if let Some(&child_instance_key) = children.get(&eik) {
                     plan.child_instances.push(MigratedChildInstance {
                         call_activity_element_instance_key: eik,
                         child_instance_key,

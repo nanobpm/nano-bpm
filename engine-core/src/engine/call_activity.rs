@@ -48,19 +48,46 @@ impl Engine {
     /// ever held multiple matches (a bug or partial-replay artifact),
     /// boundary-interrupt cancellation always targets the same child.
     pub(super) fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
-        self.state
-            .instances
-            .values()
-            .filter(|i| {
-                matches!(
-                    i.state,
-                    ProcessInstanceState::Active
-                        | ProcessInstanceState::Terminating
-                        | ProcessInstanceState::Suspended
-                ) && i.parent_element_instance_key == Some(call_eik)
-            })
-            .map(|i| i.key)
+        self.live_call_activity_children()
+            .filter(|(parent, _)| *parent == call_eik)
+            .map(|(_, child)| child)
             .min()
+    }
+
+    /// Batched form of [`Self::call_activity_child_of`]: one partition scan
+    /// indexing the live child of every call-activity element instance in
+    /// `call_eiks` (lowest key wins, same lifecycle filter).
+    pub(super) fn call_activity_children_of(
+        &self,
+        call_eiks: &std::collections::HashSet<Key>,
+    ) -> std::collections::HashMap<Key, Key> {
+        let mut out = std::collections::HashMap::new();
+        for (parent, child) in self.live_call_activity_children() {
+            if call_eiks.contains(&parent) {
+                out.entry(parent)
+                    .and_modify(|c: &mut Key| *c = (*c).min(child))
+                    .or_insert(child);
+            }
+        }
+        out
+    }
+
+    /// `(parent call-activity element-instance key, child instance key)` for
+    /// every live (active / terminating / suspended) child instance — the
+    /// single predicate both lookups above derive from.
+    fn live_call_activity_children(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
+        self.state.instances.values().filter_map(|i| {
+            if matches!(
+                i.state,
+                ProcessInstanceState::Active
+                    | ProcessInstanceState::Terminating
+                    | ProcessInstanceState::Suspended
+            ) {
+                i.parent_element_instance_key.map(|p| (p, i.key))
+            } else {
+                None
+            }
+        })
     }
 
     /// Depth of `instance_key` in the call-activity parent chain (0 for a
