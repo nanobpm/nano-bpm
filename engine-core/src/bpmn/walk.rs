@@ -238,6 +238,14 @@ pub(crate) fn parse_with_captures(
                             reason = "the `current.is_some()` match guard proves this is Some"
                         )]
                         let acc = current.as_mut().expect("current process set");
+                        // Count every event-definition element on the start
+                        // event being read — occurrences, not types — so a
+                        // repeated definition of the same type (which would
+                        // otherwise overwrite its field) is still detected as
+                        // an ambiguous trigger at build (#1555).
+                        if let (Some(idx), true) = (cur_start, tag.ends_with("EventDefinition")) {
+                            acc.nodes[idx].start_def_count += 1;
+                        }
                         match tag {
                             "startEvent" => {
                                 let idx = acc.add_node(attrs, NodeKind::Start);

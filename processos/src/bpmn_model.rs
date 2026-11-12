@@ -2170,6 +2170,17 @@ fn emit_io_mapping(el: &Element, out: &mut String) {
     out.push_str("        </zeebe:ioMapping>\n");
 }
 
+/// Emit `el`'s `zeebe:ioMapping` wrapped in its own `<bpmn:extensionElements>`, for owners that
+/// carry no other extension elements. A no-op when the element has no mappings.
+fn emit_io_extension(el: &Element, out: &mut String) {
+    if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+        return;
+    }
+    out.push_str("      <bpmn:extensionElements>\n");
+    emit_io_mapping(el, out);
+    out.push_str("      </bpmn:extensionElements>\n");
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
 /// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
@@ -2852,6 +2863,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
         }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
+            emit_io_extension(el, out);
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
@@ -2883,8 +2895,10 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:subProcess id=\"{eid}\"{na} triggeredByEvent=\"true\">\n"
             ));
+            emit_io_extension(el, out);
             emit_esp_start_event(
                 start_event,
+                def.elements.get(start_event),
                 trigger,
                 *interrupting,
                 errors,
@@ -2932,6 +2946,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
 #[allow(clippy::too_many_arguments)]
 fn emit_esp_start_event(
     start_event: &str,
+    start_el: Option<&Element>,
     trigger: &nanobpmn_engine_core::EventSubProcessTrigger,
     interrupting: bool,
     errors: &BTreeMap<String, String>,
@@ -3014,9 +3029,13 @@ fn emit_esp_start_event(
             xml_escape(condition)
         ),
     };
-    out.push_str(&format!(
-        "    <bpmn:startEvent id=\"{eid}\"{na}{ia}>{def_xml}</bpmn:startEvent>\n"
-    ));
+    out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}{ia}>\n"));
+    // Round-trip the start event's own `zeebe:ioMapping` (the parser attaches
+    // io on a start event) before its event definition.
+    if let Some(start_el) = start_el {
+        emit_io_extension(start_el, out);
+    }
+    out.push_str(&format!("      {def_xml}\n    </bpmn:startEvent>\n"));
 }
 
 /// A hand-authored diagram-interchange sidecar extracted from an original BPMN document, so a pure
@@ -5515,6 +5534,58 @@ mod tests {
             1,
             "terminate-end output mapping preserved on round-trip"
         );
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_sub_process_and_esp_start_io() {
+        // Every container kind and an event sub-process's start event carry io
+        // the parser attaches; the serializer must not drop any of them.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, Mapping};
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Scoped")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .end_event("SubEnd")
+            .connect("SubStart", "SubEnd")
+            .contained_in("SubStart", "Sub")
+            .contained_in("SubEnd", "Sub")
+            .end_event("End")
+            .connect("Start", "Sub")
+            .connect("Sub", "End")
+            .event_sub_process(
+                "Esp",
+                "EspStart",
+                EventSubProcessTrigger::Signal {
+                    signal_name: "sig".to_string(),
+                },
+                true,
+            )
+            .start_event("EspStart")
+            .end_event("EspEnd")
+            .connect("EspStart", "EspEnd")
+            .contained_in("EspStart", "Esp")
+            .contained_in("EspEnd", "Esp")
+            .build()
+            .unwrap();
+        for id in ["Sub", "Esp", "EspStart"] {
+            def.elements.get_mut(id).unwrap().io.outputs.push(Mapping {
+                source: format!("= {}", id.to_lowercase()),
+                target: format!("{id}Out"),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for id in ["Sub", "Esp", "EspStart"] {
+            assert_eq!(
+                reparsed[0].elements[id].io, def.elements[id].io,
+                "{id} io preserved on round-trip:\n{xml}"
+            );
+        }
+        assert!(matches!(
+            reparsed[0].elements["Esp"].kind,
+            ElementKind::EventSubProcess { .. }
+        ));
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub(super) struct NodeAcc {
     /// attribute. `None` when absent (BPMN/Zeebe default `true`); only an
     /// explicit `isInterrupting="false"` records `Some(false)`.
     pub(super) esp_interrupting: Option<bool>,
+    /// Number of `*EventDefinition` child elements read on a start event
+    /// (occurrences, so two same-type definitions count as two).
+    pub(super) start_def_count: u32,
     /// For a timer start event: the raw text of its `timeDuration`/`timeCycle`/
     /// `timeDate` when it is a static ISO-8601 literal (not a `=`-prefixed FEEL
     /// expression, which populates `timer_expr` instead). Retained so an event
@@ -431,6 +434,7 @@ impl ProcessAcc {
             esp_escalation_ref: None,
             esp_condition: None,
             esp_interrupting: None,
+            start_def_count: 0,
             timer_literal: None,
             timer_def_kind: None,
             adhoc_output_collection: None,
@@ -1476,7 +1480,7 @@ impl ProcessAcc {
                     esp.id, start.id
                 )));
             }
-            if trigger_count > 1 {
+            if trigger_count > 1 || start.start_def_count > 1 {
                 return Err(invalid(format!(
                     "event sub-process {} start event {} declares more than one event \
                      definition; exactly one trigger (message, timer, signal, error, \

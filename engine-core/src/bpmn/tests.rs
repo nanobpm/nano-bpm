@@ -6017,6 +6017,23 @@ fn event_subprocess_rejects_a_start_event_with_multiple_definitions() {
 }
 
 #[test]
+fn event_subprocess_rejects_repeated_same_type_definitions() {
+    // Two definitions of the SAME type would overwrite one field and look like
+    // a single trigger; definition occurrences, not types, must be counted.
+    for defs in [
+        r#"<bpmn:signalEventDefinition signalRef="Sig" /><bpmn:signalEventDefinition signalRef="Sig" />"#,
+        r#"<bpmn:errorEventDefinition /><bpmn:errorEventDefinition />"#,
+    ] {
+        let xml = esp_process(&esp_decl(defs, ""));
+        let err = parse_bpmn(&xml).expect_err("same-type duplicate definitions rejected");
+        assert!(
+            err.to_string().contains("more than one event definition"),
+            "{defs}: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn event_subprocess_is_not_part_of_normal_flow() {
     // The event sub-process and its inner elements stay out of the main
     // token flow: no sequence flow may target or leave it, and the process

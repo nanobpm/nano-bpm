@@ -97,3 +97,110 @@ fn event_subprocess_is_never_triggered_by_token_flow() {
         "main flow ran"
     );
 }
+
+/// Builds `s -> e` plus an event sub-process `esp` with inner `esp_start ->
+/// esp_end`, letting each test mutate one structural aspect.
+fn esp_builder(
+    trigger: crate::model::EventSubProcessTrigger,
+    interrupting: bool,
+) -> crate::model::ProcessBuilder {
+    crate::model::ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .event_sub_process("esp", "esp_start", trigger, interrupting)
+        .start_event("esp_start")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_end", "esp")
+}
+
+fn signal() -> crate::model::EventSubProcessTrigger {
+    crate::model::EventSubProcessTrigger::Signal {
+        signal_name: "sig".into(),
+    }
+}
+
+fn assert_esp_rejected(b: crate::model::ProcessBuilder, needle: &str) {
+    match b.build() {
+        Err(crate::model::BuildError::InvalidEventSubProcess { id, reason }) => {
+            assert_eq!(id, "esp");
+            assert!(
+                reason.contains(needle),
+                "reason {reason:?} lacks {needle:?}"
+            );
+        }
+        other => panic!("expected InvalidEventSubProcess, got {other:?}"),
+    }
+}
+
+#[test]
+fn well_formed_event_subprocess_builds() {
+    esp_builder(signal(), false).build().unwrap();
+}
+
+#[test]
+fn flow_into_event_subprocess_is_rejected() {
+    assert_esp_rejected(esp_builder(signal(), true).connect("s", "esp"), "incoming");
+}
+
+#[test]
+fn flow_out_of_event_subprocess_is_rejected() {
+    assert_esp_rejected(esp_builder(signal(), true).connect("esp", "e"), "outgoing");
+}
+
+#[test]
+fn unknown_event_subprocess_start_is_rejected() {
+    let b = crate::model::ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .event_sub_process("esp", "ghost", signal(), true);
+    assert_esp_rejected(b, "unknown start event ghost");
+}
+
+#[test]
+fn event_subprocess_start_outside_the_container_is_rejected() {
+    // `s` is a start event but the process-level one, not inside `esp`.
+    let b = crate::model::ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .event_sub_process("esp", "s", signal(), true);
+    assert_esp_rejected(b, "directly contained");
+}
+
+#[test]
+fn event_subprocess_start_that_is_not_a_start_event_is_rejected() {
+    let b = crate::model::ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .event_sub_process("esp", "t", signal(), true)
+        .task("t")
+        .contained_in("t", "esp");
+    assert_esp_rejected(b, "directly contained");
+}
+
+#[test]
+fn non_interrupting_error_event_subprocess_is_rejected_by_builder() {
+    let err = crate::model::EventSubProcessTrigger::Error { error_code: None };
+    assert_esp_rejected(esp_builder(err, false), "interrupting");
+}
+
+#[test]
+fn bpmn_sequence_flow_into_or_out_of_event_subprocess_is_rejected() {
+    let base = esp_message_xml();
+    for extra in [
+        r#"<bpmn:sequenceFlow id="fx" sourceRef="s" targetRef="esp" />"#,
+        r#"<bpmn:sequenceFlow id="fx" sourceRef="esp" targetRef="e" />"#,
+    ] {
+        let xml = base.replace(
+            r#"<bpmn:subProcess id="esp""#,
+            &format!(r#"{extra}<bpmn:subProcess id="esp""#),
+        );
+        let err = crate::bpmn::parse_bpmn(&xml).unwrap_err().to_string();
+        assert!(err.contains("event sub-process esp"), "{extra}: {err}");
+    }
+}

@@ -1091,18 +1091,21 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(ParsedIr {
-            definition: ProcessDefinition {
-                id: process_id,
-                name: None,
-                elements,
-                start_event,
-                xml: String::new(),
-                adhoc: Vec::new(),
-                start_form_id: None,
-            },
-            names,
-        })
+        let definition = ProcessDefinition {
+            id: process_id,
+            name: None,
+            elements,
+            start_event,
+            xml: String::new(),
+            adhoc: Vec::new(),
+            start_form_id: None,
+        };
+        // Event sub-process structural constraints — the same canonical check
+        // `ProcessBuilder::build` (and so the BPMN parser) applies.
+        definition
+            .validate_event_subprocesses()
+            .map_err(|e| e.to_string())?;
+        Ok(ParsedIr { definition, names })
     }
 
     /// Parse one node statement: `<keyword> <id> ["<name>"] [{ <attrs> }]`.
@@ -2404,6 +2407,67 @@ mod cancel_remaining_instances_ir_tests {
                 .expect("mi");
             assert_eq!(mi.cancel_remaining_instances, cancel, "{ir1}");
             assert_eq!(ir1, definition_to_ir(&parsed.definition, &parsed.names));
+        }
+    }
+}
+
+#[cfg(test)]
+mod esp_validation_tests {
+    use std::collections::HashMap;
+
+    use nanobpmn_engine_core::{EventSubProcessTrigger, ProcessBuilder};
+
+    use super::{definition_to_ir, ir_to_definition};
+
+    /// A valid model with an event sub-process, rendered to IR.
+    fn valid_ir(trigger: EventSubProcessTrigger) -> String {
+        let def = ProcessBuilder::new("P")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .event_sub_process("esp", "esp_start", trigger, true)
+            .start_event("esp_start")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_end", "esp")
+            .build()
+            .unwrap();
+        definition_to_ir(&def, &HashMap::new())
+    }
+
+    fn signal() -> EventSubProcessTrigger {
+        EventSubProcessTrigger::Signal {
+            signal_name: "sig".into(),
+        }
+    }
+
+    fn assert_rejected(ir: &str) {
+        let err = ir_to_definition(ir)
+            .err()
+            .unwrap_or_else(|| panic!("IR must be rejected:\n{ir}"));
+        assert!(err.contains("event sub-process esp"), "{err}\n{ir}");
+    }
+
+    #[test]
+    fn valid_event_subprocess_ir_parses() {
+        ir_to_definition(&valid_ir(signal())).unwrap();
+    }
+
+    #[test]
+    fn ir_rejects_event_subprocess_with_unknown_start() {
+        let ir = valid_ir(signal()).replace("    startEvent esp_start\n", "    startEvent ghost\n");
+        assert!(ir.contains("ghost"), "fixture rewrite failed:\n{ir}");
+        assert_rejected(&ir);
+    }
+
+    #[test]
+    fn ir_rejects_flows_into_or_out_of_event_subprocess() {
+        let base = valid_ir(signal());
+        for extra in ["s -> esp", "esp -> e"] {
+            let close = base.trim_end().rfind('}').expect("process block closes");
+            let ir = format!("{}  {extra}\n}}\n", &base[..close]);
+            assert_rejected(&ir);
         }
     }
 }

@@ -1662,6 +1662,15 @@ pub struct ProcessDefinition {
 }
 
 impl ProcessDefinition {
+    /// Validates every [`ElementKind::EventSubProcess`] structurally (no
+    /// sequence flow in or out, `start_event` is a start event directly
+    /// contained in it, error trigger interrupting). [`ProcessBuilder::build`]
+    /// runs this; callers that assemble a `ProcessDefinition` directly (e.g.
+    /// an IR parser) must run it too, so every path shares one check.
+    pub fn validate_event_subprocesses(&self) -> Result<(), BuildError> {
+        validate_event_subprocesses(&self.elements)
+    }
+
     /// Enumerates the event sub-processes ([`ElementKind::EventSubProcess`])
     /// **directly contained** in `scope`: pass `None` for the process-level
     /// scope, or `Some(id)` for the embedded sub-process whose id is `id`.
@@ -3030,6 +3039,8 @@ impl ProcessBuilder {
             }
         }
 
+        validate_event_subprocesses(&elements)?;
+
         // The process-level start event is a start event that is not contained in
         // any sub-process (sub-process inner start events have a parent and start
         // their own scope, not the instance).
@@ -3077,6 +3088,76 @@ impl ProcessBuilder {
     }
 }
 
+/// Structural validation of every [`ElementKind::EventSubProcess`] — the single
+/// canonical check shared by the BPMN parser, the programmatic builder and the
+/// processos IR (all of which assemble through [`ProcessBuilder::build`]).
+///
+/// An event sub-process is entered only by its trigger, so it must have no
+/// incoming or outgoing sequence flow; its `start_event` must name a start
+/// event directly contained in it; and an error trigger must be interrupting.
+pub(crate) fn validate_event_subprocesses(
+    elements: &HashMap<ElementId, Element>,
+) -> Result<(), BuildError> {
+    let mut esps: Vec<&Element> = elements
+        .values()
+        .filter(|e| matches!(e.kind, ElementKind::EventSubProcess { .. }))
+        .collect();
+    esps.sort_by(|a, b| a.id.cmp(&b.id));
+    for esp in esps {
+        let ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } = &esp.kind
+        else {
+            continue;
+        };
+        let invalid = |reason: String| BuildError::InvalidEventSubProcess {
+            id: esp.id.clone(),
+            reason,
+        };
+        if let Some(flow) = esp.outgoing.first() {
+            return Err(invalid(format!(
+                "has an outgoing sequence flow to {}; an event sub-process takes no sequence flows",
+                flow.to
+            )));
+        }
+        let mut sources: Vec<&ElementId> = elements
+            .values()
+            .filter(|e| e.outgoing.iter().any(|f| f.to == esp.id))
+            .map(|e| &e.id)
+            .collect();
+        sources.sort();
+        if let Some(src) = sources.first() {
+            return Err(invalid(format!(
+                "has an incoming sequence flow from {src}; an event sub-process takes no sequence flows"
+            )));
+        }
+        match elements.get(start_event) {
+            None => {
+                return Err(invalid(format!(
+                    "references unknown start event {start_event}"
+                )))
+            }
+            Some(start)
+                if !start.kind.is_start_event()
+                    || start.parent.as_deref() != Some(esp.id.as_str()) =>
+            {
+                return Err(invalid(format!(
+                    "start event {start_event} must be a start event directly contained in the event sub-process"
+                )))
+            }
+            Some(_) => {}
+        }
+        if matches!(trigger, EventSubProcessTrigger::Error { .. }) && !interrupting {
+            return Err(invalid(
+                "an error event sub-process must be interrupting".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Errors produced while assembling a [`ProcessDefinition`] with [`ProcessBuilder::build`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuildError {
@@ -3112,6 +3193,16 @@ pub enum BuildError {
     UnknownListenerElement(ElementId),
     /// A `with_name` referenced an element that does not exist.
     UnknownNameElement(ElementId),
+    /// An [`ElementKind::EventSubProcess`] violates a structural constraint:
+    /// it has an incoming/outgoing sequence flow, its `start_event` is not a
+    /// start event directly contained in it, or it carries a non-interrupting
+    /// error trigger.
+    InvalidEventSubProcess {
+        /// The offending event sub-process.
+        id: ElementId,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -3160,6 +3251,9 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownListenerElement(id) => {
                 write!(f, "execution listeners declared on unknown element {id}")
+            }
+            BuildError::InvalidEventSubProcess { id, reason } => {
+                write!(f, "event sub-process {id}: {reason}")
             }
             BuildError::UnknownNameElement(id) => {
                 write!(f, "name declared on unknown element {id}")
