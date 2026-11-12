@@ -45,6 +45,14 @@ struct Metrics {
     /// Serialized bytes of the most recently built snapshot (resident-SM size
     /// proxy: why a returning owner's builds are heavier than a survivor's).
     raft_snapshot_bytes: IntGauge,
+    /// On-disk bytes of each partition's CURRENT Raft snapshot `.bin`, labelled
+    /// by `partition` and `node` (the replica holding the file) (#1488). Set on
+    /// every local snapshot build and every follower snapshot install. This is
+    /// the per-partition/per-replica view the unlabelled `raft_snapshot_bytes`
+    /// cannot give: an oversized snapshot on ONE replica of ONE partition (the
+    /// #100 blowup — 8.4 GB follower snapshots against a 435 KB leader snapshot
+    /// of the same partition) is invisible in a process-wide last-write gauge.
+    raft_snapshot_file_bytes: prometheus::IntGaugeVec,
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
@@ -456,6 +464,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Serialized bytes of the most recently built snapshot (resident-SM size proxy).",
     )
     .expect("valid gauge opts");
+    let raft_snapshot_file_bytes = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_raft_snapshot_file_bytes",
+            "On-disk bytes of each partition's current Raft snapshot file, by partition and replica node (#1488); an oversized snapshot on one replica of one partition is the #100 blowup signature.",
+        ),
+        &["partition", "node"],
+    )
+    .expect("valid gauge vec");
 
     let commit_wait_seconds = Histogram::with_opts(
         HistogramOpts::new(
@@ -950,6 +966,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_snapshot_serialize_seconds.clone())))
         .and(registry.register(Box::new(raft_snapshot_fsync_seconds.clone())))
         .and(registry.register(Box::new(raft_snapshot_bytes.clone())))
+        .and(registry.register(Box::new(raft_snapshot_file_bytes.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
@@ -1026,6 +1043,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_snapshot_serialize_seconds,
         raft_snapshot_fsync_seconds,
         raft_snapshot_bytes,
+        raft_snapshot_file_bytes,
         commit_wait_seconds,
         commits_total,
         writes_total,
@@ -1161,6 +1179,23 @@ pub fn observe_snapshot_build(serialize: Duration, fsync: Duration, bytes: u64) 
 /// builds expensive, so the build-concurrency limiter + cadence stretch engage.
 pub fn last_snapshot_bytes() -> i64 {
     METRICS.raft_snapshot_bytes.get()
+}
+
+/// Publishes the on-disk byte size of one partition's CURRENT Raft snapshot file
+/// on this replica (#1488). Called on every local snapshot build and every
+/// follower snapshot install, so `/metrics` carries a per-partition, per-replica
+/// size series: an oversized snapshot on ONE replica of ONE partition (the #100
+/// blowup — 8.4 GB follower snapshots against a 435 KB leader snapshot of the
+/// same partition) is then visible to a `nanobpm_raft_snapshot_file_bytes`
+/// threshold alert instead of hiding inside the process-wide
+/// `raft_snapshot_bytes` last-write gauge.
+pub fn set_raft_snapshot_file_bytes(partition: u64, node: u64, bytes: u64) {
+    let p = partition.to_string();
+    let n = node.to_string();
+    METRICS
+        .raft_snapshot_file_bytes
+        .with_label_values(&[&p, &n])
+        .set(bytes as i64);
 }
 
 /// A durable write was enqueued (pipeline depth +1).
@@ -1928,6 +1963,37 @@ pub fn snapshot() -> MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raft_snapshot_file_bytes_is_labelled_per_partition_and_node() {
+        // #1488: the per-partition/per-replica snapshot size series. Unique
+        // partition/node labels keep the assertion isolated from the shared
+        // process-global registry (other tests and the sampler may publish real
+        // series concurrently).
+        set_raft_snapshot_file_bytes(987001, 1, 435_927);
+        set_raft_snapshot_file_bytes(987001, 2, 8_383_101_022);
+        let out = gather();
+        assert!(
+            out.contains(
+                "nanobpm_raft_snapshot_file_bytes{node=\"1\",partition=\"987001\"} 435927"
+            ),
+            "leader-sized series missing from exposition:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "nanobpm_raft_snapshot_file_bytes{node=\"2\",partition=\"987001\"} 8383101022"
+            ),
+            "follower-sized series missing from exposition:\n{out}"
+        );
+        // A later observation for the same series replaces the value (it is a
+        // gauge of the CURRENT snapshot file, not a cumulative counter).
+        set_raft_snapshot_file_bytes(987001, 1, 500_000);
+        assert!(
+            gather().contains(
+                "nanobpm_raft_snapshot_file_bytes{node=\"1\",partition=\"987001\"} 500000"
+            )
+        );
+    }
 
     #[test]
     fn job_type_starvation_flags_waiting_jobs_with_no_workers() {
