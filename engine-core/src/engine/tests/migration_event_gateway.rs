@@ -571,3 +571,28 @@ fn race_index_marks_catch_ambiguous_when_one_claimant_is_ineligible() {
     members.sort_unstable();
     assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
 }
+
+/// Copilot #1564: a gateway with two incoming flows (concurrent activations
+/// possible) owns no race even when its catch is private (one incoming flow),
+/// so completing that catch never withdraws catches of an unrelated
+/// activation. Exercises the gateway in-degree guard in isolation.
+#[test]
+fn race_index_excludes_private_catch_of_gateway_with_two_incoming_flows() {
+    let def = race_builder("p", "", "reply")
+        .start_event("start2")
+        .event_based_gateway("gw2")
+        .timer_intermediate_catch_event("private", 3_000)
+        .end_event("endPrivate")
+        .connect("start", "gw2")
+        .connect("start2", "gw2")
+        .connect("gw2", "private")
+        .connect("private", "endPrivate")
+        .build()
+        .unwrap();
+    assert_eq!(def.incoming_count("gw2"), 2);
+    assert_eq!(def.incoming_count("private"), 1);
+    let index = event_gateway_race_index(&def);
+    assert!(index.owner_of("private").is_none());
+    assert!(index.members_of(def.element("gw2").unwrap()).is_empty());
+    assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
+}
