@@ -157,6 +157,13 @@ struct BatchOperationRecord {
     start_date_ms: u64,
     end_date_ms: Option<u64>,
     items: Vec<BatchOperationItemRecord>,
+    /// `item_key → position in items`, built once at create. `items` is
+    /// append-never, reorder-never after creation (search/counts only read it),
+    /// so the index stays valid for the record's lifetime and makes each
+    /// [`BatchOperationStore::record_item`] outcome update constant-time —
+    /// without it, recording N outcomes scans the vector per item (O(N²) under
+    /// the registry-wide mutex).
+    item_index: std::collections::HashMap<u64, usize>,
 }
 
 /// One item (target process instance) of a batch operation.
@@ -196,7 +203,7 @@ impl BatchOperationStore {
         }
         inner.seq += 1;
         let key = inner.seq;
-        let items = item_keys
+        let items: Vec<BatchOperationItemRecord> = item_keys
             .into_iter()
             .map(|item_key| BatchOperationItemRecord {
                 item_key,
@@ -205,6 +212,11 @@ impl BatchOperationStore {
                 processed_date_ms: None,
                 error_message: None,
             })
+            .collect();
+        let item_index = items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| (item.item_key, pos))
             .collect();
         inner.ops.insert(
             key,
@@ -215,6 +227,7 @@ impl BatchOperationStore {
                 start_date_ms: now,
                 end_date_ms: None,
                 items,
+                item_index,
             },
         );
         key
@@ -298,17 +311,21 @@ impl BatchOperationStore {
     /// the item `COMPLETED`, `Err(message)` marks it `FAILED` with the message as
     /// its `errorMessage`. Items already processed are left untouched (first
     /// outcome wins). Unknown batch/item keys are ignored.
+    ///
+    /// The item is located through the record's `item_index` (built at create),
+    /// so each outcome update is O(1) — a per-item vector scan would make
+    /// recording N outcomes O(N²) while holding the registry-wide mutex.
     fn record_item(&self, key: u64, item_key: u64, outcome: Result<(), String>) {
         use models::BatchOperationItemStateEnum as I;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(rec) = inner.ops.get_mut(&key) else {
             return;
         };
-        if let Some(item) = rec
-            .items
-            .iter_mut()
-            .find(|i| i.item_key == item_key && matches!(i.state, I::Active))
-        {
+        let Some(&pos) = rec.item_index.get(&item_key) else {
+            return;
+        };
+        let item = &mut rec.items[pos];
+        if matches!(item.state, I::Active) {
             item.processed_date_ms = Some(now_millis());
             match outcome {
                 Ok(()) => item.state = I::Completed,
@@ -1654,6 +1671,55 @@ mod converted_lock_poison_tests {
             .is_err(),
             "the closure must panic while holding the lock to poison it"
         );
+    }
+
+    /// `record_item` locates the item through the record's `item_index` rather
+    /// than scanning the item vector: recording N outcomes must be O(N), not
+    /// O(N²) under the registry-wide mutex (#1551 review). Behavioural guard:
+    /// outcomes land on the right items, first outcome wins on a duplicate
+    /// delivery, and unknown batch/item keys are ignored.
+    #[test]
+    fn record_item_updates_items_in_constant_time_via_the_index() {
+        let store = BatchOperationStore::default();
+        let key = store.create(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![10, 20, 30],
+        );
+
+        store.record_item(key, 20, Err("no mapping for element".to_string()));
+        store.record_item(key, 10, Ok(()));
+        // A duplicate outcome for an already-processed item is ignored (first
+        // outcome wins).
+        store.record_item(key, 20, Ok(()));
+        // Unknown item / batch keys are ignored, not panics.
+        store.record_item(key, 999, Ok(()));
+        store.record_item(123_456_789, 10, Ok(()));
+
+        let rec = store.get(key).expect("record present");
+        let by_key = |item_key: u64| {
+            rec.items
+                .iter()
+                .find(|i| i.item_key == item_key)
+                .expect("item present")
+        };
+        assert!(matches!(
+            by_key(10).state,
+            models::BatchOperationItemStateEnum::Completed
+        ));
+        let failed = by_key(20);
+        assert!(matches!(
+            failed.state,
+            models::BatchOperationItemStateEnum::Failed
+        ));
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("no mapping for element"),
+            "the first (failed) outcome wins over the duplicate"
+        );
+        assert!(matches!(
+            by_key(30).state,
+            models::BatchOperationItemStateEnum::Active
+        ));
     }
 
     /// Batch-store: a panic while holding `BatchOperationStore::inner` must not
@@ -21576,11 +21642,47 @@ impl ServerImpl {
     /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
     /// threading a per-call `state` policy) keeps the override in one place so a
     /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
+    ///
+    /// The `variables` filter is honoured exactly as
+    /// `search_process_instances_impl` honours it: matched against the
+    /// instance's process-scoped (root) variables via [`match_instance_variables`],
+    /// over a per-call index built only when a variable filter is present (the
+    /// common no-variable-filter path pays nothing for the extra scan). Dropping
+    /// it here would silently *broaden* the batch — a migration filtered to
+    /// `batch = "alpha"` would also migrate every other eligible instance.
     fn batch_matched_process_instances(
         &self,
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
+        // Pre-index root-scope variables by instance only when the filter
+        // actually constrains on them, restricted to the variable names the
+        // filter references (same construction as `search_process_instances_impl`).
+        let variables_index: std::collections::HashMap<
+            u64,
+            std::collections::HashMap<String, String>,
+        > = match &filter.variables {
+            Some(entries) if !entries.is_empty() => {
+                let requested: std::collections::HashSet<&str> =
+                    entries.iter().map(|entry| entry.name.as_str()).collect();
+                let mut idx: std::collections::HashMap<
+                    u64,
+                    std::collections::HashMap<String, String>,
+                > = std::collections::HashMap::new();
+                for v in self.store.variables() {
+                    // Root-scope (process-instance) variables only: a variable
+                    // held under a nested scope has `scope_key != instance_key`
+                    // and is not a process-instance-level variable.
+                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+                        idx.entry(v.instance_key)
+                            .or_default()
+                            .insert(v.name, v.value);
+                    }
+                }
+                idx
+            }
+            _ => std::collections::HashMap::new(),
+        };
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
@@ -21633,6 +21735,10 @@ impl ServerImpl {
                     // Call-activity hierarchy filters (C8 parity, issue #977),
                     // gated per the per-operation contract above.
                     && hierarchy_matches
+                    && match_instance_variables(
+                        &filter.variables,
+                        variables_index.get(&inst.key),
+                    )
             })
             .map(|inst| inst.key)
             .collect();
@@ -35335,11 +35441,29 @@ mod clustered_startup_tests {
         assert_eq!(got.operations_failed_count, 1);
         assert!(got.end_date.is_present());
 
-        // Eligible instances were actually migrated onto order-v2.
-        for key in &eligible {
-            let rec = server.store.process_instance(*key).expect("instance");
-            assert_eq!(rec.process_definition_id, "order-v2");
+        // Eligible instances were actually migrated onto order-v2. A terminal
+        // batch state does not guarantee the migration events have reached the
+        // read model (the in-memory journal queues them for the exporter
+        // without awaiting projection), so poll for the re-home with a bounded
+        // timeout — as the adjacent single-instance migration test does —
+        // rather than asserting against a possibly-stale row.
+        let mut rehomed = false;
+        for _ in 0..200 {
+            if eligible.iter().all(|key| {
+                server
+                    .store
+                    .process_instance(*key)
+                    .is_some_and(|rec| rec.process_definition_id == "order-v2")
+            }) {
+                rehomed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(
+            rehomed,
+            "eligible instances project onto order-v2 after the batch settles"
+        );
 
         // The ineligible item is FAILED with an error message.
         let items = match server
@@ -49876,6 +50000,91 @@ mod call_activity_hierarchy_read_model_tests {
                 vec![instance_key],
                 "batch matcher overrides state to ACTIVE and selects the active \
                  instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_variables_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.variables`
+        // against each instance's process-scoped (root) variables with the same
+        // algebra as `search_process_instances_impl` — dropping it silently
+        // *broadens* the batch (a migration filtered to `batch = "alpha"` would
+        // also migrate every other eligible instance). Seeds the read model
+        // directly (same pattern as the search-side variable-filter tests) and
+        // drives the matcher both batch operations consume, so the join cannot
+        // silently regress for cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::{Event, Value};
+        let created_with_vars =
+            |instance_key: u64, vars: &[(&str, Value)]| Event::ProcessInstanceCreated {
+                instance_key,
+                process_id: "p".to_string(),
+                variables: vars
+                    .iter()
+                    .map(|(n, v)| ((*n).to_string(), v.clone()))
+                    .collect(),
+                created_at: 0,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: 0,
+                version: 0,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_vars(1, &[("batch", Value::Str("alpha".into()))]),
+                &created_with_vars(2, &[("batch", Value::Str("beta".into()))]),
+                &created_with_vars(3, &[("batch", Value::Str("alpha".into()))]),
+                // Carries no `batch` variable at all.
+                &created_with_vars(4, &[("other", Value::Str("alpha".into()))]),
+            ])
+            .unwrap();
+
+        let var_filter = |name: &str, json_value: &str| models::ProcessInstanceFilter {
+            variables: Some(vec![models::VariableValueFilterProperty {
+                name: name.to_string(),
+                value: models::StringFilterProperty::String(json_value.to_string()),
+            }]),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        // Baseline: no variable filter selects every ACTIVE instance.
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // The variable filter narrows to exactly the instances whose
+            // root-scope `batch` equals the JSON-encoded string "alpha" — not
+            // the full set (the pre-fix matcher ignored `variables` and
+            // returned all 4).
+            let matched = server.batch_matched_process_instances(
+                &var_filter("batch", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                matched,
+                vec![1, 3],
+                "batch matcher honours the variables filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A filter on a variable no instance carries excludes everything
+            // (matched against an absent value) rather than being ignored.
+            let none = server.batch_matched_process_instances(
+                &var_filter("ghost", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert!(
+                none.is_empty(),
+                "an absent variable name fails honestly (honour_hierarchy={honour_hierarchy:?})"
             );
         }
     }
