@@ -4012,3 +4012,87 @@ fn quarantine_offheap_orphan_incident_replays_identically() {
         state::IncidentKind::VariablesLost
     );
 }
+
+// #1481: a COLD (wholly off-heap) orphan is absent from engine state by
+// construction, so `QuarantineOffheapOrphan` is a no-op for it and the loss
+// was never journaled. `QuarantineColdOrphan` records the `VariablesLost`
+// incident against the bare instance key, idempotently, and it survives a
+// snapshot round-trip and a replay (the durable record after compaction).
+#[test]
+fn quarantine_cold_orphan_records_a_durable_incident_for_a_non_resident_instance() {
+    let mut engine = Engine::new();
+    let cold_key: Key = 4_242_424;
+    assert!(
+        engine
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: cold_key
+            })
+            .unwrap()
+            .is_empty(),
+        "precondition: the resident-only command records nothing for a cold orphan"
+    );
+
+    let events = engine
+        .apply_command(Command::QuarantineColdOrphan {
+            instance_key: cold_key,
+        })
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1
+    );
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::VariablesLost);
+    assert_eq!(active[0].instance_key, cold_key);
+
+    // Idempotent.
+    assert!(engine
+        .apply_command(Command::QuarantineColdOrphan {
+            instance_key: cold_key
+        })
+        .unwrap()
+        .is_empty());
+    assert_eq!(engine.active_incidents().len(), 1);
+
+    // Durable: replaying the journal and restoring a snapshot both keep it.
+    let replayed = Engine::replay(events);
+    assert_eq!(replayed.active_incidents(), engine.active_incidents());
+    let restored = Engine::from_snapshot(engine.snapshot());
+    assert_eq!(restored.active_incidents(), engine.active_incidents());
+}
+
+// #1481: for a RESIDENT instance the cold command defers to the resident path.
+#[test]
+fn quarantine_cold_orphan_on_a_resident_instance_matches_the_resident_path() {
+    let def = ProcessBuilder::new("orphan-cold-res")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orphan-cold-res"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command(Command::QuarantineColdOrphan { instance_key: key })
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].element_id, "orphan-cold-res");
+    assert!(
+        engine
+            .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+            .unwrap()
+            .is_empty(),
+        "shares the idempotency guard with the resident command"
+    );
+}

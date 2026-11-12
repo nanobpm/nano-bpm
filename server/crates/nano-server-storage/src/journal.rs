@@ -1784,14 +1784,30 @@ impl Journal {
                 ColdRehydration::Restored
             }
             Ok(None) => {
-                if let Some(cold) = self.cold.as_mut() {
-                    cold.index.remove(key);
-                }
                 self.note_orphan(
                     key,
                     "cold rehydration: cold instance has no row in the spill store; it is \
                      lost — quarantined (routing entry dropped)",
                 );
+                // Journal the durable `VariablesLost` incident AT DISCOVERY
+                // (#1481 review): once the index entry is dropped below, no
+                // sealing fold can rediscover the key, so a loss found by a
+                // poll/tick before rotation would otherwise vanish on restart.
+                // `raise_quarantine_incident` routes it through
+                // `QuarantineColdOrphan` while the key is still indexed and
+                // drops the entry on success. Under replicated (Raft) apply a
+                // locally minted incident would diverge replicas, so observe
+                // only (same rule as the resident quarantine path, #1384).
+                // On a failed raise the entry is KEPT so the sealing fold
+                // retries the incident rather than losing it.
+                if self.strict_cold_reads() {
+                    crate::metrics::record_offheap_orphan_unreported();
+                    if let Some(cold) = self.cold.as_mut() {
+                        cold.index.remove(key);
+                    }
+                } else {
+                    self.raise_quarantine_incident(key, "cold rehydration");
+                }
                 ColdRehydration::Absent
             }
             Err(err) => {
@@ -3441,12 +3457,11 @@ impl Journal {
             // Clear the LIVE spilled flag too, keeping the surviving resident
             // map (as boot reconciliation does), so resolving the incident does
             // not leave the instance spilled and re-raise on the next snapshot.
-            let resident = self
-                .engine
-                .instance(key)
-                .map(|i| Arc::clone(&i.variables))
-                .unwrap_or_default();
-            self.engine.rehydrate_variables(key, resident);
+            // A cold orphan (#1481) is not resident — nothing to rehydrate; its
+            // incident is recorded by `raise_quarantine_incident`'s cold arm.
+            if let Some(resident) = self.engine.instance(key).map(|i| Arc::clone(&i.variables)) {
+                self.engine.rehydrate_variables(key, resident);
+            }
             // Idempotent: an orphan already carrying an active incident is a no-op.
             self.raise_quarantine_incident(key, "snapshot");
         }
@@ -3467,15 +3482,29 @@ impl Journal {
     /// incident command emits only `IncidentRaised`, so the activated-job
     /// rehydration step is a no-op here; spill housekeeping is left to the
     /// outer command that follows.
+    ///
+    /// A **cold** orphan (#1481) — indexed in the cold tier, absent from engine
+    /// state — is routed through [`Command::QuarantineColdOrphan`] instead (the
+    /// resident command is a no-op for a non-resident instance, so its loss was
+    /// never journaled and vanished on restart). Once its incident is
+    /// journaled the key leaves the cold index: the row is gone, so there is
+    /// nothing left to route to, and keeping it would re-quarantine every tick.
     fn raise_quarantine_incident(&mut self, key: Key, context: &str) {
-        match self.engine.apply_command_at(
-            Command::QuarantineOffheapOrphan { instance_key: key },
-            now_millis(),
-        ) {
+        let cold = self.engine.instance(key).is_none()
+            && self.cold.as_ref().is_some_and(|c| c.index.contains(key));
+        let command = if cold {
+            Command::QuarantineColdOrphan { instance_key: key }
+        } else {
+            Command::QuarantineOffheapOrphan { instance_key: key }
+        };
+        match self.engine.apply_command_at(command, now_millis()) {
             Ok(events) => {
                 // The `Commit` is the journal write's durability receipt; the
                 // incident must survive a crash, so keep the must-use explicit.
                 let _commit = self.persist(&Arc::new(events));
+                if cold && let Some(cold) = self.cold.as_mut() {
+                    cold.index.remove(key);
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -3508,7 +3537,10 @@ impl Journal {
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
         // variable-spilled instances.
-        self.fold_cold_into(&mut snap.state, policy)?;
+        // Cold orphans (#1481) join the returned set so the sealing caller
+        // journals their `VariablesLost` incident too.
+        let (_, cold_orphans) = self.fold_cold_into(&mut snap.state, policy)?;
+        orphans.extend(cold_orphans);
         for instance in snap.state.instances.values_mut() {
             if !instance.variables_spilled {
                 continue;
@@ -3775,13 +3807,14 @@ impl Journal {
         &self,
         state: &mut nanobpmn_engine_core::State,
         policy: OrphanPolicy,
-    ) -> Option<VarUpsertDelta> {
+    ) -> Option<(VarUpsertDelta, Vec<Key>)> {
         let mut folded = Vec::new();
+        let mut orphans = Vec::new();
         // No cold tier configured is not a failure — nothing to fold, so succeed
         // with an empty delta. Only an indexed cold row that will not read fails
         // the fold (`None`).
         let Some(cold) = self.cold.as_ref() else {
-            return Some(folded);
+            return Some((folded, orphans));
         };
         for key in cold.index.keys() {
             match cold.store.try_get_cold(key) {
@@ -3794,11 +3827,16 @@ impl Journal {
                 // Definitive absence (#1383): the whole instance is already lost
                 // and can never be folded in; quarantine it (log once) rather
                 // than block every future snapshot and all compaction.
-                Ok(None) if policy == OrphanPolicy::Quarantine => self.note_orphan(
-                    key,
-                    "snapshot: cold instance has no row in the spill store; it is lost \
-                     — quarantined (omitted) so snapshots and compaction are not blocked",
-                ),
+                // The key is returned so a sealing caller journals the durable
+                // `VariablesLost` incident before the seal (#1481).
+                Ok(None) if policy == OrphanPolicy::Quarantine => {
+                    self.note_orphan(
+                        key,
+                        "snapshot: cold instance has no row in the spill store; it is lost \
+                         — quarantined (omitted) so snapshots and compaction are not blocked",
+                    );
+                    orphans.push(key);
+                }
                 Ok(None) => {
                     self.note_blocker(
                         key,
@@ -3819,7 +3857,7 @@ impl Journal {
                 }
             }
         }
-        Some(folded)
+        Some((folded, orphans))
     }
 
     /// Decomposes the live engine into the streaming halves and the store handles
@@ -4335,7 +4373,23 @@ impl Journal {
         // drained the dirty-var delta — leaving the accumulated upserts/forgets
         // intact so the next checkpoint still captures them (draining first and
         // then aborting would silently drop them).
-        let (snap, cold_upserts) = self.lean_snapshot_and_cold_upserts()?;
+        let (mut snap, mut cold_upserts, cold_orphans) = self.lean_snapshot_and_cold_upserts()?;
+        // A definitively-absent cold row (#1481): journal its durable
+        // `VariablesLost` incident BEFORE the seal, then recapture so the sealed
+        // checkpoint carries it (the orphan leaves the cold index once recorded,
+        // so the recapture cannot re-quarantine it). Under replicated apply,
+        // abort instead (see `try_engine_snapshot_quarantining_with_incidents`).
+        if !cold_orphans.is_empty() {
+            if self.replicated_apply {
+                return None;
+            }
+            drop(snap);
+            drop(cold_upserts);
+            for key in cold_orphans {
+                self.raise_quarantine_incident(key, "lean snapshot");
+            }
+            (snap, cold_upserts, _) = self.lean_snapshot_and_cold_upserts()?;
+        }
         // Drain BEFORE the seal so the delta reflects exactly the state the
         // control-only snapshot captures.
         let (mut upserts, forgets) = self.engine.drain_dirty_vars();
@@ -4365,10 +4419,15 @@ impl Journal {
     /// [`fold_cold_into`](Journal::fold_cold_into)).
     fn lean_snapshot_and_cold_upserts(
         &self,
-    ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
+    ) -> Option<(
+        nanobpmn_engine_core::EngineSnapshot,
+        VarUpsertDelta,
+        Vec<Key>,
+    )> {
         let mut snap = self.engine.snapshot_control_only();
         self.begin_fold();
-        let cold_upserts = self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
+        let (cold_upserts, cold_orphans) =
+            self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
         self.fold_succeeded();
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
@@ -4377,7 +4436,7 @@ impl Journal {
                 inst.variables = Arc::new(HashMap::new());
             }
         }
-        Some((snap, cold_upserts))
+        Some((snap, cold_upserts, cold_orphans))
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {
@@ -6328,9 +6387,13 @@ mod tests {
 
         // Cut a lean checkpoint: the cold instance's CONTROL state lands in the
         // snapshot (variable-free), its variables in the upsert delta.
-        let (snap, cold_upserts) = journal
+        let (snap, cold_upserts, cold_orphans) = journal
             .lean_snapshot_and_cold_upserts()
             .expect("cold fold succeeds");
+        assert!(
+            cold_orphans.is_empty(),
+            "a healthy cold row is not an orphan"
+        );
         let inst = snap
             .state
             .instances
