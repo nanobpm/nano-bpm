@@ -4301,15 +4301,15 @@ mod tests {
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let build_barrier = Arc::clone(&barrier);
-        let build_sm = sm.clone();
-        let build = tokio::spawn(async move {
-            // Build on the SAME state machine the install publishes to: the
-            // non-regression check reads its published-snapshot cache.
-            let mut sm = build_sm;
-            let mut builder = sm.get_snapshot_builder().await;
-            builder.test_writer_barrier = Some(build_barrier);
-            builder.build_snapshot().await.expect("racing build")
-        });
+        // Build on the SAME state machine the install publishes to: the
+        // non-regression check reads its published-snapshot cache. Capture
+        // the builder BEFORE spawning/installing so it deterministically
+        // records the pre-install (older) applied index.
+        let mut build_sm = sm.clone();
+        let mut builder = build_sm.get_snapshot_builder().await;
+        builder.test_writer_barrier = Some(build_barrier);
+        let build =
+            tokio::spawn(async move { builder.build_snapshot().await.expect("racing build") });
 
         sm.install_snapshot_skip_adoption_for_test(&newer_meta, received)
             .await
