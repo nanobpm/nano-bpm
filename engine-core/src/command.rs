@@ -38,6 +38,17 @@ pub struct JobActivationOptions {
 pub struct JobAttribution {
     #[cfg_attr(feature = "serde", serde(default))]
     pub worker: Option<String>,
+    /// The activation-lock deadline the job held on the proposing leader
+    /// (#1494) — soft (leader-local) or durable. A soft lock lives only in
+    /// the leader's RAM, so stamping it here is what lets a soft job's
+    /// terminal `JobCompleted.deadline` / `Job::terminal_end` agree on every
+    /// replica. `None` when unlocked (or for a stamp written before the field
+    /// existed; additive, so an older log entry decodes unchanged).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub deadline: Option<u64>,
 }
 
 /// Which deployed decision a [`Command::EvaluateDecision`] evaluates.
