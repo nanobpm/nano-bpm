@@ -167,6 +167,157 @@ impl Engine {
         Ok(())
     }
 
+    /// Event-based gateway race preconditions (#1554, Zeebe migrates an active
+    /// event-based gateway together with its armed catch events). The engine
+    /// models the gateway as a pass-through whose catch events are each an
+    /// active element instance, so a resting race is a set of active catch
+    /// events sharing one owning gateway ([`event_gateway_race_index`] — the
+    /// same race definition the runtime withdrawal uses). Per source race:
+    ///
+    /// * every mapped member must be a race member of one target event-based
+    ///   gateway — the mapped target of the source gateway when that is mapped
+    ///   — otherwise [`EngineError::MigrationCatchEventDetached`];
+    /// * no two members may map onto the same target catch event
+    ///   ([`EngineError::MigrationCatchEventsMerged`]);
+    /// * an unmapped member is withdrawn (its subscriptions deleted, as Zeebe
+    ///   deletes an unmapped catch event's subscription) provided at least one
+    ///   sibling is mapped; a race with no mapped member is left for the
+    ///   unmapped-active-element rejection.
+    ///
+    /// A race is identified by its owning gateway **and** its token scope
+    /// (`scope_of`), exactly as the runtime withdrawal scopes a race, so two
+    /// live subprocess scopes resting at the same gateway are two races. Two
+    /// distinct source races in one scope must not land on the same target
+    /// gateway: the runtime would then treat them as one race and a win in
+    /// either would withdraw the other's catches
+    /// ([`EngineError::UnsupportedMigration`]).
+    ///
+    /// Returns the active `(element instance key, element id)`s to withdraw.
+    pub(crate) fn check_migrated_event_gateway_races(
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &HashMap<String, String>,
+        active: &[(Key, String)],
+        scope_of: impl Fn(Key) -> Key,
+    ) -> Result<Vec<(Key, String)>, EngineError> {
+        // One indexed pass per definition, shared by every ownership lookup in
+        // this check (O(V + E) each, not a full rescan per active element).
+        let source_races = event_gateway_race_index(source);
+        let target_races = event_gateway_race_index(target);
+        let mut races: BTreeMap<(Key, &str), Vec<(Key, &str)>> = BTreeMap::new();
+        for (eik, eid) in active {
+            if let Some(owner) = source_races.owner_of(eid) {
+                races
+                    .entry((scope_of(*eik), owner.id.as_str()))
+                    .or_default()
+                    .push((*eik, eid.as_str()));
+            }
+        }
+        // (scope, target gateway) -> the live origin that claimed it: a source
+        // race (its gateway id), a standalone catch, or a gateway paused before
+        // arming (its element id). Two origins in one scope must never land on
+        // one target race, or a win in either withdraws the other's catches.
+        let mut claimed: BTreeMap<(Key, String), String> = BTreeMap::new();
+        let claim = |claimed: &mut BTreeMap<(Key, String), String>,
+                     scope: Key,
+                     tg: String,
+                     origin: &str|
+         -> Result<(), EngineError> {
+            if let Some(other) = claimed.get(&(scope, tg.clone())) {
+                return Err(EngineError::UnsupportedMigration {
+                    instance_key,
+                    element_id: origin.to_string(),
+                    reason: format!(
+                        "`{other}` and `{origin}` in one scope would merge into the \
+                         single target event-based gateway race `{tg}`"
+                    ),
+                });
+            }
+            claimed.insert((scope, tg), origin.to_string());
+            Ok(())
+        };
+        let mut withdraw = Vec::new();
+        for ((scope, gateway), members) in races {
+            let mapped_members: Vec<(&str, &String)> = members
+                .iter()
+                .filter_map(|(_, eid)| mapped.get(*eid).map(|t| (*eid, t)))
+                .collect();
+            let Some((_, first_target)) = mapped_members.first() else {
+                continue;
+            };
+            let target_gateway = mapped
+                .get(gateway)
+                .cloned()
+                .or_else(|| target_races.owner_of(first_target).map(|o| o.id.clone()));
+            let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (src, tgt) in &mapped_members {
+                let owner = target_races.owner_of(tgt).map(|o| o.id.as_str());
+                if owner.is_none() || owner != target_gateway.as_deref() {
+                    return Err(EngineError::MigrationCatchEventDetached {
+                        instance_key,
+                        element_id: gateway.to_string(),
+                        target_element_id: target_gateway
+                            .clone()
+                            .unwrap_or_else(|| gateway.to_string()),
+                        catch_event_id: src.to_string(),
+                        target_catch_event_id: tgt.to_string(),
+                    });
+                }
+                by_target
+                    .entry(tgt.as_str())
+                    .or_default()
+                    .push(src.to_string());
+            }
+            if let Some((tgt, mut sources)) = by_target.into_iter().find(|(_, s)| s.len() > 1) {
+                sources.sort();
+                return Err(EngineError::MigrationCatchEventsMerged {
+                    instance_key,
+                    element_id: gateway.to_string(),
+                    target_catch_event_id: tgt.to_string(),
+                    source_catch_event_ids: sources,
+                });
+            }
+            if let Some(tg) = target_gateway {
+                claim(&mut claimed, scope, tg, gateway)?;
+            }
+            withdraw.extend(
+                members
+                    .iter()
+                    .filter(|(_, eid)| !mapped.contains_key(*eid))
+                    .map(|(k, eid)| (*k, eid.to_string())),
+            );
+        }
+        // Live origins outside any source race that still land in a target
+        // race: a gateway paused before arming its catches (start listener /
+        // incident) mapped onto a target gateway, or a standalone catch mapped
+        // onto a target race member.
+        for (eik, eid) in active {
+            if source_races.owner_of(eid).is_some() {
+                continue;
+            }
+            let Some(tgt) = mapped.get(eid) else {
+                continue;
+            };
+            let source_is_gateway = matches!(
+                source.element(eid).map(|e| &e.kind),
+                Some(ElementKind::EventBasedGateway)
+            );
+            let tg = if source_is_gateway {
+                target
+                    .element(tgt)
+                    .filter(|e| matches!(e.kind, ElementKind::EventBasedGateway))
+                    .map(|e| e.id.clone())
+            } else {
+                target_races.owner_of(tgt).map(|o| o.id.clone())
+            };
+            if let Some(tg) = tg {
+                claim(&mut claimed, scope_of(*eik), tg, eid)?;
+            }
+        }
+        Ok(withdraw)
+    }
+
     /// Every armed trigger resting on any of `hosts` (element-instance key ->
     /// host element id), grouped by host and sorted by key. One pass over each
     /// partition-wide trigger table per migration, not one per active element.
@@ -438,6 +589,19 @@ impl Engine {
         let not_armable = self.hosts_not_armable_now(&hosts);
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
+                // An unmapped host still active here is a withdrawn race member
+                // (#1554; every other unmapped host was rejected): its withdrawal
+                // cancels the triggers, the migration fact reports them deleted.
+                for armed in armed_by_host.remove(&eik).unwrap_or_default() {
+                    if let Some(trigger) = armed.report {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: eik,
+                            element_id: armed.catch_id,
+                            action: SubscriptionMigrationAction::Deleted,
+                            trigger,
+                        });
+                    }
+                }
                 continue;
             };
             if matches!(
