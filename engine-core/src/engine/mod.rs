@@ -4780,11 +4780,14 @@ impl Engine {
                 }
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
-                //    active element instance whose own kind is a call activity
-                //    (`unsupported_migration_reason`).
+                //    active element instance whose kind is listed in
+                //    `unsupported_migration_reason` (currently none).
                 //    Embedded sub-processes and boundary / intermediate catch
                 //    events are migrated (#1374): their flow scopes and
-                //    subscriptions are planned in `engine/migration.rs`.
+                //    subscriptions are planned in `engine/migration.rs`. Call
+                //    activities are migrated (#1553): the parent element
+                //    instance is remapped and its child instance keeps the
+                //    parent link untouched (Zeebe `MigrateCallActivityTest`).
                 #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
@@ -5177,7 +5180,7 @@ impl Engine {
                         element_mappings: mapping_instructions,
                         migrated_flow_scopes: plan.migrated_flow_scopes,
                         subscriptions: plan.subscriptions,
-                        child_instances: Vec::new(),
+                        child_instances: plan.child_instances,
                     },
                 );
                 for event in plan.after {
@@ -16073,10 +16076,11 @@ pub enum EngineError {
         flow_index: usize,
     },
     /// A `MigrateInstance` targeted an instance that contains an active element
-    /// class this phase does not yet support migrating (boundary events, event
-    /// subprocesses, multi-instance bodies, call activities, event-based-gateway
-    /// catch events). Maps to HTTP 409. Zeebe itself rejects several of these as
-    /// "not supported yet"; reproducing the rejection is parity.
+    /// class this phase does not yet support migrating (event subprocesses,
+    /// multi-instance bodies, ad-hoc sub-processes, compensation runtime,
+    /// event-based-gateway catch events). Maps to HTTP 409. Zeebe itself
+    /// rejects several of these as "not supported yet"; reproducing the
+    /// rejection is parity.
     UnsupportedMigration {
         instance_key: Key,
         element_id: String,
@@ -16386,12 +16390,10 @@ pub(crate) fn event_gateway_race_index(
 /// "not supported yet" migration rejections. Returns `Some(reason)` when a
 /// migration touching an active element (or armed boundary runtime) of this kind
 /// must be rejected with [`EngineError::UnsupportedMigration`].
-fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'static str> {
-    use crate::model::ElementKind;
-    match kind {
-        ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
-        _ => None,
-    }
+fn unsupported_migration_reason(_kind: &crate::model::ElementKind) -> Option<&'static str> {
+    // Every element class Zeebe migrates is supported; extend here when a new
+    // non-migratable kind appears.
+    None
 }
 
 impl std::fmt::Display for EngineError {
