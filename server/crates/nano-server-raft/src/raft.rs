@@ -2637,6 +2637,7 @@ fn is_creation_intake(command: &Command) -> bool {
 /// capacity the drain path leaves — the log-layer analogue of Zeebe's
 /// `WhiteListedCommands`, and the fix for the credit-starvation latch where a
 /// create flood at the single FIFO starved job completion.
+#[derive(Clone)]
 struct Batcher {
     hi_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
     lo_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
@@ -2784,6 +2785,124 @@ async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command
         .await
 }
 
+/// The engine-actor → Raft-leader propose channel for off-heap orphans
+/// (#1447): an orphan detected inside replicated state-machine application is
+/// handed to this queue (via [`OrphanQueueSink`]) and re-proposed by the
+/// partition LEADER as a durable `Command::QuarantineOffheapOrphan` stamped
+/// with the leader's `now` — the replicated timestamp every replica then
+/// applies identically. Unbounded: orphan detection is rare (a lost spill row)
+/// and each item is a single `u64`.
+type OrphanQueue = tokio::sync::mpsc::UnboundedSender<nanobpmn_engine_core::Key>;
+
+/// The journal-facing half of the orphan propose channel (#1447): implements
+/// the storage layer's `OrphanSink` trait so the engine actor can hand an
+/// orphan key off without blocking (a `send` on an unbounded channel is
+/// non-blocking and allocation-cheap).
+struct OrphanQueueSink {
+    tx: OrphanQueue,
+}
+
+impl nano_server_storage::journal::OrphanSink for OrphanQueueSink {
+    fn enqueue_orphan(&self, instance_key: nanobpmn_engine_core::Key) -> bool {
+        self.tx.send(instance_key).is_ok()
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the leader's replicated
+/// `now` stamp on a re-proposed quarantine command (#1447).
+fn orphan_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Wires the orphan propose channel for one partition member (#1447):
+///
+/// 1. The journal gets an [`OrphanQueueSink`] (plus the member's CURRENT
+///    leadership, so an orphan detected before the watcher fires is routed
+///    correctly).
+/// 2. A drainer task proposes each queued orphan through the partition's
+///    [`Batcher`] — leader-only, so a stale queue on a follower simply fails
+///    each propose with a retryable leadership error (the orphan is
+///    re-detected on the next snapshot fold / activation if still unreported,
+///    and the engine command is idempotent, so a duplicated proposal is a
+///    no-op apply).
+/// 3. A metrics watcher keeps the journal's leadership flag fresh and drains
+///    the parked backlog on promotion, so an orphan a replica detected as a
+///    FOLLOWER is proposed the moment it wins leadership.
+fn wire_orphan_propose(
+    raft: &openraft::Raft<RaftConfig>,
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<nanobpmn_engine_core::Key>();
+    let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
+    let node_id = raft.metrics().borrow().id;
+    let engine_for_sink = engine.clone();
+    let mut metrics_for_seed = raft.metrics();
+    let initial_leader = metrics_for_seed.borrow().current_leader == Some(node_id);
+    // Seed the sink + the current leadership on the engine actor before any
+    // apply can report an orphan into an unwired journal.
+    tokio::spawn(async move {
+        engine_for_sink
+            .with(move |journal| {
+                journal.set_orphan_sink(sink);
+                journal.set_orphan_leadership(initial_leader);
+            })
+            .await;
+    });
+    // Drainer: one leader-proposed quarantine per queued orphan. A failed
+    // propose (leadership lost mid-flight, batcher teardown) is logged and
+    // dropped — detection repeats via the snapshot fold / activation paths and
+    // the parked backlog, so the report is never silently lost.
+    let batcher_for_drain = batcher.clone();
+    tokio::spawn(async move {
+        while let Some(key) = rx.recv().await {
+            let now = orphan_now_millis();
+            match batcher_for_drain
+                .submit(Command::QuarantineOffheapOrphan { instance_key: key }, now)
+                .await
+            {
+                Ok(item) => {
+                    if let Some((status, message)) = item.error {
+                        tracing::error!(
+                            instance_key = key,
+                            status,
+                            %message,
+                            "orphan quarantine proposal applied with an engine rejection \
+                             (#1447; the command is idempotent, so a later detection retries)"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        instance_key = key,
+                        error = %err,
+                        "orphan quarantine proposal failed (#1447; retried by the next \
+                         detection / backlog drain)"
+                    );
+                }
+            }
+        }
+    });
+    // Leadership watcher: keep the journal's flag fresh, draining the parked
+    // backlog on promotion.
+    let engine_for_watch = engine.clone();
+    tokio::spawn(async move {
+        loop {
+            let is_leader = metrics_for_seed.borrow().current_leader == Some(node_id);
+            let engine = engine_for_watch.clone();
+            engine
+                .with(move |journal| journal.set_orphan_leadership(is_leader))
+                .await;
+            if metrics_for_seed.changed().await.is_err() {
+                break; // Raft dropped: the watcher's job is done.
+            }
+        }
+    });
+}
+
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
 pub struct RaftPartition {
     pub raft: openraft::Raft<RaftConfig>,
@@ -2835,6 +2954,7 @@ impl RaftPartition {
 
         let log_store = MemLogStore::default();
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
@@ -2850,6 +2970,7 @@ impl RaftPartition {
         raft.initialize(members).await?;
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
         Ok(Self {
             raft,
             node_id,
@@ -2884,6 +3005,7 @@ impl RaftPartition {
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -2914,6 +3036,7 @@ impl RaftPartition {
         }
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
         Ok(Self {
             raft,
             node_id,
@@ -2965,6 +3088,7 @@ impl RaftPartition {
         // metrics watcher spawned below once the Raft handle exists.
         let leader = Arc::new(AtomicU64::new(u64::MAX));
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -3014,6 +3138,7 @@ impl RaftPartition {
             }
         };
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.
@@ -6532,6 +6657,243 @@ mod tests {
 
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");
+        }
+    }
+
+    /// #1447: an off-heap orphan discovered inside replicated state-machine
+    /// application (one replica lost the spill row, the others still have it)
+    /// is surfaced as a durable `VariablesLost` incident proposed by the Raft
+    /// LEADER with a replicated timestamp — every replica applies the identical
+    /// incident (same key, same `created_at`) and the journals stay identical.
+    #[tokio::test]
+    async fn orphan_detected_in_apply_is_leader_proposed_with_replicated_timestamp() {
+        use crate::raft_net::LocalCluster;
+
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+
+        // Three voters of partition 0, each with its OWN file-backed spill
+        // store (spill state is replica-local by construction).
+        let mut parts = Vec::new();
+        let mut engines = Vec::new();
+        let mut store_paths = Vec::new();
+        for id in 0u64..3 {
+            let store_dir = unique_log_dir(&format!("1447-spill-{id}"));
+            std::fs::create_dir_all(&store_dir).expect("store dir");
+            let store_path = store_dir.join("var-spill.sqlite");
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engine
+                .with({
+                    let store_path = store_path.clone();
+                    move |j| {
+                        let store = Arc::new(
+                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                                .expect("open spill store"),
+                        );
+                        // Budget 0: every spill check sheds, so the instance is
+                        // spilled after the forced scan below.
+                        j.set_spill(store, 0);
+                        j.set_replicated_apply(true);
+                    }
+                })
+                .await;
+            engines.push(engine.clone());
+            store_paths.push(store_path);
+            let p = RaftPartition::bootstrap_member(id, 0, engine, transport.clone(), None, false)
+                .await
+                .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
+            "node 0 wins the initial election"
+        );
+
+        // Deploy a service-task process and create one instance with a payload,
+        // replicated to every voter.
+        parts[0]
+            .propose(wait_process_command(), 1_000)
+            .await
+            .expect("deploy");
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("payload-0".to_string()),
+        );
+        let create_events = parts[0]
+            .propose(
+                Command::CreateInstance {
+                    process_id: "w".into(),
+                    variables: vars,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: None,
+                    version: None,
+                },
+                2_000,
+            )
+            .await
+            .expect("create");
+        let instance_key = create_events
+            .iter()
+            .find_map(|e| e.instance_key())
+            .expect("create minted an instance key");
+
+        // Spill the instance's variables on EVERY replica (a purely local
+        // memory-reclamation op, so driving it per-replica is faithful), then
+        // drop the row on node 1 ONLY: its store is now definitively missing
+        // the payload the other two replicas hold.
+        for (id, engine) in engines.iter().enumerate() {
+            engine
+                .with(move |j| {
+                    j.force_spill_scan();
+                    assert!(
+                        j.engine().is_variables_spilled(instance_key),
+                        "replica {id} spilled the instance"
+                    );
+                })
+                .await;
+        }
+        {
+            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_paths[1]))
+                .expect("reopen node 1 store");
+            store.forget(&[instance_key]).expect("drop node 1's row");
+        }
+
+        // Replicated activation: node 1 discovers the orphan mid-apply and
+        // hands it to the leader-propose channel; the command itself must
+        // apply identically on every replica (no inline incident).
+        parts[0]
+            .propose(
+                Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                3_000,
+            )
+            .await
+            .expect("activate");
+
+        // Precondition: node 1 (the orphan replica) OBSERVED the loss during
+        // the replicated apply (its spill row is definitively absent).
+        let quarantined_on_node1 = engines[1].with(|j| j.quarantined_orphans()).await;
+        assert_eq!(
+            quarantined_on_node1,
+            vec![instance_key],
+            "node 1 observed the orphan during the replicated apply"
+        );
+
+        // The orphan was detected on a FOLLOWER and parked in its backlog
+        // (only the leader proposes). Fail the leader over to node 1: node 0
+        // steps down, node 1 wins the triggered election, its watcher flips
+        // the orphan-leadership flag, and the promotion drain hands the parked
+        // key to its own batcher — which proposes the quarantine through the
+        // log.
+        parts[0].raft.shutdown().await.expect("node 0 steps down");
+        parts[1]
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .expect("trigger node 1 election");
+        assert!(
+            wait_until(3_000, || parts[1].raft.metrics().borrow().current_leader
+                == Some(1))
+            .await,
+            "node 1 wins the triggered election"
+        );
+
+        // The leader's drainer re-proposes the orphan as a
+        // `QuarantineOffheapOrphan` carrying the leader's replicated `now`;
+        // every LIVE replica applies the identical incident (the downed former
+        // leader catches up from the new leader when it rejoins).
+        let mut incidents_per_replica = Vec::new();
+        let mut converged = false;
+        for _ in 0..300 {
+            incidents_per_replica.clear();
+            for engine in engines.iter().skip(1) {
+                let incidents = engine
+                    .with(move |j| {
+                        j.incidents()
+                            .into_iter()
+                            .filter(|i| i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost)
+                            .map(|i| {
+                                (
+                                    i.key,
+                                    i.instance_key,
+                                    i.created_at,
+                                    i.state,
+                                    i.reason.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                incidents_per_replica.push(incidents);
+            }
+            if incidents_per_replica.iter().all(|v| v.len() == 1) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "exactly one replicated VariablesLost incident on every replica \
+             (got {incidents_per_replica:?})"
+        );
+        let first = &incidents_per_replica[0][0];
+        assert_eq!(first.1, instance_key, "incident pinned to the orphan");
+        assert_eq!(
+            first.3,
+            nanobpmn_engine_core::IncidentState::Active,
+            "the replicated incident is active"
+        );
+        for (id, incidents) in incidents_per_replica.iter().enumerate() {
+            assert_eq!(
+                &incidents[0],
+                first,
+                "replica {} applied the identical incident (key + replicated timestamp)",
+                id + 1
+            );
+        }
+
+        // The incident journals are identical across the replicas that applied
+        // the proposal (the downed former leader replays the same entry from
+        // the new leader when it rejoins): the orphan replica minted nothing
+        // locally.
+        let mut journals = Vec::new();
+        for engine in engines.iter().skip(1) {
+            let events = engine
+                .with(|j| {
+                    j.state()
+                        .incidents
+                        .values()
+                        .map(|i| (i.key, i.instance_key, i.created_at))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            journals.push(events);
+        }
+        assert!(
+            journals.windows(2).all(|w| w[0] == w[1]),
+            "identical incident journals across replicas (got {journals:?})"
+        );
+
+        for (id, p) in parts.into_iter().enumerate() {
+            if id == 0 {
+                continue; // already shut down (the failover above)
+            }
+            p.raft.shutdown().await.expect("clean shutdown");
+        }
+        for path in &store_paths {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
