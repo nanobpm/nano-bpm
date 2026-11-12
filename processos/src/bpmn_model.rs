@@ -3390,7 +3390,9 @@ fn serialize_definition(
             out.push_str("    <bpmn:extensionElements>\n");
             out.push_str(&format!(
                 "      <zeebe:subscription correlationKey=\"={}\"/>\n",
-                xml_escape(key)
+                xml_escape(
+                    &nanobpmn_engine_core::bpmn::parse_correlation_key(key).unwrap_or_default()
+                )
             ));
             out.push_str("    </bpmn:extensionElements>\n");
             out.push_str("  </bpmn:message>\n");
@@ -5597,11 +5599,19 @@ mod tests {
         for trigger in [
             EventSubProcessTrigger::Message {
                 message_name: "ping".to_string(),
-                correlation_key: "= key".to_string(),
+                correlation_key: "key".to_string(),
             },
             EventSubProcessTrigger::Timer(TimerDef {
                 kind: TimerDefKind::Duration,
                 expr: "PT5M".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Date,
+                expr: "2030-01-01T00:00:00Z".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "= delay".to_string(),
             }),
         ] {
             let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
@@ -5624,6 +5634,37 @@ mod tests {
                 assert_eq!(a.parent, b.parent, "{id} parent preserved");
                 assert_eq!(a.timer, b.timer, "{id} timer preserved");
             }
+        }
+    }
+
+    #[test]
+    fn marked_correlation_key_emits_exactly_one_feel_marker() {
+        for key in ["key", "=key", "= key", " =  key "] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process(
+                    "Esp",
+                    "EspStart",
+                    nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                        message_name: "ping".to_string(),
+                        correlation_key: key.to_string(),
+                    },
+                    false,
+                )
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            assert!(
+                xml.contains("correlationKey=\"=key\""),
+                "{key:?} must emit a single marker:\n{xml}"
+            );
         }
     }
 

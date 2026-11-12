@@ -191,6 +191,22 @@ impl Engine {
                 )));
             }
 
+            // An event sub-process is only ever entered through its trigger;
+            // the runtime does not drive one yet (its drained scope would never
+            // complete, stranding the instance). Fail closed for the container
+            // and every descendant until runtime support lands.
+            let mut cursor = Some(element);
+            while let Some(el) = cursor {
+                if matches!(el.kind, crate::model::ElementKind::EventSubProcess { .. }) {
+                    return Err(not_activatable(format!(
+                        "The activation of elements inside an event sub-process '{}' \
+                         is not supported",
+                        el.id
+                    )));
+                }
+                cursor = el.parent.as_ref().and_then(|p| def.element(p));
+            }
+
             // Zeebe's `-1` (and an absent key) = no ancestor selection.
             let ancestor = a.ancestor_element_instance_key;
             if let Some(body) =

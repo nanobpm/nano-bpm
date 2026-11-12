@@ -276,3 +276,92 @@ fn bpmn_message_event_subprocess_start_is_a_plain_start_event() {
         crate::model::ElementKind::StartEvent
     ));
 }
+
+/// A built (valid) definition mutated to add `s -> esp`, which the builder
+/// would reject — the shape a direct `DeployProcess` caller could hand in.
+fn def_with_flow_into_esp() -> crate::model::ProcessDefinition {
+    let mut def = esp_builder(signal(), true).build().unwrap();
+    def.elements
+        .get_mut("s")
+        .unwrap()
+        .outgoing
+        .push(crate::model::SequenceFlow {
+            to: "esp".into(),
+            condition: None,
+            is_default: false,
+        });
+    def
+}
+
+#[test]
+fn direct_deploy_of_invalid_event_subprocess_is_rejected() {
+    let mut engine = Engine::new();
+    let err = engine
+        .apply_command(Command::DeployProcess(def_with_flow_into_esp()))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::InvalidProcessModel { ref process_id, .. } if process_id == "p"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn batch_deploy_with_invalid_event_subprocess_is_rejected_atomically() {
+    let mut engine = Engine::new();
+    let good = crate::model::ProcessBuilder::new("good")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    let err = engine
+        .apply_command(Command::DeployResources(vec![
+            good,
+            def_with_flow_into_esp(),
+        ]))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::InvalidProcessModel { .. }),
+        "{err:?}"
+    );
+    // Nothing from the batch was installed.
+    assert!(
+        engine
+            .apply_command(Command::create_instance_with("good", HashMap::new()))
+            .is_err(),
+        "the valid process of a rejected batch must not be deployed"
+    );
+}
+
+#[test]
+fn modification_cannot_activate_an_event_subprocess_or_its_descendants() {
+    let def = crate::bpmn::parse_bpmn(&esp_message_xml())
+        .unwrap()
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("orderId".to_string(), Value::Int(7));
+    let created = engine
+        .apply_command(Command::create_instance_with("p", vars))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    for target in ["esp", "esp_task", "esp_end"] {
+        let err = engine
+            .apply_command(Command::ModifyInstance {
+                instance_key: inst,
+                activate_instructions: vec![crate::command::ActivateElementInstruction {
+                    element_id: target.into(),
+                    ..Default::default()
+                }],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec![],
+                move_instructions: vec![],
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ElementNotActivatable { ref reason, .. } if reason.contains("event sub-process")),
+            "{target}: {err:?}"
+        );
+    }
+}

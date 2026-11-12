@@ -1606,6 +1606,10 @@ impl ProcessAcc {
                 .clone()
                 .filter(|mi| !mi.input_collection.trim().is_empty());
             let parent = node.parent.clone();
+            // Only an ESP *start* has its timer carried by the container.
+            let esp_start_parent = parent
+                .clone()
+                .filter(|_| matches!(node.kind, NodeKind::Start));
             if matches!(node.kind, NodeKind::Start) && parent.is_none() {
                 start_form_id = node.start_form_id.clone();
             }
@@ -1858,7 +1862,14 @@ impl ProcessAcc {
             if !node_io.is_empty() {
                 builder = builder.with_io(io_id, node_io);
             }
-            if let Some(timer) = node_timer {
+            // An event sub-process start's timer is carried by the container's
+            // `EventSubProcessTrigger::Timer` (the single source of truth);
+            // attaching it to the plain start too would leave two independently
+            // editable timer definitions after a round trip.
+            let in_esp = esp_start_parent
+                .as_deref()
+                .is_some_and(|p| event_subprocess_ids.contains(p));
+            if let Some(timer) = node_timer.filter(|_| !in_esp) {
                 builder = builder.with_timer(timer_id, timer);
             }
             if let Some(retries) = node_retries {

@@ -405,6 +405,8 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         // A start event whose message-name / timer expression cannot be
         // evaluated at deploy time (Zeebe INVALID_ARGUMENT, #1398).
         E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
+        // A structurally invalid process handed straight to deploy.
+        E::InvalidProcessModel { .. } => (400, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -3403,6 +3405,13 @@ mod tests {
                 E::StartEventExpressionInvalid {
                     process_id: "p".into(),
                     element_id: "s".into(),
+                    reason: "boom".into(),
+                },
+                400,
+            ),
+            (
+                E::InvalidProcessModel {
+                    process_id: "p".into(),
                     reason: "boom".into(),
                 },
                 400,

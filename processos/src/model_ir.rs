@@ -516,12 +516,12 @@ fn parse_esp_trigger(
     use nanobpmn_engine_core::EventSubProcessTrigger as T;
     // Split into the leading keyword and the rest, honouring the double-quoted
     // payloads (which may contain spaces).
-    let mut tokens = split_ir_tokens(raw);
+    let err = |m: &str| format!("element {id}: invalid eventSubProcess trigger: {m}");
+    let mut tokens = split_ir_tokens(raw).map_err(|m| err(&m))?.into_iter();
     let kw = tokens
         .next()
         .ok_or_else(|| format!("element {id}: empty eventSubProcess trigger"))?;
-    let err = |m: &str| format!("element {id}: invalid eventSubProcess trigger: {m}");
-    match kw.as_str() {
+    let trigger = match kw.as_str() {
         "message" => {
             let message_name = tokens.next().ok_or_else(|| err("message needs a name"))?;
             let ck_kw = tokens
@@ -568,12 +568,20 @@ fn parse_esp_trigger(
             Ok(T::Conditional { condition })
         }
         other => Err(err(&format!("unknown trigger kind '{other}'"))),
+    }?;
+    // Every token must be consumed: trailing input would otherwise be dropped
+    // silently and the IR rewritten into a different trigger.
+    if let Some(extra) = tokens.next() {
+        return Err(err(&format!("unexpected trailing token '{extra}'")));
     }
+    Ok(trigger)
 }
 
 /// Split an IR attribute payload into whitespace-separated tokens, treating a
 /// double-quoted span (with `\"` / `\\` escapes) as one token and unquoting it.
-fn split_ir_tokens(raw: &str) -> impl Iterator<Item = String> + '_ {
+/// An unterminated quote or a dangling trailing `\\` is an error, never an
+/// implicit close at end of input.
+fn split_ir_tokens(raw: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut chars = raw.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -584,19 +592,27 @@ fn split_ir_tokens(raw: &str) -> impl Iterator<Item = String> + '_ {
         if c == '"' {
             chars.next();
             let mut tok = String::new();
+            let mut closed = false;
             while let Some(c) = chars.next() {
                 match c {
                     '\\' => {
-                        if let Some(n) = chars.next() {
-                            tok.push(match n {
-                                'n' => '\n',
-                                other => other,
-                            });
-                        }
+                        let n = chars
+                            .next()
+                            .ok_or_else(|| "dangling escape at end of input".to_string())?;
+                        tok.push(match n {
+                            'n' => '\n',
+                            other => other,
+                        });
                     }
-                    '"' => break,
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
                     other => tok.push(other),
                 }
+            }
+            if !closed {
+                return Err("unterminated quoted string".to_string());
             }
             tokens.push(tok);
         } else {
@@ -611,7 +627,7 @@ fn split_ir_tokens(raw: &str) -> impl Iterator<Item = String> + '_ {
             tokens.push(tok);
         }
     }
-    tokens.into_iter()
+    Ok(tokens)
 }
 
 // ===========================================================================================
@@ -2469,5 +2485,24 @@ mod esp_validation_tests {
             let ir = format!("{}  {extra}\n}}\n", &base[..close]);
             assert_rejected(&ir);
         }
+    }
+
+    #[test]
+    fn esp_trigger_rejects_malformed_or_partially_consumed_payloads() {
+        for bad in [
+            "signal \"abort",              // unterminated quote
+            "signal \"abort\\",            // dangling escape inside a quote
+            "signal \"abort\" unexpected", // trailing token
+            "error \"E\" extra",
+            "timer duration \"PT5M\" x",
+            "message \"m\" correlationKey \"k\" x",
+        ] {
+            assert!(
+                crate::model_ir::parse_esp_trigger(bad, "esp").is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        assert!(crate::model_ir::parse_esp_trigger("signal \"abort\"", "esp").is_ok());
+        assert!(crate::model_ir::parse_esp_trigger("error", "esp").is_ok());
     }
 }

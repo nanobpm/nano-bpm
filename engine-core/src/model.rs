@@ -506,9 +506,9 @@ fn default_propagate() -> bool {
 pub enum EventSubProcessTrigger {
     /// A `messageEventDefinition`: the sub-process starts when a message named
     /// `message_name` correlates to the enclosing scope. `correlation_key` is
-    /// the raw (un-evaluated) correlation-key expression declared via
-    /// `zeebe:subscription correlationKey` (typically `=`-prefixed FEEL),
-    /// resolved against the scope's variables when the subscription is opened —
+    /// the correlation-key expression declared via `zeebe:subscription
+    /// correlationKey`, canonically stored WITHOUT its leading FEEL `=` marker
+    /// (see [`crate::bpmn::parse_correlation_key`]), resolved against the scope's variables when the subscription is opened —
     /// same shape as [`ElementKind::MessageIntermediateCatchEvent`].
     Message {
         /// The BPMN message name this trigger subscribes to.
