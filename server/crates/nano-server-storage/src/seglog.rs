@@ -3016,6 +3016,13 @@ pub fn recover_multi(
     // snapshot — same reconstruction as an unsnapshotted partition, but over the
     // complete history rather than only the tail.
     let stored_vars = varstore.map(|vs| vs.load_all());
+    // Pending (not-yet-checkpointed) spill rows are never recovery input
+    // (#1487): one may carry the effect of a torn, re-applied frame. The engines
+    // rebuilt below hold every owned instance's variables resident, so drop them
+    // before they could be promoted by a later checkpoint.
+    if let Some(vs) = varstore {
+        vs.discard_pending(owned).map_err(io::Error::other)?;
+    }
     let engines: Vec<(u64, Engine)> = owned
         .iter()
         .map(|&p| {

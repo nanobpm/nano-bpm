@@ -53,6 +53,11 @@ const SCHEMA_VERSION: i64 = 1;
 /// per-partition event position cursor.
 pub struct VarStore {
     conn: Mutex<Connection>,
+    /// Per-partition pending-spill watermark recorded by
+    /// [`mark_capture`](VarStore::mark_capture) when a lean checkpoint captures
+    /// its control-only snapshot, and consumed by the following
+    /// [`checkpoint`](VarStore::checkpoint) (#1487).
+    captured: Mutex<HashMap<u64, i64>>,
 }
 
 /// Whether lean (control-only) snapshots backed by the authoritative
@@ -108,7 +113,9 @@ impl VarStore {
              PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS schema (version INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS vars (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS position (partition INTEGER PRIMARY KEY, pos INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS position (partition INTEGER PRIMARY KEY, pos INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS pending (seq INTEGER PRIMARY KEY AUTOINCREMENT, partition INTEGER NOT NULL, key INTEGER NOT NULL, vars TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS pending_key ON pending (key, seq);",
         )?;
         let version: Option<i64> = conn
             .query_row("SELECT version FROM schema LIMIT 1", [], |r| r.get(0))
@@ -117,7 +124,9 @@ impl VarStore {
             Some(v) if v == SCHEMA_VERSION => {}
             Some(_) => {
                 // Incompatible format: discard and recreate empty.
-                conn.execute_batch("DELETE FROM vars; DELETE FROM position; DELETE FROM schema;")?;
+                conn.execute_batch(
+                    "DELETE FROM vars; DELETE FROM position; DELETE FROM pending; DELETE FROM schema;",
+                )?;
                 conn.execute(
                     "INSERT INTO schema (version) VALUES (?1)",
                     params![SCHEMA_VERSION],
@@ -132,6 +141,7 @@ impl VarStore {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            captured: Mutex::new(HashMap::new()),
         })
     }
 
@@ -148,9 +158,32 @@ impl VarStore {
         upserts: &[(Key, &HashMap<String, Value>)],
         forgets: &[Key],
     ) -> rusqlite::Result<()> {
+        let watermark = self
+            .captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partition);
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         {
+            // Promote this partition's spill rows written BEFORE the snapshot
+            // capture (#1487): those instances were spilled at the capture, so
+            // the drained upserts skip them and the spill row is the state the
+            // control-only snapshot at `position` relies on. Newest row per key
+            // wins; the explicit upserts below (fresher, resident at capture)
+            // then override. Rows written after the capture stay pending.
+            if let Some(mark) = watermark {
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO vars (key, vars) \
+                     SELECT p.key, p.vars FROM pending p \
+                     WHERE p.partition = ?1 AND p.seq <= ?2 AND p.seq = \
+                       (SELECT MAX(q.seq) FROM pending q \
+                        WHERE q.key = p.key AND q.partition = ?1 AND q.seq <= ?2)",
+                )?
+                .execute(params![partition as i64, mark])?;
+                tx.prepare_cached("DELETE FROM pending WHERE partition = ?1 AND seq <= ?2")?
+                    .execute(params![partition as i64, mark])?;
+            }
             let mut put =
                 tx.prepare_cached("INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)")?;
             for (key, vars) in upserts {
@@ -159,8 +192,10 @@ impl VarStore {
                 put.execute(params![*key as i64, json])?;
             }
             let mut del = tx.prepare_cached("DELETE FROM vars WHERE key = ?1")?;
+            let mut del_pending = tx.prepare_cached("DELETE FROM pending WHERE key = ?1")?;
             for &key in forgets {
                 del.execute(params![key as i64])?;
+                del_pending.execute(params![key as i64])?;
             }
             tx.prepare_cached("INSERT OR REPLACE INTO position (partition, pos) VALUES (?1, ?2)")?
                 .execute(params![partition as i64, position as i64])?;
@@ -171,18 +206,75 @@ impl VarStore {
     /// Writes through a single instance's current variable map outside the
     /// checkpoint cycle — used when variable spill evicts an instance's payload
     /// from hot RAM. The row must be durable *before* the payload leaves memory
-    /// (the store is now the only copy the recovery path reads), so spill calls
-    /// this at eviction. It does not advance the partition position: the row may
-    /// be ahead of the last checkpoint, which recovery tolerates (the journal
-    /// tail past the checkpoint re-applies any newer change).
-    pub fn put_current(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
+    /// (the store is the only copy runtime rehydration reads), so spill calls
+    /// this at eviction.
+    ///
+    /// **Durability ordering (#1487).** The spilling command's journal frame
+    /// may not be durable yet (a Raft entry is buffered until its barrier), so
+    /// this row must never reach the checkpointed map recovery loads: a torn
+    /// frame would otherwise leave recovery with variables NEWER than the
+    /// recovered journal, and the re-applied entry would double-apply them.
+    /// The row is therefore appended to a separate, sequenced `pending` log
+    /// that only [`try_get`](VarStore::try_get) reads. It is promoted into the
+    /// authoritative map only by the next [`checkpoint`](VarStore::checkpoint)
+    /// whose capture ([`mark_capture`](VarStore::mark_capture)) it precedes —
+    /// i.e. once the snapshot at that checkpoint's (durable) position depends
+    /// on it — and recovery discards whatever is still pending
+    /// ([`discard_pending`](VarStore::discard_pending)).
+    pub fn put_current(
+        &self,
+        partition: u64,
+        key: Key,
+        vars: &HashMap<String, Value>,
+    ) -> rusqlite::Result<()> {
         let json = serde_json::to_string(vars)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)",
-            params![key as i64, json],
+            "INSERT INTO pending (partition, key, vars) VALUES (?1, ?2, ?3)",
+            params![partition as i64, key as i64, json],
         )?;
+        Ok(())
+    }
+
+    /// Records `partition`'s pending-spill watermark at a lean snapshot
+    /// capture (#1487): every spill row written so far precedes the capture,
+    /// so the next [`checkpoint`](VarStore::checkpoint) for `partition`
+    /// promotes exactly those rows. Must be called on the engine thread at the
+    /// capture instant (before any later spill can run).
+    pub fn mark_capture(&self, partition: u64) -> rusqlite::Result<()> {
+        let mark: i64 = {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM pending WHERE partition = ?1",
+                params![partition as i64],
+                |r| r.get(0),
+            )?
+        };
+        self.captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(partition, mark);
+        Ok(())
+    }
+
+    /// Drops every not-yet-promoted spill row of `partitions` (#1487). Called
+    /// by recovery after it rebuilt those partitions from the checkpointed map
+    /// plus the durable journal tail: a pending row may describe effects whose
+    /// journal frame was torn, and the rebuilt engine holds every instance's
+    /// variables resident anyway, so pending rows are stale by construction.
+    pub fn discard_pending(&self, partitions: &[u64]) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut del = conn.prepare_cached("DELETE FROM pending WHERE partition = ?1")?;
+        for &p in partitions {
+            del.execute(params![p as i64])?;
+        }
+        drop(del);
+        drop(conn);
+        let mut captured = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+        for p in partitions {
+            captured.remove(p);
+        }
         Ok(())
     }
 
@@ -192,13 +284,25 @@ impl VarStore {
     /// unreadable store or row (#1383); there is no infallible form (#1388).
     pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let json: Option<String> = conn
+        // The newest pending spill row (if any) is the latest state; otherwise
+        // the checkpointed row (#1487).
+        let pending: Option<String> = conn
             .query_row(
-                "SELECT vars FROM vars WHERE key = ?1",
+                "SELECT vars FROM pending WHERE key = ?1 ORDER BY seq DESC LIMIT 1",
                 params![key as i64],
                 |r| r.get(0),
             )
             .optional()?;
+        let json = match pending {
+            Some(j) => Some(j),
+            None => conn
+                .query_row(
+                    "SELECT vars FROM vars WHERE key = ?1",
+                    params![key as i64],
+                    |r| r.get(0),
+                )
+                .optional()?,
+        };
         drop(conn);
         json.map(|j| crate::varspill::decode(&j)).transpose()
     }
@@ -219,7 +323,8 @@ impl VarStore {
         .unwrap_or(0) as u64
     }
 
-    /// Bulk-loads every stored instance's current variable map, for recovery to
+    /// Bulk-loads every **checkpointed** instance's variable map (never a
+    /// pending spill row, #1487), for recovery to
     /// rehydrate the instances a lean snapshot restored with empty variables.
     /// Rows that fail to deserialize are skipped (the journal tail can still
     /// re-create them), keeping a partially-corrupt store non-fatal.
@@ -269,8 +374,12 @@ impl VarStore {
     /// Number of instances currently held. Test/observability helper.
     pub fn len(&self) -> usize {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row("SELECT COUNT(*) FROM vars", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT key FROM vars UNION SELECT key FROM pending)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
     }
 
     /// Whether the store holds no instances.
@@ -335,7 +444,7 @@ mod tests {
         );
 
         // Every public path must still work — no panics.
-        store.put_current(2, &vars("after")).unwrap();
+        store.put_current(0, 2, &vars("after")).unwrap();
         assert_eq!(store.try_get(2).unwrap(), Some(vars("after")));
         store.checkpoint(0, 2, &[(3, &vars("c"))], &[1]).unwrap();
         assert_eq!(store.position(0), 2);
@@ -344,6 +453,47 @@ mod tests {
         store.checkpoint_wal().unwrap();
         assert_eq!(store.len(), 2);
         assert!(!store.is_empty());
+    }
+
+    /// #1487: a spill row is invisible to recovery until a checkpoint whose
+    /// capture it precedes promotes it; rows after the capture stay pending,
+    /// `try_get` always sees the newest, and `discard_pending` drops them.
+    #[test]
+    fn spill_rows_are_promoted_only_by_a_later_capture_checkpoint() {
+        let store = VarStore::open(None).unwrap();
+        store.checkpoint(0, 1, &[(5, &vars("v1"))], &[]).unwrap();
+        store.put_current(0, 5, &vars("v2")).unwrap();
+        assert_eq!(store.try_get(5).unwrap(), Some(vars("v2")));
+        assert_eq!(
+            store.load_all().get(&5),
+            Some(&vars("v1")),
+            "not yet durable"
+        );
+
+        store.mark_capture(0).unwrap();
+        // A spill after the capture (and another partition's) stays pending.
+        store.put_current(0, 5, &vars("v3")).unwrap();
+        store.put_current(1, 9, &vars("p1")).unwrap();
+        store.checkpoint(0, 2, &[], &[]).unwrap();
+        assert_eq!(
+            store.load_all().get(&5),
+            Some(&vars("v2")),
+            "promoted at capture"
+        );
+        assert!(!store.load_all().contains_key(&9));
+        assert_eq!(store.try_get(5).unwrap(), Some(vars("v3")));
+
+        // A checkpoint without a capture promotes nothing.
+        store.checkpoint(0, 3, &[], &[]).unwrap();
+        assert_eq!(store.load_all().get(&5), Some(&vars("v2")));
+
+        store.discard_pending(&[0]).unwrap();
+        assert_eq!(store.try_get(5).unwrap(), Some(vars("v2")));
+        assert_eq!(
+            store.try_get(9).unwrap(),
+            Some(vars("p1")),
+            "partition 1 untouched"
+        );
     }
 
     #[test]
