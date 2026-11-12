@@ -191,6 +191,9 @@ impl Engine {
                     boundary_element_id,
                 } => (boundary_element_id.clone(), Some(false)),
                 state::TimerKind::IntermediateCatch => (host_element_id.clone(), None),
+                // An event sub-process trigger rests on its scope, not on a
+                // token; it is not a per-element trigger to re-map here.
+                state::TimerKind::EventSubProcess { .. } => continue,
             };
             let Some(fingerprint) = source.element(&catch_id).and_then(timer_fingerprint) else {
                 continue;
@@ -442,7 +445,7 @@ impl Engine {
             };
             if matches!(
                 source.element(&source_id).map(|e| &e.kind),
-                Some(ElementKind::SubProcess { .. })
+                Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
             ) {
                 plan.migrated_flow_scopes.push(MigratedElementInstance {
                     element_instance_key: eik,

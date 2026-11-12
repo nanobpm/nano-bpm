@@ -68,10 +68,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 // A non-interrupting boundary subscription stays open so every
                 // matching message spawns another token; all others settle.
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -116,10 +113,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.signal_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -166,10 +160,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -212,10 +203,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }

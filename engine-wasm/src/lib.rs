@@ -3015,6 +3015,7 @@ fn subscription_kind_tag(kind: &MessageSubscriptionKind) -> &'static str {
         MessageSubscriptionKind::IntermediateCatch => "intermediateCatch",
         MessageSubscriptionKind::InterruptingBoundary { .. } => "interruptingBoundary",
         MessageSubscriptionKind::NonInterruptingBoundary { .. } => "nonInterruptingBoundary",
+        MessageSubscriptionKind::EventSubProcess { .. } => "eventSubProcess",
     }
 }
 

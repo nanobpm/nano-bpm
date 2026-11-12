@@ -577,8 +577,20 @@ impl Engine {
     /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
     /// sweep, which sees the `ProcessInstanceTerminated` this emits).
     pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
+        let descendants = self.scope_descendants(instance_key, scope_eik);
+        let mut events = self.element_teardown_events(instance_key, &descendants);
+        self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
+        events
+    }
+
+    /// The per-element-instance half of [`Self::scope_teardown_events`]: tears
+    /// down each of `members` (cancelling every runtime resource it owns, then
+    /// completing it) without touching compensation state. An interrupting
+    /// event sub-process uses it directly, so compensable activities completed
+    /// in the scope stay compensable from inside the event sub-process.
+    pub(crate) fn element_teardown_events(&self, instance_key: Key, members: &[Key]) -> Vec<Event> {
         let mut events = Vec::new();
-        for eik in self.scope_descendants(instance_key, scope_eik) {
+        for &eik in members {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
@@ -671,6 +683,17 @@ impl Engine {
                 element_id,
             });
         }
+        events
+    }
+
+    /// Appends the [`Event::ScopedCompensationCleared`] for a scope teardown
+    /// of `scope_eik` (see [`Self::scope_teardown_events`]).
+    fn push_scoped_compensation_cleared(
+        &self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        scope_eik: Key,
+    ) {
         // Scoped compensation cleanup. A completed compensable activity and an
         // in-flight compensation throw both record the `scope` (element instance
         // of the enclosing sub-process, or `0` for the root) they belong to. The
@@ -701,7 +724,6 @@ impl Engine {
                 });
             }
         }
-        events
     }
 
     /// Root-record teardown events for an activity interrupted at its boundary —

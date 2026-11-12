@@ -1521,6 +1521,19 @@ pub enum TimerKind {
         /// Id of the boundary event whose outgoing flow runs when the timer fires.
         boundary_element_id: ElementId,
     },
+    /// The timer start event of an **event sub-process** (#1555), armed when
+    /// its enclosing scope activates. The timer's `element_instance_key` is the
+    /// enclosing scope (the embedded sub-process instance, or `0` for the
+    /// process root) and its `element_id` the event sub-process's start event.
+    /// Firing activates the event sub-process in that scope — tearing the
+    /// scope's other children down first when `interrupting`. A non-interrupting
+    /// cycle re-arms after each fire.
+    EventSubProcess {
+        /// Id of the event sub-process element to activate.
+        esp_element_id: ElementId,
+        /// Whether firing interrupts the enclosing scope.
+        interrupting: bool,
+    },
 }
 
 /// An armed timer holding a token on a timer intermediate catch event until its
@@ -1598,6 +1611,37 @@ pub enum MessageSubscriptionKind {
         /// correlated.
         boundary_element_id: ElementId,
     },
+    /// The message / signal / conditional start event of an **event
+    /// sub-process** (#1555), armed when its enclosing scope activates. The
+    /// subscription's `element_instance_key` is the enclosing scope (the
+    /// embedded sub-process instance, or `0` for the process root) and its
+    /// `element_id` the event sub-process's start event. Triggering activates
+    /// the event sub-process in that scope (interrupting the scope's other
+    /// children first when `interrupting`); a non-interrupting subscription
+    /// stays open so every trigger spawns another event sub-process instance.
+    EventSubProcess {
+        /// Id of the event sub-process element to activate.
+        esp_element_id: ElementId,
+        /// Whether triggering interrupts the enclosing scope.
+        interrupting: bool,
+    },
+}
+
+impl MessageSubscriptionKind {
+    /// Whether a subscription of this kind stays open after it triggers (a
+    /// non-interrupting boundary or a non-interrupting event sub-process start
+    /// fires repeatedly); every other kind settles on its first trigger. The
+    /// single source of truth for the message / signal / conditional appliers.
+    pub fn stays_open_after_trigger(&self) -> bool {
+        matches!(
+            self,
+            MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                | MessageSubscriptionKind::EventSubProcess {
+                    interrupting: false,
+                    ..
+                }
+        )
+    }
 }
 
 /// An open message subscription holding a token on a message catch element until

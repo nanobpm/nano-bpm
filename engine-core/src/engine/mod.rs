@@ -23,6 +23,7 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod event_subprocess;
 mod expression;
 mod flow_scope;
 mod memory;
@@ -3030,6 +3031,44 @@ impl Engine {
                                 }
                             }
                         }
+                        // Event sub-process timer: `element_instance_key` is the
+                        // enclosing scope, `element_id` the ESP start event. A
+                        // non-interrupting cycle re-arms for the next interval.
+                        state::TimerKind::EventSubProcess {
+                            esp_element_id,
+                            interrupting,
+                        } => {
+                            if !interrupting {
+                                match self.rearm_event_subprocess_timer(
+                                    instance_key,
+                                    element_instance_key,
+                                    &element_id,
+                                    &esp_element_id,
+                                    due_at,
+                                ) {
+                                    Ok(Some(event)) => self.emit(&mut log, event),
+                                    Ok(None) => {}
+                                    Err(failure) => {
+                                        let incident = self.expression_incident(
+                                            instance_key,
+                                            element_instance_key,
+                                            element_id.clone(),
+                                            failure,
+                                            None,
+                                        );
+                                        self.emit(&mut log, incident);
+                                    }
+                                }
+                            }
+                            self.trigger_event_subprocess(
+                                &mut log,
+                                &mut queue,
+                                instance_key,
+                                element_instance_key,
+                                esp_element_id,
+                                interrupting,
+                            );
+                        }
                     }
                 }
 
@@ -3867,7 +3906,10 @@ impl Engine {
                             Some(state::IoMappingRedrive::Completion) => {
                                 if matches!(
                                     self.element_kind(instance_key, &element_id),
-                                    Some(ElementKind::SubProcess { .. })
+                                    Some(
+                                        ElementKind::SubProcess { .. }
+                                            | ElementKind::EventSubProcess { .. }
+                                    )
                                 ) {
                                     // Re-driven by the drain sweep, not a step.
                                     None
@@ -5696,6 +5738,19 @@ impl Engine {
                         via: None,
                     });
                 }
+                state::MessageSubscriptionKind::EventSubProcess {
+                    esp_element_id,
+                    interrupting,
+                } => {
+                    self.trigger_event_subprocess(
+                        log,
+                        queue,
+                        instance_key,
+                        element_instance_key,
+                        esp_element_id,
+                        interrupting,
+                    );
+                }
             }
         }
         scan_end
@@ -5736,7 +5791,7 @@ impl Engine {
         // element's enclosing (flow) scope upward (nearest defining ancestor,
         // else root). Root-only instances collapse to the flat `VariablesUpdated`.
         if !variables.is_empty() {
-            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            let flow_scope = self.event_payload_scope(instance_key, element_instance_key, &kind);
             for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
             {
                 self.emit(log, event);
@@ -5788,6 +5843,19 @@ impl Engine {
                     via: None,
                 });
             }
+            state::MessageSubscriptionKind::EventSubProcess {
+                esp_element_id,
+                interrupting,
+            } => {
+                self.trigger_event_subprocess(
+                    log,
+                    queue,
+                    instance_key,
+                    element_instance_key,
+                    esp_element_id,
+                    interrupting,
+                );
+            }
         }
     }
 
@@ -5821,7 +5889,7 @@ impl Engine {
         if !variables.is_empty() {
             // Signal payload propagates from the catching element's enclosing
             // (flow) scope upward, defaulting to root.
-            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            let flow_scope = self.event_payload_scope(instance_key, element_instance_key, &kind);
             for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
             {
                 self.emit(log, event);
@@ -5863,6 +5931,19 @@ impl Engine {
                     via: None,
                 });
             }
+            state::MessageSubscriptionKind::EventSubProcess {
+                esp_element_id,
+                interrupting,
+            } => {
+                self.trigger_event_subprocess(
+                    log,
+                    queue,
+                    instance_key,
+                    element_instance_key,
+                    esp_element_id,
+                    interrupting,
+                );
+            }
         }
     }
 
@@ -5893,7 +5974,7 @@ impl Engine {
             for (eik, element_id) in &instance.active {
                 let is_subprocess = matches!(
                     process.definition.element(element_id).map(|e| &e.kind),
-                    Some(ElementKind::SubProcess { .. })
+                    Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
                 );
                 if !is_subprocess {
                     continue;
@@ -5925,6 +6006,8 @@ impl Engine {
             }
         }
         drained.sort();
+        let sweep_from = log.len();
+        let drained_keys: HashSet<Key> = drained.iter().map(|(_, eik, _)| *eik).collect();
 
         let mut followups = Vec::new();
         for (instance_key, eik, element_id) in drained {
@@ -5957,6 +6040,9 @@ impl Engine {
                     self.emit(log, event);
                 }
                 for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.disarm_event_subprocess_events(instance_key, eik) {
                     self.emit(log, event);
                 }
                 for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
@@ -6039,6 +6125,11 @@ impl Engine {
                     }
                 }
             };
+            // The sub-process scope is completing: disarm the start-event
+            // triggers of the event sub-processes it contains (#1555).
+            for event in self.disarm_event_subprocess_events(instance_key, eik) {
+                self.emit(log, event);
+            }
             self.emit(
                 log,
                 Event::ElementCompleting {
@@ -6166,6 +6257,19 @@ impl Engine {
                 }
                 followups.push(step);
             }
+        }
+        // A drained scope with no outgoing flow (an event sub-process, #1555)
+        // completes without enqueueing a follow-up, so the caller's fixpoint
+        // loop would not re-sweep — yet its completion may have drained the
+        // enclosing scope. Re-sweep while this pass completed something and
+        // produced no follow-up work (each pass retires at least one element,
+        // so this terminates).
+        let completed_any = log[sweep_from..].iter().any(|e| {
+            matches!(e, Event::ElementCompleted { element_instance_key, .. }
+                if drained_keys.contains(element_instance_key))
+        });
+        if followups.is_empty() && completed_any {
+            return self.complete_drained_subprocesses(log);
         }
         followups
     }
@@ -6924,7 +7028,10 @@ impl Engine {
         // activation, BEFORE the input mappings run; a resolved input-mapping
         // incident re-runs only `activate_body`, which sees the scope already
         // registered and does not re-create it.
-        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let is_sub_process = matches!(
+            kind,
+            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
+        );
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
         // #1437 (Zeebe parity): an element declaring execution listeners is a
@@ -7010,7 +7117,10 @@ impl Engine {
         // inner flow, not propagated to the parent, and dropped when the element
         // completes.
         let kind = self.element_kind(instance_key, &element_id);
-        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let is_sub_process = matches!(
+            kind,
+            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. })
+        );
         let is_call_activity = matches!(kind, Some(ElementKind::CallActivity { .. }));
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
@@ -7470,6 +7580,14 @@ impl Engine {
         let mut events: Vec<Event> = Vec::new();
         let mut followups: Vec<Step> = Vec::new();
 
+        // The process-level start event activating opens the process scope:
+        // arm the start-event triggers of the root's event sub-processes
+        // (#1555). (An event sub-process's own start event activates in the
+        // event sub-process scope, never scope 0.)
+        if scope == 0 && kind.as_ref().is_some_and(ElementKind::is_start_event) {
+            events.extend(self.arm_event_subprocesses(instance_key, 0, None)?);
+        }
+
         match kind {
             // A service task creates a job and parks the token.
             Some(ElementKind::ServiceTask {
@@ -7803,6 +7921,29 @@ impl Engine {
                     scope,
                     &element_id,
                 )?;
+                // The sub-process scope opens: arm its event sub-processes.
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    element_instance_key,
+                    Some(&element_id),
+                )?);
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: element_instance_key,
+                    via: None,
+                });
+            }
+            // A triggered event sub-process opens its own token scope and
+            // activates its start event inside it (#1555); it completes once
+            // that scope drains, exactly like an embedded sub-process. Nested
+            // event sub-processes arm with it.
+            Some(ElementKind::EventSubProcess { start_event, .. }) => {
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    element_instance_key,
+                    Some(&element_id),
+                )?);
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -8736,6 +8877,11 @@ impl Engine {
             // flow. This is what makes the nested "wave" pattern — a sequential MI
             // over waves wrapping a parallel MI over a wave's tasks — executable.
             Some(ElementKind::SubProcess { start_event }) => {
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    child_key,
+                    Some(&element_id),
+                )?);
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -12511,7 +12657,7 @@ impl Engine {
                 element_id,
                 scope,
             ),
-            Some(ElementKind::SubProcess { .. }) => {
+            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. }) => {
                 self.finalize_subprocess(instance_key, element_instance_key, element_id, scope)
             }
             Some(ElementKind::TerminateEndEvent) => {
@@ -14748,6 +14894,11 @@ impl Engine {
             // variables so the call activity's output mappings still see them.
             if let Some(step) = self.call_activity_completion_step(instance_key) {
                 followups.push(step);
+            }
+            // The process scope completes: disarm its event sub-process
+            // start-event triggers (#1555).
+            for event in self.disarm_event_subprocess_events(instance_key, 0) {
+                self.emit(log, event);
             }
             self.emit(log, Event::ProcessInstanceCompleted { instance_key });
         }

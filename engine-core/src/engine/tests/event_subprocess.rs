@@ -1,11 +1,13 @@
 //! Event sub-process (`subProcess triggeredByEvent="true"`) engine tests —
-//! #1555 wave-0 model slice.
+//! #1555.
 //!
-//! The runtime does NOT trigger an event sub-process yet (that is the
-//! follow-up runtime slice). These tests pin the wave-0 contract: deploying a
-//! model containing an event sub-process succeeds, the event sub-process is
-//! never activated by token flow, and an existing model's behaviour is
-//! unchanged.
+//! Model/deploy contract (wave 0): deploying a model containing an event
+//! sub-process succeeds and the event sub-process is never activated by
+//! sequence flow. Runtime (esp-runtime slice): the start-event trigger
+//! (message, timer, signal, conditional) is armed when the enclosing scope
+//! activates and disarmed when it completes or terminates; an interrupting
+//! trigger tears the scope's other children down, a non-interrupting one runs
+//! the event sub-process concurrently (and repeatedly).
 use super::*;
 
 /// A process with a message event sub-process beside the main flow
@@ -411,4 +413,407 @@ fn modification_with_cyclic_containment_does_not_hang() {
         terminate_element_ids: vec![],
         move_instructions: vec![],
     });
+}
+
+// ---------------------------------------------------------------------------
+// Runtime (esp-runtime slice, #1555)
+// ---------------------------------------------------------------------------
+
+use crate::model::{EventSubProcessTrigger as Trig, TimerDef, TimerDefKind};
+
+/// `s -> work("w") -> e` (or, `embedded`, `s -> sub[sub_s -> work -> sub_e]
+/// -> after("after") -> e`) plus an event sub-process `esp` (in the process,
+/// or inside `sub` when embedded) running `esp_start -> esp_work("esp") ->
+/// esp_end`.
+fn esp_model(trigger: Trig, interrupting: bool, embedded: bool) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e")
+        .event_sub_process("esp", "esp_start", trigger, interrupting)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp");
+    if embedded {
+        b = b
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .end_event("sub_e")
+            .service_task("after", "after")
+            .connect("s", "sub")
+            .connect("sub_s", "work")
+            .connect("work", "sub_e")
+            .connect("sub", "after")
+            .connect("after", "e")
+            .contained_in("sub_s", "sub")
+            .contained_in("work", "sub")
+            .contained_in("sub_e", "sub")
+            .contained_in("esp", "sub");
+    } else {
+        b = b.connect("s", "work").connect("work", "e");
+    }
+    b.build().unwrap()
+}
+
+fn msg() -> Trig {
+    Trig::Message {
+        message_name: "m".into(),
+        correlation_key: "orderId".into(),
+    }
+}
+fn timer(kind: TimerDefKind, expr: &str) -> Trig {
+    Trig::Timer(TimerDef {
+        kind,
+        expr: expr.into(),
+    })
+}
+fn sig() -> Trig {
+    Trig::Signal {
+        signal_name: "sig".into(),
+    }
+}
+fn cond() -> Trig {
+    Trig::Conditional {
+        condition: "=flag".into(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum T {
+    Message,
+    Timer,
+    Signal,
+    Conditional,
+}
+
+fn trig_of(t: T) -> Trig {
+    match t {
+        T::Message => msg(),
+        T::Timer => timer(TimerDefKind::Duration, "PT5S"),
+        T::Signal => sig(),
+        T::Conditional => cond(),
+    }
+}
+
+fn start(engine: &mut Engine, def: ProcessDefinition) -> Key {
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("orderId", Value::Int(7)), ("flag", Value::Bool(false))]),
+        ))
+        .unwrap();
+    created.iter().find_map(|e| e.instance_key()).unwrap()
+}
+
+/// Fires trigger `t` once (the timer at `due`).
+fn fire(engine: &mut Engine, inst: Key, t: T, due: u64) -> Vec<Event> {
+    match t {
+        T::Message => engine
+            .apply_command(Command::CorrelateMessage {
+                message_name: "m".into(),
+                correlation_key: "7".into(),
+                variables: vars(&[("payload", Value::Int(42))]),
+                business_id: None,
+            })
+            .unwrap(),
+        T::Timer => engine.trigger_timers(due),
+        T::Signal => engine
+            .apply_command(Command::BroadcastSignal {
+                signal_name: "sig".into(),
+                variables: vars(&[("payload", Value::Int(42))]),
+            })
+            .unwrap(),
+        T::Conditional => engine
+            .apply_command(Command::SetVariables {
+                scope_key: inst,
+                variables: vars(&[("flag", Value::Bool(true))]),
+                local: false,
+            })
+            .unwrap(),
+    }
+}
+
+fn job_count(engine: &mut Engine, job_type: &str) -> usize {
+    engine
+        .state
+        .jobs
+        .values()
+        .filter(|j| {
+            j.job_type == job_type
+                && matches!(
+                    j.state,
+                    crate::state::JobState::Created | crate::state::JobState::Activated
+                )
+        })
+        .count()
+}
+
+/// Every still-armed trigger (timer / message / signal / conditional) of `inst`.
+fn armed(engine: &Engine, inst: Key) -> usize {
+    use crate::state::{MessageSubscriptionState as S, TimerState};
+    let s = &engine.state;
+    s.timers
+        .values()
+        .filter(|t| t.instance_key == inst && t.state == TimerState::Created)
+        .count()
+        + s.message_subscriptions
+            .values()
+            .filter(|x| x.instance_key == inst && matches!(x.state, S::Open | S::Opening))
+            .count()
+        + s.signal_subscriptions
+            .values()
+            .filter(|x| x.instance_key == inst && x.state == S::Open)
+            .count()
+        + s.conditional_subscriptions
+            .values()
+            .filter(|x| x.instance_key == inst && x.state == S::Open)
+            .count()
+}
+
+const ALL: [T; 4] = [T::Message, T::Timer, T::Signal, T::Conditional];
+
+fn interrupting_case(t: T, embedded: bool) {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, esp_model(trig_of(t), true, embedded));
+    assert_eq!(
+        armed(&engine, inst),
+        1,
+        "{t:?}/{embedded}: ESP trigger armed"
+    );
+    let fired = fire(&mut engine, inst, t, 5_000);
+    assert!(
+        fired.iter().any(
+            |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp")
+        ),
+        "{t:?}/{embedded}: event sub-process activated"
+    );
+    assert_eq!(
+        job_count(&mut engine, "w"),
+        0,
+        "{t:?}/{embedded}: sibling work torn down"
+    );
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        1,
+        "{t:?}/{embedded}: ESP runs"
+    );
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "{t:?}/{embedded}: interrupting trigger consumed"
+    );
+    complete_one(&mut engine, "esp");
+    if embedded {
+        // The sub-process completed via its event sub-process and continued.
+        assert!(!engine.is_completed(inst));
+        complete_one(&mut engine, "after");
+    }
+    assert!(
+        engine.is_completed(inst),
+        "{t:?}/{embedded}: scope completes with the ESP"
+    );
+}
+
+fn non_interrupting_case(t: T, embedded: bool) {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
+    fire(&mut engine, inst, t, 5_000);
+    assert_eq!(
+        job_count(&mut engine, "w"),
+        1,
+        "{t:?}/{embedded}: main work keeps running"
+    );
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        1,
+        "{t:?}/{embedded}: ESP runs concurrently"
+    );
+    // Finish the main work first: the scope must wait for the running ESP.
+    complete_one(&mut engine, "w");
+    if embedded {
+        assert_eq!(
+            job_count(&mut engine, "after"),
+            0,
+            "{t:?}: sub-process waits for ESP"
+        );
+    }
+    assert!(
+        !engine.is_completed(inst),
+        "{t:?}/{embedded}: scope waits for ESP"
+    );
+    complete_one(&mut engine, "esp");
+    if embedded {
+        complete_one(&mut engine, "after");
+    }
+    assert!(
+        engine.is_completed(inst),
+        "{t:?}/{embedded}: completes after ESP"
+    );
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "{t:?}/{embedded}: disarmed on completion"
+    );
+}
+
+#[test]
+fn interrupting_event_subprocess_in_process() {
+    for t in ALL {
+        interrupting_case(t, false);
+    }
+}
+
+#[test]
+fn interrupting_event_subprocess_in_embedded_subprocess() {
+    for t in ALL {
+        interrupting_case(t, true);
+    }
+}
+
+#[test]
+fn non_interrupting_event_subprocess_in_process() {
+    for t in ALL {
+        non_interrupting_case(t, false);
+    }
+}
+
+#[test]
+fn non_interrupting_event_subprocess_in_embedded_subprocess() {
+    for t in ALL {
+        non_interrupting_case(t, true);
+    }
+}
+
+#[test]
+fn completing_the_scope_disarms_event_subprocess_triggers() {
+    for t in ALL {
+        for embedded in [false, true] {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig_of(t), true, embedded));
+            assert_eq!(armed(&engine, inst), 1);
+            complete_one(&mut engine, "w");
+            // The embedded sub-process completed (instance parked on `after`):
+            // its event sub-process trigger is disarmed with it.
+            assert_eq!(armed(&engine, inst), 0, "{t:?}/{embedded}: disarmed");
+            if embedded {
+                complete_one(&mut engine, "after");
+            }
+            assert!(engine.is_completed(inst));
+            // A late trigger does nothing.
+            let late = fire(&mut engine, inst, t, 10_000);
+            assert!(!late.iter().any(
+                |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp")
+            ));
+        }
+    }
+}
+
+#[test]
+fn terminating_the_scope_disarms_event_subprocess_triggers() {
+    for t in ALL {
+        for embedded in [false, true] {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
+            engine
+                .apply_command(Command::CancelInstance { instance_key: inst })
+                .unwrap();
+            assert_eq!(
+                armed(&engine, inst),
+                0,
+                "{t:?}/{embedded}: disarmed on cancel"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_interrupting_event_subprocess_fires_repeatedly() {
+    for (t, trig) in [
+        (T::Message, msg()),
+        (T::Signal, sig()),
+        (T::Timer, timer(TimerDefKind::Cycle, "R/PT5S")),
+    ] {
+        for embedded in [false, true] {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig.clone(), false, embedded));
+            fire(&mut engine, inst, t, 5_000);
+            fire(&mut engine, inst, t, 10_000);
+            assert_eq!(
+                job_count(&mut engine, "esp"),
+                2,
+                "{t:?}/{embedded}: fired twice"
+            );
+            assert_eq!(armed(&engine, inst), 1, "{t:?}/{embedded}: stays armed");
+            // Both concurrent ESP instances run to completion.
+            let jobs = engine.activate_jobs("esp", "test-worker", 10, 60_000, 0);
+            assert_eq!(jobs.len(), 2);
+            for job in jobs {
+                engine
+                    .apply_command(Command::complete_job(job.key))
+                    .unwrap();
+            }
+            complete_one(&mut engine, "w");
+            if embedded {
+                complete_one(&mut engine, "after");
+            }
+            assert!(engine.is_completed(inst), "{t:?}/{embedded}");
+            assert_eq!(armed(&engine, inst), 0, "{t:?}/{embedded}: disarmed");
+        }
+    }
+}
+
+#[test]
+fn event_payload_is_visible_in_the_event_subprocess() {
+    for t in [T::Message, T::Signal] {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, esp_model(trig_of(t), true, false));
+        fire(&mut engine, inst, t, 0);
+        assert_eq!(
+            engine.variables(inst).get("payload"),
+            Some(&Value::Int(42)),
+            "{t:?}: payload merged into the instance"
+        );
+    }
+}
+
+#[test]
+fn interrupting_event_subprocess_disarms_sibling_event_subprocesses() {
+    // Two ESPs in the process: an interrupting signal and a non-interrupting
+    // message. Firing the signal disarms the message ESP.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .event_sub_process("esp", "esp_start", sig(), true)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .event_sub_process("esp2", "esp2_start", msg(), false)
+        .start_event("esp2_start")
+        .end_event("esp2_end")
+        .connect("esp2_start", "esp2_end")
+        .contained_in("esp2_start", "esp2")
+        .contained_in("esp2_end", "esp2")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    assert_eq!(armed(&engine, inst), 2);
+    fire(&mut engine, inst, T::Signal, 0);
+    assert_eq!(armed(&engine, inst), 0, "sibling ESP disarmed");
+    complete_one(&mut engine, "esp");
+    assert!(engine.is_completed(inst));
 }
