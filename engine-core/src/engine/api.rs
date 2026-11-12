@@ -676,6 +676,12 @@ impl Engine {
     /// holds the retained deadline. First-terminal-wins on every replica — a
     /// cascade re-cancel of an ALREADY-terminal job must restate the deadline
     /// its first terminal transition recorded, not `None`.
+    ///
+    /// The CURRENT live durable lease is checked BEFORE the proposer's stamp:
+    /// the stamp is taken at proposal time, so a journaled `UpdateJobTimeout`
+    /// landing between stamping and completion advances the replicated lease
+    /// past it — the terminal record must restate the deadline the job
+    /// actually held at completion, not the proposal-time one.
     pub fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
         let job = self.state.jobs.get(&job_key)?;
         if let Some(terminal_end) = job.terminal_end {
@@ -684,23 +690,19 @@ impl Engine {
             // first-terminal-wins over any stamp.
             return terminal_end.deadline;
         }
-        let stamped = self
-            .terminal_deadline_stamp
-            .filter(|(stamped_key, _)| *stamped_key == job_key)
-            .and_then(|(_, deadline)| deadline);
-        if stamped.is_some() {
-            // The current command's proposer-stamped deadline (#1494): carried
-            // on the replicated command, so identical on every replica even
-            // for a soft lock this replica never saw.
-            stamped
-        } else if job.lease_token.is_some() {
+        if job.lease_token.is_some() {
             // A durable (journaled) lease: the lock is replicated, so its
-            // deadline is identical on every replica.
+            // CURRENT deadline is identical on every replica — including any
+            // `UpdateJobTimeout` applied after the proposer stamped.
             job.deadline
         } else {
-            // An unstamped soft (leader-local) activation: nothing replicated
-            // to restate.
-            None
+            // The current command's proposer-stamped deadline (#1494): carried
+            // on the replicated command, so identical on every replica even
+            // for a soft lock this replica never saw. An unstamped soft
+            // (leader-local) activation has nothing replicated to restate.
+            self.terminal_deadline_stamp
+                .filter(|(stamped_key, _)| *stamped_key == job_key)
+                .and_then(|(_, deadline)| deadline)
         }
     }
 }

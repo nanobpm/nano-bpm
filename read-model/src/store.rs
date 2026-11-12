@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -55,6 +55,14 @@ const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 /// below `exported_position`, so the migration backfills the column to that
 /// cursor (see [`ReadStore::ensure_schema_on`]).
 const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
+/// The schema version whose migration normalizes legacy terminal job rows to
+/// the single backward-clock policy (#1494, `bounded_creation`): a terminal
+/// row projected before the policy can carry `created_at_ms > end_ms` (a
+/// backward clock adjustment or a legacy batch-time creation fallback), which
+/// a clean reseed would resolve to `created_at_ms == end_ms`. The migration
+/// bounds those rows in place so a warm upgrade converges with a reseed
+/// without replaying the journal (see [`ReadStore::ensure_schema_on`]).
+const JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION: i64 = 14;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -2085,6 +2093,24 @@ impl ReadStore {
         // now held, while every event the exporter delivers past it applies.
         if stored_version.is_none_or(|v| v < JOB_EVENT_POSITION_SCHEMA_VERSION) {
             stamp_job_positions_to_cursor(conn)?;
+        }
+        // #1494: a terminal row projected before the single backward-clock
+        // policy can carry `created_at_ms > end_ms` (a backward clock
+        // adjustment or a legacy batch-time creation fallback), while a clean
+        // reseed of the same job bounds creation by the retained terminal
+        // instant (`bounded_creation`). Bound those rows in place — the same
+        // `MIN(created_at_ms, end_ms)` the event-driven terminal projection
+        // applies — so a warm upgrade converges with a reseed without
+        // replaying the journal. Only `created_at_ms` moves: the terminal
+        // instant (`end_ms`, `last_update_ms`) and the replay floors
+        // (`last_event_identity_ms`, `last_event_position`) are preserved, so
+        // terminal history and replay identity are untouched.
+        if stored_version.is_none_or(|v| v < JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE jobs SET created_at_ms = MIN(created_at_ms, end_ms) \
+                 WHERE end_ms IS NOT NULL AND created_at_ms > end_ms",
+                [],
+            )?;
         }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
         conn.execute(
@@ -4196,7 +4222,15 @@ fn project_engine_state(
         // pre-terminal value would surface a stale `lastUpdateTime` that no
         // later terminal-event delivery can repair (the terminal projection is
         // `end_ms`-guarded, so it is a no-op once `end_ms` is set). When an
-        // end time already exists, both values are preserved. Seed `created_at_ms` with
+        // end time already exists, both values are preserved — except that
+        // `created_at_ms` is STILL bounded against the retained `end_ms`
+        // (`MIN(created_at_ms, end_ms)`, the single backward-clock policy of
+        // #1494): a terminal row projected before the policy can carry
+        // `created_at_ms > end_ms`, and a reseed must converge it with a
+        // clean seed (which bounds creation by the terminal instant via
+        // `bounded_creation`) instead of preserving the pre-policy pair
+        // forever. The v14 warm-upgrade migration applies the same bound to
+        // rows that never see a reseed. Seed `created_at_ms` with
         // the SAME batch-observation fallback as `last_update_ms` when the
         // snapshot predates `created_at` (legacy `0`), so a recovered legacy
         // job surfaces a non-null `creationTime` (== `lastUpdateTime`) rather
@@ -4245,7 +4279,10 @@ fn project_engine_state(
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
              end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
              created_at_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
-                 THEN MIN(jobs.created_at_ms, excluded.end_ms) ELSE jobs.created_at_ms END, \
+                 THEN MIN(jobs.created_at_ms, excluded.end_ms) \
+                 WHEN jobs.end_ms IS NOT NULL \
+                 THEN MIN(jobs.created_at_ms, jobs.end_ms) \
+                 ELSE jobs.created_at_ms END, \
              last_update_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
                  THEN excluded.last_update_ms ELSE jobs.last_update_ms END, \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
@@ -7800,6 +7837,156 @@ mod writability_tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// #1494 review: a terminal row projected BEFORE the single backward-clock
+    /// policy can carry `created_at_ms > end_ms` (creation 900, end 600), and a
+    /// normal restart never reseeds — so without a versioned normalization the
+    /// row keeps the pre-policy pair forever while a clean reseed of the same
+    /// job resolves it to `(600, 600)`. The v14 migration bounds every such
+    /// row in place (`MIN(created_at_ms, end_ms)`), preserving the terminal
+    /// instant and the replay floors.
+    #[test]
+    fn migration_normalizes_a_pre_policy_terminal_creation() {
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            // A pre-policy terminal row: creation (900) AFTER the terminal
+            // instant (600), with its replay floors already backfilled.
+            conn.execute_batch(
+                "INSERT INTO jobs \
+                 (key, instance_key, element_instance_key, element_id, job_type, \
+                  state, retries, process_definition_id, process_definition_key, \
+                  created_at_ms, last_update_ms, end_ms, last_event_identity_ms) \
+                 VALUES (14, 1, 1, 'e', 't', 1, 3, 'p', '1', 900, 600, 600, 900);
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = ReadStore::open(Some(&path)).expect("warm upgrade migrates");
+        let row = job_row(&store, 14);
+        assert_eq!(
+            row.created_at_ms, 600,
+            "a pre-policy terminal creation is bounded by endTime on upgrade"
+        );
+        assert_eq!(row.end_ms, Some(600), "the terminal instant is preserved");
+        assert_eq!(
+            row.last_update_ms,
+            Some(600),
+            "lastUpdateTime stays at the terminal instant"
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// #1494 review: a compaction-floor reseed CONFLICTING with a pre-policy
+    /// terminal row must converge it with a clean seed — bound the existing
+    /// `created_at_ms` against the retained `end_ms` even when the terminal
+    //  instant itself is preserved (not overwritten from the snapshot).
+    #[test]
+    fn reseed_bounds_a_conflicting_pre_policy_terminal_creation() {
+        use nanobpmn_engine_core::{Job, JobKind, JobTerminalEnd, ProcessInstance, State};
+
+        let store = ReadStore::open(None).unwrap();
+        // The pre-policy row: creation 900 after the terminal instant 600.
+        apply_at(
+            &store,
+            &Event::JobCreated {
+                job_key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 900,
+                priority: 0,
+                retries: 3,
+            },
+            900,
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET state = 1, end_ms = 600, last_update_ms = 600 \
+                 WHERE key = 8700",
+                [],
+            )
+            .unwrap();
+        }
+        // The snapshot reseed carries the same job, terminal at 600.
+        let mut state = State::default();
+        let mut inst = ProcessInstance {
+            key: 7_700,
+            process_id: "p".to_string(),
+            process_definition_key: 0,
+            state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            suspended_at: None,
+            created_at: 50,
+            tags: Vec::new(),
+            business_id: None,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+            active: Default::default(),
+            scopes: Default::default(),
+            variables: Default::default(),
+            join_counts: Default::default(),
+            join_flow_arrivals: Default::default(),
+            join_instances: Default::default(),
+            parked_joins: Default::default(),
+            activating: Default::default(),
+            gateway_routes: Default::default(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+            multi_instances: Default::default(),
+            adhoc_instances: Default::default(),
+            scope_parents: Default::default(),
+            scope_variables: Default::default(),
+            compensable: Default::default(),
+            compensation_waits: Default::default(),
+            agent_instances: Default::default(),
+            agent_history: Default::default(),
+        };
+        inst.active.insert(7_701, "t".to_string());
+        state.instances.insert(7_700, inst);
+        state.jobs.insert(
+            8_700,
+            Job {
+                key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Completed,
+                worker: None,
+                deadline: None,
+                activated_at: None,
+                activation_timeout: None,
+                lease_token: None,
+                durable_activation: false,
+                activated: false,
+                retries: 3,
+                priority: 0,
+                created_at: 900,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
+                terminal_end: Some(JobTerminalEnd {
+                    at: 600,
+                    deadline: None,
+                }),
+            },
+        );
+        store.seed_from_engine_state(&state).unwrap();
+        let row = job_row(&store, 8_700);
+        assert_eq!(row.end_ms, Some(600), "the terminal instant is preserved");
+        assert_eq!(
+            row.created_at_ms, 600,
+            "a reseed bounds a conflicting pre-policy creation by endTime"
+        );
     }
 
     #[test]
