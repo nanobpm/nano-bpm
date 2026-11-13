@@ -177,13 +177,30 @@ fn http(
     content_type: &str,
     body: &str,
 ) -> std::io::Result<(u16, String)> {
+    http_with_headers(port, method, path, content_type, body, &[])
+}
+
+/// [`http`] with extra request headers (`Authorization`, `Origin`, …).
+fn http_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let extra: String = extra_headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: {content_type}\r\n\
          Accept: application/json, text/event-stream\r\n\
+         {extra}\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -419,5 +436,55 @@ fn mcp_disabled_node_does_not_mount_endpoints() {
         )
         .unwrap();
         assert_eq!(status, 404, "{path} is unmounted when disabled");
+    }
+}
+
+/// Auth parity over the real wire (issue #1499 slice 2: "same auth as the
+/// REST API"). Every MCP route is layered in the same `ApiAuthBasic`
+/// credential check the generated `/v2` handlers apply. The node runs
+/// unsecured today (that one impl accepts any credentials), so — exactly like
+/// `/v2` — an MCP request is served with no, basic, or bearer credentials;
+/// the in-process guard tests in `server/src/mcp/mod.rs`
+/// (`every_mcp_route_sits_behind_auth`, `refused_credentials_get_401_with_challenge`)
+/// pin the 401 branch that a secured deployment takes. The loopback-Origin
+/// hardening is defence in depth on top of auth: a non-loopback `Origin` is
+/// refused with 403 *even when the credentials are accepted*.
+#[test]
+fn mcp_endpoints_share_the_rest_auth_layer() {
+    let scratch = ScratchDir::new();
+    let node = ServerProcess::boot(&scratch.0.join("journal"), &[]);
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
+    for path in ["/mcp/cluster", "/mcp/processes"] {
+        // Unsecured mode (the only mode today): no credentials → served, as /v2.
+        let (status, body) = http(node.port, "POST", path, "application/json", &frame).unwrap();
+        assert_eq!(status, 200, "{path} without credentials: {body}");
+        // Valid credentials are accepted (Basic and Bearer), as /v2.
+        for auth in ["Basic dXNlcjpwYXNz", "Bearer some-token"] {
+            let (status, body) = http_with_headers(
+                node.port,
+                "POST",
+                path,
+                "application/json",
+                &frame,
+                &[("Authorization", auth)],
+            )
+            .unwrap();
+            assert_eq!(status, 200, "{path} with {auth}: {body}");
+            // A non-loopback Origin is still rejected even with accepted
+            // credentials (defence in depth, not authentication).
+            let (status, body) = http_with_headers(
+                node.port,
+                "POST",
+                path,
+                "application/json",
+                &frame,
+                &[("Authorization", auth), ("Origin", "https://evil.example")],
+            )
+            .unwrap();
+            assert_eq!(
+                status, 403,
+                "{path} with {auth} and a foreign Origin must still 403: {body}"
+            );
+        }
     }
 }

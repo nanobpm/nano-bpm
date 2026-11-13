@@ -520,12 +520,20 @@ NANOBPM_MCP_ENABLED=false ./nanobpm-gateway-rest-server   # turn both MCP server
 ```
 
 When MCP is on, the startup banner lists both endpoints. **The MCP endpoints
-have no built-in authentication**: like `/v2`, the gateway accepts any (or no)
-credentials, there is no setting that makes it validate them, and the listener
-binds to all interfaces. Before exposing the port beyond a trusted host, put an
-authenticating reverse proxy or a network restriction in front of it — or turn
-MCP off with `NANOBPM_MCP_ENABLED=false`. Camunda's `/physical-tenants/{id}/mcp/*` paths are not
-served — Nano has no physical tenants.
+sit behind the same auth check as `/v2`**: every `/mcp/*` request passes
+through the same credential extraction the generated REST handlers apply, so
+whatever authentication the REST API enforces applies to MCP identically.
+Today the REST API runs **unsecured** — it accepts any (or no) credentials and
+there is no setting that makes it validate them — and MCP inherits that
+behaviour exactly; when a secured mode is added to the REST layer, both
+surfaces tighten together. The listener binds to all interfaces, so before
+exposing the port beyond a trusted host, put an authenticating reverse proxy
+or a network restriction in front of it — or turn MCP off with
+`NANOBPM_MCP_ENABLED=false`. Independently of auth, an MCP request whose
+browser `Origin` is not a loopback host is refused with `403` (defence in
+depth against DNS-rebinding / drive-by pages; non-browser MCP clients send no
+`Origin` and are unaffected). Camunda's `/physical-tenants/{id}/mcp/*` paths
+are not served — Nano has no physical tenants.
 
 **Example client config** (any MCP client that speaks streamable HTTP, e.g. an
 `mcp.json` / `claude_desktop_config.json`-style entry):

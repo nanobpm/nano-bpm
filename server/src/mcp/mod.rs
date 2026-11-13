@@ -7,9 +7,10 @@
 //! handler the corresponding REST route uses, so the MCP surface can never
 //! drift from the REST behaviour.
 //!
-//! Two servers are mounted (both behind the same auth as the REST API and the
-//! `NANOBPM_MCP_ENABLED` gate, default on — set it to `false`/`0`/`off`/`no`
-//! to disable):
+//! Two servers are mounted (both behind the same auth check as the REST API —
+//! [`mcp_auth`] applies the shared `ApiAuthBasic` credential extraction the
+//! generated `/v2` handlers use — and the `NANOBPM_MCP_ENABLED` gate, default
+//! on — set it to `false`/`0`/`off`/`no` to disable):
 //!
 //! - `/mcp/cluster` — Camunda's 18 static cluster tools (slice 2, this module).
 //! - `/mcp/processes` — dynamic per-process tools (slice 3, builds on the seam
@@ -172,6 +173,15 @@ impl ToolServer {
 /// This is the seam `main.rs` calls once. The returned router serves each
 /// server's `path` at HTTP POST. Slice 4 layers the `NANOBPM_MCP_ENABLED` gate
 /// and startup banner on top of this single call site.
+///
+/// **Auth:** every mounted path is wrapped in [`mcp_auth`], which runs the
+/// request through the *same* credential check the generated REST router
+/// applies to each `/v2` operation —
+/// [`apis::ApiAuthBasic::extract_claims_from_auth_header`] — and refuses the
+/// request with `401` (and `WWW-Authenticate`) when it yields no claims. The
+/// layer is applied to the whole MCP router here, so a future [`ToolServer`]
+/// registered above is covered by construction and cannot bypass it; the
+/// `every_mcp_route_sits_behind_auth` test guards that invariant.
 pub(crate) fn mcp_router(server: ServerImpl) -> axum::Router {
     let mut app = axum::Router::new();
     let servers = cluster_tools::cluster_tool_servers()
@@ -192,7 +202,55 @@ pub(crate) fn mcp_router(server: ServerImpl) -> axum::Router {
             ),
         );
     }
-    app
+    app.layer(axum::middleware::from_fn_with_state(server, mcp_auth))
+}
+
+/// The auth gate every MCP request passes through, mirroring the generated
+/// REST router's per-operation check (`generated/src/server/mod.rs`): extract
+/// claims from the `Authorization` header via the shared
+/// [`apis::ApiAuthBasic`] implementation and reject with `401` when it refuses
+/// the credentials. The `WWW-Authenticate` header advertises both schemes the
+/// REST layer accepts (`basicAuth` and `bearerAuth` in `spec/rest-api.yaml`).
+///
+/// Today `ServerImpl`'s `ApiAuthBasic` accepts any credentials (the REST API
+/// runs unsecured), so this passes exactly when `/v2` would — including with
+/// no `Authorization` header at all. The parity is structural: when secured
+/// mode is implemented in that one impl, both surfaces tighten together, and
+/// an MCP route can never drift onto a weaker check.
+async fn mcp_auth(
+    axum::extract::State(server): axum::extract::State<ServerImpl>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use nanobpm_gateway_rest::apis::{ApiAuthBasic, BasicAuthKind};
+    let claims = server
+        .extract_claims_from_auth_header(BasicAuthKind::Bearer, req.headers(), "authorization")
+        .await;
+    mcp_auth_finish(claims.is_some(), req, next).await
+}
+
+/// The decision half of [`mcp_auth`], split out so the 401 mapping is testable
+/// without a `ServerImpl` whose credentials are refused (the production impl
+/// accepts everything today): `authorized == false` short-circuits with `401`
+/// + `WWW-Authenticate`, exactly the generated router's `None`-claims branch.
+async fn mcp_auth_finish(
+    authorized: bool,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !authorized {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"nanobpm\", Bearer",
+            )],
+            "Unauthorized\n",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Reject a request whose transport metadata is unsafe before any parsing or
@@ -1432,6 +1490,125 @@ mod tests {
             axum::http::StatusCode::OK,
             "no Origin (non-browser client)"
         );
+    }
+
+    /// Auth parity, unsecured mode (the only mode the REST layer has today):
+    /// `ServerImpl`'s `ApiAuthBasic` accepts any credentials, so `/v2` accepts
+    /// a request with no, basic, or bearer credentials — and every MCP route
+    /// must behave identically. When secured mode lands in that one impl, both
+    /// surfaces tighten together; this test then pins the dev-mode contract.
+    #[tokio::test]
+    async fn every_mcp_route_sits_behind_auth() {
+        let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let app = mcp_router(ServerImpl::default());
+        for path in mcp_endpoint_paths() {
+            for (label, auth) in [
+                ("no credentials", None),
+                ("basic credentials", Some("Basic dXNlcjpwYXNz")),
+                ("bearer credentials", Some("Bearer some-token")),
+            ] {
+                use tower::ServiceExt;
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json");
+                if let Some(auth) = auth {
+                    req = req.header("authorization", auth);
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(req.body(axum::body::Body::from(frame.to_string())).unwrap())
+                    .await
+                    .expect("route responds");
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::OK,
+                    "{path} must accept a request exactly as unsecured /v2 does ({label})"
+                );
+            }
+        }
+    }
+
+    /// The 401 branch of the MCP auth gate: when the shared credential
+    /// extraction refuses a request (claims = `None`, the generated router's
+    /// unsecured→secured switch), the MCP surface must answer `401` with a
+    /// `WWW-Authenticate` challenge and never reach dispatch — the same
+    /// contract the generated `/v2` handlers produce. `ServerImpl` accepts
+    /// everything today, so this drives the decision half of `mcp_auth`
+    /// directly; `every_mcp_route_sits_behind_auth` covers the wired layer.
+    #[tokio::test]
+    async fn refused_credentials_get_401_with_challenge() {
+        use tower::ServiceExt;
+        // An authorized control request passes through to the inner service.
+        let app = axum::Router::new().route(
+            "/probe",
+            axum::routing::post(|| async { axum::http::StatusCode::OK }),
+        );
+        let app = app.layer(axum::middleware::from_fn(|req, next| {
+            mcp_auth_finish(true, req, next)
+        }));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // A refused request is short-circuited with 401 + challenge.
+        let app = axum::Router::new().route(
+            "/probe",
+            axum::routing::post(|| async { axum::http::StatusCode::OK }),
+        );
+        let app = app.layer(axum::middleware::from_fn(|req, next| {
+            mcp_auth_finish(false, req, next)
+        }));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(challenge.contains("Basic"), "{challenge}");
+        assert!(challenge.contains("Bearer"), "{challenge}");
+    }
+
+    /// A non-loopback `Origin` stays rejected (403) even when the request
+    /// carries credentials the auth layer accepts — the browser hardening is
+    /// defence in depth *on top of* auth, not a replacement for it.
+    #[tokio::test]
+    async fn foreign_origin_rejected_even_with_valid_credentials() {
+        let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        for auth in ["Basic dXNlcjpwYXNz", "Bearer some-token"] {
+            let (st, _) = post(
+                &[
+                    ("content-type", "application/json"),
+                    ("authorization", auth),
+                    ("origin", "https://evil.example"),
+                ],
+                frame.clone(),
+            )
+            .await;
+            assert_eq!(
+                st,
+                axum::http::StatusCode::FORBIDDEN,
+                "{auth}: a foreign Origin must still 403"
+            );
+        }
     }
 
     /// `initialize` negotiates the protocol version and server identity.

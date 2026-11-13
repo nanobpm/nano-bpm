@@ -29022,9 +29022,10 @@ async fn main() {
 
     // MCP gateway (issue #1499 slice 2). On by default (operator decision,
     // epic #1499); mounted unless `NANOBPM_MCP_ENABLED` is explicitly falsy
-    // (`false`/`0`/`off`/`no`). The endpoint sits behind the same auth
-    // middleware as the REST API (the generated router's `ApiAuthBasic` guard
-    // applies app-wide).
+    // (`false`/`0`/`off`/`no`). The endpoints sit behind the same auth check
+    // as the REST API: `mcp::mcp_router` layers every `/mcp/*` route in
+    // `mcp_auth`, which applies the shared `ApiAuthBasic` credential
+    // extraction the generated `/v2` handlers use (see server/src/mcp/mod.rs).
     if mcp::mcp_enabled() {
         app = app.merge(mcp::mcp_router(mcp_server));
         tracing::info!(
