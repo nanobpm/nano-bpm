@@ -1316,3 +1316,68 @@ fn modify_created_flow_scope_arms_its_event_subprocesses() {
     complete_one(&mut engine, "work");
     assert!(engine.is_completed(inst));
 }
+
+#[test]
+fn modify_created_flow_scope_evaluates_a_conditional_event_subprocess_on_open() {
+    // A conditional ESP armed by a ModifyInstance-created scope must get its
+    // initial evaluation: the `ConditionalSubscriptionCreated` event the arming
+    // emits is picked up by the same drain's `reevaluate_conditionals`, so a
+    // condition that already holds fires in the same command.
+    //
+    // Same shape as `modify_created_flow_scope_arms_its_event_subprocesses`,
+    // but the ESP is conditional (`=flag`, already `true` at the root).
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("w", "work")
+        .end_event("e")
+        .connect("s", "w")
+        .connect("w", "e")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("inner", "innerwork")
+        .end_event("sub_e")
+        .connect("sub_s", "inner")
+        .connect("inner", "sub_e")
+        .contained_in("sub_s", "sub")
+        .contained_in("inner", "sub")
+        .contained_in("sub_e", "sub")
+        .event_sub_process("esp", "esp_start", cond(), false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .contained_in("esp", "sub")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    // `flag` is already true (the `start` helper seeds it false; set it).
+    engine
+        .apply_command(Command::SetVariables {
+            scope_key: inst,
+            variables: vars(&[("flag", Value::Bool(true))]),
+            local: false,
+        })
+        .unwrap();
+
+    let events = engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![crate::ActivateElementInstruction::new("inner")],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp")
+        ),
+        "the conditional ESP fires on the modify-created scope in the same \
+         command: {events:?}"
+    );
+}
