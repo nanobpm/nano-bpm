@@ -1223,6 +1223,7 @@ fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
             element_id: stale_eid,
             kind: stale_kind,
             variables: HashMap::new(),
+            delivery_key: 0,
         })
         .unwrap();
     assert!(

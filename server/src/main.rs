@@ -9547,6 +9547,7 @@ impl ServerImpl {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => {
                 let target =
                     nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions);
@@ -9558,6 +9559,7 @@ impl ServerImpl {
                     message_name: message_name.clone(),
                     correlation_key: correlation_key.clone(),
                     kind: kind.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9569,6 +9571,7 @@ impl ServerImpl {
                 element_id,
                 kind,
                 variables,
+                delivery_key,
             } => {
                 let target = nanobpmn_engine_core::partition_of(*instance_key);
                 let command = Command::CorrelateMessageSubscription {
@@ -9579,6 +9582,7 @@ impl ServerImpl {
                     element_id: element_id.clone(),
                     kind: kind.clone(),
                     variables: variables.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9588,6 +9592,7 @@ impl ServerImpl {
                 element_instance_key,
                 element_id,
                 correlation_key,
+                delivery_key,
                 ..
             } => {
                 let target =
@@ -9597,6 +9602,7 @@ impl ServerImpl {
                     instance_key: *instance_key,
                     element_instance_key: *element_instance_key,
                     element_id: element_id.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9608,6 +9614,7 @@ impl ServerImpl {
                 business_id,
                 target_partition,
                 message_start,
+                delivery_key,
             } => {
                 let command = Command::DispatchStartInstance {
                     process_id: process_id.clone(),
@@ -9616,6 +9623,7 @@ impl ServerImpl {
                     tags: tags.clone(),
                     business_id: business_id.clone(),
                     message_start: message_start.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((*target_partition, command))
             }
@@ -27792,7 +27800,7 @@ async fn main() {
                     let mut per_partition: Vec<Vec<Event>> =
                         (0..partitions).map(|_| Vec::new()).collect();
                     for event in events {
-                        let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
+                        let p = event.owning_partition() as usize;
                         per_partition[p.min(partitions - 1)].push(event);
                     }
 
@@ -27917,7 +27925,7 @@ async fn main() {
                             }
                             continue;
                         }
-                        let p = nanobpmn_engine_core::partition_of(event.max_key());
+                        let p = event.owning_partition();
                         if let Some(bucket) = per_owned.get_mut(&p) {
                             bucket.push(event);
                         }

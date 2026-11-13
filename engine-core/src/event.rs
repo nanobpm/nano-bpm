@@ -792,6 +792,45 @@ pub enum Event {
         outcome: crate::state::JobSettlementOutcome,
         lease_token: String,
     },
+    /// A **routed cross-partition delivery was applied** (#1497): the recipient
+    /// partition records the source-minted `delivery_key` of a routed follow-up
+    /// (`OpenMessageSubscription` / `CorrelateMessageSubscription` /
+    /// `CloseMessageSubscription` / `DispatchStartInstance`) it applied, so a
+    /// re-delivery of the same `delivery_key` — a host re-delivery
+    /// after a lost acknowledgement — is acknowledged WITHOUT being re-applied
+    /// (at-least-once transport ⇒ exactly-once effect, Zeebe's command
+    /// distribution dedup).
+    ///
+    /// For a `CloseMessageSubscription` the record doubles as the **close
+    /// tombstone**: it additionally carries the `subscription_key` it closed,
+    /// so a delayed `OpenMessageSubscription` for that subscription — which
+    /// bears its OWN, different `delivery_key` — that lands after its close is
+    /// rejected instead of resurrecting a subscription for a cancelled
+    /// instance. (`None` for the non-subscription `DispatchStartInstance`.)
+    /// Replicated through the partition's log, so every replica holds the same
+    /// ledger; bounded by [`crate::state::ROUTED_DELIVERY_LEDGER_CAP`].
+    /// Additive variant: a journal written before #1497 never contains it.
+    RoutedDeliveryRecorded {
+        /// The source partition's minted delivery identity (see the routed
+        /// source events' `delivery_key`).
+        delivery_key: Key,
+        /// The RECIPIENT partition that applied (and owns) this ledger record.
+        /// `delivery_key` is minted on the SOURCE partition, so a key-derived
+        /// split (`partition_of(max_key())`, the legacy shared-journal
+        /// recovery) would file it under the sender; recovery routes the record
+        /// by this field instead (see [`Event::owning_partition`]).
+        #[cfg_attr(feature = "serde", serde(default))]
+        recipient_partition: u64,
+        /// The subscription this delivery concerned, recorded so a close
+        /// tombstones it against a late open. `None` for a start-instance
+        /// dispatch (no subscription).
+        #[cfg_attr(feature = "serde", serde(default))]
+        subscription_key: Option<Key>,
+        /// `true` for a `CloseMessageSubscription` delivery: the record is the
+        /// close tombstone for `subscription_key`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        close_tombstone: bool,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
@@ -1145,6 +1184,14 @@ pub enum Event {
     /// advance the token. Only emitted when `num_partitions > 1` and the key
     /// hashes off-partition — a single-partition host never produces it, so its
     /// log is byte-identical to before.
+    ///
+    /// `delivery_key` is the **stable delivery identity** (#1497) the host's
+    /// bounded re-drive carries to the message partition: minted on this (the
+    /// source) partition when the event is emitted, it lets the recipient
+    /// deduplicate a re-delivered `OpenMessageSubscription` after a lost
+    /// acknowledgement (at-least-once ⇒ exactly-once). `0` on a record written
+    /// before #1497, which the recipient treats as "no identity" (no dedup —
+    /// the legacy best-effort path).
     MessageSubscriptionOpening {
         subscription_key: Key,
         instance_key: Key,
@@ -1153,6 +1200,8 @@ pub enum Event {
         message_name: String,
         correlation_key: String,
         kind: MessageSubscriptionKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A published message correlated to an open subscription. For an
     /// intermediate catch event its token is released along the event's outgoing
@@ -1174,6 +1223,14 @@ pub enum Event {
     /// the message's variables) so the host can route a
     /// [`crate::Command::CorrelateMessageSubscription`] to the instance partition,
     /// where the token actually advances. Only produced when `num_partitions > 1`.
+    ///
+    /// `delivery_key` is the stable delivery identity (#1497) a host re-delivery
+    /// carries with the continuation: minted on this (the message) partition, it
+    /// lets the instance partition deduplicate a re-delivered
+    /// `CorrelateMessageSubscription` after a lost acknowledgement — the guard
+    /// that keeps a retried **non-interrupting** boundary correlation (whose
+    /// `Opening` record intentionally stays open) from spawning a second token.
+    /// `0` on a pre-#1497 record: no dedup (the legacy path).
     RemoteMessageCorrelation {
         subscription_key: Key,
         message_key: Key,
@@ -1182,6 +1239,8 @@ pub enum Event {
         element_id: ElementId,
         kind: MessageSubscriptionKind,
         variables: HashMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A published message correlated to a process-level **message start
     /// event** and created instance `instance_key` (#1300; Zeebe records this as
@@ -1565,6 +1624,14 @@ pub enum Event {
     /// [`Event::MessageSubscriptionOpening`]: only emitted when the canonical
     /// subscription lives off-partition, so a single-partition log never
     /// produces it and stays byte-identical.
+    ///
+    /// `delivery_key` is the stable delivery identity (#1497) a host re-delivery
+    /// carries with the routed close: minted on this (the instance) partition,
+    /// it lets the message partition record a **close tombstone** so an
+    /// `OpenMessageSubscription` that arrives *after* its close (an instance
+    /// cancelled while the open was still backing off) is rejected instead of
+    /// resurrecting a live subscription for the dead instance. `0` on a
+    /// pre-#1497 record: no tombstone (the legacy path).
     MessageSubscriptionClosing {
         subscription_key: Key,
         instance_key: Key,
@@ -1572,6 +1639,8 @@ pub enum Event {
         element_id: ElementId,
         message_name: String,
         correlation_key: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
@@ -1624,6 +1693,14 @@ pub enum Event {
         /// correlation once it mints the instance. `None` for timer starts.
         #[cfg_attr(feature = "serde", serde(default))]
         message_start: Option<MessageStartCorrelation>,
+        /// The stable delivery identity (#1497) a host re-delivery carries with
+        /// the routed `DispatchStartInstance`: minted on this (the deploy)
+        /// partition, it lets the target partition deduplicate a re-delivered
+        /// dispatch after a lost acknowledgement — the guard that keeps a retry
+        /// from minting a SECOND process instance. `0` on a pre-#1497 record:
+        /// no dedup (the legacy path).
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
 
     /// An engine-native AgentInstance was created (Camunda `AgentInstanceIntent.CREATED`,
@@ -1841,6 +1918,7 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
+            | Event::RoutedDeliveryRecorded { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }
@@ -1902,6 +1980,60 @@ impl Event {
     /// engine and stamped onto events, so the log is an exact record of them —
     /// including transient ones like completed element-instance keys that no
     /// longer appear in final state.)
+    /// The source-minted routed-delivery identity (#1497) this event carries,
+    /// if it is one of the four routable source events
+    /// (`MessageSubscriptionOpening` / `RemoteMessageCorrelation` /
+    /// `MessageSubscriptionClosing` / `StartInstanceDispatched`) with a non-zero
+    /// key. These keys are minted by THIS partition's allocator, so recovery
+    /// must advance past them ([`Event::advance_allocator`]) or a restarted
+    /// node re-issues an already-delivered identity and the recipient drops a
+    /// genuinely new delivery as a duplicate.
+    pub fn source_delivery_key(&self) -> Option<Key> {
+        let k = match self {
+            Event::MessageSubscriptionOpening { delivery_key, .. }
+            | Event::RemoteMessageCorrelation { delivery_key, .. }
+            | Event::MessageSubscriptionClosing { delivery_key, .. }
+            | Event::StartInstanceDispatched { delivery_key, .. } => *delivery_key,
+            _ => return None,
+        };
+        (k != 0).then_some(k)
+    }
+
+    /// Advance a partition's local key allocator (`next_local`) past every key
+    /// this event proves `partition_id` already minted — the single canonical
+    /// replay/recovery fold (#1497). Considers [`Event::max_key`] and,
+    /// independently, [`Event::source_delivery_key`]: the latter is checked on
+    /// its own because a routed event can also carry a higher FOREIGN key (e.g.
+    /// a `RemoteMessageCorrelation` naming an instance on a higher partition),
+    /// which would otherwise mask the local delivery key behind the
+    /// `partition_of(max) == partition_id` guard.
+    pub fn advance_allocator(&self, partition_id: u64, next_local: &mut u64) {
+        for k in [Some(self.max_key()), self.source_delivery_key()]
+            .into_iter()
+            .flatten()
+        {
+            if crate::state::partition_of(k) == partition_id {
+                *next_local = (*next_local).max(crate::state::local_of(k));
+            }
+        }
+    }
+
+    /// The partition that owns this event when a shared (untagged) journal is
+    /// split per partition on recovery. Normally the partition encoded in
+    /// [`Event::max_key`]; a [`Event::RoutedDeliveryRecorded`] record instead
+    /// belongs to its `recipient_partition`, because its only key was minted on
+    /// the SOURCE partition (#1497). Every key-derived split must go through
+    /// this, never `partition_of(max_key())` directly.
+    pub fn owning_partition(&self) -> u64 {
+        match self {
+            Event::RoutedDeliveryRecorded {
+                recipient_partition,
+                ..
+            } => *recipient_partition,
+            _ => crate::state::partition_of(self.max_key()),
+        }
+    }
+
     pub fn max_key(&self) -> Key {
         let mut m = self.instance_key().unwrap_or(0);
         match self {
@@ -2020,6 +2152,13 @@ impl Event {
                 ..
             } => {
                 m = m.max(*job_key).max(crate::lease::issued_key(lease_token));
+            }
+            // The recorded key was minted on the SOURCE partition; folding it
+            // in is harmless because the allocator fold is partition-scoped
+            // (`partition_of(k) == partition_id`), so a foreign key never
+            // advances this partition's counter.
+            Event::RoutedDeliveryRecorded { delivery_key, .. } => {
+                m = m.max(*delivery_key);
             }
             Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }

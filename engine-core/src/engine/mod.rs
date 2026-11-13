@@ -767,10 +767,7 @@ impl Engine {
                 start_dispatch_rr = rr;
                 continue;
             }
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == partition_id {
-                next_local = next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(partition_id, &mut next_local);
             state::apply(&mut state, &event);
         }
         Self {
@@ -1455,10 +1452,7 @@ impl Engine {
             // and the replica forks. Keys minted by OTHER partitions never advance
             // this counter (partition guard), so the common in-memory fan-out to
             // non-owning partitions is unchanged.
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == self.partition_id {
-                self.next_local = self.next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(self.partition_id, &mut self.next_local);
             if matches!(
                 event,
                 Event::ProcessDeployed { .. }
@@ -1486,10 +1480,7 @@ impl Engine {
     /// [`install_deployment`](Self::install_deployment).
     pub fn install_deployment_if_newer(&mut self, events: &[Event]) {
         for event in events {
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == self.partition_id {
-                self.next_local = self.next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(self.partition_id, &mut self.next_local);
             if matches!(
                 event,
                 Event::ProcessDeployed { .. }
@@ -1599,6 +1590,10 @@ impl Engine {
                 message_start,
             );
         } else {
+            // Mint the stable delivery identity (#1497) on THIS (the source)
+            // partition: a host re-delivery carries it to the target, whose
+            // routed-delivery ledger dedups a re-delivery after a lost ack.
+            let delivery_key = self.mint_key();
             self.emit(
                 log,
                 Event::StartInstanceDispatched {
@@ -1609,6 +1604,7 @@ impl Engine {
                     business_id,
                     target_partition: target,
                     message_start,
+                    delivery_key,
                 },
             );
         }
@@ -4200,7 +4196,11 @@ impl Engine {
                         // The instance lives on another partition: settle the
                         // canonical subscription here and hand the token-advance to
                         // the host, which routes a `CorrelateMessageSubscription`
-                        // continuation to `partition_of(instance_key)`.
+                        // continuation to `partition_of(instance_key)`. Mint the
+                        // stable delivery identity (#1497) on THIS (the message)
+                        // partition so the instance partition dedups a re-driven
+                        // continuation after a lost ack.
+                        let delivery_key = self.mint_key();
                         self.emit(
                             &mut log,
                             Event::RemoteMessageCorrelation {
@@ -4211,6 +4211,7 @@ impl Engine {
                                 element_id,
                                 kind,
                                 variables: variables.clone(),
+                                delivery_key,
                             },
                         );
                     }
@@ -4330,7 +4331,22 @@ impl Engine {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered open whose
+                // `delivery_key` this partition already recorded is acknowledged
+                // without being re-applied.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
+                // Close tombstone (#1497): a `CloseMessageSubscription` for this
+                // subscription that landed BEFORE its delayed open (the instance
+                // was cancelled while the open backed off) recorded the
+                // `subscription_key`; the late open must NOT resurrect a live
+                // subscription for the dead instance.
+                if self.state.routed_deliveries.is_tombstoned(subscription_key) {
+                    return Ok((log, queue));
+                }
                 // Idempotent: re-delivering an open for a subscription we already
                 // hold (at-least-once retry, or a duplicate) is a no-op.
                 if !self
@@ -4351,6 +4367,17 @@ impl Engine {
                         },
                     );
                 }
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::CorrelateMessageSubscription {
@@ -4361,7 +4388,18 @@ impl Engine {
                 element_id,
                 kind,
                 variables,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered
+                // continuation whose `delivery_key` this partition already
+                // recorded is acknowledged without being re-applied. This is the
+                // guard that keeps a retried **non-interrupting** boundary
+                // correlation — whose `Opening` record intentionally stays open,
+                // so the state check below alone would re-fire it — from
+                // spawning a second token after a lost ack.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 // Advance only while the local record is still `Opening` (a parked
                 // token). Once it settles to `Correlated`/`Canceled` — or the
                 // instance is gone — a redelivered continuation is safely ignored,
@@ -4405,6 +4443,17 @@ impl Engine {
                         &variables,
                     );
                 }
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::CloseMessageSubscription {
@@ -4412,7 +4461,14 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered close
+                // whose `delivery_key` is already recorded is acknowledged
+                // without being re-applied.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 // Disarm the canonical subscription because the instance partition
                 // tore down the waiting element. Idempotent: only an open
                 // subscription is cancelled.
@@ -4431,6 +4487,22 @@ impl Engine {
                             instance_key,
                             element_instance_key,
                             element_id,
+                        },
+                    );
+                }
+                // Close tombstone (#1497): record the delivery EVEN WHEN no
+                // canonical record existed (the close landed before its delayed
+                // open). The recorded key then rejects the late
+                // `OpenMessageSubscription` for the same `subscription_key`, so
+                // a cancelled instance's subscription is never resurrected.
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: true,
                         },
                     );
                 }
@@ -5261,7 +5333,15 @@ impl Engine {
                 tags,
                 business_id,
                 message_start,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered dispatch
+                // whose `delivery_key` this partition already recorded is
+                // acknowledged WITHOUT minting a second process instance — the
+                // lost-ack duplicate the re-drive would otherwise create.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 check_business_id(business_id.as_deref())?;
                 // Routed from the deploy partition's StartInstanceDispatched: mint
                 // the start-triggered instance here, in this partition's namespace,
@@ -5276,6 +5356,17 @@ impl Engine {
                     business_id,
                     message_start,
                 );
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: None,
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::ActivateAdHocActivities {
@@ -15357,6 +15448,29 @@ impl Engine {
                 instance_key,
                 canceled_at,
                 deadline: self.job_terminal_deadline(job_key),
+            },
+            // The stable delivery identity (#1497) of a routable
+            // `MessageSubscriptionClosing` is minted HERE — the single
+            // `&mut self` event choke point — because the disarm sites
+            // (`disarm_subscription_event` and the `&self` teardown helpers
+            // above it) cannot mint. A `0` means "not yet minted"; a non-zero
+            // value (none today — the disarm path always emits `0`) is kept.
+            Event::MessageSubscriptionClosing {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                delivery_key: 0,
+            } => Event::MessageSubscriptionClosing {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                delivery_key: self.mint_key(),
             },
             other => other,
         };

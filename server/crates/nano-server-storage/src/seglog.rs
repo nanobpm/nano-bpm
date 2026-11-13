@@ -1516,7 +1516,7 @@ fn read_segment_events_tagged_with(
         };
         let event = decode_event_json(json)?;
         let tag = tag.unwrap_or_else(|| {
-            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+            (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         Ok((tag, event))
     })
@@ -2192,7 +2192,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
         let event =
             decode_event_json(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tag = tag.unwrap_or_else(|| {
-            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+            (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         events.push((tag, event));
     }

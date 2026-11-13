@@ -200,10 +200,7 @@ impl Engine {
                 self.start_dispatch_rr = start_dispatch_rr;
                 continue;
             }
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == self.partition_id {
-                self.next_local = self.next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(self.partition_id, &mut self.next_local);
             state::apply(&mut self.state, &event);
         }
     }

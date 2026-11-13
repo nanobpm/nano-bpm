@@ -799,6 +799,15 @@ fn build_event_witnesses() -> Vec<Event> {
                 message_name: "m".to_string(),
                 correlation_key: "c".to_string(),
             }),
+            delivery_key: 25,
+        },
+        // The #1497 routed-delivery ledger frame (additive variant, no version
+        // bump): the recipient partition's dedup / close-tombstone record.
+        Event::RoutedDeliveryRecorded {
+            delivery_key: 25,
+            recipient_partition: 2,
+            subscription_key: Some(6),
+            close_tombstone: true,
         },
         // The #1402 carried-selection frame: a split gateway journals the
         // outgoing-flow indices it picked while ACTIVATING so completion takes
@@ -934,6 +943,43 @@ fn pre_1300_start_instance_dispatched_decodes_with_defaults() {
             ..
         }
     ));
+}
+
+/// The #1497 additive `delivery_key` fields default to `0` ("no identity") when
+/// absent: pre-#1497 records of all four routed source events still decode (no
+/// format bump), and the recipient treats `0` as the legacy no-dedup path.
+#[test]
+fn pre_1497_routed_events_decode_with_zero_delivery_key() {
+    let cases = [
+        (
+            r#"{"StartInstanceDispatched":{"process_id":"p","start_element_id":"s","variables":{},"target_partition":1}}"#,
+            "StartInstanceDispatched",
+        ),
+        (
+            r#"{"MessageSubscriptionOpening":{"subscription_key":1,"instance_key":2,"element_instance_key":3,"element_id":"e","message_name":"m","correlation_key":"c","kind":"IntermediateCatch"}}"#,
+            "MessageSubscriptionOpening",
+        ),
+        (
+            r#"{"MessageSubscriptionClosing":{"subscription_key":1,"instance_key":2,"element_instance_key":3,"element_id":"e","message_name":"m","correlation_key":"c"}}"#,
+            "MessageSubscriptionClosing",
+        ),
+        (
+            r#"{"RemoteMessageCorrelation":{"subscription_key":1,"message_key":2,"instance_key":3,"element_instance_key":4,"element_id":"e","kind":"IntermediateCatch","variables":{}}}"#,
+            "RemoteMessageCorrelation",
+        ),
+    ];
+    for (json, name) in cases {
+        let decoded = nanobpmn_engine_core::decode_event_json(json)
+            .unwrap_or_else(|e| panic!("decode old {name}: {e}"));
+        let delivery_key = match decoded {
+            Event::StartInstanceDispatched { delivery_key, .. }
+            | Event::MessageSubscriptionOpening { delivery_key, .. }
+            | Event::MessageSubscriptionClosing { delivery_key, .. }
+            | Event::RemoteMessageCorrelation { delivery_key, .. } => delivery_key,
+            other => panic!("{name} decoded to {other:?}"),
+        };
+        assert_eq!(delivery_key, 0, "{name} defaults delivery_key to 0");
+    }
 }
 
 /// The #1405 additive `start_dispatch_rr` cursor defaults when absent: a

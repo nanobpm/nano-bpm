@@ -6702,6 +6702,9 @@ fn project_event(
         | Event::ProcessStartTimerFired { .. }
         // A Raft applied-entry record (#1405): no read-model state.
         | Event::RaftEntryApplied { .. }
+        // Engine-internal routed-delivery dedup / close-tombstone ledger
+        // (#1497): no read-model projection.
+        | Event::RoutedDeliveryRecorded { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
@@ -11802,6 +11805,7 @@ mod element_instance_tests {
                 element_id: "await".to_string(),
                 kind: MessageSubscriptionKind::IntermediateCatch,
                 variables: std::collections::HashMap::new(),
+                delivery_key: 0,
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());

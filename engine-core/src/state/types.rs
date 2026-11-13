@@ -1773,6 +1773,126 @@ pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
 /// dropped token on a still-live job remains fenced by [`Job::settled_tokens`].
 pub const SETTLED_TOKENS_PER_JOB_CAP: usize = 8;
 
+/// Upper bound on [`State::routed_deliveries`] (#1497). Beyond it the entries
+/// this partition **applied earliest** are dropped (FIFO in the recipient's own
+/// applied order — never by key value: keys sort by source partition first, so
+/// key-order eviction would let a fresh delivery from a low partition evict
+/// itself the moment it is recorded). A re-delivery that old degrades to the
+/// pre-#1497 answer (applied again), never to a lost first delivery — the same
+/// degrade-to-previous-behaviour rule as [`SETTLED_JOB_LEDGER_CAP`].
+pub const ROUTED_DELIVERY_LEDGER_CAP: usize = 65_536;
+
+/// One routed-delivery ledger entry (#1497): the source-minted `delivery_key`
+/// (the dedup key) plus, for a subscription follow-up, the `subscription_key`
+/// it concerned, and whether it is a **close tombstone** (a
+/// `CloseMessageSubscription`) that rejects a delayed `OpenMessageSubscription`
+/// for that subscription (which bears its own, different `delivery_key`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RoutedDelivery {
+    pub delivery_key: Key,
+    /// `Some` for a subscription open/close/correlate; `None` for a
+    /// start-instance dispatch.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub subscription_key: Option<Key>,
+    /// `true` only for a `CloseMessageSubscription` delivery.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub close_tombstone: bool,
+}
+
+/// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
+/// close-tombstone index, kept consistent by [`RoutedDeliveries::record`]
+/// (the only mutator). Derived solely from replicated
+/// [`crate::Event::RoutedDeliveryRecorded`] records applied in log order, so
+/// every replica — and every snapshot/replay — holds the identical ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        from = "std::collections::VecDeque<RoutedDelivery>",
+        into = "std::collections::VecDeque<RoutedDelivery>"
+    )
+)]
+pub struct RoutedDeliveries {
+    /// Entries in the order this partition APPLIED them (oldest first). The
+    /// eviction order and the serialized source of truth.
+    order: std::collections::VecDeque<RoutedDelivery>,
+    /// `delivery_key` membership index (derived from `order`).
+    keys: std::collections::HashSet<Key>,
+    /// `subscription_key -> delivery_key` of the live close tombstone (derived
+    /// from `order`): an O(1) lookup instead of a ledger scan per open.
+    tombstones: std::collections::HashMap<Key, Key>,
+}
+
+impl RoutedDeliveries {
+    /// Whether `delivery_key` was already applied (and is still retained).
+    pub fn contains(&self, delivery_key: Key) -> bool {
+        self.keys.contains(&delivery_key)
+    }
+    /// Whether a retained close tombstone exists for `subscription_key`.
+    pub fn is_tombstoned(&self, subscription_key: Key) -> bool {
+        self.tombstones.contains_key(&subscription_key)
+    }
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    /// Retained entries, oldest-applied first.
+    pub fn iter(&self) -> impl Iterator<Item = &RoutedDelivery> {
+        self.order.iter()
+    }
+    /// Record an applied delivery, evicting the earliest-APPLIED entries
+    /// beyond `cap`. A key already present is a no-op (never re-ordered).
+    pub fn record(&mut self, entry: RoutedDelivery, cap: usize) {
+        if !self.keys.insert(entry.delivery_key) {
+            return;
+        }
+        if entry.close_tombstone {
+            if let Some(sub) = entry.subscription_key {
+                self.tombstones.insert(sub, entry.delivery_key);
+            }
+        }
+        self.order.push_back(entry);
+        while self.order.len() > cap {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.keys.remove(&old.delivery_key);
+            if let Some(sub) = old.subscription_key {
+                if self.tombstones.get(&sub) == Some(&old.delivery_key) {
+                    self.tombstones.remove(&sub);
+                }
+            }
+        }
+    }
+}
+
+/// Serialized form is the applied-order list only; the indexes are rebuilt on
+/// load, so a snapshot can never carry an index that drifted from `order`.
+impl From<std::collections::VecDeque<RoutedDelivery>> for RoutedDeliveries {
+    fn from(order: std::collections::VecDeque<RoutedDelivery>) -> Self {
+        let mut l = Self::default();
+        for e in order {
+            l.record(e, usize::MAX);
+        }
+        l
+    }
+}
+
+impl From<RoutedDeliveries> for std::collections::VecDeque<RoutedDelivery> {
+    fn from(l: RoutedDeliveries) -> Self {
+        l.order
+    }
+}
+
+/// Record a routed delivery in `state`'s ledger (bounded by `cap`).
+pub fn record_routed_delivery(state: &mut State, entry: RoutedDelivery, cap: usize) {
+    state.routed_deliveries.record(entry, cap);
+}
+
 /// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.
 ///
 /// Entries are keyed by job but **retained per lease token** (#1181): a later
@@ -1846,6 +1966,25 @@ pub struct State {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub settled_jobs: BTreeMap<Key, Vec<JobSettlement>>,
+    /// The **routed-delivery ledger** (#1497): the source-minted
+    /// `delivery_key` of every routed cross-partition follow-up this partition
+    /// applied (`OpenMessageSubscription` / `CorrelateMessageSubscription` /
+    /// `CloseMessageSubscription` / `DispatchStartInstance`). A re-delivered
+    /// command carrying an already-recorded key is acknowledged without being
+    /// re-applied (at-least-once transport ⇒ exactly-once effect); a
+    /// `CloseMessageSubscription` records its key even when no canonical
+    /// subscription exists yet, and its entry carries the `subscription_key`
+    /// so it doubles as the **close tombstone** that rejects a delayed open
+    /// landing after its close. Derived only from the replicated
+    /// [`crate::Event::RoutedDeliveryRecorded`], so every replica holds the
+    /// same ledger; bounded by [`ROUTED_DELIVERY_LEDGER_CAP`].
+    /// `serde(default)`: snapshots written before #1497 load with an empty
+    /// ledger.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "RoutedDeliveries::is_empty")
+    )]
+    pub routed_deliveries: RoutedDeliveries,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.
