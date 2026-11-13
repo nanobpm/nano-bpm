@@ -1794,6 +1794,27 @@ pub enum Event {
         /// duplicate resolves to.
         original_agent_history_key: Key,
     },
+
+    /// An instance's off-heap variable payload was quarantined as lost and the
+    /// surviving state transitioned **identically on every replica** (#1574
+    /// review). Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
+    /// alongside its `IncidentRaised`, this is the replayable record of the
+    /// repair: its reducer clears the resident instance's `variables_spilled`
+    /// flag (keeping the surviving resident map) and records the instance in
+    /// [`crate::state::State::variables_lost_quarantined`], the replicated dedup
+    /// tombstone the quarantine idempotency guard reads. Because the transition
+    /// rides the replicated event log, every replica — spilled, rehydrated, or
+    /// cold — lands on the same surviving payload, and a crash/restart replays
+    /// it instead of resurrecting the discarded store payload. `repair` is
+    /// `serde(default)` so a record written before the field existed decodes
+    /// with `repair: false` (the incident alone was the durable fact then).
+    VariablesLostQuarantined {
+        instance_key: Key,
+        /// `true` when the surviving resident-variable transition was applied.
+        /// `serde(default)` for forward/backward-compatible replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        repair: bool,
+    },
 }
 
 impl Event {
@@ -1885,6 +1906,7 @@ impl Event {
             | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
+            | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no

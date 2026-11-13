@@ -4230,6 +4230,7 @@
     "signal_subscriptions": {},
     "start_timers": {},
     "timers": {},
-    "user_tasks": {}
+    "user_tasks": {},
+    "variables_lost_quarantined": []
   }
 }

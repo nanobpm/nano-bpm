@@ -1709,6 +1709,17 @@ impl Journal {
             // (a later command rehydrated it) — there is no outstanding loss.
             OrphanKind::Resident if !self.engine.is_variables_spilled(key) => false,
             OrphanKind::Resident => matches!(self.peek_spilled_variables(key), Ok(None)),
+            // A cold report is stale once the key has left the cold index (a
+            // successful rehydrate_cold removed it AND its row): the miss then
+            // describes a legitimately-consumed row, not a lost payload (#1574).
+            OrphanKind::Cold
+                if !self
+                    .cold
+                    .as_ref()
+                    .is_some_and(|cold| cold.index.contains(key)) =>
+            {
+                false
+            }
             OrphanKind::Cold => matches!(self.peek_cold_instance(key), Ok(None)),
         };
         if !still_absent {
@@ -1733,37 +1744,36 @@ impl Journal {
     }
 
     /// Replica-local repair on applying a STAMPED `QuarantineOffheapOrphan`
-    /// (#1447), identical on every replica whatever it found locally: the
-    /// instance's off-heap payload is declared lost cluster-wide, so a spilled
-    /// resident instance keeps only its surviving resident variables (flag
-    /// cleared, dead spill row forgotten) and a cold instance leaves the cold
-    /// index (row forgotten). Settles the report. Without this, the next
-    /// snapshot fails again on the same absent row.
+    /// (#1447). The *engine-state* transition (clearing the resident spill flag so
+    /// the instance keeps its surviving resident map) is applied by the companion
+    /// [`Event::VariablesLostQuarantined`] reducer — identically on every replica,
+    /// whatever it found locally (#1574 review) — so this host-side pass only
+    /// settles the report and forgets the now-dead off-heap rows (spill / cold),
+    /// and marks the surviving map dirty so a lean checkpoint persists it (the
+    /// reducer's flag clear is not a variable event, so the dirty tracker never
+    /// fires for it). Without the forgets, the next snapshot fails again on the
+    /// same absent row.
     fn repair_orphan_reference(&mut self, key: Key) {
         self.orphans.backlog.remove(&key);
         self.orphans.in_flight.remove(&key);
         self.orphans.inbox.forget(key);
-        if self.engine.is_variables_spilled(key) {
-            let resident = self
-                .engine
-                .instance(key)
-                .map(|i| Arc::clone(&i.variables))
-                .unwrap_or_default();
-            self.engine.rehydrate_variables(key, resident);
-            // The repair rehydrates WITHOUT an event, so the dirty tracker never
-            // fires for it. Mark the surviving map dirty explicitly: otherwise a
-            // lean checkpoint omits the replacement and a restart reloads the
-            // discarded store payload (#1574 review).
-            self.engine.mark_variables_dirty(key);
-            if self.varstore.is_none()
-                && let Some(Err(err)) = self.spill.as_ref().map(|vs| vs.store.forget(&[key]))
-            {
-                tracing::error!(
-                    instance_key = key,
-                    error = %err,
-                    "orphan repair: dead spill row could not be forgotten (latched for retry)"
-                );
-            }
+        // The event reducer already cleared the spill flag and kept the
+        // surviving resident map; that flag clear is not a variable event, so
+        // the dirty tracker never fires for it. Mark the surviving map dirty
+        // unconditionally (a no-op for a non-resident/unknown key): otherwise a
+        // lean checkpoint omits the replacement and a restart reloads the
+        // discarded store payload (#1574 review).
+        self.engine.mark_variables_dirty(key);
+        // Forget the now-dead spill row. The reducer already cleared the flag,
+        // so gate on the store being wired, not the (now-cleared) flag.
+        if self.varstore.is_none()
+            && let Some(Err(err)) = self.spill.as_ref().map(|vs| vs.store.forget(&[key]))
+        {
+            tracing::error!(
+                instance_key = key,
+                error = %err,
+                "orphan repair: dead spill row could not be forgotten (latched for retry)"
+            );
         }
         if let Some(cold) = self.cold.as_mut()
             && cold.index.contains(key)
@@ -7352,7 +7362,10 @@ mod tests {
         let (events, commit) = journal.apply_command_at(command, 42).unwrap();
         commit.blocking_wait();
         assert_eq!(
-            events.len(),
+            events
+                .iter()
+                .filter(|e| matches!(e, nanobpmn_engine_core::Event::IncidentRaised { .. }))
+                .count(),
             1,
             "the incident is recorded for a cold instance"
         );
@@ -7381,7 +7394,14 @@ mod tests {
         commit.blocking_wait();
         let (on_cold, commit) = cold.apply_command_at(command, 42).unwrap();
         commit.blocking_wait();
-        assert_eq!(on_resident.len(), 1, "one incident event");
+        assert_eq!(
+            on_resident
+                .iter()
+                .filter(|e| matches!(e, nanobpmn_engine_core::Event::IncidentRaised { .. }))
+                .count(),
+            1,
+            "one incident event"
+        );
         assert_eq!(on_resident, on_cold, "identical events on both replicas");
         let incidents = |j: &Journal| {
             j.state()
@@ -7458,6 +7478,49 @@ mod tests {
         );
         assert!(journal.incidents().is_empty(), "no incident");
         assert!(journal.engine.is_variables_spilled(key), "still spilled");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: a COLD off-thread (streaming-writer) report that arrives
+    // AFTER the instance was rehydrated out of the cold tier must not quarantine
+    // it. A successful `rehydrate_cold` removes BOTH the cold index entry and its
+    // stored row, so the writer's physical-row miss describes a
+    // legitimately-consumed row, not a lost payload. `park_orphan_revalidated`
+    // requires the key to still be in the cold index, so the stale report is
+    // dropped. Covers capture → cold rehydration → writer miss → drain.
+    #[test]
+    fn stale_cold_report_after_rehydration_is_not_quarantined() {
+        let path = restart_store_path("orphan-stale-cold-1574");
+        let (mut journal, key) = cold_file_journal(&path);
+        journal.set_replicated_apply(true);
+        assert_eq!(journal.cold_count(), 1, "precondition: cold");
+        // The off-thread writer records the cold miss into the inbox while the
+        // instance is still cold-indexed.
+        journal.orphans.inbox.record(key, OrphanKind::Cold);
+        // Before the drain, a command rehydrates the instance out of the cold
+        // tier: the index entry AND the row are consumed.
+        let _ = journal
+            .apply_command(Command::cancel_instance(key))
+            .unwrap();
+        assert_eq!(journal.cold_count(), 0, "rehydrated out of the cold tier");
+        assert!(
+            journal.instance(key).is_some() || journal.state().instances.contains_key(&key),
+            "instance resident again"
+        );
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "the stale cold report is not parked"
+        );
+        assert!(
+            journal
+                .incidents()
+                .iter()
+                .all(|i| i.kind != nanobpmn_engine_core::IncidentKind::VariablesLost),
+            "no VariablesLost incident for a rehydrated instance"
+        );
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

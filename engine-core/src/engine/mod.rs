@@ -5507,9 +5507,9 @@ impl Engine {
             } => {
                 // Replicated form (#1447): no residency / terminal branch — those
                 // read replica-local state. The leader decided. The idempotency
-                // guard, however, reads ONLY replicated state (the incident set
-                // every replica applies identically), so it is safe here and
-                // required: two committed stamped proposals for the same
+                // guard, however, reads ONLY replicated state (the dedup
+                // tombstone every replica applies identically), so it is safe
+                // here and required: two committed stamped proposals for the same
                 // outstanding loss (a promoted member re-proposing its parked
                 // report before an inherited quarantine entry applies) must not
                 // mint a second incident (#1574 review).
@@ -5521,6 +5521,22 @@ impl Engine {
                         stamp.reason,
                     );
                 }
+                // The repair rides the replicated log (#1574 review): EVERY
+                // replica applies the identical surviving-state transition
+                // (clear the resident spill flag, keep the surviving map) and
+                // records the dedup tombstone — independent of what that replica
+                // found locally, and replayable so a crash/restart re-applies it
+                // instead of resurrecting the discarded store payload. Emitted
+                // even on the dedup-skip path: the tombstone insert is
+                // idempotent, and a replica that skipped the incident (already
+                // tombstoned) must still re-assert the repair transition.
+                self.emit(
+                    &mut log,
+                    Event::VariablesLostQuarantined {
+                        instance_key,
+                        repair: true,
+                    },
+                );
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
@@ -7530,7 +7546,26 @@ impl Engine {
 
     /// Whether an active `VariablesLost` incident already names `instance_key`
     /// in this engine's state.
+    ///
+    /// The quarantine idempotency guard must be **replica-identical** (#1574
+    /// review), so it reads the replicated dedup tombstone
+    /// ([`State::variables_lost_quarantined`]) first: that set is recorded by the
+    /// quarantine's own event and is independent of instance residency and
+    /// terminal eviction, whereas the `VariablesLost` *incident record* leaves
+    /// hot state when its instance cold-spills and is dropped on eviction — a
+    /// guard reading only `incidents` would go blind on exactly the replica that
+    /// tiered and mint a duplicate incident there. The tombstone is the
+    /// authoritative answer; the incident scan below is the legacy fallback for
+    /// an incident journaled before the tombstone event existed (a pre-#1574
+    /// journal mid-replay) and for the resident fast path.
     pub fn has_active_variables_lost(&self, instance_key: Key) -> bool {
+        if self
+            .state
+            .variables_lost_quarantined
+            .contains(&instance_key)
+        {
+            return true;
+        }
         self.state.incidents.values().any(|i| {
             i.instance_key == instance_key
                 && i.state == state::IncidentState::Active

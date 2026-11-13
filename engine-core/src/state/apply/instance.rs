@@ -253,6 +253,26 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // untouched (no record is created for an idempotent retry).
         Event::AgentHistoryDeduplicated { .. } => {}
 
+        // Off-heap orphan quarantine repair (#1574 review): the surviving-state
+        // transition rides the replicated log so EVERY replica lands identically,
+        // whatever it found locally. Record the dedup tombstone unconditionally
+        // (it is residency- and eviction-independent), and when `repair` is set
+        // clear a resident instance's spilled flag so it keeps its surviving
+        // resident map. A cold instance is not resident here — its flag rides
+        // its cold row and is reconciled when the row is rehydrated or dropped —
+        // so the `get_mut` miss is a no-op, not an error.
+        Event::VariablesLostQuarantined {
+            instance_key,
+            repair,
+        } => {
+            state.variables_lost_quarantined.insert(*instance_key);
+            if *repair {
+                if let Some(instance) = state.instances.get_mut(instance_key) {
+                    instance.variables_spilled = false;
+                }
+            }
+        }
+
         Event::ProcessInstanceCompleted { instance_key } => {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {

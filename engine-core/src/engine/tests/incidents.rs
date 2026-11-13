@@ -4169,10 +4169,17 @@ fn stamped_orphan_quarantine_is_residency_independent() {
     };
     let on_resident = resident.apply_command_at(command.clone(), 50).unwrap();
     let on_cold = cold.apply_command_at(command, 50).unwrap();
-    assert_eq!(on_resident.len(), 1);
+    assert_eq!(
+        on_resident
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "exactly one incident"
+    );
     assert_eq!(
         on_resident, on_cold,
-        "identical incident on resident and cold replicas"
+        "identical events on resident and cold replicas"
     );
     assert_eq!(
         resident.snapshot().next_local,
@@ -4190,6 +4197,114 @@ fn stamped_orphan_quarantine_is_residency_independent() {
         .unwrap();
     assert_eq!(cold_stamp.element_id, "");
     assert!(cold_stamp.reason.contains("cold instance row missing"));
+}
+
+// #1574 review: the `VariablesLostQuarantined` event is additive — a record
+// written before the `repair` field existed decodes with `repair: false`, and
+// the current form round-trips. Replay-compat for the persisted event frame.
+#[cfg(feature = "serde")]
+#[test]
+fn variables_lost_quarantined_is_serde_additive() {
+    let old: Event =
+        serde_json::from_str(r#"{"VariablesLostQuarantined":{"instance_key":7}}"#).unwrap();
+    assert_eq!(
+        old,
+        Event::VariablesLostQuarantined {
+            instance_key: 7,
+            repair: false,
+        },
+        "a record without `repair` decodes with repair: false"
+    );
+    let current = Event::VariablesLostQuarantined {
+        instance_key: 7,
+        repair: true,
+    };
+    let json = serde_json::to_string(&current).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Event>(&json).unwrap(),
+        current,
+        "the current form round-trips"
+    );
+}
+
+// #1574 review: the quarantine repair rides the replicated event log, so it
+// replays identically on a fresh engine (crash recovery / follower). The
+// reducer clears the resident spill flag and records the dedup tombstone, so a
+// replayed journal neither resurrects the discarded payload nor re-mints the
+// incident.
+#[test]
+fn quarantine_repair_replays_identically() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut leader = Engine::new();
+    let mut journal: Vec<Event> = Vec::new();
+    journal.extend(
+        leader
+            .apply_command_at(Command::DeployProcess(def), 1)
+            .unwrap(),
+    );
+    journal.extend(
+        leader
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap(),
+    );
+    let key = journal.iter().find_map(|e| e.instance_key()).unwrap();
+    journal.extend(
+        leader
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(OrphanIncidentStamp {
+                        kind: OrphanKind::Resident,
+                        element_id: "orphan".into(),
+                        reason: "variables lost: spill row missing".into(),
+                    }),
+                },
+                50,
+            )
+            .unwrap(),
+    );
+
+    // The leader's journal carries the repair event alongside the incident.
+    assert!(
+        journal
+            .iter()
+            .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
+        "the repair is journaled as a replayable event"
+    );
+
+    // Replay into a fresh engine: identical tombstone + incident, and a
+    // duplicate quarantine after replay is still deduped (no second incident).
+    let mut follower = Engine::replay(journal);
+    assert!(
+        follower.has_active_variables_lost(key),
+        "the tombstone survives replay"
+    );
+    let dup = follower
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Resident,
+                    element_id: "orphan".into(),
+                    reason: "variables lost: spill row missing".into(),
+                }),
+            },
+            51,
+        )
+        .unwrap();
+    assert!(
+        dup.iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "a post-replay duplicate mints no second incident"
+    );
 }
 
 // #1447: the `stamp` field is additive — a pre-#1447 Raft-log command (no
@@ -4258,11 +4373,21 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
         }),
     };
     let first = engine.apply_command_at(mk(), 50).unwrap();
-    assert_eq!(first.len(), 1, "the first proposal raises the incident");
-    // A second committed stamped proposal for the SAME loss is a no-op.
+    assert_eq!(
+        first
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "the first proposal raises the incident"
+    );
+    // A second committed stamped proposal for the SAME loss mints no second
+    // incident (the dedup tombstone already names the instance).
     let second = engine.apply_command_at(mk(), 51).unwrap();
     assert!(
-        second.is_empty(),
+        second
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
         "a duplicate committed proposal mints no second incident"
     );
     let active = engine
@@ -4271,4 +4396,92 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
         .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
         .count();
     assert_eq!(active, 1, "exactly one VariablesLost incident");
+}
+
+// #1574 review (inline): the dedup guard must survive COLD TIERING and terminal
+// eviction. The `VariablesLost` incident record leaves hot state when its
+// instance cold-spills (`snapshot_instance` drains `incidents` into the cold
+// row), so a guard reading only `incidents` goes blind on exactly the replica
+// that tiered — a duplicate committed proposal then mints a second incident on
+// that replica while a resident replica skips it, diverging the journals. The
+// replicated tombstone (`State::variables_lost_quarantined`) is residency- and
+// eviction-independent, so both replicas dedup identically.
+#[test]
+fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mk = |key| Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+        }),
+    };
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    // Two replicas; both apply the first committed stamped proposal.
+    let (mut resident, key) = boot();
+    let (mut tiered, _) = boot();
+    resident.apply_command_at(mk(key), 50).unwrap();
+    tiered.apply_command_at(mk(key), 50).unwrap();
+    assert_eq!(
+        resident
+            .incidents()
+            .iter()
+            .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+            .count(),
+        1
+    );
+
+    // Replica-local cold tiering on ONE replica: the incident record leaves hot
+    // state there, so an incidents-only guard would now be blind on `tiered`.
+    assert!(tiered.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(
+        tiered.instance(key).is_none(),
+        "precondition: instance cold on the tiered replica"
+    );
+    assert!(
+        tiered
+            .incidents()
+            .iter()
+            .all(|i| i.kind != crate::state::IncidentKind::VariablesLost),
+        "precondition: the incident record left hot state on the tiered replica"
+    );
+
+    // A duplicate committed stamped proposal lands on BOTH replicas. The
+    // resident replica dedups via its hot incident; the tiered replica must
+    // dedup via the replicated tombstone — NEITHER mints a second incident.
+    let dup_resident = resident.apply_command_at(mk(key), 51).unwrap();
+    let dup_tiered = tiered.apply_command_at(mk(key), 51).unwrap();
+    for (name, evts) in [("resident", &dup_resident), ("tiered", &dup_tiered)] {
+        assert!(
+            evts.iter()
+                .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+            "{name}: a duplicate proposal mints no second incident after tiering"
+        );
+    }
+    // Both replicas agree: exactly one VariablesLost incident, identical key
+    // counters (no divergent mint on the tiered replica).
+    assert_eq!(
+        resident.snapshot().next_local,
+        tiered.snapshot().next_local,
+        "no divergent key mint across the tiered/resident split"
+    );
 }
