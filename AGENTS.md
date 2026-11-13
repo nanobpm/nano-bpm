@@ -146,6 +146,32 @@ command limit. Therefore:
 - **Commit and push early** on your task branch once a coherent step compiles, so
   a killed run resumes from your work instead of starting over.
 
+## A checkout path with a space in it breaks the build
+
+Agent workspaces can live under a path containing a space (e.g. macOS
+`~/Library/Application Support/…`). Two failure classes follow, both looking
+like unrelated toolchain bugs:
+
+- **`make fmt` / `make console-wasm` break.** The Makefile expands
+  `PROJECT_ROOT`-derived variables (`FMT_CRATES`, `$(PROJECT_ROOT)/engine-wasm`,
+  …) unquoted into shell words, so the path splits at the space. Workaround —
+  run the underlying commands directly, per crate:
+
+  ```bash
+  cd engine-core && rustup run nightly-2026-06-26 cargo fmt   # per FMT_CRATES crate
+  cd engine-wasm && wasm-pack build --target web --release --no-pack \
+      --out-dir pkg/lean --out-name nanobpmn_engine           # see the console-wasm target
+  ```
+
+- **`tikv-jemalloc-sys` fails its autoconf configure** (building `server` with
+  the `heapprof` feature, e.g. server clippy/test) — the jemalloc configure
+  script also splits on the space. Workaround: redirect the build out of the
+  spaced path with `CARGO_TARGET_DIR=/tmp/<somewhere>` (or any space-free dir;
+  if your `/tmp` is quota-capped, use one under `$HOME`).
+
+The durable fix is a space-free checkout path; the workarounds above are for
+when you don't control where the workspace lives.
+
 ## BPMN Models need DI
 
 All BPMN Models need DI for rendering for humans.
