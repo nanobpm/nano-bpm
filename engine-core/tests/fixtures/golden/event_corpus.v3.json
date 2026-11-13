@@ -1162,7 +1162,8 @@
         "from": "fork",
         "ordinal": 1
       },
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1179,7 +1180,8 @@
         "from": "fork",
         "ordinal": 0
       },
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1201,7 +1203,8 @@
   {
     "ParallelJoinFired": {
       "element_id": "join",
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1355,7 +1358,8 @@
         "from": "fork",
         "ordinal": 0
       },
-      "instance_key": 25
+      "instance_key": 25,
+      "scope": 0
     }
   },
   {
@@ -3823,6 +3827,7 @@
         ]
       ],
       "instance_key": 86,
+      "join_scoped": true,
       "migrated_flow_scopes": [],
       "subscriptions": [],
       "target_process_definition_key": 91,

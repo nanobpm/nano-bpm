@@ -1348,7 +1348,13 @@ fn terminating_a_waiting_join_discards_its_arrivals() {
         0,
         "join fired on a cancelled arrival"
     );
-    assert_eq!(engine.instance(inst).unwrap().join_flows_taken("join"), 1);
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .join_flows_taken(&crate::state::JoinKey::root("join")),
+        1
+    );
 }
 
 /// A multi-instance body parked on an input-collection incident (active, but
@@ -1660,28 +1666,27 @@ fn join_in_sub() -> ProcessDefinition {
         .unwrap()
 }
 
-/// Join bookkeeping is keyed by element id per process instance, so activating
-/// a join under a flow-scope instance other than the one its waiting instance
-/// lives in would take over that instance's arrivals and variables. Both the
-/// plain and the element-local-variable activation paths must fail closed.
+/// Join bookkeeping is keyed per flow-scope instance (#1580, Zeebe parity), so
+/// activating a join under a flow-scope instance other than the one its
+/// waiting instance lives in opens an INDEPENDENT join there: the waiting
+/// join keeps its arrivals untouched and neither fires (each has one of its
+/// two flows). Both the plain and the element-local-variable activation paths.
 #[test]
-fn rejects_join_activation_in_a_different_flow_scope_than_its_waiting_instance() {
+fn join_activation_in_another_flow_scope_opens_an_independent_join() {
     for locals in [false, true] {
         let mut engine = Engine::new();
         let inst = start(&mut engine, join_in_sub(), HashMap::new());
         complete_all(&mut engine, "ja");
         let waiting = eiks(&engine, inst, "join");
         assert_eq!(waiting.len(), 1, "join is waiting");
+        let waiting_scope = scope_of(&engine, inst, waiting[0]);
         // A second `sub` instance, created by activating `b` from the root.
         engine
             .apply_command(modify(inst, vec![under("b", inst)]))
             .unwrap();
         let subs = eiks(&engine, inst, "sub");
         assert_eq!(subs.len(), 2, "two sub instances");
-        let other = *subs
-            .iter()
-            .find(|s| **s != scope_of(&engine, inst, waiting[0]))
-            .unwrap();
+        let other = *subs.iter().find(|s| **s != waiting_scope).unwrap();
         let mut instruction = under("join", other);
         if locals {
             instruction.variable_instructions = vec![VariableInstruction {
@@ -1689,29 +1694,38 @@ fn rejects_join_activation_in_a_different_flow_scope_than_its_waiting_instance()
                 scope_id: Some("join".into()),
             }];
         }
-        let before = engine.instance(inst).unwrap().join_flows_taken("join");
+        let events = engine
+            .apply_command(modify(inst, vec![instruction]))
+            .unwrap_or_else(|e| panic!("locals={locals}: {e}"));
         assert!(
-            engine
-                .apply_command(modify(inst, vec![instruction]))
-                .is_err(),
-            "locals={locals}: cross-scope join activation must be rejected"
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ParallelJoinFired { .. })),
+            "locals={locals}: neither scope's join has both flows"
         );
-        assert_eq!(eiks(&engine, inst, "join"), waiting, "locals={locals}");
+        let instance = engine.instance(inst).unwrap();
+        let waiting_key = crate::state::JoinKey::new(waiting_scope, "join");
+        let other_key = crate::state::JoinKey::new(other, "join");
         assert_eq!(
-            engine.instance(inst).unwrap().join_flows_taken("join"),
-            before,
+            instance.join_flows_taken(&waiting_key),
+            1,
             "locals={locals}"
         );
+        assert_eq!(instance.join_flows_taken(&other_key), 1, "locals={locals}");
+        assert_eq!(
+            instance.join_instances.get(&waiting_key),
+            Some(&waiting[0]),
+            "locals={locals}: the waiting join is untouched"
+        );
+        assert_eq!(eiks(&engine, inst, "join").len(), 2, "locals={locals}");
     }
 }
 
-/// With no join waiting, two activations of the same join under DIFFERENT
-/// sub-process instances both pass the waiting-instance check — but the
-/// process-wide join bookkeeping would then combine arrivals from unrelated
-/// scopes and fire the join incorrectly. Both the plain and the
-/// element-local-variable (seeded) activation paths must fail closed.
+/// Two activations of the same join under DIFFERENT sub-process instances
+/// land in two independent joins (#1580, Zeebe parity): each sees one
+/// unidentified arrival of its two flows, so neither fires.
 #[test]
-fn rejects_planned_join_activations_conflicting_across_scopes() {
+fn planned_join_activations_across_scopes_open_independent_joins() {
     for locals in [false, true] {
         let mut engine = Engine::new();
         let inst = start(&mut engine, join_in_sub(), HashMap::new());
@@ -1732,22 +1746,24 @@ fn rejects_planned_join_activations_conflicting_across_scopes() {
             }
             instruction
         };
-        let err = engine
+        let events = engine
             .apply_command(modify(inst, vec![activate(subs[0]), activate(subs[1])]))
-            .unwrap_err();
+            .unwrap_or_else(|e| panic!("locals={locals}: {e}"));
         assert!(
-            err.to_string().contains("different flow scopes"),
-            "locals={locals}: {err}"
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ParallelJoinFired { .. })),
+            "locals={locals}: arrivals in two scopes never combine"
         );
-        assert!(
-            eiks(&engine, inst, "join").is_empty(),
-            "locals={locals}: atomic — no join activated"
-        );
-        assert_eq!(
-            engine.instance(inst).unwrap().join_flows_taken("join"),
-            0,
-            "locals={locals}: no arrival recorded"
-        );
+        let instance = engine.instance(inst).unwrap();
+        for sub in &subs {
+            assert_eq!(
+                instance.join_flows_taken(&crate::state::JoinKey::new(*sub, "join")),
+                1,
+                "locals={locals}: one arrival per scope instance"
+            );
+        }
+        assert_eq!(eiks(&engine, inst, "join").len(), 2, "locals={locals}");
     }
 }
 

@@ -542,6 +542,12 @@ pub enum Event {
     ParallelJoinTokenArrived {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
         #[cfg_attr(feature = "serde", serde(default))]
         flow: Option<IncomingFlow>,
     },
@@ -551,6 +557,12 @@ pub enum Event {
     ParallelJoinReset {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
     /// A join fired: a parallel join because every incoming flow has been taken,
     /// an inclusive join because every incoming flow has been taken or no active
@@ -561,6 +573,12 @@ pub enum Event {
     ParallelJoinFired {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
 
     /// A job was created for a service task; the token now rests until the job
@@ -1037,6 +1055,11 @@ pub enum Event {
         /// call-activity element instance (#1374). Additive; empty when none.
         #[cfg_attr(feature = "serde", serde(default))]
         child_instances: Vec<MigratedChildInstance>,
+        /// Whether the join bookkeeping was migrated per flow-scope instance
+        /// (#1580). Additive; a legacy record decodes `false` and replays the
+        /// pre-#1580 element-wide merge (one slot per target join element).
+        #[cfg_attr(feature = "serde", serde(default))]
+        join_scoped: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification

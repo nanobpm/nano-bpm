@@ -420,7 +420,9 @@ fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
     );
     assert!(!engine.is_completed(instance_key));
     let instance = engine.instance(instance_key).unwrap();
-    assert!(instance.join_instances.contains_key("j"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("j")));
 }
 
 /// Issue #1170 — regression guard, service-task multi-instance child.

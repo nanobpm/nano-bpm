@@ -20,6 +20,7 @@ mod incidents;
 mod job_attribution;
 mod job_settlement;
 mod jobs;
+mod join_scopes;
 mod lifecycle;
 mod listeners;
 mod migration;

@@ -396,84 +396,11 @@ impl Engine {
             }
         }
 
-        // Join bookkeeping (waiting instance + arrivals) is keyed by element id
-        // per process instance, not per flow-scope instance. Activating a join
-        // whose waiting instance lives in a DIFFERENT flow-scope instance would
-        // take over that instance's arrivals and variables: fail closed.
-        for planned in &activations {
-            if self.join_kind(instance_key, &planned.element_id).is_none() {
-                continue;
-            }
-            let Some(waiting) = self.join_eik(instance_key, &planned.element_id) else {
-                continue;
-            };
-            if terminations.iter().any(|&t| {
-                t == waiting || self.is_ancestor_element_instance(instance_key, t, waiting)
-            }) {
-                continue;
-            }
-            let waiting_scope = self.scope_of(instance_key, waiting);
-            if !planned.resolution.to_create.is_empty()
-                || waiting_scope != planned.resolution.existing
-            {
-                return Err(invalid(
-                    instance_key,
-                    &process_id,
-                    format!(
-                        "an activate instruction for join element '{}' in a flow scope other \
-                         than that of its waiting instance '{waiting}' (flow scope \
-                         '{waiting_scope}')",
-                        planned.element_id
-                    ),
-                ));
-            }
-        }
-
-        // The same id-keyed bookkeeping also forces every activation of one
-        // join element in a single command to land in ONE flow-scope instance:
-        // with no join waiting, two activations under different scope instances
-        // would still share the join's arrivals and could combine tokens from
-        // unrelated scopes into a firing. Zeebe activates both (its joins are
-        // per-scope); this engine keys joins per process instance, so it fails
-        // closed instead. Activations sharing the to-be-created scope instance
-        // (same existing parent, same innermost created scope — the applier
-        // reuses one created instance for both) land together and are fine.
-        let planned_joins: Vec<&PlannedActivation> = activations
-            .iter()
-            .filter(|p| self.join_kind(instance_key, &p.element_id).is_some())
-            .collect();
-        for (i, a) in planned_joins.iter().enumerate() {
-            for b in &planned_joins[i + 1..] {
-                // Distinct joins keep separately keyed bookkeeping: no collision.
-                if a.element_id != b.element_id {
-                    continue;
-                }
-                let (ra, rb) = (&a.resolution, &b.resolution);
-                // Guaranteed same landing scope only when both create the same
-                // innermost scope under the same parent (the applier shares
-                // that one created instance), or both reuse the same existing
-                // instance and create nothing. Everything else can land the
-                // two activations in different scope instances.
-                let shared_created = ra.existing == rb.existing
-                    && !ra.to_create.is_empty()
-                    && ra.to_create.last() == rb.to_create.last();
-                let same_existing = ra.existing == rb.existing
-                    && ra.to_create.is_empty()
-                    && rb.to_create.is_empty();
-                if !(shared_created || same_existing) {
-                    return Err(invalid(
-                        instance_key,
-                        &process_id,
-                        format!(
-                            "multiple activate instructions for join element '{}' in different \
-                             flow scopes of one modification: join arrivals are kept per \
-                             process instance, so the activations would share one join",
-                            a.element_id
-                        ),
-                    ));
-                }
-            }
-        }
+        // Join bookkeeping is keyed per flow-scope instance (#1580), as in
+        // Zeebe: a join activated under one scope instance takes over only that
+        // instance's waiting join, and two activations of one join under
+        // different scope instances keep independent arrivals. No cross-scope
+        // guard is needed.
 
         // Scopes an activation creates arm their boundary events (Zeebe
         // `ElementActivationBehavior.activateFlowScope` → `subscribeToEvents`);
@@ -920,7 +847,7 @@ impl Engine {
         if self.step_targets_dead_scope(&step) {
             return;
         }
-        let eik = match self.join_eik(instance_key, &element_id) {
+        let eik = match self.join_eik(instance_key, scope, &element_id) {
             Some(eik) => eik,
             None => {
                 let mut events = Vec::new();

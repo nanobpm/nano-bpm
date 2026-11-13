@@ -897,6 +897,7 @@ fn build_event_witnesses() -> Vec<Event> {
                 child_instance_key: 19,
                 target_element_id: "call2".to_string(),
             }],
+            join_scoped: true,
         },
         // The #1181 settlement-ledger frame (additive variant, no version bump).
         Event::JobSettlementRecorded {
@@ -971,6 +972,7 @@ fn pre_1374_migrated_record_decodes_with_defaults() {
             migrated_flow_scopes: vec![],
             subscriptions: vec![],
             child_instances: vec![],
+            join_scoped: false,
         }
     );
 }

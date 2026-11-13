@@ -626,9 +626,9 @@
         "created_at": 1700000000004,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 12,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -661,9 +661,9 @@
         "created_at": 1700000000009,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 20,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -695,21 +695,29 @@
         "created_at": 1700000000010,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {
-          "join": [
-            [
-              {
-                "from": "fork",
-                "ordinal": 0
-              },
-              1
+        "join_counts": [],
+        "join_flow_arrivals": [
+          {
+            "element_id": "join",
+            "scope": 0,
+            "value": [
+              [
+                {
+                  "from": "fork",
+                  "ordinal": 0
+                },
+                1
+              ]
             ]
-          ]
-        },
-        "join_instances": {
-          "join": 28
-        },
+          }
+        ],
+        "join_instances": [
+          {
+            "element_id": "join",
+            "scope": 0,
+            "value": 28
+          }
+        ],
         "key": 25,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -759,9 +767,9 @@
         "created_at": 1700000000011,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 33,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -819,9 +827,9 @@
         "created_at": 1700000000013,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 42,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -856,9 +864,9 @@
         "created_at": 1700000000015,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 54,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -887,9 +895,9 @@
         "created_at": 1700000000001,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 7,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -918,9 +926,9 @@
         "created_at": 1700000000012,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 70,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -953,9 +961,9 @@
         "incidents": [
           79
         ],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 75,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -992,9 +1000,9 @@
         "incidents": [
           85
         ],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 81,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -1025,9 +1033,9 @@
         "created_at": 1700000000018,
         "gateway_routes": {},
         "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 86,
         "multi_instances": {},
         "parent_element_instance_key": null,
@@ -1060,9 +1068,9 @@
         "incidents": [
           96
         ],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
         "key": 92,
         "multi_instances": {},
         "parent_element_instance_key": null,
