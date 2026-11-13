@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -70,6 +70,11 @@ const JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION: i64 = 14;
 /// events below it, so the migration flags an engine-state backfill
 /// ([`MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY`]).
 const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 15;
+/// The schema version that introduced the durable replay identity of a
+/// message start subscription (`message_start_subscriptions.last_event_position`).
+/// A database migrated across it receives `0`; every existing row already
+/// reflects every event below the warm cursor, so the migration stamps it.
+const MESSAGE_START_POSITION_SCHEMA_VERSION: i64 = 16;
 /// `meta` key flagging that `message_start_subscriptions` awaits an
 /// engine-state backfill (see [`ReadStore::backfill_pending_event_waits`]).
 const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
@@ -83,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -2607941217815480261;
+const SCHEMA_FINGERPRINT: i64 = 5936058379013217281;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -346,7 +351,11 @@ CREATE TABLE message_start_subscriptions (
     start_element_id       TEXT NOT NULL,
     tool_name              TEXT,
     tool_properties        TEXT NOT NULL DEFAULT '{}',
-    created_at_ms          INTEGER NOT NULL DEFAULT 0
+    created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- journal position of the creation event the row reflects (a seed stamps
+    -- the shard cursor): a same-definition replacement applies only from a
+    -- strictly later position, so an overlapping replay never regresses it.
+    last_event_position    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE event_waits (
     wait_key               INTEGER PRIMARY KEY,
@@ -2174,6 +2183,14 @@ impl ReadStore {
             conn.execute(
                 "UPDATE jobs SET created_at_ms = MIN(created_at_ms, end_ms) \
                  WHERE end_ms IS NOT NULL AND created_at_ms > end_ms",
+                [],
+            )?;
+        }
+        if stored_version.is_none_or(|v| v < MESSAGE_START_POSITION_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE message_start_subscriptions SET last_event_position = \
+                 MAX(last_event_position, \
+                 COALESCE((SELECT v FROM meta WHERE k = 'exported_position'), 0))",
                 [],
             )?;
         }
@@ -4633,6 +4650,15 @@ fn project_message_start_subscriptions_from_state(
     state: &nanobpmn_engine_core::State,
     now_ms: u64,
 ) -> rusqlite::Result<()> {
+    // Seeded rows reflect every event below the cursor: that is their floor.
+    let cursor: i64 = tx
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'exported_position'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
     for sub in state.message_start_subscriptions.values() {
         upsert_message_start_subscription(
             tx,
@@ -4642,6 +4668,7 @@ fn project_message_start_subscriptions_from_state(
             &sub.start_element_id,
             sub.tool_name.as_deref(),
             &sub.tool_properties,
+            cursor.max(0) as u64,
             now_ms,
         )?;
     }
@@ -4662,8 +4689,10 @@ fn project_message_start_subscriptions_from_state(
 /// Same-definition conflict (older journals: two starts in one definition whose
 /// names resolve to the same message, e.g. `go` and `="go"`): the engine keeps
 /// the **later** creation, so a same-key creation for a *different* element
-/// replaces the element/tool fields in event order — but never re-stamps
-/// `created_at_ms`, and a same-key same-element replay stays a no-op.
+/// replaces the element/tool fields — but only from a **strictly later**
+/// journal `position` than the row's `last_event_position` (seeds stamp the
+/// cursor), so replaying the earlier creation after the later one is a no-op.
+/// It never re-stamps `created_at_ms`.
 #[allow(clippy::too_many_arguments)]
 fn upsert_message_start_subscription(
     tx: &rusqlite::Transaction,
@@ -4673,14 +4702,15 @@ fn upsert_message_start_subscription(
     start_element_id: &str,
     tool_name: Option<&str>,
     tool_properties: &std::collections::BTreeMap<String, String>,
+    position: u64,
     now_ms: u64,
 ) -> rusqlite::Result<()> {
     let tool_properties_json =
         serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
     tx.cexecute(
         "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
-         process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         process_id, start_element_id, tool_name, tool_properties, created_at_ms, \
+         last_event_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(message_name) DO UPDATE SET \
          process_definition_key = excluded.process_definition_key, \
          process_id = excluded.process_id, \
@@ -4689,10 +4719,13 @@ fn upsert_message_start_subscription(
          tool_properties = excluded.tool_properties, \
          created_at_ms = CASE WHEN excluded.process_definition_key > \
          message_start_subscriptions.process_definition_key THEN excluded.created_at_ms \
-         ELSE message_start_subscriptions.created_at_ms END \
+         ELSE message_start_subscriptions.created_at_ms END, \
+         last_event_position = MAX(excluded.last_event_position, \
+         message_start_subscriptions.last_event_position) \
          WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key \
          OR (excluded.process_definition_key = message_start_subscriptions.process_definition_key \
-         AND excluded.start_element_id <> message_start_subscriptions.start_element_id)",
+         AND excluded.start_element_id <> message_start_subscriptions.start_element_id \
+         AND excluded.last_event_position > message_start_subscriptions.last_event_position)",
         params![
             message_name,
             process_definition_key as i64,
@@ -4701,6 +4734,7 @@ fn upsert_message_start_subscription(
             tool_name,
             tool_properties_json,
             now_ms as i64,
+            position as i64,
         ],
     )?;
     Ok(())
@@ -5357,6 +5391,7 @@ fn project_event(
                 start_element_id,
                 tool_name.as_deref(),
                 tool_properties,
+                position,
                 now_ms,
             )?;
         }
@@ -10050,6 +10085,9 @@ mod definition_xml_tests {
         replay_at(&store, &created("second"), 2, 2_000);
         assert_eq!(row(&store), ("second".to_string(), 1_000));
         replay_at(&store, &created("second"), 2, 3_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        // Overlapping replay of the EARLIER creation must not regress the row.
+        replay_at(&store, &created("first"), 1, 4_000);
         assert_eq!(row(&store), ("second".to_string(), 1_000));
     }
 
