@@ -143,6 +143,14 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         let raw = std::fs::read_to_string(golden_path(&format!("engine_snapshot.v{version}.json")))
             .unwrap();
         let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
+        let terminal_keys: std::collections::VecDeque<_> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+                _ => None,
+            })
+            .collect();
         let replayed = Engine::replay_partition(expected.partition_id, journal);
 
         // Replay-compatibility is a NORMALIZED equality, not a byte-identical
@@ -174,6 +182,12 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
                 job.has_failed_with_retries_left = false;
             }
         }
+        // #1574 review adds the replicated `recently_terminated` ring, derived
+        // purely from terminal events. Archived snapshots predate it (they load
+        // it empty via `serde(default)`), so normalize it to what the archived
+        // journal's own terminal events derive — computed independently here
+        // from the journal, not copied from the replayed state.
+        expected_state.recently_terminated = terminal_keys;
         assert_eq!(
             &replayed_state, &expected_state,
             "archived format {version}"

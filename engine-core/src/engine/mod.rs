@@ -5505,8 +5505,8 @@ impl Engine {
                 instance_key,
                 stamp: Some(stamp),
             } => {
-                // Replicated form (#1447): no residency / terminal branch — those
-                // read replica-local state. The leader decided. The idempotency
+                // Replicated form (#1447): no residency branch — that reads
+                // replica-local state. The leader decided the incident metadata. The idempotency
                 // guard, however, reads ONLY replicated state (the dedup
                 // tombstone every replica applies identically), so it is safe
                 // here and required: two committed stamped proposals for the same
@@ -5520,6 +5520,25 @@ impl Engine {
                 // The guard reads ONLY the replicated tombstone, never the hot
                 // incident map: the latter is residency-dependent (a cold-tiered
                 // replica has drained it), so it would split replicas.
+                //
+                // Terminal gate (#1574 review, cancellation race): a report
+                // queued before a cancel/complete can commit after it and must
+                // not raise an incident on the finished instance. Decided from
+                // REPLICATED state only, so every replica agrees: a resident
+                // terminal instance, or a key in the replicated
+                // `recently_terminated` ring (which survives replica-local
+                // terminal eviction), is a complete no-op. An absent key NOT in
+                // the ring is live-but-cold on this replica (the cold-orphan
+                // case) and proceeds like the resident live case.
+                let resident_terminal = self.state.instances.get(&instance_key).is_some_and(|i| {
+                    !matches!(
+                        i.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                    )
+                });
+                if resident_terminal || self.state.recently_terminated.contains(&instance_key) {
+                    return Ok((log, queue));
+                }
                 if self
                     .state
                     .variables_lost_quarantined

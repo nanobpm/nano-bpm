@@ -2888,10 +2888,59 @@ async fn propose_orphan(
     true
 }
 
+/// Stop handle for the orphan propose tasks of one partition member (#1574
+/// review). The drainer task holds the engine handle and a [`Batcher`] (which
+/// holds the Raft), while the channel's sender lives inside that same engine's
+/// journal — an ownership cycle in which `rx.recv()` alone never returns
+/// `None`. The tasks therefore also exit on an EXPLICIT stop: when this handle
+/// is [stopped](Self::stop) or dropped (it is owned by [`RaftPartition`]), or
+/// when the Raft core has shut down. Exiting drops their engine/Batcher/Raft
+/// clones, breaking the cycle.
+struct OrphanProposeStop {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl OrphanProposeStop {
+    fn stop(&self) {
+        self.tx.send_replace(true);
+    }
+}
+
+impl Drop for OrphanProposeStop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Resolves once the orphan propose tasks must exit (#1574 review): the stop
+/// handle fired or was dropped, or the Raft core shut down (its metrics report
+/// `Shutdown`, or the metrics channel closed with the core).
+async fn orphan_propose_stopped(
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>>,
+) {
+    let stop_fired = async move {
+        // `wait_for` errs when the sender is dropped — also a stop.
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    };
+    let raft_down = async move {
+        let _ = metrics
+            .wait_for(|m| m.state == openraft::ServerState::Shutdown)
+            .await;
+    };
+    tokio::select! {
+        () = stop_fired => {}
+        () = raft_down => {}
+    }
+}
+
 /// Wires the orphan propose channel for one partition member (#1447). Every
 /// task is bound to the member's lifecycle `epoch` (#1473) and stops once it is
 /// retired, so a rebuilt successor sharing the engine actor cannot have its
-/// sink or leadership flag overwritten by a delayed predecessor:
+/// sink or leadership flag overwritten by a delayed predecessor. Both tasks
+/// also exit when the returned [`OrphanProposeStop`] fires / drops or the Raft
+/// core shuts down (#1574 review), so the drainer ⇄ journal ownership cycle
+/// cannot keep them (and the Raft they hold) alive past shutdown:
 ///
 /// 1. The journal gets an [`OrphanQueueSink`] plus the member's CURRENT
 ///    leadership (wiring drains anything parked before it).
@@ -2904,42 +2953,62 @@ fn wire_orphan_propose(
     batcher: &Batcher,
     engine: &DeepthiHandle,
     epoch: u64,
+) -> (
+    OrphanProposeStop,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
 ) {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
     let node_id = raft.metrics().borrow().id;
     let mut metrics = raft.metrics();
     let engine_for_watch = engine.clone();
+    let watch_stopped = orphan_propose_stopped(stop_rx.clone(), raft.metrics());
     // Seed the sink first, then keep the leadership flag fresh — one task, so
     // the seed is ordered before the first leadership publish.
-    tokio::spawn(async move {
-        let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
-            journal.set_orphan_sink(sink);
-        })
-        .await;
-        if seeded.is_none() {
-            return; // retired before wiring
-        }
-        loop {
-            let is_leader = metrics.borrow().current_leader == Some(node_id);
-            let published = with_member_engine(&engine_for_watch, epoch, move |journal| {
-                journal.set_orphan_leadership(is_leader)
+    let watcher = tokio::spawn(async move {
+        let work = async move {
+            let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                journal.set_orphan_sink(sink);
             })
             .await;
-            if published.is_none() || metrics.changed().await.is_err() {
-                break; // retired, or Raft dropped
+            if seeded.is_none() {
+                return; // retired before wiring
             }
+            loop {
+                let is_leader = metrics.borrow().current_leader == Some(node_id);
+                let published = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                    journal.set_orphan_leadership(is_leader)
+                })
+                .await;
+                if published.is_none() || metrics.changed().await.is_err() {
+                    break; // retired, or Raft dropped
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            () = watch_stopped => {}
         }
     });
     let batcher = batcher.clone();
     let engine = engine.clone();
-    tokio::spawn(async move {
-        while let Some((key, kind)) = rx.recv().await {
-            if !propose_orphan(&batcher, &engine, epoch, key, kind).await {
-                break; // retired: the successor wires its own channel
+    let drain_stopped = orphan_propose_stopped(stop_rx, raft.metrics());
+    let drainer = tokio::spawn(async move {
+        let work = async move {
+            while let Some((key, kind)) = rx.recv().await {
+                if !propose_orphan(&batcher, &engine, epoch, key, kind).await {
+                    break; // retired: the successor wires its own channel
+                }
             }
+        };
+        tokio::select! {
+            () = work => {}
+            () = drain_stopped => {}
         }
     });
+    (OrphanProposeStop { tx: stop_tx }, watcher, drainer)
 }
 
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
@@ -2973,6 +3042,13 @@ pub struct RaftPartition {
     /// dir). Only a volatile dir is reclaimed on retire; a durable recovery
     /// directory is never touched.
     sm_volatile_snap: bool,
+    /// Stops this member's orphan propose tasks on retire / drop (#1574
+    /// review), breaking the drainer ⇄ journal ownership cycle.
+    orphan_stop: OrphanProposeStop,
+    /// The orphan watcher + drainer task handles (#1574 review), kept so tests
+    /// can assert they exit on shutdown.
+    #[cfg_attr(not(test), allow(dead_code))]
+    orphan_tasks: [tokio::task::JoinHandle<()>; 2],
 }
 
 impl RaftPartition {
@@ -3009,7 +3085,8 @@ impl RaftPartition {
         raft.initialize(members).await?;
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -3022,6 +3099,8 @@ impl RaftPartition {
             sm_snapshot_dir,
             // A single in-memory voter anchors its snapshots in a temp dir.
             sm_volatile_snap: true,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -3075,7 +3154,8 @@ impl RaftPartition {
         }
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -3088,6 +3168,8 @@ impl RaftPartition {
             sm_snapshot_dir,
             // Snapshots anchor next to the durable log — never reclaimed on retire.
             sm_volatile_snap: false,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -3177,7 +3259,8 @@ impl RaftPartition {
             }
         };
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.
@@ -3204,6 +3287,8 @@ impl RaftPartition {
             sm_epoch,
             sm_snapshot_dir,
             sm_volatile_snap: volatile_snap,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -3492,6 +3577,7 @@ impl RaftPartition {
         &self,
         bound: std::time::Duration,
     ) -> std::io::Result<LifecycleExclusive> {
+        self.orphan_stop.stop();
         self.raft.shutdown().await.ok();
         let Ok(exclusive) = tokio::time::timeout(bound, self.sm_engine.lifecycle_exclusive()).await
         else {
@@ -4753,6 +4839,57 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// #1574 review: the orphan drainer holds the engine + a Batcher (→ Raft)
+    /// while the journal inside that engine owns the drainer's channel sender,
+    /// so `rx.recv()` never yields `None`. The orphan tasks must still exit on
+    /// every shutdown path — a direct `raft.shutdown()`, `retire()`, and a plain
+    /// drop of the partition — or they keep the Raft alive forever.
+    #[tokio::test]
+    async fn orphan_propose_tasks_exit_on_shutdown() {
+        async fn assert_exits(tasks: [tokio::task::JoinHandle<()>; 2], path: &str) {
+            for task in tasks {
+                tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                    .await
+                    .unwrap_or_else(|_| panic!("orphan task still alive after {path}"))
+                    .expect("orphan task exits cleanly");
+            }
+        }
+        let boot = || async {
+            RaftPartition::bootstrap_single(
+                0,
+                0,
+                "addr".into(),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            )
+            .await
+            .expect("boot")
+        };
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        part.raft.shutdown().await.expect("clean shutdown");
+        assert_exits(tasks, "raft.shutdown()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part.retire().await.expect("retire"));
+        assert_exits(tasks, "retire()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part);
+        assert_exits(tasks, "drop(RaftPartition)").await;
     }
 
     /// A fresh receiver is provably empty, and the emptiness guard fails closed

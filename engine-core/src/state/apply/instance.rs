@@ -266,6 +266,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
@@ -510,6 +511,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
             // gone the parked tokens are gone too, so `hasIncident` must clear.

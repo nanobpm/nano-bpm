@@ -4225,6 +4225,12 @@
         "version": 1
       }
     },
+    "recently_terminated": [
+      7,
+      20,
+      54,
+      70
+    ],
     "resource_versions": {},
     "resources": {},
     "signal_subscriptions": {},

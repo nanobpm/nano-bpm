@@ -2123,6 +2123,33 @@ pub struct State {
     /// event, so there is nothing to dedup yet).
     #[cfg_attr(feature = "serde", serde(default))]
     pub variables_lost_quarantined: BTreeMap<Key, Key>,
+    /// The most recent instance keys to reach a terminal state
+    /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
+    /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
+    /// **replicated** record — appended only by `apply_event`, so identical on
+    /// every replica and independent of host-driven terminal eviction (which is
+    /// replica-local in timing). It closes the orphan-quarantine cancellation
+    /// race: a stamped `QuarantineOffheapOrphan` queued before a cancel can
+    /// commit after it, when one replica still holds the terminal instance and
+    /// another has already evicted it; both must no-op identically.
+    /// `serde(default)`: older snapshots load empty.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub recently_terminated: std::collections::VecDeque<Key>,
+}
+
+/// Bound on [`State::recently_terminated`]. The window it must cover is one
+/// orphan proposal's round trip (enqueue → commit), so a few thousand terminal
+/// transitions is ample while keeping the snapshot cost tiny (8 bytes/key).
+pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
+
+impl State {
+    /// Records `instance_key` as terminal in the bounded replicated ring.
+    pub(crate) fn note_terminated(&mut self, instance_key: Key) {
+        if self.recently_terminated.len() >= RECENTLY_TERMINATED_CAP {
+            self.recently_terminated.pop_front();
+        }
+        self.recently_terminated.push_back(instance_key);
+    }
 }
 
 /// A deployed decision requirements graph together with the identity the engine

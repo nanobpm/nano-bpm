@@ -4736,3 +4736,73 @@ fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
     );
     assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
 }
+
+// #1574 review (cancellation race): an orphan report can be queued before the
+// instance is cancelled and its stamped proposal commit AFTER the cancel. The
+// replicated apply must then be a deterministic no-op — no incident, no
+// tombstone — for a resident terminal instance. (Absent targets are gated by
+// the host journal, which alone can tell cold-live from evicted.)
+#[test]
+fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+        .unwrap();
+    let after_cancel = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Resident,
+                    element_id: "orphan".into(),
+                    reason: "variables lost: spill row missing".into(),
+                }),
+            },
+            50,
+        )
+        .unwrap();
+    assert!(
+        after_cancel.is_empty(),
+        "a proposal applying after cancel is a complete no-op: {after_cancel:?}"
+    );
+    assert!(!engine.has_active_variables_lost(key));
+
+    // A replica that has ALREADY EVICTED the terminal instance (eviction is
+    // replica-local in timing) must reach the same decision from replicated
+    // state alone.
+    assert!(engine.evict_instance(key), "terminal instance evicts");
+    assert!(engine.instance(key).is_none());
+    let after_evict = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Cold,
+                    element_id: String::new(),
+                    reason: "variables lost: cold instance row missing".into(),
+                }),
+            },
+            51,
+        )
+        .unwrap();
+    assert!(
+        after_evict.is_empty(),
+        "evicted terminal instance: identical no-op: {after_evict:?}"
+    );
+}
