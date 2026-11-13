@@ -5,12 +5,14 @@
 //! The guard (`server/src/response_contract.rs`) buffers a response body to
 //! validate it against the OpenAPI contract, capped at
 //! `NANOBPM_RESPONSE_VALIDATION_MAX_BYTES` (default 8 MiB). Before the fix, an
-//! activateJobs response that streamed past that cap (no Content-Length to
-//! pre-check) was replaced with a 500 `response_contract_buffer_failed` — but
-//! the engine had ALREADY activated (locked) the jobs, so no worker ever
-//! received them and they stayed locked until their job timeout. An overloaded
-//! worker then kept polling, each poll failed, and each failure locked another
-//! batch.
+//! activateJobs response larger than that cap was replaced with a 500
+//! `response_contract_buffer_failed` — but the engine had ALREADY activated
+//! (locked) the jobs, so no worker ever received them and they stayed locked
+//! until their job timeout. An overloaded worker then kept polling, each poll
+//! failed, and each failure locked another batch. The fix detects the
+//! oversized response BEFORE consuming it (via `Content-Length` or the body's
+//! own exact size hint — every first-party endpoint serializes to a single
+//! known-length buffer) and passes it through unvalidated.
 //!
 //! This harness boots the real server binary with a tiny validation cap,
 //! creates jobs whose activation response exceeds it, and asserts the

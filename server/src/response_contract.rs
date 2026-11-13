@@ -1281,12 +1281,20 @@ mod middleware_tests {
         );
     }
 
-    /// A response with no declared length whose body exceeds the buffer cap is
-    /// passed through unvalidated — never rewritten to a 500. The guard buffers
-    /// at most `cap + 1` bytes (preserving the OOM/DoS bound), and the one byte
-    /// past the cap is the precise overflow signal. Proven by using a body that
-    /// *would* violate the contract: the guard skips validation and returns it
-    /// as-is (200) instead of rewriting to 500.
+    /// A response with no declared `Content-Length` whose body exceeds the
+    /// buffer cap is passed through unvalidated — never rewritten to a 500.
+    /// The guard detects this WITHOUT consuming the body: `Body::from` knows
+    /// its own length, so the pre-consumption `size_hint().lower()` check in
+    /// `guard_impl` sees the oversized hint and short-circuits before a single
+    /// byte is buffered. Proven by using a body that *would* violate the
+    /// contract: the guard skips validation and returns it as-is (200) instead
+    /// of rewriting to 500.
+    ///
+    /// (A genuinely streaming body with an unknown size hint that streams past
+    /// the cap is a different, fail-loud path — `to_bytes` errors and the guard
+    /// returns a structured 500 — and is not what this test exercises: no
+    /// first-party endpoint produces such a body, since each serializes to a
+    /// single known-length buffer.)
     ///
     /// This is the #1594 regression guard at middleware level: a state-changing
     /// operation's successful response must never be replaced by an error after
@@ -1313,9 +1321,9 @@ mod middleware_tests {
                         Response::builder()
                             .status(200)
                             .header(CONTENT_TYPE, "application/json")
-                            // No Content-Length: the pre-check can't
-                            // short-circuit, so the overflow is detected while
-                            // buffering.
+                            // No Content-Length, but `Body::from` carries an
+                            // exact size hint, so the pre-consumption hint
+                            // check still short-circuits before any buffering.
                             .body(Body::from(serialized))
                             .unwrap()
                     }
