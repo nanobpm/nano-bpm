@@ -5669,6 +5669,13 @@ impl Engine {
     /// other queued step runs; a join guard evaluated in between therefore sees
     /// the same live paths as Zeebe's (#1244).
     fn completes_inline(&self, step: &Step) -> bool {
+        // An interrupting event sub-process queued by a throw fires right
+        // after the throw's completion is applied, before any sibling step
+        // (#1555): a parallel sibling throw must not complete first and
+        // purge this handler's activation.
+        if matches!(step, Step::TriggerEventSubProcess { .. }) {
+            return true;
+        }
         let Step::Complete {
             instance_key,
             element_id,

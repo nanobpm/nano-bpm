@@ -446,3 +446,113 @@ fn error_variables_land_in_the_embedded_subprocess_hosting_the_event_subprocess(
     let job = engine.activate_jobs("esp", "w", 10, 60_000, 0).remove(0);
     assert_eq!(job.variables.get("reason"), Some(&Value::Int(7)));
 }
+
+// --- Review regressions (PR #1593) -----------------------------------------
+
+#[test]
+fn interrupting_handler_throwing_its_own_escalation_does_not_recatch_itself() {
+    // The handler's own throw must not be caught by the (interrupted) host
+    // scope's event sub-processes — it previously restarted forever.
+    let mut engine = Engine::new();
+    let def = esc_root()
+        .event_sub_process("esp", "esp_start", esc(Some("ESC")), true)
+        .start_event("esp_start")
+        .escalation_throw_event("esp_throw", "ESC")
+        .service_task("esp_task", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_throw")
+        .connect("esp_throw", "esp_task")
+        .connect("esp_task", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_throw", "esp")
+        .contained_in("esp_task", "esp")
+        .contained_in("esp_end", "esp")
+        .build()
+        .unwrap();
+    let (inst, events) = create(&mut engine, def);
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp"))
+        .count();
+    assert_eq!(starts, 1, "handler fires exactly once");
+    assert_eq!(job_types(&engine), vec!["esp".to_string()]);
+    complete_one(&mut engine, "esp");
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn parallel_escalation_throws_fire_only_the_first_interrupting_handler() {
+    let mut engine = Engine::new();
+    let b = ProcessBuilder::new("p")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .escalation_throw_event("ta", "A")
+        .escalation_throw_event("tb", "B")
+        .end_event("ea")
+        .end_event("eb")
+        .connect("s", "fork")
+        .connect("fork", "ta")
+        .connect("fork", "tb")
+        .connect("ta", "ea")
+        .connect("tb", "eb");
+    let b = with_esp(b, "espa", esc(Some("A")), true, None);
+    let def = with_esp(b, "espb", esc(Some("B")), true, None)
+        .build()
+        .unwrap();
+    let (inst, events) = create(&mut engine, def);
+    // The fork takes `tb` first (execution order), so `B` is thrown first:
+    // its interrupt must fire before `ta` completes, tearing `ta` down — the
+    // later throw must not purge the earlier handler's activation.
+    assert!(activated(&events, "espb"), "first throw's handler runs");
+    assert!(
+        !activated(&events, "espa"),
+        "interrupted scope cannot re-trigger"
+    );
+    assert_eq!(job_types(&engine), vec!["espb".to_string()]);
+    complete_one(&mut engine, "espb");
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn unnamed_escalation_prefers_a_catch_all_event_subprocess_over_a_catch_all_boundary() {
+    let mut engine = Engine::new();
+    let b = ProcessBuilder::new("p")
+        .start_event("s")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .escalation_throw_event("throw", "")
+        .end_event("sub_e")
+        .contained_in("sub_s", "sub")
+        .contained_in("throw", "sub")
+        .contained_in("sub_e", "sub")
+        .end_event("e")
+        .connect("s", "sub")
+        .connect("sub_s", "throw")
+        .connect("throw", "sub_e")
+        .connect("sub", "e")
+        .escalation_boundary_event("bnd", "sub", "")
+        .end_event("bnd_end")
+        .connect("bnd", "bnd_end");
+    let def = with_esp(b, "esp", esc(None), true, Some("sub"))
+        .build()
+        .unwrap();
+    let (_, events) = create(&mut engine, def);
+    assert!(activated(&events, "esp"));
+    assert!(!activated(&events, "bnd"));
+}
+
+#[test]
+fn empty_job_error_code_prefers_a_catch_all_event_subprocess_over_a_catch_all_boundary() {
+    let mut engine = Engine::new();
+    let b = sub_task()
+        .error_boundary_event("bnd", "sub", "")
+        .end_event("bnd_end")
+        .connect("bnd", "bnd_end");
+    let def = with_esp(b, "esp", err(None), true, Some("sub"))
+        .build()
+        .unwrap();
+    start(&mut engine, def);
+    let events = throw_error(&mut engine, "", HashMap::new());
+    assert!(activated(&events, "esp"));
+    assert!(!activated(&events, "bnd"));
+}

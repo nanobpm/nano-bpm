@@ -502,6 +502,15 @@ impl Engine {
         if scope_eik != 0 && self.is_multi_instance_body(instance_key, scope_eik) {
             return Vec::new();
         }
+        // An interrupting event sub-process already running in the scope has
+        // disabled the scope's other triggers (Zeebe: the flow scope is
+        // *interrupted*), so none of the scope's event sub-processes can catch
+        // — not even the running handler itself, which would otherwise catch
+        // its own throw and restart forever. Boundaries on the scope element
+        // and outer scopes still apply.
+        if self.scope_interrupted_by_event_subprocess(instance_key, scope_eik) {
+            return Vec::new();
+        }
         self.process_of_instance(instance_key)
             .map(|p| {
                 p.event_subprocesses_in_scope(scope_element)
@@ -511,6 +520,29 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether an **interrupting** event sub-process instance is live directly
+    /// in scope `scope_eik` (`0` = the process root) of `instance_key`.
+    /// Derived from the live element instances, so it holds across replay.
+    pub(crate) fn scope_interrupted_by_event_subprocess(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+    ) -> bool {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return false;
+        };
+        instance.active.iter().any(|(eik, element_id)| {
+            self.scope_of(instance_key, *eik) == scope_eik
+                && matches!(
+                    self.element_kind(instance_key, element_id),
+                    Some(ElementKind::EventSubProcess {
+                        interrupting: true,
+                        ..
+                    })
+                )
+        })
     }
 
     /// The single catch-resolution walk shared by errors and escalations
@@ -544,7 +576,10 @@ impl Engine {
             for exact in [true, false] {
                 let esp = esps.iter().find(|(_, trigger, _)| match esp_code(trigger) {
                     Some(Some(c)) => exact && c == code,
-                    Some(None) => !exact,
+                    // A no-code catch is a catch-all; for an unnamed throw
+                    // (empty code) it is also the exact match, consistent with
+                    // the boundary lookups, so ESP precedence holds.
+                    Some(None) => !exact || code.is_empty(),
                     None => false,
                 });
                 if let Some((esp_id, _, interrupting)) = esp {
