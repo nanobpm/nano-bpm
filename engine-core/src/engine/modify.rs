@@ -345,10 +345,13 @@ impl Engine {
     /// The inferred ancestor scope instance for a move target (Zeebe
     /// `findProperAncestorScopeKeyForTarget`): walk the source instance's
     /// ancestry — starting at its direct flow scope — for an instance whose
-    /// element is one of the target's flow scopes, and use it. `0` (the
-    /// process root) matches a root-level target. No matching ancestor →
-    /// `None` (Zeebe's `-1`): the activation's default find-or-create
-    /// resolution applies.
+    /// element is one of the target's flow scopes, and use it. The process
+    /// root is itself a flow scope of every element, so when the walk reaches
+    /// the root without an intermediate match the root is the selection
+    /// (`Some(instance_key)`, as for `SourceParent`): the target's missing
+    /// scope chain is created beneath it rather than reusing an unrelated
+    /// active scope. A root-level target → `None`: the default resolution
+    /// lands it at the root.
     fn infer_ancestor_scope(
         &self,
         def: &crate::model::ProcessDefinition,
@@ -365,7 +368,7 @@ impl Engine {
         let mut current = Some(source_parent);
         while let Some(key) = current {
             if key == 0 {
-                break;
+                return Some(instance_key);
             }
             let matches = self
                 .element_id_of_instance(instance_key, key)
@@ -379,7 +382,7 @@ impl Engine {
                 .get(&instance_key)
                 .and_then(|i| i.scopes.get(&key).copied());
         }
-        None
+        Some(instance_key)
     }
 
     /// Validates a `ModifyInstance` against the current state without emitting

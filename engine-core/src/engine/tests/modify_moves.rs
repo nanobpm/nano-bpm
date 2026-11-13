@@ -710,3 +710,38 @@ fn move_by_id_of_a_parked_join_is_a_no_op() {
     assert!(eiks(&engine, inst, "a").is_empty(), "nothing activated");
     assert_eq!(eiks(&engine, inst, "b"), b_before);
 }
+
+/// Inferred scope for a ROOT-level source and a nested target selects the
+/// process root (Zeebe walks up to the process instance): a fresh target
+/// scope is created instead of reusing the unrelated active `sub`.
+#[test]
+fn inferred_move_from_root_creates_the_target_scope() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, root_task_beside_sub());
+    let existing_sub = eiks(&engine, inst, "sub");
+
+    let mut m = move_by_id("r", "b");
+    m.ancestor_scope = AncestorScopeInstruction::Inferred;
+    engine.apply_command(move_cmd(inst, vec![m])).unwrap();
+
+    let subs = eiks(&engine, inst, "sub");
+    assert_eq!(subs.len(), 2, "a fresh `sub` scope is created at the root");
+    let b_scope = scope_of(&engine, inst, eiks(&engine, inst, "b")[0]);
+    assert_ne!(b_scope, existing_sub[0], "the active scope is not reused");
+}
+
+/// Same with two active target scopes: inference is unambiguous (the root),
+/// so the move succeeds instead of failing with an ambiguous flow scope.
+#[test]
+fn inferred_move_from_root_with_multiple_target_scopes_is_not_ambiguous() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, root_task_beside_sub());
+    activate_second_sub(&mut engine, inst);
+
+    let mut m = move_by_id("r", "b");
+    m.ancestor_scope = AncestorScopeInstruction::Inferred;
+    engine.apply_command(move_cmd(inst, vec![m])).unwrap();
+
+    assert_eq!(eiks(&engine, inst, "sub").len(), 3);
+    assert_eq!(eiks(&engine, inst, "b").len(), 1);
+}
