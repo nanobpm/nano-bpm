@@ -1318,6 +1318,145 @@ fn modify_created_flow_scope_arms_its_event_subprocesses() {
 }
 
 #[test]
+fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
+    // Review r4558198708: a modify-created host's event sub-processes live
+    // INSIDE the host, so their trigger expressions must see the
+    // instruction-supplied locals of that host — a local `orderId = 99`
+    // shadowing the root's `7` subscribes to `99`, and a local-only key is
+    // accepted (not rejected during planning).
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("w", "work")
+        .end_event("e")
+        .connect("s", "w")
+        .connect("w", "e")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("inner", "innerwork")
+        .end_event("sub_e")
+        .connect("sub_s", "inner")
+        .connect("inner", "sub_e")
+        .contained_in("sub_s", "sub")
+        .contained_in("inner", "sub")
+        .contained_in("sub_e", "sub")
+        .event_sub_process("esp", "esp_start", msg(), false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .contained_in("esp", "sub")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    let mut activate = crate::ActivateElementInstruction::new("inner");
+    activate
+        .variable_instructions
+        .push(crate::event::VariableInstruction {
+            variables: vars(&[("orderId", Value::Int(99))]),
+            scope_id: Some("sub".into()),
+        });
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![activate],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert_eq!(armed(&engine, inst), 1);
+    let _ = engine.apply_command(Command::CorrelateMessage {
+        message_name: "m".into(),
+        correlation_key: "7".into(),
+        variables: HashMap::new(),
+        business_id: None,
+    });
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        0,
+        "the root's shadowed `orderId = 7` is not the host's correlation key"
+    );
+    engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "99".into(),
+            variables: HashMap::new(),
+            business_id: None,
+        })
+        .unwrap();
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        1,
+        "the ESP subscribed with the host-local `orderId = 99`"
+    );
+}
+
+#[test]
+fn modify_created_flow_scope_accepts_a_host_local_only_esp_correlation_key() {
+    // The local-only variant: the key exists ONLY as a host local, so a
+    // parent-view check would reject the modification.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("w", "work")
+        .end_event("e")
+        .connect("s", "w")
+        .connect("w", "e")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("inner", "innerwork")
+        .end_event("sub_e")
+        .connect("sub_s", "inner")
+        .connect("inner", "sub_e")
+        .contained_in("sub_s", "sub")
+        .contained_in("inner", "sub")
+        .contained_in("sub_e", "sub")
+        .event_sub_process(
+            "esp",
+            "esp_start",
+            Trig::Message {
+                message_name: "m".into(),
+                correlation_key: "localKey".into(),
+            },
+            false,
+        )
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .contained_in("esp", "sub")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    let mut activate = crate::ActivateElementInstruction::new("inner");
+    activate
+        .variable_instructions
+        .push(crate::event::VariableInstruction {
+            variables: vars(&[("localKey", Value::Int(5))]),
+            scope_id: Some("sub".into()),
+        });
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![activate],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .expect("a host-local correlation key is visible to the host's ESPs");
+    assert_eq!(armed(&engine, inst), 1);
+}
+
+#[test]
 fn modify_created_flow_scope_evaluates_a_conditional_event_subprocess_on_open() {
     // A conditional ESP armed by a ModifyInstance-created scope must get its
     // initial evaluation: the `ConditionalSubscriptionCreated` event the arming
