@@ -21,7 +21,25 @@ pub(crate) fn cluster_tool_servers() -> Vec<ToolServer> {
     vec![ToolServer {
         path: "/mcp/cluster",
         tools: build_tools(),
+        dynamic: None,
     }]
+}
+
+/// The cluster tools named in `names`, in that order — the SAME `Tool`
+/// (metadata + dispatch) the `/mcp/cluster` server registers, so a sibling
+/// server (e.g. `/mcp/processes`) shares the implementation instead of copying
+/// it. Panics-free: a name not in the 18-tool table is simply absent, which the
+/// caller's tests guard.
+pub(crate) fn shared_cluster_tools(names: &[&str]) -> Vec<Tool> {
+    let mut all = build_tools();
+    names
+        .iter()
+        .filter_map(|n| {
+            all.iter()
+                .position(|t| t.name == *n)
+                .map(|i| all.swap_remove(i))
+        })
+        .collect()
 }
 
 /// Build the 18 tools, wiring each schema entry to its dispatch by name.
