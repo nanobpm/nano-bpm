@@ -17,7 +17,7 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +51,49 @@ impl Drop for ScratchDir {
     }
 }
 
+/// True for an inherited variable the server reads as configuration: every
+/// `NANOBPM_*` / `NANOBPMN_*` knob (e.g. `NANOBPMN_DATA_DIR`, which outranks
+/// `NANOBPMN_JOURNAL`; `NANOBPMN_READ_DB`; `NANOBPM_MCP_ENABLED`) plus `PORT`.
+fn is_server_config_var(name: &str) -> bool {
+    name.starts_with("NANOBPM") || name == "PORT"
+}
+
+/// Remove every inherited server-config variable so a test node is isolated
+/// to its scratch dir and the test's explicit env, never the runner's.
+fn scrub_inherited_server_env(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_server_config_var) {
+            command.env_remove(&name);
+        }
+    }
+}
+
+#[test]
+fn server_config_env_class_is_scrubbed() {
+    for name in [
+        "NANOBPMN_DATA_DIR",
+        "NANOBPMN_READ_DB",
+        "NANOBPMN_JOURNAL",
+        "NANOBPM_MCP_ENABLED",
+        "PORT",
+    ] {
+        assert!(is_server_config_var(name), "{name} must be scrubbed");
+    }
+    assert!(!is_server_config_var("PATH"));
+    let mut command = server_command();
+    scrub_inherited_server_env(&mut command);
+    let removed: Vec<_> = command
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_owned())
+        .collect();
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_server_config_var) {
+            assert!(removed.contains(&name), "{name:?} leaks into the child");
+        }
+    }
+}
+
 /// A running server child, killed (whole process group) and reaped on drop.
 struct ServerProcess {
     child: Child,
@@ -61,6 +104,7 @@ struct ServerProcess {
 impl ServerProcess {
     fn boot(journal: &std::path::Path, env: &[(&str, &str)]) -> Self {
         let mut command = server_command();
+        scrub_inherited_server_env(&mut command);
         command.env("NANOBPMN_JOURNAL", journal).env("PORT", "0");
         for (k, v) in env {
             command.env(k, v);

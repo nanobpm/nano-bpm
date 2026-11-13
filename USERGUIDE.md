@@ -519,9 +519,12 @@ defaults `camunda.mcp.enabled` to false). One switch covers both servers:
 NANOBPM_MCP_ENABLED=false ./nanobpm-gateway-rest-server   # turn both MCP servers off
 ```
 
-When MCP is on, the startup banner lists both endpoints. Note that an
-unauthenticated node exposes MCP exactly as it exposes `/v2`; configure auth
-before exposing the port. Camunda's `/physical-tenants/{id}/mcp/*` paths are not
+When MCP is on, the startup banner lists both endpoints. **The MCP endpoints
+have no built-in authentication**: like `/v2`, the gateway accepts any (or no)
+credentials, there is no setting that makes it validate them, and the listener
+binds to all interfaces. Before exposing the port beyond a trusted host, put an
+authenticating reverse proxy or a network restriction in front of it — or turn
+MCP off with `NANOBPM_MCP_ENABLED=false`. Camunda's `/physical-tenants/{id}/mcp/*` paths are not
 served — Nano has no physical tenants.
 
 **Example client config** (any MCP client that speaks streamable HTTP, e.g. an
