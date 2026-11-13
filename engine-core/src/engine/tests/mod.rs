@@ -24,6 +24,7 @@ mod listeners;
 mod migration;
 mod migration_event_gateway;
 mod migration_scopes;
+mod modify_moves;
 mod modify_scopes;
 mod multi_instance;
 mod retry_phases;

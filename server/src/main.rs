@@ -21956,6 +21956,109 @@ impl ServerImpl {
         ))
     }
 
+    /// `POST /v2/process-instances/modification` — mint a
+    /// `MODIFY_PROCESS_INSTANCE` batch operation over every ACTIVE process
+    /// instance matched by the request filter and apply the request's
+    /// `moveInstructions` to each one (Zeebe
+    /// `ModifyProcessInstanceBatchOperationExecutor` parity), via the same
+    /// [`Self::modify_instance_core`] as the single-instance endpoint.
+    /// Ineligible instances are recorded as `FAILED` items carrying the
+    /// engine's rejection reason.
+    ///
+    /// Batch modification supports `moveInstructions` only (spec:
+    /// `ProcessInstanceModificationBatchOperationRequest`); each batch move
+    /// instruction carries a source/target element id pair, which maps onto
+    /// the engine's [`nanobpmn_engine_core::MoveInstruction`] with the
+    /// inferred ancestor scope — Zeebe maps the batch shape onto
+    /// `setInferAncestorScopeFromSourceHierarchy(true)`
+    /// (`ProcessInstanceMapper.mapProcessInstanceModificationMoveBatchInstruction`).
+    ///
+    /// Up-front 400s (no batch minted), matching Zeebe's
+    /// `validateModifyProcessInstanceBatchOperationRequest`: an empty
+    /// `moveInstructions`, a blank source/target element id, and the filter
+    /// contract violation of supplying BOTH the deprecated
+    /// `batchOperationId` and `batchOperationKey`.
+    async fn modify_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceModificationBatchOperationRequest,
+    ) -> Result<apis::process_instance::ModifyProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let bad_request = |detail: String| {
+            Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                problem("INVALID_ARGUMENT", 400, detail),
+            ))
+        };
+        // The filter schema (spec/process-instances.yaml) deprecates
+        // `batchOperationId` in favour of `batchOperationKey` and requires a
+        // 400 when BOTH are supplied — the same contract the migration
+        // endpoint enforces.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return bad_request(
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            );
+        }
+        // Zeebe `ERROR_MESSAGE_EMPTY_ATTRIBUTE.formatted("moveInstructions")`.
+        if body.move_instructions.is_empty() {
+            return bad_request("No moveInstructions provided.".to_string());
+        }
+        // Zeebe `validateMoveBatchInstructions`: every instruction needs a
+        // non-blank source and target element id.
+        if body
+            .move_instructions
+            .iter()
+            .any(|m| m.source_element_id.trim().is_empty())
+        {
+            return bad_request("No sourceElementId provided.".to_string());
+        }
+        if body
+            .move_instructions
+            .iter()
+            .any(|m| m.target_element_id.trim().is_empty())
+        {
+            return bad_request("No targetElementId provided.".to_string());
+        }
+        let move_instructions: Vec<nanobpmn_engine_core::MoveInstruction> = body
+            .move_instructions
+            .iter()
+            .map(|m| nanobpmn_engine_core::MoveInstruction {
+                source: nanobpmn_engine_core::MoveSource::ById(m.source_element_id.clone()),
+                target_element_id: m.target_element_id.clone(),
+                ancestor_scope: nanobpmn_engine_core::AncestorScopeInstruction::Inferred,
+                variable_instructions: Vec::new(),
+            })
+            .collect();
+        let op_type = models::BatchOperationTypeEnum::ModifyProcessInstance;
+        // Modification honours the supplied filters; `state` is overridden to
+        // ACTIVE by the matcher (only ACTIVE instances can be modified).
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
+            let move_instructions = move_instructions.clone();
+            async move {
+                match server
+                    .modify_instance_core(
+                        instance,
+                        falcon::ModifyInstanceInstructions {
+                            move_instructions,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    ModifyInstanceOutcome::Modified => Ok(()),
+                    ModifyInstanceOutcome::BadRequest(d)
+                    | ModifyInstanceOutcome::NotFound(d)
+                    | ModifyInstanceOutcome::Conflict(d)
+                    | ModifyInstanceOutcome::Unavailable(d)
+                    | ModifyInstanceOutcome::Internal(d) => Err(d),
+                }
+            }
+        });
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
     /// `POST /v2/process-instances/incident-resolution` — mint a `RESOLVE_INCIDENT`
     /// batch operation over every process instance matched by the request filter.
     async fn resolve_incidents_batch_operation_impl(
@@ -25369,12 +25472,16 @@ fn modify_instructions_from_rest(
             }
         };
         // Spec: the default (absent) ancestor scope resembles a `direct`
-        // instruction with key `-1`, i.e. the engine's inferred default.
+        // instruction with key `-1`, i.e. the default find-or-create flow
+        // scope resolution (`Direct(0)`) — NOT source-hierarchy inference,
+        // which is reserved for an explicit `inferred` instruction (it would
+        // silently pick the source's scope where the default rejects an
+        // ambiguous target scope).
         let ancestor_scope = match &m.ancestor_scope_instruction {
-            None => AncestorScopeInstruction::Inferred,
+            None => AncestorScopeInstruction::Direct(0),
             Some(models::AncestorScopeInstruction::DirectAncestorKeyInstruction(d)) => {
                 if d.ancestor_element_instance_key.0 == "-1" {
-                    AncestorScopeInstruction::Inferred
+                    AncestorScopeInstruction::Direct(0)
                 } else {
                     AncestorScopeInstruction::Direct(parse_modification_key(
                         "ancestorElementInstanceKey",
@@ -35934,6 +36041,276 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #1552: `POST /v2/process-instances/modification` mints a trackable
+    /// `MODIFY_PROCESS_INSTANCE` batch over every matched ACTIVE instance and
+    /// applies the request's `moveInstructions` to each one (Zeebe
+    /// `ModifyProcessInstanceBatchOperationExecutor` parity): the matched
+    /// instances' tokens move from the source to the target element, an
+    /// instance whose active element is not the source is recorded FAILED with
+    /// the engine's reason, and the batch settles `PARTIALLY_COMPLETED`.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_moves_tokens_and_records_failures() {
+        use apis::batch_operation::{
+            GetBatchOperationResponse as GetResp, SearchBatchOperationItemsResponse as ItemsResp,
+        };
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+        // `move-me`: s → a(work-a) → b(work-b) → e. `other`: s → c(work-c) →
+        // b(work-b) → e (no `a` element, so a move from `a` matches nothing
+        // there — Zeebe records it as a per-item failure).
+        let build = |id: &str, task: &str, job: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .service_task(task, job)
+                .service_task("b", "work-b")
+                .end_event("e")
+                .connect("s", task)
+                .connect(task, "b")
+                .connect("b", "e")
+                .build()
+                .expect("valid definition")
+        };
+        for (id, task, job) in [("move-me", "a", "work-a"), ("other", "c", "work-c")] {
+            let mut names = std::collections::HashMap::new();
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+            server
+                .deploy_resources_locally(
+                    vec![build(id, task, job)],
+                    &names,
+                    Vec::new(),
+                    &std::collections::HashMap::new(),
+                    "<default>",
+                )
+                .await
+                .expect("deploy");
+        }
+
+        // Two eligible move-me instances (parked on `a`), one other instance
+        // (parked on `c`; the move from `a` matches nothing there — Zeebe
+        // records it as a per-item failure).
+        let mut eligible = Vec::new();
+        let mut ineligible = 0u64;
+        for id in ["move-me", "move-me", "other"] {
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .await
+                .expect("create instance");
+            if id == "other" {
+                ineligible = key;
+            } else {
+                eligible.push(key);
+            }
+        }
+        let all: Vec<u64> = eligible.iter().copied().chain([ineligible]).collect();
+        let mut projected = false;
+        for _ in 0..200 {
+            let matched = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                BatchHierarchyPolicy::HonourFilters,
+            );
+            if all.iter().all(|k| matched.contains(k)) {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "all instances project as ACTIVE");
+
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            vec![
+                models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                    "a".to_string(),
+                    "b".to_string(),
+                ),
+            ],
+        );
+        let created = match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("response")
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200 created, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::ModifyProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // Poll the batch until it settles.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let mut got = None;
+        for _ in 0..500 {
+            let r = match server.get_batch_operation_impl(&path).await.unwrap() {
+                GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                other => panic!("expected 200 get, got {other:?}"),
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                got = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the batch settles");
+        assert_eq!(
+            got.state,
+            models::BatchOperationStateEnum::PartiallyCompleted
+        );
+        assert_eq!(got.operations_total_count, 3);
+        assert_eq!(got.operations_completed_count, 2);
+        assert_eq!(got.operations_failed_count, 1);
+
+        // The eligible instances' tokens actually moved from `a` to `b`. A
+        // terminal batch state does not guarantee the modification events have
+        // reached the read model, so poll for the move with a bounded timeout
+        // (as the batch-migration test does).
+        let mut moved = false;
+        for _ in 0..200 {
+            if eligible.iter().all(|key| {
+                let elements = server.store.element_instances();
+                let active = |element_id: &str| {
+                    elements.iter().any(|e| {
+                        e.instance_key == *key
+                            && e.element_id == element_id
+                            && e.state == crate::readstore::ElementInstanceState::Active
+                    })
+                };
+                !active("a") && active("b")
+            }) {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            moved,
+            "eligible instances project the moved token (a terminated, b active)"
+        );
+
+        // The ineligible item is FAILED with an error message.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r.items,
+            other => panic!("expected 200 items, got {other:?}"),
+        };
+        let failed = items
+            .iter()
+            .find(|i| i.batch_operation_key == batch_key && i.item_key == ineligible.to_string())
+            .expect("ineligible item recorded");
+        assert_eq!(failed.state, "FAILED");
+        assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
+    }
+
+    /// #1552: an empty `moveInstructions` array is rejected up front with `400`
+    /// (Zeebe `ERROR_MESSAGE_EMPTY_ATTRIBUTE.formatted("moveInstructions")`),
+    /// and no batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_empty_move_instructions() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            Vec::new(),
+        );
+        match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for empty moveInstructions, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
+    /// #1552: a move instruction with a blank source or target element id is
+    /// rejected up front with `400` (Zeebe `validateMoveBatchInstructions`),
+    /// and no batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_blank_element_ids() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        for (source, target) in [("", "b"), ("a", "")] {
+            let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+                models::ProcessInstanceFilter::new(),
+                vec![
+                    models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                        source.to_string(),
+                        target.to_string(),
+                    ),
+                ],
+            );
+            match server
+                .modify_process_instances_batch_operation_impl(&req)
+                .await
+                .unwrap()
+            {
+                Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                    assert_eq!(p.status, 400);
+                }
+                other => {
+                    panic!("expected 400 for ({source:?} -> {target:?}), got {other:?}")
+                }
+            }
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
+    /// #1552: the filter schema (spec/process-instances.yaml) deprecates
+    /// `batchOperationId` in favour of `batchOperationKey` and requires a `400`
+    /// when BOTH are supplied — the modification endpoint enforces the same
+    /// contract as the migration endpoint, before any batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_id_and_key_together() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let filter = models::ProcessInstanceFilter {
+            batch_operation_id: Some(s("2251799813685249")),
+            batch_operation_key: Some(s("2251799813685249")),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            filter,
+            vec![
+                models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                    "a".to_string(),
+                    "b".to_string(),
+                ),
+            ],
+        );
+        match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for id+key together, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
     /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
     /// core the v2 REST API shares — end to end: a service-task instance waiting
     /// on a job is migrated onto a second definition, the read model re-homes
@@ -36211,9 +36588,53 @@ mod clustered_startup_tests {
         assert!(ok, "b active, a terminated, x=42 on the root scope");
     }
 
-    /// 400: an unknown element id and an engine 'not yet supported' instruction
-    /// (a move instruction) are INVALID_ARGUMENT carrying the
-    /// engine's message; a malformed element-instance key is 400 too.
+    /// #1552: a `moveInstructions` request on the single-instance endpoint
+    /// moves the token — the full REST → engine move path (the instruction was
+    /// previously rejected `not yet supported`).
+    #[tokio::test]
+    async fn modify_instance_moves_a_token_via_rest() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let (instance_key, _) = modify_fixture(&server).await;
+
+        let resp = modify_via_rest(
+            &server,
+            &instance_key.to_string(),
+            serde_json::json!({
+                "moveInstructions": [{
+                    "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                    "targetElementId": "b"
+                }]
+            }),
+        )
+        .await;
+        assert!(
+            matches!(resp, Resp::Status204_TheProcessInstanceIsModified),
+            "unexpected response: {resp:?}"
+        );
+
+        let mut moved = false;
+        for _ in 0..200 {
+            let rows = server.store.element_instances();
+            let active = |element_id: &str| {
+                rows.iter().any(|e| {
+                    e.instance_key == instance_key
+                        && e.element_id == element_id
+                        && e.state == crate::readstore::ElementInstanceState::Active
+                })
+            };
+            if !active("a") && active("b") {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(moved, "the token moved from a to b");
+    }
+
+    /// 400: an unknown element id (activate target or move target) is
+    /// INVALID_ARGUMENT carrying the engine's message; a malformed
+    /// element-instance key is 400 too.
     #[tokio::test]
     async fn modify_instance_invalid_instruction_is_400() {
         use apis::process_instance::ModifyProcessInstanceResponse as Resp;
@@ -36232,28 +36653,24 @@ mod clustered_startup_tests {
             "unknown element: {resp:?}"
         );
 
+        // Move instructions are acted on (#1552): a move to an UNKNOWN target
+        // element is a 400 (the engine's ElementNotFound), never silently
+        // ignored.
         let resp = modify_via_rest(
             &server,
             &key,
             serde_json::json!({
                 "moveInstructions": [{
                     "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
-                    "targetElementId": "b"
+                    "targetElementId": "nope"
                 }]
             }),
         )
         .await;
-        let expected = nanobpmn_engine_core::EngineError::ModificationInstructionNotYetSupported {
-            instance_key,
-            instruction: "move_instructions",
-        }
-        .to_string();
-        match &resp {
-            Resp::Status400_TheProvidedDataIsNotValid(p) => {
-                assert_eq!(p.detail, expected);
-            }
-            other => panic!("move instructions must be 400 not-yet-supported: {other:?}"),
-        }
+        assert!(
+            matches!(&resp, Resp::Status400_TheProvidedDataIsNotValid(p) if p.status == 400),
+            "unknown move target: {resp:?}"
+        );
 
         let resp = modify_via_rest(
             &server,
@@ -36314,6 +36731,48 @@ mod clustered_startup_tests {
     /// (root-scope aliases — absent/empty `scopeId` or the process id — stay
     /// in `variable_instructions` for the engine to resolve), terminate by id,
     /// and move instructions.
+    /// An omitted ancestor scope and an explicit `direct`/`-1` are the
+    /// spec's default find-or-create resolution (`Direct(0)`); only an
+    /// explicit `inferred` instruction maps to source-hierarchy inference.
+    #[test]
+    fn modify_move_default_ancestor_scope_is_direct_not_inferred() {
+        use nanobpmn_engine_core::AncestorScopeInstruction;
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(serde_json::json!({
+                "moveInstructions": [
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                        "targetElementId": "b"
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "c" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "direct", "ancestorElementInstanceKey": "-1" }
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "d" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "inferred" }
+                    }
+                ]
+            }))
+            .expect("well-formed body");
+        let i = modify_instructions_from_rest(&body).expect("maps");
+        let scopes: Vec<_> = i
+            .move_instructions
+            .iter()
+            .map(|m| m.ancestor_scope.clone())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Inferred,
+            ]
+        );
+    }
+
     #[test]
     fn modify_instructions_map_full_request_shape() {
         use nanobpmn_engine_core::{AncestorScopeInstruction, MoveSource};
