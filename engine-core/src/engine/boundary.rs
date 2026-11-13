@@ -577,8 +577,27 @@ impl Engine {
     /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
     /// sweep, which sees the `ProcessInstanceTerminated` this emits).
     pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
+        let descendants = self.scope_descendants(instance_key, scope_eik);
+        // An event sub-process trigger rests on its host **scope** (#1555) —
+        // on `scope_eik` itself, not on a descendant — so the descendant sweep
+        // never reaches it, and once the scope token is gone the drain sweep
+        // cannot disarm it either. Every teardown of a scope (interrupting
+        // boundary, modification terminate, error / terminate-end throw)
+        // routes through here, so disarm the scope's own triggers first.
+        let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
+        events.extend(self.element_teardown_events(instance_key, &descendants));
+        self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
+        events
+    }
+
+    /// The per-element-instance half of [`Self::scope_teardown_events`]: tears
+    /// down each of `members` (cancelling every runtime resource it owns, then
+    /// completing it) without touching compensation state. An interrupting
+    /// event sub-process uses it directly, so compensable activities completed
+    /// in the scope stay compensable from inside the event sub-process.
+    pub(crate) fn element_teardown_events(&self, instance_key: Key, members: &[Key]) -> Vec<Event> {
         let mut events = Vec::new();
-        for eik in self.scope_descendants(instance_key, scope_eik) {
+        for &eik in members {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
@@ -668,6 +687,17 @@ impl Engine {
                 element_id,
             });
         }
+        events
+    }
+
+    /// Appends the [`Event::ScopedCompensationCleared`] for a scope teardown
+    /// of `scope_eik` (see [`Self::scope_teardown_events`]).
+    fn push_scoped_compensation_cleared(
+        &self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        scope_eik: Key,
+    ) {
         // Scoped compensation cleanup. A completed compensable activity and an
         // in-flight compensation throw both record the `scope` (element instance
         // of the enclosing sub-process, or `0` for the root) they belong to. The
@@ -698,7 +728,6 @@ impl Engine {
                 });
             }
         }
-        events
     }
 
     /// Root-record teardown events for an activity interrupted at its boundary —
@@ -1295,13 +1324,14 @@ impl Engine {
         })
     }
 
-    /// Whether `element_id` is an embedded sub-process (interrupting it must tear
-    /// down its whole inner token scope, not just cancel a job).
+    /// Whether `element_id` owns an inner token scope — an embedded sub-process
+    /// or an event sub-process (interrupting or terminating it must tear down
+    /// its whole inner token scope, not just cancel a job). Delegates to the
+    /// canonical [`ElementKind::owns_token_scope`].
     pub(crate) fn is_subprocess(&self, instance_key: Key, element_id: &str) -> bool {
-        matches!(
-            self.element_kind(instance_key, element_id),
-            Some(ElementKind::SubProcess { .. })
-        )
+        self.element_kind(instance_key, element_id)
+            .as_ref()
+            .is_some_and(ElementKind::owns_token_scope)
     }
 
     /// Whether `element_instance_key` is a live ad-hoc sub-process container —

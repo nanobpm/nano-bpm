@@ -1751,6 +1751,19 @@ pub enum TimerKind {
         /// Id of the boundary event whose outgoing flow runs when the timer fires.
         boundary_element_id: ElementId,
     },
+    /// The timer start event of an **event sub-process** (#1555), armed when
+    /// its enclosing scope activates. The timer's `element_instance_key` is the
+    /// enclosing scope (the embedded sub-process instance, or `0` for the
+    /// process root) and its `element_id` the event sub-process's start event.
+    /// Firing activates the event sub-process in that scope — tearing the
+    /// scope's other children down first when `interrupting`. A non-interrupting
+    /// cycle re-arms after each fire.
+    EventSubProcess {
+        /// Id of the event sub-process element to activate.
+        esp_element_id: ElementId,
+        /// Whether firing interrupts the enclosing scope.
+        interrupting: bool,
+    },
 }
 
 /// An armed timer holding a token on a timer intermediate catch event until its
@@ -1828,6 +1841,37 @@ pub enum MessageSubscriptionKind {
         /// correlated.
         boundary_element_id: ElementId,
     },
+    /// The message / signal / conditional start event of an **event
+    /// sub-process** (#1555), armed when its enclosing scope activates. The
+    /// subscription's `element_instance_key` is the enclosing scope (the
+    /// embedded sub-process instance, or `0` for the process root) and its
+    /// `element_id` the event sub-process's start event. Triggering activates
+    /// the event sub-process in that scope (interrupting the scope's other
+    /// children first when `interrupting`); a non-interrupting subscription
+    /// stays open so every trigger spawns another event sub-process instance.
+    EventSubProcess {
+        /// Id of the event sub-process element to activate.
+        esp_element_id: ElementId,
+        /// Whether triggering interrupts the enclosing scope.
+        interrupting: bool,
+    },
+}
+
+impl MessageSubscriptionKind {
+    /// Whether a subscription of this kind stays open after it triggers (a
+    /// non-interrupting boundary or a non-interrupting event sub-process start
+    /// fires repeatedly); every other kind settles on its first trigger. The
+    /// single source of truth for the message / signal / conditional appliers.
+    pub fn stays_open_after_trigger(&self) -> bool {
+        matches!(
+            self,
+            MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                | MessageSubscriptionKind::EventSubProcess {
+                    interrupting: false,
+                    ..
+                }
+        )
+    }
 }
 
 /// An open message subscription holding a token on a message catch element until
@@ -1853,6 +1897,22 @@ pub struct MessageSubscription {
     pub state: MessageSubscriptionState,
     /// What the subscription guards, and so what correlating it does.
     pub kind: MessageSubscriptionKind,
+    /// The `message_key`s already correlated to this subscription — recorded
+    /// only for a kind that [`stays_open_after_trigger`](MessageSubscriptionKind::stays_open_after_trigger)
+    /// (a one-shot kind settles on its first correlation, which already makes a
+    /// redelivered continuation a no-op). A routed
+    /// [`crate::Command::CorrelateMessageSubscription`] is delivered
+    /// at-least-once, so a persistent subscription must recognise a
+    /// redelivered `message_key` and ignore it, while still accepting every
+    /// *distinct* message. Bounded by the distinct messages the subscription
+    /// actually correlated, and dropped with the subscription. Additive
+    /// (`serde(default)`, omitted when empty), so older snapshots decode
+    /// unchanged and one-shot subscriptions serialize byte-identically.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub correlated_message_keys: std::collections::BTreeSet<Key>,
 }
 
 /// An open **signal** subscription holding a token on a signal catch element (or

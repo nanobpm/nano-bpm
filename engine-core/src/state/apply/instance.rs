@@ -364,7 +364,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 | MessageSubscriptionKind::NonInterruptingBoundary {
                     boundary_element_id,
                 } => remap_id(boundary_element_id),
-                _ => {}
+                MessageSubscriptionKind::EventSubProcess { esp_element_id, .. } => {
+                    remap_id(esp_element_id)
+                }
+                MessageSubscriptionKind::IntermediateCatch => {}
             };
 
             // Move the live-instance count from the source process id to the
@@ -477,6 +480,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         | TimerKind::NonInterruptingBoundary {
                             boundary_element_id,
                         } => remap_id(boundary_element_id),
+                        TimerKind::EventSubProcess { esp_element_id, .. } => {
+                            remap_id(esp_element_id)
+                        }
                         TimerKind::IntermediateCatch => {}
                     }
                 }

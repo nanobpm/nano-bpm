@@ -441,7 +441,8 @@ impl Engine {
                     planned.resolution.existing,
                     planned.resolution.to_create[..=depth].to_vec(),
                 );
-                let checked = if created.insert(path.clone()) {
+                let first = created.insert(path.clone());
+                let checked = if first {
                     self.check_boundary_arming(instance_key, scope_id, &host_vars)
                 } else {
                     Ok(())
@@ -458,6 +459,17 @@ impl Engine {
                         host_vars.extend(variables.clone());
                     }
                 }
+                // The created scope's event sub-processes (#1555) live INSIDE
+                // the scope, so — unlike its boundaries — they see its staged
+                // locals (application arms them from the scope's own view). A
+                // failing trigger expression rejects the command here.
+                let checked = checked.and_then(|()| {
+                    if first {
+                        self.check_event_subprocess_arming(instance_key, Some(scope_id), &host_vars)
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(failure) = checked {
                     return Err(invalid(
                         instance_key,
@@ -550,6 +562,30 @@ impl Engine {
                 // fail here. Never drop a failure silently: should it happen
                 // anyway, surface it as an incident on the created scope.
                 match self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    Ok(armed) => {
+                        for event in armed {
+                            self.emit(log, event);
+                        }
+                    }
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            key,
+                            scope_id.clone(),
+                            failure,
+                            None,
+                        );
+                        self.emit(log, event);
+                    }
+                }
+                // The created scope's event sub-processes (#1555) arm here too —
+                // this path bypasses the activation body where arming otherwise
+                // lives. Validated by `plan_modification`
+                // (`check_event_subprocess_arming`) against the scope's own view
+                // (its locals layered over the parent chain), so a failure is
+                // likewise surfaced as an incident on the scope.
+                let esp_vars = self.variables_for_element(instance_key, key);
+                match self.arm_event_subprocesses(instance_key, key, Some(&scope_id), &esp_vars) {
                     Ok(armed) => {
                         for event in armed {
                             self.emit(log, event);
