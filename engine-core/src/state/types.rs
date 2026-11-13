@@ -2512,6 +2512,43 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
     for incident in incidents {
         state.incidents.insert(incident.key, incident);
     }
+    reconcile_incident_index(state, key);
+}
+
+/// Folds every ACTIVE incident in `state.incidents` owned by `instance_key`
+/// into that instance's `incidents` index (#1574 review). An incident raised
+/// while the instance was cold (e.g. the off-heap-orphan `VariablesLost`
+/// quarantine) lands in `state.incidents` with no resident instance to index
+/// it, so restoring the stale cold row alone would leave it unindexed and a
+/// later termination would resolve it only on peers that held the instance
+/// resident — diverging the event log. Keys are appended in ascending order so
+/// every replica rebuilds an identical index.
+fn reconcile_incident_index(state: &mut State, instance_key: Key) {
+    let Some(instance) = state.instances.get(&instance_key) else {
+        return;
+    };
+    let mut missing: Vec<Key> = state
+        .incidents
+        .values()
+        .filter(|i| {
+            i.instance_key == instance_key
+                && i.state == IncidentState::Active
+                && !instance.incidents.contains(&i.key)
+        })
+        .map(|i| i.key)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    missing.sort_unstable();
+    let owed: Vec<Key> = missing
+        .iter()
+        .filter_map(|k| state.incidents.get(k).and_then(Incident::owed_activation))
+        .collect();
+    if let Some(instance) = state.instances.get_mut(&instance_key) {
+        instance.incidents.extend(missing);
+        instance.activating.extend(owed);
+    }
 }
 
 /// Re-syncs the index membership of one job to match its current state.

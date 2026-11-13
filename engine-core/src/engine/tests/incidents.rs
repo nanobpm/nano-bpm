@@ -4641,7 +4641,14 @@ fn stamped_quarantine_converges_resident_and_cold_replicas() {
             .map(|i| (i.key, i.instance_key, i.kind, i.state, i.reason.clone()))
             .collect();
         incidents.sort_by_key(|i| i.0);
-        (inst.variables.as_ref().clone(), inst.state, incidents)
+        let mut indexed = inst.incidents.clone();
+        indexed.sort_unstable();
+        (
+            inst.variables.as_ref().clone(),
+            inst.state,
+            incidents,
+            indexed,
+        )
     };
     assert_eq!(
         view(&resident),
@@ -4652,6 +4659,28 @@ fn stamped_quarantine_converges_resident_and_cold_replicas() {
         view(&resident).0.get("x"),
         Some(&Value::Int(1)),
         "no variable rollback"
+    );
+    assert_eq!(
+        view(&cold).3.len(),
+        1,
+        "the incident raised while cold is indexed on the rehydrated instance"
+    );
+
+    // A later termination resolves the incident identically on both replicas
+    // and lifts both tombstones.
+    let end_resident = resident
+        .apply_command_at(Command::cancel_instance(key), 60)
+        .unwrap();
+    let end_cold = cold
+        .apply_command_at(Command::cancel_instance(key), 60)
+        .unwrap();
+    assert_eq!(end_resident, end_cold, "identical termination events");
+    assert!(end_cold
+        .iter()
+        .any(|e| matches!(e, Event::IncidentResolved { .. })));
+    assert_eq!(
+        resident.state.variables_lost_quarantined, cold.state.variables_lost_quarantined,
+        "identical tombstones after termination"
     );
 }
 
