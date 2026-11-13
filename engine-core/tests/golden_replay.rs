@@ -186,7 +186,10 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // purely from terminal events. Archived snapshots predate it (they load
         // it empty via `serde(default)`), so normalize it to what the archived
         // journal's own terminal events derive — computed independently here
-        // from the journal, not copied from the replayed state.
+        // from the journal, not copied from the replayed state. The same
+        // change adds the replicated `terminal_epoch` counter (one increment
+        // per terminal event), normalized the same way.
+        expected_state.terminal_epoch = terminal_keys.len() as u64;
         expected_state.recently_terminated = terminal_keys;
         assert_eq!(
             &replayed_state, &expected_state,

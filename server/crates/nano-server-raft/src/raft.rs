@@ -2826,13 +2826,51 @@ fn orphan_now_millis() -> u64 {
 /// Runs `f` on the engine actor under this member's lifecycle epoch (#1473):
 /// `None` (and nothing runs) once the member is retired, so a delayed task of a
 /// retired predecessor can never touch the successor's journal state.
+///
+/// The shared lifecycle guard is moved INTO the queued actor closure, not held
+/// by this future (#1574 review): the orphan drainer/watcher run under a
+/// shutdown `select!`, so this future can be CANCELLED after the callback was
+/// queued — a future-held guard would drop with it, letting retirement's
+/// exclusive lock advance the epoch while the queued update still runs. Owned
+/// by the closure, the guard is released only when the job has finished (or
+/// when the actor drains it on death), so the epoch cannot advance underneath
+/// a pending update.
 async fn with_member_engine<R: Send + 'static>(
     engine: &DeepthiHandle,
     epoch: u64,
     f: impl FnOnce(&mut Journal) -> R + Send + 'static,
 ) -> Option<R> {
-    let _lifecycle = engine.lifecycle_enter(epoch).await?;
-    Some(engine.with(f).await)
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
+}
+
+/// [`with_member_engine`] with a probe fired once the shared lifecycle guard
+/// is held, before the actor callback is queued — so the cancellation test can
+/// drop the calling future at the exact point the #1574-review race needs.
+#[cfg(test)]
+async fn with_member_engine_observed<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+    on_guard: impl FnOnce() + Send,
+) -> Option<R> {
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    on_guard();
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
 }
 
 /// Proposes one orphan report as a leader-STAMPED quarantine (#1447). The
@@ -4839,6 +4877,109 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// #1574 review: the lifecycle guard a member-bound engine op takes must
+    /// survive CANCELLATION of the calling future. The orphan drainer/watcher
+    /// run under a shutdown `select!`; if the stop branch wins after the actor
+    /// callback was queued, the outer future is dropped — the guard must live
+    /// in the QUEUED CLOSURE so the queued update still finishes under the
+    /// shared hold, and retirement's exclusive lock waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_member_engine_op_holds_its_guard_until_the_job_runs() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let epoch = engine.lifecycle_epoch();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Occupy the actor with a blocking job so the next job stays QUEUED.
+        let blocker = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .with(move |_| {
+                        entered_tx.send(()).ok();
+                        release_rx.recv().ok();
+                    })
+                    .await;
+            }
+        });
+        entered_rx
+            .recv()
+            .expect("the blocking job is running on the actor");
+
+        // Queue the member-bound op, then CANCEL its future mid-flight (the
+        // shutdown select! dropping the drainer/watcher future). Poll it on a
+        // task so it enters the lifecycle lock and queues its actor callback.
+        let (job_ran_tx, job_ran_rx) = mpsc::channel::<()>();
+        let (guard_held_tx, guard_held_rx) = mpsc::channel::<()>();
+        let op = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                with_member_engine_observed(
+                    &engine,
+                    epoch,
+                    move |_| {
+                        job_ran_tx.send(()).ok();
+                    },
+                    move || {
+                        guard_held_tx.send(()).ok();
+                    },
+                )
+                .await;
+            }
+        });
+        // The op holds the shared guard and its callback sits QUEUED behind
+        // the blocker. Now CANCEL the op's future (the shutdown select!
+        // dropping the drainer/watcher): any guard the FUTURE holds dies with
+        // it, while the queued callback's fate is the question under test.
+        guard_held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the op entered the lifecycle lock");
+        op.abort();
+        assert!(
+            op.await.unwrap_err().is_cancelled(),
+            "the op task was cancelled mid-flight"
+        );
+
+        // The cancelled future must NOT have released the guard: retirement's
+        // exclusive lock is still blocked behind the queued job's shared hold.
+        let retire_probe = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.lifecycle_exclusive().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !retire_probe.is_finished(),
+            "a cancelled op must not release the lifecycle guard before its queued job runs"
+        );
+        // The probe holds the write slot (write-preferring lock); keep it as
+        // the retirement under test.
+        let retire = retire_probe;
+
+        // Unblock the actor: the queued job runs under its guard, THEN
+        // retirement's exclusive lock is granted.
+        release_tx.send(()).expect("release the blocking job");
+        blocker.await.expect("blocker task");
+        job_ran_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued job still ran after its caller was cancelled");
+        let exclusive = tokio::time::timeout(Duration::from_secs(5), retire)
+            .await
+            .expect("retirement completes once the queued job ran")
+            .expect("retire task");
+        // The job ran BEFORE the exclusive was granted: the epoch only
+        // advances under the exclusive lock, which could not be taken while
+        // the job's guard lived.
+        assert_eq!(
+            engine.lifecycle_epoch(),
+            epoch + 1,
+            "retirement advanced the epoch only after the queued job finished"
+        );
+        drop(exclusive);
     }
 
     /// #1574 review: the orphan drainer holds the engine + a Batcher (→ Raft)

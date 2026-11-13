@@ -2135,6 +2135,20 @@ pub struct State {
     /// `serde(default)`: older snapshots load empty.
     #[cfg_attr(feature = "serde", serde(default))]
     pub recently_terminated: std::collections::VecDeque<Key>,
+    /// Total terminal transitions ever applied (`ProcessInstanceCompleted` /
+    /// `ProcessInstanceTerminated`) — a **replicated** monotonic epoch
+    /// (#1574 review). The [`recently_terminated`](Self::recently_terminated)
+    /// ring is bounded, so once it wraps it can no longer answer "did this key
+    /// terminate after the leader stamped its orphan proposal?" for an evicted
+    /// instance. The epoch can: the leader stamps the value it saw, and the
+    /// apply gate compares the distance against the ring's coverage
+    /// (`terminal_epoch - stamp_epoch <= recently_terminated.len()` ⇒ every
+    /// transition since the stamp is still in the ring). Replicated-only, so
+    /// every replica computes the identical distance and decides identically.
+    /// `serde(default)`: older snapshots load `0` (they predate the quarantine
+    /// command, so no stamped proposal can be outstanding against them).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminal_epoch: u64,
 }
 
 /// Bound on [`State::recently_terminated`]. The window it must cover is one
@@ -2143,12 +2157,14 @@ pub struct State {
 pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
 
 impl State {
-    /// Records `instance_key` as terminal in the bounded replicated ring.
+    /// Records `instance_key` as terminal in the bounded replicated ring and
+    /// advances the replicated terminal epoch.
     pub(crate) fn note_terminated(&mut self, instance_key: Key) {
         if self.recently_terminated.len() >= RECENTLY_TERMINATED_CAP {
             self.recently_terminated.pop_front();
         }
         self.recently_terminated.push_back(instance_key);
+        self.terminal_epoch += 1;
     }
 }
 

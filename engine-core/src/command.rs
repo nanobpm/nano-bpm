@@ -799,6 +799,20 @@ pub struct OrphanIncidentStamp {
     pub element_id: String,
     /// The incident's `reason`.
     pub reason: String,
+    /// The leader's replicated terminal epoch
+    /// ([`crate::state::State::terminal_epoch`]) at stamp time (#1574 review).
+    /// The apply gate compares it against the applying replica's epoch and
+    /// terminal ring coverage, so a proposal committing after the ring wrapped
+    /// still decides identically on a resident and an evicted replica.
+    /// Additive: `0` (a stamp minted before this field existed) disables the
+    /// epoch check and keeps the pre-field behaviour (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub terminal_epoch: u64,
+}
+
+#[cfg(feature = "serde")]
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -1617,6 +1631,7 @@ mod kind_tests {
                 kind: OrphanKind::Resident,
                 element_id: "e".repeat(10_000),
                 reason: "r".repeat(20_000),
+                terminal_epoch: 0,
             }),
         }
         .approx_bytes();

@@ -5539,6 +5539,35 @@ impl Engine {
                 if resident_terminal || self.state.recently_terminated.contains(&instance_key) {
                     return Ok((log, queue));
                 }
+                // Ring-wrap gate (#1574 review, terminal-history eviction): the
+                // ring is BOUNDED, so once more terminal transitions commit
+                // than it holds while this proposal was in flight, an evicted
+                // replica can no longer find the key in it — while a replica
+                // retaining the terminal instance still no-ops via residency
+                // above, splitting the journals (incident + key mint on one,
+                // silence on the other). The stamp's terminal epoch closes it:
+                // the distance to the replica's epoch is replicated state, so
+                // every replica computes it identically.
+                //
+                // - distance 0: no terminal transition committed since the
+                //   stamp — the absent key is live-but-cold; proceed.
+                // - distance within the ring's coverage: every transition
+                //   since the stamp is still in the ring, and this key is not —
+                //   so it terminated BEFORE the stamp (a stale proposal
+                //   re-committed after the instance finished); no-op.
+                // - distance beyond the ring's coverage (or a legacy stamp with
+                //   no epoch): the ring can no longer prove ordering — fail
+                //   OPEN (proceed), the pre-epoch behaviour, so a genuine
+                //   stale-stamp loss is still reported identically everywhere.
+                if stamp.terminal_epoch > 0 {
+                    let distance = self
+                        .state
+                        .terminal_epoch
+                        .saturating_sub(stamp.terminal_epoch);
+                    if distance > 0 && distance <= self.state.recently_terminated.len() as u64 {
+                        return Ok((log, queue));
+                    }
+                }
                 if self
                     .state
                     .variables_lost_quarantined
@@ -7634,6 +7663,7 @@ impl Engine {
             kind,
             element_id,
             reason: reason.to_string(),
+            terminal_epoch: self.state.terminal_epoch,
         })
     }
 

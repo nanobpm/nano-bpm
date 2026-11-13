@@ -4235,6 +4235,7 @@
     "resources": {},
     "signal_subscriptions": {},
     "start_timers": {},
+    "terminal_epoch": 4,
     "timers": {},
     "user_tasks": {},
     "variables_lost_quarantined": {}
