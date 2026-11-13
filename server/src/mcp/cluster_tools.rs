@@ -103,7 +103,9 @@ fn not_implemented(tool: &str) -> Value {
 /// The advertised JSON Schema types these keys as `integer`, which also covers
 /// integral *representations* serde_json stores as floats (`3.0`, `3e0`): those
 /// are accepted when finite, in the `u64` range, and exactly integral — while a
-/// genuinely fractional value (`3.5`) or a negative one stays rejected.
+/// genuinely fractional value (`3.5`) or a negative one stays rejected. The
+/// float upper bound is **exclusive**: `u64::MAX as f64` rounds up to 2^64,
+/// which `as u64` would silently saturate to a different key.
 pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
     args.get(camel)
         .and_then(|v| {
@@ -111,7 +113,7 @@ pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
                 .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                 .or_else(|| {
                     v.as_f64().and_then(|f| {
-                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= u64::MAX as f64)
+                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64)
                             .then_some(f as u64)
                     })
                 })
@@ -311,20 +313,12 @@ async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
         Ok(k) => models::AssignUserTaskPathParams { user_task_key: k },
         Err(e) => return e,
     };
-    // An omitted/null `assignee` means "unassign" in Camunda's tool contract:
-    // route it through the shared unassign handler, never store `""`.
-    if args.get("assignee").is_none_or(Value::is_null) {
-        let path = models::UnassignUserTaskPathParams {
-            user_task_key: path.user_task_key,
-        };
-        return match server.unassign_user_task_impl(&path).await {
-            Ok(resp) => map_rest_response(&resp),
-            Err(()) => tool_error_result("unassign user task failed", 500),
-        };
-    }
     // Camunda's MCP tool nests `action`/`allowOverride` under
     // `assignmentOptions`; the REST `UserTaskAssignmentRequest` expects them
     // flat alongside `assignee`. Flatten them (thin adapter, no logic).
+    // Options are validated BEFORE either mutation path, so malformed options
+    // can never slip through the unassign branch.
+    let unassign = args.get("assignee").is_none_or(Value::is_null);
     let mut body_json = json!({});
     if let Some(a) = args.get("assignee") {
         body_json["assignee"] = a.clone();
@@ -343,6 +337,23 @@ async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
         if let Some(allow) = opts.get("allowOverride") {
             body_json["allowOverride"] = allow.clone();
         }
+    }
+    if unassign {
+        // Validate the options through the same generated model (with a
+        // placeholder assignee) before routing to the shared unassign handler;
+        // an omitted/null `assignee` means "unassign", never store `""`.
+        let mut probe = body_json.clone();
+        probe["assignee"] = json!("unassign-probe");
+        if let Err(e) = arg_body::<models::UserTaskAssignmentRequest>(probe) {
+            return e;
+        }
+        let path = models::UnassignUserTaskPathParams {
+            user_task_key: path.user_task_key,
+        };
+        return match server.unassign_user_task_impl(&path).await {
+            Ok(resp) => map_rest_response(&resp),
+            Err(()) => tool_error_result("unassign user task failed", 500),
+        };
     }
     let body: models::UserTaskAssignmentRequest = match arg_body(body_json) {
         Ok(b) => b,

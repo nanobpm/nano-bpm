@@ -891,6 +891,9 @@ mod tests {
             json!({ "k": 3.5 }),
             json!({ "k": -3.0 }),
             json!({ "k": 1e300 }),
+            // `u64::MAX as f64` rounds to 2^64: out of range, must not
+            // saturate to a different key.
+            json!({ "k": 18446744073709551616.0_f64 }),
         ] {
             assert!(cluster_tools::arg_key(&args, "k").is_err(), "{args}");
         }
@@ -1156,6 +1159,18 @@ mod tests {
         )
         .await;
         assert_eq!(r["isError"].as_bool(), Some(false), "{r}");
+        // Malformed options are rejected on the unassign path too, and the
+        // assignment stays unchanged.
+        for bad in [
+            json!({ "userTaskKey": task_key, "assignee": null, "assignmentOptions": [] }),
+            json!({ "userTaskKey": task_key, "assignmentOptions": "x" }),
+            json!({ "userTaskKey": task_key, "assignmentOptions": { "allowOverride": "no" } }),
+        ] {
+            let r = call(&server, "assignUserTask", bad.clone()).await;
+            assert_eq!(r["isError"].as_bool(), Some(true), "{bad}: {r}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(assignee(&server).as_deref(), Some("alice"), "{bad}");
+        }
         for unassign_args in [
             json!({ "userTaskKey": task_key, "assignee": null }),
             json!({ "userTaskKey": task_key }),

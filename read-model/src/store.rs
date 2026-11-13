@@ -4658,6 +4658,12 @@ fn project_message_start_subscriptions_from_state(
 /// no-op — it neither regresses the definition/tool metadata nor re-stamps
 /// `created_at_ms` (`lastUpdatedDate`). The ordering is durable in the row
 /// itself, so it holds equally after a snapshot seed.
+///
+/// Same-definition conflict (older journals: two starts in one definition whose
+/// names resolve to the same message, e.g. `go` and `="go"`): the engine keeps
+/// the **later** creation, so a same-key creation for a *different* element
+/// replaces the element/tool fields in event order — but never re-stamps
+/// `created_at_ms`, and a same-key same-element replay stays a no-op.
 #[allow(clippy::too_many_arguments)]
 fn upsert_message_start_subscription(
     tx: &rusqlite::Transaction,
@@ -4681,8 +4687,12 @@ fn upsert_message_start_subscription(
          start_element_id = excluded.start_element_id, \
          tool_name = excluded.tool_name, \
          tool_properties = excluded.tool_properties, \
-         created_at_ms = excluded.created_at_ms \
-         WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key",
+         created_at_ms = CASE WHEN excluded.process_definition_key > \
+         message_start_subscriptions.process_definition_key THEN excluded.created_at_ms \
+         ELSE message_start_subscriptions.created_at_ms END \
+         WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key \
+         OR (excluded.process_definition_key = message_start_subscriptions.process_definition_key \
+         AND excluded.start_element_id <> message_start_subscriptions.start_element_id)",
         params![
             message_name,
             process_definition_key as i64,
@@ -10015,6 +10025,32 @@ mod definition_xml_tests {
         // A genuine later deployment replaces it.
         replay_at(&store, &start_created(30, "newer"), 2, 7_000);
         assert_eq!(row(&store), (30, Some("newer".into()), 7_000));
+    }
+
+    /// Regression (#1586 review): an older journal can hold two starts in ONE
+    /// definition resolving to the same message name; the engine keeps the
+    /// later creation, so cold replay must expose the second element — without
+    /// re-stamping `created_at_ms`, and a same-element duplicate stays a no-op.
+    #[test]
+    fn same_definition_message_name_conflict_keeps_the_later_start() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |element: &str| Event::MessageStartSubscriptionCreated {
+            process_definition_key: 20,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: element.into(),
+            tool_name: None,
+            tool_properties: std::collections::BTreeMap::new(),
+        };
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.start_element_id, r.created_at_ms)
+        };
+        replay_at(&store, &created("first"), 1, 1_000);
+        replay_at(&store, &created("second"), 2, 2_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        replay_at(&store, &created("second"), 2, 3_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
     }
 
     /// Regression (#1540 review): a warm v13→v15 upgrade must re-key retained
