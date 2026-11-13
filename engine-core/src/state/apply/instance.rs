@@ -96,6 +96,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     adhoc_instances: HashMap::new(),
                     scope_parents: HashMap::new(),
                     scope_variables: HashMap::new(),
+                    esp_held_payloads: HashMap::new(),
                     compensable: Default::default(),
                     compensation_waits: HashMap::new(),
                     agent_instances: HashMap::new(),
@@ -156,6 +157,19 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.scope_parents.remove(scope_key);
                 instance.scope_variables.remove(scope_key);
+                instance.esp_held_payloads.remove(scope_key);
+            }
+        }
+
+        Event::EventSubProcessPayloadHeld {
+            instance_key,
+            scope_key,
+            variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .esp_held_payloads
+                    .insert(*scope_key, variables.clone());
             }
         }
 

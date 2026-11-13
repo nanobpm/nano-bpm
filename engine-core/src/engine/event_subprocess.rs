@@ -493,8 +493,11 @@ impl Engine {
     /// [`event_payload_scope`](Self::event_payload_scope) upward — except for
     /// an event sub-process whose start event carries output mappings: Zeebe
     /// then creates the payload LOCAL to the start event (only the mapped
-    /// targets propagate), so it is held in `esp_start_payloads` and seeded
-    /// when that start event activates later in this drain.
+    /// targets propagate), so it is held in `esp_start_payloads` until the
+    /// event sub-process container activates in this drain, which journals it
+    /// as [`Event::EventSubProcessPayloadHeld`]; the container's start event
+    /// seeds it as local variables when it activates (possibly in a later
+    /// command, after a container `start` execution listener).
     pub(super) fn merge_event_payload(
         &mut self,
         log: &mut Vec<Event>,
@@ -516,9 +519,15 @@ impl Engine {
                     .and_then(|p| p.element(id))
                     .is_some_and(|e| !e.io.outputs.is_empty())
             });
-            if let (Some(start), true) = (start, start_has_outputs) {
-                self.esp_start_payloads
-                    .insert((instance_key, start), variables.clone());
+            if start_has_outputs {
+                // Keyed by the concrete host scope (the trigger rests on it),
+                // so concurrent host scopes — e.g. the bodies of a parallel
+                // multi-instance sub-process receiving one signal broadcast —
+                // each keep their own payload.
+                self.esp_start_payloads.insert(
+                    (instance_key, element_instance_key, esp_element_id.clone()),
+                    variables.clone(),
+                );
                 return;
             }
         }

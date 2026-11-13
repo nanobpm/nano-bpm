@@ -233,15 +233,16 @@ pub struct Engine {
     /// one command's drain — so it is cleared at the top of every
     /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
     torn_down_scopes: HashSet<Key>,
-    /// Event payloads (message / signal variables) held for an event
-    /// sub-process start event that carries output mappings, keyed by
-    /// `(instance_key, start_event_id)` (#1555, Zeebe parity): Zeebe creates
+    /// Event payloads (message / signal variables) for an event sub-process
+    /// whose start event carries output mappings, keyed by `(instance_key,
+    /// host_scope_key, esp_element_id)` (#1555, Zeebe parity): Zeebe creates
     /// such a payload LOCAL to the start event instance — only the mapped
-    /// targets propagate — so the merge is deferred from correlation to that
-    /// start event's activation in the same drain. NOT journaled (the emitted
-    /// `ScopedVariablesUpdated` is) and cleared per command, like
+    /// targets propagate. This in-drain scratch only bridges correlation to
+    /// the container activation queued in the SAME drain, which journals the
+    /// payload as [`Event::EventSubProcessPayloadHeld`] against the concrete
+    /// container instance (durable from then on). Cleared per command, like
     /// [`torn_down_scopes`](Self::torn_down_scopes).
-    esp_start_payloads: HashMap<(Key, String), HashMap<String, Value>>,
+    esp_start_payloads: HashMap<(Key, Key, String), HashMap<String, Value>>,
     /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
     /// mutable snapshot of global + per-tenant configuration values that FEEL
     /// expressions resolve at runtime. External configuration, not journaled
@@ -7185,12 +7186,28 @@ impl Engine {
             });
         }
 
+        // An event sub-process container whose trigger carried a payload for
+        // an output-mapped start event journals the hold against this
+        // concrete container instance, so it survives a deferred start (a
+        // container `start` listener) and replay.
+        if matches!(kind, Some(ElementKind::EventSubProcess { .. })) {
+            if let Some(variables) =
+                self.esp_start_payloads
+                    .remove(&(instance_key, scope, element_id.clone()))
+            {
+                events.push(Event::EventSubProcessPayloadHeld {
+                    instance_key,
+                    scope_key: element_instance_key,
+                    variables,
+                });
+            }
+        }
         // An event sub-process start event with output mappings receives its
-        // trigger's payload as LOCAL variables before it runs (Zeebe parity).
-        if let Some(payload) = self
-            .esp_start_payloads
-            .remove(&(instance_key, element_id.clone()))
-        {
+        // trigger's payload as LOCAL variables before it runs (Zeebe parity),
+        // visible to its own activation-time expressions (listener job types,
+        // input mappings) as well.
+        let mut view_overlay = None;
+        if let Some(payload) = self.held_esp_start_payload(instance_key, &element_id, scope) {
             if !(is_sub_process || is_adhoc_container || has_listeners) {
                 events.push(Event::VariableScopeCreated {
                     instance_key,
@@ -7201,15 +7218,30 @@ impl Engine {
             events.push(Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key: element_instance_key,
-                variables: payload,
+                variables: payload.clone(),
             });
+            view_overlay = Some(payload);
         }
-        let (body_events, body_followups) = self.activate_body(
-            instance_key,
-            element_id.clone(),
-            element_instance_key,
-            scope,
-        );
+        let (body_events, body_followups) = match view_overlay {
+            None => self.activate_body(
+                instance_key,
+                element_id.clone(),
+                element_instance_key,
+                scope,
+            ),
+            Some(payload) => {
+                let mut vars = (*self.variables_for_element(instance_key, scope)).clone();
+                vars.extend(payload);
+                self.activate_body_with_vars(
+                    instance_key,
+                    element_id.clone(),
+                    element_instance_key,
+                    scope,
+                    Arc::new(vars),
+                    true,
+                )
+            }
+        };
         events.extend(body_events);
         followups.extend(body_followups);
         // `ElementActivated` sits right after `ElementActivating` — unless the
@@ -7263,6 +7295,62 @@ impl Engine {
         scope: Key,
         view_scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        // The scoped variable view the activating element evaluates against: both
+        // its input-mapping *source* expressions and its own FEEL attributes (job
+        // type, retries, priority, timer/message/signal name, correlation key,
+        // user-task fields). It is the element's enclosing flow scope — a
+        // root-scope element gets the shared root Arc (a cheap refcount bump), so
+        // evaluation is byte-identical to the flat engine; an element inside a
+        // sub-process or multi-instance body additionally sees its enclosing
+        // scope's locals, so an input mapping that reads an enclosing-scope-local
+        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
+        // are evaluated here against its *parent* scope and then applied local to
+        // the new sub-process scope.
+        let element_vars = self.variables_for_element(instance_key, view_scope);
+        self.activate_body_with_vars(
+            instance_key,
+            element_id,
+            element_instance_key,
+            scope,
+            element_vars,
+            false,
+        )
+    }
+
+    /// The payload held (journaled [`Event::EventSubProcessPayloadHeld`]) for
+    /// `element_id` iff it is the start event of the event sub-process
+    /// container instance `scope`.
+    fn held_esp_start_payload(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<HashMap<String, Value>> {
+        let held = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .esp_held_payloads
+            .get(&scope)?;
+        let container_id = self.element_id_of_instance(instance_key, scope)?;
+        match self.element_kind(instance_key, &container_id) {
+            Some(ElementKind::EventSubProcess { start_event, .. }) if start_event == element_id => {
+                Some(held.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// [`activate_body_in`] against an explicit variable view.
+    fn activate_body_with_vars(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        element_vars: Arc<HashMap<String, Value>>,
+        scope_pre_registered: bool,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -7277,8 +7365,11 @@ impl Engine {
         // sub-process/ad-hoc container or a listener-bearing element (#1437)
         // (before this body runs); a leaf activity registers it lazily below,
         // only if its inputs produce values.
-        // A modification may have registered it already (seeded locals).
-        let scope_registered = is_sub_process
+        // A modification may have registered it already (seeded locals), or
+        // the caller may register it in the same activation (an event
+        // sub-process start event seeded with its trigger payload).
+        let scope_registered = scope_pre_registered
+            || is_sub_process
             || is_adhoc_container
             || self.has_execution_listeners(instance_key, &element_id)
             || self
@@ -7298,19 +7389,6 @@ impl Engine {
         } else {
             self.io_inputs(instance_key, &element_id)
         };
-
-        // The scoped variable view the activating element evaluates against: both
-        // its input-mapping *source* expressions and its own FEEL attributes (job
-        // type, retries, priority, timer/message/signal name, correlation key,
-        // user-task fields). It is the element's enclosing flow scope — a
-        // root-scope element gets the shared root Arc (a cheap refcount bump), so
-        // evaluation is byte-identical to the flat engine; an element inside a
-        // sub-process or multi-instance body additionally sees its enclosing
-        // scope's locals, so an input mapping that reads an enclosing-scope-local
-        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
-        // are evaluated here against its *parent* scope and then applied local to
-        // the new sub-process scope.
-        let element_vars = self.variables_for_element(instance_key, view_scope);
 
         let mut events: Vec<Event> = Vec::new();
         let followups: Vec<Step> = Vec::new();
