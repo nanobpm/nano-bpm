@@ -1520,3 +1520,35 @@ fn modify_created_flow_scope_evaluates_a_conditional_event_subprocess_on_open() 
          command: {events:?}"
     );
 }
+
+#[test]
+fn start_output_mappings_keep_the_event_payload_local_to_the_start_event() {
+    // Zeebe parity (trace `esp-message-output-mapping`): when the event
+    // sub-process start event carries output mappings, the message / signal
+    // payload is created LOCAL to the start event (not merged into the host
+    // scope); only the mapped targets propagate outward.
+    for t in [T::Message, T::Signal] {
+        let mut def = esp_model(trig_of(t), false, false);
+        def.elements.get_mut("esp_start").unwrap().io = crate::model::IoMapping {
+            inputs: vec![],
+            outputs: vec![crate::model::Mapping {
+                source: "=payload".into(),
+                target: "mapped".into(),
+            }],
+        };
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, def);
+        let events = fire(&mut engine, inst, t, 0);
+        let vars = engine.variables(inst);
+        assert_eq!(
+            vars.get("mapped"),
+            Some(&Value::Int(42)),
+            "{t:?}: the output mapping propagated its target: {events:?}"
+        );
+        assert_eq!(
+            vars.get("payload"),
+            None,
+            "{t:?}: the raw payload stays local to the start event: {events:?}"
+        );
+    }
+}

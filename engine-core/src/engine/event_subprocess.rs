@@ -488,4 +488,43 @@ impl Engine {
             self.scope_of(instance_key, element_instance_key)
         }
     }
+
+    /// Merges a correlated message / signal payload. Propagates from
+    /// [`event_payload_scope`](Self::event_payload_scope) upward — except for
+    /// an event sub-process whose start event carries output mappings: Zeebe
+    /// then creates the payload LOCAL to the start event (only the mapped
+    /// targets propagate), so it is held in `esp_start_payloads` and seeded
+    /// when that start event activates later in this drain.
+    pub(super) fn merge_event_payload(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        kind: &state::MessageSubscriptionKind,
+        variables: &HashMap<String, Value>,
+    ) {
+        if variables.is_empty() {
+            return;
+        }
+        if let state::MessageSubscriptionKind::EventSubProcess { esp_element_id, .. } = kind {
+            let start = match self.element_kind(instance_key, esp_element_id) {
+                Some(ElementKind::EventSubProcess { start_event, .. }) => Some(start_event),
+                _ => None,
+            };
+            let start_has_outputs = start.as_ref().is_some_and(|id| {
+                self.process_of_instance(instance_key)
+                    .and_then(|p| p.element(id))
+                    .is_some_and(|e| !e.io.outputs.is_empty())
+            });
+            if let (Some(start), true) = (start, start_has_outputs) {
+                self.esp_start_payloads
+                    .insert((instance_key, start), variables.clone());
+                return;
+            }
+        }
+        let flow_scope = self.event_payload_scope(instance_key, element_instance_key, kind);
+        for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false) {
+            self.emit(log, event);
+        }
+    }
 }

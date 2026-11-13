@@ -1,0 +1,24 @@
+{
+  "description": "A non-interrupting message event sub-process whose start event output-maps the message payload (`reason` -> `why`); Zeebe parity for where payload and mapped variables land.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-message-output-mapping",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "order-1",
+      "variables": {
+        "reason": "customer"
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

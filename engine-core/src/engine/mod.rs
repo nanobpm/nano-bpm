@@ -233,6 +233,15 @@ pub struct Engine {
     /// one command's drain — so it is cleared at the top of every
     /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
     torn_down_scopes: HashSet<Key>,
+    /// Event payloads (message / signal variables) held for an event
+    /// sub-process start event that carries output mappings, keyed by
+    /// `(instance_key, start_event_id)` (#1555, Zeebe parity): Zeebe creates
+    /// such a payload LOCAL to the start event instance — only the mapped
+    /// targets propagate — so the merge is deferred from correlation to that
+    /// start event's activation in the same drain. NOT journaled (the emitted
+    /// `ScopedVariablesUpdated` is) and cleared per command, like
+    /// [`torn_down_scopes`](Self::torn_down_scopes).
+    esp_start_payloads: HashMap<(Key, String), HashMap<String, Value>>,
     /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
     /// mutable snapshot of global + per-tenant configuration values that FEEL
     /// expressions resolve at runtime. External configuration, not journaled
@@ -631,6 +640,7 @@ impl Engine {
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
+            esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied: None,
         }
@@ -789,6 +799,7 @@ impl Engine {
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
+            esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied,
         }
@@ -2139,6 +2150,7 @@ impl Engine {
         // scope invalidated by a previous command's terminate must not leak into
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
+        self.esp_start_payloads.clear();
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -5930,13 +5942,7 @@ impl Engine {
         // instance before its token advances, propagating from the catching
         // element's enclosing (flow) scope upward (nearest defining ancestor,
         // else root). Root-only instances collapse to the flat `VariablesUpdated`.
-        if !variables.is_empty() {
-            let flow_scope = self.event_payload_scope(instance_key, element_instance_key, &kind);
-            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
-            {
-                self.emit(log, event);
-            }
-        }
+        self.merge_event_payload(log, instance_key, element_instance_key, &kind, variables);
 
         match kind {
             // Catch event: completing it resumes the token along its own outgoing
@@ -6026,15 +6032,7 @@ impl Engine {
                 element_id: element_id.clone(),
             },
         );
-        if !variables.is_empty() {
-            // Signal payload propagates from the catching element's enclosing
-            // (flow) scope upward, defaulting to root.
-            let flow_scope = self.event_payload_scope(instance_key, element_instance_key, &kind);
-            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
-            {
-                self.emit(log, event);
-            }
-        }
+        self.merge_event_payload(log, instance_key, element_instance_key, &kind, variables);
 
         match kind {
             state::MessageSubscriptionKind::IntermediateCatch => {
@@ -7187,6 +7185,25 @@ impl Engine {
             });
         }
 
+        // An event sub-process start event with output mappings receives its
+        // trigger's payload as LOCAL variables before it runs (Zeebe parity).
+        if let Some(payload) = self
+            .esp_start_payloads
+            .remove(&(instance_key, element_id.clone()))
+        {
+            if !(is_sub_process || is_adhoc_container || has_listeners) {
+                events.push(Event::VariableScopeCreated {
+                    instance_key,
+                    scope_key: element_instance_key,
+                    parent_scope_key: scope,
+                });
+            }
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: element_instance_key,
+                variables: payload,
+            });
+        }
         let (body_events, body_followups) = self.activate_body(
             instance_key,
             element_id.clone(),
