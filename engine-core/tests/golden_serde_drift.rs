@@ -738,6 +738,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .apply_command_at(
                 Command::QuarantineOffheapOrphan {
                     instance_key: inst_e,
+                    stamp: None,
                 },
                 T0 + 23,
             )

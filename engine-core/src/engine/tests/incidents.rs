@@ -3867,7 +3867,10 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
 
     let events = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     // Exactly one IncidentRaised, pinned to the instance root.
     let raised: Vec<&Event> = events
@@ -3891,7 +3894,10 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
 
     // Idempotent: a second quarantine of the same instance raises nothing.
     let again = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     assert!(
         again
@@ -3906,6 +3912,7 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
     let unknown = engine
         .apply_command(Command::QuarantineOffheapOrphan {
             instance_key: 999_999,
+            stamp: None,
         })
         .unwrap();
     assert!(unknown.is_empty(), "unknown instance is a no-op");
@@ -3940,7 +3947,10 @@ fn quarantine_offheap_orphan_raises_for_a_suspended_instance() {
         .apply_command(Command::SuspendInstance { instance_key: key })
         .unwrap();
     let events = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     let raised: Vec<&Event> = events
         .iter()
@@ -3958,7 +3968,10 @@ fn quarantine_offheap_orphan_raises_for_a_suspended_instance() {
 
     // Idempotent across the suspend/quarantine pair too.
     let again = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     assert!(
         again
@@ -3994,7 +4007,10 @@ fn quarantine_offheap_orphan_incident_replays_identically() {
     let key = journal.iter().find_map(|e| e.instance_key()).unwrap();
     journal.extend(
         leader
-            .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: None,
+            })
             .unwrap(),
     );
 
@@ -4025,7 +4041,8 @@ fn quarantine_cold_orphan_records_a_durable_incident_for_a_non_resident_instance
     assert!(
         engine
             .apply_command(Command::QuarantineOffheapOrphan {
-                instance_key: cold_key
+                instance_key: cold_key,
+                stamp: None,
             })
             .unwrap()
             .is_empty(),
@@ -4090,9 +4107,119 @@ fn quarantine_cold_orphan_on_a_resident_instance_matches_the_resident_path() {
     assert_eq!(active[0].element_id, "orphan-cold-res");
     assert!(
         engine
-            .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: None,
+            })
             .unwrap()
             .is_empty(),
         "shares the idempotency guard with the resident command"
     );
+}
+
+// #1447: a leader-STAMPED `QuarantineOffheapOrphan` applies identically on a
+// replica where the instance is resident and on one where it is cold
+// (non-resident) — same events, same incident key, same key counter — because
+// it never branches on replica-local residency. The bare (local) form diverges
+// on exactly that split, which is the defect the stamp closes.
+#[test]
+fn stamped_orphan_quarantine_is_residency_independent() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut resident, key) = boot();
+    let (mut cold, cold_key) = boot();
+    assert_eq!(key, cold_key);
+    // Replica-local cold tiering: the instance leaves hot state on `cold` only.
+    assert!(cold.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+
+    // The leader (resident) resolves the stamp from ITS state.
+    let stamp = resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("leader stamps a live orphan");
+    assert_eq!(
+        stamp,
+        OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+        }
+    );
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    let on_resident = resident.apply_command_at(command.clone(), 50).unwrap();
+    let on_cold = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(on_resident.len(), 1);
+    assert_eq!(
+        on_resident, on_cold,
+        "identical incident on resident and cold replicas"
+    );
+    assert_eq!(
+        resident.snapshot().next_local,
+        cold.snapshot().next_local,
+        "identical key counters"
+    );
+    // Once incidented, the leader stamps nothing more (no duplicate proposal).
+    assert!(resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .is_none());
+    // A cold stamp from a leader that does not hold the instance carries the
+    // cold metadata.
+    let cold_stamp = Engine::new()
+        .orphan_incident_stamp(4_242, OrphanKind::Cold)
+        .unwrap();
+    assert_eq!(cold_stamp.element_id, "");
+    assert!(cold_stamp.reason.contains("cold instance row missing"));
+}
+
+// #1447: the `stamp` field is additive — a pre-#1447 Raft-log command (no
+// `stamp`) still decodes (as the local form), and the stamped form round-trips.
+#[cfg(feature = "serde")]
+#[test]
+fn quarantine_offheap_orphan_stamp_is_serde_additive() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let old: Command =
+        serde_json::from_str(r#"{"QuarantineOffheapOrphan":{"instance_key":7}}"#).unwrap();
+    assert_eq!(
+        old,
+        Command::QuarantineOffheapOrphan {
+            instance_key: 7,
+            stamp: None
+        }
+    );
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        r#"{"QuarantineOffheapOrphan":{"instance_key":7}}"#,
+        "an unstamped command keeps its pre-#1447 wire shape"
+    );
+    let stamped = Command::QuarantineOffheapOrphan {
+        instance_key: 7,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Cold,
+            element_id: String::new(),
+            reason: "r".into(),
+        }),
+    };
+    let json = serde_json::to_string(&stamped).unwrap();
+    assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), stamped);
 }

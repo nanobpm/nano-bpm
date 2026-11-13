@@ -335,6 +335,10 @@ pub struct SpillStores {
     pub spill: Option<Arc<VarSpillStore>>,
     /// The lean mode's authoritative variable store.
     pub varstore: Option<Arc<VarStore>>,
+    /// Where a DEFINITIVELY absent row (readable store, no row) is recorded
+    /// before the write fails closed (#1447), so the off-thread Raft snapshot
+    /// writer still reports the orphan to the leader-propose machinery.
+    pub absences: Option<crate::journal::OrphanInbox>,
 }
 
 /// Store-backed streaming write (#1337): the production entry point. Streams
@@ -370,6 +374,7 @@ pub fn write_streaming_snapshot_from_stores(
         cold: cold_store,
         spill: spill_store,
         varstore,
+        absences,
     } = stores;
     write_streaming_snapshot(StreamWrite {
         path,
@@ -379,68 +384,17 @@ pub fn write_streaming_snapshot_from_stores(
         control: capture.control,
         instances: capture.resident,
         cold: cold_keys,
-        read_cold: move |key| {
-            let store = cold_store.as_ref().ok_or_else(|| {
-                invalid_data("cold index references a key but no cold store is wired")
-            })?;
-            store
-                .try_get_cold(key)
-                .map_err(|e| invalid_data(&e.to_string()))?
-                .ok_or_else(|| {
-                    invalid_data(&format!(
-                        "cold instance {key} has no row in the spill store"
-                    ))
-                })
+        read_cold: {
+            let absences = absences.clone();
+            move |key| read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())
         },
         resolve_spilled: move |snap| {
-            let key = snap.instance.key;
-            // Lean mode reads the authoritative var store; classic reads the
-            // spill cache. Mirror `Journal::peek_spilled_variables`'s preference
-            // AND its fail-closed semantics (#1464 review): a store read ERROR is
-            // propagated (never swallowed into a silent `None`), so a
-            // transient/corrupt row aborts the snapshot instead of being mistaken
-            // for a definitively-absent payload.
-            let resolved = if let Some(vs) = varstore.as_ref() {
-                match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
-                    Some(vars) => Some(vars),
-                    // The authoritative var store has NO row. A legacy spill row
-                    // may still exist from an unmigrated lean-over-legacy
-                    // transition; that row is potentially STALE (the var store is
-                    // authoritative), so accepting it would seal outdated
-                    // variables into a self-contained snapshot whose covered log
-                    // is then purged. `Journal::peek_spilled_variables` refuses
-                    // exactly this state (journal.rs) — fail closed here too
-                    // rather than seal a payload the restore side would reject.
-                    None => {
-                        let legacy_row = match spill_store.as_ref() {
-                            Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
-                            None => None,
-                        };
-                        if legacy_row.is_some() {
-                            return Err(invalid_data(&format!(
-                                "spilled instance {key}: var store has no row but a legacy \
-                                 spill row exists (unmigrated lean-over-legacy state); refusing \
-                                 to seal a potentially stale payload"
-                            )));
-                        }
-                        None
-                    }
-                }
-            } else if let Some(sp) = spill_store.as_ref() {
-                sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
-            } else {
-                None
-            };
-            match resolved {
-                Some(vars) => {
-                    snap.instance.variables = Arc::new(vars);
-                    snap.instance.variables_spilled = false;
-                    Ok(())
-                }
-                None => Err(invalid_data(&format!(
-                    "spilled instance {key} has no variable row in any wired store"
-                ))),
-            }
+            resolve_spilled_from_stores(
+                snap,
+                varstore.as_ref(),
+                spill_store.as_ref(),
+                absences.as_ref(),
+            )
         },
         control_only,
     })
@@ -808,10 +762,16 @@ fn write_multi_streaming_snapshot_inner(
             cold: cold_store,
             spill: spill_store,
             varstore,
+            absences,
         } = stores;
         // Reuse the single-partition spill-resolution closure logic per row.
         let resolve = |snap: &mut InstanceSnapshot| {
-            resolve_spilled_from_stores(snap, varstore.as_ref(), spill_store.as_ref())
+            resolve_spilled_from_stores(
+                snap,
+                varstore.as_ref(),
+                spill_store.as_ref(),
+                absences.as_ref(),
+            )
         };
         let push = |chunk: &mut Vec<(u64, InstanceSnapshot)>,
                     w: &mut BufWriter<File>,
@@ -832,17 +792,7 @@ fn write_multi_streaming_snapshot_inner(
             push(&mut chunk, &mut w, snap)?;
         }
         for key in cold_keys {
-            let store = cold_store.as_ref().ok_or_else(|| {
-                invalid_data("cold index references a key but no cold store is wired")
-            })?;
-            let snap = store
-                .try_get_cold(key)
-                .map_err(|e| invalid_data(&e.to_string()))?
-                .ok_or_else(|| {
-                    invalid_data(&format!(
-                        "cold instance {key} has no row in the spill store"
-                    ))
-                })?;
+            let snap = read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())?;
             push(&mut chunk, &mut w, snap)?;
         }
     }
@@ -895,10 +845,36 @@ fn flush_multi_chunk(
 /// Resolves a variable-spilled instance's payload from the wired stores,
 /// mirroring [`write_streaming_snapshot_from_stores`]'s fail-closed semantics
 /// (a lean var-store miss with a surviving legacy spill row is refused).
+/// Reads a cold instance's row, failing closed when absent or unreadable. A
+/// DEFINITIVE absence is recorded in `absences` first (#1447).
+fn read_cold_from_store(
+    key: Key,
+    cold_store: Option<&Arc<VarSpillStore>>,
+    absences: Option<&crate::journal::OrphanInbox>,
+) -> std::io::Result<InstanceSnapshot> {
+    let store = cold_store
+        .ok_or_else(|| invalid_data("cold index references a key but no cold store is wired"))?;
+    match store
+        .try_get_cold(key)
+        .map_err(|e| invalid_data(&e.to_string()))?
+    {
+        Some(snap) => Ok(snap),
+        None => {
+            if let Some(absences) = absences {
+                absences.record(key, nanobpmn_engine_core::OrphanKind::Cold);
+            }
+            Err(invalid_data(&format!(
+                "cold instance {key} has no row in the spill store"
+            )))
+        }
+    }
+}
+
 fn resolve_spilled_from_stores(
     snap: &mut InstanceSnapshot,
     varstore: Option<&Arc<VarStore>>,
     spill_store: Option<&Arc<VarSpillStore>>,
+    absences: Option<&crate::journal::OrphanInbox>,
 ) -> std::io::Result<()> {
     let key = snap.instance.key;
     let resolved = if let Some(vs) = varstore {
@@ -930,9 +906,17 @@ fn resolve_spilled_from_stores(
             snap.instance.variables_spilled = false;
             Ok(())
         }
-        None => Err(invalid_data(&format!(
-            "spilled instance {key} has no variable row in any wired store"
-        ))),
+        None => {
+            // Only a wired, readable tier's miss is a definitive absence.
+            if (varstore.is_some() || spill_store.is_some())
+                && let Some(absences) = absences
+            {
+                absences.record(key, nanobpmn_engine_core::OrphanKind::Resident);
+            }
+            Err(invalid_data(&format!(
+                "spilled instance {key} has no variable row in any wired store"
+            )))
+        }
     }
 }
 
@@ -1513,6 +1497,7 @@ mod tests {
                 cold: None,
                 spill: Some(spill),
                 varstore: Some(varstore),
+                absences: None,
             },
             false,
         );

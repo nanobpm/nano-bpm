@@ -733,7 +733,28 @@ pub enum Command {
     /// leader retry / replay), and an unknown or terminal instance is a no-op too
     /// (the orphan may have been cancelled between the quarantine note and this
     /// command landing). Additive brand-new variant — old journals never carry it.
-    QuarantineOffheapOrphan { instance_key: Key },
+    ///
+    /// **Replicated form (#1447).** Under Raft the residency-dependent rules
+    /// above are NOT replica-independent: whether an instance is resident,
+    /// terminal, or already incidented differs per replica (cold tiering,
+    /// follower retirement), so the bare command could raise the incident on
+    /// one replica and no-op on another, diverging their journals and key
+    /// counters. The partition leader therefore proposes it with a
+    /// [`OrphanIncidentStamp`] (`stamp: Some`) — the orphan kind plus the
+    /// incident metadata it resolved from ITS state — and every replica applies
+    /// a stamped command identically: it unconditionally emits exactly one
+    /// `IncidentRaised` carrying the stamp's metadata, whatever its local
+    /// residency. The host repairs its replica-local spill/cold reference to
+    /// the instance on the same apply. Additive `#[serde(default)]` field: a
+    /// journal written before #1447 decodes as `stamp: None` (the local form).
+    QuarantineOffheapOrphan {
+        instance_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        stamp: Option<OrphanIncidentStamp>,
+    },
     /// Raise a durable [`crate::Event::IncidentRaised`]
     /// ([`crate::IncidentKind::VariablesLost`]) for a **cold** (wholly off-heap)
     /// instance whose cold row the host's storage layer found definitively
@@ -749,6 +770,34 @@ pub enum Command {
     /// active `VariablesLost` incident already names the instance. Additive
     /// brand-new variant — old journals never carry it.
     QuarantineColdOrphan { instance_key: Key },
+}
+
+/// Which off-heap tier lost an orphan's payload (#1447).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OrphanKind {
+    /// A resident instance whose spilled variable row is gone: it keeps its
+    /// surviving resident variables.
+    Resident,
+    /// A cold (wholly off-heap) instance whose cold row is gone: the whole
+    /// instance is unrecoverable.
+    Cold,
+}
+
+/// The leader-resolved incident metadata a replicated
+/// [`Command::QuarantineOffheapOrphan`] carries (#1447), so every replica emits
+/// a byte-identical `IncidentRaised` whatever its local residency. Built by
+/// [`crate::Engine::orphan_incident_stamp`] on the proposing leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OrphanIncidentStamp {
+    /// The tier that lost the payload (drives the host's local repair).
+    pub kind: OrphanKind,
+    /// The incident's `element_id` (the process id when the leader had the
+    /// instance resident; empty for a cold instance whose model is lost).
+    pub element_id: String,
+    /// The incident's `reason`.
+    pub reason: String,
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].

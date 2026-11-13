@@ -73,7 +73,6 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::deepthi::{DeepthiHandle, LifecycleExclusive, LifecycleShared, SnapshotPublishGuard};
-#[cfg(test)]
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
@@ -2787,29 +2786,36 @@ async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command
 
 /// The engine-actor → Raft-leader propose channel for off-heap orphans
 /// (#1447): an orphan detected inside replicated state-machine application is
-/// handed to this queue (via [`OrphanQueueSink`]) and re-proposed by the
-/// partition LEADER as a durable `Command::QuarantineOffheapOrphan` stamped
-/// with the leader's `now` — the replicated timestamp every replica then
-/// applies identically. Unbounded: orphan detection is rare (a lost spill row)
-/// and each item is a single `u64`.
-type OrphanQueue = tokio::sync::mpsc::UnboundedSender<nanobpmn_engine_core::Key>;
+/// handed to this queue (via [`OrphanQueueSink`]) and proposed by the
+/// partition LEADER as a STAMPED `Command::QuarantineOffheapOrphan` — the
+/// leader resolves the incident metadata from its own state, so every replica
+/// applies the identical incident whatever its local residency. Unbounded:
+/// orphan detection is rare (a lost spill row) and each item is tiny; the
+/// journal's in-flight set keeps a key from being queued twice.
+type OrphanQueue = tokio::sync::mpsc::UnboundedSender<(
+    nanobpmn_engine_core::Key,
+    nanobpmn_engine_core::OrphanKind,
+)>;
 
 /// The journal-facing half of the orphan propose channel (#1447): implements
 /// the storage layer's `OrphanSink` trait so the engine actor can hand an
-/// orphan key off without blocking (a `send` on an unbounded channel is
-/// non-blocking and allocation-cheap).
+/// orphan key off without blocking.
 struct OrphanQueueSink {
     tx: OrphanQueue,
 }
 
 impl nano_server_storage::journal::OrphanSink for OrphanQueueSink {
-    fn enqueue_orphan(&self, instance_key: nanobpmn_engine_core::Key) -> bool {
-        self.tx.send(instance_key).is_ok()
+    fn enqueue_orphan(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        kind: nanobpmn_engine_core::OrphanKind,
+    ) -> bool {
+        self.tx.send((instance_key, kind)).is_ok()
     }
 }
 
 /// Wall-clock milliseconds since the Unix epoch, for the leader's replicated
-/// `now` stamp on a re-proposed quarantine command (#1447).
+/// `now` stamp on a proposed quarantine command (#1447).
 fn orphan_now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2817,87 +2823,115 @@ fn orphan_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Wires the orphan propose channel for one partition member (#1447):
+/// Runs `f` on the engine actor under this member's lifecycle epoch (#1473):
+/// `None` (and nothing runs) once the member is retired, so a delayed task of a
+/// retired predecessor can never touch the successor's journal state.
+async fn with_member_engine<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+) -> Option<R> {
+    let _lifecycle = engine.lifecycle_enter(epoch).await?;
+    Some(engine.with(f).await)
+}
+
+/// Proposes one orphan report as a leader-STAMPED quarantine (#1447). The
+/// report stays in the journal's backlog until the command applies: a stamp of
+/// `None` (the leader already holds the incident, or the instance is terminal
+/// here) settles it; a failed or rejected proposal returns it to the backlog
+/// for the next drain. Returns `false` once the member is retired.
+async fn propose_orphan(
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+    epoch: u64,
+    key: nanobpmn_engine_core::Key,
+    kind: nanobpmn_engine_core::OrphanKind,
+) -> bool {
+    let Some(stamp) = with_member_engine(engine, epoch, move |journal| {
+        journal.engine().orphan_incident_stamp(key, kind)
+    })
+    .await
+    else {
+        return false;
+    };
+    let Some(stamp) = stamp else {
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_settled(key))
+            .await
+            .is_some();
+    };
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    let failure = match batcher.submit(command, orphan_now_millis()).await {
+        Ok(item) => item
+            .error
+            .map(|(status, message)| format!("{status}: {message}")),
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(error) = failure {
+        tracing::error!(
+            instance_key = key,
+            %error,
+            "orphan quarantine proposal failed (#1447); the report stays in the \
+             backlog and is re-proposed by the next drain"
+        );
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_failed(key))
+            .await
+            .is_some();
+    }
+    true
+}
+
+/// Wires the orphan propose channel for one partition member (#1447). Every
+/// task is bound to the member's lifecycle `epoch` (#1473) and stops once it is
+/// retired, so a rebuilt successor sharing the engine actor cannot have its
+/// sink or leadership flag overwritten by a delayed predecessor:
 ///
-/// 1. The journal gets an [`OrphanQueueSink`] (plus the member's CURRENT
-///    leadership, so an orphan detected before the watcher fires is routed
-///    correctly).
-/// 2. A drainer task proposes each queued orphan through the partition's
-///    [`Batcher`] — leader-only, so a stale queue on a follower simply fails
-///    each propose with a retryable leadership error (the orphan is
-///    re-detected on the next snapshot fold / activation if still unreported,
-///    and the engine command is idempotent, so a duplicated proposal is a
-///    no-op apply).
-/// 3. A metrics watcher keeps the journal's leadership flag fresh and drains
-///    the parked backlog on promotion, so an orphan a replica detected as a
-///    FOLLOWER is proposed the moment it wins leadership.
+/// 1. The journal gets an [`OrphanQueueSink`] plus the member's CURRENT
+///    leadership (wiring drains anything parked before it).
+/// 2. A drainer proposes each queued orphan through the partition's
+///    [`Batcher`] as a leader-stamped quarantine ([`propose_orphan`]).
+/// 3. A metrics watcher keeps the journal's leadership flag fresh, draining the
+///    parked backlog on promotion.
 fn wire_orphan_propose(
     raft: &openraft::Raft<RaftConfig>,
     batcher: &Batcher,
     engine: &DeepthiHandle,
+    epoch: u64,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<nanobpmn_engine_core::Key>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
     let node_id = raft.metrics().borrow().id;
-    let engine_for_sink = engine.clone();
-    let mut metrics_for_seed = raft.metrics();
-    let initial_leader = metrics_for_seed.borrow().current_leader == Some(node_id);
-    // Seed the sink + the current leadership on the engine actor before any
-    // apply can report an orphan into an unwired journal.
+    let mut metrics = raft.metrics();
+    let engine_for_watch = engine.clone();
+    // Seed the sink first, then keep the leadership flag fresh — one task, so
+    // the seed is ordered before the first leadership publish.
     tokio::spawn(async move {
-        engine_for_sink
-            .with(move |journal| {
-                journal.set_orphan_sink(sink);
-                journal.set_orphan_leadership(initial_leader);
+        let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
+            journal.set_orphan_sink(sink);
+        })
+        .await;
+        if seeded.is_none() {
+            return; // retired before wiring
+        }
+        loop {
+            let is_leader = metrics.borrow().current_leader == Some(node_id);
+            let published = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                journal.set_orphan_leadership(is_leader)
             })
             .await;
-    });
-    // Drainer: one leader-proposed quarantine per queued orphan. A failed
-    // propose (leadership lost mid-flight, batcher teardown) is logged and
-    // dropped — detection repeats via the snapshot fold / activation paths and
-    // the parked backlog, so the report is never silently lost.
-    let batcher_for_drain = batcher.clone();
-    tokio::spawn(async move {
-        while let Some(key) = rx.recv().await {
-            let now = orphan_now_millis();
-            match batcher_for_drain
-                .submit(Command::QuarantineOffheapOrphan { instance_key: key }, now)
-                .await
-            {
-                Ok(item) => {
-                    if let Some((status, message)) = item.error {
-                        tracing::error!(
-                            instance_key = key,
-                            status,
-                            %message,
-                            "orphan quarantine proposal applied with an engine rejection \
-                             (#1447; the command is idempotent, so a later detection retries)"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        instance_key = key,
-                        error = %err,
-                        "orphan quarantine proposal failed (#1447; retried by the next \
-                         detection / backlog drain)"
-                    );
-                }
+            if published.is_none() || metrics.changed().await.is_err() {
+                break; // retired, or Raft dropped
             }
         }
     });
-    // Leadership watcher: keep the journal's flag fresh, draining the parked
-    // backlog on promotion.
-    let engine_for_watch = engine.clone();
+    let batcher = batcher.clone();
+    let engine = engine.clone();
     tokio::spawn(async move {
-        loop {
-            let is_leader = metrics_for_seed.borrow().current_leader == Some(node_id);
-            let engine = engine_for_watch.clone();
-            engine
-                .with(move |journal| journal.set_orphan_leadership(is_leader))
-                .await;
-            if metrics_for_seed.changed().await.is_err() {
-                break; // Raft dropped: the watcher's job is done.
+        while let Some((key, kind)) = rx.recv().await {
+            if !propose_orphan(&batcher, &engine, epoch, key, kind).await {
+                break; // retired: the successor wires its own channel
             }
         }
     });
@@ -2970,7 +3004,7 @@ impl RaftPartition {
         raft.initialize(members).await?;
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -3036,7 +3070,7 @@ impl RaftPartition {
         }
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -3138,7 +3172,7 @@ impl RaftPartition {
             }
         };
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
-        wire_orphan_propose(&raft, &batcher, &engine_for_orphans);
+        wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.
@@ -6660,6 +6694,32 @@ mod tests {
         }
     }
 
+    /// Waits until every member has applied up to the leader's (node 0's)
+    /// current `last_applied` — the applied-index barrier a test needs before
+    /// touching a FOLLOWER's state (`propose` only waits for the leader).
+    async fn wait_all_applied(parts: &[RaftPartition]) {
+        let target = parts[0]
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for (id, p) in parts.iter().enumerate() {
+            let raft = &p.raft;
+            let applied = wait_until(3_000, || {
+                raft.metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+                    >= target
+            })
+            .await;
+            assert!(applied, "node {id} did not apply up to index {target}");
+        }
+    }
+
     /// #1447: an off-heap orphan discovered inside replicated state-machine
     /// application (one replica lost the spill row, the others still have it)
     /// is surfaced as a durable `VariablesLost` incident proposed by the Raft
@@ -6747,6 +6807,10 @@ mod tests {
             .iter()
             .find_map(|e| e.instance_key())
             .expect("create minted an instance key");
+        // Applied-index barrier: `propose` returns once the LEADER applied, so
+        // wait for every follower to apply the create before touching its
+        // replica-local spill state (#1447 review).
+        wait_all_applied(&parts).await;
 
         // Spill the instance's variables on EVERY replica (a purely local
         // memory-reclamation op, so driving it per-replica is faithful), then
@@ -6779,6 +6843,9 @@ mod tests {
             )
             .await
             .expect("activate");
+        // Applied-index barrier: node 1 must have applied the activation
+        // before its observation is inspected (#1447 review).
+        wait_all_applied(&parts).await;
 
         // Precondition: node 1 (the orphan replica) OBSERVED the loss during
         // the replicated apply (its spill row is definitively absent).
@@ -6885,6 +6952,15 @@ mod tests {
             journals.windows(2).all(|w| w[0] == w[1]),
             "identical incident journals across replicas (got {journals:?})"
         );
+        // The stamped quarantine repaired the spill reference on EVERY live
+        // replica — the orphan replica and the one whose row still existed —
+        // so their states are identical and the next snapshot is unblocked.
+        for (id, engine) in engines.iter().enumerate().skip(1) {
+            let spilled = engine
+                .with(move |j| j.engine().is_variables_spilled(instance_key))
+                .await;
+            assert!(!spilled, "replica {id} dropped its spill reference");
+        }
 
         for (id, p) in parts.into_iter().enumerate() {
             if id == 0 {

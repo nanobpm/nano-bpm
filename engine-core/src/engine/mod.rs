@@ -596,6 +596,12 @@ enum Step {
 /// self / mutually-recursive callees that never terminate.
 const MAX_CALL_ACTIVITY_DEPTH: usize = 1000;
 
+/// `reason` of a resident off-heap orphan's `VariablesLost` incident (#1384).
+const RESIDENT_ORPHAN_REASON: &str = "variables lost: spill row missing";
+/// `reason` of a cold off-heap orphan's `VariablesLost` incident (#1481).
+const COLD_ORPHAN_REASON: &str = "variables lost: cold instance row missing from the spill \
+                                  store; the whole instance is unrecoverable";
+
 impl Engine {
     /// Creates an empty engine for the single-partition (id `0`) namespace.
     pub fn new() -> Self {
@@ -5489,8 +5495,19 @@ impl Engine {
                 self.process_complete_agent_instance(&mut log, agent_instance_key)?;
             }
 
-            Command::QuarantineOffheapOrphan { instance_key } => {
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: None,
+            } => {
                 self.process_quarantine_offheap_orphan(&mut log, instance_key);
+            }
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: Some(stamp),
+            } => {
+                // Replicated form (#1447): no residency / terminal / idempotency
+                // branch — those read replica-local state. The leader decided.
+                self.emit_variables_lost(&mut log, instance_key, stamp.element_id, stamp.reason);
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
@@ -7463,6 +7480,24 @@ impl Engine {
             return;
         }
         let element_id = instance.process_id.clone();
+        self.emit_variables_lost(
+            log,
+            instance_key,
+            element_id,
+            RESIDENT_ORPHAN_REASON.to_string(),
+        );
+    }
+
+    /// Emits the single instance-root `VariablesLost` incident every orphan
+    /// quarantine form shares (#1384/#1481/#1447): one canonical shape, so the
+    /// local and replicated forms cannot drift.
+    fn emit_variables_lost(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: String,
+        reason: String,
+    ) {
         let incident_key = self.mint_key();
         self.emit(
             log,
@@ -7473,11 +7508,58 @@ impl Engine {
                 element_id,
                 kind: state::IncidentKind::VariablesLost,
                 redrive: None,
-                reason: "variables lost: spill row missing".to_string(),
+                reason,
                 job_key: None,
                 created_at: self.now,
             },
         );
+    }
+
+    /// Whether an active `VariablesLost` incident already names `instance_key`
+    /// in this engine's state.
+    pub fn has_active_variables_lost(&self, instance_key: Key) -> bool {
+        self.state.incidents.values().any(|i| {
+            i.instance_key == instance_key
+                && i.state == state::IncidentState::Active
+                && i.kind == state::IncidentKind::VariablesLost
+        })
+    }
+
+    /// Resolves, from THIS (proposing leader's) state, the stamp a replicated
+    /// [`Command::QuarantineOffheapOrphan`] carries (#1447) — every replica then
+    /// applies the identical incident. `None` means nothing should be proposed:
+    /// the leader already holds an active `VariablesLost` incident for the
+    /// instance, or holds it resident in a terminal state (the loss no longer
+    /// matters to any live work). Pure read.
+    pub fn orphan_incident_stamp(
+        &self,
+        instance_key: Key,
+        kind: crate::command::OrphanKind,
+    ) -> Option<crate::command::OrphanIncidentStamp> {
+        if self.has_active_variables_lost(instance_key) {
+            return None;
+        }
+        let element_id = match self.state.instances.get(&instance_key) {
+            Some(instance)
+                if !matches!(
+                    instance.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                ) =>
+            {
+                return None;
+            }
+            Some(instance) => instance.process_id.clone(),
+            None => String::new(),
+        };
+        let reason = match kind {
+            crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
+            crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
+        };
+        Some(crate::command::OrphanIncidentStamp {
+            kind,
+            element_id,
+            reason: reason.to_string(),
+        })
     }
 
     /// Process a [`Command::QuarantineColdOrphan`] (#1481): record a durable
@@ -7491,30 +7573,14 @@ impl Engine {
             self.process_quarantine_offheap_orphan(log, instance_key);
             return;
         }
-        let already_raised = self.state.incidents.values().any(|i| {
-            i.instance_key == instance_key
-                && i.state == state::IncidentState::Active
-                && i.kind == state::IncidentKind::VariablesLost
-        });
-        if already_raised {
+        if self.has_active_variables_lost(instance_key) {
             return;
         }
-        let incident_key = self.mint_key();
-        self.emit(
+        self.emit_variables_lost(
             log,
-            Event::IncidentRaised {
-                incident_key,
-                instance_key,
-                element_instance_key: instance_key,
-                element_id: String::new(),
-                kind: state::IncidentKind::VariablesLost,
-                redrive: None,
-                reason: "variables lost: cold instance row missing from the spill store; \
-                         the whole instance is unrecoverable"
-                    .to_string(),
-                job_key: None,
-                created_at: self.now,
-            },
+            instance_key,
+            String::new(),
+            COLD_ORPHAN_REASON.to_string(),
         );
     }
 
