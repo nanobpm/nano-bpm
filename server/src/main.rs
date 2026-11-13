@@ -11446,35 +11446,7 @@ impl ServerImpl {
             .iter()
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -11590,35 +11562,7 @@ impl ServerImpl {
             .filter(|inc| contained.contains(&inc.element_instance_key))
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -12825,6 +12769,25 @@ impl ServerImpl {
                                 .map(|k| k.to_string())
                                 .as_deref(),
                         )
+                        // The read model does not project the definition's
+                        // display name or version tag onto the instance row, so
+                        // those filters match against an absent value — value
+                        // operators exclude (honest, never silently widening)
+                        // while `$exists: false` still matches (the `endDate`
+                        // convention above).
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
+                        // `suspendedDate` is the nullable column the read model
+                        // maintains (the single source of truth for suspension).
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Camunda's `tags` filter is a conjunction: an instance
+                        // must carry every listed tag.
+                        && f.tags.as_ref().is_none_or(|tags| {
+                            tags.iter().all(|t| inst.tags.contains(&t.0))
+                        })
                         && match_instance_variables(
                             &f.variables,
                             variables_index.get(&inst.key),
@@ -23508,13 +23471,65 @@ fn match_element_instance_fields(
         })
 }
 
+/// The incident filter predicate, shared by `searchIncidents` and the
+/// element-instance-scoped incident search so the two cannot drift. Every
+/// declared `IncidentFilter` field is matched: the process-definition identity
+/// is denormalized onto the row at projection time (no cross-entity lookup),
+/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
+/// against an absent value — value operators exclude the row (honest, never
+/// silently widening the search) while `$exists: false` still matches.
+fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
+    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
+        && query::match_element_instance_key(
+            &f.element_instance_key,
+            &inc.element_instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inc.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
+        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
+        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
+        && query::match_incident_error_type(
+            &f.error_type,
+            &incident_error_type_enum(inc.kind).to_string(),
+        )
+        && query::match_string(&f.element_id, &inc.element_id)
+        && query::match_string(&f.error_message, &inc.reason)
+        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
+        && query::match_string_opt(&f.tenant_id, None)
+}
+
 /// The user-task filter predicate over one AND-group of fields, shared by the
 /// top-level filter and each `$or` clause so the two cannot drift.
+///
+/// Every advertised field is matched against what the row actually projects.
+/// Fields Nano never projects onto a user task — `name` (the result's `name`
+/// is always null), `completionDate` (always null), `tags` (always empty), and
+/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
+/// absent value: value operators exclude the row (honest, never silently
+/// widening the search) while `$exists: false` still matches. The variable
+/// filters (`processInstanceVariables` / `localVariables`) are NOT evaluated
+/// here — they need a variable-store join this predicate cannot see, so the
+/// MCP adapter rejects them instead of letting them widen results silently.
 fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
+    // The task's due/follow-up dates are stored as RFC 3339 strings; project
+    // them to epoch millis for the date-time filter algebra. An unparseable or
+    // absent stored date is an absent value (value operators exclude it).
+    let parse_ms = |d: &Option<String>| {
+        d.as_deref()
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .map(|dt| dt.timestamp_millis())
+    };
     f.user_task_key
         .as_ref()
         .is_none_or(|k| k.0 == task.key.to_string())
+        && f.element_instance_key
+            .as_ref()
+            .is_none_or(|k| k.0 == task.element_instance_key.to_string())
         && query::match_process_instance_key(
             &f.process_instance_key,
             &task.instance_key.to_string(),
@@ -23523,9 +23538,40 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
             &f.process_definition_key,
             &task.process_definition_key,
         )
+        && query::match_process_definition_id(
+            &f.process_definition_id,
+            Some(&task.process_definition_id),
+        )
         && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
         && query::match_string(&f.assignee, &assignee)
         && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+        && query::match_string_opt(&f.business_id, task.business_id.as_deref())
+        && query::match_integer(&f.priority, Some(i64::from(task.priority)))
+        && f.candidate_group.as_ref().is_none_or(|g| match g {
+            models::StringFilterProperty::String(s) => task.candidate_groups.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_groups
+                .iter()
+                .any(|cg| query::match_string_property(g, Some(cg))),
+        })
+        && f.candidate_user.as_ref().is_none_or(|u| match u {
+            models::StringFilterProperty::String(s) => task.candidate_users.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_users
+                .iter()
+                .any(|cu| query::match_string_property(u, Some(cu))),
+        })
+        && query::match_date_time_ms(&f.creation_date, Some(task.created_at_ms as i64))
+        && query::match_date_time_ms(&f.due_date, parse_ms(&task.due_date))
+        && query::match_date_time_ms(&f.follow_up_date, parse_ms(&task.follow_up_date))
+        // Never projected: completion date (result is always null).
+        && query::match_date_time_ms(&f.completion_date, None)
+        // Never projected: task name (result is always null).
+        && query::match_string_opt(&f.name, None)
+        // Never projected: task tags (result is always empty), so any listed
+        // tag excludes the row.
+        && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
+        && query::match_string_opt(&f.tenant_id, None)
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -49479,6 +49525,444 @@ mod search_process_instances_suspend_resume_tests {
             ),
             "an unparseable key is a 400 on resumption"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_filter_honesty_tests {
+    //! Regression coverage for the "silently ignored filter" defect class
+    //! (PR #1586 review): a filter field the API advertises but the predicate
+    //! never evaluates *widens* the caller's restriction while looking like a
+    //! match — the worst failure mode for a search API. Every field the
+    //! incident / process-instance / user-task predicates declare must either
+    //! narrow the result set or honestly exclude (matching against an absent
+    //! value, so `$exists: false` still works). These tests seed the read model
+    //! directly and drive the real `*_impl` handlers.
+
+    use nanobpmn_engine_core::{Event, IncidentKind};
+
+    use super::*;
+
+    /// Seed two process instances on *different* process definitions (so a
+    /// processDefinitionId filter can tell them apart), each with tags and a
+    /// business id.
+    fn seed_instances(server: &ServerImpl) {
+        let created = |key: u64, process_id: &str, tags: &[&str], business_id: Option<&str>| {
+            Event::ProcessInstanceCreated {
+                instance_key: key,
+                process_id: process_id.to_string(),
+                variables: std::collections::HashMap::new(),
+                created_at: 1_700_000_000_000,
+                tags: tags.iter().map(|t| (*t).to_string()).collect(),
+                business_id: business_id.map(str::to_string),
+                process_definition_key: 0,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            }
+        };
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1, "order-process", &["blue"], Some("order-7")),
+                &created(2, "returns-process", &["red"], Some("return-3")),
+            ])
+            .unwrap();
+    }
+
+    async fn search_instances(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_instance_search_honours_tags_suspended_date_and_definition_metadata() {
+        let server = ServerImpl::default();
+        seed_instances(&server);
+        // Suspend instance 1 at a known instant so suspendedDate can select it.
+        server.store.shards()[0]
+            .1
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 1,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // Baseline: both instances.
+        let all = search_instances(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both instances");
+
+        // `tags` narrows to the instance carrying every listed tag.
+        let tagged = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(tagged.page.total_items, 1);
+        assert_eq!(tagged.items[0].process_instance_key.0, "1");
+        let no_tag = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("no-such-tag".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_tag.page.total_items, 0,
+            "a tag nothing carries must match nothing — not widen to all rows"
+        );
+
+        // `suspendedDate` narrows to the instance suspended in the range.
+        let suspended = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "1");
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are not
+        // projected onto the instance row: a value filter honestly matches
+        // nothing (never widens), while `$exists: false` matches both.
+        let by_name = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::String(
+                    "Order Process".to_string(),
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+        let name_absent = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            name_absent.page.total_items, 2,
+            "$exists: false on an unprojected field matches every row"
+        );
+    }
+
+    /// Seed one incident per process instance (different definitions).
+    fn seed_incidents(server: &ServerImpl) {
+        seed_instances(server);
+        let raised = |key: u64, instance: u64, reason: &str, at: u64| Event::IncidentRaised {
+            incident_key: key,
+            instance_key: instance,
+            element_instance_key: 100 + instance,
+            element_id: "task".to_string(),
+            kind: IncidentKind::JobNoRetries,
+            reason: reason.to_string(),
+            job_key: Some(200 + instance),
+            created_at: at,
+            redrive: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &raised(11, 1, "order failed", 1_700_000_100_000),
+                &raised(22, 2, "return failed", 1_700_000_200_000),
+            ])
+            .unwrap();
+    }
+
+    async fn search_incidents(
+        server: &ServerImpl,
+        filter: models::IncidentFilter,
+    ) -> models::IncidentSearchQueryResult {
+        let body = Some(models::IncidentSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_incidents_impl(&body).await {
+            Ok(apis::incident::SearchIncidentsResponse::Status200_TheIncidentSearchResult(r)) => r,
+            other => panic!("expected a 200 incident search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_search_honours_process_definition_id_and_creation_time() {
+        let server = ServerImpl::default();
+        seed_incidents(&server);
+
+        let all = search_incidents(&server, models::IncidentFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both incidents");
+
+        // `processDefinitionId` narrows to the incident of that definition's
+        // instance — the field the PR #1586 review caught being ignored.
+        let narrowed = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "order-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(narrowed.page.total_items, 1);
+        assert_eq!(narrowed.items[0].incident_key.0, "11");
+        let widened = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "no-such-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            widened.page.total_items, 0,
+            "a non-matching processDefinitionId must exclude, not widen"
+        );
+
+        // `creationTime` narrows by the incident's creation timestamp.
+        let recent = search_incidents(
+            &server,
+            models::IncidentFilter {
+                creation_time: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_150_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(recent.page.total_items, 1);
+        assert_eq!(recent.items[0].incident_key.0, "22");
+    }
+
+    /// Seed one user task per instance with distinct business ids, priorities
+    /// and candidate assignments.
+    fn seed_user_tasks(server: &ServerImpl) {
+        seed_instances(server);
+        let task = |key: u64,
+                    instance: u64,
+                    assignee: Option<&str>,
+                    groups: &[&str],
+                    priority: i32,
+                    due: Option<&str>| Event::UserTaskCreated {
+            user_task_key: key,
+            instance_key: instance,
+            element_instance_key: 300 + instance,
+            element_id: "review".to_string(),
+            created_at: 1_700_000_300_000 + key,
+            assignee: assignee.map(str::to_string),
+            candidate_groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            candidate_users: Vec::new(),
+            due_date: due.map(str::to_string),
+            follow_up_date: None,
+            priority,
+            form_key: None,
+            external_form_reference: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &task(
+                    31,
+                    1,
+                    Some("alice"),
+                    &["ops"],
+                    50,
+                    Some("2024-01-01T00:00:00Z"),
+                ),
+                &task(32, 2, None, &["finance"], 80, None),
+            ])
+            .unwrap();
+    }
+
+    async fn search_tasks(
+        server: &ServerImpl,
+        filter: models::UserTaskFilter,
+    ) -> models::UserTaskSearchQueryResult {
+        let body = Some(models::UserTaskSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_user_tasks_impl(&body).await {
+            Ok(apis::user_task::SearchUserTasksResponse::Status200_TheUserTaskSearchResult(r)) => r,
+            other => panic!("expected a 200 user-task search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_task_search_honours_the_advertised_filters() {
+        let server = ServerImpl::default();
+        seed_user_tasks(&server);
+
+        let all = search_tasks(&server, models::UserTaskFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both tasks");
+
+        // `businessId` narrows to the task of the instance carrying it — the
+        // exact case the PR #1586 review cited.
+        let by_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String("order-7".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_business.page.total_items, 1);
+        assert_eq!(by_business.items[0].user_task_key.0, "31");
+        let no_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String(
+                    "no-such-order".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_business.page.total_items, 0,
+            "a non-matching businessId must exclude, not widen"
+        );
+
+        // `priority` narrows numerically.
+        let by_priority = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                priority: Some(models::IntegerFilterProperty::I32(80)),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_priority.page.total_items, 1);
+        assert_eq!(by_priority.items[0].user_task_key.0, "32");
+
+        // `processDefinitionId` narrows to the task of that definition.
+        let by_pd = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                process_definition_id: Some(models::ProcessDefinitionIdFilterProperty::String(
+                    "returns-process".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_pd.page.total_items, 1);
+        assert_eq!(by_pd.items[0].user_task_key.0, "32");
+
+        // `elementInstanceKey` narrows to the task with that element instance.
+        let by_eik = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                element_instance_key: Some(models::ElementInstanceKey("302".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_eik.page.total_items, 1);
+        assert_eq!(by_eik.items[0].user_task_key.0, "32");
+
+        // `candidateGroup` narrows to the tasks listing the group.
+        let by_group = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                candidate_group: Some(models::StringFilterProperty::String("ops".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_group.page.total_items, 1);
+        assert_eq!(by_group.items[0].user_task_key.0, "31");
+
+        // `dueDate` narrows by the parsed stored date; the task without a due
+        // date is excluded by a range operator (honest absent-value semantics).
+        let by_due = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                due_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_lte: Some(
+                            chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                                .unwrap()
+                                .to_utc(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_due.page.total_items, 1);
+        assert_eq!(by_due.items[0].user_task_key.0, "31");
+
+        // `name` is never projected (the result's name is always null): a
+        // value filter honestly matches nothing instead of widening.
+        let by_name = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                name: Some(models::StringFilterProperty::String("Review".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+
+        // `tags` is always empty on Nano tasks: any listed tag excludes.
+        let by_tags = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_tags.page.total_items, 0);
     }
 }
 

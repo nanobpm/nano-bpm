@@ -857,6 +857,9 @@ mod tests {
 
     /// Nano keys are `u64`: partition >= 4096 keys exceed `i64::MAX` and must
     /// parse in both numeric and string form; negatives/garbage are rejected.
+    /// The advertised JSON Schema `integer` type also covers integral float
+    /// representations (`3.0`, `3e0`), which serde stores as f64 — accept them,
+    /// while genuinely fractional or negative floats stay rejected.
     #[test]
     fn arg_key_accepts_full_u64_key_range() {
         let big = 9_223_372_036_854_775_809_u64;
@@ -868,6 +871,27 @@ mod tests {
             );
         }
         for args in [json!({ "k": -1 }), json!({ "k": "x" }), json!({})] {
+            assert!(cluster_tools::arg_key(&args, "k").is_err(), "{args}");
+        }
+    }
+
+    /// Integral float representations of a key (`3.0`, `3e0`) are valid per
+    /// the advertised JSON Schema `integer` type and must reach the handler;
+    /// fractional/negative floats are not keys and stay rejected.
+    #[test]
+    fn arg_key_accepts_integral_float_representations() {
+        for args in [json!({ "k": 3.0 }), json!({ "k": 3e0 })] {
+            assert_eq!(
+                cluster_tools::arg_key(&args, "k").ok(),
+                Some("3".to_string()),
+                "{args}"
+            );
+        }
+        for args in [
+            json!({ "k": 3.5 }),
+            json!({ "k": -3.0 }),
+            json!({ "k": 1e300 }),
+        ] {
             assert!(cluster_tools::arg_key(&args, "k").is_err(), "{args}");
         }
     }
@@ -996,6 +1020,8 @@ mod tests {
         let server = ServerImpl::default();
         for (tool, key, val) in [
             ("searchUserTasks", "isSuspended", json!(true)),
+            ("searchUserTasks", "processInstanceVariables", json!([])),
+            ("searchUserTasks", "localVariables", json!([])),
             ("searchVariables", "protectionMode", json!("REDACT")),
         ] {
             let mut filter = json!({});
@@ -1004,6 +1030,66 @@ mod tests {
             assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
             let text = result["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(key), "{key} named in error: {text}");
+        }
+    }
+
+    /// Every filter the MCP search tools advertise is either honoured by the
+    /// shared REST predicate or rejected — never silently dropped (which would
+    /// widen the search beyond the caller's restriction). These calls run
+    /// against an empty store: a *silently ignored* restriction still returns
+    /// success, so each assertion pairs "restriction accepted" with the
+    /// behaviour that proves it was evaluated (an empty result set for a
+    /// restriction nothing can match).
+    #[tokio::test]
+    async fn advertised_search_filters_never_silently_widen() {
+        let server = ServerImpl::default();
+        // A restriction nothing can match must yield an empty page, proving
+        // the filter reached the predicate instead of being dropped.
+        for (tool, filter) in [
+            (
+                "searchIncidents",
+                json!({ "processDefinitionId": "no-such-process" }),
+            ),
+            (
+                "searchIncidents",
+                json!({ "creationTime": { "from": "2999-01-01T00:00:00Z" } }),
+            ),
+            (
+                "searchProcessInstances",
+                json!({ "processDefinitionName": "no-such-name" }),
+            ),
+            (
+                "searchProcessInstances",
+                json!({ "suspendedDate": { "from": "2999-01-01T00:00:00Z" } }),
+            ),
+            ("searchProcessInstances", json!({ "tags": ["no-such-tag"] })),
+            ("searchUserTasks", json!({ "businessId": "no-such-order" })),
+            ("searchUserTasks", json!({ "name": "no-such-task-name" })),
+            ("searchUserTasks", json!({ "priority": 77 })),
+            (
+                "searchUserTasks",
+                json!({ "processDefinitionId": "no-such-process" }),
+            ),
+            ("searchUserTasks", json!({ "elementInstanceKey": "12345" })),
+            (
+                "searchUserTasks",
+                json!({ "dueDate": { "from": "2999-01-01T00:00:00Z" } }),
+            ),
+            ("searchUserTasks", json!({ "tags": ["no-such-tag"] })),
+        ] {
+            let result = call(&server, tool, json!({ "filter": filter })).await;
+            assert_eq!(
+                result["isError"].as_bool(),
+                Some(false),
+                "{tool} must accept the advertised filter: {result}"
+            );
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let body: Value = serde_json::from_str(text).expect("search body is json");
+            assert_eq!(
+                body["items"].as_array().map(Vec::len),
+                Some(0),
+                "{tool} with {filter}: a non-matching restriction must not return rows: {body}"
+            );
         }
     }
 

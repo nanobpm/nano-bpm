@@ -397,6 +397,13 @@ fn render_element_attrs(el: &Element, attrs: &mut Vec<String>) {
     for m in &el.io.outputs {
         attrs.push(format!("output {} <- {}", m.target, quote(&m.source)));
     }
+    // `zeebe:properties` extension properties (e.g. the `io.camunda.tool:*` MCP
+    // tool metadata, #1499) round-trip through the IR so an IR edit → BPMN
+    // re-emit never silently strips them. BTreeMap order keeps the emission
+    // deterministic.
+    for (name, value) in &el.properties {
+        attrs.push(format!("property {} {}", quote(name), quote(value)));
+    }
     if let Some(mi) = &el.multi_instance {
         let mut parts: Vec<String> = vec![format!("collection {}", quote(&mi.input_collection))];
         if let Some(v) = &mi.input_element {
@@ -761,6 +768,9 @@ struct NodeAttrs {
     outputs: Vec<Mapping>,
     /// `zeebe:taskHeaders` entries (serviceTask only), keyed by header name.
     headers: BTreeMap<String, String>,
+    /// `zeebe:properties` entries (`property "name" "value"` lines), keyed by
+    /// property name.
+    properties: BTreeMap<String, String>,
     timer: Option<TimerDef>,
     multi_instance: Option<MultiInstance>,
 }
@@ -983,9 +993,10 @@ impl<'a> Parser<'a> {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
-            // processos' IR does not model zeebe:properties (out of the IR's
-            // scope, #1499); parsed elements carry no extension properties.
-            properties: std::collections::BTreeMap::new(),
+            // `zeebe:properties` extension properties round-trip through the IR
+            // as `property "name" "value"` lines (MCP tool metadata lives here,
+            // #1499), so an IR parse → BPMN re-emit preserves them.
+            properties: std::mem::take(&mut attrs.properties),
         };
         if let Some((leftover, _)) = attrs.scalars.iter().next() {
             return Err(format!(
@@ -1039,6 +1050,11 @@ impl<'a> Parser<'a> {
                 self.expect_tok(&Tok::LArrow, "in a task header")?;
                 let value = self.expect_str("for a task header value")?;
                 attrs.headers.insert(key, value);
+            }
+            "property" => {
+                let name = self.expect_str("for a property name")?;
+                let value = self.expect_str("for a property value")?;
+                attrs.properties.insert(name, value);
             }
             "timer" => {
                 let kind_word = self.expect_word("for a timer kind")?;

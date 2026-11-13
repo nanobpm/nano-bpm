@@ -725,6 +725,7 @@ fn emit_attr_block(out: &mut String, s: &KindSpec) {
     alts.push("attr-timer".into());
     alts.push("attr-input".into());
     alts.push("attr-output".into());
+    alts.push("attr-property".into());
     alts.push("attr-multiInstance".into());
     out.push_str(&alts.join(" | "));
     out.push('\n');
@@ -769,6 +770,7 @@ attr-retries         ::= "retries" sp string
 attr-timer           ::= "timer" sp ("duration" | "cycle" | "date") sp string
 attr-input           ::= "input" sp id sp "<-" sp string
 attr-output          ::= "output" sp id sp "<-" sp string
+attr-property        ::= "property" sp string sp string
 attr-multiInstance   ::= "multiInstance" sp "{" sp mi-attr (sp "," sp mi-attr)* sp "}"
 mi-attr              ::= "collection" sp string
                        | "inputElement" sp string
@@ -819,6 +821,7 @@ pub fn describe(kind: Option<&str>) -> Value {
                 { "key": "timer",        "doc": "`timer duration|cycle|date \"<feel>\"` on a timer event." },
                 { "key": "input",        "doc": "`input <target-id> <- \"<feel-source>\"` — repeat for each mapping." },
                 { "key": "output",       "doc": "`output <target-id> <- \"<feel-source>\"` — repeat for each mapping." },
+                { "key": "property",     "doc": "`property \"<name>\" \"<value>\"` — a `zeebe:properties` extension property (e.g. the `io.camunda.tool:*` MCP tool metadata); repeat for each entry." },
                 { "key": "multiInstance", "doc": "`multiInstance { collection \"<feel>\", ... }` on the activity." },
             ],
             "flowAnnotations": [
@@ -845,7 +848,7 @@ pub fn describe(kind: Option<&str>) -> Value {
                     { "key": "when",    "doc": "FEEL boolean guarding an outgoing flow." },
                     { "key": "default", "doc": "Bare keyword; meaningful on a condition-routed gateway's outgoing flow (an exclusiveGateway or inclusiveGateway)." },
                 ],
-                "sharedAttrs": ["parent", "retries", "timer", "input", "output", "multiInstance"],
+                "sharedAttrs": ["parent", "retries", "timer", "input", "output", "property", "multiInstance"],
                 "note": "All attributes go inside a `{ ... }` block, one per line. \
                          Required attributes must be present; optional attributes may be omitted.",
             }),
@@ -1272,7 +1275,10 @@ mod tests {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
-            properties: std::collections::BTreeMap::new(),
+            properties: std::collections::BTreeMap::from([(
+                "io.camunda.tool:name".to_string(),
+                "svc-tool".to_string(),
+            )]),
         };
         let mut emitted = Vec::new();
         render_element_attrs_for_test(&el, &mut emitted);
@@ -1281,14 +1287,15 @@ mod tests {
             .filter_map(|line| line.split_whitespace().next().map(str::to_string))
             .collect();
         // The SHARED_ATTRS list only holds the simple K/V shared attrs (parent, retries). The
-        // shaped ones (timer, input, output, multiInstance) are described inline in `describe`
-        // and get their own GBNF productions; assert they appear too by string-match.
+        // shaped ones (timer, input, output, property, multiInstance) are described inline in
+        // `describe` and get their own GBNF productions; assert they appear too by string-match.
         for key in [
             "parent",
             "retries",
             "timer",
             "input",
             "output",
+            "property",
             "multiInstance",
         ] {
             assert!(

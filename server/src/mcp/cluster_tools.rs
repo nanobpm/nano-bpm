@@ -99,11 +99,22 @@ fn not_implemented(tool: &str) -> Value {
 
 /// Pull a required key out of the flat MCP argument object. Nano keys are
 /// `u64` (partitions >= 4096 mint keys above `i64::MAX`), so parse unsigned.
+///
+/// The advertised JSON Schema types these keys as `integer`, which also covers
+/// integral *representations* serde_json stores as floats (`3.0`, `3e0`): those
+/// are accepted when finite, in the `u64` range, and exactly integral — while a
+/// genuinely fractional value (`3.5`) or a negative one stays rejected.
 pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
     args.get(camel)
         .and_then(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .or_else(|| {
+                    v.as_f64().and_then(|f| {
+                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= u64::MAX as f64)
+                            .then_some(f as u64)
+                    })
+                })
         })
         .map(|k| k.to_string())
         .ok_or_else(|| {
@@ -372,7 +383,15 @@ async fn get_user_task(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_user_tasks(server: &ServerImpl, args: Value) -> Value {
-    if let Err(e) = reject_unsupported_filter(&args, &["isSuspended"]) {
+    // Fail closed on advertised filters the shared REST predicate cannot
+    // honour: `isSuspended` (Nano has no task suspension), and the two variable
+    // filters, which need a variable-store join the user-task predicate does
+    // not have. Deserializing them would silently drop the condition and widen
+    // the search.
+    if let Err(e) = reject_unsupported_filter(
+        &args,
+        &["isSuspended", "processInstanceVariables", "localVariables"],
+    ) {
         return e;
     }
     let body: Option<models::UserTaskSearchQuery> = match optional_body(args) {
