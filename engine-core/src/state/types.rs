@@ -2515,38 +2515,32 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
     reconcile_incident_index(state, key);
 }
 
-/// Folds every ACTIVE incident in `state.incidents` owned by `instance_key`
-/// into that instance's `incidents` index (#1574 review). An incident raised
-/// while the instance was cold (e.g. the off-heap-orphan `VariablesLost`
-/// quarantine) lands in `state.incidents` with no resident instance to index
-/// it, so restoring the stale cold row alone would leave it unindexed and a
-/// later termination would resolve it only on peers that held the instance
-/// resident — diverging the event log. Keys are appended in ascending order so
-/// every replica rebuilds an identical index.
+/// Folds the ACTIVE incident raised while `instance_key` was cold into that
+/// instance's `incidents` index (#1574 review). The only incident that can be
+/// raised against a non-resident instance is the off-heap-orphan
+/// `VariablesLost` quarantine, and it is always recorded in the replicated
+/// tombstone [`State::variables_lost_quarantined`] (instance → incident). That
+/// map is the O(1) instance-keyed lookup, so restore never scans the
+/// partition-wide incident map (which would make bulk snapshot loading
+/// quadratic). Restoring the stale cold row alone would leave the incident
+/// unindexed and a later termination would resolve it only on peers that held
+/// the instance resident — diverging the event log.
 fn reconcile_incident_index(state: &mut State, instance_key: Key) {
-    let Some(instance) = state.instances.get(&instance_key) else {
+    let Some(&incident_key) = state.variables_lost_quarantined.get(&instance_key) else {
         return;
     };
-    let mut missing: Vec<Key> = state
-        .incidents
-        .values()
-        .filter(|i| {
-            i.instance_key == instance_key
-                && i.state == IncidentState::Active
-                && !instance.incidents.contains(&i.key)
-        })
-        .map(|i| i.key)
-        .collect();
-    if missing.is_empty() {
+    let Some(incident) = state.incidents.get(&incident_key) else {
+        return;
+    };
+    if incident.instance_key != instance_key || incident.state != IncidentState::Active {
         return;
     }
-    missing.sort_unstable();
-    let owed: Vec<Key> = missing
-        .iter()
-        .filter_map(|k| state.incidents.get(k).and_then(Incident::owed_activation))
-        .collect();
+    let owed = incident.owed_activation();
     if let Some(instance) = state.instances.get_mut(&instance_key) {
-        instance.incidents.extend(missing);
+        if instance.incidents.contains(&incident_key) {
+            return;
+        }
+        instance.incidents.push(incident_key);
         instance.activating.extend(owed);
     }
 }
