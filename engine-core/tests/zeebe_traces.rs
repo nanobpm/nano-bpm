@@ -748,8 +748,7 @@ impl<'a> NanoRun<'a> {
             .into_iter()
             .filter_map(|(name, v)| {
                 let value = to_json(v);
-                let unchanged =
-                    self.values.get(&(scope_key, name.clone())) == Some(&value);
+                let unchanged = self.values.get(&(scope_key, name.clone())) == Some(&value);
                 (!unchanged).then(|| {
                     self.variable_record(scope_key, scope_label.clone(), name, value, instance)
                 })
