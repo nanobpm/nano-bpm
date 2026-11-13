@@ -4223,3 +4223,52 @@ fn quarantine_offheap_orphan_stamp_is_serde_additive() {
     let json = serde_json::to_string(&stamped).unwrap();
     assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), stamped);
 }
+
+// #1574 review: two committed STAMPED proposals for the same outstanding loss
+// must not mint two incidents. During failover a promoted member can stamp its
+// parked report before an inherited quarantine entry applies, so both proposals
+// commit; the second must be a no-op because the replicated incident set already
+// carries an active `VariablesLost` for the instance.
+#[test]
+fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let mk = || Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+        }),
+    };
+    let first = engine.apply_command_at(mk(), 50).unwrap();
+    assert_eq!(first.len(), 1, "the first proposal raises the incident");
+    // A second committed stamped proposal for the SAME loss is a no-op.
+    let second = engine.apply_command_at(mk(), 51).unwrap();
+    assert!(
+        second.is_empty(),
+        "a duplicate committed proposal mints no second incident"
+    );
+    let active = engine
+        .incidents()
+        .iter()
+        .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+        .count();
+    assert_eq!(active, 1, "exactly one VariablesLost incident");
+}

@@ -5505,9 +5505,22 @@ impl Engine {
                 instance_key,
                 stamp: Some(stamp),
             } => {
-                // Replicated form (#1447): no residency / terminal / idempotency
-                // branch — those read replica-local state. The leader decided.
-                self.emit_variables_lost(&mut log, instance_key, stamp.element_id, stamp.reason);
+                // Replicated form (#1447): no residency / terminal branch — those
+                // read replica-local state. The leader decided. The idempotency
+                // guard, however, reads ONLY replicated state (the incident set
+                // every replica applies identically), so it is safe here and
+                // required: two committed stamped proposals for the same
+                // outstanding loss (a promoted member re-proposing its parked
+                // report before an inherited quarantine entry applies) must not
+                // mint a second incident (#1574 review).
+                if !self.has_active_variables_lost(instance_key) {
+                    self.emit_variables_lost(
+                        &mut log,
+                        instance_key,
+                        stamp.element_id,
+                        stamp.reason,
+                    );
+                }
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);

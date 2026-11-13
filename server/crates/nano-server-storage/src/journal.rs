@@ -213,6 +213,14 @@ impl OrphanInbox {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
     }
+
+    /// Whether `key` currently has a recorded absence (test/diagnostic read).
+    pub fn contains(&self, key: Key) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+    }
 }
 
 /// The leader-propose reporting state for off-heap orphans under replicated
@@ -1602,7 +1610,13 @@ impl Journal {
     /// Returns the number of keys newly enqueued.
     pub fn drain_orphan_backlog(&mut self) -> usize {
         for (key, kind) in self.orphans.inbox.take() {
-            self.park_orphan(key, kind, "off-thread snapshot");
+            // Off-thread (streaming-snapshot) discoveries are revalidated against
+            // CURRENT routing before parking (#1574 review): the capture may have
+            // referenced a spill/cold row that a later command rehydrated and
+            // deleted before the writer read it, so the writer's miss can be
+            // stale. In-apply detections (restore / fold) run on the actor and
+            // are already current, so they park directly.
+            self.park_orphan_revalidated(key, kind, "off-thread snapshot");
         }
         // A key whose incident already landed here needs no proposal.
         let resolved: Vec<Key> = self
@@ -1680,6 +1694,35 @@ impl Journal {
         }
     }
 
+    /// [`park_orphan`](Self::park_orphan) for an OFF-THREAD (streaming-snapshot)
+    /// discovery, which can be stale (#1574 review): the capture referenced a
+    /// spill/cold row that a later command rehydrated and deleted before the
+    /// writer read it, so the writer's miss may describe a legitimately-gone row
+    /// rather than a lost payload. The report is revalidated against CURRENT
+    /// routing and parked only when the row is still DEFINITIVELY absent
+    /// (`Ok(None)`); a now-readable payload (`Ok(Some)`), a spill flag that has
+    /// since cleared, or a merely UNREADABLE row (`Err` — possibly transient,
+    /// fail closed) drops the report instead of quarantining an intact instance.
+    fn park_orphan_revalidated(&mut self, key: Key, kind: OrphanKind, context: &str) {
+        let still_absent = match kind {
+            // A resident report is stale once the instance is no longer spilled
+            // (a later command rehydrated it) — there is no outstanding loss.
+            OrphanKind::Resident if !self.engine.is_variables_spilled(key) => false,
+            OrphanKind::Resident => matches!(self.peek_spilled_variables(key), Ok(None)),
+            OrphanKind::Cold => matches!(self.peek_cold_instance(key), Ok(None)),
+        };
+        if !still_absent {
+            tracing::info!(
+                instance_key = key,
+                ?kind,
+                "{context}: off-heap orphan report is stale (payload since rehydrated \
+                 or only transiently unreadable); not quarantining an intact instance"
+            );
+            return;
+        }
+        self.park_orphan(key, kind, context);
+    }
+
     /// Routes an orphan detected under replicated apply to the leader-propose
     /// channel (#1447): parked in the backlog, then drained (a no-op on a
     /// follower or with no sink wired). The apply itself stays deterministic —
@@ -1707,6 +1750,11 @@ impl Journal {
                 .map(|i| Arc::clone(&i.variables))
                 .unwrap_or_default();
             self.engine.rehydrate_variables(key, resident);
+            // The repair rehydrates WITHOUT an event, so the dirty tracker never
+            // fires for it. Mark the surviving map dirty explicitly: otherwise a
+            // lean checkpoint omits the replacement and a restart reloads the
+            // discarded store payload (#1574 review).
+            self.engine.mark_variables_dirty(key);
             if self.varstore.is_none()
                 && let Some(Err(err)) = self.spill.as_ref().map(|vs| vs.store.forget(&[key]))
             {
@@ -4201,6 +4249,14 @@ impl Journal {
             cold: self.cold.as_ref().map(|c| Arc::clone(&c.store)),
             spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
             varstore: self.varstore.as_ref().map(Arc::clone),
+            // Legacy fallback for a lean var-store miss (#1574 review): the same
+            // spill-or-cold tier `peek_spilled_variables` consults before it
+            // refuses to declare a loss.
+            legacy: self
+                .spill
+                .as_ref()
+                .map(|s| Arc::clone(&s.store))
+                .or_else(|| self.cold.as_ref().map(|c| Arc::clone(&c.store))),
             // Under replicated apply this capture feeds the off-thread Raft
             // snapshot writer: a definitive absence it hits is reported to the
             // leader-propose machinery (#1447) before the build fails closed.
@@ -7348,6 +7404,98 @@ mod tests {
         drop(cold);
         let _ = std::fs::remove_dir_all(resident_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(cold_path.parent().unwrap());
+    }
+
+    // #1574 review: a stale off-thread discovery must not quarantine an intact
+    // instance. A streaming capture can reference a spill row that a later
+    // command rehydrates and deletes before the writer reads it; the writer's
+    // miss then describes a legitimately-gone row, not a loss. `park_orphan`
+    // revalidates against current routing, so the stale report is dropped.
+    #[test]
+    fn stale_orphan_report_after_rehydration_is_not_quarantined() {
+        let path = restart_store_path("orphan-stale-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let key = keys[0];
+        // The capture records the absence into the inbox while the instance is
+        // still spilled (as the off-thread writer would on a miss).
+        journal.orphans.inbox.record(key, OrphanKind::Resident);
+        // Before the drain, a later command rehydrates the instance (its row is
+        // consumed and the spill flag clears) — the report is now stale.
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(jobs.len(), 1, "rehydrated for activation");
+        assert!(!journal.engine.is_variables_spilled(key), "flag cleared");
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "the stale report is not parked"
+        );
+        assert!(
+            journal.incidents().is_empty(),
+            "no VariablesLost incident for an intact instance"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: a still-spilled instance whose row is only UNREADABLE (not
+    // definitively absent) must not be quarantined off a stale report either —
+    // fail closed and keep it for a later, accurate detection.
+    #[test]
+    fn unreadable_orphan_report_is_not_quarantined() {
+        let path = restart_store_path("orphan-unreadable-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let key = keys[0];
+        corrupt_row(&path, "spill", "vars", key);
+        journal.orphans.inbox.record(key, OrphanKind::Resident);
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "an unreadable row is not a definitive absence"
+        );
+        assert!(journal.incidents().is_empty(), "no incident");
+        assert!(journal.engine.is_variables_spilled(key), "still spilled");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: the orphan repair rehydrates WITHOUT an event, so the dirty
+    // tracker never fires for it. Unless the surviving map is marked dirty, a
+    // lean checkpoint omits the replacement and a restart reloads the discarded
+    // store payload.
+    #[test]
+    fn orphan_repair_marks_the_surviving_variables_dirty() {
+        let path = restart_store_path("orphan-dirty-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        // Lean mode: authoritative var store + dirty tracking.
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
+        journal.set_varstore(varstore);
+        let key = keys[0];
+        // Drain the seed dirty mark so the repair is the only thing that can
+        // re-mark the instance.
+        let _ = journal.engine.drain_dirty_vars();
+        assert!(
+            journal.engine.is_variables_spilled(key),
+            "precondition: spilled"
+        );
+
+        let command = stamped_quarantine(&journal, key, OrphanKind::Resident);
+        let (_events, commit) = journal.apply_command_at(command, 42).unwrap();
+        commit.blocking_wait();
+        assert!(!journal.engine.is_variables_spilled(key), "repaired");
+
+        let (upserts, _) = journal.engine.drain_dirty_vars();
+        assert!(
+            upserts.iter().any(|(k, _)| *k == key),
+            "the repaired instance's surviving variables are marked dirty for the \
+             next lean checkpoint"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // #1447 review: the Raft snapshot builder streams off-thread from the

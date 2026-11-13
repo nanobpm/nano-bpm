@@ -515,6 +515,21 @@ impl Engine {
         }
     }
 
+    /// Marks `key`'s variables dirty so the next
+    /// [`drain_dirty_vars`](Engine::drain_dirty_vars) checkpoint writes its
+    /// current map to the durable store. Needed by a host-side repair that
+    /// rehydrates WITHOUT an event (so the dirty tracker never fires): e.g. the
+    /// stamped-orphan repair (#1447) clears the spill flag and keeps the
+    /// surviving resident map, and unless that map is marked dirty a lean
+    /// checkpoint omits it and a restart reloads the discarded store payload
+    /// (#1574 review). No-op when tracking is off or the instance is gone.
+    pub fn mark_variables_dirty(&mut self, key: Key) {
+        if self.track_dirty_vars && self.state.instances.contains_key(&key) {
+            self.dirty_vars.insert(key);
+            self.forgotten_vars.remove(&key);
+        }
+    }
+
     /// The merged, scope-resolved variable view an activated job on
     /// `element_instance_key` should carry: the element's own scope plus every
     /// ancestor scope up to the (now-resident) root, nearer scopes shadowing
