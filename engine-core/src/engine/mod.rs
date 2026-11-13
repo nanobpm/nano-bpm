@@ -306,6 +306,16 @@ enum JoinKind {
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
+    /// Fire the **interrupting** event sub-process `esp_element_id` hosted by
+    /// scope `scope` (`0` = the process root) — queued by an escalation throw
+    /// caught by an interrupting escalation event sub-process (#1555), so the
+    /// interrupt runs once the throw's own completion is applied. Handled in
+    /// the drain loop (it needs the queue to purge host-scope work).
+    TriggerEventSubProcess {
+        instance_key: Key,
+        scope: Key,
+        esp_element_id: String,
+    },
     /// Run an element through `ACTIVATING -> ACTIVATED` (and decide what comes
     /// next based on its kind).
     Activate {
@@ -3275,16 +3285,45 @@ impl Engine {
                     },
                 );
 
-                match self.find_catching_error_boundary(
+                match self.find_error_catch(
                     instance_key,
                     &task_element_id,
                     element_instance_key,
                     &error_code,
                 ) {
+                    // Caught by an error event sub-process (#1555): always
+                    // interrupting — its host scope's other work (the throwing
+                    // task included) is torn down and the event sub-process
+                    // runs alone in it. The error's variables are seeded at the
+                    // host scope, like a boundary catch seeds its scope.
+                    Some(boundary::ThrowCatch::EventSubProcess {
+                        scope_eik, esp_id, ..
+                    }) => {
+                        self.trigger_event_subprocess(
+                            &mut log,
+                            &mut queue,
+                            instance_key,
+                            scope_eik,
+                            esp_id,
+                            true,
+                        );
+                        if !variables.is_empty() {
+                            for event in
+                                self.propagated_updates(instance_key, scope_eik, variables, true)
+                            {
+                                self.emit(&mut log, event);
+                            }
+                        }
+                    }
                     // Caught: interrupt the catching activity (the throwing task
                     // itself, or an enclosing sub-process) and run the boundary
                     // event's error-handling path.
-                    Some((boundary_id, caught_eik, caught_element_id)) => {
+                    Some(boundary::ThrowCatch::Boundary {
+                        boundary_id,
+                        caught_eik,
+                        caught_element_id,
+                        ..
+                    }) => {
                         // Capture the catching activity's scope before completing
                         // it (completion clears its scope entry); the boundary
                         // event runs in that same scope.
@@ -3322,6 +3361,18 @@ impl Engine {
                         }
                         for event in self.resolve_incidents_on(instance_key, caught_eik) {
                             self.emit(&mut log, event);
+                        }
+                        // A boundary caught at a multi-instance BODY: clear the
+                        // body's active-child record too (only
+                        // `MultiInstanceCompleted` does), or the loop hangs.
+                        if self.is_multi_instance_body(instance_key, caught_eik) {
+                            self.emit(
+                                &mut log,
+                                Event::MultiInstanceCompleted {
+                                    instance_key,
+                                    body_key: caught_eik,
+                                },
+                            );
                         }
                         self.emit(
                             &mut log,
@@ -5487,6 +5538,29 @@ impl Engine {
                     }
                     continue;
                 }
+                if let Step::TriggerEventSubProcess {
+                    instance_key,
+                    scope,
+                    ref esp_element_id,
+                } = step
+                {
+                    let emitted_from = log.len();
+                    if !self.step_targets_dead_scope(&step) {
+                        let esp_element_id = esp_element_id.clone();
+                        self.trigger_event_subprocess(
+                            log,
+                            &mut queue,
+                            instance_key,
+                            scope,
+                            esp_element_id,
+                            true,
+                        );
+                    }
+                    if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
                 let (events, followups) = self.process_step(step, &queue);
                 let emitted_from = log.len();
                 for event in events {
@@ -5607,6 +5681,13 @@ impl Engine {
     /// other queued step runs; a join guard evaluated in between therefore sees
     /// the same live paths as Zeebe's (#1244).
     fn completes_inline(&self, step: &Step) -> bool {
+        // An interrupting event sub-process queued by a throw fires right
+        // after the throw's completion is applied, before any sibling step
+        // (#1555): a parallel sibling throw must not complete first and
+        // purge this handler's activation.
+        if matches!(step, Step::TriggerEventSubProcess { .. }) {
+            return true;
+        }
         let Step::Complete {
             instance_key,
             element_id,
@@ -6359,6 +6440,11 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::TriggerEventSubProcess {
+                instance_key,
+                scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
@@ -6899,6 +6985,10 @@ impl Engine {
             } => {
                 debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
                 self.activate(instance_key, element_id, scope, None, pending)
+            }
+            Step::TriggerEventSubProcess { .. } => {
+                debug_assert!(false, "TriggerEventSubProcess is dispatched by run_with");
+                (Vec::new(), Vec::new())
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -12845,7 +12935,8 @@ impl Engine {
     ///
     /// The catch is resolved by propagating up the enclosing sub-process scopes
     /// from the throw's `scope`, preferring an exact escalation-code match over a
-    /// catch-all (see [`find_catching_escalation_boundary`](Self::find_catching_escalation_boundary)).
+    /// catch-all, and an escalation event sub-process hosted by a scope over a
+    /// boundary attached to it (see [`find_escalation_catch`](Self::find_escalation_catch)).
     fn raise_escalation_from_throw(
         &mut self,
         instance_key: Key,
@@ -12856,7 +12947,47 @@ impl Engine {
         mut events: Vec<Event>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut followups = Vec::new();
-        let caught = self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
+        let caught = match self.find_escalation_catch(instance_key, scope, &escalation_code) {
+            // Caught by an escalation event sub-process (#1555).
+            Some(boundary::ThrowCatch::EventSubProcess {
+                scope_eik,
+                esp_id,
+                interrupting,
+            }) => {
+                if interrupting {
+                    // The throw's flow is NOT taken. The interrupt runs as a
+                    // queued step, after this throw's completion is applied, so
+                    // the teardown sees exactly the scope's other work.
+                    followups.push(Step::TriggerEventSubProcess {
+                        instance_key,
+                        scope: scope_eik,
+                        esp_element_id: esp_id,
+                    });
+                } else {
+                    // Non-interrupting: the throw continues and the event
+                    // sub-process runs concurrently in its host scope.
+                    for (taken, step) in self.take_all_flows(instance_key, &throw_element_id, scope)
+                    {
+                        events.extend(taken);
+                        followups.push(step);
+                    }
+                    followups.push(Step::Activate {
+                        instance_key,
+                        element_id: esp_id,
+                        scope: scope_eik,
+                        via: None,
+                    });
+                }
+                return (events, followups);
+            }
+            Some(boundary::ThrowCatch::Boundary {
+                boundary_id,
+                caught_eik,
+                caught_element_id,
+                interrupting,
+            }) => Some((boundary_id, caught_eik, caught_element_id, interrupting)),
+            None => None,
+        };
         // Build the throw's outgoing flows up front (owned) so routing does not
         // hold an immutable borrow of `self` across the teardown mutation.
         let outgoing_flows = self.take_all_flows(instance_key, &throw_element_id, scope);

@@ -12,6 +12,7 @@ mod adhoc;
 mod boundary;
 mod call_activity;
 mod compensation_escalation;
+mod esp_error_escalation;
 mod event_subprocess;
 mod execution_order;
 mod expression_failures;
