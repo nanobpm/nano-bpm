@@ -28,9 +28,10 @@
 //! upward, exactly like a boundary event's payload.
 //!
 //! Error and escalation triggers are **not** armed here: they are not
-//! subscriptions but are caught by throw-resolution (see the
-//! `esp-error-escalation` slice). [`Engine::arm_event_subprocesses`] skips
-//! them explicitly — that match arm is the hook.
+//! subscriptions but are caught by throw-resolution — the single
+//! `resolve_throw_catch` walk in `boundary.rs` (Zeebe `CatchEventAnalyzer`
+//! parity), which weighs a scope's hosted event sub-processes against the
+//! boundary events attached to it.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -173,10 +174,9 @@ impl Engine {
                         kind,
                     });
                 }
-                // HOOK (esp-error-escalation slice): error and escalation event
-                // sub-processes arm no subscription — they are caught when an
-                // error / escalation is thrown inside the scope, by the
-                // throw-resolution path, not by a runtime trigger.
+                // Error and escalation event sub-processes arm no subscription —
+                // they are caught when an error / escalation is thrown inside
+                // the scope, by `resolve_throw_catch` (boundary.rs).
                 EventSubProcessTrigger::Error { .. }
                 | EventSubProcessTrigger::Escalation { .. } => {}
             }
