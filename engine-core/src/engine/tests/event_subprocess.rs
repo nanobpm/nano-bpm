@@ -1740,3 +1740,42 @@ fn start_event_activation_expressions_see_the_local_payload() {
     assert_eq!(writes_of(&events, "mapped"), vec![Value::Int(42)]);
     assert_eq!(engine.variables(inst).get("listenerType"), None);
 }
+
+#[test]
+fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_ends() {
+    // Review r4562643140: the held start payload must not outlive its event
+    // sub-process container — neither across repeated non-interrupting runs
+    // (normal completion) nor on instance termination.
+    for completed_via_listener in [false, true] {
+        let mut engine = Engine::new();
+        let listener = r#"<zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="esp-gate" />
+               </zeebe:executionListeners>"#;
+        let ext = if completed_via_listener { listener } else { "" };
+        let (inst, _) = start_xml(&mut engine, &esp_payload_xml(false, false, ext, ""));
+        for n in 0..3 {
+            engine
+                .apply_command(Command::CorrelateMessage {
+                    message_name: "m".into(),
+                    correlation_key: "7".into(),
+                    variables: vars(&[("payload", Value::Int(n))]),
+                    business_id: None,
+                })
+                .unwrap();
+        }
+        let held = engine.state.instances[&inst].esp_held_payloads.len();
+        if completed_via_listener {
+            // Containers still parked on their listener legitimately hold.
+            assert!(held > 0, "listener-deferred starts hold their payload");
+            engine
+                .apply_command(Command::CancelInstance { instance_key: inst })
+                .unwrap();
+            assert!(
+                engine.state.instances[&inst].esp_held_payloads.is_empty(),
+                "termination clears held payloads"
+            );
+        } else {
+            assert_eq!(held, 0, "completed ESP runs leave no held payload");
+        }
+    }
+}

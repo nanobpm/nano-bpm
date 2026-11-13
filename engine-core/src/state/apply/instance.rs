@@ -301,6 +301,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
+                instance.esp_held_payloads.clear();
                 // A terminal instance's variables are never read from hot state
                 // again — workers are done, the exporter projects from events,
                 // and recovery replays the journal + durable store. Drop the
@@ -580,6 +581,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
+                instance.esp_held_payloads.clear();
                 // Drop the variable payload on the terminal transition — see
                 // `ProcessInstanceCompleted` above (ADR 0012).
                 if !instance.variables.is_empty() {
