@@ -516,6 +516,17 @@ impl Engine {
                 );
                 let checked = if created.insert(path.clone()) {
                     self.check_boundary_arming(instance_key, scope_id, &host_vars)
+                        .and_then(|()| {
+                            // The created scope's event sub-processes (#1555) arm
+                            // against the same parent-scope view its boundaries do;
+                            // a failing trigger expression rejects the command here,
+                            // exactly like a boundary's.
+                            self.check_event_subprocess_arming(
+                                instance_key,
+                                Some(scope_id),
+                                &host_vars,
+                            )
+                        })
                 } else {
                     Ok(())
                 };
@@ -623,6 +634,29 @@ impl Engine {
                 // fail here. Never drop a failure silently: should it happen
                 // anyway, surface it as an incident on the created scope.
                 match self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    Ok(armed) => {
+                        for event in armed {
+                            self.emit(log, event);
+                        }
+                    }
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            key,
+                            scope_id.clone(),
+                            failure,
+                            None,
+                        );
+                        self.emit(log, event);
+                    }
+                }
+                // The created scope's event sub-processes (#1555) arm here too —
+                // this path bypasses the activation body where arming otherwise
+                // lives. Validated by `plan_modification`
+                // (`check_event_subprocess_arming`) against the same view, so a
+                // failure is likewise surfaced as an incident on the scope.
+                let esp_vars = self.variables_for_element(instance_key, parent);
+                match self.arm_event_subprocesses(instance_key, key, Some(&scope_id), &esp_vars) {
                     Ok(armed) => {
                         for event in armed {
                             self.emit(log, event);

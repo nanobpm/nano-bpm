@@ -5511,6 +5511,17 @@ impl Engine {
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
             let drain_from = log.len();
+            // A sweep pass that completed a scope while enqueueing no follow-up
+            // (a drained event sub-process has no outgoing flow, #1555) may have
+            // drained the ENCLOSING scope — but its output mappings may also
+            // satisfy a conditional trigger armed on that enclosing scope. The
+            // re-sweep must therefore go through the conditional re-evaluation
+            // below first (never recurse inside the sweep: that would complete
+            // the freshly-drained host and disarm the trigger before it can
+            // fire, r4557686184). Carried across the re-evaluation, which does
+            // not clear it: a fire enqueues work, and the sweep re-runs once
+            // that work drains.
+            let mut needs_resweep = false;
             // Re-evaluate any conditional-event subscriptions whose condition may
             // now hold: those opened, or whose referenced variables changed, since
             // the last pass. A satisfied condition fires (advancing a catch token,
@@ -5532,6 +5543,10 @@ impl Engine {
                 // The sweep's own events (a completed scope's output mappings)
                 // may satisfy a conditional: loop to re-evaluate them.
                 swept = log.len() > sweep_from;
+                // A pass that completed something with no follow-up work left a
+                // possibly-drained enclosing scope behind; re-sweep on the next
+                // pass, after the conditional re-evaluation above.
+                needs_resweep = swept && queue.is_empty();
             }
             // Consult the driver on the events the drain sweep itself emitted
             // (a sub-process's own `ElementCompleted`, a conditional/boundary
@@ -5546,7 +5561,7 @@ impl Engine {
                     return Some(Paused { queue, cursor });
                 }
             }
-            if !queue.is_empty() || swept {
+            if !queue.is_empty() || swept || needs_resweep {
                 continue;
             }
             // Token quiescence. Complete any instance whose tokens have all
@@ -6045,8 +6060,6 @@ impl Engine {
             }
         }
         drained.sort();
-        let sweep_from = log.len();
-        let drained_keys: HashSet<Key> = drained.iter().map(|(_, eik, _)| *eik).collect();
 
         let mut followups = Vec::new();
         for (instance_key, eik, element_id) in drained {
@@ -6296,19 +6309,6 @@ impl Engine {
                 }
                 followups.push(step);
             }
-        }
-        // A drained scope with no outgoing flow (an event sub-process, #1555)
-        // completes without enqueueing a follow-up, so the caller's fixpoint
-        // loop would not re-sweep — yet its completion may have drained the
-        // enclosing scope. Re-sweep while this pass completed something and
-        // produced no follow-up work (each pass retires at least one element,
-        // so this terminates).
-        let completed_any = log[sweep_from..].iter().any(|e| {
-            matches!(e, Event::ElementCompleted { element_instance_key, .. }
-                if drained_keys.contains(element_instance_key))
-        });
-        if followups.is_empty() && completed_any {
-            return self.complete_drained_subprocesses(log);
         }
         followups
     }
@@ -10619,6 +10619,30 @@ impl Engine {
                         );
                     }
                 }
+                // The tool's scope opens here — bypassing the activation body —
+                // so arm the event sub-processes its body contains (#1555)
+                // against the tool's post-input view, exactly like a normally
+                // activated sub-process. A trigger expression failure is the
+                // same clean-retry incident as a boundary's above.
+                match self.arm_event_subprocesses(
+                    instance_key,
+                    child_key,
+                    Some(&element_id),
+                    &child_vars,
+                ) {
+                    Ok(armed) => events.extend(armed),
+                    Err(failure) => {
+                        return self.adhoc_tool_incident(
+                            instance_key,
+                            container_key,
+                            container_element_id,
+                            element_id,
+                            redrive_seed,
+                            failure,
+                            key_mark,
+                        );
+                    }
+                }
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -10980,6 +11004,11 @@ impl Engine {
                 element_id: tool_element_id.clone(),
             },
         ];
+        // An embedded-subProcess tool's scope opened on activation (arming its
+        // event sub-processes, #1555); completing the tool disarms them, exactly
+        // like a drained sub-process's sweep does. Emitted before the scope's
+        // `ElementCompleted` applies (events are batched, state read live).
+        events.extend(self.disarm_event_subprocess_events(instance_key, child_eik));
         events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
         events.push(Event::AdHocToolCompleted {
             instance_key,
@@ -11187,6 +11216,10 @@ impl Engine {
                 element_id: tool_element_id.clone(),
             },
         ];
+        // An embedded-subProcess tool's event sub-processes (#1555) disarm as
+        // its scope completes, exactly like the leaf path in
+        // `complete_adhoc_tool`.
+        events.extend(self.disarm_event_subprocess_events(instance_key, child_eik));
         // Tear down the tool's dedicated inner-instance wrapper (only when its id
         // resolves — see `adhoc_inner_instance_teardown`).
         events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));

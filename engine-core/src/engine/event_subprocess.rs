@@ -184,6 +184,28 @@ impl Engine {
         Ok(events)
     }
 
+    /// Dry-runs the arming of the event sub-processes contained in scope
+    /// element `scope_element` (`None` = the process root) against `vars`
+    /// WITHOUT emitting anything (minted keys are rewound): the first
+    /// expression failure, if any. The ESP analogue of
+    /// [`Engine::check_boundary_arming`](super::Engine), so an all-or-nothing
+    /// command (process-instance modification) rejects up front exactly when
+    /// arming would fail — through the single arming implementation, not a
+    /// parallel validator (#1398).
+    pub(super) fn check_event_subprocess_arming(
+        &mut self,
+        instance_key: Key,
+        scope_element: Option<&str>,
+        vars: &HashMap<String, Value>,
+    ) -> Result<(), expression::Failure> {
+        let mark = self.next_local;
+        let result = self
+            .arm_event_subprocesses(instance_key, 0, scope_element, vars)
+            .map(|_| ());
+        self.next_local = mark;
+        result
+    }
+
     /// The events disarming every still-armed event sub-process trigger on the
     /// scope `scope_eik` of `instance_key` (sorted by key within each family).
     /// Emitted when the scope completes or terminates, and by an interrupting

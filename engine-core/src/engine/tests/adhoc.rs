@@ -2222,6 +2222,140 @@ fn adhoc_subprocess_tool_body_routes_through_a_gateway_before_completing() {
 }
 
 #[test]
+fn adhoc_subprocess_tool_arms_and_disarms_its_event_subprocesses() {
+    // Review advisory (round 3): an embedded-subProcess ad-hoc tool activates
+    // through `activate_adhoc_tool`, bypassing the activation body where event
+    // sub-processes are otherwise armed — so an ESP inside the tool's body
+    // must be armed there, and disarmed when the tool completes.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:subProcess id="review">
+              <bpmn:startEvent id="r_s" />
+              <bpmn:userTask id="ask">
+                <bpmn:extensionElements>
+                  <zeebe:assignmentDefinition assignee="alice" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="r_e" />
+              <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="ask" />
+              <bpmn:sequenceFlow id="rf2" sourceRef="ask" targetRef="r_e" />
+              <bpmn:subProcess id="esp" triggeredByEvent="true">
+                <bpmn:startEvent id="esp_s" isInterrupting="false">
+                  <bpmn:signalEventDefinition signalRef="Sig" />
+                </bpmn:startEvent>
+                <bpmn:serviceTask id="esp_w">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="esp-work" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:endEvent id="esp_e" />
+                <bpmn:sequenceFlow id="esf1" sourceRef="esp_s" targetRef="esp_w" />
+                <bpmn:sequenceFlow id="esf2" sourceRef="esp_w" targetRef="esp_e" />
+              </bpmn:subProcess>
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:signal id="Sig" name="tool-signal" />
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let _inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+
+    // The ESP is not armed before its host (the tool's subProcess) exists.
+    assert!(
+        engine.state().signal_subscriptions.is_empty(),
+        "no ESP trigger armed before the tool is activated"
+    );
+
+    // Turn 1: activate the embedded subProcess tool. Its scope opens here —
+    // bypassing the activation body — so this is where its ESP must arm.
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let ask_task = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the tool body runs (#872)");
+    assert_eq!(
+        engine.state().signal_subscriptions.len(),
+        1,
+        "activating the subProcess tool arms its event sub-process: \
+         {:?}",
+        engine.state().signal_subscriptions
+    );
+
+    // The armed trigger fires inside the tool's scope. A non-interrupting ESP
+    // trigger STAYS armed after firing (it can fire again), so the signal
+    // subscription remains open alongside the running `esp-work` job.
+    engine
+        .apply_command(Command::BroadcastSignal {
+            signal_name: "tool-signal".into(),
+            variables: HashMap::new(),
+        })
+        .unwrap();
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "esp-work"),
+        "the tool's event sub-process fired on the signal"
+    );
+
+    // Complete the tool body fully — the human task AND the ESP's job — so the
+    // tool drains and completes, disarming its (still-armed, non-interrupting)
+    // ESP trigger.
+    engine
+        .apply_command(Command::complete_user_task_with(ask_task, HashMap::new()))
+        .unwrap();
+    complete_one(&mut engine, "esp-work");
+    assert!(
+        engine
+            .state()
+            .signal_subscriptions
+            .values()
+            .all(|s| s.state != crate::state::MessageSubscriptionState::Open),
+        "completing the subProcess tool disarms its event sub-process: \
+         {:?}",
+        engine.state().signal_subscriptions
+    );
+}
+
+#[test]
 fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
     // Defect-class guard (#872): cancelling the container while an embedded
     // subProcess tool's body is mid-flight (an open human task inside it) must

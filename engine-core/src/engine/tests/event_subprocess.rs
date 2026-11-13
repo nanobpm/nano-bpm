@@ -1132,3 +1132,187 @@ fn migrating_an_instance_with_armed_event_subprocess_triggers_is_rejected() {
         assert_eq!(armed(&engine, inst), 1, "{t:?}: nothing changed");
     }
 }
+#[test]
+fn esp_output_satisfying_a_sibling_condition_fires_before_the_host_drains() {
+    // Review r4557686184: a non-interrupting ESP whose completion output
+    // satisfies a SIBLING conditional trigger must not let the drain sweep
+    // complete the (now childless) host before `reevaluate_conditionals` runs
+    // — the recursive re-sweep did exactly that, disarming the sibling before
+    // it could fire.
+    //
+    // `s -> sub[ sub_s -> hold(holdwork) -> sub_e ] -> e` with two ESPs inside
+    // `sub`: `esp_msg` (non-interrupting message) whose output mapping sets
+    // `flag := true`, and `esp_cond` (conditional `=flag`) whose body parks on
+    // the `condwork` job. The host's own flow parks on the `holdwork` job, so
+    // `sub` is alive when the message fires. Completing the ESP's job drains
+    // `esp_msg` and writes `flag = true`; the conditional must fire before
+    // the drained-ESP sweep can complete the host and disarm it. The
+    // `condwork` job makes the fire observable: were the trigger disarmed
+    // first, no `condwork` job would ever exist.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .end_event("e")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("hold", "holdwork")
+        .end_event("sub_e")
+        .connect("s", "sub")
+        .connect("sub_s", "hold")
+        .connect("hold", "sub_e")
+        .connect("sub", "e")
+        .contained_in("sub_s", "sub")
+        .contained_in("hold", "sub")
+        .contained_in("sub_e", "sub")
+        .event_sub_process("esp_msg", "esp_msg_start", msg(), false)
+        .start_event("esp_msg_start")
+        .service_task("esp_msg_work", "espwork")
+        .end_event("esp_msg_end")
+        .connect("esp_msg_start", "esp_msg_work")
+        .connect("esp_msg_work", "esp_msg_end")
+        .with_io(
+            "esp_msg",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=true".to_string(),
+                    target: "flag".to_string(),
+                }],
+            },
+        )
+        .contained_in("esp_msg_start", "esp_msg")
+        .contained_in("esp_msg_work", "esp_msg")
+        .contained_in("esp_msg_end", "esp_msg")
+        .contained_in("esp_msg", "sub")
+        .event_sub_process("esp_cond", "esp_cond_start", cond(), false)
+        .start_event("esp_cond_start")
+        .service_task("esp_cond_work", "condwork")
+        .end_event("esp_cond_end")
+        .connect("esp_cond_start", "esp_cond_work")
+        .connect("esp_cond_work", "esp_cond_end")
+        .contained_in("esp_cond_start", "esp_cond")
+        .contained_in("esp_cond_work", "esp_cond")
+        .contained_in("esp_cond_end", "esp_cond")
+        .contained_in("esp_cond", "sub")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    // Fire the message ESP; its body parks on the `espwork` job while the
+    // host's own token rests on `holdwork`.
+    engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "7".into(),
+            variables: HashMap::new(),
+            business_id: None,
+        })
+        .unwrap();
+    // Complete the HOST's own job first: the host then has no flow-flow child
+    // left and stays alive only because `esp_msg` is still running. Draining
+    // the ESP next leaves the host genuinely childless — the exact shape whose
+    // recursive re-sweep completed the host and disarmed the sibling
+    // conditional before `reevaluate_conditionals` could fire it.
+    complete_one(&mut engine, "holdwork");
+    // Completing the ESP's job drains `esp_msg`: its output mapping sets
+    // `flag = true` on `sub`, which satisfies the sibling conditional.
+    complete_one(&mut engine, "espwork");
+    assert_eq!(
+        job_count(&mut engine, "condwork"),
+        1,
+        "the sibling conditional ESP fired on the drained ESP's output, before \
+         the host's drain sweep could disarm it"
+    );
+    // Drain the rest: the conditional ESP's job completes the host.
+    complete_one(&mut engine, "condwork");
+    assert!(
+        engine.is_completed(inst),
+        "both ESPs and the host drain; the instance completes"
+    );
+}
+
+#[test]
+fn modify_created_flow_scope_arms_its_event_subprocesses() {
+    // Review r4557686184's sibling (the "previously missed" advisory): a flow
+    // scope created implicitly by `ModifyInstance` (Zeebe
+    // `shouldCreateEventSubscriptionsWhenActivatingElementsInsideNonExistingFlowScopes`)
+    // must arm the event sub-processes it contains — it bypasses the
+    // activation body where arming otherwise lives.
+    //
+    // `s -> w(work) -> e`, with `sub[ sub_s -> inner(innerwork) -> sub_e ]`
+    // disconnected (reachable only by modification) and a non-interrupting
+    // message ESP inside `sub`.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("w", "work")
+        .end_event("e")
+        .connect("s", "w")
+        .connect("w", "e")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("inner", "innerwork")
+        .end_event("sub_e")
+        .connect("sub_s", "inner")
+        .connect("inner", "sub_e")
+        .contained_in("sub_s", "sub")
+        .contained_in("inner", "sub")
+        .contained_in("sub_e", "sub")
+        .event_sub_process("esp", "esp_start", msg(), false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .contained_in("esp", "sub")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def);
+    assert_eq!(armed(&engine, inst), 0, "no ESP scope is live yet");
+
+    // Activate `inner`, implicitly creating the `sub` flow scope.
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![crate::ActivateElementInstruction::new("inner")],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        1,
+        "the modify-created `sub` scope arms its event sub-process"
+    );
+
+    // The armed trigger actually fires: correlating the message starts a
+    // non-interrupting run of the ESP inside the created scope.
+    engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "7".into(),
+            variables: HashMap::new(),
+            business_id: None,
+        })
+        .unwrap();
+    assert_eq!(
+        job_count(&mut engine, "esp"),
+        1,
+        "the ESP triggered inside the modify-created scope"
+    );
+
+    // Completing the scope's work drains `sub`, disarming the (still-armed,
+    // non-interrupting) trigger.
+    complete_one(&mut engine, "esp");
+    complete_one(&mut engine, "innerwork");
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "draining the modify-created scope disarms its event sub-process"
+    );
+    complete_one(&mut engine, "work");
+    assert!(engine.is_completed(inst));
+}
