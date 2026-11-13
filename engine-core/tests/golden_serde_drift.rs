@@ -915,6 +915,13 @@ fn build_event_witnesses() -> Vec<Event> {
             outcome: nanobpmn_engine_core::JobSettlementOutcome::Failed,
             lease_token: "nano-lease:0000000000000019".to_string(),
         },
+        // The #1447 off-heap-orphan quarantine tombstone frame (additive
+        // variant, no version bump): pins its field names so a rename fails
+        // the drift guard instead of breaking replay of old journals.
+        Event::VariablesLostQuarantined {
+            instance_key: 25,
+            incident_key: 26,
+        },
     ]
 }
 
