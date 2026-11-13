@@ -28981,7 +28981,10 @@ async fn main() {
     // applies app-wide).
     if mcp::mcp_enabled() {
         app = app.merge(mcp::mcp_router(mcp_server));
-        tracing::info!("MCP gateway enabled: /mcp/cluster");
+        tracing::info!(
+            "MCP gateway enabled: {}",
+            mcp::mcp_endpoint_paths().join(", ")
+        );
     }
 
     if debug_rest_enabled() {
@@ -29870,6 +29873,9 @@ async fn main() {
         println!("  API reference  {base}/swagger");
         println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);
         println!("  Metrics        {base}/metrics");
+        for line in mcp::mcp_banner_lines(&base, mcp::mcp_enabled()) {
+            println!("{line}");
+        }
         println!();
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }

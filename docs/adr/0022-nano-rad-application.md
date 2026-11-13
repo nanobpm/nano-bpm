@@ -364,6 +364,8 @@ on-ramp binary first — but growth to a hosted cluster is a one-line change whe
   audit trail of tool activations to match Operate, or a reduced one?
 - **MCP surface**: does an Urban App only *consume* MCP tool servers, or also *expose* its own
   processes/tasks as an MCP server (making the App itself an agent tool for other systems)?
+  **Settled (2026-11-11, epic #1499): yes — Nano exposes Camunda's MCP gateway contract
+  (`/mcp/cluster`, `/mcp/processes`); any Urban-specific extras are additive over it.**
 - **SQLite vs the engine journal**: two files, or does App data ride the engine's varstore? Keep
   them separate for a clean DB-manager story, or unify for one durability model?
 - **Trigger packs vs first-party set**: which sources are core (cron/webhook/file) vs pack-only
