@@ -167,6 +167,11 @@ pub(crate) fn build_input_schema(props: &BTreeMap<String, String>) -> Value {
             // Reserved argument: never shadowed by a declared input.
             continue;
         }
+        if properties.contains_key(name) {
+            // Repeated name: the lowest-numbered group wins, so `properties`
+            // and the (JSON-Schema-unique) `required` array never diverge.
+            continue;
+        }
         let mut schema = Map::new();
         // Only JSON-Schema primitive types are advertised; an unknown type is
         // left unconstrained so clients compiling the schema never reject it.
@@ -605,6 +610,24 @@ mod tests {
         let (inst, names) = found.expect("instance and variables projected");
         assert_eq!(inst.business_id.as_deref(), Some("order-7"));
         assert!(!names.contains("businessId"), "{names:?}");
+    }
+
+    #[test]
+    fn repeated_input_name_is_declared_once_and_required_is_unique() {
+        let props: BTreeMap<String, String> = [
+            ("input_1_name", "amount"),
+            ("input_1_type", "number"),
+            ("input_1_required", "true"),
+            ("input_2_name", "amount"),
+            ("input_2_type", "string"),
+            ("input_2_required", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (format!("{TOOL_PROPERTY_PREFIX}{k}"), v.to_string()))
+        .collect();
+        let schema = build_input_schema(&props);
+        assert_eq!(schema["required"], json!(["amount"]));
+        assert_eq!(schema["properties"]["amount"]["type"], json!("number"));
     }
 
     #[test]
