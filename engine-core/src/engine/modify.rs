@@ -242,7 +242,16 @@ impl Engine {
         // selection").
         let ancestor_for = |m: &MoveInstruction, source_parent: Key| -> Option<Key> {
             match &m.ancestor_scope {
-                Anc::SourceParent => Some(source_parent).filter(|k| *k != 0),
+                // A root-level source's parent is the process root (`0`).
+                // That is an EXPLICIT selection, not "no selection": carry it
+                // as the instance key, which the flow-scope resolver treats as
+                // the root (it then creates the target's whole scope chain
+                // beneath it rather than reusing/inferring an active scope).
+                Anc::SourceParent => Some(if source_parent == 0 {
+                    instance_key
+                } else {
+                    source_parent
+                }),
                 Anc::Direct(k) => Some(*k).filter(|k| *k != 0),
                 Anc::Inferred => self.infer_ancestor_scope(
                     def,

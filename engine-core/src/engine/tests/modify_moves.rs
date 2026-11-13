@@ -570,3 +570,97 @@ fn move_of_a_multi_instance_source_moves_the_body() {
         "exactly one target token is activated for the moved body"
     );
 }
+
+/// `start -> fork -> { r(jobR), sub[ ss -> a(jobA) -> b(jobB) -> se ] } ->
+/// join -> end`: a root-level task beside an embedded sub-process.
+fn root_task_beside_sub() -> ProcessDefinition {
+    ProcessBuilder::new("root-beside-sub")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("r", "jobR")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("a", "jobA")
+        .contained_in("a", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .parallel_gateway("join")
+        .end_event("end")
+        .connect("start", "fork")
+        .connect("fork", "r")
+        .connect("fork", "sub")
+        .connect("ss", "a")
+        .connect("a", "b")
+        .connect("b", "se")
+        .connect("r", "join")
+        .connect("sub", "join")
+        .connect("join", "end")
+        .build()
+        .unwrap()
+}
+
+/// Activate a second instance of `sub` so two target scopes are active.
+fn activate_second_sub(engine: &mut Engine, inst: Key) {
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![crate::command::ActivateElementInstruction {
+                element_id: "sub".to_string(),
+                variables: HashMap::new(),
+                ancestor_element_instance_key: None,
+                variable_instructions: vec![],
+            }],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+}
+
+/// `sourceParent` of a ROOT-level source selects the process root explicitly:
+/// the nested target's missing scope chain is created beneath the root rather
+/// than reusing an already-active target scope.
+#[test]
+fn move_with_source_parent_from_root_creates_the_target_scope() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, root_task_beside_sub());
+    let existing_sub = eiks(&engine, inst, "sub");
+    assert_eq!(existing_sub.len(), 1);
+
+    let mut m = move_by_id("r", "b");
+    m.ancestor_scope = AncestorScopeInstruction::SourceParent;
+    engine.apply_command(move_cmd(inst, vec![m])).unwrap();
+
+    let subs = eiks(&engine, inst, "sub");
+    assert_eq!(subs.len(), 2, "a fresh `sub` scope is created at the root");
+    let b = eiks(&engine, inst, "b");
+    assert_eq!(b.len(), 1);
+    let b_scope = scope_of(&engine, inst, b[0]);
+    assert_ne!(b_scope, existing_sub[0], "the active scope is not reused");
+    assert!(subs.contains(&b_scope));
+}
+
+/// The default `Direct(0)` resolution rejects an ambiguous target scope (two
+/// active `sub` instances) instead of inferring the source's scope.
+#[test]
+fn move_with_default_scope_rejects_an_ambiguous_target_scope() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, root_task_beside_sub());
+    activate_second_sub(&mut engine, inst);
+    let a = eiks(&engine, inst, "a")[0];
+
+    let mut m = move_by_key(a, "b");
+    m.ancestor_scope = AncestorScopeInstruction::Direct(0);
+    assert!(engine.apply_command(move_cmd(inst, vec![m])).is_err());
+
+    // Inference, by contrast, picks the source's own scope.
+    let mut m = move_by_key(a, "b");
+    m.ancestor_scope = AncestorScopeInstruction::Inferred;
+    let a_scope = scope_of(&engine, inst, a);
+    engine.apply_command(move_cmd(inst, vec![m])).unwrap();
+    let b = eiks(&engine, inst, "b")[0];
+    assert_eq!(scope_of(&engine, inst, b), a_scope);
+}

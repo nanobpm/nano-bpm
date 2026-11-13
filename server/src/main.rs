@@ -25464,12 +25464,16 @@ fn modify_instructions_from_rest(
             }
         };
         // Spec: the default (absent) ancestor scope resembles a `direct`
-        // instruction with key `-1`, i.e. the engine's inferred default.
+        // instruction with key `-1`, i.e. the default find-or-create flow
+        // scope resolution (`Direct(0)`) — NOT source-hierarchy inference,
+        // which is reserved for an explicit `inferred` instruction (it would
+        // silently pick the source's scope where the default rejects an
+        // ambiguous target scope).
         let ancestor_scope = match &m.ancestor_scope_instruction {
-            None => AncestorScopeInstruction::Inferred,
+            None => AncestorScopeInstruction::Direct(0),
             Some(models::AncestorScopeInstruction::DirectAncestorKeyInstruction(d)) => {
                 if d.ancestor_element_instance_key.0 == "-1" {
-                    AncestorScopeInstruction::Inferred
+                    AncestorScopeInstruction::Direct(0)
                 } else {
                     AncestorScopeInstruction::Direct(parse_modification_key(
                         "ancestorElementInstanceKey",
@@ -36719,6 +36723,48 @@ mod clustered_startup_tests {
     /// (root-scope aliases — absent/empty `scopeId` or the process id — stay
     /// in `variable_instructions` for the engine to resolve), terminate by id,
     /// and move instructions.
+    /// An omitted ancestor scope and an explicit `direct`/`-1` are the
+    /// spec's default find-or-create resolution (`Direct(0)`); only an
+    /// explicit `inferred` instruction maps to source-hierarchy inference.
+    #[test]
+    fn modify_move_default_ancestor_scope_is_direct_not_inferred() {
+        use nanobpmn_engine_core::AncestorScopeInstruction;
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(serde_json::json!({
+                "moveInstructions": [
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                        "targetElementId": "b"
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "c" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "direct", "ancestorElementInstanceKey": "-1" }
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "d" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "inferred" }
+                    }
+                ]
+            }))
+            .expect("well-formed body");
+        let i = modify_instructions_from_rest(&body).expect("maps");
+        let scopes: Vec<_> = i
+            .move_instructions
+            .iter()
+            .map(|m| m.ancestor_scope.clone())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Inferred,
+            ]
+        );
+    }
+
     #[test]
     fn modify_instructions_map_full_request_shape() {
         use nanobpmn_engine_core::{AncestorScopeInstruction, MoveSource};
