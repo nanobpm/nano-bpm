@@ -64,6 +64,38 @@ pub(crate) fn mcp_enabled() -> bool {
     )
 }
 
+/// The mount paths of every MCP server, in mount order — derived from the
+/// registered [`ToolServer`]s so the banner/docs can never drift from what
+/// [`mcp_router`] actually mounts.
+pub(crate) fn mcp_endpoint_paths() -> Vec<&'static str> {
+    cluster_tools::cluster_tool_servers()
+        .into_iter()
+        .chain(processes_tools::processes_tool_servers())
+        .map(|s| s.path)
+        .collect()
+}
+
+/// The startup-banner lines advertising the MCP endpoints under `base` (e.g.
+/// `http://127.0.0.1:8080`). Empty when MCP is disabled, so the banner only
+/// mentions endpoints that are actually mounted. (c8run prints only
+/// `/mcp/cluster`; Nano prints both servers.)
+#[cfg_attr(
+    not(feature = "console"),
+    allow(
+        dead_code,
+        reason = "the startup banner is printed by console builds only"
+    )
+)]
+pub(crate) fn mcp_banner_lines(base: &str, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    mcp_endpoint_paths()
+        .into_iter()
+        .map(|path| format!("  MCP server     {base}{path}"))
+        .collect()
+}
+
 /// A named MCP tool: its advertised `tools/list` metadata plus the dispatch
 /// that executes a call. Implemented per-server (cluster tools here; process
 /// tools in slice 3).
@@ -1316,6 +1348,22 @@ mod tests {
         let result = &out["result"];
         assert_eq!(result["protocolVersion"].as_str(), Some(PROTOCOL_VERSION));
         assert_eq!(result["serverInfo"]["name"].as_str(), Some(SERVER_NAME));
+    }
+
+    /// The banner advertises BOTH MCP endpoints when enabled and neither when
+    /// disabled; the paths are the ones the router mounts.
+    #[test]
+    fn banner_lists_both_endpoints_only_when_enabled() {
+        assert_eq!(mcp_endpoint_paths(), vec!["/mcp/cluster", "/mcp/processes"]);
+        let on = mcp_banner_lines("http://127.0.0.1:8080", true);
+        assert_eq!(
+            on,
+            vec![
+                "  MCP server     http://127.0.0.1:8080/mcp/cluster".to_string(),
+                "  MCP server     http://127.0.0.1:8080/mcp/processes".to_string(),
+            ]
+        );
+        assert!(mcp_banner_lines("http://127.0.0.1:8080", false).is_empty());
     }
 
     /// The MCP endpoint is on by default; only an explicit falsy

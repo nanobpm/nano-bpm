@@ -267,6 +267,7 @@ The most common settings:
 | `NANOBPMN_DATA_DIR=<dir>` | Durable data directory (event log + read model). **Without it, the server runs fully in-memory and loses everything on exit.** Set it for anything you want to keep. |
 | `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your projects and workers (default `./nanobpm-workspace`; projects live under `<workspace>/projects/` by default, unless `NANOBPMN_PROJECTS_DIR` moves them). Survives deletion of the engine data dir. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Advanced: override the projects root directly (default `<workspace>/projects`). |
+| `NANOBPM_MCP_ENABLED=false` | Turn off the MCP gateway (`/mcp/cluster`, `/mcp/processes`; on by default — see [Use the MCP gateway](#use-the-mcp-gateway)). |
 | `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency). Leave off in production. |
 
 The clustering and tuning variables are covered in
@@ -492,6 +493,48 @@ subscribes to the pushed Falcon stream. Against stock Camunda the same
 client stays on plain REST. Toggle with `CAMUNDA_FALCON=off` to force
 REST against a Nano server.
 
+
+## Use the MCP gateway
+
+Nano serves Camunda's **MCP (Model Context Protocol) gateway** contract, so an
+AI agent or MCP client configured for Camunda's `/mcp/cluster` and
+`/mcp/processes` endpoints works against Nano unchanged. Both are stateless
+**streamable-HTTP** MCP servers (JSON-RPC 2.0 over HTTP POST, protocol revision
+`2025-03-26`) served on the REST API port, under the same auth as `/v2`.
+
+| Endpoint | Tools |
+|----------|-------|
+| `/mcp/cluster` | Camunda's 18 static cluster tools: `getClusterStatus`, `getTopology`, `getIncident`, `resolveIncident`, `searchIncidents`, `getProcessDefinition`, `getProcessDefinitionXml`, `searchProcessDefinitions`, `createProcessInstance`, `getProcessInstance`, `searchProcessInstances`, `assignUserTask`, `completeUserTask`, `getUserTask`, `searchUserTaskVariables`, `searchUserTasks`, `getVariable`, `searchVariables`. |
+| `/mcp/processes` | One tool per deployed process whose message start event carries `io.camunda.tool:*` `zeebe:properties` (named `<toolName>_<subscriptionKey>`; description and input schema come from those properties; a call starts an instance and returns `{processInstanceKey}`), plus `searchIncidents`, `getProcessInstance`, and `searchVariables`. |
+
+Every tool dispatches through the same handler as the matching REST operation,
+and a failed call returns an MCP result with `isError: true` and a
+ProblemDetail payload.
+
+**Enabling it.** MCP is **on by default** — both on a plain gateway and in the
+quick-start distribution — matching what c8run ships (Camunda's own gateway
+defaults `camunda.mcp.enabled` to false). One switch covers both servers:
+
+```bash
+NANOBPM_MCP_ENABLED=false ./nanobpm-gateway-rest-server   # turn both MCP servers off
+```
+
+When MCP is on, the startup banner lists both endpoints. Note that an
+unauthenticated node exposes MCP exactly as it exposes `/v2`; configure auth
+before exposing the port. Camunda's `/physical-tenants/{id}/mcp/*` paths are not
+served — Nano has no physical tenants.
+
+**Example client config** (any MCP client that speaks streamable HTTP, e.g. an
+`mcp.json` / `claude_desktop_config.json`-style entry):
+
+```json
+{
+  "mcpServers": {
+    "nano-cluster":   { "type": "http", "url": "http://localhost:8080/mcp/cluster" },
+    "nano-processes": { "type": "http", "url": "http://localhost:8080/mcp/processes" }
+  }
+}
+```
 
 ## Deploy processes and run instances
 
