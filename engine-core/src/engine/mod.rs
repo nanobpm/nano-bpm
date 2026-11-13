@@ -5515,29 +5515,33 @@ impl Engine {
                 // mint a second incident (#1574 review).
                 //
                 // A duplicate (the guard already holds this loss episode) is a
-                // COMPLETE no-op (#1574 review): it must NOT re-emit the repair
-                // event. A re-emitted repair would re-install the ORIGINAL
-                // quarantine's canonical payload over any replacement variables
-                // spilled since, and the host's `repair_orphan_reference` would
-                // forget the NEW spill/cold row — erasing the replacement. So the
-                // repair event rides only the FIRST quarantine of an episode.
-                if self.has_active_variables_lost(instance_key) {
+                // complete no-op.
+                //
+                // The guard reads ONLY the replicated tombstone, never the hot
+                // incident map: the latter is residency-dependent (a cold-tiered
+                // replica has drained it), so it would split replicas.
+                if self
+                    .state
+                    .variables_lost_quarantined
+                    .contains_key(&instance_key)
+                {
                     return Ok((log, queue));
                 }
-                self.emit_variables_lost(&mut log, instance_key, stamp.element_id, stamp.reason);
-                // The repair rides the replicated log (#1574 review): EVERY
-                // replica applies the identical surviving-state transition
-                // (install the leader-resolved canonical payload, clear the
-                // resident spill flag) and records the dedup tombstone —
-                // independent of what that replica found locally, and replayable
-                // so a crash/restart re-applies it instead of resurrecting the
-                // discarded store payload.
+                let incident_key = self.emit_variables_lost(
+                    &mut log,
+                    instance_key,
+                    stamp.element_id,
+                    stamp.reason,
+                );
+                // Record the replicated dedup tombstone. Deliberately NO
+                // variable install and no off-heap row cleanup (#1574): the
+                // command must be replica-deterministic, and a leader-snapshotted
+                // payload is not (it can roll back an intervening SetVariables).
                 self.emit(
                     &mut log,
                     Event::VariablesLostQuarantined {
                         instance_key,
-                        repair: true,
-                        surviving_variables: stamp.surviving_variables,
+                        incident_key,
                     },
                 );
             }
@@ -7529,7 +7533,7 @@ impl Engine {
         instance_key: Key,
         element_id: String,
         reason: String,
-    ) {
+    ) -> Key {
         let incident_key = self.mint_key();
         self.emit(
             log,
@@ -7545,6 +7549,7 @@ impl Engine {
                 created_at: self.now,
             },
         );
+        incident_key
     }
 
     /// Whether an active `VariablesLost` incident already names `instance_key`
@@ -7565,7 +7570,7 @@ impl Engine {
         if self
             .state
             .variables_lost_quarantined
-            .contains(&instance_key)
+            .contains_key(&instance_key)
         {
             return true;
         }
@@ -7606,23 +7611,10 @@ impl Engine {
             crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
             crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
         };
-        // The canonical surviving payload (#1574 review): the leader's CURRENT
-        // resident map. For a resident orphan this is the surviving map (the
-        // spill row is lost; any post-spill journal-tail updates were merged
-        // into it). For a cold orphan the instance is wholly off-heap here, so
-        // there is no resident map — the payload is empty (the whole instance
-        // is lost). Every replica installs THIS map, so they converge.
-        let surviving_variables = self
-            .state
-            .instances
-            .get(&instance_key)
-            .map(|i| i.variables.as_ref().clone())
-            .unwrap_or_default();
         Some(crate::command::OrphanIncidentStamp {
             kind,
             element_id,
             reason: reason.to_string(),
-            surviving_variables,
         })
     }
 

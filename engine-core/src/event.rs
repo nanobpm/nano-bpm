@@ -1795,36 +1795,23 @@ pub enum Event {
         original_agent_history_key: Key,
     },
 
-    /// An instance's off-heap variable payload was quarantined as lost and the
-    /// surviving state transitioned **identically on every replica** (#1574
-    /// review). Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
-    /// alongside its `IncidentRaised`, this is the replayable record of the
-    /// repair: its reducer installs the **canonical surviving payload** the
-    /// proposing leader resolved (`surviving_variables`) into the resident
-    /// instance and clears its `variables_spilled` flag, and records the
-    /// instance in [`crate::state::State::variables_lost_quarantined`], the
-    /// replicated dedup tombstone the quarantine idempotency guard reads.
-    /// Carrying the payload — rather than each replica keeping whatever resident
-    /// map it happened to hold — is what makes the post-quarantine state
-    /// converge: a replica that lost its row (empty placeholder), one that
-    /// rehydrated (original payload), and one replaying the log all install the
-    /// SAME map, so subsequent variable-dependent commands evaluate identically
-    /// (#1574 review). A crash/restart replays it instead of resurrecting the
-    /// discarded store payload. Both fields are `serde(default)` so a record
-    /// written before they existed decodes with `repair: false` and an empty
-    /// payload (the incident alone was the durable fact then).
+    /// An instance's off-heap variable payload was quarantined as lost (#1574).
+    /// Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
+    /// alongside its `IncidentRaised`, its reducer records the instance in
+    /// [`crate::state::State::variables_lost_quarantined`], the replicated
+    /// dedup tombstone the quarantine idempotency guard reads (lifted when
+    /// `incident_key` is resolved). It carries **no** variable payload
+    /// and mutates no instance state: the payload-carrying repair was dropped
+    /// because a leader-snapshotted payload is not safe under Raft ordering
+    /// (it can roll back an intervening `SetVariables`). Deterministic
+    /// apply-time repair is the #1447 follow-up.
     VariablesLostQuarantined {
         instance_key: Key,
-        /// `true` when the surviving resident-variable transition was applied.
-        /// `serde(default)` for forward/backward-compatible replay.
-        #[cfg_attr(feature = "serde", serde(default))]
-        repair: bool,
-        /// The canonical surviving variable payload, resolved by the proposing
-        /// leader (its resident map; empty when the whole instance was cold and
-        /// lost). Installed verbatim on every replica so they converge.
-        /// `serde(default)` for forward/backward-compatible replay.
-        #[cfg_attr(feature = "serde", serde(default))]
-        surviving_variables: HashMap<String, Value>,
+        /// The `VariablesLost` incident this quarantine raised: the loss
+        /// episode. Resolving exactly this incident lifts the tombstone, keyed
+        /// on the replicated `IncidentResolved.incident_key` so the lift does
+        /// not depend on whether the incident record is resident.
+        incident_key: Key,
     },
 }
 

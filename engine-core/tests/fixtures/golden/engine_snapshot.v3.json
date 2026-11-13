@@ -4231,6 +4231,6 @@
     "start_timers": {},
     "timers": {},
     "user_tasks": {},
-    "variables_lost_quarantined": []
+    "variables_lost_quarantined": {}
   }
 }

@@ -2108,8 +2108,8 @@ pub struct State {
     /// for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource_versions: HashMap<Key, DeployedResource>,
-    /// Instance keys whose off-heap variable payload was quarantined as lost
-    /// (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
+    /// Instance key → the `VariablesLost` incident key of its active loss
+    /// episode (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
     /// tombstone** (#1574 review). The `VariablesLost` incident record itself
     /// leaves hot state when its instance cold-spills
     /// ([`crate::Engine::snapshot_instance`] drains `incidents` into the cold
@@ -2122,7 +2122,7 @@ pub struct State {
     /// before it deserialize empty (such a snapshot predates the quarantine
     /// event, so there is nothing to dedup yet).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables_lost_quarantined: BTreeSet<Key>,
+    pub variables_lost_quarantined: BTreeMap<Key, Key>,
 }
 
 /// A deployed decision requirements graph together with the identity the engine

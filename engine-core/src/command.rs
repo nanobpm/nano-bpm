@@ -744,9 +744,10 @@ pub enum Command {
     /// incident metadata it resolved from ITS state — and every replica applies
     /// a stamped command identically: it unconditionally emits exactly one
     /// `IncidentRaised` carrying the stamp's metadata, whatever its local
-    /// residency. The host repairs its replica-local spill/cold reference to
-    /// the instance on the same apply. Additive `#[serde(default)]` field: a
-    /// journal written before #1447 decodes as `stamp: None` (the local form).
+    /// residency (deduped only by the replicated tombstone). It carries no
+    /// variable payload and triggers no replica-local row repair (#1574).
+    /// Additive `#[serde(default)]` field: a journal written before #1447
+    /// decodes as `stamp: None` (the local form).
     QuarantineOffheapOrphan {
         instance_key: Key,
         #[cfg_attr(
@@ -791,21 +792,13 @@ pub enum OrphanKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OrphanIncidentStamp {
-    /// The tier that lost the payload (drives the host's local repair).
+    /// The tier that lost the payload.
     pub kind: OrphanKind,
     /// The incident's `element_id` (the process id when the leader had the
     /// instance resident; empty for a cold instance whose model is lost).
     pub element_id: String,
     /// The incident's `reason`.
     pub reason: String,
-    /// The canonical surviving variable payload the leader resolved (its
-    /// resident map; empty when the whole instance was cold and lost). The
-    /// repair event installs it verbatim on every replica so they converge on
-    /// the SAME post-quarantine state (#1574 review) rather than each keeping
-    /// whatever resident map it happened to hold. `serde(default)` so a stamp
-    /// written before the field existed decodes with an empty payload.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub surviving_variables: HashMap<String, Value>,
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -1058,6 +1051,12 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // The stamp's strings are leader-resolved metadata of unbounded
+            // length (#1574 review): count them so the batcher's byte budget
+            // sees the real proposal size.
+            Command::QuarantineOffheapOrphan {
+                stamp: Some(stamp), ..
+            } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
             _ => 0,
         };
         BASE + payload
@@ -1600,6 +1599,30 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    // #1574 review: a stamped orphan quarantine carries leader-resolved strings;
+    // `approx_bytes` must count them, not treat the command as fixed-size.
+    #[test]
+    fn approx_bytes_counts_the_orphan_quarantine_stamp() {
+        let bare = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: None,
+        }
+        .approx_bytes();
+        let stamped = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: Some(OrphanIncidentStamp {
+                kind: OrphanKind::Resident,
+                element_id: "e".repeat(10_000),
+                reason: "r".repeat(20_000),
+            }),
+        }
+        .approx_bytes();
+        assert!(
+            stamped >= bare + 30_000,
+            "stamp strings must count: stamped={stamped} bare={bare}"
         );
     }
 

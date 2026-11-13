@@ -6952,15 +6952,22 @@ mod tests {
             journals.windows(2).all(|w| w[0] == w[1]),
             "identical incident journals across replicas (got {journals:?})"
         );
-        // The stamped quarantine repaired the spill reference on EVERY live
-        // replica — the orphan replica and the one whose row still existed —
-        // so their states are identical and the next snapshot is unblocked.
-        for (id, engine) in engines.iter().enumerate().skip(1) {
-            let spilled = engine
-                .with(move |j| j.engine().is_variables_spilled(instance_key))
-                .await;
-            assert!(!spilled, "replica {id} dropped its spill reference");
+        // The stamped quarantine carries no repair (#1574): it raises the
+        // incident and records the replicated tombstone identically on every
+        // live replica, and leaves each replica's off-heap reference alone.
+        let mut tombstones = Vec::new();
+        for engine in engines.iter().skip(1) {
+            tombstones.push(
+                engine
+                    .with(move |j| j.state().variables_lost_quarantined.clone())
+                    .await,
+            );
         }
+        assert!(
+            tombstones.windows(2).all(|w| w[0] == w[1])
+                && tombstones[0].contains_key(&instance_key),
+            "identical replicated tombstones (got {tombstones:?})"
+        );
 
         for (id, p) in parts.into_iter().enumerate() {
             if id == 0 {

@@ -6717,8 +6717,8 @@ fn project_event(
         | Event::UserTaskTransitionResolved { .. }
         | Event::VariableScopeCreated { .. }
         | Event::VariableScopeDestroyed { .. }
-        // Engine-internal quarantine repair record (#1574): the read model
-        // projects the companion `IncidentRaised`, not the residency transition.
+        // Engine-internal quarantine dedup tombstone (#1574): the read model
+        // projects the companion `IncidentRaised`.
         | Event::VariablesLostQuarantined { .. } => {}
     }
     Ok(delta)

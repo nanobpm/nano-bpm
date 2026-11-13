@@ -4161,8 +4161,6 @@ fn stamped_orphan_quarantine_is_residency_independent() {
             kind: OrphanKind::Resident,
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
-            // No variables were set, so the leader's surviving map is empty.
-            surviving_variables: HashMap::new(),
         }
     );
     let command = Command::QuarantineOffheapOrphan {
@@ -4201,43 +4199,24 @@ fn stamped_orphan_quarantine_is_residency_independent() {
     assert!(cold_stamp.reason.contains("cold instance row missing"));
 }
 
-// #1574 review: the `VariablesLostQuarantined` event is additive — a record
-// written before the `repair` field existed decodes with `repair: false`, and
-// the current form round-trips. Replay-compat for the persisted event frame.
+// #1574: the `VariablesLostQuarantined` event round-trips (replay-compat for
+// the persisted event frame).
 #[cfg(feature = "serde")]
 #[test]
-fn variables_lost_quarantined_is_serde_additive() {
-    let old: Event =
-        serde_json::from_str(r#"{"VariablesLostQuarantined":{"instance_key":7}}"#).unwrap();
-    assert_eq!(
-        old,
-        Event::VariablesLostQuarantined {
-            instance_key: 7,
-            repair: false,
-            surviving_variables: HashMap::new(),
-        },
-        "a record without `repair`/`surviving_variables` decodes with both defaulted"
-    );
+fn variables_lost_quarantined_round_trips() {
     let current = Event::VariablesLostQuarantined {
         instance_key: 7,
-        repair: true,
-        surviving_variables: HashMap::from([("x".to_string(), Value::Int(1))]),
+        incident_key: 9,
     };
     let json = serde_json::to_string(&current).unwrap();
-    assert_eq!(
-        serde_json::from_str::<Event>(&json).unwrap(),
-        current,
-        "the current form round-trips"
-    );
+    assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), current);
 }
 
-// #1574 review: the quarantine repair rides the replicated event log, so it
-// replays identically on a fresh engine (crash recovery / follower). The
-// reducer clears the resident spill flag and records the dedup tombstone, so a
-// replayed journal neither resurrects the discarded payload nor re-mints the
-// incident.
+// #1574: the quarantine's dedup tombstone rides the replicated event log, so it
+// replays identically on a fresh engine (crash recovery / follower) and a
+// replayed journal does not re-mint the incident.
 #[test]
-fn quarantine_repair_replays_identically() {
+fn quarantine_tombstone_replays_identically() {
     use crate::{OrphanIncidentStamp, OrphanKind};
     let def = ProcessBuilder::new("orphan")
         .start_event("start")
@@ -4269,7 +4248,6 @@ fn quarantine_repair_replays_identically() {
                         kind: OrphanKind::Resident,
                         element_id: "orphan".into(),
                         reason: "variables lost: spill row missing".into(),
-                        surviving_variables: HashMap::new(),
                     }),
                 },
                 50,
@@ -4282,7 +4260,7 @@ fn quarantine_repair_replays_identically() {
         journal
             .iter()
             .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
-        "the repair is journaled as a replayable event"
+        "the tombstone is journaled as a replayable event"
     );
 
     // Replay into a fresh engine: identical tombstone + incident, and a
@@ -4300,7 +4278,6 @@ fn quarantine_repair_replays_identically() {
                     kind: OrphanKind::Resident,
                     element_id: "orphan".into(),
                     reason: "variables lost: spill row missing".into(),
-                    surviving_variables: HashMap::new(),
                 }),
             },
             51,
@@ -4339,7 +4316,6 @@ fn quarantine_offheap_orphan_stamp_is_serde_additive() {
             kind: OrphanKind::Cold,
             element_id: String::new(),
             reason: "r".into(),
-            surviving_variables: HashMap::new(),
         }),
     };
     let json = serde_json::to_string(&stamped).unwrap();
@@ -4377,7 +4353,6 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
             kind: OrphanKind::Resident,
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
-            surviving_variables: HashMap::new(),
         }),
     };
     let first = engine.apply_command_at(mk(), 50).unwrap();
@@ -4398,24 +4373,21 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
             .all(|e| !matches!(e, Event::IncidentRaised { .. })),
         "a duplicate committed proposal mints no second incident"
     );
-    // …and is a COMPLETE no-op (#1574 review): it must NOT re-emit the repair
-    // event, or it would re-install the original canonical payload over any
-    // replacement variables spilled since (and the host would forget the new
-    // row). The first proposal emitted exactly one repair event; the duplicate
-    // emits none.
+    // …and is a COMPLETE no-op: the first proposal emitted exactly one
+    // tombstone event; the duplicate emits none.
     assert_eq!(
         first
             .iter()
             .filter(|e| matches!(e, Event::VariablesLostQuarantined { .. }))
             .count(),
         1,
-        "the first proposal emits exactly one repair event"
+        "the first proposal emits exactly one tombstone event"
     );
     assert!(
         second
             .iter()
             .all(|e| !matches!(e, Event::VariablesLostQuarantined { .. })),
-        "a duplicate proposal re-emits no repair event"
+        "a duplicate proposal re-emits no tombstone event"
     );
     assert!(
         second.is_empty(),
@@ -4454,7 +4426,6 @@ fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
             kind: OrphanKind::Resident,
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
-            surviving_variables: HashMap::new(),
         }),
     };
     let boot = || {
@@ -4518,96 +4489,6 @@ fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
     );
 }
 
-// #1574 review: the repair must converge every replica on the SAME surviving
-// payload. Before the fix the reducer only cleared the spill flag, so a replica
-// that lost its row kept an empty placeholder while a rehydrated replica kept
-// the original payload — divergent variable state from identical incidents. The
-// repair event now carries the leader-resolved canonical payload and every
-// replica installs it verbatim.
-#[test]
-fn quarantine_repair_converges_replica_payloads() {
-    use crate::OrphanKind;
-    let def = ProcessBuilder::new("orphan")
-        .start_event("start")
-        .service_task("work", "demo-work")
-        .end_event("end")
-        .connect("start", "work")
-        .connect("work", "end")
-        .build()
-        .unwrap();
-    // The leader holds the instance resident with surviving variables {x: 1}
-    // (the spill row is lost; this is the map that survives).
-    let mut leader = Engine::new();
-    leader
-        .apply_command_at(Command::DeployProcess(def.clone()), 1)
-        .unwrap();
-    let created = leader
-        .apply_command_at(Command::create_instance("orphan"), 2)
-        .unwrap();
-    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
-    leader
-        .apply_command_at(
-            Command::set_variables(key, HashMap::from([("x".into(), Value::Int(1))])),
-            3,
-        )
-        .unwrap();
-
-    // The leader resolves the canonical payload from ITS resident map.
-    let stamp = leader
-        .orphan_incident_stamp(key, OrphanKind::Resident)
-        .expect("leader stamps a live orphan");
-    assert_eq!(
-        stamp.surviving_variables.get("x"),
-        Some(&Value::Int(1)),
-        "the stamp carries the leader's surviving map"
-    );
-    let command = Command::QuarantineOffheapOrphan {
-        instance_key: key,
-        stamp: Some(stamp),
-    };
-
-    // Replica A: lost the row — its resident map is an empty placeholder.
-    let mut lost = Engine::new();
-    lost.apply_command_at(Command::DeployProcess(def.clone()), 1)
-        .unwrap();
-    lost.apply_command_at(Command::create_instance("orphan"), 2)
-        .unwrap();
-    // (no SetVariables: `lost` never saw the payload — its map is empty)
-    assert!(lost.instance(key).unwrap().variables.is_empty());
-
-    // Replica B: rehydrated — it holds the ORIGINAL payload.
-    let mut rehydrated = Engine::new();
-    rehydrated
-        .apply_command_at(Command::DeployProcess(def), 1)
-        .unwrap();
-    rehydrated
-        .apply_command_at(Command::create_instance("orphan"), 2)
-        .unwrap();
-    rehydrated
-        .apply_command_at(
-            Command::set_variables(key, HashMap::from([("x".into(), Value::Int(1))])),
-            3,
-        )
-        .unwrap();
-
-    // Both apply the SAME committed stamped command.
-    lost.apply_command_at(command.clone(), 50).unwrap();
-    rehydrated.apply_command_at(command, 50).unwrap();
-
-    // After the repair BOTH replicas hold the canonical payload {x: 1} — the
-    // previously-empty replica is repaired to it, the rehydrated replica keeps
-    // it — and neither is left spilled.
-    for (name, eng) in [("lost", &lost), ("rehydrated", &rehydrated)] {
-        let inst = eng.instance(key).unwrap();
-        assert_eq!(
-            inst.variables.get("x"),
-            Some(&Value::Int(1)),
-            "{name}: converged on the canonical surviving payload"
-        );
-        assert!(!inst.variables_spilled, "{name}: spill flag cleared");
-    }
-}
-
 // #1574 review: the dedup tombstone must be EPISODE-scoped, not lifetime. A
 // permanent tombstone makes `has_active_variables_lost` return true even after
 // the incident is resolved, so a LATER, distinct loss (operator replaced the
@@ -4639,7 +4520,6 @@ fn quarantine_dedup_is_episode_scoped_across_resolution() {
             kind: OrphanKind::Resident,
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
-            surviving_variables: HashMap::new(),
         }),
     };
 
@@ -4677,7 +4557,7 @@ fn quarantine_dedup_is_episode_scoped_across_resolution() {
         second
             .iter()
             .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
-        "the second episode repairs again (new canonical payload)"
+        "the second episode records a fresh tombstone"
     );
     let active = engine
         .incidents()
@@ -4688,4 +4568,142 @@ fn quarantine_dedup_is_episode_scoped_across_resolution() {
         })
         .count();
     assert_eq!(active, 1, "exactly one active VariablesLost incident again");
+}
+
+/// Boots one replica of the orphan fixture: deploy, create, and set `x = 1`.
+fn orphan_replica() -> (Engine, Key) {
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command_at(
+            Command::set_variables(key, HashMap::from([("x".into(), Value::Int(1))])),
+            3,
+        )
+        .unwrap();
+    (engine, key)
+}
+
+fn stamped(key: Key) -> Command {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+        }),
+    }
+}
+
+// #1574 (scope B): the stamped quarantine is replica-deterministic. Applied on a
+// replica where the instance is resident and on one where it is cold, it yields
+// identical events, tombstones, key counters and — once the cold replica
+// rehydrates — identical instance state and incidents. It carries no variable
+// payload, so it cannot touch variables on either replica.
+#[test]
+fn stamped_quarantine_converges_resident_and_cold_replicas() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    let row = cold.snapshot_instance(key).expect("cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+
+    let on_resident = resident.apply_command_at(stamped(key), 50).unwrap();
+    let on_cold = cold.apply_command_at(stamped(key), 50).unwrap();
+    assert_eq!(on_resident, on_cold, "identical events");
+    assert_eq!(
+        resident.state.variables_lost_quarantined, cold.state.variables_lost_quarantined,
+        "identical tombstones"
+    );
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
+
+    // Rehydrate the cold replica: instance state (variables untouched) and the
+    // incident set now match the resident replica exactly.
+    cold.rehydrate_instance(row);
+    let view = |e: &Engine| {
+        let inst = e.instance(key).unwrap();
+        let mut incidents: Vec<_> = e
+            .incidents()
+            .iter()
+            .map(|i| (i.key, i.instance_key, i.kind, i.state, i.reason.clone()))
+            .collect();
+        incidents.sort_by_key(|i| i.0);
+        (inst.variables.as_ref().clone(), inst.state, incidents)
+    };
+    assert_eq!(
+        view(&resident),
+        view(&cold),
+        "identical state and incidents"
+    );
+    assert_eq!(
+        view(&resident).0.get("x"),
+        Some(&Value::Int(1)),
+        "no variable rollback"
+    );
+}
+
+// #1574 (scope B): a delayed duplicate of an already-resolved quarantine is
+// harmless and replica-deterministic. With no payload it cannot overwrite
+// variables updated after the resolve; it is reported as a fresh episode
+// (exact per-episode dedup is the #1447 follow-up), identically on a resident
+// and a cold replica.
+#[test]
+fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    let run = |engine: &mut Engine, shed: bool| {
+        engine.apply_command_at(stamped(key), 50).unwrap();
+        let incident_key = engine.state.variables_lost_quarantined[&key];
+        engine
+            .apply_command_at(Command::resolve_incident(incident_key), 51)
+            .unwrap();
+        assert!(
+            !engine.state.variables_lost_quarantined.contains_key(&key),
+            "resolve lifts the tombstone"
+        );
+        engine
+            .apply_command_at(
+                Command::set_variables(key, HashMap::from([("x".into(), Value::Int(2))])),
+                52,
+            )
+            .unwrap();
+        let row = shed.then(|| engine.snapshot_instance(key).expect("cold-shed"));
+        let dup = engine.apply_command_at(stamped(key), 53).unwrap();
+        if let Some(row) = row {
+            engine.rehydrate_instance(row);
+        }
+        dup
+    };
+    let dup_resident = run(&mut resident, false);
+    let dup_cold = run(&mut cold, true);
+    assert_eq!(dup_resident, dup_cold, "identical events on both replicas");
+    assert!(dup_resident.iter().all(|e| !matches!(
+        e,
+        Event::VariablesUpdated { .. } | Event::ScopedVariablesUpdated { .. }
+    )));
+    for engine in [&resident, &cold] {
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("x"),
+            Some(&Value::Int(2)),
+            "the post-resolve SetVariables is never rolled back"
+        );
+    }
+    assert_eq!(
+        resident.state.variables_lost_quarantined,
+        cold.state.variables_lost_quarantined
+    );
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
 }

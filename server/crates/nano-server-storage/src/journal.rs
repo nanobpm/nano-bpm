@@ -167,8 +167,8 @@ enum OrphanPolicy {
 /// running under replicated (Raft) apply hands a detected off-heap orphan to
 /// the replication layer so the LEADER proposes it as a STAMPED
 /// [`Command::QuarantineOffheapOrphan`] (see [`OrphanIncidentStamp`]) — every
-/// replica then applies the identical incident and repairs its own spill/cold
-/// reference, instead of minting a replica-local incident (which diverges
+/// replica then applies the identical incident (no replica-local repair, #1574),
+/// instead of minting a replica-local incident (which diverges
 /// replicas whose spill state differs, the #1384 review finding).
 ///
 /// The hook is invoked on the single-writer engine actor thread, so it must be
@@ -1743,50 +1743,16 @@ impl Journal {
         self.drain_orphan_backlog();
     }
 
-    /// Replica-local repair on applying a STAMPED `QuarantineOffheapOrphan`
-    /// (#1447). The *engine-state* transition (clearing the resident spill flag so
-    /// the instance keeps its surviving resident map) is applied by the companion
-    /// [`Event::VariablesLostQuarantined`] reducer — identically on every replica,
-    /// whatever it found locally (#1574 review) — so this host-side pass only
-    /// settles the report and forgets the now-dead off-heap rows (spill / cold),
-    /// and marks the surviving map dirty so a lean checkpoint persists it (the
-    /// reducer's flag clear is not a variable event, so the dirty tracker never
-    /// fires for it). Without the forgets, the next snapshot fails again on the
-    /// same absent row.
-    fn repair_orphan_reference(&mut self, key: Key) {
+    /// Settles the replica-local orphan report once a STAMPED
+    /// `QuarantineOffheapOrphan` for `key` applies (#1447). Proposal bookkeeping
+    /// only: it touches no engine state and no off-heap row. The
+    /// payload-carrying repair (variable install, spill/cold row forget) was
+    /// dropped (#1574) because it was not replica-deterministic; deterministic
+    /// apply-time repair is the #1447 follow-up.
+    fn settle_orphan_report(&mut self, key: Key) {
         self.orphans.backlog.remove(&key);
         self.orphans.in_flight.remove(&key);
         self.orphans.inbox.forget(key);
-        // The event reducer already cleared the spill flag and kept the
-        // surviving resident map; that flag clear is not a variable event, so
-        // the dirty tracker never fires for it. Mark the surviving map dirty
-        // unconditionally (a no-op for a non-resident/unknown key): otherwise a
-        // lean checkpoint omits the replacement and a restart reloads the
-        // discarded store payload (#1574 review).
-        self.engine.mark_variables_dirty(key);
-        // Forget the now-dead spill row. The reducer already cleared the flag,
-        // so gate on the store being wired, not the (now-cleared) flag.
-        if self.varstore.is_none()
-            && let Some(Err(err)) = self.spill.as_ref().map(|vs| vs.store.forget(&[key]))
-        {
-            tracing::error!(
-                instance_key = key,
-                error = %err,
-                "orphan repair: dead spill row could not be forgotten (latched for retry)"
-            );
-        }
-        if let Some(cold) = self.cold.as_mut()
-            && cold.index.contains(key)
-        {
-            cold.index.remove(key);
-            if let Err(err) = cold.store.forget(&[key]) {
-                tracing::error!(
-                    instance_key = key,
-                    error = %err,
-                    "orphan repair: cold row could not be forgotten (latched for retry)"
-                );
-            }
-        }
     }
 
     pub fn set_varstore(&mut self, store: Arc<VarStore>) {
@@ -2852,9 +2818,9 @@ impl Journal {
             command,
             Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
         ) || command.routed_delivery_key().is_some();
-        // A STAMPED orphan quarantine (#1447) carries a replica-local repair:
-        // every replica drops its now-dead spill/cold reference on apply.
-        let orphan_repair = match &command {
+        // A STAMPED orphan quarantine (#1447) settles this replica's pending
+        // report for the key once it applies (dup or not).
+        let orphan_settled = match &command {
             Command::QuarantineOffheapOrphan {
                 instance_key,
                 stamp: Some(_),
@@ -2862,20 +2828,8 @@ impl Journal {
             _ => None,
         };
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
-        if let Some(key) = orphan_repair {
-            // Run the host-side repair ONLY when the engine actually emitted the
-            // repair event (#1574 review): a duplicate committed proposal is a
-            // complete no-op in the engine (the dedup tombstone already covers
-            // the episode), so it emits no `VariablesLostQuarantined`. Running
-            // the host cleanup anyway would forget the NEW spill/cold row of any
-            // replacement variables spilled since the first quarantine — erasing
-            // them. Gate on the emitted events, not the command shape.
-            let repaired = events
-                .iter()
-                .any(|e| matches!(e, Event::VariablesLostQuarantined { .. }));
-            if repaired {
-                self.repair_orphan_reference(key);
-            }
+        if let Some(key) = orphan_settled {
+            self.settle_orphan_report(key);
         }
         let mut activated: Vec<_> = events
             .iter()
@@ -7326,112 +7280,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // #1447 review: applying the STAMPED quarantine repairs the replica-local
-    // spill reference (flag cleared, surviving resident variables kept), so
-    // the next strict snapshot no longer fails on the same absent row — and it
-    // does so even on a replica whose row still exists (identical state).
-    #[test]
-    fn stamped_quarantine_repairs_the_spill_reference_so_capture_succeeds() {
-        let path = restart_store_path("orphan-repair-1447");
-        let (mut journal, keys) = spilled_journal(&path, 2);
-        journal.set_replicated_apply(true);
-        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
-        store.forget(&[keys[0]]).unwrap();
-        assert!(
-            journal.try_engine_snapshot().is_none(),
-            "precondition: blocked"
-        );
-
-        for key in &keys {
-            // keys[1] still has its row here: the stamped command applies the
-            // same repair anyway (the leader declared the payload lost).
-            let command = stamped_quarantine(&journal, *key, OrphanKind::Resident);
-            let (_events, commit) = journal.apply_command_at(command, 42).unwrap();
-            commit.blocking_wait();
-            assert!(!journal.engine.is_variables_spilled(*key), "flag cleared");
-        }
-        assert_eq!(
-            raw_row_count(&path, "spill", keys[1]),
-            0,
-            "dead row forgotten"
-        );
-        assert!(
-            journal.try_engine_snapshot().is_some(),
-            "capture succeeds once the quarantine applied"
-        );
-        drop(journal);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    // #1447: a stamped quarantine of a COLD instance drops the cold routing
-    // entry on every replica, so the cold set no longer references the row.
-    #[test]
-    fn stamped_quarantine_drops_the_cold_reference() {
-        let path = restart_store_path("orphan-repair-cold-1447");
-        let (mut journal, key) = cold_file_journal(&path);
-        journal.set_replicated_apply(true);
-        let command = stamped_quarantine(&journal, key, OrphanKind::Cold);
-        let (events, commit) = journal.apply_command_at(command, 42).unwrap();
-        commit.blocking_wait();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, nanobpmn_engine_core::Event::IncidentRaised { .. }))
-                .count(),
-            1,
-            "the incident is recorded for a cold instance"
-        );
-        assert_eq!(journal.cold_count(), 0, "cold reference dropped");
-        drop(journal);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    // #1447 review (replica convergence): the SAME stamped command applied on
-    // a replica where the instance is resident-spilled and on one where it is
-    // cold yields identical events and incident state, and both replicas drop
-    // their local off-heap reference.
+    // #1574 (scope B): the stamped quarantine is replica-deterministic. Applied
+    // on a replica where the instance is resident-spilled and on one where it
+    // is cold, it yields identical events and incidents, and it leaves every
+    // off-heap reference intact (no row forget, no cold-index drop, no spill
+    // flag clear) — cold rows are never discarded. Rehydrating the cold
+    // replica then yields the same instance state as the resident one.
     #[test]
     fn stamped_quarantine_converges_resident_and_cold_replicas() {
         let resident_path = restart_store_path("orphan-converge-resident-1447");
         let cold_path = restart_store_path("orphan-converge-cold-1447");
         let (mut resident, keys) = spilled_journal(&resident_path, 1);
-        let (mut cold, cold_key) = cold_file_journal(&cold_path);
+        // The cold replica applied the SAME commands, then tiered the
+        // instance wholly off-heap.
+        let mut cold = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap());
+        cold.set_cold_spill(store, 1, 0);
+        let _ = cold.apply_command(Command::DeployProcess(demo())).unwrap();
+        let vars = std::collections::HashMap::from([(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("payload-0".into()),
+        )]);
+        let (events, _) = cold
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let cold_key = events.iter().find_map(|e| e.instance_key()).unwrap();
         assert_eq!(keys[0], cold_key, "same deterministic key on both replicas");
+        assert_eq!(cold.force_cold_spill_all(), 1);
         resident.set_replicated_apply(true);
         cold.set_replicated_apply(true);
 
-        // The leader (here: the resident replica) stamps from its own state.
         let command = stamped_quarantine(&resident, keys[0], OrphanKind::Resident);
         let (on_resident, commit) = resident.apply_command_at(command.clone(), 42).unwrap();
         commit.blocking_wait();
         let (on_cold, commit) = cold.apply_command_at(command, 42).unwrap();
         commit.blocking_wait();
-        assert_eq!(
-            on_resident
-                .iter()
-                .filter(|e| matches!(e, nanobpmn_engine_core::Event::IncidentRaised { .. }))
-                .count(),
-            1,
-            "one incident event"
-        );
         assert_eq!(on_resident, on_cold, "identical events on both replicas");
         let incidents = |j: &Journal| {
-            j.state()
+            let mut v = j
+                .state()
                 .incidents
                 .values()
                 .map(|i| (i.key, i.instance_key, i.created_at, i.reason.clone()))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            v.sort();
+            v
         };
+        assert_eq!(incidents(&resident).len(), 1);
+        assert_eq!(
+            resident.state().variables_lost_quarantined,
+            cold.state().variables_lost_quarantined,
+            "identical tombstones"
+        );
+        // No replica-local repair: references intact on both replicas.
+        assert!(
+            resident.engine.is_variables_spilled(keys[0]),
+            "resident spill reference kept"
+        );
+        assert_eq!(raw_row_count(&resident_path, "spill", keys[0]), 1);
+        assert_eq!(cold.cold_count(), 1, "cold row never forgotten");
+
+        // Rehydrate both replicas through a command touching the instance:
+        // identical post-state and incidents.
+        for j in [&mut resident, &mut cold] {
+            let _ = j.activate_jobs("demo-work", "w", 1, 60_000, 50);
+        }
         assert_eq!(
             incidents(&resident),
             incidents(&cold),
             "identical incidents"
         );
-        assert!(
-            !resident.engine.is_variables_spilled(keys[0]),
-            "resident repaired"
-        );
-        assert_eq!(cold.cold_count(), 0, "cold reference dropped");
+        let view = |j: &Journal| {
+            let inst = j.engine().instance(keys[0]).expect("resident");
+            (inst.variables.as_ref().clone(), inst.state)
+        };
+        assert_eq!(view(&resident), view(&cold), "identical instance state");
         drop(resident);
         drop(cold);
         let _ = std::fs::remove_dir_all(resident_path.parent().unwrap());
@@ -7532,42 +7455,6 @@ mod tests {
                 .iter()
                 .all(|i| i.kind != nanobpmn_engine_core::IncidentKind::VariablesLost),
             "no VariablesLost incident for a rehydrated instance"
-        );
-        drop(journal);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    // #1574 review: the orphan repair rehydrates WITHOUT an event, so the dirty
-    // tracker never fires for it. Unless the surviving map is marked dirty, a
-    // lean checkpoint omits the replacement and a restart reloads the discarded
-    // store payload.
-    #[test]
-    fn orphan_repair_marks_the_surviving_variables_dirty() {
-        let path = restart_store_path("orphan-dirty-1574");
-        let (mut journal, keys) = spilled_journal(&path, 1);
-        journal.set_replicated_apply(true);
-        // Lean mode: authoritative var store + dirty tracking.
-        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
-        journal.set_varstore(varstore);
-        let key = keys[0];
-        // Drain the seed dirty mark so the repair is the only thing that can
-        // re-mark the instance.
-        let _ = journal.engine.drain_dirty_vars();
-        assert!(
-            journal.engine.is_variables_spilled(key),
-            "precondition: spilled"
-        );
-
-        let command = stamped_quarantine(&journal, key, OrphanKind::Resident);
-        let (_events, commit) = journal.apply_command_at(command, 42).unwrap();
-        commit.blocking_wait();
-        assert!(!journal.engine.is_variables_spilled(key), "repaired");
-
-        let (upserts, _) = journal.engine.drain_dirty_vars();
-        assert!(
-            upserts.iter().any(|(k, _)| *k == key),
-            "the repaired instance's surviving variables are marked dirty for the \
-             next lean checkpoint"
         );
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

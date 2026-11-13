@@ -253,29 +253,16 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // untouched (no record is created for an idempotent retry).
         Event::AgentHistoryDeduplicated { .. } => {}
 
-        // Off-heap orphan quarantine repair (#1574 review): the surviving-state
-        // transition rides the replicated log so EVERY replica lands identically,
-        // whatever it found locally. Record the dedup tombstone unconditionally
-        // (it is residency- and eviction-independent), and when `repair` is set
-        // install the CANONICAL surviving payload the proposing leader resolved
-        // (`surviving_variables`) into the resident instance and clear its
-        // spilled flag — so a replica that lost its row (empty placeholder), one
-        // that rehydrated (original payload), and one replaying the log all
-        // converge on the SAME map (#1574 review). A cold instance is not
-        // resident here — its payload is reconciled when its row is rehydrated
-        // or dropped — so the `get_mut` miss is a no-op, not an error.
+        // Off-heap orphan quarantine (#1574): record the replicated dedup
+        // tombstone only. Residency-independent, so every replica lands
+        // identically; no instance state is touched.
         Event::VariablesLostQuarantined {
             instance_key,
-            repair,
-            surviving_variables,
+            incident_key,
         } => {
-            state.variables_lost_quarantined.insert(*instance_key);
-            if *repair {
-                if let Some(instance) = state.instances.get_mut(instance_key) {
-                    instance.variables = Arc::new(surviving_variables.clone());
-                    instance.variables_spilled = false;
-                }
-            }
+            state
+                .variables_lost_quarantined
+                .insert(*instance_key, *incident_key);
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
