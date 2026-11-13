@@ -1250,6 +1250,7 @@ impl Journal {
         if let Some(cold) = self.cold.as_mut() {
             cold.index = ColdIndex::default();
         }
+        self.discard_orphan_reports();
         self.fresh = false;
     }
 
@@ -1287,6 +1288,8 @@ impl Journal {
         // whole completed history resident indefinitely (the boot path runs the
         // same post-catch-up `evict_completed` for the same reason).
         self.engine.evict_completed();
+        // Orphan reports describe the superseded engine (#1574 review).
+        self.discard_orphan_reports();
         // The rebuild IS the durable state: the fence and any armed (aborted)
         // raft-entry buffer are predecessor state that must not outlive it.
         self.raft_entry = None;
@@ -1673,6 +1676,37 @@ impl Journal {
     /// yet, in key order (#1447).
     pub fn orphan_backlog(&self) -> Vec<Key> {
         self.orphans.backlog.keys().copied().collect()
+    }
+
+    /// Discards every pending orphan report — backlog, in-flight set, and the
+    /// off-thread inbox — on ENGINE ADOPTION (snapshot install or durable
+    /// rebuild, #1574 review). Every report was detected against the
+    /// superseded engine's off-heap routing; the adopted engine is
+    /// self-contained, so a stale report proposed after promotion would stamp a
+    /// false `VariablesLost` incident on a healthy instance. A proposal already
+    /// queued in the sink is dropped too: [`orphan_pending_stamp`](Self::orphan_pending_stamp)
+    /// stamps only keys still in the backlog. A genuine loss in the adopted
+    /// state is re-detected afresh by its next restore/fold.
+    fn discard_orphan_reports(&mut self) {
+        self.orphans.backlog.clear();
+        self.orphans.in_flight.clear();
+        let _ = self.orphans.inbox.take();
+    }
+
+    /// The leader's stamp for a queued orphan proposal (#1447): `None` when the
+    /// report is no longer pending here (settled, or discarded on engine
+    /// adoption — the queued item is stale and must not be proposed);
+    /// `Some(stamp)` otherwise, where `stamp` is
+    /// [`Engine::orphan_incident_stamp`] (`None` = nothing to propose).
+    pub fn orphan_pending_stamp(
+        &self,
+        key: Key,
+        kind: OrphanKind,
+    ) -> Option<Option<nanobpmn_engine_core::OrphanIncidentStamp>> {
+        self.orphans
+            .backlog
+            .contains_key(&key)
+            .then(|| self.engine.orphan_incident_stamp(key, kind))
     }
 
     /// Adds a report to the backlog (deduped; counted once per new report).
@@ -4313,11 +4347,17 @@ impl Journal {
                 // Don't restore the (possibly stale) legacy row; just refuse to
                 // call the payload lost while it still exists.
                 None => match legacy {
-                    Some(store) => match store.try_get(key).map_err(|e| e.to_string())? {
-                        Some(_) => Err("var store has no row but a legacy spill row exists \
-                                        (unmigrated lean-over-legacy state)"
+                    // Either legacy table (spill row OR whole-instance cold row)
+                    // keeps the payload alive (#1574 review) — the same check the
+                    // streaming writer makes (`try_has_legacy_payload`).
+                    Some(store) => match store
+                        .try_has_legacy_payload(key)
+                        .map_err(|e| e.to_string())?
+                    {
+                        true => Err("var store has no row but a legacy spill/cold row exists \
+                                     (unmigrated lean-over-legacy state)"
                             .to_string()),
-                        None => Ok(None),
+                        false => Ok(None),
                     },
                     // No legacy tier to check: an empty var store cannot prove
                     // a lean-over-legacy placeholder's payload is gone — fail
@@ -8510,5 +8550,99 @@ mod tests {
         drop(rebooted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
+    }
+
+    // #1574 review: a lean var-store miss whose payload survives ONLY in the
+    // legacy tier's whole-instance COLD row (not its spill row) is not a loss.
+    // Both the inbox revalidation and the strict reconcile must consult both
+    // legacy tables (`try_has_legacy_payload`) before declaring `Ok(None)`.
+    #[test]
+    fn lean_over_legacy_cold_row_report_is_not_parked() {
+        let path = restart_store_path("orphan-lean-legacy-cold");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        // Borrow any cold row and store it under the spilled key, then drop
+        // the spill row: only the legacy COLD table holds a payload now.
+        let cold_path = restart_store_path("orphan-lean-legacy-cold-src");
+        let (cold_journal, cold_key) = cold_file_journal(&cold_path);
+        let cold_store = crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap();
+        let row = cold_store.try_get_cold(cold_key).unwrap().unwrap();
+        drop((cold_journal, cold_store));
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        store.put_cold(keys[0], &row).unwrap();
+        assert!(store.try_get(keys[0]).unwrap().is_none());
+
+        let vpath = restart_store_path("orphan-lean-legacy-cold-vs");
+        let mut rebooted = reboot_from(&path, legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+        rebooted.set_replicated_apply(true);
+
+        assert!(
+            rebooted.peek_spilled_variables(keys[0]).is_err(),
+            "not lost"
+        );
+        rebooted.orphans.inbox.record(keys[0], OrphanKind::Resident);
+        rebooted.drain_orphan_backlog();
+        assert!(rebooted.orphan_backlog().is_empty(), "stale report dropped");
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.incidents().is_empty());
+
+        drop((rebooted, store));
+        for p in [&path, &cold_path, &vpath] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    // #1574 review: a report parked against the superseded engine must not
+    // survive a healthy snapshot install — neither in the backlog (drained on
+    // promotion) nor as an already-queued proposal (stamped by the leader).
+    #[test]
+    fn orphan_reports_are_discarded_on_engine_adoption() {
+        let path = restart_store_path("orphan-adopt-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        let healthy = journal.engine.snapshot();
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        // Follower detects the loss and parks it; an off-thread miss also waits
+        // in the inbox.
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "parked");
+        journal
+            .orphans
+            .inbox
+            .record(keys[0] + 1, OrphanKind::Resident);
+        assert!(
+            journal
+                .orphan_pending_stamp(keys[0], OrphanKind::Resident)
+                .is_some(),
+            "pending before adoption"
+        );
+
+        // A healthy, self-contained snapshot is installed.
+        journal.restore_engine_from_snapshot(healthy);
+        assert!(journal.orphan_backlog().is_empty(), "backlog discarded");
+        assert!(
+            !journal.orphans.inbox.contains(keys[0] + 1),
+            "inbox discarded"
+        );
+        assert!(
+            journal
+                .orphan_pending_stamp(keys[0], OrphanKind::Resident)
+                .is_none(),
+            "a queued stale proposal is not stamped"
+        );
+
+        // Promotion proposes nothing.
+        journal.set_orphan_leadership(true);
+        assert!(sink.keys().is_empty(), "nothing proposed after promotion");
+        assert!(journal.incidents().is_empty());
+        drop((journal, store));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

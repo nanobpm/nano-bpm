@@ -915,13 +915,8 @@ fn resolve_spilled_from_stores(
                 // row or its whole-instance cold row (which carries variables
                 // inline); either means the payload survives.
                 let legacy_row = legacy_store
-                    .try_get(key)
-                    .map_err(|e| invalid_data(&e.to_string()))?
-                    .is_some()
-                    || legacy_store
-                        .try_get_cold(key)
-                        .map_err(|e| invalid_data(&e.to_string()))?
-                        .is_some();
+                    .try_has_legacy_payload(key)
+                    .map_err(|e| invalid_data(&e.to_string()))?;
                 if legacy_row {
                     return Err(invalid_data(&format!(
                         "spilled instance {key}: var store has no row but a legacy \

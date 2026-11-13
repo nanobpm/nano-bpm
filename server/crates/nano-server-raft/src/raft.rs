@@ -2847,12 +2847,17 @@ async fn propose_orphan(
     key: nanobpmn_engine_core::Key,
     kind: nanobpmn_engine_core::OrphanKind,
 ) -> bool {
-    let Some(stamp) = with_member_engine(engine, epoch, move |journal| {
-        journal.engine().orphan_incident_stamp(key, kind)
+    let Some(pending) = with_member_engine(engine, epoch, move |journal| {
+        journal.orphan_pending_stamp(key, kind)
     })
     .await
     else {
         return false;
+    };
+    // Stale queued item (#1574 review): the report was settled or discarded on
+    // engine adoption (a healthy snapshot install) — never propose it.
+    let Some(stamp) = pending else {
+        return true;
     };
     let Some(stamp) = stamp else {
         return with_member_engine(engine, epoch, move |j| j.orphan_proposal_settled(key))

@@ -909,6 +909,15 @@ impl VarSpillStore {
         json.map(|j| decode(&j)).transpose()
     }
 
+    /// Whether this LEGACY tier still holds a payload for `key` in EITHER its
+    /// variable-spill row or its whole-instance cold row (which carries the
+    /// variables inline). The single canonical "does a legacy payload survive?"
+    /// check (#1574 review): a lean var-store miss is a definitive loss only
+    /// when this is `Ok(false)`. `Err` = unreadable (fail closed).
+    pub fn try_has_legacy_payload(&self, key: Key) -> rusqlite::Result<bool> {
+        Ok(self.try_get(key)?.is_some() || self.try_get_cold(key)?.is_some())
+    }
+
     /// Test hook: overwrites the cold row for `key` with undecodable bytes so
     /// the next read of it is *unreadable* (not absent). Returns whether a row
     /// was rewritten. Lets cross-crate tests inject the #1405 failure mode.
