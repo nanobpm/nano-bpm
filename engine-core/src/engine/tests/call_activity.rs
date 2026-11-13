@@ -454,7 +454,6 @@ fn multi_instance_call_activity_spawn_retry_is_mi_aware() {
     engine
         .apply_command(Command::ResolveIncident {
             incident_key,
-            operation_reference: None,
         })
         .unwrap();
 
