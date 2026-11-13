@@ -11562,6 +11562,7 @@ mod element_instance_tests {
                 migrated_flow_scopes: vec![],
                 subscriptions: vec![],
                 child_instances: vec![],
+                join_scoped: true,
             }])
             .unwrap();
 
@@ -11660,6 +11661,7 @@ mod element_instance_tests {
                 migrated_flow_scopes: vec![],
                 subscriptions: vec![],
                 child_instances: vec![],
+                join_scoped: true,
             }])
             .unwrap();
 

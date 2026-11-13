@@ -164,7 +164,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     .copied()
                     .filter(|eik| {
                         instance.active.get(eik) == Some(element_id)
-                            && instance.scopes.get(eik).copied().unwrap_or(0) == key.scope
+                            // A legacy (scope-less) reset was element-wide.
+                            && (scope.is_none()
+                                || instance.scopes.get(eik).copied().unwrap_or(0) == key.scope)
                     })
                     .collect();
                 for eik in parked {
@@ -201,6 +203,12 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     }
                 }
                 instance.join_instances.remove(&key);
+                // A legacy (scope-less) firing left any surplus in the
+                // element's single slot, which the next open adopts wherever
+                // it opens: its scope is unknown until then.
+                if scope.is_none() && key.scope != UNRESOLVED_JOIN_SCOPE {
+                    instance.collapse_legacy_join(element_id);
+                }
             }
         }
 
@@ -655,9 +663,10 @@ fn register_token(
 
 /// The join a join event addresses: `element_id` in its flow-scope instance
 /// (#1580), or — for a legacy scope-less event — the element's single slot.
-fn join_key(instance: &ProcessInstance, element_id: &str, scope: Option<Key>) -> JoinKey {
+fn join_key(instance: &mut ProcessInstance, element_id: &str, scope: Option<Key>) -> JoinKey {
     match scope {
         Some(scope) => JoinKey::new(scope, element_id),
-        None => instance.legacy_join_key(element_id),
+        // A legacy (pre-#1580) record addresses the element's single slot.
+        None => instance.collapse_legacy_join(element_id),
     }
 }

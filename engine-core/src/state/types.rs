@@ -206,7 +206,7 @@ impl JoinKey {
 /// The placeholder scope a legacy (pre-#1580) element-keyed join entry decodes
 /// with. [`ProcessInstance::resolve_legacy_join_scopes`] replaces it with the
 /// real flow scope on load, and the state applier resolves a legacy event's
-/// missing scope ([`ProcessInstance::legacy_join_key`]); it never survives
+/// missing scope ([`ProcessInstance::collapse_legacy_join`]); it never survives
 /// into a running engine.
 pub const UNRESOLVED_JOIN_SCOPE: Key = Key::MAX;
 
@@ -325,16 +325,51 @@ impl ProcessInstance {
         keys
     }
 
-    /// The join key a **legacy** (pre-#1580, scope-less) join event addresses.
-    /// Before #1580 joins were keyed by element id alone, so at most one slot
-    /// per element exists: reuse it if present; otherwise the event opens the
-    /// slot in an as-yet unknown scope ([`UNRESOLVED_JOIN_SCOPE`]), which the
-    /// join's `ParallelJoinOpened` (or a load) then resolves.
-    pub fn legacy_join_key(&self, element_id: &str) -> JoinKey {
-        self.join_keys()
+    /// Collapse every slot of `element_id` into the single element-wide slot a
+    /// **legacy** (pre-#1580) record addresses, and return its key.
+    ///
+    /// Before #1580 each join element had exactly one slot, so a scope-less
+    /// record (or a legacy migration) must see the element's bookkeeping as one
+    /// slot — exactly what loading the matching legacy snapshot produces. The
+    /// slot keeps the scope of its open join instance (the smallest
+    /// element-instance key wins, as legacy migration merging did); with no
+    /// open instance its scope is unknown ([`UNRESOLVED_JOIN_SCOPE`]) until the
+    /// next `ParallelJoinOpened` or a load resolves it.
+    pub fn collapse_legacy_join(&mut self, element_id: &str) -> JoinKey {
+        let keys: Vec<JoinKey> = self
+            .join_keys()
             .into_iter()
-            .find(|k| k.element_id == element_id)
-            .unwrap_or_else(|| JoinKey::new(UNRESOLVED_JOIN_SCOPE, element_id))
+            .filter(|k| k.element_id == element_id)
+            .collect();
+        let open = keys
+            .iter()
+            .filter_map(|k| self.join_instances.get(k).map(|eik| (*eik, k.scope)))
+            .min();
+        let target = JoinKey::new(
+            open.map_or(UNRESOLVED_JOIN_SCOPE, |(_, scope)| scope),
+            element_id,
+        );
+        let mut count = 0usize;
+        let mut arrivals = FlowArrivals::default();
+        for key in &keys {
+            count += self.join_counts.remove(key).unwrap_or(0);
+            if let Some(a) = self.join_flow_arrivals.remove(key) {
+                for (flow, n) in a.iter() {
+                    arrivals.add(flow, n);
+                }
+            }
+            self.join_instances.remove(key);
+        }
+        if count > 0 {
+            self.join_counts.insert(target.clone(), count);
+        }
+        if !arrivals.is_empty() {
+            self.join_flow_arrivals.insert(target.clone(), arrivals);
+        }
+        if let Some((eik, _)) = open {
+            self.join_instances.insert(target.clone(), eik);
+        }
+        target
     }
 
     /// Move every [`UNRESOLVED_JOIN_SCOPE`] entry of `element_id` onto `scope`

@@ -316,3 +316,167 @@ fn legacy_element_keyed_join_maps_load_into_scoped_bookkeeping() {
         "load keys the legacy join by its flow scope"
     );
 }
+
+/// Legacy (pre-#1580) scope-less join records address the element's single
+/// slot, whichever flow-scope instance it lives in. These drive the state
+/// applier directly with hand-built legacy sequences that a scoped engine can
+/// no longer emit, asserting the outcome a legacy snapshot of the same history
+/// loads into (one slot per join element).
+mod legacy_element_wide {
+    use super::*;
+    use crate::state::{JoinKey, State, UNRESOLVED_JOIN_SCOPE};
+
+    const INSTANCE: Key = 1;
+    const SCOPE_A: Key = 100;
+    const SCOPE_B: Key = 200;
+    const JOIN_A: Key = 10;
+    const JOIN_B: Key = 20;
+
+    fn state() -> State {
+        let mut engine = Engine::new();
+        let key = start(&mut engine, mi_body_with_inner_join(false), two_items());
+        let mut state = engine.state().clone();
+        let mut instance = state.instances.remove(&key).unwrap();
+        instance.key = INSTANCE;
+        instance.join_counts.clear();
+        instance.join_flow_arrivals.clear();
+        instance.join_instances.clear();
+        instance.parked_joins.clear();
+        state.instances.clear();
+        state.instances.insert(INSTANCE, instance);
+        state
+    }
+
+    fn flow(from: &str) -> IncomingFlow {
+        IncomingFlow {
+            from: from.into(),
+            ordinal: 0,
+        }
+    }
+
+    fn opened(eik: Key, element_id: &str, scope: Key) -> Event {
+        Event::ParallelJoinOpened {
+            instance_key: INSTANCE,
+            element_instance_key: eik,
+            element_id: element_id.into(),
+            scope: Some(scope),
+        }
+    }
+
+    fn arrived(element_id: &str, from: &str) -> Event {
+        Event::ParallelJoinTokenArrived {
+            instance_key: INSTANCE,
+            element_id: element_id.into(),
+            flow: Some(flow(from)),
+            scope: None,
+        }
+    }
+
+    fn instance(state: &State) -> &crate::state::ProcessInstance {
+        &state.instances[&INSTANCE]
+    }
+
+    /// A legacy firing in scope A keeps its surplus in the element's single
+    /// slot, which the join re-opened in scope B adopts.
+    #[test]
+    fn legacy_fire_then_reopen_in_another_scope_carries_the_surplus() {
+        let mut state = state();
+        for e in [
+            opened(JOIN_A, "join", SCOPE_A),
+            arrived("join", "a"),
+            arrived("join", "a"),
+            arrived("join", "b"),
+            Event::ParallelJoinFired {
+                instance_key: INSTANCE,
+                element_id: "join".into(),
+                scope: None,
+            },
+            opened(JOIN_B, "join", SCOPE_B),
+        ] {
+            crate::state::apply(&mut state, &e);
+        }
+        let i = instance(&state);
+        let slot = JoinKey::new(SCOPE_B, "join");
+        assert_eq!(i.join_keys(), vec![slot.clone()]);
+        assert_eq!(i.join_flow_arrivals[&slot].count(&flow("a")), 1);
+        assert_eq!(i.join_instances[&slot], JOIN_B);
+    }
+
+    /// A legacy reset is element-wide: it drops every parked key of the
+    /// element even when no join-map entry names their scope any more.
+    #[test]
+    fn legacy_reset_after_fire_drops_every_parked_key() {
+        let mut state = state();
+        for e in [
+            opened(JOIN_A, "join", SCOPE_A),
+            opened(JOIN_B, "join", SCOPE_B),
+            Event::ParallelJoinFired {
+                instance_key: INSTANCE,
+                element_id: "join".into(),
+                scope: None,
+            },
+            Event::ParallelJoinReset {
+                instance_key: INSTANCE,
+                element_id: "join".into(),
+                scope: None,
+            },
+        ] {
+            crate::state::apply(&mut state, &e);
+        }
+        let i = instance(&state);
+        assert!(i.parked_joins.is_empty(), "no phantom parked join remains");
+        assert!(!i.active.contains_key(&JOIN_A) && !i.active.contains_key(&JOIN_B));
+        assert!(i.join_keys().is_empty());
+    }
+
+    /// A legacy migration merged joins element-wide; a scoped one keeps each
+    /// flow-scope instance's join separate.
+    #[test]
+    fn legacy_migration_merges_joins_across_scopes() {
+        for join_scoped in [false, true] {
+            let mut state = state();
+            for e in [
+                opened(JOIN_A, "join-a", SCOPE_A),
+                arrived("join-a", "a"),
+                opened(JOIN_B, "join-b", SCOPE_B),
+                arrived("join-b", "b"),
+            ] {
+                crate::state::apply(&mut state, &e);
+            }
+            let process_id = instance(&state).process_id.clone();
+            let pdk = instance(&state).process_definition_key;
+            crate::state::apply(
+                &mut state,
+                &Event::ProcessInstanceMigrated {
+                    instance_key: INSTANCE,
+                    target_process_id: process_id,
+                    target_process_definition_key: pdk,
+                    element_mappings: vec![
+                        ("join-a".into(), "join".into()),
+                        ("join-b".into(), "join".into()),
+                    ],
+                    migrated_flow_scopes: vec![],
+                    subscriptions: vec![],
+                    child_instances: vec![],
+                    join_scoped,
+                },
+            );
+            let i = instance(&state);
+            if join_scoped {
+                assert_eq!(
+                    i.join_keys(),
+                    vec![JoinKey::new(SCOPE_A, "join"), JoinKey::new(SCOPE_B, "join")]
+                );
+            } else {
+                let slot = JoinKey::new(SCOPE_A, "join");
+                assert_eq!(i.join_keys(), vec![slot.clone()]);
+                assert_eq!(i.join_instances[&slot], JOIN_A);
+                assert_eq!(i.join_flow_arrivals[&slot].distinct_flows(), 2);
+            }
+            assert!(i
+                .join_keys()
+                .iter()
+                .all(|k| k.scope != UNRESOLVED_JOIN_SCOPE));
+        }
+    }
+}

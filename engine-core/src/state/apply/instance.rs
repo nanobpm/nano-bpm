@@ -342,6 +342,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             target_process_id,
             target_process_definition_key,
             element_mappings,
+            join_scoped,
             ..
         } => {
             let remap: HashMap<&str, &str> = element_mappings
@@ -429,6 +430,20 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                             .or_insert(eik);
                     }
                     instance.join_instances = remapped;
+                }
+                // A legacy (pre-#1580) migration merged joins element-wide,
+                // across flow-scope instances: replay that merge.
+                if !*join_scoped {
+                    let mut elements: Vec<ElementId> = instance
+                        .join_keys()
+                        .into_iter()
+                        .map(|k| k.element_id)
+                        .collect();
+                    elements.sort();
+                    elements.dedup();
+                    for element_id in elements {
+                        instance.collapse_legacy_join(&element_id);
+                    }
                 }
             }
             if source_process_id.as_deref() != Some(target_process_id.as_str()) {

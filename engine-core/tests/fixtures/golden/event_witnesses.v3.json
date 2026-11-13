@@ -141,6 +141,7 @@
         ]
       ],
       "instance_key": 1,
+      "join_scoped": true,
       "migrated_flow_scopes": [
         {
           "element_instance_key": 8,

@@ -1055,6 +1055,11 @@ pub enum Event {
         /// call-activity element instance (#1374). Additive; empty when none.
         #[cfg_attr(feature = "serde", serde(default))]
         child_instances: Vec<MigratedChildInstance>,
+        /// Whether the join bookkeeping was migrated per flow-scope instance
+        /// (#1580). Additive; a legacy record decodes `false` and replays the
+        /// pre-#1580 element-wide merge (one slot per target join element).
+        #[cfg_attr(feature = "serde", serde(default))]
+        join_scoped: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification

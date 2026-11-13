@@ -5177,6 +5177,7 @@ impl Engine {
                         migrated_flow_scopes: plan.migrated_flow_scopes,
                         subscriptions: plan.subscriptions,
                         child_instances: Vec::new(),
+                        join_scoped: true,
                     },
                 );
                 for event in plan.after {

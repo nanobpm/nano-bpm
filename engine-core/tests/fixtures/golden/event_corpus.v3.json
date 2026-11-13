@@ -3827,6 +3827,7 @@
         ]
       ],
       "instance_key": 86,
+      "join_scoped": true,
       "migrated_flow_scopes": [],
       "subscriptions": [],
       "target_process_definition_key": 91,
