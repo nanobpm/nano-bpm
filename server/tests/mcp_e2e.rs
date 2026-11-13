@@ -159,7 +159,8 @@ impl Drop for ServerProcess {
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
-        #[cfg(not(unix))]
+        // Portable fallback (and a no-op after the group kill on unix):
+        // kept unconditional so no `#[cfg(not(unix))]` site escapes Clippy.
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(t) = self.stdout_thread.take() {
