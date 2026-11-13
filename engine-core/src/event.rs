@@ -1799,21 +1799,32 @@ pub enum Event {
     /// surviving state transitioned **identically on every replica** (#1574
     /// review). Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
     /// alongside its `IncidentRaised`, this is the replayable record of the
-    /// repair: its reducer clears the resident instance's `variables_spilled`
-    /// flag (keeping the surviving resident map) and records the instance in
-    /// [`crate::state::State::variables_lost_quarantined`], the replicated dedup
-    /// tombstone the quarantine idempotency guard reads. Because the transition
-    /// rides the replicated event log, every replica — spilled, rehydrated, or
-    /// cold — lands on the same surviving payload, and a crash/restart replays
-    /// it instead of resurrecting the discarded store payload. `repair` is
-    /// `serde(default)` so a record written before the field existed decodes
-    /// with `repair: false` (the incident alone was the durable fact then).
+    /// repair: its reducer installs the **canonical surviving payload** the
+    /// proposing leader resolved (`surviving_variables`) into the resident
+    /// instance and clears its `variables_spilled` flag, and records the
+    /// instance in [`crate::state::State::variables_lost_quarantined`], the
+    /// replicated dedup tombstone the quarantine idempotency guard reads.
+    /// Carrying the payload — rather than each replica keeping whatever resident
+    /// map it happened to hold — is what makes the post-quarantine state
+    /// converge: a replica that lost its row (empty placeholder), one that
+    /// rehydrated (original payload), and one replaying the log all install the
+    /// SAME map, so subsequent variable-dependent commands evaluate identically
+    /// (#1574 review). A crash/restart replays it instead of resurrecting the
+    /// discarded store payload. Both fields are `serde(default)` so a record
+    /// written before they existed decodes with `repair: false` and an empty
+    /// payload (the incident alone was the durable fact then).
     VariablesLostQuarantined {
         instance_key: Key,
         /// `true` when the surviving resident-variable transition was applied.
         /// `serde(default)` for forward/backward-compatible replay.
         #[cfg_attr(feature = "serde", serde(default))]
         repair: bool,
+        /// The canonical surviving variable payload, resolved by the proposing
+        /// leader (its resident map; empty when the whole instance was cold and
+        /// lost). Installed verbatim on every replica so they converge.
+        /// `serde(default)` for forward/backward-compatible replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        surviving_variables: HashMap<String, Value>,
     },
 }
 

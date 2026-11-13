@@ -2863,7 +2863,19 @@ impl Journal {
         };
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         if let Some(key) = orphan_repair {
-            self.repair_orphan_reference(key);
+            // Run the host-side repair ONLY when the engine actually emitted the
+            // repair event (#1574 review): a duplicate committed proposal is a
+            // complete no-op in the engine (the dedup tombstone already covers
+            // the episode), so it emits no `VariablesLostQuarantined`. Running
+            // the host cleanup anyway would forget the NEW spill/cold row of any
+            // replacement variables spilled since the first quarantine — erasing
+            // them. Gate on the emitted events, not the command shape.
+            let repaired = events
+                .iter()
+                .any(|e| matches!(e, Event::VariablesLostQuarantined { .. }));
+            if repaired {
+                self.repair_orphan_reference(key);
+            }
         }
         let mut activated: Vec<_> = events
             .iter()

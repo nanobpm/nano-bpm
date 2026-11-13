@@ -257,17 +257,22 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // transition rides the replicated log so EVERY replica lands identically,
         // whatever it found locally. Record the dedup tombstone unconditionally
         // (it is residency- and eviction-independent), and when `repair` is set
-        // clear a resident instance's spilled flag so it keeps its surviving
-        // resident map. A cold instance is not resident here — its flag rides
-        // its cold row and is reconciled when the row is rehydrated or dropped —
-        // so the `get_mut` miss is a no-op, not an error.
+        // install the CANONICAL surviving payload the proposing leader resolved
+        // (`surviving_variables`) into the resident instance and clear its
+        // spilled flag — so a replica that lost its row (empty placeholder), one
+        // that rehydrated (original payload), and one replaying the log all
+        // converge on the SAME map (#1574 review). A cold instance is not
+        // resident here — its payload is reconciled when its row is rehydrated
+        // or dropped — so the `get_mut` miss is a no-op, not an error.
         Event::VariablesLostQuarantined {
             instance_key,
             repair,
+            surviving_variables,
         } => {
             state.variables_lost_quarantined.insert(*instance_key);
             if *repair {
                 if let Some(instance) = state.instances.get_mut(instance_key) {
+                    instance.variables = Arc::new(surviving_variables.clone());
                     instance.variables_spilled = false;
                 }
             }

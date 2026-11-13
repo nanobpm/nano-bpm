@@ -5513,28 +5513,31 @@ impl Engine {
                 // outstanding loss (a promoted member re-proposing its parked
                 // report before an inherited quarantine entry applies) must not
                 // mint a second incident (#1574 review).
-                if !self.has_active_variables_lost(instance_key) {
-                    self.emit_variables_lost(
-                        &mut log,
-                        instance_key,
-                        stamp.element_id,
-                        stamp.reason,
-                    );
+                //
+                // A duplicate (the guard already holds this loss episode) is a
+                // COMPLETE no-op (#1574 review): it must NOT re-emit the repair
+                // event. A re-emitted repair would re-install the ORIGINAL
+                // quarantine's canonical payload over any replacement variables
+                // spilled since, and the host's `repair_orphan_reference` would
+                // forget the NEW spill/cold row — erasing the replacement. So the
+                // repair event rides only the FIRST quarantine of an episode.
+                if self.has_active_variables_lost(instance_key) {
+                    return Ok((log, queue));
                 }
+                self.emit_variables_lost(&mut log, instance_key, stamp.element_id, stamp.reason);
                 // The repair rides the replicated log (#1574 review): EVERY
                 // replica applies the identical surviving-state transition
-                // (clear the resident spill flag, keep the surviving map) and
-                // records the dedup tombstone — independent of what that replica
-                // found locally, and replayable so a crash/restart re-applies it
-                // instead of resurrecting the discarded store payload. Emitted
-                // even on the dedup-skip path: the tombstone insert is
-                // idempotent, and a replica that skipped the incident (already
-                // tombstoned) must still re-assert the repair transition.
+                // (install the leader-resolved canonical payload, clear the
+                // resident spill flag) and records the dedup tombstone —
+                // independent of what that replica found locally, and replayable
+                // so a crash/restart re-applies it instead of resurrecting the
+                // discarded store payload.
                 self.emit(
                     &mut log,
                     Event::VariablesLostQuarantined {
                         instance_key,
                         repair: true,
+                        surviving_variables: stamp.surviving_variables,
                     },
                 );
             }
@@ -7603,10 +7606,23 @@ impl Engine {
             crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
             crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
         };
+        // The canonical surviving payload (#1574 review): the leader's CURRENT
+        // resident map. For a resident orphan this is the surviving map (the
+        // spill row is lost; any post-spill journal-tail updates were merged
+        // into it). For a cold orphan the instance is wholly off-heap here, so
+        // there is no resident map — the payload is empty (the whole instance
+        // is lost). Every replica installs THIS map, so they converge.
+        let surviving_variables = self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.variables.as_ref().clone())
+            .unwrap_or_default();
         Some(crate::command::OrphanIncidentStamp {
             kind,
             element_id,
             reason: reason.to_string(),
+            surviving_variables,
         })
     }
 

@@ -798,6 +798,14 @@ pub struct OrphanIncidentStamp {
     pub element_id: String,
     /// The incident's `reason`.
     pub reason: String,
+    /// The canonical surviving variable payload the leader resolved (its
+    /// resident map; empty when the whole instance was cold and lost). The
+    /// repair event installs it verbatim on every replica so they converge on
+    /// the SAME post-quarantine state (#1574 review) rather than each keeping
+    /// whatever resident map it happened to hold. `serde(default)` so a stamp
+    /// written before the field existed decodes with an empty payload.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub surviving_variables: HashMap<String, Value>,
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].

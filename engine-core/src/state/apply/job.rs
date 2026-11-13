@@ -425,6 +425,9 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             resolved_at,
             operation_reference,
         } => {
+            // Capture the kind before transitioning, so a resolved
+            // `VariablesLost` incident also lifts its dedup tombstone below.
+            let resolved_kind = state.incidents.get(incident_key).map(|i| i.kind);
             // Retain the record as an audit trail: transition it to Resolved
             // rather than dropping it.
             if let Some(incident) = state.incidents.get_mut(incident_key) {
@@ -436,6 +439,16 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             // reflects only open incidents.
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.incidents.retain(|k| k != incident_key);
+            }
+            // A resolved `VariablesLost` incident ends its loss episode (#1574
+            // review): lift the dedup tombstone so a LATER, distinct loss (the
+            // operator replaced the variables, spilled again, and lost the new
+            // row) is reported fresh rather than suppressed forever by a
+            // lifetime tombstone. The tombstone still dedups duplicates of the
+            // SAME episode while the incident is active — resolution is the
+            // episode boundary.
+            if resolved_kind == Some(IncidentKind::VariablesLost) {
+                state.variables_lost_quarantined.remove(instance_key);
             }
             // A recoverable job-incident: return the parked job to the
             // activatable pool so a worker can pick it up again — but *only* if
