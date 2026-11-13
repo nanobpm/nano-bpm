@@ -140,6 +140,58 @@ impl Commit {
         }
     }
 
+    /// A commit that becomes durable when `ack` fires; if its sender is dropped
+    /// unacked, the write is treated as never durable (as when the writer thread
+    /// dies). Lets hosts and tests model a not-yet-fsynced write.
+    pub fn from_ack(ack: oneshot::Receiver<()>) -> Self {
+        Commit(CommitInner::Pending(ack))
+    }
+
+    /// Waits until the write backing this commit has been fsynced and reports
+    /// whether it actually **became durable**: `true` once the writer acked the
+    /// fsync (or for a `Ready` commit), `false` when the writer went away without
+    /// acknowledging it (shutdown / writer failure). Unlike [`wait`](Self::wait),
+    /// which resolves either way, this lets a caller gate a side effect that must
+    /// never outrun the source write — e.g. forwarding a keyed cross-partition
+    /// event a peer will durably dedup on (#1582).
+    pub async fn wait_durable(self) -> bool {
+        match self.0 {
+            CommitInner::Ready => true,
+            CommitInner::Pending(rx) => {
+                let start = std::time::Instant::now();
+                let durable = rx.await.is_ok();
+                crate::metrics::record_commit_wait(start.elapsed());
+                durable
+            }
+        }
+    }
+
+    /// Splits this durability handle into two independent handles that both
+    /// resolve when (and with the same outcome as) the original write: a durable
+    /// ack is relayed to both, a writer that vanished without acking leaves both
+    /// un-acked (so [`wait_durable`](Self::wait_durable) reports `false` on each).
+    /// A pending commit is relayed by a detached task, so this must be called
+    /// within a Tokio runtime.
+    pub fn tee(self) -> (Commit, Commit) {
+        match self.0 {
+            CommitInner::Ready => (Commit::ready(), Commit::ready()),
+            CommitInner::Pending(rx) => {
+                let (tx_a, rx_a) = oneshot::channel();
+                let (tx_b, rx_b) = oneshot::channel();
+                tokio::spawn(async move {
+                    if rx.await.is_ok() {
+                        let _ = tx_a.send(());
+                        let _ = tx_b.send(());
+                    }
+                });
+                (
+                    Commit(CommitInner::Pending(rx_a)),
+                    Commit(CommitInner::Pending(rx_b)),
+                )
+            }
+        }
+    }
+
     /// Blocks the current thread until the write backing this commit has been
     /// fsynced. For synchronous callers (tests, startup seeding) that cannot
     /// `.await`; must NOT be called from within an async runtime. Resolves
@@ -4477,6 +4529,29 @@ mod tests {
     use nanobpmn_engine_core::ProcessBuilder;
 
     use super::*;
+
+    /// #1582: `tee` relays the source outcome to both halves — an fsync ack
+    /// makes both durable; a writer that vanishes without acking makes neither
+    /// durable, so a gated side effect (cross-partition forward) never outruns
+    /// a write that was never persisted.
+    #[tokio::test]
+    async fn commit_tee_relays_durable_and_lost_outcomes() {
+        assert!(Commit::ready().wait_durable().await);
+        let (a, b) = Commit::ready().tee();
+        assert!(a.wait_durable().await && b.wait_durable().await);
+
+        let (tx, rx) = oneshot::channel();
+        let (a, b) = Commit(CommitInner::Pending(rx)).tee();
+        tx.send(()).unwrap();
+        assert!(a.wait_durable().await);
+        assert!(b.wait_durable().await);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let (a, b) = Commit(CommitInner::Pending(rx)).tee();
+        drop(tx);
+        assert!(!a.wait_durable().await);
+        assert!(!b.wait_durable().await);
+    }
 
     /// Minimal no-runtime `block_on` for the commit handles (a `Commit` resolves
     /// on a plain `oneshot`, so a thread-parking waker suffices — no tokio

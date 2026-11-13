@@ -1495,13 +1495,14 @@ async fn handle_client_frame(
             .await;
         }
         ClientFrame::RouteSubscription { corr, event } => {
-            // The owner applies the routed subscription command locally and drives
-            // its own pump for any further follow-ups, then acknowledges.
-            server.apply_routed_subscription_remote(event).await;
+            // The owner applies the routed command once and answers with a status
+            // the source's bounded re-drive classifies (#1582): 200 delivered,
+            // 503 not the leader (re-resolve and retry), 4xx permanent.
+            let (status, message) = server.apply_routed_subscription_remote(event).await;
             conn.send(ServerFrame::CommandResult {
                 corr,
-                status: 200,
-                body: None,
+                status,
+                body: (status != 200).then(|| serde_json::Value::String(message)),
             });
         }
         ClientFrame::UpdateJobRetries {

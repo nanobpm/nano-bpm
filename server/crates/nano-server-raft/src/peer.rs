@@ -86,6 +86,33 @@ pub struct PeerResult {
 /// Outstanding forwarded requests awaiting a `CommandResult`, keyed by `corr`.
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<PeerResult>>>>;
 
+/// Removes one outstanding correlation from its [`Pending`] table on drop, making
+/// [`PeerLink::request_on`] cancellation-safe (#1582). Removing an entry the
+/// reader already resolved is a harmless no-op (correlation ids are unique).
+struct PendingEntryGuard {
+    pending: Pending,
+    corr: u64,
+}
+
+impl Drop for PendingEntryGuard {
+    fn drop(&mut self) {
+        // Fast path: the table lock is almost always free.
+        if let Ok(mut map) = self.pending.try_lock() {
+            map.remove(&self.corr);
+            return;
+        }
+        // Contended (the reader is resolving another frame): finish the removal
+        // asynchronously rather than blocking inside `drop`.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pending = self.pending.clone();
+            let corr = self.corr;
+            handle.spawn(async move {
+                pending.lock().await.remove(&corr);
+            });
+        }
+    }
+}
+
 /// A live falcon connection to one peer node.
 ///
 /// Cheap to clone (shares the underlying socket writer and correlation table).
@@ -300,19 +327,23 @@ impl PeerLink {
 
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(corr, tx);
+        // Cancellation safety (#1582): from here on, however this future ends —
+        // a response, a link close, the deadline, or the caller DROPPING it
+        // mid-await (an outer timeout, a cancelled task) — the guard removes the
+        // correlation entry, so an abandoned request never lingers in the table.
+        let _entry = PendingEntryGuard {
+            pending: pending.clone(),
+            corr,
+        };
 
         if out.send(Message::Text(txt.into())).await.is_err() {
-            pending.lock().await.remove(&corr);
             return Err(PeerError::Closed);
         }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(PeerError::Closed),
-            Err(_) => {
-                pending.lock().await.remove(&corr);
-                Err(PeerError::Timeout)
-            }
+            Err(_) => Err(PeerError::Timeout),
         }
     }
 
@@ -813,13 +844,18 @@ impl PeerLink {
     /// Forwards a cross-partition subscription follow-up event (a
     /// `MessageSubscriptionOpening` or `RemoteMessageCorrelation`) to the peer
     /// that owns the target partition, so it applies the corresponding routed
-    /// command on its own engine. Answered by a `CommandResult` (200).
+    /// command on its own engine. Answered by a `CommandResult` (200 applied,
+    /// 503 not the target's leader). Bounded by the fast write-forward deadline:
+    /// this is one attempt of the caller's bounded re-drive (#1582), so a
+    /// leaderless target fails fast and is retried against the new leader.
     pub async fn route_subscription(
         &self,
         event: nanobpmn_engine_core::Event,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::RouteSubscription { corr, event })
-            .await
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::RouteSubscription { corr, event }
+        })
+        .await
     }
 
     /// Forwards a job-retries update to the peer that owns the job's partition.
@@ -1331,6 +1367,42 @@ fn fast_forward_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1582: dropping an in-flight `request_on` future (a caller-side timeout,
+    /// a cancelled task, a `select!` loser) must remove its pending-correlation
+    /// entry immediately. Otherwise the entry lingers until the inner timeout —
+    /// or forever while a stalled socket stays connected — leaking one slot per
+    /// abandoned request.
+    #[tokio::test]
+    async fn dropped_request_future_removes_its_pending_entry() {
+        let (out_app, _out_app_rx) = mpsc::channel::<Message>(16);
+        let (out_raft, _out_raft_rx) = mpsc::channel::<Message>(16);
+        let link = PeerLink {
+            out_app,
+            pending_app: Arc::new(Mutex::new(HashMap::new())),
+            out_raft,
+            pending_raft: Arc::new(Mutex::new(HashMap::new())),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        // The stalled peer never answers; the inner deadline is far away, so
+        // only the drop of the outer future can clean the entry up.
+        let outer = tokio::time::timeout(
+            Duration::from_millis(50),
+            link.request_within(Duration::from_secs(3600), |corr| {
+                ClientFrame::RouteSubscription {
+                    corr,
+                    event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+                }
+            }),
+        )
+        .await;
+        assert!(outer.is_err(), "the stalled request must still be in flight");
+        assert!(
+            link.pending_app.lock().await.is_empty(),
+            "a dropped request future must not leave a pending correlation behind"
+        );
+    }
 
     #[test]
     fn ws_url_maps_scheme_and_appends_path() {

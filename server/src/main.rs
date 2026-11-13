@@ -1902,6 +1902,73 @@ enum RoutedApply {
     Failed(u16, String),
 }
 
+/// Classified outcome of ONE delivery attempt of a routed cross-partition
+/// follow-up (#1582) — the decision [`ServerImpl::route_with_redrive`] retries on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteAttempt {
+    /// Applied by the target partition's writer.
+    Delivered,
+    /// Permanently rejected (a 4xx): retrying cannot help, so the re-drive stops.
+    Rejected(u16, String),
+    /// Not delivered for a reason a later attempt can overcome — no reachable
+    /// leader, link down / timeout, a 503 leader race, any 5xx. Retried.
+    Transient(String),
+}
+
+impl RouteAttempt {
+    /// Classifies a write-path status: 2xx delivered, 4xx permanent, anything
+    /// else (5xx, incl. the 503 leader race) transient.
+    fn from_status(status: u16, message: String) -> Self {
+        match status {
+            200..=299 => RouteAttempt::Delivered,
+            400..=499 => RouteAttempt::Rejected(status, message),
+            _ => RouteAttempt::Transient(format!("status {status}: {message}")),
+        }
+    }
+
+    /// Classifies a forwarded attempt's peer reply; every transport failure
+    /// (connect, link closed, per-attempt timeout) is transient.
+    fn from_peer(
+        result: Result<nano_server_raft::peer::PeerResult, nano_server_raft::peer::PeerError>,
+    ) -> Self {
+        match result {
+            Ok(reply) => {
+                let message = reply
+                    .body
+                    .as_ref()
+                    .map(|b| b.as_str().map_or_else(|| b.to_string(), str::to_owned))
+                    .unwrap_or_default();
+                Self::from_status(reply.status, message)
+            }
+            Err(e) => RouteAttempt::Transient(e.to_string()),
+        }
+    }
+}
+
+/// Bounded re-drive budget for routed cross-partition follow-ups (#1582):
+/// exponential backoff from `base` capped at `cap`, at most `max_attempts`
+/// deliveries — long enough to ride out a Raft leader election, bounded so a
+/// permanently unreachable partition cannot pin the pump forever.
+struct RouteRedrive {
+    max_attempts: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+}
+
+impl RouteRedrive {
+    /// The sleep before attempt number `attempt` (`attempt >= 1`).
+    fn backoff(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1u32 << attempt.saturating_sub(1).min(16);
+        self.base.saturating_mul(factor).min(self.cap)
+    }
+}
+
+const ROUTE_REDRIVE: RouteRedrive = RouteRedrive {
+    max_attempts: 16,
+    base: std::time::Duration::from_millis(50),
+    cap: std::time::Duration::from_secs(1),
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobMetricStatus {
     Completed,
@@ -2613,6 +2680,11 @@ pub struct ServerImpl {
     /// in flight so the two paths can't race into competing groups. See
     /// [`HandoffPending`].
     handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
+    /// Re-drive attempts (beyond the first) the cross-partition routing pump
+    /// made for transiently undelivered follow-ups (#1582). Observability for
+    /// the bounded re-drive; lets the RF=3 leader-change tests prove the retry
+    /// path was actually exercised.
+    route_redrives: Arc<AtomicU64>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -3197,6 +3269,7 @@ impl ServerImpl {
                 handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_redrives: Arc::new(AtomicU64::new(0)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -9505,31 +9578,79 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
+    ///
+    /// **Uncancellable (#1582).** Every caller reaches this only AFTER the source
+    /// command committed, so the routing it performs is post-commit work that a
+    /// caller-side timeout / dropped request future must never abort — a lost
+    /// follow-up would otherwise be unrecoverable (the retried parent is deduped
+    /// to a no-op). The pump therefore runs as a detached task; awaiting it only
+    /// observes completion, and dropping the await leaves it running.
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
-        let num_partitions = self.engine.topology().num_partitions;
-        if num_partitions <= 1 {
+        if self.engine.topology().num_partitions <= 1 {
             return;
         }
+        let server = self.clone();
+        let pump = tokio::spawn(async move { server.drive_subscription_routing_now(events).await });
+        if let Err(e) = pump.await {
+            tracing::warn!("subscription routing pump task failed: {e}");
+        }
+    }
+
+    /// The routing pump body behind [`Self::drive_subscription_routing`]; only
+    /// ever run inside that detached task.
+    async fn drive_subscription_routing_now(&self, events: Vec<Event>) {
+        let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            match self.apply_routed_command(target, command).await {
-                RoutedApply::Applied(produced) => work.extend(produced),
-                RoutedApply::NotHere => {
-                    // The target partition is owned (led, under Raft) by a peer:
-                    // forward the source event so that node applies it (and
-                    // drives any further routing) through its own write path.
-                    self.forward_route_subscription(target, event).await;
-                }
+            work.extend(self.route_with_redrive(target, command, event).await);
+        }
+    }
+
+    /// Delivers one routed follow-up to partition `target` with a **bounded
+    /// re-drive** (#1582): each attempt re-resolves the writer — applying
+    /// locally when this node leads `target` (the produced follow-ups are
+    /// returned for the pump to continue), or forwarding the source `event` to
+    /// the current leader otherwise. A transient non-delivery (no reachable
+    /// leader, link down, timeout, a 503 leader race, any 5xx) is retried with
+    /// backoff per [`ROUTE_REDRIVE`]; a 4xx is a permanent rejection and stops.
+    /// Re-delivery is safe: routed deliveries carry stable source-minted keys the
+    /// recipient dedups on (#1568), so a retry of an attempt whose reply was lost
+    /// is a no-op.
+    async fn route_with_redrive(&self, target: u64, command: Command, event: Event) -> Vec<Event> {
+        let mut last = String::new();
+        for attempt in 0..ROUTE_REDRIVE.max_attempts {
+            if attempt > 0 {
+                self.route_redrives.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
+            }
+            let outcome = match self.apply_routed_command(target, command.clone()).await {
+                RoutedApply::Applied(produced) => return produced,
                 RoutedApply::Failed(status, message) => {
-                    tracing::warn!(
-                        "subscription routing on partition {target} failed ({status}): {message}"
-                    );
+                    RouteAttempt::from_status(status, message)
                 }
+                // Led by a peer (or a leadership gap): forward to the current
+                // writer, re-resolved on every attempt.
+                RoutedApply::NotHere => self.forward_route_subscription(target, &event).await,
+            };
+            match outcome {
+                RouteAttempt::Delivered => return Vec::new(),
+                RouteAttempt::Rejected(status, message) => {
+                    tracing::warn!(
+                        "subscription routing on partition {target} rejected ({status}): {message}"
+                    );
+                    return Vec::new();
+                }
+                RouteAttempt::Transient(reason) => last = reason,
             }
         }
+        tracing::warn!(
+            "subscription routing on partition {target} not delivered after {} attempts: {last}",
+            ROUTE_REDRIVE.max_attempts
+        );
+        Vec::new()
     }
 
     /// Derives the `(target partition, command)` a cross-partition follow-up event
@@ -9684,7 +9805,11 @@ impl ServerImpl {
                 },
             )
             .await;
-        commit.wait().await;
+        // Only a durable apply counts as delivered: its follow-ups are routed
+        // onward with keys peers dedup on, so they must never outrun it (#1582).
+        if !commit.wait_durable().await {
+            return RoutedApply::Failed(503, format!("partition {target} write not durable"));
+        }
         match result {
             Ok(events) => RoutedApply::Applied(events.iter().cloned().collect()),
             Err(error) => {
@@ -9694,44 +9819,57 @@ impl ServerImpl {
         }
     }
 
-    /// Forwards a cross-partition subscription follow-up `event` to the peer that
-    /// owns `target_partition`, over the Falcon protocol. The owner applies it and
-    /// drives its own pump for any further follow-ups. Best-effort: a delivery
-    /// failure is logged and dropped (idempotent — the source command re-emits the
-    /// event on replay; at RF=1 a lost open just leaves the instance parked until
-    /// a retry/restart re-routes it).
-    async fn forward_route_subscription(&self, target_partition: u64, event: Event) {
+    /// ONE forwarding attempt of a cross-partition subscription follow-up
+    /// `event` to the node currently writing `target_partition`, over the Falcon
+    /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
+    /// it and drives its own pump for any further follow-ups.
+    async fn forward_route_subscription(&self, target_partition: u64, event: &Event) -> RouteAttempt {
         let owner = self.partition_write_node(target_partition);
         if owner == self.engine.topology().node_id {
             // No peer to hand it to: this node is the best-known writer but does
             // not lead the partition right now (a leadership gap). Never apply
-            // around the log; the source command re-emits the event on replay.
-            tracing::warn!(
-                "subscription routing: partition {target_partition} has no reachable leader; dropped"
-            );
-            return;
+            // around the log — wait for an election and re-resolve.
+            return RouteAttempt::Transient(format!(
+                "partition {target_partition} has no reachable leader"
+            ));
         }
-        match self.peers.link(owner).await {
-            Ok(link) => {
-                if let Err(e) = link.route_subscription(event).await {
-                    tracing::warn!(
-                        "subscription routing to node {owner} (partition {target_partition}) failed: {e}"
-                    );
-                }
+        let link = match self.peers.link(owner).await {
+            Ok(link) => link,
+            Err(e) => {
+                return RouteAttempt::Transient(format!(
+                    "node {owner} (partition {target_partition}) unreachable: {e}"
+                ));
             }
-            Err(e) => tracing::warn!(
-                "subscription routing: node {owner} (partition {target_partition}) unreachable: {e}"
-            ),
+        };
+        let result = link.route_subscription(event.clone()).await;
+        if result.is_err() {
+            // A dead/stalled link: drop it so the next attempt redials.
+            self.peers.drop_link(owner).await;
         }
+        RouteAttempt::from_peer(result)
     }
 
-    /// Peer-side handler for a forwarded subscription follow-up: the owning node
-    /// drives its own pump for `event` (it now owns the target partition, so the
-    /// apply is local), recursing into any further cross-node follow-ups. Wakes
-    /// pollers in case the correlation advanced a token onto a service task.
-    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) {
-        self.drive_subscription_routing(vec![event]).await;
-        self.signal_jobs_available();
+    /// Peer-side handler for a forwarded subscription follow-up: applies the
+    /// routed command on `event`'s target partition **once** (no re-forward — a
+    /// node that does not lead the target answers `503` and the source re-drives
+    /// against the re-resolved leader, #1582), then drives its own pump for any
+    /// follow-ups the apply produced. Returns the status the source classifies
+    /// (`200` delivered, `503` not the leader, otherwise the apply's status).
+    /// Wakes pollers in case the correlation advanced a token onto a service task.
+    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) -> (u16, String) {
+        let num_partitions = self.engine.topology().num_partitions;
+        let Some((target, command)) = Self::route_event(&event, num_partitions) else {
+            return (400, "event is not a routable subscription follow-up".into());
+        };
+        match self.apply_routed_command(target, command).await {
+            RoutedApply::Applied(produced) => {
+                self.drive_subscription_routing(produced).await;
+                self.signal_jobs_available();
+                (200, String::new())
+            }
+            RoutedApply::NotHere => (503, format!("not the leader of partition {target}; retry")),
+            RoutedApply::Failed(status, message) => (status, message),
+        }
     }
 
     /// Spawns cross-partition subscription routing for the follow-ups carried in
@@ -9766,6 +9904,41 @@ impl ServerImpl {
         tokio::spawn(async move {
             server.drive_subscription_routing(routable).await;
         });
+    }
+
+    /// Like [`Self::spawn_routing_if_needed`] but for a source write that is NOT
+    /// yet durable (the pipelined non-Raft stream path acks before fsync):
+    /// routing is gated on the source commit becoming durable (#1582). Routed
+    /// deliveries carry source-minted keys the peer durably dedups on, so
+    /// forwarding before the source persisted could let a peer record a close
+    /// identity the source then loses in a crash — after restart the key is
+    /// reused and the real delivery silently deduped away. Returns the commit the
+    /// caller awaits (same outcome as `commit`) plus the gated routing task,
+    /// which resolves to whether routing ran.
+    fn route_after_durable(
+        &self,
+        events: &[Event],
+        commit: Commit,
+    ) -> (Commit, Option<tokio::task::JoinHandle<bool>>) {
+        if self.engine.topology().num_partitions <= 1
+            || !Self::has_routable_subscription_events(events)
+        {
+            return (commit, None);
+        }
+        let routable = Self::routable_events(events);
+        let (caller, gate) = commit.tee();
+        let server = self.clone();
+        let task = tokio::spawn(async move {
+            if !gate.wait_durable().await {
+                tracing::warn!(
+                    "subscription routing withheld: the source write never became durable"
+                );
+                return false;
+            }
+            server.drive_subscription_routing(routable).await;
+            true
+        });
+        (caller, Some(task))
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -20762,12 +20935,26 @@ impl ServerImpl {
             return self.propose_partition_command(job_key, command, true).await;
         }
         let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self.gate_stream_routing(result);
         if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
             self.record_adhoc_events(events);
         }
         Self::map_job_events(result)
+    }
+
+    /// Routes the cross-partition follow-ups of a pipelined (ack-before-fsync)
+    /// non-Raft stream job command only once its source write is durable
+    /// (#1582), handing back the commit the pipelined caller still awaits. See
+    /// [`Self::route_after_durable`].
+    fn gate_stream_routing(
+        &self,
+        result: Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        result.map(|(events, commit)| {
+            let (commit, _routing) = self.route_after_durable(&events, commit);
+            (events, commit)
+        })
     }
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
@@ -20815,10 +21002,7 @@ impl ServerImpl {
                 ),
             )
             .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
-        }
-        Self::map_job_events(result)
+        Self::map_job_events(self.gate_stream_routing(result))
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -20860,10 +21044,7 @@ impl ServerImpl {
                 ),
             )
             .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
-        }
-        Self::map_job_events(result)
+        Self::map_job_events(self.gate_stream_routing(result))
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -42212,6 +42393,143 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1582: bounded re-drive of a routed forward across an RF=3 leader change.
+    /// Deterministic fixture: the subscription partition's leader (node 1) is
+    /// STOPPED before the instance is created, so the FIRST forward of the
+    /// routed subscription open cannot be delivered (stale leader view / dead
+    /// link / no leader yet). The re-drive must re-resolve the new leader and
+    /// deliver it, with exactly-once effects: one instance, exactly one armed
+    /// subscription on every surviving replica, one completion — and no
+    /// resurrection of the subscription after the correlation closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn routed_forward_is_redriven_across_a_leader_change() {
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("start")
+            .message_intermediate_catch_event("catch", "go", "orderId")
+            .end_event("end")
+            .connect("start", "catch")
+            .connect("catch", "end")
+            .build()
+            .expect("valid waiter process");
+        let (node0, node1, node2, handles) =
+            boot_rf3_intake_cluster_with(false, false, None, None, vec![waiter]).await;
+        let sub_partition = 1u64;
+        let order_id = (0..)
+            .map(|i| format!("redrive-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == sub_partition)
+            .expect("some key hashes to partition 1");
+
+        // Stop partition 1's leader BEFORE any routing happens.
+        for p in 0..3u64 {
+            if let Some(part) = node1.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[1].abort();
+        let redrives_before = node0.route_redrives.load(Ordering::Relaxed);
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
+        let (instance_key, _) = node0
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create commits on partition 0 (quorum node0+node2)");
+        assert_ne!(partition_of(instance_key), sub_partition);
+
+        let sub_count = |node: &ServerImpl| {
+            let node = node.clone();
+            async move {
+                let Some(handle) = node.engine_handle_for(sub_partition) else {
+                    return 0usize;
+                };
+                handle
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .filter(|s| {
+                                s.instance_key == instance_key
+                                    && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                            })
+                            .count()
+                    })
+                    .await
+            }
+        };
+        let mut delivered = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if sub_count(&node0).await == 1 && sub_count(&node2).await == 1 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            delivered,
+            "the re-drive must deliver the routed open to the new partition-1 leader"
+        );
+        assert!(
+            node0.route_redrives.load(Ordering::Relaxed) > redrives_before,
+            "the first forward failed, so the re-drive path must have been exercised"
+        );
+        let instances = node0
+            .engine_handle_for(partition_of(instance_key))
+            .expect("instance partition")
+            .with(|j| j.state().instances.len())
+            .await;
+        assert_eq!(instances, 1, "exactly one instance");
+
+        let taps = [
+            tap_replica_events(&node0, partition_of(instance_key)).await,
+            tap_replica_events(&node2, partition_of(instance_key)).await,
+        ];
+        let (message_key, _) = node0
+            .correlate_message_cluster("go".into(), order_id.clone(), None, None)
+            .await
+            .expect("publish succeeds");
+        assert!(message_key.is_some());
+        let mut completions = [0usize, 0usize];
+        for _ in 0..250 {
+            for (n, tap) in completions.iter_mut().zip(&taps) {
+                while let Ok(batch) = tap.try_recv() {
+                    *n += batch
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key))
+                        .count();
+                }
+            }
+            if completions.iter().all(|n| *n >= 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(completions, [1, 1], "exactly one completion per surviving replica");
+
+        // No resurrection: the correlated subscription is no longer open and
+        // stays so (a late re-delivery of the open is deduped), and a second
+        // publish correlates nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(sub_count(&node0).await, 0, "no resurrected subscription (node0)");
+        assert_eq!(sub_count(&node2).await, 0, "no resurrected subscription (node2)");
+        let (_, correlated) = node0
+            .correlate_message_cluster("go".into(), order_id, None, None)
+            .await
+            .expect("second publish succeeds");
+        assert_eq!(correlated, None, "nothing left to correlate");
+
+        for node in [&node0, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancel_instance_replicates_through_raft() {
         // #1306: cancelling a running instance is a durable operator mutation, so
@@ -46655,6 +46973,116 @@ mod subscription_placement_tests {
             correlated, None,
             "the publish correlates nothing after the remote subscription is disarmed"
         );
+    }
+
+    /// #1582 (crash window): the pipelined non-Raft stream path acks before
+    /// fsync, so its cross-partition routing must wait for the SOURCE write to
+    /// become durable. A source that never persists (writer gone unacked — the
+    /// crash case) must route nothing, otherwise a peer durably records a close
+    /// identity the source then loses and a reused delivery key is silently
+    /// deduped. Once durable, the same follow-up routes.
+    #[tokio::test]
+    async fn pipelined_routing_is_gated_on_source_durability() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("gate-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, _) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            let sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if sub != nanobpmn_engine_core::partition_of(key) {
+                chosen = Some((sub, key));
+                break;
+            }
+        }
+        let (sub_partition, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let armed = || {
+            let handle = server
+                .engine_handle_for(sub_partition)
+                .expect("subscription partition is local");
+            async move {
+                handle
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .any(|s| {
+                                s.instance_key == instance_key
+                                    && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                            })
+                    })
+                    .await
+            }
+        };
+        assert!(armed().await, "the routed subscription is armed");
+
+        let (events, commit) = server
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+            .expect("cancel succeeds");
+        commit.wait().await;
+
+        // The source write never becomes durable: nothing may be routed.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        drop(tx);
+        let routed = routing.expect("cancel emits a routable close").await;
+        assert!(!routed.expect("gate task"), "no routing before durability");
+        assert!(!caller.wait_durable().await, "the caller sees the same outcome");
+        assert!(armed().await, "the close was withheld from the peer partition");
+
+        // The same follow-up routes once the source is durable.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        tx.send(()).expect("gate listening");
+        assert!(routing.expect("routable").await.expect("gate task"));
+        assert!(caller.wait_durable().await);
+        assert!(!armed().await, "the durable close disarmed the subscription");
+    }
+
+    /// #1582: transient non-delivery (5xx, the 503 leader race, transport
+    /// failures) is retried; a 4xx is permanent; the backoff is bounded.
+    #[test]
+    fn route_attempt_classification_and_backoff_are_bounded() {
+        use nano_server_raft::peer::{PeerError, PeerResult};
+        assert_eq!(RouteAttempt::from_status(200, String::new()), RouteAttempt::Delivered);
+        assert!(matches!(RouteAttempt::from_status(404, "x".into()), RouteAttempt::Rejected(404, _)));
+        assert!(matches!(RouteAttempt::from_status(503, "x".into()), RouteAttempt::Transient(_)));
+        assert!(matches!(RouteAttempt::from_status(500, "x".into()), RouteAttempt::Transient(_)));
+        for e in [PeerError::Closed, PeerError::Timeout, PeerError::Connect("refused".into())] {
+            assert!(matches!(RouteAttempt::from_peer(Err(e)), RouteAttempt::Transient(_)));
+        }
+        let reply = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert_eq!(
+            RouteAttempt::from_peer(Ok(reply)),
+            RouteAttempt::Rejected(409, "conflict".into())
+        );
+        assert_eq!(ROUTE_REDRIVE.backoff(1), std::time::Duration::from_millis(50));
+        assert_eq!(ROUTE_REDRIVE.backoff(2), std::time::Duration::from_millis(100));
+        assert_eq!(ROUTE_REDRIVE.backoff(40), ROUTE_REDRIVE.cap);
+        let total: std::time::Duration =
+            (1..ROUTE_REDRIVE.max_attempts).map(|a| ROUTE_REDRIVE.backoff(a)).sum();
+        assert!(total >= std::time::Duration::from_secs(5), "rides out an election: {total:?}");
+        assert!(total <= std::time::Duration::from_secs(30), "bounded: {total:?}");
     }
 
     /// start -> serviceTask "work" with an interrupting message boundary keyed on
