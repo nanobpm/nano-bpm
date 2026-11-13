@@ -5311,9 +5311,21 @@ impl Engine {
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 
-                // Move instructions are not acted on yet: rejected explicitly —
-                // never silently ignored (#1374; `engine-modify-move` lands them).
-                Self::reject_unsupported_modification(instance_key, &move_instructions)?;
+                // Move instructions (Camunda 8.9, #1552) desugar into the
+                // activate/terminate pairs they abbreviate — one terminate of
+                // each moved source element instance plus one activation of the
+                // target per moved instance — so the existing all-or-nothing
+                // validation/apply covers them unchanged (Zeebe
+                // `ProcessInstanceModificationModifyProcessor` builds the same
+                // final instruction lists).
+                let mut activate_instructions = activate_instructions;
+                let mut terminate_instructions = terminate_instructions;
+                self.desugar_move_instructions(
+                    instance_key,
+                    &move_instructions,
+                    &mut activate_instructions,
+                    &mut terminate_instructions,
+                )?;
 
                 // Validate everything up front so the command is all-or-nothing,
                 // then apply (see `modify.rs`).
@@ -16400,28 +16412,6 @@ pub enum EngineError {
     /// read back right now, so the command was not applied (#1388). Transient
     /// and retryable (503) — distinct from [`EngineError::InstanceNotFound`].
     InstanceUnavailable { instance_key: Key },
-}
-
-impl Engine {
-    /// Rejects the [`Command::ModifyInstance`] instruction fields the engine
-    /// does not act on yet with
-    /// [`EngineError::ModificationInstructionNotYetSupported`], in a fixed
-    /// field order so the rejection is deterministic.
-    fn reject_unsupported_modification(
-        instance_key: Key,
-        move_instructions: &[crate::command::MoveInstruction],
-    ) -> Result<(), EngineError> {
-        let unsupported = |instruction| {
-            Err(EngineError::ModificationInstructionNotYetSupported {
-                instance_key,
-                instruction,
-            })
-        };
-        if !move_instructions.is_empty() {
-            return unsupported("move_instructions");
-        }
-        Ok(())
-    }
 }
 
 /// Whether `element_id` is an intermediate catch event — the only element

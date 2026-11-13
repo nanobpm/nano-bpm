@@ -1182,9 +1182,13 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
 }
 
-/// #1374 scaffold: `move_instructions` (not acted on yet) are rejected explicitly (never silently ignored), atomically.
+/// #1552: `move_instructions` are acted on (the `ModificationInstructionNotYetSupported`
+/// scaffold is gone): a move terminates the source and activates the target in
+/// one atomic command. The full move surface lives in
+/// [`super::modify_moves`]; this pins the scaffold's atomicity case — the
+/// bundled terminate applies exactly when the move does.
 #[test]
-fn modify_rejects_not_yet_supported_instruction_fields() {
+fn modify_move_instructions_apply_atomically_with_the_other_instructions() {
     use crate::command::{AncestorScopeInstruction, MoveInstruction, MoveSource};
     let mut engine = Engine::new();
     engine
@@ -1198,41 +1202,40 @@ fn modify_rejects_not_yet_supported_instruction_fields() {
         .unwrap();
     let a_eik = active_eik_of(&engine, inst, "a");
 
-    let modify = |activate: Vec<ActivateElementInstruction>,
-                  by_id: Vec<String>,
-                  moves: Vec<MoveInstruction>| Command::ModifyInstance {
-        instance_key: inst,
-        activate_instructions: activate,
-        terminate_instructions: vec![a_eik],
-        terminate_element_ids: by_id,
-        move_instructions: moves,
-    };
-    let cases = [(
-        modify(
-            vec![],
-            vec![],
-            vec![MoveInstruction {
+    // A move of `a` to `b` bundled with a terminate of `a`: the move's
+    // desugared terminate deduplicates with the explicit one, `a` goes, and
+    // exactly one `b` activates.
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![],
+            terminate_instructions: vec![a_eik],
+            terminate_element_ids: vec![],
+            move_instructions: vec![MoveInstruction {
                 source: MoveSource::ById("a".into()),
                 target_element_id: "b".into(),
                 ancestor_scope: AncestorScopeInstruction::SourceParent,
                 variable_instructions: vec![],
             }],
-        ),
-        "move_instructions",
-    )];
-    for (command, instruction) in cases {
-        let err = engine.apply_command(command).unwrap_err();
-        assert_eq!(
-            err,
-            EngineError::ModificationInstructionNotYetSupported {
-                instance_key: inst,
-                instruction,
-            }
-        );
-        assert!(err.to_string().contains("not yet supported"), "{err}");
-        // Atomic: the bundled terminate of `a` did not happen.
-        assert_eq!(active_eik_of(&engine, inst, "a"), a_eik);
-    }
+        })
+        .unwrap();
+    assert!(engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .all(|id| id.as_str() != "a"));
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .active
+            .values()
+            .filter(|id| id.as_str() == "b")
+            .count(),
+        1,
+        "exactly one b activated"
+    );
 }
 
 /// #1374 scaffold: a suspended instance exists but is in the wrong state for

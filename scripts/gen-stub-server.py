@@ -99,6 +99,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "cancel_process_instances_batch_operation"): "self.cancel_process_instances_batch_operation_impl(body).await",
     ("process_instance", "resolve_incidents_batch_operation"): "self.resolve_incidents_batch_operation_impl(body).await",
     ("process_instance", "migrate_process_instances_batch_operation"): "self.migrate_process_instances_batch_operation_impl(body).await",
+    ("process_instance", "modify_process_instances_batch_operation"): "self.modify_process_instances_batch_operation_impl(body).await",
     # --- END issue-905 batch-operations delegations ---
     # --- BEGIN issue-906 cluster-variables delegations ---
     ("cluster_variable", "create_global_cluster_variable"): "self.create_global_cluster_variable_impl(body).await",
