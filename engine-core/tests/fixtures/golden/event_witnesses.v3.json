@@ -46,6 +46,7 @@
     "RoutedDeliveryRecorded": {
       "close_tombstone": true,
       "delivery_key": 25,
+      "recipient_partition": 2,
       "subscription_key": 6
     }
   },

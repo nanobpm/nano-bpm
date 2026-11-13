@@ -814,6 +814,13 @@ pub enum Event {
         /// The source partition's minted delivery identity (see the routed
         /// source events' `delivery_key`).
         delivery_key: Key,
+        /// The RECIPIENT partition that applied (and owns) this ledger record.
+        /// `delivery_key` is minted on the SOURCE partition, so a key-derived
+        /// split (`partition_of(max_key())`, the legacy shared-journal
+        /// recovery) would file it under the sender; recovery routes the record
+        /// by this field instead (see [`Event::owning_partition`]).
+        #[cfg_attr(feature = "serde", serde(default))]
+        recipient_partition: u64,
         /// The subscription this delivery concerned, recorded so a close
         /// tombstones it against a late open. `None` for a start-instance
         /// dispatch (no subscription).
@@ -2008,6 +2015,22 @@ impl Event {
             if crate::state::partition_of(k) == partition_id {
                 *next_local = (*next_local).max(crate::state::local_of(k));
             }
+        }
+    }
+
+    /// The partition that owns this event when a shared (untagged) journal is
+    /// split per partition on recovery. Normally the partition encoded in
+    /// [`Event::max_key`]; a [`Event::RoutedDeliveryRecorded`] record instead
+    /// belongs to its `recipient_partition`, because its only key was minted on
+    /// the SOURCE partition (#1497). Every key-derived split must go through
+    /// this, never `partition_of(max_key())` directly.
+    pub fn owning_partition(&self) -> u64 {
+        match self {
+            Event::RoutedDeliveryRecorded {
+                recipient_partition,
+                ..
+            } => *recipient_partition,
+            _ => crate::state::partition_of(self.max_key()),
         }
     }
 

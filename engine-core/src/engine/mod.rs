@@ -4372,6 +4372,7 @@ impl Engine {
                         &mut log,
                         Event::RoutedDeliveryRecorded {
                             delivery_key,
+                            recipient_partition: self.partition_id,
                             subscription_key: Some(subscription_key),
                             close_tombstone: false,
                         },
@@ -4447,6 +4448,7 @@ impl Engine {
                         &mut log,
                         Event::RoutedDeliveryRecorded {
                             delivery_key,
+                            recipient_partition: self.partition_id,
                             subscription_key: Some(subscription_key),
                             close_tombstone: false,
                         },
@@ -4498,6 +4500,7 @@ impl Engine {
                         &mut log,
                         Event::RoutedDeliveryRecorded {
                             delivery_key,
+                            recipient_partition: self.partition_id,
                             subscription_key: Some(subscription_key),
                             close_tombstone: true,
                         },
@@ -5358,6 +5361,7 @@ impl Engine {
                         &mut log,
                         Event::RoutedDeliveryRecorded {
                             delivery_key,
+                            recipient_partition: self.partition_id,
                             subscription_key: None,
                             close_tombstone: false,
                         },

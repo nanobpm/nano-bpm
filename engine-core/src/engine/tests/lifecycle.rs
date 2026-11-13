@@ -1421,6 +1421,15 @@ fn redriven_dispatch_start_after_a_lost_ack_mints_exactly_one_instance() {
         "the first dispatch mints an instance"
     );
     assert_eq!(target.state().instances.len(), 1);
+    // The ledger record belongs to the RECIPIENT (partition 2), though its only
+    // key was minted on the source: a key-derived legacy split must not file it
+    // under the sender (Copilot review, #1568).
+    let record = first
+        .iter()
+        .find(|e| matches!(e, Event::RoutedDeliveryRecorded { .. }))
+        .expect("the first dispatch records its delivery");
+    assert_eq!(record.owning_partition(), 2);
+    assert_ne!(crate::state::partition_of(record.max_key()), 2);
 
     // The ack is lost; the re-drive re-delivers the SAME delivery key. It is
     // acknowledged but NOT re-applied: still exactly one instance.

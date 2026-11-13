@@ -198,6 +198,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             delivery_key,
             subscription_key,
             close_tombstone,
+            ..
         } => {
             record_routed_delivery(
                 state,

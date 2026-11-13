@@ -27800,7 +27800,7 @@ async fn main() {
                     let mut per_partition: Vec<Vec<Event>> =
                         (0..partitions).map(|_| Vec::new()).collect();
                     for event in events {
-                        let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
+                        let p = event.owning_partition() as usize;
                         per_partition[p.min(partitions - 1)].push(event);
                     }
 
@@ -27925,7 +27925,7 @@ async fn main() {
                             }
                             continue;
                         }
-                        let p = nanobpmn_engine_core::partition_of(event.max_key());
+                        let p = event.owning_partition();
                         if let Some(bucket) = per_owned.get_mut(&p) {
                             bucket.push(event);
                         }

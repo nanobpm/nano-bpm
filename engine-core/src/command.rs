@@ -842,6 +842,22 @@ impl UserTaskChangeset {
 }
 
 impl Command {
+    /// The routed-delivery identity (#1497) this command carries, when it is
+    /// one of the four routed recipient commands with a non-zero
+    /// `delivery_key`. A deduplicated redelivery of such a command applies
+    /// eventlessly, so its acknowledgement must wait on a writer barrier for
+    /// the original delivery's write rather than resolve immediately.
+    pub fn routed_delivery_key(&self) -> Option<Key> {
+        let key = match self {
+            Command::OpenMessageSubscription { delivery_key, .. }
+            | Command::CorrelateMessageSubscription { delivery_key, .. }
+            | Command::CloseMessageSubscription { delivery_key, .. }
+            | Command::DispatchStartInstance { delivery_key, .. } => *delivery_key,
+            _ => return None,
+        };
+        (key != 0).then_some(key)
+    }
+
     /// A stable, allocation-free `&'static str` discriminant for this command,
     /// used as a metrics label so per-command actor cost (wall time and
     /// allocated bytes) can be attributed by kind. Kept in lockstep with the

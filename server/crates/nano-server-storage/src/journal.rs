@@ -2533,10 +2533,13 @@ impl Journal {
             return Err(EngineError::InstanceUnavailable { instance_key: 0 });
         }
         self.ensure_resident_for_command(&command)?;
+        // Commands whose eventless success restates an earlier write: a job
+        // settlement replay (#1181), or a deduplicated routed redelivery
+        // (#1497) whose original delivery may still be in flight.
         let settles_job = matches!(
             command,
             Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
-        );
+        ) || command.routed_delivery_key().is_some();
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -4779,6 +4782,44 @@ mod tests {
             "an in-memory journal is already durable"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1497 regression: a deduplicated routed redelivery is eventless, but it
+    /// restates the ORIGINAL delivery, whose write may still be queued. Its ack
+    /// must ride a writer barrier, never a bare ready commit — otherwise a
+    /// crash loses the instance + ledger entry the sender was told landed.
+    #[test]
+    fn a_deduplicated_routed_redelivery_commit_is_a_durability_barrier() {
+        let dir =
+            std::env::temp_dir().join(format!("nanobpmn-routed-barrier-{}", std::process::id()));
+        let path = dir.join("test.journal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut journal = Journal::open(&path).unwrap();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let dispatch = Command::DispatchStartInstance {
+            process_id: "demo".into(),
+            start_element_id: "start".into(),
+            variables: std::collections::HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
+            message_start: None,
+            delivery_key: 777,
+        };
+        let (events, original) = journal.apply_command_at(dispatch.clone(), 1).unwrap();
+        assert!(!events.is_empty(), "the first delivery really applies");
+        let (events, redelivery) = journal.apply_command_at(dispatch, 2).unwrap();
+        assert!(events.is_empty(), "the redelivery is deduplicated");
+        assert!(
+            matches!(redelivery, Commit(CommitInner::Pending(_))),
+            "a deduplicated redelivery's ack must wait on the writer barrier"
+        );
+        block_on(original.wait());
+        block_on(redelivery.wait());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

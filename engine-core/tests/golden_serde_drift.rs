@@ -805,6 +805,7 @@ fn build_event_witnesses() -> Vec<Event> {
         // bump): the recipient partition's dedup / close-tombstone record.
         Event::RoutedDeliveryRecorded {
             delivery_key: 25,
+            recipient_partition: 2,
             subscription_key: Some(6),
             close_tombstone: true,
         },
