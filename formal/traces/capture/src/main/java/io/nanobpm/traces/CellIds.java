@@ -94,11 +94,17 @@ public final class CellIds {
    * recording one here would be grammar drift the parity guard rejects. Likewise {@code
    * MULTI_INSTANCE_BODY}: a runtime wrapper Zeebe puts around a multi-instance activity, not a
    * BPMN flow element ({@code FlowElementValidator} has no such class) — the activity's own cell
-   * is touched by its children.
+   * is touched by its children. {@code EVENT_SUB_PROCESS} is a runtime classification of a BPMN
+   * {@code <subProcess triggeredByEvent="true">}: its model class (the grammar's source of truth)
+   * is {@code SubProcess}, so it maps to {@code element:SubProcess} — never a fabricated
+   * {@code element:EventSubProcess} cell extract.mjs does not know.
    */
   public static String elementCellOrNull(final String bpmnElementType) {
-    return "PROCESS".equals(bpmnElementType) || "MULTI_INSTANCE_BODY".equals(bpmnElementType)
-        ? null
+    if ("PROCESS".equals(bpmnElementType) || "MULTI_INSTANCE_BODY".equals(bpmnElementType)) {
+      return null;
+    }
+    return "EVENT_SUB_PROCESS".equals(bpmnElementType)
+        ? elementCell("SUB_PROCESS")
         : elementCell(bpmnElementType);
   }
 

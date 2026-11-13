@@ -84,6 +84,7 @@ impl Engine {
             forgotten_vars: std::collections::HashSet::new(),
             retired_tombstones: std::collections::HashSet::new(),
             torn_down_scopes: std::collections::HashSet::new(),
+            esp_start_payloads: std::collections::HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied: snapshot.raft_applied,
         }

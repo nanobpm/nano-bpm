@@ -43,6 +43,17 @@ fn traces_dir() -> PathBuf {
     }
 }
 
+/// The Zeebe `elementInstanceKey` of a subscription/timer's scope. Nano keys
+/// a process-level event sub-process trigger by the sentinel host scope `0`
+/// (the root, #1555); Zeebe names the process instance itself.
+fn zeebe_scope_key(instance_key: Key, element_instance_key: Key) -> Key {
+    if element_instance_key == 0 {
+        instance_key
+    } else {
+        element_instance_key
+    }
+}
+
 fn read_json(path: &Path) -> J {
     let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
@@ -279,7 +290,16 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
                 edges.insert(t.attrs.get("bpmnElement").cloned().unwrap_or_default());
             }
             tag if FLOW_NODE_TAGS.contains(&tag) => {
-                element_types.insert(id.clone(), zeebe_element_type(tag));
+                // Zeebe types a `triggeredByEvent` sub-process as its own
+                // `EVENT_SUB_PROCESS` element type (#1555), not `SUB_PROCESS`.
+                let ty = if tag == "subProcess"
+                    && t.attrs.get("triggeredByEvent").map(String::as_str) == Some("true")
+                {
+                    "EVENT_SUB_PROCESS".to_string()
+                } else {
+                    zeebe_element_type(tag)
+                };
+                element_types.insert(id.clone(), ty);
                 needs_shape.insert(id.clone());
                 last_flow_node = Some(id);
             }
@@ -480,6 +500,12 @@ struct NanoRun<'a> {
     /// scope's element-INSTANCE key, not its BPMN element id: two instances of
     /// one process (or a re-entered scope) each get their own CREATED records.
     known: BTreeMap<Key, BTreeSet<String>>,
+    /// The last rendered value per (scope key, variable name). Zeebe's
+    /// `VariableBehavior` writes no VARIABLE record when a merge sets a
+    /// variable to the value it already holds (e.g. a repeated
+    /// non-interrupting message carrying the same payload, #1555); nano's
+    /// merge event still names it, so the general path suppresses the no-op.
+    values: HashMap<(Key, String), J>,
     /// Each live multi-instance body's `outputCollection` accumulator:
     /// body element-instance key -> (collection variable name, per-index slots).
     /// Zeebe seeds the collection on the BODY scope as a list of nulls when the
@@ -529,6 +555,7 @@ impl<'a> NanoRun<'a> {
             subscriptions: HashMap::new(),
             subscription_scopes: HashMap::new(),
             known: BTreeMap::new(),
+            values: HashMap::new(),
             mi_output: HashMap::new(),
         }
     }
@@ -719,8 +746,12 @@ impl<'a> NanoRun<'a> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
         sorted
             .into_iter()
-            .map(|(name, v)| {
-                self.variable_record(scope_key, scope_label.clone(), name, to_json(v), instance)
+            .filter_map(|(name, v)| {
+                let value = to_json(v);
+                let unchanged = self.values.get(&(scope_key, name.clone())) == Some(&value);
+                (!unchanged).then(|| {
+                    self.variable_record(scope_key, scope_label.clone(), name, value, instance)
+                })
             })
             .collect()
     }
@@ -736,6 +767,8 @@ impl<'a> NanoRun<'a> {
         value: J,
         instance: Key,
     ) -> J {
+        self.values
+            .insert((scope_key, name.to_string()), value.clone());
         let known = self.known.entry(scope_key).or_default();
         let intent = if known.insert(name.to_string()) {
             "CREATED"
@@ -1288,8 +1321,9 @@ impl<'a> NanoRun<'a> {
                 };
                 let v = (catching, message_name.clone());
                 self.subscriptions.insert(*subscription_key, v.clone());
+                let scope = zeebe_scope_key(*instance_key, *element_instance_key);
                 self.subscription_scopes
-                    .insert(*subscription_key, (*instance_key, *element_instance_key));
+                    .insert(*subscription_key, (*instance_key, scope));
                 vec![event(
                     "PROCESS_MESSAGE_SUBSCRIPTION",
                     "CREATED",
@@ -1297,7 +1331,7 @@ impl<'a> NanoRun<'a> {
                         "elementId": v.0,
                         "messageName": v.1,
                         "processInstanceKey": instance_key,
-                        "elementInstanceKey": element_instance_key,
+                        "elementInstanceKey": scope,
                     }),
                 )]
             }
@@ -1370,15 +1404,15 @@ impl<'a> NanoRun<'a> {
                     _ => element_id,
                 };
                 self.timers.insert(*timer_key, element_id.to_string());
-                self.timer_scopes
-                    .insert(*timer_key, (*instance_key, *element_instance_key));
+                let scope = zeebe_scope_key(*instance_key, *element_instance_key);
+                self.timer_scopes.insert(*timer_key, (*instance_key, scope));
                 vec![event(
                     "TIMER",
                     "CREATED",
                     json!({
                         "targetElementId": element_id,
                         "processInstanceKey": instance_key,
-                        "elementInstanceKey": element_instance_key,
+                        "elementInstanceKey": scope,
                     }),
                 )]
             }
@@ -1389,15 +1423,15 @@ impl<'a> NanoRun<'a> {
                 element_id,
                 ..
             } => {
-                self.timer_scopes
-                    .insert(*timer_key, (*instance_key, *element_instance_key));
+                let scope = zeebe_scope_key(*instance_key, *element_instance_key);
+                self.timer_scopes.insert(*timer_key, (*instance_key, scope));
                 vec![event(
                     "TIMER",
                     "TRIGGERED",
                     json!({
                         "targetElementId": self.timer_target(*timer_key, element_id),
                         "processInstanceKey": instance_key,
-                        "elementInstanceKey": element_instance_key,
+                        "elementInstanceKey": scope,
                     }),
                 )]
             }
@@ -1408,15 +1442,15 @@ impl<'a> NanoRun<'a> {
                 element_id,
                 ..
             } => {
-                self.timer_scopes
-                    .insert(*timer_key, (*instance_key, *element_instance_key));
+                let scope = zeebe_scope_key(*instance_key, *element_instance_key);
+                self.timer_scopes.insert(*timer_key, (*instance_key, scope));
                 vec![event(
                     "TIMER",
                     "CANCELED",
                     json!({
                         "targetElementId": self.timer_target(*timer_key, element_id),
                         "processInstanceKey": instance_key,
-                        "elementInstanceKey": element_instance_key,
+                        "elementInstanceKey": scope,
                     }),
                 )]
             }

@@ -793,10 +793,8 @@ pub enum ElementKind {
     /// embedded sub-process) is active, its start event's [`trigger`] is armed,
     /// and the event's occurrence activates the sub-process.
     ///
-    /// Zeebe runtime semantics (the contract the runtime slices implement; this
-    /// wave-0 model slice only *represents* the element — deploying a model
-    /// containing one succeeds, and until the runtime lands the sub-process is
-    /// simply never triggered):
+    /// Zeebe runtime semantics (implemented in `engine/event_subprocess.rs`
+    /// and the throw/catch walk in `engine/boundary.rs`):
     ///
     /// - **Arming**: when the enclosing scope activates (the process instance
     ///   starts, or the containing embedded sub-process is entered), the start

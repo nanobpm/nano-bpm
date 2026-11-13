@@ -6644,7 +6644,8 @@ fn project_event(
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
         | Event::VariableScopeCreated { .. }
-        | Event::VariableScopeDestroyed { .. } => {}
+        | Event::VariableScopeDestroyed { .. }
+        | Event::EventSubProcessPayloadHeld { .. } => {}
     }
     Ok(delta)
 }
@@ -8226,6 +8227,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
+            esp_held_payloads: Default::default(),
             compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
@@ -8488,6 +8490,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
+            esp_held_payloads: Default::default(),
             compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),

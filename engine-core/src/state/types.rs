@@ -964,6 +964,13 @@ pub struct ProcessInstance {
     /// keeping the flat fast path unchanged.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_variables: HashMap<Key, HashMap<String, Value>>,
+    /// Message / signal payloads held for event sub-process start events with
+    /// output mappings, keyed by the event sub-process container instance
+    /// (see [`crate::Event::EventSubProcessPayloadHeld`]). Seeded LOCAL to the
+    /// container's start event when it activates; dropped with the
+    /// container's scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub esp_held_payloads: HashMap<Key, HashMap<String, Value>>,
     /// Compensable activities that completed successfully and carry a
     /// compensation boundary event, in completion order (oldest first). A
     /// [`crate::model::ElementKind::CompensationThrowEvent`] in the same scope

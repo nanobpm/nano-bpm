@@ -65,6 +65,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 // A split gateway's carried activation-time selection (#1402)
                 // dies with it. A no-op for every other element.
                 instance.gateway_routes.remove(element_instance_key);
+                // An event sub-process container's held start payload dies
+                // with the container (normal completion or interrupt teardown).
+                instance.esp_held_payloads.remove(element_instance_key);
             }
         }
 

@@ -624,6 +624,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000004,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -659,6 +660,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000009,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -693,6 +695,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000010,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -765,6 +768,7 @@
           }
         },
         "created_at": 1700000000011,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -825,6 +829,7 @@
           }
         },
         "created_at": 1700000000013,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -862,6 +867,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000015,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -893,6 +899,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000001,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -924,6 +931,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000012,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -957,6 +965,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000013,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [
           79
@@ -996,6 +1005,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000015,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [
           85
@@ -1031,6 +1041,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000018,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],
@@ -1064,6 +1075,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000022,
+        "esp_held_payloads": {},
         "gateway_routes": {},
         "incidents": [
           96

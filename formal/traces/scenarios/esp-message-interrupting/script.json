@@ -1,0 +1,20 @@
+{
+  "description": "An interrupting message event sub-process terminates the running service task and completes the process instance; the message payload lands in the event sub-process scope.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-message-interrupting",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "order-1",
+      "variables": {
+        "reason": "customer"
+      }
+    }
+  ]
+}

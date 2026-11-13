@@ -1520,3 +1520,262 @@ fn modify_created_flow_scope_evaluates_a_conditional_event_subprocess_on_open() 
          command: {events:?}"
     );
 }
+
+#[test]
+fn start_output_mappings_keep_the_event_payload_local_to_the_start_event() {
+    // Zeebe parity (trace `esp-message-output-mapping`): when the event
+    // sub-process start event carries output mappings, the message / signal
+    // payload is created LOCAL to the start event (not merged into the host
+    // scope); only the mapped targets propagate outward.
+    for t in [T::Message, T::Signal] {
+        let mut def = esp_model(trig_of(t), false, false);
+        def.elements.get_mut("esp_start").unwrap().io = crate::model::IoMapping {
+            inputs: vec![],
+            outputs: vec![crate::model::Mapping {
+                source: "=payload".into(),
+                target: "mapped".into(),
+            }],
+        };
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, def);
+        let events = fire(&mut engine, inst, t, 0);
+        let vars = engine.variables(inst);
+        assert_eq!(
+            vars.get("mapped"),
+            Some(&Value::Int(42)),
+            "{t:?}: the output mapping propagated its target: {events:?}"
+        );
+        assert_eq!(
+            vars.get("payload"),
+            None,
+            "{t:?}: the raw payload stays local to the start event: {events:?}"
+        );
+    }
+}
+
+/// A message / signal event sub-process whose start event maps `=payload`
+/// to `mapped`, with optional extra XML inside the event sub-process
+/// container (`esp_ext`) and on its start event (`start_ext`), hosted in
+/// `host` (`"process"` or a parallel multi-instance sub-process over `[1,2]`).
+fn esp_payload_xml(signal: bool, mi_host: bool, esp_ext: &str, start_ext: &str) -> String {
+    let def = if signal {
+        r#"<bpmn:signalEventDefinition signalRef="Sig" />"#
+    } else {
+        r#"<bpmn:messageEventDefinition messageRef="Msg" />"#
+    };
+    let esp = format!(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:extensionElements>{esp_ext}</bpmn:extensionElements>
+             <bpmn:startEvent id="esp_start" isInterrupting="false">
+               <bpmn:extensionElements>
+                 <zeebe:ioMapping><zeebe:output source="=payload" target="mapped" /></zeebe:ioMapping>
+                 {start_ext}
+               </bpmn:extensionElements>
+               {def}
+             </bpmn:startEvent>
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+           </bpmn:subProcess>"#
+    );
+    let work = r#"<bpmn:serviceTask id="work">
+             <bpmn:extensionElements><zeebe:taskDefinition type="w" /></bpmn:extensionElements>
+           </bpmn:serviceTask>"#;
+    let body = if mi_host {
+        format!(
+            r#"<bpmn:subProcess id="host">
+             <bpmn:multiInstanceLoopCharacteristics>
+               <bpmn:extensionElements>
+                 <zeebe:loopCharacteristics inputCollection="=[1,2]" inputElement="item" />
+               </bpmn:extensionElements>
+             </bpmn:multiInstanceLoopCharacteristics>
+             <bpmn:startEvent id="hs" />
+             {work}
+             <bpmn:endEvent id="he" />
+             <bpmn:sequenceFlow id="h1" sourceRef="hs" targetRef="work" />
+             <bpmn:sequenceFlow id="h2" sourceRef="work" targetRef="he" />
+             {esp}
+           </bpmn:subProcess>
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="host" />
+           <bpmn:sequenceFlow id="f2" sourceRef="host" targetRef="e" />"#
+        )
+    } else {
+        format!(
+            r#"{work}
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+           <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+           {esp}"#
+        )
+    };
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+         <bpmn:message id="Msg" name="m">
+           <bpmn:extensionElements><zeebe:subscription correlationKey="=orderId" /></bpmn:extensionElements>
+         </bpmn:message>
+         <bpmn:signal id="Sig" name="sig" />
+         <bpmn:process id="p" isExecutable="true">
+           <bpmn:startEvent id="s" />
+           <bpmn:endEvent id="e" />
+           {body}
+         </bpmn:process>
+       </bpmn:definitions>"#
+    )
+}
+
+fn start_xml(engine: &mut Engine, xml: &str) -> (Key, Vec<Event>) {
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut log = engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("orderId", Value::Int(7))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    log.extend(created);
+    (inst, log)
+}
+
+/// Every value an event in `events` wrote to variable `name`.
+fn writes_of(events: &[Event], name: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ScopedVariablesUpdated { variables, .. }
+            | Event::VariablesUpdated { variables, .. } => variables.get(name).cloned(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn one_signal_broadcast_seeds_every_concurrent_host_scopes_start_payload() {
+    // Review r4562389430: a broadcast reaching the same event sub-process in
+    // two concurrent multi-instance host scopes must hand EACH start event
+    // its payload — the hold is keyed by the concrete host scope, not just
+    // the start event id.
+    let mut engine = Engine::new();
+    let (_inst, _) = start_xml(&mut engine, &esp_payload_xml(true, true, "", ""));
+    let events = engine
+        .apply_command(Command::BroadcastSignal {
+            signal_name: "sig".into(),
+            variables: vars(&[("payload", Value::Int(42))]),
+        })
+        .unwrap();
+    assert_eq!(
+        writes_of(&events, "mapped"),
+        vec![Value::Int(42), Value::Int(42)],
+        "both host scopes' start events mapped the payload: {events:?}"
+    );
+}
+
+#[test]
+fn container_start_listener_defers_the_start_without_losing_its_payload() {
+    // Review r4562389487: a `start` execution listener on the event
+    // sub-process container defers its start event to a later command (the
+    // listener job's completion). The held payload must survive that — and a
+    // replay of the journal in between.
+    for replay in [false, true] {
+        let mut engine = Engine::new();
+        let listener = r#"<zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="esp-gate" />
+               </zeebe:executionListeners>"#;
+        let (inst, mut log) = start_xml(&mut engine, &esp_payload_xml(false, false, listener, ""));
+        log.extend(
+            engine
+                .apply_command(Command::CorrelateMessage {
+                    message_name: "m".into(),
+                    correlation_key: "7".into(),
+                    variables: vars(&[("payload", Value::Int(42))]),
+                    business_id: None,
+                })
+                .unwrap(),
+        );
+        assert!(
+            writes_of(&log, "mapped").is_empty(),
+            "the start event waits on the container listener"
+        );
+        if replay {
+            engine = Engine::replay(log);
+        }
+        let events = complete_one(&mut engine, "esp-gate");
+        assert_eq!(
+            writes_of(&events, "mapped"),
+            vec![Value::Int(42)],
+            "replay={replay}: the deferred start mapped the held payload: {events:?}"
+        );
+        assert_eq!(engine.variables(inst).get("payload"), None);
+    }
+}
+
+#[test]
+fn start_event_activation_expressions_see_the_local_payload() {
+    // Review r4562389516: the payload is local to the start event, so its
+    // own activation-time expressions (here a `start` listener's job type)
+    // resolve against it.
+    let mut engine = Engine::new();
+    let listener = r#"<zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="=listenerType" />
+               </zeebe:executionListeners>"#;
+    let (inst, _) = start_xml(&mut engine, &esp_payload_xml(false, false, "", listener));
+    let events = engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "7".into(),
+            variables: vars(&[
+                ("payload", Value::Int(42)),
+                ("listenerType", Value::Str("dyn".into())),
+            ]),
+            business_id: None,
+        })
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. })),
+        "no extraction incident: {events:?}"
+    );
+    assert_eq!(job_count(&mut engine, "dyn"), 1, "{events:?}");
+    let events = complete_one(&mut engine, "dyn");
+    assert_eq!(writes_of(&events, "mapped"), vec![Value::Int(42)]);
+    assert_eq!(engine.variables(inst).get("listenerType"), None);
+}
+
+#[test]
+fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_ends() {
+    // Review r4562643140: the held start payload must not outlive its event
+    // sub-process container — neither across repeated non-interrupting runs
+    // (normal completion) nor on instance termination.
+    for completed_via_listener in [false, true] {
+        let mut engine = Engine::new();
+        let listener = r#"<zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="esp-gate" />
+               </zeebe:executionListeners>"#;
+        let ext = if completed_via_listener { listener } else { "" };
+        let (inst, _) = start_xml(&mut engine, &esp_payload_xml(false, false, ext, ""));
+        for n in 0..3 {
+            engine
+                .apply_command(Command::CorrelateMessage {
+                    message_name: "m".into(),
+                    correlation_key: "7".into(),
+                    variables: vars(&[("payload", Value::Int(n))]),
+                    business_id: None,
+                })
+                .unwrap();
+        }
+        let held = engine.state.instances[&inst].esp_held_payloads.len();
+        if completed_via_listener {
+            // Containers still parked on their listener legitimately hold.
+            assert!(held > 0, "listener-deferred starts hold their payload");
+            engine
+                .apply_command(Command::CancelInstance { instance_key: inst })
+                .unwrap();
+            assert!(
+                engine.state.instances[&inst].esp_held_payloads.is_empty(),
+                "termination clears held payloads"
+            );
+        } else {
+            assert_eq!(held, 0, "completed ESP runs leave no held payload");
+        }
+    }
+}

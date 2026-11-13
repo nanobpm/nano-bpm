@@ -43,6 +43,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ScopedVariablesUpdated { .. }
         | Event::VariableScopeCreated { .. }
         | Event::VariableScopeDestroyed { .. }
+        | Event::EventSubProcessPayloadHeld { .. }
         | Event::AgentInstanceCreated { .. }
         | Event::AgentInstanceUpdated { .. }
         | Event::AgentInstanceCompleted { .. }

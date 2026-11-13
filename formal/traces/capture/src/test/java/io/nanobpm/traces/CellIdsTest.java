@@ -82,5 +82,6 @@ public class CellIdsTest {
     assertEquals(null, CellIds.elementCellOrNull("PROCESS"));
     assertEquals(null, CellIds.elementCellOrNull("MULTI_INSTANCE_BODY"));
     assertEquals("element:ServiceTask", CellIds.elementCellOrNull("SERVICE_TASK"));
+    assertEquals("element:SubProcess", CellIds.elementCellOrNull("EVENT_SUB_PROCESS"));
   }
 }

@@ -33,10 +33,10 @@
 //!   `errorEventDefinition`, `escalationEventDefinition` or
 //!   `conditionalEventDefinition`; `isInterrupting="false"` marks it
 //!   non-interrupting (the default is interrupting; an error start is always
-//!   interrupting). This wave-0 slice *represents* the element
-//!   ([`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)) and its
-//!   trigger: deploying such a model
-//!   succeeds, but the event sub-process is not yet triggered at runtime.
+//!   interrupting). It is modelled as
+//!   [`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)
+//!   carrying its trigger; the engine arms the trigger while the enclosing
+//!   scope is active (see the engine-core README for the runtime semantics).
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`

@@ -1827,6 +1827,7 @@ mod tests {
                 adhoc_instances: HashMap::new(),
                 scope_parents: HashMap::new(),
                 scope_variables: HashMap::new(),
+                esp_held_payloads: HashMap::new(),
                 compensable: Default::default(),
                 compensation_waits: HashMap::new(),
                 agent_instances: HashMap::new(),
