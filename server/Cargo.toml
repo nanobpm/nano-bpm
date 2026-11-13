@@ -84,6 +84,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # flat observability config at startup — no hot-path involvement.
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
+# Random correlation keys for MCP process-tool calls (Camunda parity, #1499).
+uuid = { version = "1", features = ["v4"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the

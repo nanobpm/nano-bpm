@@ -33,6 +33,7 @@
 
 pub(crate) mod cluster_schemas;
 pub(crate) mod cluster_tools;
+pub(crate) mod processes_tools;
 
 use serde_json::{Value, json};
 
@@ -88,8 +89,22 @@ pub(crate) type DispatchFuture<'a> =
 pub(crate) struct ToolServer {
     /// The mount path, e.g. `/mcp/cluster`.
     pub(crate) path: &'static str,
-    /// The tools this server exposes, in `tools/list` order.
+    /// The static tools this server exposes, in `tools/list` order.
     pub(crate) tools: Vec<Tool>,
+    /// An optional request-time tool resolver (the `/mcp/processes` per-process
+    /// tools). Its tools list *before* the static ones (Camunda's
+    /// `ProcessesToolRepository` order); a call resolves static tools first.
+    pub(crate) dynamic: Option<DynamicTools>,
+}
+
+/// A request-time tool source: the tool set is resolved from engine state on
+/// every `tools/list` / `tools/call` rather than fixed at mount time.
+pub(crate) struct DynamicTools {
+    /// The current dynamic tools as `tools/list` descriptors.
+    pub(crate) list: fn(&ServerImpl) -> Vec<Value>,
+    /// Execute a call against a dynamic tool name. Must return an `isError`
+    /// result (never panic) for a name it does not resolve.
+    pub(crate) call: for<'a> fn(&'a ServerImpl, String, Value) -> DispatchFuture<'a>,
 }
 
 impl ToolServer {
@@ -97,24 +112,25 @@ impl ToolServer {
         self.tools.iter().find(|t| t.name == name)
     }
 
-    /// Build the `tools/list` result payload.
-    fn tools_list(&self) -> Value {
-        let tools: Vec<Value> = self
-            .tools
-            .iter()
-            .map(|t| {
-                let mut tool = json!({
-                    "name": t.name,
-                    "title": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                });
-                if t.read_only {
-                    tool["annotations"] = json!({ "readOnlyHint": true });
-                }
-                tool
-            })
-            .collect();
+    /// Build the `tools/list` result payload: dynamic tools (resolved now)
+    /// followed by the static ones.
+    fn tools_list(&self, server: &ServerImpl) -> Value {
+        let mut tools: Vec<Value> = self
+            .dynamic
+            .as_ref()
+            .map_or_else(Vec::new, |d| (d.list)(server));
+        tools.extend(self.tools.iter().map(|t| {
+            let mut tool = json!({
+                "name": t.name,
+                "title": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            });
+            if t.read_only {
+                tool["annotations"] = json!({ "readOnlyHint": true });
+            }
+            tool
+        }));
         json!({ "tools": tools })
     }
 }
@@ -126,7 +142,10 @@ impl ToolServer {
 /// and startup banner on top of this single call site.
 pub(crate) fn mcp_router(server: ServerImpl) -> axum::Router {
     let mut app = axum::Router::new();
-    for srv in cluster_tools::cluster_tool_servers() {
+    let servers = cluster_tools::cluster_tool_servers()
+        .into_iter()
+        .chain(processes_tools::processes_tool_servers());
+    for srv in servers {
         // Each tool server is shared by every request to its path.
         let srv = std::sync::Arc::new(srv);
         let server = server.clone();
@@ -320,7 +339,7 @@ async fn handle_frame(server: &ServerImpl, srv: &ToolServer, frame: Value) -> Op
     Some(match env.method.as_str() {
         "initialize" => rpc_result(id, initialize_result()),
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, srv.tools_list()),
+        "tools/list" => rpc_result(id, srv.tools_list(server)),
         "tools/call" => handle_tool_call(server, srv, id, env.params).await,
         other => rpc_error(id, -32601, &format!("Method not found: {other}")),
     })
@@ -338,11 +357,13 @@ async fn handle_tool_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let Some(tool) = srv.find(name) else {
-        return rpc_result(id, tool_error_result(&format!("Unknown tool: {name}"), 400));
-    };
-    let payload = (tool.dispatch)(server, args).await;
-    rpc_result(id, payload)
+    if let Some(tool) = srv.find(name) {
+        return rpc_result(id, (tool.dispatch)(server, args).await);
+    }
+    if let Some(dynamic) = &srv.dynamic {
+        return rpc_result(id, (dynamic.call)(server, name.to_string(), args).await);
+    }
+    rpc_result(id, tool_error_result(&format!("Unknown tool: {name}"), 400))
 }
 
 /// The `initialize` result: protocol version, capabilities, server identity.
@@ -531,7 +552,7 @@ mod tests {
     #[test]
     fn tools_list_returns_the_18_cluster_tools() {
         let srv = cluster_server();
-        let list = srv.tools_list();
+        let list = srv.tools_list(&ServerImpl::default());
         let tools = list["tools"].as_array().expect("tools is an array");
         assert_eq!(tools.len(), 18, "exactly 18 cluster tools");
 
@@ -578,7 +599,7 @@ mod tests {
         let expected = snapshot["tools"].as_array().expect("snapshot tools array");
 
         let srv = cluster_server();
-        let list = srv.tools_list();
+        let list = srv.tools_list(&ServerImpl::default());
         let actual = list["tools"].as_array().unwrap();
 
         assert_eq!(
