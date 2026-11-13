@@ -589,7 +589,13 @@ impl Engine {
                         interrupting: *interrupting,
                     });
                 }
-                if let Some(element_id) = &element_id {
+                // A multi-instance CHILD shares its element id with the loop
+                // BODY, but the boundaries belong to the body: offer them at
+                // the body level (the next level out), so the child's own
+                // event sub-processes are not outranked by a body boundary.
+                let is_mi_child = eik != 0
+                    && self.is_multi_instance_body(instance_key, self.scope_of(instance_key, eik));
+                if let Some(element_id) = element_id.as_ref().filter(|_| !is_mi_child) {
                     if let Some((boundary_id, interrupting)) = boundary(element_id, exact) {
                         return Some(ThrowCatch::Boundary {
                             boundary_id,

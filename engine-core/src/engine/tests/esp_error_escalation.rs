@@ -556,3 +556,97 @@ fn empty_job_error_code_prefers_a_catch_all_event_subprocess_over_a_catch_all_bo
     assert!(activated(&events, "esp"));
     assert!(!activated(&events, "bnd"));
 }
+
+// --- Multi-instance: boundaries belong to the BODY, not each child --------
+
+fn mi_spec() -> crate::model::MultiInstance {
+    crate::model::MultiInstance {
+        input_collection: "=items".to_string(),
+        input_element: Some("item".to_string()),
+        output_collection: None,
+        output_element: None,
+        completion_condition: None,
+        cancel_remaining_instances: true,
+        sequential: false,
+    }
+}
+
+fn create_with_items(engine: &mut Engine, def: ProcessDefinition) -> (Key, Vec<Event>) {
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut vars_in = HashMap::new();
+    vars_in.insert(
+        "items".to_string(),
+        Value::List(vec![Value::Int(1), Value::Int(2)]),
+    );
+    let events = engine
+        .apply_command(Command::create_instance_with("p", vars_in))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    (inst, events)
+}
+
+#[test]
+fn catch_all_esp_inside_a_multi_instance_child_beats_an_exact_error_boundary_on_the_body() {
+    let mut engine = Engine::new();
+    let b = sub_task()
+        .with_multi_instance("sub", mi_spec())
+        .error_boundary_event("bnd", "sub", "E1")
+        .end_event("bnd_end")
+        .connect("bnd", "bnd_end");
+    let def = with_esp(b, "esp", err(None), true, Some("sub"))
+        .build()
+        .unwrap();
+    let (inst, _) = create_with_items(&mut engine, def);
+    let events = throw_error(&mut engine, "E1", HashMap::new());
+    assert!(activated(&events, "esp"), "the child's ESP catches");
+    assert!(!activated(&events, "bnd"), "the body boundary does not");
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+}
+
+#[test]
+fn catch_all_esp_inside_a_multi_instance_child_beats_an_exact_escalation_boundary_on_the_body() {
+    let mut engine = Engine::new();
+    let b = esc_sub()
+        .with_multi_instance("sub", mi_spec())
+        .escalation_boundary_event("bnd", "sub", "ESC")
+        .end_event("bnd_end")
+        .connect("bnd", "bnd_end");
+    let def = with_esp(b, "esp", esc(None), true, Some("sub"))
+        .build()
+        .unwrap();
+    let (inst, events) = create_with_items(&mut engine, def);
+    assert!(activated(&events, "esp"), "the child's ESP catches");
+    assert!(!activated(&events, "bnd"), "the body boundary does not");
+    assert!(!engine.is_completed(inst));
+}
+
+#[test]
+fn error_reaching_a_multi_instance_body_boundary_tears_down_the_whole_loop() {
+    let mut engine = Engine::new();
+    let def = sub_task()
+        .with_multi_instance("sub", mi_spec())
+        .error_boundary_event("bnd", "sub", "E1")
+        .end_event("bnd_end")
+        .connect("bnd", "bnd_end")
+        .build()
+        .unwrap();
+    let (inst, _) = create_with_items(&mut engine, def);
+    assert_eq!(job_types(&engine), vec!["work", "work"]);
+    let events = throw_error(&mut engine, "E1", HashMap::new());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| activated(std::slice::from_ref(e), "bnd"))
+            .count(),
+        1,
+        "the body boundary fires exactly once"
+    );
+    assert!(
+        job_types(&engine).is_empty(),
+        "every child job is cancelled"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the instance completes via the boundary"
+    );
+}

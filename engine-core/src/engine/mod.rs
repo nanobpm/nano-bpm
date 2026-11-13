@@ -3362,6 +3362,18 @@ impl Engine {
                         for event in self.resolve_incidents_on(instance_key, caught_eik) {
                             self.emit(&mut log, event);
                         }
+                        // A boundary caught at a multi-instance BODY: clear the
+                        // body's active-child record too (only
+                        // `MultiInstanceCompleted` does), or the loop hangs.
+                        if self.is_multi_instance_body(instance_key, caught_eik) {
+                            self.emit(
+                                &mut log,
+                                Event::MultiInstanceCompleted {
+                                    instance_key,
+                                    body_key: caught_eik,
+                                },
+                            );
+                        }
                         self.emit(
                             &mut log,
                             Event::ElementCompleting {
