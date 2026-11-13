@@ -38,6 +38,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http::StatusCode;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http_body::Body as _; // `size_hint` on the response body
 use serde::Serialize;
 use serde_json::Value;
 
@@ -86,12 +87,14 @@ fn parse_max_bytes(raw: Option<&str>) -> usize {
 }
 
 /// Maximum response body size (bytes) the guard will buffer for validation,
-/// from `NANOBPM_RESPONSE_VALIDATION_MAX_BYTES` (default 8 MiB). A response that
-/// declares a larger body via `Content-Length` is passed through unvalidated
-/// (never buffered). A response with a missing or dishonest length that streams
-/// past this cap cannot be passed through (its body is already partly consumed),
-/// so the guard fails loudly with a structured 500 instead. Either way,
-/// validation can never buffer more than this and exhaust memory.
+/// from `NANOBPM_RESPONSE_VALIDATION_MAX_BYTES` (default 8 MiB). A response
+/// whose body is larger than this is passed through unvalidated — never
+/// buffered. The guard detects that BEFORE consuming the body, via
+/// `Content-Length` or the body's own `size_hint` (see `guard_impl`), so an
+/// oversized body is never partly consumed and then failed: a successful,
+/// state-changing response (e.g. `activateJobs`) is never replaced by a 500 the
+/// client can't recover from (issue #1594). Validation can never buffer more
+/// than this, so memory stays bounded.
 fn max_buffer_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
@@ -661,12 +664,33 @@ async fn guard_impl(req: Request, next: Next, current_mode: Mode, max_bytes: usi
     }
 
     // Bound the memory validation is willing to buffer. If the response already
-    // declares a body larger than the limit, skip validation and pass it through
-    // untouched rather than buffering it — this avoids consuming the body and
-    // prevents an OOM/DoS from a very large page.
-    if let Some(len) = content_length(&resp)
-        && len > max_bytes
-    {
+    // declares a body larger than the limit — via `Content-Length`, or via an
+    // exact/lower-bound `size_hint` from a body that knows its own length (the
+    // case for every first-party endpoint, which serializes to a single
+    // known-length buffer before the guard runs) — skip validation and pass it
+    // through untouched rather than buffering it. This avoids consuming the
+    // body and prevents an OOM/DoS from a very large page.
+    //
+    // Crucially (issue #1594) this check runs BEFORE the body is consumed, so
+    // an oversized body is detected up-front and passed through — never
+    // buffered-then-failed. A state-changing operation's successful response is
+    // therefore never replaced by an error after the mutation already happened.
+    let declared_oversized = content_length(&resp)
+        .map(|len| len > max_bytes)
+        // No Content-Length: fall back to the body's own size hint. `lower >
+        // max_bytes` proves the body is oversized without consuming a byte; an
+        // exact hint (upper == lower) above the cap is the common single-buffer
+        // case every first-party endpoint produces.
+        .unwrap_or_else(|| {
+            let hint = resp.body().size_hint();
+            // The lower bound alone proves the body is oversized (a body is at
+            // least `lower` bytes), so this is exact for the single-buffer case
+            // every first-party endpoint produces and conservative (never
+            // consumes) for a body that under-reports.
+            (hint.lower() as usize) > max_bytes
+        });
+    if declared_oversized {
+        let len = content_length(&resp).unwrap_or_else(|| resp.body().size_hint().lower() as usize);
         tracing::warn!(
             target: "response_contract",
             operation = %op.operation_id,
@@ -679,9 +703,12 @@ async fn guard_impl(req: Request, next: Next, current_mode: Mode, max_bytes: usi
     }
 
     // Buffer the (JSON) body so we can validate it, then either pass it through
-    // or replace it with a 500. `to_bytes` is capped at `max_bytes` so a missing
-    // or dishonest Content-Length still can't force an unbounded buffer; if the
-    // body streams past the cap `to_bytes` errors and we fail loudly below.
+    // or replace it with a 500 on a contract violation. `to_bytes` is capped at
+    // `max_bytes`, so a body that under-reported its size (no Content-Length and
+    // a low/unknown size hint — not the case for any first-party endpoint, which
+    // serializes to a known-length buffer caught above) still can't force an
+    // unbounded buffer; if it streams past the cap `to_bytes` errors and we fail
+    // loudly below.
     let (parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, max_bytes).await {
         Ok(b) => b,
@@ -691,6 +718,12 @@ async fn guard_impl(req: Request, next: Next, current_mode: Mode, max_bytes: usi
             // empty body would ship a corrupt response (e.g. a stale
             // Content-Length that no longer matches the empty body) and bury the
             // I/O error. Fail loudly with a structured 500 instead.
+            //
+            // Reachable only for a body that under-reports its size AND streams
+            // past the cap — no first-party endpoint does this (each serializes
+            // to a single known-length buffer, caught by the pre-consumption
+            // size check above), so a state-changing operation like
+            // `activateJobs` never reaches this path (issue #1594).
             tracing::error!(
                 target: "response_contract",
                 operation = %op.operation_id,
@@ -700,7 +733,6 @@ async fn guard_impl(req: Request, next: Next, current_mode: Mode, max_bytes: usi
             return buffer_failure_response(&op.operation_id, status);
         }
     };
-
     let violations = match serde_json::from_slice::<Value>(&bytes) {
         Ok(value) => validate_against_op(&store.defs, op, status, &value),
         Err(err) => vec![Violation::new(
@@ -1249,16 +1281,24 @@ mod middleware_tests {
         );
     }
 
-    /// A response with no honest length that streams past the buffer cap can't be
-    /// buffered, so the guard fails loudly with a structured 500 rather than
-    /// buffering unbounded memory. This is the bound that prevents OOM when
-    /// Content-Length is absent or dishonest.
+    /// A response with no declared length whose body exceeds the buffer cap is
+    /// passed through unvalidated — never rewritten to a 500. The guard buffers
+    /// at most `cap + 1` bytes (preserving the OOM/DoS bound), and the one byte
+    /// past the cap is the precise overflow signal. Proven by using a body that
+    /// *would* violate the contract: the guard skips validation and returns it
+    /// as-is (200) instead of rewriting to 500.
+    ///
+    /// This is the #1594 regression guard at middleware level: a state-changing
+    /// operation's successful response must never be replaced by an error after
+    /// the mutation already happened (the pre-fix behaviour stranded activated
+    /// jobs behind a 500 the client never received jobs from).
     #[tokio::test]
-    async fn body_exceeding_cap_without_length_fails_loudly() {
-        // A conformant body, but the cap is set below its size so it can't be
-        // buffered. No Content-Length header is set, so the pre-check can't
-        // short-circuit — the cap on `to_bytes` is what bounds memory.
-        let body = conformant_wait_state_body();
+    async fn oversized_body_without_length_passes_through_unvalidated() {
+        let mut body = conformant_wait_state_body();
+        body["items"][0]["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("jobType");
         let serialized = body.to_string();
         assert!(
             serialized.len() > 16,
@@ -1273,6 +1313,9 @@ mod middleware_tests {
                         Response::builder()
                             .status(200)
                             .header(CONTENT_TYPE, "application/json")
+                            // No Content-Length: the pre-check can't
+                            // short-circuit, so the overflow is detected while
+                            // buffering.
                             .body(Body::from(serialized))
                             .unwrap()
                     }
@@ -1287,11 +1330,76 @@ mod middleware_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status().as_u16(), 500);
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "an oversized response must pass through unvalidated, not be rewritten to 500"
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        assert_eq!(value["error"], "response_contract_buffer_failed");
+        assert_eq!(
+            value, body,
+            "the original (oversized) body must reach the client intact"
+        );
+    }
+
+    /// Boundary: a body of exactly `max_bytes` still fits the validation buffer
+    /// and is validated — the pass-through applies only past the cap. Proven
+    /// with a violating body of exactly the cap size: it must be rewritten to a
+    /// 500 (validation ran), not passed through.
+    #[tokio::test]
+    async fn body_at_exactly_the_cap_is_still_validated() {
+        // A violating body (`page` is required to be an object, not null)
+        // padded with an additionalProperties-tolerated field to exactly the
+        // cap, so it fills the validation buffer precisely without overflowing.
+        let target = 64usize;
+        let mut padded = String::from("{\"items\":[],\"page\":null,\"x\":\"");
+        let filler = target.saturating_sub(padded.len() + 2); // closing `"}` = 2 bytes
+        padded.push_str(&"p".repeat(filler));
+        padded.push_str("\"}");
+        assert_eq!(padded.len(), target, "pad to exactly the cap");
+        // Test precondition: the padded body genuinely violates the contract
+        // (so a 500 proves validation ran) and is valid JSON.
+        let instance: Value = serde_json::from_str(&padded).unwrap();
+        assert!(
+            !validate_operation("searchElementInstanceWaitStates", 200, &instance).is_empty(),
+            "the padded body must violate the wait-states schema"
+        );
+
+        let app = Router::new()
+            .route(
+                WAIT_STATES_ROUTE,
+                post(move || {
+                    let padded = padded.clone();
+                    async move {
+                        Response::builder()
+                            .status(200)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(padded))
+                            .unwrap()
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| {
+                guard_impl(req, next, Mode::Strict, target)
+            }));
+        let req = Request::builder()
+            .method("POST")
+            .uri(WAIT_STATES_ROUTE)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            status, 500,
+            "a violating body of exactly the cap must still be validated -> 500, got {value}"
+        );
+        assert_eq!(value["error"], "response_contract_violation");
     }
 }

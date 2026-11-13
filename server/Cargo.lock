@@ -1582,6 +1582,7 @@ dependencies = [
  "futures-util",
  "headers",
  "http",
+ "http-body",
  "libc",
  "nano-falcon-protocol",
  "nano-provisioning-advisor",
