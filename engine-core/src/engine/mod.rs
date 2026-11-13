@@ -4981,9 +4981,13 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
-                let mut open_joins: Vec<String> = instance.join_instances.keys().cloned().collect();
+                // Joins are keyed per flow-scope instance (#1580): every open
+                // join of every scope instance is checked.
+                let mut open_joins: Vec<state::JoinKey> =
+                    instance.join_instances.keys().cloned().collect();
                 open_joins.sort();
-                for src in open_joins {
+                for join in open_joins {
+                    let src = join.element_id.clone();
                     let join_kind = source_def.definition.elements.get(&src).map(|e| &e.kind);
                     let is_parallel_join = matches!(join_kind, Some(ElementKind::ParallelGateway));
                     let is_inclusive_join =
@@ -5008,7 +5012,7 @@ impl Engine {
                     // (`join_counts`) counts as one taken flow of the arity it
                     // was recorded under, so it needs parity just like a
                     // parallel join.
-                    let has_unidentified = instance.join_counts.get(&src).is_some_and(|n| *n > 0);
+                    let has_unidentified = instance.join_counts.get(&join).is_some_and(|n| *n > 0);
                     if is_parallel_join || has_unidentified {
                         let source_incoming_count = source_def.definition.incoming_count(&src);
                         let target_incoming_count = target.definition.incoming_count(tgt);
@@ -5038,7 +5042,7 @@ impl Engine {
                     // parity check above keeps that reading valid in the target.
                     // Rejecting them instead would strand every half-open
                     // legacy join on its old definition.
-                    if let Some(arrivals) = instance.join_flow_arrivals.get(&src) {
+                    if let Some(arrivals) = instance.join_flow_arrivals.get(&join) {
                         for (flow, _) in arrivals.iter() {
                             let migrated = IncomingFlow {
                                 from: mapped.get(&flow.from).unwrap_or(&flow.from).clone(),
@@ -6397,22 +6401,24 @@ impl Engine {
         let Step::Activate {
             instance_key,
             element_id,
+            scope,
             via: Some(_),
-            ..
         } = step
         else {
             return Vec::new();
         };
+        let join = state::JoinKey::new(*scope, element_id.as_str());
         let holds_tokens = self.state.instances.get(instance_key).is_some_and(|i| {
-            i.join_flow_arrivals.contains_key(element_id) || i.join_counts.contains_key(element_id)
+            i.join_flow_arrivals.contains_key(&join) || i.join_counts.contains_key(&join)
         });
         if holds_tokens
             && self.join_kind(*instance_key, element_id).is_some()
-            && self.join_eik(*instance_key, element_id).is_none()
+            && self.join_eik(*instance_key, *scope, element_id).is_none()
         {
             vec![Event::ParallelJoinReset {
                 instance_key: *instance_key,
                 element_id: element_id.clone(),
+                scope: Some(*scope),
             }]
         } else {
             Vec::new()
@@ -6443,7 +6449,9 @@ impl Engine {
             {
                 debug_assert!(
                     instance.join_instances.contains_key(join),
-                    "instance {key}: join `{join}` holds tokens but no open join instance"
+                    "instance {key}: join `{}` (scope {}) holds tokens but no open join instance",
+                    join.element_id,
+                    join.scope
                 );
             }
         }
@@ -14380,8 +14388,8 @@ impl Engine {
         scope: Key,
         events: &mut Vec<Event>,
     ) {
-        if self.join_eik(instance_key, element_id) == Some(element_instance_key) {
-            let arrivals = self.join_arrivals(instance_key, element_id);
+        if self.join_eik(instance_key, scope, element_id) == Some(element_instance_key) {
+            let arrivals = self.join_arrivals(instance_key, scope, element_id);
             self.fire_join(instance_key, element_id, scope, arrivals, events);
         }
     }
@@ -14434,6 +14442,7 @@ impl Engine {
                 instance_key,
                 element_id: to.clone(),
                 flow: Some(flow.clone()),
+                scope: Some(scope),
             });
         }
         (
@@ -14492,17 +14501,22 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.join_counts.get(&element_id).copied())
+            .and_then(|i| {
+                i.join_counts
+                    .get(&state::JoinKey::new(scope, element_id.as_str()))
+                    .copied()
+            })
             .unwrap_or(0);
         if via.is_none() {
             events.push(Event::ParallelJoinTokenArrived {
                 instance_key,
                 element_id: element_id.clone(),
                 flow: None,
+                scope: Some(scope),
             });
             unidentified += 1;
         }
-        let arrivals = self.join_arrivals(instance_key, &element_id);
+        let arrivals = self.join_arrivals(instance_key, scope, &element_id);
         let taken = arrivals.distinct_flows() + unidentified;
         let all_taken = taken >= self.incoming_count(instance_key, &element_id);
         let accepted = match join {
@@ -14520,7 +14534,7 @@ impl Engine {
             }
         };
 
-        let open = self.join_eik(instance_key, &element_id);
+        let open = self.join_eik(instance_key, scope, &element_id);
         if !accepted {
             if taken > 0 && open.is_none() {
                 self.open_join(instance_key, &element_id, scope, &mut events);
@@ -14676,6 +14690,7 @@ impl Engine {
         events.push(Event::ParallelJoinFired {
             instance_key,
             element_id: element_id.to_string(),
+            scope: Some(scope),
         });
         arrivals.consume_one_each();
         if !arrivals.is_empty() {
@@ -14683,12 +14698,21 @@ impl Engine {
         }
     }
 
-    /// The per-flow tokens currently waiting on `element_id`'s open join.
-    fn join_arrivals(&self, instance_key: Key, element_id: &str) -> state::FlowArrivals {
+    /// The per-flow tokens currently waiting on `element_id`'s open join in
+    /// flow-scope instance `scope`.
+    pub(crate) fn join_arrivals(
+        &self,
+        instance_key: Key,
+        scope: Key,
+        element_id: &str,
+    ) -> state::FlowArrivals {
         self.state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.join_flow_arrivals.get(element_id))
+            .and_then(|i| {
+                i.join_flow_arrivals
+                    .get(&state::JoinKey::new(scope, element_id))
+            })
             .cloned()
             .unwrap_or_default()
     }

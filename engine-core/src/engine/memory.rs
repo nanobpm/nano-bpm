@@ -66,6 +66,11 @@ impl Engine {
                 instance.activating.extend(element_keys);
             }
         }
+        // A legacy (pre-#1580) snapshot keyed join bookkeeping by element id
+        // alone; key it by its flow-scope instance.
+        for instance in snapshot.state.instances.values_mut() {
+            instance.resolve_legacy_join_scopes();
+        }
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,

@@ -173,15 +173,208 @@ impl FlowArrivals {
     }
 }
 
+/// The identity of one join's bookkeeping: the join gateway **in one runtime
+/// flow-scope instance** (#1580). Zeebe counts a join's taken sequence flows
+/// per flow-scope instance, so two live instances of the same scope (two
+/// multi-instance children, an embedded sub-process entered by two concurrent
+/// tokens, concurrent non-interrupting event sub-process executions) each own
+/// an independent join: one execution's arrival can never satisfy another's.
+///
+/// `scope` is the enclosing flow-scope element instance (`0` = process root).
+/// Serialized (within the join maps) as a list of `{scope, element_id, value}`
+/// entries; see [`join_map_serde`] for the legacy element-keyed form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JoinKey {
+    pub scope: Key,
+    pub element_id: ElementId,
+}
+
+impl JoinKey {
+    pub fn new(scope: Key, element_id: impl Into<ElementId>) -> Self {
+        Self {
+            scope,
+            element_id: element_id.into(),
+        }
+    }
+
+    /// `element_id`'s join in the process root scope.
+    pub fn root(element_id: impl Into<ElementId>) -> Self {
+        Self::new(0, element_id)
+    }
+}
+
+/// The placeholder scope a legacy (pre-#1580) element-keyed join entry decodes
+/// with. [`ProcessInstance::resolve_legacy_join_scopes`] replaces it with the
+/// real flow scope on load, and the state applier resolves a legacy event's
+/// missing scope ([`ProcessInstance::legacy_join_key`]); it never survives
+/// into a running engine.
+pub const UNRESOLVED_JOIN_SCOPE: Key = Key::MAX;
+
+/// Serde for the `HashMap<JoinKey, V>` join maps (#1580). Serializes as a list
+/// of `{scope, element_id, value}` entries sorted by key (deterministic bytes).
+/// Deserializes either that list or the legacy (pre-#1580) JSON object keyed
+/// by element id, whose entries take [`UNRESOLVED_JOIN_SCOPE`] until
+/// [`ProcessInstance::resolve_legacy_join_scopes`] runs.
+#[cfg(feature = "serde")]
+pub mod join_map_serde {
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::marker::PhantomData;
+
+    use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::ser::{Serialize, SerializeSeq, Serializer};
+
+    use super::{JoinKey, UNRESOLVED_JOIN_SCOPE};
+    use crate::model::ElementId;
+
+    #[derive(serde::Serialize)]
+    struct EntryRef<'a, V> {
+        scope: u64,
+        element_id: &'a str,
+        value: &'a V,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Entry<V> {
+        scope: u64,
+        element_id: ElementId,
+        value: V,
+    }
+
+    pub fn serialize<S: Serializer, V: Serialize>(
+        map: &HashMap<JoinKey, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut seq = serializer.serialize_seq(Some(entries.len()))?;
+        for (key, value) in entries {
+            seq.serialize_element(&EntryRef {
+                scope: key.scope,
+                element_id: &key.element_id,
+                value,
+            })?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<HashMap<JoinKey, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        struct JoinMapVisitor<V>(PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for JoinMapVisitor<V> {
+            type Value = HashMap<JoinKey, V>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a list of join entries or a legacy element-keyed join map")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut map = HashMap::new();
+                while let Some(Entry {
+                    scope,
+                    element_id,
+                    value,
+                }) = seq.next_element::<Entry<V>>()?
+                {
+                    map.insert(JoinKey { scope, element_id }, value);
+                }
+                Ok(map)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut map = HashMap::new();
+                while let Some((element_id, value)) = access.next_entry::<ElementId, V>()? {
+                    map.insert(
+                        JoinKey {
+                            scope: UNRESOLVED_JOIN_SCOPE,
+                            element_id,
+                        },
+                        value,
+                    );
+                }
+                Ok(map)
+            }
+        }
+        deserializer.deserialize_any(JoinMapVisitor(PhantomData))
+    }
+}
+
 impl ProcessInstance {
     /// How many of `join`'s incoming flows have been taken: identified flows
     /// with a waiting token plus unidentified arrivals (each counted as one
     /// flow).
-    pub fn join_flows_taken(&self, join: &str) -> usize {
+    pub fn join_flows_taken(&self, join: &JoinKey) -> usize {
         self.join_flow_arrivals
             .get(join)
             .map_or(0, FlowArrivals::distinct_flows)
             + self.join_counts.get(join).copied().unwrap_or(0)
+    }
+
+    /// Every join key holding bookkeeping (arrivals, unidentified counts or an
+    /// open join instance), sorted and de-duplicated.
+    pub fn join_keys(&self) -> Vec<JoinKey> {
+        let mut keys: Vec<JoinKey> = self
+            .join_counts
+            .keys()
+            .chain(self.join_flow_arrivals.keys())
+            .chain(self.join_instances.keys())
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The join key a **legacy** (pre-#1580, scope-less) join event addresses.
+    /// Before #1580 joins were keyed by element id alone, so at most one slot
+    /// per element exists: reuse it if present; otherwise the event opens the
+    /// slot in an as-yet unknown scope ([`UNRESOLVED_JOIN_SCOPE`]), which the
+    /// join's `ParallelJoinOpened` (or a load) then resolves.
+    pub fn legacy_join_key(&self, element_id: &str) -> JoinKey {
+        self.join_keys()
+            .into_iter()
+            .find(|k| k.element_id == element_id)
+            .unwrap_or_else(|| JoinKey::new(UNRESOLVED_JOIN_SCOPE, element_id))
+    }
+
+    /// Move every [`UNRESOLVED_JOIN_SCOPE`] entry of `element_id` onto `scope`
+    /// (merging into any entry already there).
+    pub fn rekey_unresolved_join(&mut self, element_id: &str, scope: Key) {
+        let from = JoinKey::new(UNRESOLVED_JOIN_SCOPE, element_id);
+        let to = JoinKey::new(scope, element_id);
+        if let Some(n) = self.join_counts.remove(&from) {
+            *self.join_counts.entry(to.clone()).or_insert(0) += n;
+        }
+        if let Some(arrivals) = self.join_flow_arrivals.remove(&from) {
+            let slot = self.join_flow_arrivals.entry(to.clone()).or_default();
+            for (flow, n) in arrivals.iter() {
+                slot.add(flow, n);
+            }
+        }
+        if let Some(eik) = self.join_instances.remove(&from) {
+            self.join_instances.insert(to, eik);
+        }
+    }
+
+    /// Resolve the scope of every legacy (pre-#1580) element-keyed join entry
+    /// decoded from an old snapshot: the scope of the open join instance
+    /// holding it (`scopes`, root when absent), as each element had exactly one
+    /// slot. Run wherever a snapshot instance is loaded; a no-op otherwise.
+    pub fn resolve_legacy_join_scopes(&mut self) {
+        let unresolved: Vec<ElementId> = self
+            .join_keys()
+            .into_iter()
+            .filter(|k| k.scope == UNRESOLVED_JOIN_SCOPE)
+            .map(|k| k.element_id)
+            .collect();
+        for element_id in unresolved {
+            let scope = self
+                .join_instances
+                .get(&JoinKey::new(UNRESOLVED_JOIN_SCOPE, element_id.as_str()))
+                .and_then(|eik| self.scopes.get(eik).copied())
+                .unwrap_or(0);
+            self.rekey_unresolved_join(&element_id, scope);
+        }
     }
 }
 
@@ -642,16 +835,18 @@ pub struct ProcessInstance {
     /// arrivals journaled before #1233 (#1237 for inclusive joins) and
     /// activations that did not come over a flow. A join counts each of these
     /// as one taken incoming flow; a firing clears them all.
-    pub join_counts: HashMap<ElementId, usize>,
+    #[cfg_attr(feature = "serde", serde(with = "join_map_serde"))]
+    pub join_counts: HashMap<JoinKey, usize>,
     /// For each open parallel- or inclusive-gateway join: arrivals per
     /// identified incoming flow (Zeebe's "number of taken sequence flows",
     /// #1233, #1237). Absent from
     /// pre-#1233 snapshots, hence `serde(default)`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub join_flow_arrivals: HashMap<ElementId, FlowArrivals>,
+    #[cfg_attr(feature = "serde", serde(default, with = "join_map_serde"))]
+    pub join_flow_arrivals: HashMap<JoinKey, FlowArrivals>,
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
-    pub join_instances: HashMap<ElementId, Key>,
+    #[cfg_attr(feature = "serde", serde(with = "join_map_serde"))]
+    pub join_instances: HashMap<JoinKey, Key>,
     /// The [`join_instances`](Self::join_instances) that are **parked**: they
     /// hold waiting tokens but have not activated (#1244). Zeebe keeps a join's
     /// waiting tokens as active sequence flows on the flow scope and writes no
@@ -2328,6 +2523,7 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
         incidents,
     } = snapshot;
     reconstruct_owed_activations(&mut instance, &incidents);
+    instance.resolve_legacy_join_scopes();
     let key = instance.key;
     state.instances.insert(key, instance);
     for job in jobs {

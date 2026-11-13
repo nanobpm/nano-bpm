@@ -143,14 +143,19 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
             .unwrap();
         let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
         let replayed = Engine::replay_partition(expected.partition_id, journal);
+        // Load the archived snapshot the way a host does (`from_snapshot`), so
+        // its load-time normalizations apply — e.g. legacy element-keyed join
+        // bookkeeping is keyed by flow-scope instance (#1580).
+        let next_local = expected.next_local;
+        let expected = Engine::from_snapshot(expected);
         assert_eq!(
             replayed.state(),
-            &expected.state,
+            expected.state(),
             "archived format {version}"
         );
         assert_eq!(
             replayed.snapshot().next_local,
-            expected.next_local,
+            next_local,
             "archived allocator {version}"
         );
     }
@@ -226,7 +231,10 @@ fn pre_1233_half_open_parallel_join_fires_after_upgrade() {
     let mut upgraded = Engine::replay(legacy);
     let instance = upgraded.instance(instance_key).unwrap();
     assert!(instance.join_flow_arrivals.is_empty());
-    assert_eq!(instance.join_flows_taken("join"), 1);
+    assert_eq!(
+        instance.join_flows_taken(&nanobpmn_engine_core::JoinKey::root("join")),
+        1
+    );
 
     let job = upgraded.activate_jobs("sync-task", "w", 1, 60_000, 0)[0].key;
     upgraded.apply_command(Command::complete_job(job)).unwrap();

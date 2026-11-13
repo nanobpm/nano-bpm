@@ -820,12 +820,14 @@ impl Engine {
             .map(|i| i.key)
     }
 
-    pub(crate) fn join_eik(&self, instance_key: Key, element_id: &str) -> Option<Key> {
+    /// The open join instance of `element_id` in flow-scope instance `scope`
+    /// (#1580: joins count per flow-scope instance).
+    pub(crate) fn join_eik(&self, instance_key: Key, scope: Key, element_id: &str) -> Option<Key> {
         self.state
             .instances
             .get(&instance_key)?
             .join_instances
-            .get(element_id)
+            .get(&state::JoinKey::new(scope, element_id))
             .copied()
     }
 

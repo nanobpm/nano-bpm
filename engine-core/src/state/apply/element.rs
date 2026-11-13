@@ -95,9 +95,18 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance
-                    .join_instances
-                    .insert(element_id.clone(), *element_instance_key);
+                // The join's flow-scope instance: carried since #1244; a
+                // pre-#1244 join activated visibly, registering its scope.
+                let flow_scope = scope
+                    .or_else(|| instance.scopes.get(element_instance_key).copied())
+                    .unwrap_or(0);
+                // Arrivals a legacy (pre-#1580) journal counted before this
+                // open named no scope; they belong to this join.
+                instance.rekey_unresolved_join(element_id, flow_scope);
+                instance.join_instances.insert(
+                    JoinKey::new(flow_scope, element_id.as_str()),
+                    *element_instance_key,
+                );
                 // A parked join (#1244) holds its tokens in its flow scope
                 // without activating: register the key as live, but not as an
                 // activated element instance.
@@ -117,15 +126,17 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             instance_key,
             element_id,
             flow,
+            scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                let key = join_key(instance, element_id, *scope);
                 match flow {
                     Some(flow) => instance
                         .join_flow_arrivals
-                        .entry(element_id.clone())
+                        .entry(key)
                         .or_default()
                         .record(flow),
-                    None => *instance.join_counts.entry(element_id.clone()).or_insert(0) += 1,
+                    None => *instance.join_counts.entry(key).or_insert(0) += 1,
                 }
             }
         }
@@ -133,22 +144,28 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         Event::ParallelJoinReset {
             instance_key,
             element_id,
+            scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.join_counts.remove(element_id);
-                instance.join_flow_arrivals.remove(element_id);
+                let key = join_key(instance, element_id, *scope);
+                instance.join_counts.remove(&key);
+                instance.join_flow_arrivals.remove(&key);
                 // A reset parked join (#1244) never activated, so its tokens
                 // simply vanish with it: nothing completes or terminates.
-                // Drop EVERY parked key of this element, not just the one
-                // `join_instances` names: migration can merge two waiting
-                // joins onto one target, keeping both keys in `active` but
-                // only one in `join_instances`.
-                instance.join_instances.remove(element_id);
+                // Drop EVERY parked key of this element in this flow scope, not
+                // just the one `join_instances` names: migration can merge two
+                // waiting joins onto one target, keeping both keys in `active`
+                // but only one in `join_instances`. A parked join of the same
+                // element in ANOTHER scope instance is a different join (#1580).
+                instance.join_instances.remove(&key);
                 let parked: Vec<_> = instance
                     .parked_joins
                     .iter()
                     .copied()
-                    .filter(|eik| instance.active.get(eik) == Some(element_id))
+                    .filter(|eik| {
+                        instance.active.get(eik) == Some(element_id)
+                            && instance.scopes.get(eik).copied().unwrap_or(0) == key.scope
+                    })
                     .collect();
                 for eik in parked {
                     instance.parked_joins.remove(&eik);
@@ -170,18 +187,20 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         Event::ParallelJoinFired {
             instance_key,
             element_id,
+            scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                let key = join_key(instance, element_id, *scope);
                 // Unidentified arrivals predate per-flow counting and were
                 // consumed wholesale, as before #1233.
-                instance.join_counts.remove(element_id);
-                if let Some(arrivals) = instance.join_flow_arrivals.get_mut(element_id) {
+                instance.join_counts.remove(&key);
+                if let Some(arrivals) = instance.join_flow_arrivals.get_mut(&key) {
                     arrivals.consume_one_each();
                     if arrivals.is_empty() {
-                        instance.join_flow_arrivals.remove(element_id);
+                        instance.join_flow_arrivals.remove(&key);
                     }
                 }
-                instance.join_instances.remove(element_id);
+                instance.join_instances.remove(&key);
             }
         }
 
@@ -631,5 +650,14 @@ fn register_token(
         }
         // A parked join activating is no longer parked (#1244).
         instance.parked_joins.remove(&element_instance_key);
+    }
+}
+
+/// The join a join event addresses: `element_id` in its flow-scope instance
+/// (#1580), or — for a legacy scope-less event — the element's single slot.
+fn join_key(instance: &ProcessInstance, element_id: &str, scope: Option<Key>) -> JoinKey {
+    match scope {
+        Some(scope) => JoinKey::new(scope, element_id),
+        None => instance.legacy_join_key(element_id),
     }
 }

@@ -142,7 +142,7 @@ pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
     subscription_partition, ConditionalSubscription, DeployedProcess, Incident, IncidentKind,
     IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
-    JobSettlementOutcome, JobState, JobTerminalEnd, Key, MessageStartSubscription,
+    JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
     ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
     UserTask, UserTaskState, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK,

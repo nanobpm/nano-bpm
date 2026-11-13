@@ -381,18 +381,19 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 for element_id in instance.active.values_mut() {
                     remap_id(element_id);
                 }
-                // Both parallel-join maps are keyed by the join gateway's element
-                // id, so they must be remapped together to stay in sync (a stale
+                // The join maps are keyed by the join gateway's element id in
+                // its flow-scope instance (#1580; migration keeps element
+                // instance keys, so only the element id is remapped), so they must be remapped together to stay in sync (a stale
                 // `join_instances` key would make `join_eik` miss after migration
                 // and re-open an already-open join). `collect()` would silently
                 // drop entries if two source ids collapse onto one target id, so
                 // merge deterministically instead: sum the arrival counts, and
                 // keep the smallest element-instance key for the open join.
                 if !instance.join_counts.is_empty() {
-                    let mut remapped: HashMap<ElementId, usize> =
+                    let mut remapped: HashMap<JoinKey, usize> =
                         HashMap::with_capacity(instance.join_counts.len());
                     for (mut eid, count) in instance.join_counts.drain() {
-                        remap_id(&mut eid);
+                        remap_id(&mut eid.element_id);
                         *remapped.entry(eid).or_insert(0) += count;
                     }
                     instance.join_counts = remapped;
@@ -401,10 +402,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // source element, so both ids are remapped (the migration guard
                 // has already checked every flow exists in the target).
                 if !instance.join_flow_arrivals.is_empty() {
-                    let mut remapped: HashMap<ElementId, FlowArrivals> =
+                    let mut remapped: HashMap<JoinKey, FlowArrivals> =
                         HashMap::with_capacity(instance.join_flow_arrivals.len());
                     for (mut eid, mut arrivals) in instance.join_flow_arrivals.drain() {
-                        remap_id(&mut eid);
+                        remap_id(&mut eid.element_id);
                         arrivals.remap(remap_id);
                         let merged = remapped.entry(eid).or_default();
                         for (flow, count) in arrivals.iter() {
@@ -414,10 +415,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     instance.join_flow_arrivals = remapped;
                 }
                 if !instance.join_instances.is_empty() {
-                    let mut remapped: HashMap<ElementId, Key> =
+                    let mut remapped: HashMap<JoinKey, Key> =
                         HashMap::with_capacity(instance.join_instances.len());
                     for (mut eid, eik) in instance.join_instances.drain() {
-                        remap_id(&mut eid);
+                        remap_id(&mut eid.element_id);
                         remapped
                             .entry(eid)
                             .and_modify(|existing| {

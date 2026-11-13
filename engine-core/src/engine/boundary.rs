@@ -589,6 +589,7 @@ impl Engine {
                 events.push(Event::ParallelJoinReset {
                     instance_key,
                     element_id,
+                    scope: Some(self.scope_of(instance_key, eik)),
                 });
                 continue;
             }
@@ -648,16 +649,12 @@ impl Engine {
             // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping (untouched by
             // `ElementCompleted`) cannot fire against a dead token if the scope
             // is ever re-entered.
-            if self
-                .state
-                .instances
-                .get(&instance_key)
-                .and_then(|i| i.join_instances.get(&element_id))
-                == Some(&eik)
-            {
+            let eik_scope = self.scope_of(instance_key, eik);
+            if self.join_eik(instance_key, eik_scope, &element_id) == Some(eik) {
                 events.push(Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.clone(),
+                    scope: Some(eik_scope),
                 });
             }
             events.push(Event::ElementCompleting {
@@ -1739,11 +1736,13 @@ impl Engine {
         // A parked join (#1244) never activated: drop its waiting tokens
         // without an element-instance record.
         if self.is_parked_join(instance_key, element_instance_key) {
+            let scope = Some(self.scope_of(instance_key, element_instance_key));
             self.emit(
                 log,
                 Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.to_string(),
+                    scope,
                 },
             );
             return;
@@ -1807,18 +1806,14 @@ impl Engine {
         // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping exactly
         // as descendant-scope teardown does, so a later arrival cannot fire it
         // against the cancelled branch's token.
-        if self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.join_instances.get(element_id))
-            == Some(&element_instance_key)
-        {
+        let eik_scope = self.scope_of(instance_key, element_instance_key);
+        if self.join_eik(instance_key, eik_scope, element_id) == Some(element_instance_key) {
             self.emit(
                 log,
                 Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.to_string(),
+                    scope: Some(eik_scope),
                 },
             );
         }
