@@ -220,6 +220,21 @@ impl Engine {
             }
         }
 
+        // Every move target must exist in the definition — validated up front
+        // so a move whose source has no active instances (and therefore spawns
+        // no activation) still rejects an unknown target instead of silently
+        // applying the rest of the modification.
+        for m in move_instructions {
+            if def.element(&m.target_element_id).is_none() {
+                return invalid_move(format!(
+                    "Expected to modify instance of process '{process_id}' but it contains one \
+                     or more move instructions with a target element id that could not be found \
+                     in the process: '{}'",
+                    m.target_element_id
+                ));
+            }
+        }
+
         // Zeebe `validateNoDuplicatedMoveInstructions`: no two by-id moves may
         // share a source element id.
         let mut seen_source_ids: Vec<&str> = Vec::new();
@@ -310,6 +325,9 @@ impl Engine {
                 .iter()
                 .filter(|(_, id)| id.as_str() == source_id)
                 .map(|(k, _)| *k)
+                // A parked join (#1244) never activated: it is no source
+                // instance to move (and is not terminable by key).
+                .filter(|k| !self.is_parked_join(instance_key, *k))
                 .collect();
             sources.sort_unstable();
             if self.multi_instance_of(instance_key, source_id).is_some() {

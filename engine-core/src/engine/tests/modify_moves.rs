@@ -664,3 +664,49 @@ fn move_with_default_scope_rejects_an_ambiguous_target_scope() {
     let b = eiks(&engine, inst, "b")[0];
     assert_eq!(scope_of(&engine, inst, b), a_scope);
 }
+
+/// A move whose source element has NO active instance still validates its
+/// target: an unknown target rejects the whole command (atomically) instead
+/// of being skipped because no activation was spawned.
+#[test]
+fn move_with_inactive_source_still_rejects_an_unknown_target() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, flat_two_tasks());
+    let a_eik = eiks(&engine, inst, "a")[0];
+
+    let err = engine
+        .apply_command(move_cmd(
+            inst,
+            vec![move_by_id("b", "ghost"), move_by_id("a", "b")],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::ModificationInstructionInvalid { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(eiks(&engine, inst, "a"), vec![a_eik], "nothing applied");
+    assert!(eiks(&engine, inst, "b").is_empty(), "nothing applied");
+}
+
+/// A by-id move naming a parallel join that is only PARKED (waiting for its
+/// other branch) has no activated source instance: it is a no-op, not a
+/// rejection of the whole modification.
+#[test]
+fn move_by_id_of_a_parked_join_is_a_no_op() {
+    let mut engine = Engine::new();
+    let inst = start_instance(&mut engine, forked_two_tasks());
+    complete_one(&mut engine, "jobA");
+    assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is parked");
+    let b_before = eiks(&engine, inst, "b");
+
+    engine
+        .apply_command(move_cmd(inst, vec![move_by_id("join", "a")]))
+        .unwrap();
+    assert_eq!(
+        eiks(&engine, inst, "join").len(),
+        1,
+        "parked join untouched"
+    );
+    assert!(eiks(&engine, inst, "a").is_empty(), "nothing activated");
+    assert_eq!(eiks(&engine, inst, "b"), b_before);
+}
