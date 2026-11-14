@@ -124,7 +124,7 @@ pub use engine::{BreakCondition, DebugSession};
 #[cfg(feature = "serde")]
 pub use event::decode_event_json;
 #[cfg(feature = "serde")]
-pub use event::decode_record_json;
+pub use event::{decode_record_json, encode_record_json};
 pub use event::Event;
 pub use event::EventDecodeError;
 pub use event::Record;

@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
-    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_event_json,
+    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_record_json,
     partition_of,
 };
 
@@ -498,7 +498,7 @@ enum TailPolicy {
 fn valid_segment_len(path: &Path) -> io::Result<u64> {
     read_segment_with(path, TailPolicy::DropTorn, |line| {
         let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
-        decode_event_json(json).map(|_| ())
+        decode_journal_event(json).map(|_| ())
     })
     .map(|(_, end)| end)
 }
@@ -1479,16 +1479,36 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
+/// THE journal-line decoder every segment / cold-archive reader goes through
+/// (#1556): a line is a [`Record`](nanobpmn_engine_core::Record) — the
+/// `{"event":…,"operation_reference":N}` envelope or a legacy bare `Event` —
+/// decoded via [`decode_record_json`], so an unknown variant is still the typed
+/// `UnknownVariant` rejection. Replay needs only the event; the reference is
+/// read-side metadata ([`read_segment_records`]).
+fn decode_journal_event(json: &str) -> Result<Event, EventDecodeError> {
+    decode_record_json(json).map(|record| record.event)
+}
+
+/// Reads every journal record (event + `operationReference`, #1556) from a
+/// single segment/log file — the bare `<json>` or the shared writer's
+/// `<partition>\t<json>` line form. Torn-tail contract: [`read_segment_with`].
+pub fn read_segment_records(path: &Path) -> io::Result<Vec<nanobpmn_engine_core::Record>> {
+    read_segment_with(path, TailPolicy::DropTorn, |line| {
+        decode_record_json(line.split_once('\t').map_or(line, |(_, rest)| rest))
+    })
+    .map(|(records, _)| records)
+}
+
 /// Reads and deserializes every event from a single segment/log file (empty if
 /// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::DropTorn, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::DropTorn, decode_journal_event).map(|(events, _)| events)
 }
 
 /// [`read_segment_events`] for a SEALED segment: no torn-tail tolerance — a
 /// damaged final record fails closed ([`TailPolicy::Strict`]).
 fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::Strict, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::Strict, decode_journal_event).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -1514,7 +1534,7 @@ fn read_segment_events_tagged_with(
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
-        let event = decode_event_json(json)?;
+        let event = decode_journal_event(json)?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
@@ -2148,7 +2168,7 @@ fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
             continue;
         }
         let event =
-            decode_event_json(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            decode_journal_event(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         events.push(event);
     }
     Ok(events)
@@ -2190,7 +2210,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
             None => (None, line),
         };
         let event =
-            decode_event_json(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            decode_journal_event(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });

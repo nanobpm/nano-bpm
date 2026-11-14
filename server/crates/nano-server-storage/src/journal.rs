@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
     ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
-    ProcessInstance, State, Value,
+    ProcessInstance, State, Value, encode_record_json,
 };
 use tokio::sync::oneshot;
 
@@ -369,8 +369,11 @@ pub struct Journal {
     /// command's events are BUFFERED here instead of written, so the whole
     /// entry — plus its [`Event::RaftEntryApplied`] record — is journaled as
     /// ONE atomic frame. `None` outside Raft apply (the direct REST /
-    /// single-node path journals per command as before).
-    raft_entry: Option<Vec<Event>>,
+    /// single-node path journals per command as before). The second vector is
+    /// the per-event `operationReference` (#1556), index-aligned with the
+    /// events, so the frame journals each [`Record`](nanobpmn_engine_core::Record)
+    /// envelope exactly.
+    raft_entry: Option<(Vec<Event>, Vec<Option<i64>>)>,
     /// Set by [`abort_raft_entry`](Self::abort_raft_entry) (#1405): the live
     /// engine may hold a refused entry's partial, NON-durable effects, so this
     /// journal is FENCED until the process rebuilds it from disk — no further
@@ -2728,6 +2731,12 @@ impl Journal {
     /// single command thread never clones them. Empty batches and in-memory
     /// journals are already durable, so they return a ready commit.
     fn persist(&self, events: &Arc<Vec<Event>>) -> Commit {
+        self.persist_with(events, None)
+    }
+
+    /// [`persist`](Self::persist) for one command's events carrying its
+    /// `operationReference` (#1556), journaled on every record.
+    fn persist_with(&self, events: &Arc<Vec<Event>>, operation_reference: Option<i64>) -> Commit {
         if events.is_empty() {
             return Commit::ready();
         }
@@ -2764,17 +2773,25 @@ impl Journal {
         // which a node not owning partition 0 could not otherwise route back. The
         // single-partition / legacy / in-memory paths keep the bare `<json>` line
         // format (their reader does not expect a tag).
-        let bytes = self.serialize_events(events);
+        let refs = match operation_reference {
+            Some(_) => vec![operation_reference; events.len()],
+            None => Vec::new(),
+        };
+        let bytes = self.serialize_events(events, &refs);
         self.send_write(bytes, events, shared_backed)
     }
 
     /// Serializes `events` to the journal's newline-terminated record format
     /// (`<partition>\t<json>` on the shared multi-partition writer, bare
     /// `<json>` otherwise — see [`persist`](Self::persist)).
-    fn serialize_events(&self, events: &[Event]) -> Vec<u8> {
+    ///
+    /// Each line is a record envelope ([`encode_record_json`], #1556):
+    /// `refs[i]` is event `i`'s `operationReference`; a missing entry (e.g. an
+    /// empty `refs`) means none, which journals the legacy bare-`Event` line.
+    fn serialize_events(&self, events: &[Event], refs: &[Option<i64>]) -> Vec<u8> {
         let tagged = self.shared_exporter.is_some();
         let mut bytes = Vec::new();
-        for event in events.iter() {
+        for (i, event) in events.iter().enumerate() {
             if tagged {
                 bytes.extend_from_slice(self.partition_id.to_string().as_bytes());
                 bytes.push(b'\t');
@@ -2787,7 +2804,8 @@ impl Journal {
                 clippy::expect_used,
                 reason = "Event serialization is total (serde derive over value types); Commit carries no error channel"
             )]
-            let line = serde_json::to_string(event).expect("event serializes");
+            let line = encode_record_json(event, refs.get(i).copied().flatten())
+                .expect("event serializes");
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
         }
@@ -2839,6 +2857,20 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        self.apply_command_ref_at(command, now, None)
+    }
+
+    /// [`apply_command_at`](Self::apply_command_at) for a command carrying a
+    /// caller `operationReference` (#1556): the engine stamps it on every
+    /// record the command produces
+    /// ([`Engine::apply_command_records_at`](nanobpmn_engine_core::Engine::apply_command_records_at))
+    /// and the journal persists each as the record envelope.
+    pub fn apply_command_ref_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         if self.fenced {
             // Environmental + retryable: a peer (or this replica once rebuilt
             // from its journal) applies the command; this one must not (#1405).
@@ -2861,7 +2893,13 @@ impl Journal {
             } => Some(*instance_key),
             _ => None,
         };
-        let events = Arc::new(self.engine.apply_command_at(command, now)?);
+        let events = Arc::new(
+            self.engine
+                .apply_command_records_at(command, now, operation_reference)?
+                .into_iter()
+                .map(|record| record.event)
+                .collect::<Vec<_>>(),
+        );
         if let Some(key) = orphan_settled {
             self.settle_orphan_report(key);
         }
@@ -2878,7 +2916,10 @@ impl Journal {
             // spill either — spilling state whose events are not yet durable
             // would let the off-heap store run ahead of the journal; the
             // deferred `maybe_spill` runs in `commit_raft_entry`.
-            buffer.extend(events.iter().cloned());
+            buffer.0.extend(events.iter().cloned());
+            buffer
+                .1
+                .extend(std::iter::repeat_n(operation_reference, events.len()));
             return Ok((events, Commit::ready()));
         }
         // An eventless success (an idempotent settlement replay, #1181) has
@@ -2894,7 +2935,7 @@ impl Journal {
         let commit = if events.is_empty() && settles_job {
             self.barrier()
         } else {
-            self.persist(&events)
+            self.persist_with(&events, operation_reference)
         };
         self.maybe_spill();
         Ok((events, commit))
@@ -2905,7 +2946,7 @@ impl Journal {
     /// [`abort_raft_entry`](Self::abort_raft_entry), applied commands buffer
     /// their events instead of journaling them.
     pub fn begin_raft_entry(&mut self) {
-        self.raft_entry = Some(Vec::new());
+        self.raft_entry = Some((Vec::new(), Vec::new()));
     }
 
     /// Journals the armed Raft entry as ONE atomic frame (#1405): every
@@ -2927,7 +2968,7 @@ impl Journal {
                 "journal fenced after an aborted Raft entry; rebuild from disk (#1405)",
             ));
         }
-        let mut events = self.raft_entry.take().unwrap_or_default();
+        let (mut events, refs) = self.raft_entry.take().unwrap_or_default();
         events.push(Event::RaftEntryApplied {
             index,
             raft_state: raft_state.clone(),
@@ -2938,7 +2979,7 @@ impl Journal {
         let commit = if self.writer.is_some() {
             let compress = self.seg.as_ref().is_some_and(|s| s.compress);
             let frame = crate::seglog::frame_atomic(
-                &self.serialize_events(&events),
+                &self.serialize_events(&events, &refs),
                 events.len() as u64,
                 compress,
             )?;
@@ -2952,6 +2993,7 @@ impl Journal {
         } else {
             // In-memory journal: nothing to frame, but the exporter still sees
             // the entry exactly as `persist` would forward it.
+            let _ = refs;
             self.persist(&events)
         };
         self.engine.set_raft_applied(index, raft_state);

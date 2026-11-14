@@ -2620,20 +2620,54 @@ impl From<Event> for Record {
     }
 }
 
+/// Borrowed serialization view of a [`Record`] — the ONE implementation of the
+/// record wire form, shared by `Record`'s `Serialize` and
+/// [`encode_record_json`] (which journals without cloning the event).
 #[cfg(feature = "serde")]
-impl serde::Serialize for Record {
+struct RecordView<'a> {
+    event: &'a Event,
+    operation_reference: Option<i64>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for RecordView<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         match self.operation_reference {
             None => self.event.serialize(serializer),
             Some(reference) => {
                 let mut s = serializer.serialize_struct("Record", 2)?;
-                s.serialize_field("event", &self.event)?;
+                s.serialize_field("event", self.event)?;
                 s.serialize_field("operation_reference", &reference)?;
                 s.end()
             }
         }
     }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Record {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RecordView {
+            event: &self.event,
+            operation_reference: self.operation_reference,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Encodes one journal line for `event` produced by a command carrying
+/// `operation_reference` — the writer-side twin of [`decode_record_json`]
+/// (#1556). Without a reference this is exactly the legacy bare-`Event` line.
+#[cfg(feature = "serde")]
+pub fn encode_record_json(
+    event: &Event,
+    operation_reference: Option<i64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RecordView {
+        event,
+        operation_reference,
+    })
 }
 
 /// Whether a journal line is the #1556 envelope form (`{"event": …}`) rather
