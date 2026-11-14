@@ -9958,8 +9958,18 @@ impl ServerImpl {
             // detached task ALWAYS routes them itself, whether or not the
             // observer is still listening — a send that races the observer's
             // timeout can otherwise be dropped unread with its follow-ups
-            // (#1582). The observer receives the result with the routable
-            // follow-ups stripped, so nothing is routed twice.
+            // (#1582).
+            //
+            // The observer is answered FIRST (with the routable follow-ups
+            // stripped, so it never re-routes them), and ONLY THEN does this task
+            // drive the routing pump. Routing-before-answer would self-deadlock:
+            // a routed correlation can advance the instance to ANOTHER catch whose
+            // open routes BACK to this same partition/leader, and that re-entrant
+            // `apply_routed_command` cannot commit while this proposal's detached
+            // task is still parked awaiting the routing it is part of. Answering
+            // first frees the proposal, so the chained open commits and the pump
+            // completes (#1582). A routed follow-up is keyed and deduped (#1568),
+            // so a later publish re-driving it is an exactly-once no-op.
             let (tx, rx) = tokio::sync::oneshot::channel();
             let server = self.clone();
             tokio::spawn(async move {
@@ -11748,8 +11758,28 @@ impl ServerImpl {
                         "the peer link closed before the forwarded create was acknowledged; its outcome is unknown, so it was not retried".into(),
                     ));
                 }
-                // Transient (peer 5xx, timeout, closed): re-resolve leader & retry.
+                // Transient peer 5xx (not link-closed, handled above): re-resolve
+                // the leader & retry.
                 Ok(r) => last_detail = peer_detail(&r),
+                // A transport error (timeout / closed) AFTER the create may have
+                // been sent is ambiguous — the peer may already have committed it.
+                // Without a business id a retry is not idempotent and could mint a
+                // duplicate instance, so surface the ambiguous outcome instead of
+                // re-driving (#1582). This mirrors the link-closed guard above and
+                // the REST path ([`forward_create_once`]), which already refuses to
+                // reroute a transport-errored create. A create WITH a business id
+                // dedups on retry, so it stays retryable.
+                Err(e) if business_id.is_none() => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem(
+                            "Peer error",
+                            500,
+                            format!(
+                                "the forwarded create's outcome is unknown ({e}); it was not retried, so no duplicate instance is minted"
+                            ),
+                        ),
+                    );
+                }
                 Err(e) => last_detail = e.to_string(),
             }
 
@@ -48640,6 +48670,50 @@ mod subscription_placement_tests {
             total <= std::time::Duration::from_secs(30),
             "bounded: {total:?}"
         );
+    }
+
+    /// #1582: a forwarded create whose transport outcome is AMBIGUOUS — the peer
+    /// link closed, or the request timed out, after the create may have been sent
+    /// — must NOT be retried when the create carries no business id, because the
+    /// peer may already have committed it and a blind retry mints a duplicate
+    /// instance. The bounded forward loop (`forward_create_bounded`) surfaces such
+    /// an outcome as a retryable-via-client 500 instead of re-driving, mirroring
+    /// the REST path (`forward_create_once`), which already maps any transport
+    /// `Err` to a non-rerouted 502. A create WITH a business id dedups on retry,
+    /// so only the unkeyed case is guarded.
+    ///
+    /// This pins the *classification* the guard relies on: a link-closed reply is
+    /// distinguishable from a timeout, and BOTH are ambiguous for an unkeyed
+    /// create (unlike a deterministic 400/409 rejection, which is safe to surface
+    /// directly, or a clean 200, which is a committed success).
+    #[test]
+    fn unkeyed_create_ambiguous_outcomes_are_not_retried() {
+        use nano_server_raft::peer::{PeerResult, is_link_closed_result};
+        // The two ambiguous outcomes the guard must catch for an unkeyed create:
+        // a synthetic link-closed reply (status 502 + LINK_CLOSED_BODY) ...
+        let link_closed = PeerResult {
+            status: 502,
+            body: Some(serde_json::Value::String(
+                nano_server_raft::peer::LINK_CLOSED_BODY.into(),
+            )),
+        };
+        assert!(is_link_closed_result(&link_closed));
+        // ... and a transport timeout, which surfaces as `Err(PeerError::Timeout)`
+        // (distinct from a link-closed `Ok` reply) and is matched by the
+        // `Err(e) if business_id.is_none()` guard arm.
+        // A deterministic rejection is NOT ambiguous and must keep surfacing
+        // directly (the 400/409 short-circuit arms precede the guard).
+        let conflict = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert!(!is_link_closed_result(&conflict));
+        // A clean success is likewise unambiguous.
+        let ok = PeerResult {
+            status: 200,
+            body: None,
+        };
+        assert!(!is_link_closed_result(&ok) && is_ok_status(ok.status));
     }
 
     /// start -> serviceTask "work" with an interrupting message boundary keyed on
