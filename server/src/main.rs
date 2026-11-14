@@ -2754,17 +2754,22 @@ pub struct ServerImpl {
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
 /// entry and restores it on drop, so every exit path (success, error, or a
-/// dropped/cancelled request future) releases its slot exactly once.
-struct ProcessingGuard<'a>(&'a AtomicUsize);
+/// dropped/cancelled request future) releases its slot exactly once. Owned (it
+/// holds an `Arc` clone of the gauge) so the accounting can be TRANSFERRED into
+/// the detached create owner (#1582): a cancelled caller's dropped future must
+/// not release the slot while the create it submitted is still queued on the
+/// engine actor — otherwise the gauge undercounts in-flight creates and repeated
+/// cancelled requests bypass the concurrency rail.
+struct ProcessingGuard(Arc<AtomicUsize>);
 
-impl<'a> ProcessingGuard<'a> {
-    fn enter(gauge: &'a AtomicUsize) -> Self {
+impl ProcessingGuard {
+    fn enter(gauge: &Arc<AtomicUsize>) -> Self {
         gauge.fetch_add(1, Ordering::Relaxed);
-        ProcessingGuard(gauge)
+        ProcessingGuard(gauge.clone())
     }
 }
 
-impl Drop for ProcessingGuard<'_> {
+impl Drop for ProcessingGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -2775,19 +2780,42 @@ impl Drop for ProcessingGuard<'_> {
 /// dropped/cancelled request future) releases its bytes exactly once. Held across
 /// the same submit→apply window as [`ProcessingGuard`], so the gauge measures the
 /// payload bytes resident in the engine's creation mailbox rather than how long a
-/// client blocks for completion.
-struct ByteGuard<'a>(&'a AtomicU64, u64);
+/// client blocks for completion. Owned (an `Arc` clone of the gauge) for the same
+/// transfer-into-the-detached-owner reason as [`ProcessingGuard`] (#1582).
+struct ByteGuard(Arc<AtomicU64>, u64);
 
-impl<'a> ByteGuard<'a> {
-    fn enter(gauge: &'a AtomicU64, bytes: u64) -> Self {
+impl ByteGuard {
+    fn enter(gauge: &Arc<AtomicU64>, bytes: u64) -> Self {
         gauge.fetch_add(bytes, Ordering::Relaxed);
-        ByteGuard(gauge, bytes)
+        ByteGuard(gauge.clone(), bytes)
     }
 }
 
-impl Drop for ByteGuard<'_> {
+impl Drop for ByteGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
+
+/// The create-path admission accounting a detached create owner must keep
+/// charged until the engine actor has finished the create (#1582): one
+/// processing-concurrency slot plus the payload bytes. Entered on the caller
+/// (so the sheds see the charge from the moment the request arrives), then
+/// MOVED into [`ServerImpl::submit_create_detached`]'s task, which drops it only
+/// after the actor round-trip resolves — a cancelled caller can no longer
+/// release the charge early and let repeated cancelled requests slip past the
+/// `admission_shed` watermarks.
+struct CreateAccounting {
+    _processing: ProcessingGuard,
+    _bytes: ByteGuard,
+}
+
+impl CreateAccounting {
+    fn enter(server: &ServerImpl, payload_bytes: u64) -> Self {
+        CreateAccounting {
+            _processing: ProcessingGuard::enter(&server.processing),
+            _bytes: ByteGuard::enter(&server.pipeline_bytes, payload_bytes),
+        }
     }
 }
 
@@ -6754,9 +6782,11 @@ impl ServerImpl {
         // OBSERVES it.
         let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            let rx = self.submit_create_detached(move |engine| {
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582): it stays charged until the actor finishes the create,
+            // even if this caller is cancelled first.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
                 // Resolve the version selector to a concrete process id +
                 // (key | version). A by-key request is matched across all
                 // retained versions; an unknown key is a 400 (the create
@@ -10119,12 +10149,22 @@ impl ServerImpl {
     /// returned oneshot. The caller merely OBSERVES the outcome; cancelling
     /// that observation strands nothing.
     ///
+    /// `accounting` is the admission charge (processing slot + payload bytes)
+    /// entered on the caller before submission; it is MOVED in here and held
+    /// until the actor round-trip resolves, so a cancelled caller cannot
+    /// release the charge while its create is still queued on the actor —
+    /// otherwise repeated cancelled requests would undercount the
+    /// `admission_shed` watermarks and bypass the memory limit (#1582).
+    ///
     /// The pre-checks (shed gates, selector resolution) run on the caller
     /// before submission, so a rejected create is never queued; a dead engine
     /// actor answers the receiver with `None` (the closed mailbox drops the
     /// job's reply sender), which the caller maps to a 500 instead of hanging.
+    /// A create whose write never became durable is answered as a 500 too:
+    /// acknowledging it would hand back an instance that disappears on restart.
     fn submit_create_detached<F, T>(
         &self,
+        accounting: CreateAccounting,
         apply: F,
     ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
     where
@@ -10136,18 +10176,28 @@ impl ServerImpl {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut outcome = engine.with_low(apply).await;
+            // The actor has finished with the create (applied or rejected), so
+            // its payload is no longer resident in the creation mailbox: the
+            // admission charge is released here, not when the caller leaves.
+            drop(accounting);
             if let Ok(outcome) = &mut outcome {
                 let (routable, commit) = outcome.take_routing_parts();
                 if !commit.wait_durable().await {
                     // The write never persisted (writer gone unacked): route
                     // nothing — the peer would durably record a delivery
-                    // identity the source then loses (#1582).
+                    // identity the source then loses (#1582) — and do NOT
+                    // acknowledge the create: the instance would disappear on
+                    // restart, so the caller must see a retryable error.
                     tracing::warn!(
-                        "subscription routing withheld: the source write never became durable"
+                        "create not acknowledged: the source write never became durable"
                     );
-                } else {
-                    server.drive_subscription_routing(routable).await;
+                    let _ = tx.send(Err((
+                        500,
+                        "the create was not persisted durably; retry".to_string(),
+                    )));
+                    return;
                 }
+                server.drive_subscription_routing(routable).await;
                 server.signal_jobs_available();
             }
             // A dropped receiver (caller cancelled) is fine; the work above
@@ -11198,9 +11248,10 @@ impl ServerImpl {
             // persisted create without its cross-partition routing. Awaiting
             // the receiver here only OBSERVES the outcome.
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            let rx = self.submit_create_detached(move |engine| {
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
                 let (process_id, sel_key, sel_ver) =
                     resolve_create_selector(engine.state(), by_id, by_key, None)?;
                 let created = apply_create_instance_direct(
@@ -20300,9 +20351,10 @@ impl ServerImpl {
         // receiver here only OBSERVES the outcome.
         let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            let rx = self.submit_create_detached(move |engine| {
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
                 let (process_id, sel_key, sel_ver) =
                     resolve_create_selector(engine.state(), by_id, by_key, None)?;
                 apply_create_instance_direct(
@@ -20858,12 +20910,19 @@ impl ServerImpl {
         // cancelled while awaiting the Raft commit must not strand a committed
         // create without its cross-partition routing — the Raft batcher keeps
         // running past the cancellation, and the detached task still observes
-        // the proposal outcome and routes. Awaiting the handle below only
-        // OBSERVES completion; dropping it leaves the work running.
+        // the proposal outcome and routes. The result is handed back over a
+        // oneshot the moment the create COMMITS, BEFORE the routing re-drive:
+        // a stalled subscription target must not withhold an already-committed
+        // create result for the whole re-drive budget (a retried forwarded
+        // create without a business id could then mint a duplicate, #1582).
+        // Routing keeps its own detached ownership below, so it still runs to
+        // completion after the answer is sent. Awaiting the receiver only
+        // OBSERVES the outcome; dropping it leaves the work running.
         let server = self.clone();
         let process_id_for_propose = process_id.clone();
-        let proposed = tokio::spawn(async move {
-            let response = part
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let proposed = part
                 .propose_result(
                     Command::create_instance_versioned(
                         process_id_for_propose,
@@ -20882,44 +20941,55 @@ impl ServerImpl {
                         (503, format!("partition {p} leader unavailable; retry"))
                     }
                     other => (500, other.to_string()),
-                })?;
-            if let Some((status, message)) = response.error {
-                return Err((status, message));
-            }
-            let events = response.events;
-
-            let instance_key = events
-                .iter()
-                .find_map(Event::instance_key)
-                .ok_or((500, "raft create produced no instance key".to_string()))?;
-            let sync_completed = events.iter().any(|e| {
-                matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
-            });
-            let routable: Vec<Event> = events
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        Event::MessageSubscriptionOpening { .. }
-                            | Event::RemoteMessageCorrelation { .. }
-                            | Event::MessageSubscriptionClosing { .. }
-                            | Event::StartInstanceDispatched { .. }
-                    )
                 })
-                .cloned()
-                .collect();
-            // Post-commit routing, still inside the detached task: the create
-            // is committed, so its follow-ups route even if the caller is gone.
-            if !routable.is_empty() {
-                server.drive_subscription_routing(routable.clone()).await;
+                .and_then(|response| {
+                    if let Some((status, message)) = response.error {
+                        return Err((status, message));
+                    }
+                    let events = response.events;
+                    let instance_key = events
+                        .iter()
+                        .find_map(Event::instance_key)
+                        .ok_or((500, "raft create produced no instance key".to_string()))?;
+                    let sync_completed = events.iter().any(|e| {
+                        matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                    });
+                    let routable: Vec<Event> = events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    Ok((instance_key, sync_completed, routable))
+                });
+            match proposed {
+                Ok((instance_key, sync_completed, routable)) => {
+                    // Answer at COMMIT, then drive the follow-ups. A dropped
+                    // receiver (caller cancelled) is fine: routing still runs.
+                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable.clone())));
+                    if !routable.is_empty() {
+                        server.drive_subscription_routing(routable).await;
+                    }
+                    server.signal_jobs_available();
+                }
+                Err(err) => {
+                    let _ = result_tx.send(Err(err));
+                }
             }
-            Ok((instance_key, sync_completed, routable))
         });
-        // Observe the detached proposal; a task failure is a 500, never a hang.
-        let (instance_key, sync_completed, routable) = match proposed.await {
+        // Observe the detached proposal; a dropped sender (task panicked) is a
+        // 500, never a hang.
+        let (instance_key, sync_completed, routable) = match result_rx.await {
             Ok(result) => result?,
-            Err(join) => {
-                return Err((500, format!("raft create task failed: {join}")));
+            Err(_) => {
+                return Err((500, "raft create task ended without a result".to_string()));
             }
         };
         // Project the deployed key + version of the version the instance was
@@ -47377,7 +47447,8 @@ mod subscription_placement_tests {
         let mut variables = std::collections::HashMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         // The caller is CANCELLED immediately: it never observes the outcome.
-        let rx = server.submit_create_detached(move |engine| {
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
             let (process_id, sel_key, sel_ver) =
                 resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
             apply_create_instance_direct(
@@ -47433,7 +47504,8 @@ mod subscription_placement_tests {
     #[tokio::test]
     async fn detached_create_reports_apply_errors() {
         let server = single_node_multi_partition();
-        let rx = server.submit_create_detached(move |engine| {
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
             let (process_id, sel_key, sel_ver) =
                 resolve_create_selector(engine.state(), Some("not-deployed".into()), None, None)?;
             apply_create_instance_direct(
@@ -47459,6 +47531,119 @@ mod subscription_placement_tests {
             err.1.contains("not-deployed"),
             "the error names the missing process: {}",
             err.1
+        );
+    }
+
+    /// #1582: a create whose write never becomes durable (the writer went away
+    /// without acking) must NOT be acknowledged — the instance would disappear
+    /// on restart. The detached owner answers a retryable 500 and routes
+    /// nothing. Model the dead writer by forcing the create's commit to
+    /// [`Commit::failed`].
+    #[tokio::test]
+    async fn detached_create_reports_durable_failure() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            // Simulate the writer dying before it could persist the create.
+            created.commit = Commit::failed();
+            Ok(created)
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("a create that never persisted must not be acknowledged"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "a non-durable create is a retryable 500");
+        assert!(
+            err.1.contains("not persisted durably"),
+            "the error says the write was not durable: {}",
+            err.1
+        );
+    }
+
+    /// #1582: the admission accounting (processing slot + payload bytes) is
+    /// TRANSFERRED into the detached create owner and released only when the
+    /// actor finishes — a caller that is cancelled (drops its observation)
+    /// while the create is still queued must NOT release the charge early, or
+    /// repeated cancelled requests would undercount the watermarks.
+    #[tokio::test]
+    async fn cancelled_create_holds_admission_charge_until_actor_finishes() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let payload_bytes = 128u64;
+        let processing_before = server.processing.load(Ordering::Relaxed);
+        let bytes_before = server.pipeline_bytes.load(Ordering::Relaxed);
+        let accounting = CreateAccounting::enter(&server, payload_bytes);
+        // The charge is visible from the moment the request arrives.
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes
+        );
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        // Cancel the caller immediately: it never observes the outcome.
+        drop(rx);
+        // The charge is released once the detached owner finishes the actor
+        // round-trip — not by the cancellation. Poll until it drains.
+        let mut released = false;
+        for _ in 0..100 {
+            if server.processing.load(Ordering::Relaxed) == processing_before
+                && server.pipeline_bytes.load(Ordering::Relaxed) == bytes_before
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the detached owner released the admission charge after the actor finished"
         );
     }
 
