@@ -1708,21 +1708,18 @@ impl Engine {
             // are wired. So scan all process-level (`parent.is_none()`) typed
             // starts, deterministically ordered by element id so key minting
             // and replay stay in lock-step.
-            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> =
-                process
-                    .elements
-                    .values()
-                    .filter(|e| e.parent.is_none())
-                    .filter(|e| {
-                        matches!(
-                            e.kind,
-                            ElementKind::MessageStartEvent { .. }
-                                | ElementKind::TimerStartEvent { .. }
-                        )
-                    })
-                    .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
-                    .collect();
-            typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut typed_starts: Vec<&crate::model::Element> = process
+                .elements
+                .values()
+                .filter(|e| e.parent.is_none())
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        ElementKind::MessageStartEvent { .. } | ElementKind::TimerStartEvent { .. }
+                    )
+                })
+                .collect();
+            typed_starts.sort_by(|a, b| a.id.cmp(&b.id));
             // Per Zeebe, a start-event message name / timer expression is
             // evaluated at deploy time against an empty context; a failure
             // rejects the deployment (Zeebe `ProcessTransformer` /
@@ -1731,11 +1728,25 @@ impl Engine {
             // fallback timer. Resolve all before anything is emitted.
             let empty = HashMap::new();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
-            for (start_element_id, start_kind, start_timer_def) in typed_starts {
+            for start in typed_starts {
+                let (start_element_id, start_kind, start_timer_def, start_properties) = (
+                    start.id.clone(),
+                    start.kind.clone(),
+                    start.timer.clone(),
+                    &start.properties,
+                );
                 let resolved = match start_kind {
                     ElementKind::MessageStartEvent { message_name } => self
                         .resolve_event_name(&empty, &message_name)
-                        .map(ResolvedStart::Message),
+                        .map(|message_name| ResolvedStart::Message {
+                            message_name,
+                            // The MCP tool markers declared on the start event
+                            // via `zeebe:properties` (Camunda 8.10, #1499) ride
+                            // the subscription so the read model / REST search
+                            // can project them without re-parsing the XML.
+                            tool_name: crate::model::tool_name_of(start_properties),
+                            tool_properties: crate::model::tool_properties_of(start_properties),
+                        }),
                     ElementKind::TimerStartEvent {
                         interval_millis,
                         repeating,
@@ -1756,6 +1767,26 @@ impl Engine {
                             element_id: start_element_id,
                             reason: failure.message,
                         })
+                    }
+                }
+            }
+            // Two message starts whose names differ textually (`go` vs
+            // `="go"`) can still resolve to the same name. The raw-name
+            // duplicate rule cannot see that, so reject resolved collisions
+            // here: otherwise the engine and the read model would each keep a
+            // different start for the one subscription (#1499, Zeebe rejects
+            // duplicate message start names).
+            let mut seen_message_names: HashSet<&str> = HashSet::new();
+            for (start_element_id, r) in &resolved_starts {
+                if let ResolvedStart::Message { message_name, .. } = r {
+                    if !seen_message_names.insert(message_name.as_str()) {
+                        return Err(EngineError::StartEventExpressionInvalid {
+                            process_id: process.id.clone(),
+                            element_id: start_element_id.clone(),
+                            reason: format!(
+                                "multiple message start events resolve to the same message name '{message_name}'"
+                            ),
+                        });
                     }
                 }
             }
@@ -1795,7 +1826,11 @@ impl Engine {
             );
             for (start_element_id, resolved) in resolved_starts {
                 match resolved {
-                    ResolvedStart::Message(message_name) => {
+                    ResolvedStart::Message {
+                        message_name,
+                        tool_name,
+                        tool_properties,
+                    } => {
                         self.emit(
                             log,
                             Event::MessageStartSubscriptionCreated {
@@ -1803,6 +1838,8 @@ impl Engine {
                                 process_id: process_id.clone(),
                                 message_name,
                                 start_element_id,
+                                tool_name,
+                                tool_properties,
                             },
                         );
                     }
@@ -16009,7 +16046,13 @@ fn group_owned<V: OwnedByInstance>(
 
 /// A process start event's deploy-time-resolved trigger.
 enum ResolvedStart {
-    Message(String),
+    Message {
+        message_name: String,
+        /// The start event's `io.camunda.tool:name` zeebe:property (#1499).
+        tool_name: Option<String>,
+        /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+        tool_properties: std::collections::BTreeMap<String, String>,
+    },
     Timer {
         due_at: u64,
         interval_millis: u64,

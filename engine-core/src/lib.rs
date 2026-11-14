@@ -130,12 +130,13 @@ pub use event::{
 };
 pub use feel::FeelError;
 pub use model::{
-    AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
-    AdHocToolKind, BindingType, BuildError, Condition, Element, ElementId, ElementKind,
-    ExecutionListener, IncomingFlow, IoMapping, LinkedResource, ListenerEventType, Mapping,
-    MultiInstance, ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener,
-    TaskListenerEventType, TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections,
-    UserTaskProps, Value,
+    tool_name_of, tool_properties_of, AdHocActivateElement, AdHocImplementationType,
+    AdHocJobResult, AdHocSubProcessDef, AdHocTool, AdHocToolKind, BindingType, BuildError,
+    Condition, Element, ElementId, ElementKind, ExecutionListener, IncomingFlow, IoMapping,
+    LinkedResource, ListenerEventType, Mapping, MultiInstance, ProcessBuilder, ProcessDefinition,
+    SequenceFlow, TaskListener, TaskListenerEventType, TaskListenerJobResult, TimerDef,
+    TimerDefKind, UserTaskCorrections, UserTaskProps, Value, TOOL_NAME_PROPERTY,
+    TOOL_PROPERTY_PREFIX,
 };
 pub use read_query::ReadQuery;
 pub use state::{

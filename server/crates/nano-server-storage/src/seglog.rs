@@ -3270,6 +3270,40 @@ pub fn plan_catch_up(exported: u64, floor: u64, surviving: u64) -> CatchUpPlan {
     }
 }
 
+/// Catches one read-model shard up from the LEGACY single-file journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`), given the full event log and the engine
+/// `state` already rebuilt from it.
+///
+/// Mirrors [`catch_up_shard`]'s `Resume` path so both single-partition boot
+/// paths share one backfill rule: a store migrated from an older schema first
+/// backfills its pending projections (`event_waits`,
+/// `message_start_subscriptions`) from `state`, THEN replays the unexported
+/// tail. A store ahead of the log (truncated/corrupt journal) is reset and
+/// rebuilt from scratch. Returns whether a backfill ran.
+pub fn catch_up_shard_legacy(
+    shard: &crate::readstore::ReadStore,
+    events: &[Event],
+    state: &nanobpmn_engine_core::State,
+) -> rusqlite::Result<bool> {
+    let mut pos = shard.exported_position();
+    if pos > events.len() {
+        shard.reset()?;
+        pos = 0;
+    }
+    let backfilled = shard.backfill_pending_event_waits(state)?;
+    if backfilled {
+        tracing::info!(
+            "backfilled pending read-model projections from the engine state \
+             after the read-model schema upgrade (legacy journal)"
+        );
+    }
+    if pos < events.len() {
+        let refs: Vec<&Event> = events[pos..].iter().collect();
+        shard.export(&refs)?;
+    }
+    Ok(backfilled)
+}
+
 /// Catches one read-model shard up from a segmented recovery, using the single
 /// canonical [`plan_catch_up`] decision. `surviving` are this shard's surviving
 /// events (log-ordered, spanning `[floor, floor + surviving.len())`).
@@ -7690,6 +7724,54 @@ mod tests {
     /// the `process_instances` table (via a second connection to the same
     /// file-backed store) that the projection writes, so `export` fails with a
     /// typed SQLite error.
+    /// Regression (#1540 review): a warm v13→v14 upgrade on the LEGACY
+    /// single-file journal must backfill already-deployed message start
+    /// subscriptions from the engine state. With an up-to-date export cursor
+    /// the tail replays no creation events, so without the backfill the starts
+    /// stay absent from search across restarts.
+    #[test]
+    fn catch_up_shard_legacy_backfills_message_starts_after_a_warm_upgrade() {
+        use nanobpmn_engine_core::{MessageStartSubscription, State};
+
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("legacy-backfill");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("read-model.sqlite");
+        drop(ReadStore::open(Some(&store_path)).expect("open file-backed read store"));
+        // Wind the store back to v13 (no `message_start_subscriptions`).
+        {
+            let conn = rusqlite::Connection::open(&store_path).expect("second connection");
+            conn.execute_batch(
+                "DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .expect("wind back to v13");
+        }
+        let store = ReadStore::open(Some(&store_path)).expect("reopen migrated store");
+        assert!(store.message_start_subscriptions().is_empty());
+
+        let mut state = State::default();
+        state.message_start_subscriptions.insert(
+            "go".into(),
+            MessageStartSubscription {
+                process_definition_key: 5,
+                process_id: "p".into(),
+                message_name: "go".into(),
+                start_element_id: "s".into(),
+                tool_name: Some("tool".into()),
+                tool_properties: std::collections::BTreeMap::new(),
+            },
+        );
+        // Up-to-date cursor: no tail to replay.
+        let backfilled = catch_up_shard_legacy(&store, &[], &state).expect("catch up");
+        let rows = store.message_start_subscriptions();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(backfilled);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("tool"));
+    }
+
     #[test]
     fn catch_up_shard_propagates_export_failure_as_typed_error() {
         use crate::readstore::ReadStore;
