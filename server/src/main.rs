@@ -6338,6 +6338,33 @@ struct CreatedInstanceDirect {
     commit: Commit,
 }
 
+/// What a detached create owner needs from a successfully applied create: the
+/// cross-partition follow-ups to route and the commit that gates them (#1582).
+/// Implemented by every create-path outcome type so
+/// [`ServerImpl::submit_create_detached`] can own submission → durability →
+/// routing for all of them. The commit is CONSUMED (it is a single-use
+/// durability handle, not `Clone`), so the outcome is returned with the commit
+/// taken out — after the owner has waited on it, only the already-durable
+/// projection remains for the caller.
+trait CreateOutcome {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit);
+}
+
+impl CreateOutcome for CreatedInstanceDirect {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        (
+            std::mem::take(&mut self.routable),
+            std::mem::replace(&mut self.commit, Commit::ready()),
+        )
+    }
+}
+
+impl CreateOutcome for (String, CreatedInstanceDirect) {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        self.1.take_routing_parts()
+    }
+}
+
 /// The ONE place the non-Raft (single-node) instance-creation handlers may apply
 /// a `CreateInstance` command directly on the engine: apply `command` on the
 /// create actor's `journal` and project the common post-apply fields. Confining
@@ -6645,7 +6672,6 @@ impl ServerImpl {
         // → applied), not the later `awaitCompletion` wait, so the backpressure
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
 
         // Cluster-wide create placement (stage 1): round-robin across EVERY
         // partition in the cluster so a single gateway drives the whole cluster.
@@ -6719,87 +6745,80 @@ impl ServerImpl {
         // command completes (the closure moves them).
         let tags_for_response = tags_vec.clone();
         let business_id_for_response = business_id_str.clone();
-        let outcome: Result<CreateOk, Box<Resp>> = {
+        // The actor round-trip, commit wait, and commit-gated routing all run
+        // inside ONE detached owner task (#1582): the engine actor executes a
+        // queued command even after its reply receiver is dropped, so awaiting
+        // the actor inline left a window where a cancelled caller persisted an
+        // instance whose cross-partition follow-ups nobody routed. The detached
+        // task owns the outcome end to end; awaiting the receiver here only
+        // OBSERVES it.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
             let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    // Resolve the version selector to a concrete process id +
-                    // (key | version). A by-key request is matched across all
-                    // retained versions; an unknown key is a 400 (the create
-                    // endpoint has no 404 variant).
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, by_version) {
-                            Ok(t) => t,
-                            Err((code, detail)) => {
-                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
-                                    problem("Process not found", code, detail),
-                                )));
-                            }
-                        };
-
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags_vec,
-                            business_id_str,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
-                            Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Process not found",
-                                400,
-                                format!("No deployed process with id '{process_id}'."),
-                            )),
-                        )),
-                        Err(e) => Err(Box::new(
-                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                problem("Internal error", 500, e.to_string()),
-                            ),
-                        )),
+            let rx = self.submit_create_detached(move |engine| {
+                // Resolve the version selector to a concrete process id +
+                // (key | version). A by-key request is matched across all
+                // retained versions; an unknown key is a 400 (the create
+                // endpoint has no 404 variant).
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, by_version)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags_vec,
+                        business_id_str,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await
         };
 
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            match outcome {
-                Ok(fields) => fields,
-                Err(resp) => return Ok(*resp),
-            };
+        let (process_id, created) = match created {
+            Ok(fields) => fields,
+            Err((code, detail)) => {
+                return Ok(if code == 400 {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Process not found",
+                        code,
+                        detail,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        code,
+                        detail,
+                    ))
+                });
+            }
+        };
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
 
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // Block on durability before acknowledging: a returned 200 means the
-        // create is fsynced. The wait + post-commit routing run DETACHED
-        // (#1582): a caller cancelled while awaiting must not strand a
-        // committed create without its cross-partition routing — the journal
-        // writer keeps running past the cancellation, and the detached task
-        // still observes the outcome and routes. Awaiting the handle only
-        // OBSERVES completion here.
-        // The instance may have parked on an off-partition message catch: route
-        // the subscription open to its canonical partition (no-op single-node).
-        let routing = self.drive_routing_after_commit(routable, commit);
-        Self::observe_routing(routing).await;
-        // Starting an instance parks it on its first service task, so new jobs
-        // may now be activatable: wake any long-pollers.
+        // The detached owner already blocked on durability and routed the
+        // cross-partition follow-ups before answering, so a returned 200 means
+        // the create is fsynced and its routing ran; cancelling this handler at
+        // any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -10087,42 +10106,70 @@ impl ServerImpl {
         (caller, Some(task))
     }
 
-    /// Cancellation-safe post-commit routing (#1582): awaits `commit` and routes
-    /// `routable` inside a DETACHED task, so a caller that is cancelled (or
-    /// drops this future) while waiting cannot strand a committed source command
-    /// without its routing — the journal writer / Raft batcher keeps running
-    /// past the caller's cancellation, and the detached task still observes the
-    /// outcome and drives the routing pump. Returns a handle the caller may
-    /// await to OBSERVE completion; dropping the handle leaves the work
-    /// running. A source write that never becomes durable routes nothing (the
-    /// same gate as [`Self::route_after_durable`]).
-    fn drive_routing_after_commit(
+    /// Cancellation-safe create submission (#1582): the create command's actor
+    /// round-trip, commit wait, and commit-gated routing all run inside ONE
+    /// detached owner task. The engine actor executes a queued command even
+    /// after its reply receiver is dropped, so awaiting the actor inline left a
+    /// window where a cancelled caller could persist an instance whose
+    /// cross-partition follow-ups nobody ever routed. Here the detached task
+    /// owns the outcome end to end: it submits `apply` at create priority,
+    /// gates routing on durability exactly as [`Self::route_after_durable`]
+    /// does (a write that never persists routes nothing), drives the routing
+    /// pump itself, and only then delivers the projected outcome over the
+    /// returned oneshot. The caller merely OBSERVES the outcome; cancelling
+    /// that observation strands nothing.
+    ///
+    /// The pre-checks (shed gates, selector resolution) run on the caller
+    /// before submission, so a rejected create is never queued; a dead engine
+    /// actor answers the receiver with `None` (the closed mailbox drops the
+    /// job's reply sender), which the caller maps to a 500 instead of hanging.
+    fn submit_create_detached<F, T>(
         &self,
-        routable: Vec<Event>,
-        commit: Commit,
-    ) -> tokio::task::JoinHandle<()> {
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
         let server = self.clone();
+        let engine = self.engine.for_create().clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            // A write that never persisted (writer gone unacked) must route
-            // nothing: the peer would durably record a delivery identity the
-            // source then loses (#1582).
-            if !commit.wait_durable().await {
-                tracing::warn!(
-                    "subscription routing withheld: the source write never became durable"
-                );
-                return;
+            let mut outcome = engine.with_low(apply).await;
+            if let Ok(outcome) = &mut outcome {
+                let (routable, commit) = outcome.take_routing_parts();
+                if !commit.wait_durable().await {
+                    // The write never persisted (writer gone unacked): route
+                    // nothing — the peer would durably record a delivery
+                    // identity the source then loses (#1582).
+                    tracing::warn!(
+                        "subscription routing withheld: the source write never became durable"
+                    );
+                } else {
+                    server.drive_subscription_routing(routable).await;
+                }
+                server.signal_jobs_available();
             }
-            server.drive_subscription_routing(routable).await;
-        })
+            // A dropped receiver (caller cancelled) is fine; the work above
+            // already ran to completion inside this task.
+            let _ = tx.send(outcome);
+        });
+        rx
     }
 
-    /// Awaits the detached commit+ routing task, mapping a task failure to a
-    /// warn (the caller's own commit outcome is unchanged — routing is
-    /// post-commit work). Awaiting only OBSERVES; cancelling this await leaves
-    /// the detached task running.
-    async fn observe_routing(task: tokio::task::JoinHandle<()>) {
-        if let Err(e) = task.await {
-            tracing::warn!("subscription routing task failed: {e}");
+    /// Observes a [`Self::submit_create_detached`] outcome, mapping a dead
+    /// engine actor (the oneshot resolves to `Err`) to a 500 rather than
+    /// hanging or panicking. Cancelling this await leaves the detached owner
+    /// running.
+    async fn observe_create<T>(
+        rx: tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>,
+    ) -> Result<T, (u16, String)> {
+        match rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err((
+                500,
+                "engine actor died while applying the create".to_string(),
+            )),
         }
     }
 
@@ -11124,78 +11171,67 @@ impl ServerImpl {
         }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
         // Under Raft, a forwarded create must be REPLICATED through this node's
         // Raft log, not applied directly to the local engine — otherwise the
         // instance would not survive this node's failure. Route it through the
         // shared Raft create core (durability is awaited inside the propose, so
         // the returned commit is already ready).
-        let outcome: Result<CreateOk, (u16, String)> = if !self.raft.is_empty() {
-            self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
-                .await
-                .map(
-                    |(
-                        process_id,
-                        version,
-                        definition_key,
-                        instance_key,
-                        sync_completed,
-                        routable,
-                    )| {
-                        (
-                            process_id,
-                            version,
-                            definition_key,
-                            instance_key,
-                            sync_completed,
-                            routable,
-                            Commit::ready(),
-                        )
-                    },
-                )
+        let (process_id, created) = if !self.raft.is_empty() {
+            let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+                self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
+                    .await?;
+            (
+                process_id,
+                CreatedInstanceDirect {
+                    instance_key,
+                    definition_key,
+                    version,
+                    sync_completed,
+                    routable,
+                    commit: Commit::ready(),
+                },
+            )
         } else {
+            // The actor round-trip, commit wait, and commit-gated routing run
+            // inside ONE detached owner task (#1582): a caller cancelled while
+            // the actor still has the command queued must not strand a
+            // persisted create without its cross-partition routing. Awaiting
+            // the receiver here only OBSERVES the outcome.
             let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
             let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags,
-                            business_id,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            let rx = self.submit_create_detached(move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await?
         };
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            outcome?;
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
         // Count the forwarded create exactly once, here at the committing owner,
         // under the ORIGINAL client transport (`origin_protocol`) rather than a
         // hardcoded "rest". The forwarding node deliberately does NOT record a
@@ -11203,9 +11239,10 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        // Cancellation-safe commit wait + routing (#1582): see the REST create.
-        let routing = self.drive_routing_after_commit(routable, commit);
-        Self::observe_routing(routing).await;
+        // The non-Raft branch's detached owner already awaited durability and
+        // routed the follow-ups before answering (#1582); under Raft the
+        // proposal is durable and routed by its own detached task. Either way
+        // the create is committed and routed by the time we answer.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -20256,54 +20293,45 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
-        #[allow(clippy::type_complexity)]
-        let outcome: Result<
-            (nanobpmn_engine_core::Key, bool, Vec<Event>, Commit),
-            (u16, String),
-        > = {
+        // The actor round-trip, commit wait, and commit-gated routing run
+        // inside ONE detached owner task (#1582): a stream connection cancelled
+        // while the actor still has the create queued must not strand a
+        // persisted instance without its cross-partition routing. Awaiting the
+        // receiver here only OBSERVES the outcome.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
             let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            Vec::new(),
-                            None,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        // The stream create reports only the key + completion; the
-                        // projected definition key/version are unused here.
-                        Ok(created) => Ok((
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            let rx = self.submit_create_detached(move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
+                    other => (500, other.to_string()),
                 })
-                .await
+            });
+            Self::observe_create(rx).await?
         };
-        let (instance_key, sync_completed, routable, commit) = outcome?;
-        // Cancellation-safe commit wait + routing (#1582): see the REST create.
-        let routing = self.drive_routing_after_commit(routable, commit);
-        Self::observe_routing(routing).await;
+        // The stream create reports only the key + completion; the projected
+        // definition key/version are unused here.
+        let instance_key = created.instance_key;
+        let sync_completed = created.sync_completed;
+        // The detached owner already awaited durability and routed the
+        // follow-ups before answering (#1582).
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -47312,15 +47340,17 @@ mod subscription_placement_tests {
         );
     }
 
-    /// #1582 (cancellation window): the commit wait + post-commit routing run
-    /// DETACHED from the caller, so a caller that is cancelled (drops its
-    /// await) while the source write is still committing cannot strand a
-    /// committed command without its routing — the detached task still observes
-    /// the durable outcome and drives the pump. Model the cancellable caller by
-    /// dropping the observation handle before acking the commit: routing must
-    /// still run once the source becomes durable.
+    /// #1582 (cancellation window): the create's actor round-trip, commit wait,
+    /// and post-commit routing all run inside ONE detached owner task
+    /// ([`ServerImpl::submit_create_detached`]), so a caller that is cancelled
+    /// (drops its observation) at ANY point — even while the command is still
+    /// queued on the engine actor, whose dropped reply receiver does NOT stop
+    /// the queued apply — cannot strand a persisted create without its routing.
+    /// Model the cancelled caller by dropping the observation receiver before
+    /// the create is submitted: the instance must still be created and its
+    /// cross-partition subscription still routed open.
     #[tokio::test]
-    async fn routing_survives_cancellation_before_acknowledgement() {
+    async fn create_routing_survives_cancellation_before_submission() {
         let server = single_node_multi_partition();
         server
             .deploy_centralized(
@@ -47329,74 +47359,106 @@ mod subscription_placement_tests {
             )
             .await
             .expect("deploy");
-        let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
-        for i in 0..64u32 {
-            let order = format!("cancel-{i}");
-            let mut variables = std::collections::HashMap::new();
-            variables.insert("orderId".to_string(), Value::Str(order.clone()));
-            let (key, _) = server
-                .create_for_stream(Some("await-payment".into()), None, variables)
-                .await
-                .expect("create succeeds");
-            let sub = nanobpmn_engine_core::subscription_partition(&order, 4);
-            if sub != nanobpmn_engine_core::partition_of(key) {
-                chosen = Some((sub, key));
+
+        // Find a correlation key whose canonical subscription partition differs
+        // from the partition the create will land on, so the opening follow-up
+        // is genuinely routable.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("orphan-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
                 break;
             }
         }
-        let (sub_partition, instance_key) =
-            chosen.expect("a cross-partition placement appears within 64 creates");
-        let armed = || {
-            let handle = server
-                .engine_handle_for(sub_partition)
-                .expect("subscription partition is local");
-            async move {
-                handle
-                    .with(move |j| {
+        let order = chosen.expect("a cross-partition correlation key exists");
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        // The caller is CANCELLED immediately: it never observes the outcome.
+        let rx = server.submit_create_detached(move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        drop(rx);
+
+        // The detached owner still applied the create, awaited durability, and
+        // routed the subscription open to its canonical partition.
+        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let handle = server
+            .engine_handle_for(sub_partition)
+            .expect("subscription partition is local");
+        let mut armed = false;
+        for _ in 0..100 {
+            let found = handle
+                .with({
+                    let order = order.clone();
+                    move |j| {
                         j.state().message_subscriptions.values().any(|s| {
-                            s.instance_key == instance_key
+                            s.correlation_key == order
                                 && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
                         })
-                    })
-                    .await
-            }
-        };
-        assert!(armed().await, "the routed subscription is armed");
-
-        let (events, _commit) = server
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
-            .await
-            .expect("cancel succeeds");
-
-        // The detached commit+routing task, gated on a commit the test controls.
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let routable = ServerImpl::routable_events(&events);
-        assert!(!routable.is_empty(), "cancel emits a routable close");
-        let routing = server.drive_routing_after_commit(routable, Commit::from_ack(rx));
-
-        // The caller is CANCELLED before the source is acknowledged: it drops
-        // its observation of the commit+routing task. The detached task must
-        // keep running and route once the source write becomes durable.
-        drop(routing);
-        assert!(armed().await, "nothing routed before the commit lands");
-        tx.send(()).expect("the detached gate is still listening");
-
-        // Routing ran despite the dropped observation: the close is delivered.
-        let mut closed = false;
-        for _ in 0..100 {
-            if !armed().await {
-                closed = true;
+                    }
+                })
+                .await;
+            if found {
+                armed = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            closed,
-            "the detached task routed the close after the caller was cancelled"
+            armed,
+            "the detached owner routed the subscription open after the caller was cancelled"
+        );
+    }
+
+    /// #1582: a detached create whose apply FAILS still answers its observer
+    /// with the error (nothing was written, so nothing routes) — the detached
+    /// owner must not swallow rejections.
+    #[tokio::test]
+    async fn detached_create_reports_apply_errors() {
+        let server = single_node_multi_partition();
+        let rx = server.submit_create_detached(move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("not-deployed".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("an unknown process id is rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "the apply error reaches the observer");
+        assert!(
+            err.1.contains("not-deployed"),
+            "the error names the missing process: {}",
+            err.1
         );
     }
 
