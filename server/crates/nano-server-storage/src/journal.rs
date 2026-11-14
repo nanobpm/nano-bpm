@@ -3758,11 +3758,13 @@ impl Journal {
         // replica-local key + wall-clock stamp outside any Raft proposal and
         // diverge replicas (#1384 review). Route each orphan to the
         // leader-propose channel instead (#1447) and capture STRICT: the orphan
-        // aborts this rotation (exactly like the Raft snapshot builder), the
-        // leader's replicated incident lands on every replica, and the next
-        // rotation — the orphan no longer spilled once the incident applies —
-        // succeeds. The loss is reported without a replicated transition ever
-        // discarding state.
+        // aborts this rotation (exactly like the Raft snapshot builder) and the
+        // leader's replicated incident lands on every replica. Reporting does
+        // NOT unblock rotation: the incident leaves `variables_spilled` and the
+        // off-heap rows untouched, so subsequent strict captures stay blocked
+        // for a snapshot-only orphan until the deterministic apply-time repair
+        // lands (#1587). The loss is reported without a replicated transition
+        // ever discarding state.
         if self.replicated_apply {
             // A strict fold records the aborting absence in the orphan inbox
             // BEFORE returning `None`, so it is reported even though the
