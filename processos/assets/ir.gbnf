@@ -17,22 +17,22 @@ element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-se
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
 attrs-startEvent   ::= "{" nl (indent2 attr-line-startEvent nl)+ indent "}"
-attr-line-startEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-startEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # endEvent — None end event. Consuming its last token completes the instance.
 elem-endEvent  ::= indent "endEvent" sp id (sp string)? (sp attrs-endEvent)? nl
 attrs-endEvent   ::= "{" nl (indent2 attr-line-endEvent nl)+ indent "}"
-attr-line-endEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-endEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # terminateEndEvent — Terminate end event. Kills every other token in its enclosing scope, then completes that scope.
 elem-terminateEndEvent  ::= indent "terminateEndEvent" sp id (sp string)? (sp attrs-terminateEndEvent)? nl
 attrs-terminateEndEvent   ::= "{" nl (indent2 attr-line-terminateEndEvent nl)+ indent "}"
-attr-line-terminateEndEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-terminateEndEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # serviceTask — Job-based task. Creates a job of `jobType` and rests until completion. Optional agent metadata does not change the job-worker lifecycle.
 elem-serviceTask  ::= indent "serviceTask" sp id (sp string)? (sp attrs-serviceTask)? nl
 attrs-serviceTask   ::= "{" nl (indent2 attr-line-serviceTask nl)+ indent "}"
-attr-line-serviceTask  ::= attr-serviceTask-jobType | attr-serviceTask-priority | attr-serviceTask-agentType | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-serviceTask  ::= attr-serviceTask-jobType | attr-serviceTask-priority | attr-serviceTask-agentType | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-serviceTask-jobType  ::= "jobType" sp attr-str   # The `zeebe:taskDefinition type` a worker subscribes to.
 attr-serviceTask-priority  ::= "priority" sp attr-str   # Raw priority expression (literal or FEEL); higher activates first.
 attr-serviceTask-agentType  ::= "agentType" sp attr-str   # Optional `zeebe:agentDefinition` metadata: `aiAgentTask`, `external`, or `aiAgentSubProcess`. All create ordinary jobs. The compact IR retains this classification but does not represent an adHocSubProcess tool catalog.
@@ -40,14 +40,14 @@ attr-serviceTask-agentType  ::= "agentType" sp attr-str   # Optional `zeebe:agen
 # businessRuleTask — DMN-bound task. Evaluates `decisionId` natively in-engine (no job) and merges the output.
 elem-businessRuleTask  ::= indent "businessRuleTask" sp id (sp string)? (sp attrs-businessRuleTask)? nl
 attrs-businessRuleTask   ::= "{" nl (indent2 attr-line-businessRuleTask nl)+ indent "}"
-attr-line-businessRuleTask  ::= attr-businessRuleTask-decisionId | attr-businessRuleTask-resultVariable | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-businessRuleTask  ::= attr-businessRuleTask-decisionId | attr-businessRuleTask-resultVariable | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-businessRuleTask-decisionId  ::= "decisionId" sp attr-str   # Raw `zeebe:calledDecision decisionId` (literal id or FEEL).
 attr-businessRuleTask-resultVariable  ::= "resultVariable" sp attr-str   # Variable to bind the decision output to; if absent a map output is spread.
 
 # userTask — Native user task. A human claims and completes it via the user-task API.
 elem-userTask  ::= indent "userTask" sp id (sp string)? (sp attrs-userTask)? nl
 attrs-userTask   ::= "{" nl (indent2 attr-line-userTask nl)+ indent "}"
-attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-userTask-formId | attr-userTask-externalFormReference | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-userTask-formId | attr-userTask-externalFormReference | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-userTask-assignee  ::= "assignee" sp attr-str   # Raw assignee expression (literal or FEEL).
 attr-userTask-candidateGroups  ::= "candidateGroups" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
 attr-userTask-candidateUsers  ::= "candidateUsers" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
@@ -60,40 +60,40 @@ attr-userTask-externalFormReference  ::= "externalFormReference" sp attr-str   #
 # exclusiveGateway — XOR gateway. Takes exactly one outgoing flow (first matching condition; default is fallback).
 elem-exclusiveGateway  ::= indent "exclusiveGateway" sp id (sp string)? (sp attrs-exclusiveGateway)? nl
 attrs-exclusiveGateway   ::= "{" nl (indent2 attr-line-exclusiveGateway nl)+ indent "}"
-attr-line-exclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-exclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # parallelGateway — AND gateway. Splits to all outgoing; joins by waiting on every incoming flow.
 elem-parallelGateway  ::= indent "parallelGateway" sp id (sp string)? (sp attrs-parallelGateway)? nl
 attrs-parallelGateway   ::= "{" nl (indent2 attr-line-parallelGateway nl)+ indent "}"
-attr-line-parallelGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-parallelGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # inclusiveGateway — OR gateway. Splits to every outgoing flow whose condition holds (default is fallback); joins by waiting until no in-flight token could still reach it.
 elem-inclusiveGateway  ::= indent "inclusiveGateway" sp id (sp string)? (sp attrs-inclusiveGateway)? nl
 attrs-inclusiveGateway   ::= "{" nl (indent2 attr-line-inclusiveGateway nl)+ indent "}"
-attr-line-inclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-inclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # eventBasedGateway — Deferred choice. Arms all downstream intermediate catch events at once; the first to fire wins and the losing siblings are withdrawn.
 elem-eventBasedGateway  ::= indent "eventBasedGateway" sp id (sp string)? (sp attrs-eventBasedGateway)? nl
 attrs-eventBasedGateway   ::= "{" nl (indent2 attr-line-eventBasedGateway nl)+ indent "}"
-attr-line-eventBasedGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-eventBasedGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # errorBoundaryEvent — Error boundary on an activity. Fires when a job throws the matching `errorCode`.
 elem-errorBoundaryEvent  ::= indent "errorBoundaryEvent" sp id (sp string)? (sp attrs-errorBoundaryEvent)? nl
 attrs-errorBoundaryEvent   ::= "{" nl (indent2 attr-line-errorBoundaryEvent nl)+ indent "}"
-attr-line-errorBoundaryEvent  ::= attr-errorBoundaryEvent-attachedTo | attr-errorBoundaryEvent-errorCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-errorBoundaryEvent  ::= attr-errorBoundaryEvent-attachedTo | attr-errorBoundaryEvent-errorCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-errorBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-errorBoundaryEvent-errorCode  ::= "errorCode" sp attr-str   # The BPMN error code this boundary catches.
 
 # timerIntermediateCatchEvent — Timer catch. Rests until `duration` after activation elapses.
 elem-timerIntermediateCatchEvent  ::= indent "timerIntermediateCatchEvent" sp id (sp string)? (sp attrs-timerIntermediateCatchEvent)? nl
 attrs-timerIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-timerIntermediateCatchEvent nl)+ indent "}"
-attr-line-timerIntermediateCatchEvent  ::= attr-timerIntermediateCatchEvent-duration | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-timerIntermediateCatchEvent  ::= attr-timerIntermediateCatchEvent-duration | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-timerIntermediateCatchEvent-duration  ::= "duration" sp attr-duration   # Delay after activation before the timer becomes due.
 
 # timerBoundaryEvent — Timer boundary on an activity. Interrupting or non-interrupting; may repeat.
 elem-timerBoundaryEvent  ::= indent "timerBoundaryEvent" sp id (sp string)? (sp attrs-timerBoundaryEvent)? nl
 attrs-timerBoundaryEvent   ::= "{" nl (indent2 attr-line-timerBoundaryEvent nl)+ indent "}"
-attr-line-timerBoundaryEvent  ::= attr-timerBoundaryEvent-attachedTo | attr-timerBoundaryEvent-duration | attr-timerBoundaryEvent-interrupting | attr-timerBoundaryEvent-repeating | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-timerBoundaryEvent  ::= attr-timerBoundaryEvent-attachedTo | attr-timerBoundaryEvent-duration | attr-timerBoundaryEvent-interrupting | attr-timerBoundaryEvent-repeating | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-timerBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-timerBoundaryEvent-duration  ::= "duration" sp attr-duration   # Delay after activation before firing (also the period when `repeating`).
 attr-timerBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
@@ -102,14 +102,14 @@ attr-timerBoundaryEvent-repeating  ::= "repeating" sp attr-bool   # `true` re-ar
 # messageIntermediateCatchEvent — Message catch. Opens a subscription and rests until a correlated message arrives.
 elem-messageIntermediateCatchEvent  ::= indent "messageIntermediateCatchEvent" sp id (sp string)? (sp attrs-messageIntermediateCatchEvent)? nl
 attrs-messageIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-messageIntermediateCatchEvent nl)+ indent "}"
-attr-line-messageIntermediateCatchEvent  ::= attr-messageIntermediateCatchEvent-message | attr-messageIntermediateCatchEvent-correlationKey | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-messageIntermediateCatchEvent  ::= attr-messageIntermediateCatchEvent-message | attr-messageIntermediateCatchEvent-correlationKey | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-messageIntermediateCatchEvent-message  ::= "message" sp attr-str   # The BPMN message name this event subscribes to.
 attr-messageIntermediateCatchEvent-correlationKey  ::= "correlationKey" sp attr-str   # Name of the instance variable whose value identifies the target instance.
 
 # messageBoundaryEvent — Message boundary on an activity. Interrupting or non-interrupting.
 elem-messageBoundaryEvent  ::= indent "messageBoundaryEvent" sp id (sp string)? (sp attrs-messageBoundaryEvent)? nl
 attrs-messageBoundaryEvent   ::= "{" nl (indent2 attr-line-messageBoundaryEvent nl)+ indent "}"
-attr-line-messageBoundaryEvent  ::= attr-messageBoundaryEvent-attachedTo | attr-messageBoundaryEvent-message | attr-messageBoundaryEvent-correlationKey | attr-messageBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-messageBoundaryEvent  ::= attr-messageBoundaryEvent-attachedTo | attr-messageBoundaryEvent-message | attr-messageBoundaryEvent-correlationKey | attr-messageBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-messageBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-messageBoundaryEvent-message  ::= "message" sp attr-str   # The BPMN message name this event subscribes to.
 attr-messageBoundaryEvent-correlationKey  ::= "correlationKey" sp attr-str   # Name of the instance variable whose value identifies the target instance.
@@ -118,32 +118,32 @@ attr-messageBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `tru
 # messageStartEvent — Message start. Correlating a matching message creates a new instance.
 elem-messageStartEvent  ::= indent "messageStartEvent" sp id (sp string)? (sp attrs-messageStartEvent)? nl
 attrs-messageStartEvent   ::= "{" nl (indent2 attr-line-messageStartEvent nl)+ indent "}"
-attr-line-messageStartEvent  ::= attr-messageStartEvent-message | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-messageStartEvent  ::= attr-messageStartEvent-message | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-messageStartEvent-message  ::= "message" sp attr-str   # The BPMN message name that triggers a new instance.
 
 # timerStartEvent — Timer start. Creates a new instance when the process-level timer fires.
 elem-timerStartEvent  ::= indent "timerStartEvent" sp id (sp string)? (sp attrs-timerStartEvent)? nl
 attrs-timerStartEvent   ::= "{" nl (indent2 attr-line-timerStartEvent nl)+ indent "}"
-attr-line-timerStartEvent  ::= attr-timerStartEvent-interval | attr-timerStartEvent-repeating | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-timerStartEvent  ::= attr-timerStartEvent-interval | attr-timerStartEvent-repeating | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-timerStartEvent-interval  ::= "interval" sp attr-duration   # Delay from deployment to first fire (also the period when `repeating`).
 attr-timerStartEvent-repeating  ::= "repeating" sp attr-bool   # `true` re-arms after firing (a cycle); `false` fires exactly once.
 
 # subProcess — Embedded sub-process. Container holding its own flow; child elements set `parent` to its id.
 elem-subProcess  ::= indent "subProcess" sp id (sp string)? (sp attrs-subProcess)? nl
 attrs-subProcess   ::= "{" nl (indent2 attr-line-subProcess nl)+ indent "}"
-attr-line-subProcess  ::= attr-subProcess-startEvent | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-subProcess  ::= attr-subProcess-startEvent | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-subProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the sub-process's inner (none) start event.
 
 # escalationThrowEvent — Escalation throw (intermediate throw or end event). Raises `escalationCode` up the enclosing scopes; non-critical, so the token always continues / drains (an uncaught escalation is ignored).
 elem-escalationThrowEvent  ::= indent "escalationThrowEvent" sp id (sp string)? (sp attrs-escalationThrowEvent)? nl
 attrs-escalationThrowEvent   ::= "{" nl (indent2 attr-line-escalationThrowEvent nl)+ indent "}"
-attr-line-escalationThrowEvent  ::= attr-escalationThrowEvent-escalationCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-escalationThrowEvent  ::= attr-escalationThrowEvent-escalationCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-escalationThrowEvent-escalationCode  ::= "escalationCode" sp attr-str   # The BPMN escalation code raised (empty raises an unnamed escalation).
 
 # escalationBoundaryEvent — Escalation boundary on an activity. Catches an escalation raised inside it (exact `escalationCode`, or empty for catch-all); interrupting or non-interrupting.
 elem-escalationBoundaryEvent  ::= indent "escalationBoundaryEvent" sp id (sp string)? (sp attrs-escalationBoundaryEvent)? nl
 attrs-escalationBoundaryEvent   ::= "{" nl (indent2 attr-line-escalationBoundaryEvent nl)+ indent "}"
-attr-line-escalationBoundaryEvent  ::= attr-escalationBoundaryEvent-attachedTo | attr-escalationBoundaryEvent-escalationCode | attr-escalationBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-escalationBoundaryEvent  ::= attr-escalationBoundaryEvent-attachedTo | attr-escalationBoundaryEvent-escalationCode | attr-escalationBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-escalationBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-escalationBoundaryEvent-escalationCode  ::= "escalationCode" sp attr-str   # The BPMN escalation code caught (empty is a catch-all).
 attr-escalationBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
@@ -151,36 +151,36 @@ attr-escalationBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `
 # intermediateThrowEvent — None intermediate throw. Pure pass-through.
 elem-intermediateThrowEvent  ::= indent "intermediateThrowEvent" sp id (sp string)? (sp attrs-intermediateThrowEvent)? nl
 attrs-intermediateThrowEvent   ::= "{" nl (indent2 attr-line-intermediateThrowEvent nl)+ indent "}"
-attr-line-intermediateThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-intermediateThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # linkIntermediateThrowEvent — Link throw. Has no outgoing flow; hands its token to the matching link catch (same `link`) in the same scope.
 elem-linkIntermediateThrowEvent  ::= indent "linkIntermediateThrowEvent" sp id (sp string)? (sp attrs-linkIntermediateThrowEvent)? nl
 attrs-linkIntermediateThrowEvent   ::= "{" nl (indent2 attr-line-linkIntermediateThrowEvent nl)+ indent "}"
-attr-line-linkIntermediateThrowEvent  ::= attr-linkIntermediateThrowEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-linkIntermediateThrowEvent  ::= attr-linkIntermediateThrowEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-linkIntermediateThrowEvent-link  ::= "link" sp attr-str   # The `linkEventDefinition name` this throw hands its token to.
 
 # linkIntermediateCatchEvent — Link catch. Has no incoming flow; activated directly by the matching link throw (same `link`), then a pass-through along its outgoing flow.
 elem-linkIntermediateCatchEvent  ::= indent "linkIntermediateCatchEvent" sp id (sp string)? (sp attrs-linkIntermediateCatchEvent)? nl
 attrs-linkIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-linkIntermediateCatchEvent nl)+ indent "}"
-attr-line-linkIntermediateCatchEvent  ::= attr-linkIntermediateCatchEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-linkIntermediateCatchEvent  ::= attr-linkIntermediateCatchEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-linkIntermediateCatchEvent-link  ::= "link" sp attr-str   # The `linkEventDefinition name` a matching throw hands its token to.
 
 # task — Abstract task (also manualTask). No execution semantics — pure pass-through.
 elem-task  ::= indent "task" sp id (sp string)? (sp attrs-task)? nl
 attrs-task   ::= "{" nl (indent2 attr-line-task nl)+ indent "}"
-attr-line-task  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-task  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # scriptTask — Inline FEEL script. Evaluates `expression`, stores in `resultVariable`, completes.
 elem-scriptTask  ::= indent "scriptTask" sp id (sp string)? (sp attrs-scriptTask)? nl
 attrs-scriptTask   ::= "{" nl (indent2 attr-line-scriptTask nl)+ indent "}"
-attr-line-scriptTask  ::= attr-scriptTask-expression | attr-scriptTask-resultVariable | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-scriptTask  ::= attr-scriptTask-expression | attr-scriptTask-resultVariable | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-scriptTask-expression  ::= "expression" sp attr-str   # Inline FEEL expression (leading `=` optional).
 attr-scriptTask-resultVariable  ::= "resultVariable" sp attr-str   # Variable name the expression result is stored under.
 
 # callActivity — Invokes another process definition and waits for it to complete.
 elem-callActivity  ::= indent "callActivity" sp id (sp string)? (sp attrs-callActivity)? nl
 attrs-callActivity   ::= "{" nl (indent2 attr-line-callActivity nl)+ indent "}"
-attr-line-callActivity  ::= attr-callActivity-calledElement | attr-callActivity-propagateAllParentVariables | attr-callActivity-propagateAllChildVariables | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-callActivity  ::= attr-callActivity-calledElement | attr-callActivity-propagateAllParentVariables | attr-callActivity-propagateAllChildVariables | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-callActivity-calledElement  ::= "calledElement" sp attr-str   # The `calledElement` / `zeebe:calledElement processId`.
 attr-callActivity-propagateAllParentVariables  ::= "propagateAllParentVariables" sp attr-bool   # `true` (Zeebe default) copies all visible parent variables into the child; `false` copies only the input-mapping results.
 attr-callActivity-propagateAllChildVariables  ::= "propagateAllChildVariables" sp attr-bool   # `true` (Zeebe default) merges the child's variables back into the parent (child wins); `false` crosses back only the output mappings.
@@ -188,13 +188,13 @@ attr-callActivity-propagateAllChildVariables  ::= "propagateAllChildVariables" s
 # signalIntermediateCatchEvent — Signal catch. Correlates by name only.
 elem-signalIntermediateCatchEvent  ::= indent "signalIntermediateCatchEvent" sp id (sp string)? (sp attrs-signalIntermediateCatchEvent)? nl
 attrs-signalIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-signalIntermediateCatchEvent nl)+ indent "}"
-attr-line-signalIntermediateCatchEvent  ::= attr-signalIntermediateCatchEvent-signal | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-signalIntermediateCatchEvent  ::= attr-signalIntermediateCatchEvent-signal | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-signalIntermediateCatchEvent-signal  ::= "signal" sp attr-str   # The BPMN signal name this event subscribes to.
 
 # signalBoundaryEvent — Signal boundary on an activity. Interrupting or non-interrupting.
 elem-signalBoundaryEvent  ::= indent "signalBoundaryEvent" sp id (sp string)? (sp attrs-signalBoundaryEvent)? nl
 attrs-signalBoundaryEvent   ::= "{" nl (indent2 attr-line-signalBoundaryEvent nl)+ indent "}"
-attr-line-signalBoundaryEvent  ::= attr-signalBoundaryEvent-attachedTo | attr-signalBoundaryEvent-signal | attr-signalBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-signalBoundaryEvent  ::= attr-signalBoundaryEvent-attachedTo | attr-signalBoundaryEvent-signal | attr-signalBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-signalBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-signalBoundaryEvent-signal  ::= "signal" sp attr-str   # The BPMN signal name this event subscribes to.
 attr-signalBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
@@ -202,13 +202,13 @@ attr-signalBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true
 # conditionalIntermediateCatchEvent — Conditional catch. Rests until a FEEL boolean becomes true.
 elem-conditionalIntermediateCatchEvent  ::= indent "conditionalIntermediateCatchEvent" sp id (sp string)? (sp attrs-conditionalIntermediateCatchEvent)? nl
 attrs-conditionalIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-conditionalIntermediateCatchEvent nl)+ indent "}"
-attr-line-conditionalIntermediateCatchEvent  ::= attr-conditionalIntermediateCatchEvent-condition | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-conditionalIntermediateCatchEvent  ::= attr-conditionalIntermediateCatchEvent-condition | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-conditionalIntermediateCatchEvent-condition  ::= "condition" sp attr-str   # FEEL boolean condition (leading `=` optional).
 
 # conditionalBoundaryEvent — Conditional boundary on an activity. Interrupting or non-interrupting.
 elem-conditionalBoundaryEvent  ::= indent "conditionalBoundaryEvent" sp id (sp string)? (sp attrs-conditionalBoundaryEvent)? nl
 attrs-conditionalBoundaryEvent   ::= "{" nl (indent2 attr-line-conditionalBoundaryEvent nl)+ indent "}"
-attr-line-conditionalBoundaryEvent  ::= attr-conditionalBoundaryEvent-attachedTo | attr-conditionalBoundaryEvent-condition | attr-conditionalBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-conditionalBoundaryEvent  ::= attr-conditionalBoundaryEvent-attachedTo | attr-conditionalBoundaryEvent-condition | attr-conditionalBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-conditionalBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-conditionalBoundaryEvent-condition  ::= "condition" sp attr-str   # FEEL boolean condition (leading `=` optional).
 attr-conditionalBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
@@ -216,14 +216,14 @@ attr-conditionalBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # 
 # compensationBoundaryEvent — Compensation boundary on an activity. Marks the activity compensable and names the handler activity run to undo it.
 elem-compensationBoundaryEvent  ::= indent "compensationBoundaryEvent" sp id (sp string)? (sp attrs-compensationBoundaryEvent)? nl
 attrs-compensationBoundaryEvent   ::= "{" nl (indent2 attr-line-compensationBoundaryEvent nl)+ indent "}"
-attr-line-compensationBoundaryEvent  ::= attr-compensationBoundaryEvent-attachedTo | attr-compensationBoundaryEvent-handler | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-compensationBoundaryEvent  ::= attr-compensationBoundaryEvent-attachedTo | attr-compensationBoundaryEvent-handler | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-compensationBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to (made compensable).
 attr-compensationBoundaryEvent-handler  ::= "handler" sp attr-id   # Id of the `isForCompensation` handler activity run to compensate it.
 
 # compensationThrowEvent — Compensation throw. Triggers the compensation handlers of completed compensable activities in scope (reverse completion order).
 elem-compensationThrowEvent  ::= indent "compensationThrowEvent" sp id (sp string)? (sp attrs-compensationThrowEvent)? nl
 attrs-compensationThrowEvent   ::= "{" nl (indent2 attr-line-compensationThrowEvent nl)+ indent "}"
-attr-line-compensationThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-compensationThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 
 # --- Attribute value primitives ---
 attr-str      ::= string
@@ -237,6 +237,7 @@ attr-retries         ::= "retries" sp string
 attr-timer           ::= "timer" sp ("duration" | "cycle" | "date") sp string
 attr-input           ::= "input" sp id sp "<-" sp string
 attr-output          ::= "output" sp id sp "<-" sp string
+attr-property        ::= "property" sp string sp string
 attr-multiInstance   ::= "multiInstance" sp "{" sp mi-attr (sp "," sp mi-attr)* sp "}"
 mi-attr              ::= "collection" sp string
                        | "inputElement" sp string

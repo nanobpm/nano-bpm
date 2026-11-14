@@ -16,6 +16,7 @@ mod console_api;
 // that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
+mod mcp;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
@@ -6322,7 +6323,7 @@ fn apply_create_instance_direct(
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
-    async fn create_process_instance_impl(
+    pub(crate) async fn create_process_instance_impl(
         &self,
         body: &models::ProcessInstanceCreationInstruction,
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
@@ -8793,7 +8794,7 @@ impl ServerImpl {
         }
     }
 
-    async fn resolve_incident_impl(
+    pub(crate) async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
         body: &Option<models::IncidentResolutionRequest>,
@@ -8915,7 +8916,7 @@ impl ServerImpl {
         )
     }
 
-    async fn get_process_instance_impl(
+    pub(crate) async fn get_process_instance_impl(
         &self,
         path_params: &models::GetProcessInstancePathParams,
     ) -> Result<apis::process_instance::GetProcessInstanceResponse, ()> {
@@ -8988,7 +8989,7 @@ impl ServerImpl {
     /// on every node). Only the latest version per process id is retained, so an
     /// older version's key yields 404. A definition built programmatically (no
     /// source XML) is reported as 204.
-    async fn get_process_definition_xml_impl(
+    pub(crate) async fn get_process_definition_xml_impl(
         &self,
         path_params: &models::GetProcessDefinitionXmlPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionXmlResponse, ()> {
@@ -9035,7 +9036,7 @@ impl ServerImpl {
     /// RF>1 are reported as `follower`. `replication_factor` is the cluster's
     /// `effective_rf()`. A single-node cluster reports one broker leading every
     /// partition at RF=1.
-    async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
+    pub(crate) async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
         let version = env!("NANOBPM_VERSION").to_string();
@@ -11365,7 +11366,7 @@ impl ServerImpl {
         }
     }
 
-    async fn get_incident_impl(
+    pub(crate) async fn get_incident_impl(
         &self,
         path_params: &models::GetIncidentPathParams,
     ) -> Result<apis::incident::GetIncidentResponse, ()> {
@@ -11429,7 +11430,7 @@ impl ServerImpl {
         }
     }
 
-    async fn search_incidents_impl(
+    pub(crate) async fn search_incidents_impl(
         &self,
         body: &Option<models::IncidentSearchQuery>,
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
@@ -11445,35 +11446,7 @@ impl ServerImpl {
             .iter()
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -11589,35 +11562,7 @@ impl ServerImpl {
             .filter(|inc| contained.contains(&inc.element_instance_key))
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -12706,7 +12651,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_process_instances_impl(
+    pub(crate) async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
@@ -12824,6 +12769,25 @@ impl ServerImpl {
                                 .map(|k| k.to_string())
                                 .as_deref(),
                         )
+                        // The read model does not project the definition's
+                        // display name or version tag onto the instance row, so
+                        // those filters match against an absent value — value
+                        // operators exclude (honest, never silently widening)
+                        // while `$exists: false` still matches (the `endDate`
+                        // convention above).
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
+                        // `suspendedDate` is the nullable column the read model
+                        // maintains (the single source of truth for suspension).
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Camunda's `tags` filter is a conjunction: an instance
+                        // must carry every listed tag.
+                        && f.tags.as_ref().is_none_or(|tags| {
+                            tags.iter().all(|t| inst.tags.contains(&t.0))
+                        })
                         && match_instance_variables(
                             &f.variables,
                             variables_index.get(&inst.key),
@@ -12877,48 +12841,83 @@ impl ServerImpl {
 
     /// Searches open message subscriptions (Zeebe `searchMessageSubscriptions`).
     ///
-    /// Backed by the `message_subscriptions` read-model table, which retains only
-    /// *open*, instance-scoped subscriptions (a running element instance parked on
-    /// a message catch), dropped on correlate/cancel/terminate. Every retained row
-    /// therefore surfaces with `state = CREATED` and `type = PROCESS_EVENT`;
-    /// settled subscriptions and message-*start* (`START_EVENT`) subscriptions are
-    /// not materialised and so are not returned. Process-definition attributes are
-    /// resolved by joining each subscription's instance to `process_instances`.
+    /// Backed by two read-model tables:
+    /// * `message_subscriptions` retains only *open*, instance-scoped
+    ///   subscriptions (a running element instance parked on a message catch),
+    ///   dropped on correlate/cancel/terminate. Every retained row surfaces with
+    ///   `state = CREATED` and `type = PROCESS_EVENT`; settled subscriptions are
+    ///   not materialised and so are not returned. Process-definition attributes
+    ///   are resolved by joining each subscription's instance to
+    ///   `process_instances`.
+    /// * `message_start_subscriptions` (#1499) retains the definition-scoped
+    ///   message *start event* subscriptions, one per deployed start message.
+    ///   These surface with `type = START_EVENT`, a null `processInstanceKey` /
+    ///   `elementInstanceKey` / `correlationKey` (they are not bound to an
+    ///   instance), and the MCP tool metadata (`toolName` / `toolProperties`)
+    ///   the start event declared via `zeebe:properties` (`io.camunda.tool:*`).
     async fn search_message_subscriptions_impl(
         &self,
         body: &Option<models::MessageSubscriptionSearchQuery>,
     ) -> Result<apis::message_subscription::SearchMessageSubscriptionsResponse, ()> {
         use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
 
-        // Every open read-model subscription is a created, process-event catch.
         let state_str = models::MessageSubscriptionStateEnum::Created.to_string();
-        let type_str = models::MessageSubscriptionTypeEnum::ProcessEvent.to_string();
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let subs = self.store.message_subscriptions();
+        let start_subs = self.store.message_start_subscriptions();
 
-        // Resolve process-definition attributes by joining to the owning instance.
+        // Resolve process-definition attributes by joining to the owning instance
+        // (PROCESS_EVENT rows) or directly to the deployed definition
+        // (START_EVENT rows).
         let instances = self.store.process_instances();
         let by_instance: std::collections::HashMap<u64, &readstore::ProcessInstanceRow> =
             instances.iter().map(|inst| (inst.key, inst)).collect();
+        let definitions = self.store.process_definitions();
+        let by_definition_key: std::collections::HashMap<u64, &readstore::ProcessDefinitionRow> =
+            definitions.iter().map(|d| (d.key, d)).collect();
 
         struct MsgSubEntry {
             subscription_key: u64,
             process_definition_id: String,
             process_definition_key: Option<String>,
-            process_instance_key: u64,
+            /// `Some` for instance-scoped (`PROCESS_EVENT`) subscriptions; `None`
+            /// for definition-scoped (`START_EVENT`) ones.
+            process_instance_key: Option<u64>,
             element_id: String,
-            element_instance_key: u64,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT`.
+            element_instance_key: Option<u64>,
             last_updated_ms: u64,
             message_name: String,
-            correlation_key: String,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT` (a start
+            /// subscription correlates by message name only).
+            correlation_key: Option<String>,
             process_definition_version: Option<i32>,
             /// The owning instance's business id (joined, like the definition
             /// attributes): the single source for both filter and result.
+            /// `None` for `START_EVENT` rows (not bound to an instance).
             business_id: Option<String>,
+            /// The MCP tool name from the start event's `io.camunda.tool:name`
+            /// zeebe:property (#1499). `None` when the property is absent and on
+            /// `PROCESS_EVENT` rows.
+            tool_name: Option<String>,
+            /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+            /// Empty when none and on `PROCESS_EVENT` rows.
+            tool_properties: std::collections::HashMap<String, String>,
+            /// The Zeebe `messageSubscriptionType` of this row.
+            is_start_event: bool,
         }
+        // The Zeebe `messageSubscriptionType` string of a row: the single
+        // source for the filter and the sort.
+        let type_str = |e: &MsgSubEntry| {
+            if e.is_start_event {
+                models::MessageSubscriptionTypeEnum::StartEvent.to_string()
+            } else {
+                models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
+            }
+        };
 
-        let entries: Vec<MsgSubEntry> = subs
+        let mut entries: Vec<MsgSubEntry> = subs
             .into_iter()
             .filter_map(|sub| {
                 // Skip subscriptions whose owning instance is not yet projected
@@ -12933,20 +12932,51 @@ impl ServerImpl {
                     subscription_key: sub.subscription_key,
                     process_definition_id: inst.process_definition_id.clone(),
                     process_definition_key: Some(inst.process_definition_key.clone()),
-                    process_instance_key: sub.instance_key,
+                    process_instance_key: Some(sub.instance_key),
                     element_id: sub.element_id,
-                    element_instance_key: sub.element_instance_key,
+                    element_instance_key: Some(sub.element_instance_key),
                     last_updated_ms: sub.created_at_ms,
                     message_name: sub.message_name,
-                    correlation_key: sub.correlation_key,
+                    correlation_key: Some(sub.correlation_key),
                     process_definition_version: Some(inst.version),
                     business_id: sub.business_id,
+                    tool_name: None,
+                    tool_properties: std::collections::HashMap::new(),
+                    is_start_event: false,
                 })
             })
             .collect();
 
-        // All Zeebe `MessageSubscriptionFilter` fields are honoured. Fields Nano
-        // does not yet project (`processDefinitionName`, `toolName`,
+        // Definition-scoped message start event subscriptions (#1499). The
+        // subscription key is the read model's canonical derived key
+        // (`message_start_subscription_key`), unique per start event even when
+        // one definition declares several message starts.
+        entries.extend(start_subs.into_iter().filter_map(|sub| {
+            let def = by_definition_key.get(&sub.process_definition_key)?;
+            Some(MsgSubEntry {
+                subscription_key: sub.subscription_key,
+                process_definition_id: def.process_id.clone(),
+                process_definition_key: Some(sub.process_definition_key.to_string()),
+                process_instance_key: None,
+                element_id: sub.start_element_id,
+                element_instance_key: None,
+                last_updated_ms: sub.created_at_ms,
+                message_name: sub.message_name,
+                correlation_key: None,
+                process_definition_version: Some(def.version),
+                business_id: None,
+                tool_name: sub.tool_name,
+                tool_properties: serde_json::from_str(&sub.tool_properties).unwrap_or_default(),
+                is_start_event: true,
+            })
+        }));
+
+        // All Zeebe `MessageSubscriptionFilter` fields are honoured. `toolName`
+        // is projected for START_EVENT rows (the start event's
+        // `io.camunda.tool:name` zeebe:property, #1499) and absent elsewhere, so
+        // an equality/`$like` filter matches only tool-marked start
+        // subscriptions while `$exists: false` matches every row without a tool
+        // name. Fields Nano does not yet project (`processDefinitionName`,
         // `inboundConnectorType`) are matched against an absent value, so an
         // equality/`$like` filter on them correctly yields no rows (rather than
         // being silently ignored) while `$exists: false` still matches.
@@ -12955,6 +12985,7 @@ impl ServerImpl {
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
+                    let type_str = type_str(e);
                     query::match_message_subscription_key(
                         &f.message_subscription_key,
                         &e.subscription_key.to_string(),
@@ -12962,17 +12993,17 @@ impl ServerImpl {
                         &f.process_definition_key,
                         e.process_definition_key.as_deref().unwrap_or(""),
                     ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
-                        && query::match_process_instance_key(
+                        && query::match_process_instance_key_opt(
                             &f.process_instance_key,
-                            &e.process_instance_key.to_string(),
+                            e.process_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
-                        && query::match_element_instance_key(
+                        && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            &e.element_instance_key.to_string(),
+                            e.element_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.message_name, &e.message_name)
-                        && query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_string_opt(&f.correlation_key, e.correlation_key.as_deref())
                         && query::match_message_subscription_state(
                             &f.message_subscription_state,
                             &state_str,
@@ -12991,7 +13022,7 @@ impl ServerImpl {
                             Some(e.last_updated_ms as i64),
                         )
                         && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.tool_name, None)
+                        && query::match_string_opt(&f.tool_name, e.tool_name.as_deref())
                         && query::match_string_opt(&f.inbound_connector_type, None)
                         && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
@@ -13016,13 +13047,21 @@ impl ServerImpl {
                 "processDefinitionVersion" => {
                     query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
                 }
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
+                "processInstanceKey" => {
+                    query::SortVal::Num(e.process_instance_key.unwrap_or(0) as i64)
+                }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => {
+                    query::SortVal::Num(e.element_instance_key.unwrap_or(0) as i64)
+                }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
+                "correlationKey" => {
+                    query::SortVal::Str(e.correlation_key.clone().unwrap_or_default())
+                }
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
+                "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
+                "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -13054,26 +13093,42 @@ impl ServerImpl {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-                        e.process_instance_key.to_string(),
-                    )),
+                    process_instance_key: match e.process_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ProcessInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     root_process_instance_key: types::Nullable::Null,
                     element_id: e.element_id,
-                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-                        e.element_instance_key.to_string(),
-                    )),
+                    element_instance_key: match e.element_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ElementInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     message_subscription_state: models::MessageSubscriptionStateEnum::Created,
                     last_updated_date: last_updated,
                     message_name: e.message_name,
-                    correlation_key: types::Nullable::Present(e.correlation_key),
-                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    tool_properties: std::collections::HashMap::new(),
+                    correlation_key: match e.correlation_key {
+                        Some(k) => types::Nullable::Present(k),
+                        None => types::Nullable::Null,
+                    },
+                    message_subscription_type: if e.is_start_event {
+                        models::MessageSubscriptionTypeEnum::StartEvent
+                    } else {
+                        models::MessageSubscriptionTypeEnum::ProcessEvent
+                    },
+                    tool_properties: e.tool_properties,
                     process_definition_name: types::Nullable::Null,
                     process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    tool_name: types::Nullable::Null,
+                    tool_name: match e.tool_name {
+                        Some(name) => types::Nullable::Present(name),
+                        None => types::Nullable::Null,
+                    },
                     inbound_connector_type: types::Nullable::Null,
                     tenant_id: "<default>".to_string(),
                 }
@@ -14259,7 +14314,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_user_tasks_impl(
+    pub(crate) async fn search_user_tasks_impl(
         &self,
         body: &Option<models::UserTaskSearchQuery>,
     ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
@@ -14308,7 +14363,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn assign_user_task_impl(
+    pub(crate) async fn assign_user_task_impl(
         &self,
         path_params: &models::AssignUserTaskPathParams,
         body: &models::UserTaskAssignmentRequest,
@@ -14406,7 +14461,7 @@ impl ServerImpl {
         }
     }
 
-    async fn complete_user_task_impl(
+    pub(crate) async fn complete_user_task_impl(
         &self,
         path_params: &models::CompleteUserTaskPathParams,
         body: &Option<models::UserTaskCompletionRequest>,
@@ -14510,7 +14565,7 @@ impl ServerImpl {
     }
 
     /// Returns a single user task from the read model by key.
-    async fn get_user_task_impl(
+    pub(crate) async fn get_user_task_impl(
         &self,
         path_params: &models::GetUserTaskPathParams,
     ) -> Result<apis::user_task::GetUserTaskResponse, ()> {
@@ -14741,7 +14796,7 @@ impl ServerImpl {
     }
 
     /// Clears a user task's assignee.
-    async fn unassign_user_task_impl(
+    pub(crate) async fn unassign_user_task_impl(
         &self,
         path_params: &models::UnassignUserTaskPathParams,
     ) -> Result<apis::user_task::UnassignUserTaskResponse, ()> {
@@ -14957,7 +15012,7 @@ impl ServerImpl {
     /// `scopeKey` of the scope that holds it — the process instance for root-scope
     /// variables, or a sub-process / multi-instance body / child element instance
     /// for a nested scope (Part C hierarchical scoping).
-    async fn search_variables_impl(
+    pub(crate) async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,
         body: &Option<models::VariableSearchQuery>,
@@ -15025,7 +15080,7 @@ impl ServerImpl {
 
     /// Returns a single variable by its (read-model assigned) key, with its full
     /// untruncated value.
-    async fn get_variable_impl(
+    pub(crate) async fn get_variable_impl(
         &self,
         path_params: &models::GetVariablePathParams,
     ) -> Result<apis::variable::GetVariableResponse, ()> {
@@ -15090,7 +15145,7 @@ impl ServerImpl {
     /// process id is retained and searchable (Camunda/Zeebe parity); the
     /// `isLatestVersion` filter narrows to the highest version per id via the
     /// `is_latest` discriminator computed by the read store.
-    async fn search_process_definitions_impl(
+    pub(crate) async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
     ) -> Result<apis::process_definition::SearchProcessDefinitionsResponse, ()> {
@@ -15180,7 +15235,7 @@ impl ServerImpl {
     /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
     /// the latest — since every version is retained and independently
     /// addressable by key. A malformed or unknown key yields 404.
-    async fn get_process_definition_impl(
+    pub(crate) async fn get_process_definition_impl(
         &self,
         path_params: &models::GetProcessDefinitionPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
@@ -15566,7 +15621,7 @@ impl ServerImpl {
     /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     #[cfg(test)]
-    async fn deploy_resources_locally(
+    pub(crate) async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
@@ -23416,13 +23471,65 @@ fn match_element_instance_fields(
         })
 }
 
+/// The incident filter predicate, shared by `searchIncidents` and the
+/// element-instance-scoped incident search so the two cannot drift. Every
+/// declared `IncidentFilter` field is matched: the process-definition identity
+/// is denormalized onto the row at projection time (no cross-entity lookup),
+/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
+/// against an absent value — value operators exclude the row (honest, never
+/// silently widening the search) while `$exists: false` still matches.
+fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
+    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
+        && query::match_element_instance_key(
+            &f.element_instance_key,
+            &inc.element_instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inc.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
+        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
+        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
+        && query::match_incident_error_type(
+            &f.error_type,
+            &incident_error_type_enum(inc.kind).to_string(),
+        )
+        && query::match_string(&f.element_id, &inc.element_id)
+        && query::match_string(&f.error_message, &inc.reason)
+        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
+        && query::match_string_opt(&f.tenant_id, None)
+}
+
 /// The user-task filter predicate over one AND-group of fields, shared by the
 /// top-level filter and each `$or` clause so the two cannot drift.
+///
+/// Every advertised field is matched against what the row actually projects.
+/// Fields Nano never projects onto a user task — `name` (the result's `name`
+/// is always null), `completionDate` (always null), `tags` (always empty), and
+/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
+/// absent value: value operators exclude the row (honest, never silently
+/// widening the search) while `$exists: false` still matches. The variable
+/// filters (`processInstanceVariables` / `localVariables`) are NOT evaluated
+/// here — they need a variable-store join this predicate cannot see, so the
+/// MCP adapter rejects them instead of letting them widen results silently.
 fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
+    // The task's due/follow-up dates are stored as RFC 3339 strings; project
+    // them to epoch millis for the date-time filter algebra. An unparseable or
+    // absent stored date is an absent value (value operators exclude it).
+    let parse_ms = |d: &Option<String>| {
+        d.as_deref()
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .map(|dt| dt.timestamp_millis())
+    };
     f.user_task_key
         .as_ref()
         .is_none_or(|k| k.0 == task.key.to_string())
+        && f.element_instance_key
+            .as_ref()
+            .is_none_or(|k| k.0 == task.element_instance_key.to_string())
         && query::match_process_instance_key(
             &f.process_instance_key,
             &task.instance_key.to_string(),
@@ -23431,9 +23538,40 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
             &f.process_definition_key,
             &task.process_definition_key,
         )
+        && query::match_process_definition_id(
+            &f.process_definition_id,
+            Some(&task.process_definition_id),
+        )
         && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
         && query::match_string(&f.assignee, &assignee)
         && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+        && query::match_string_opt(&f.business_id, task.business_id.as_deref())
+        && query::match_integer(&f.priority, Some(i64::from(task.priority)))
+        && f.candidate_group.as_ref().is_none_or(|g| match g {
+            models::StringFilterProperty::String(s) => task.candidate_groups.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_groups
+                .iter()
+                .any(|cg| query::match_string_property(g, Some(cg))),
+        })
+        && f.candidate_user.as_ref().is_none_or(|u| match u {
+            models::StringFilterProperty::String(s) => task.candidate_users.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_users
+                .iter()
+                .any(|cu| query::match_string_property(u, Some(cu))),
+        })
+        && query::match_date_time_ms(&f.creation_date, Some(task.created_at_ms as i64))
+        && query::match_date_time_ms(&f.due_date, parse_ms(&task.due_date))
+        && query::match_date_time_ms(&f.follow_up_date, parse_ms(&task.follow_up_date))
+        // Never projected: completion date (result is always null).
+        && query::match_date_time_ms(&f.completion_date, None)
+        // Never projected: task name (result is always null).
+        && query::match_string_opt(&f.name, None)
+        // Never projected: task tags (result is always empty), so any listed
+        // tag excludes the row.
+        && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
+        && query::match_string_opt(&f.tenant_id, None)
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -27806,30 +27944,19 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    let mut pos = shard.exported_position();
-                    if pos > events.len() {
-                        // The store is ahead of the log (truncated/corrupt journal):
-                        // rebuild from scratch.
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
-                        )]
-                        shard.reset().expect("reset read store");
-                        pos = 0;
-                    }
-                    if pos < events.len() {
-                        let refs: Vec<&Event> = events[pos..].iter().collect();
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
-                        )]
-                        shard
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    // Open the journal (rebuilding the engine from the full log)
+                    // BEFORE the read-model catch-up, so a store migrated from an
+                    // older schema backfills its pending projections from the
+                    // recovered engine state first — the same rule the segmented
+                    // path applies in `catch_up_shard`.
                     let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to open journal {}: {e}", journal_path.display())
                     });
+                    if let Err(e) =
+                        seglog::catch_up_shard_legacy(&shard, &events, journal.engine_state())
+                    {
+                        panic!("failed to catch up the read model from the legacy journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 }
@@ -28707,6 +28834,14 @@ async fn main() {
         });
     }
 
+    // MCP gateway (Camunda parity, issue #1499): a stateless streamable-HTTP
+    // MCP server at `/mcp/cluster` (slice 2; `/mcp/processes` lands in slice 3
+    // on the same seam). On by default; `NANOBPM_MCP_ENABLED=false/0/off/no`
+    // opts out. The mount is a single call so sibling slices extend it without
+    // touching dispatch.
+    // Built before `server` is moved into the REST router below.
+    let mcp_server = server.clone();
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route(
@@ -28883,6 +29018,20 @@ async fn main() {
     // secret. Merge it here so `/cluster` is reachable alongside `/falcon`.
     if let Some(cluster_router) = public_cluster_router {
         app = app.merge(cluster_router);
+    }
+
+    // MCP gateway (issue #1499 slice 2). On by default (operator decision,
+    // epic #1499); mounted unless `NANOBPM_MCP_ENABLED` is explicitly falsy
+    // (`false`/`0`/`off`/`no`). The endpoints sit behind the same auth check
+    // as the REST API: `mcp::mcp_router` layers every `/mcp/*` route in
+    // `mcp_auth`, which applies the shared `ApiAuthBasic` credential
+    // extraction the generated `/v2` handlers use (see server/src/mcp/mod.rs).
+    if mcp::mcp_enabled() {
+        app = app.merge(mcp::mcp_router(mcp_server));
+        tracing::info!(
+            "MCP gateway enabled: {}",
+            mcp::mcp_endpoint_paths().join(", ")
+        );
     }
 
     if debug_rest_enabled() {
@@ -29771,6 +29920,9 @@ async fn main() {
         println!("  API reference  {base}/swagger");
         println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);
         println!("  Metrics        {base}/metrics");
+        for line in mcp::mcp_banner_lines(&base, mcp::mcp_enabled()) {
+            println!("{line}");
+        }
         println!();
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -34837,9 +34989,13 @@ mod clustered_startup_tests {
             "lastUpdatedDate after 2100 excludes"
         );
 
-        // Fields Nano does not project (processDefinitionName / toolName /
+        // Fields Nano does not project (processDefinitionName /
         // inboundConnectorType) are treated as absent: an equality filter yields
         // no rows (not silently ignored) while `$exists: false` matches.
+        // (`toolName` is no longer in this list — it is projected for
+        // START_EVENT subscriptions, #1499; this process deploys no message
+        // start event, so its PROCESS_EVENT row still carries no tool name and
+        // behaves like an absent field here.)
         for field_setter in [
             |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
                 f.process_definition_name = Some(v)
@@ -34876,6 +35032,415 @@ mod clustered_startup_tests {
                 "$exists:false matches an unprojected field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_message_start_subscriptions_have_unique_keys_and_sort_by_tool_name() {
+        // #1499: a definition with several message start events yields one
+        // START_EVENT row per start event, each with its own
+        // `messageSubscriptionKey` (cursor pagination must not loop), and the
+        // advertised `toolName` sort orders by tool name, not by key.
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let multi = ProcessBuilder::new("multi")
+            .message_start_event("s1", "m1")
+            .message_start_event("s2", "m2")
+            .end_event("e")
+            .connect("s1", "e")
+            .connect("s2", "e")
+            .build()
+            .expect("valid two-start process");
+        let tool = |id: &str, name: &str| {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("io.camunda.tool:name".to_string(), name.to_string());
+            ProcessBuilder::new(id)
+                .message_start_event("s", format!("{id}-msg"))
+                .end_event("e")
+                .connect("s", "e")
+                .with_properties("s", props)
+                .build()
+                .expect("valid tool process")
+        };
+        let mut names = std::collections::HashMap::new();
+        for id in ["multi", "zeta-proc", "alpha-proc"] {
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+        }
+        // `zeta` deploys before `alpha`, so key order differs from name order.
+        server
+            .deploy_resources_locally(
+                vec![
+                    multi,
+                    tool("zeta-proc", "zeta"),
+                    tool("alpha-proc", "alpha"),
+                ],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let search = |q: models::MessageSubscriptionSearchQuery| {
+            let server = &server;
+            async move {
+                let Resp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .expect("search returns")
+                else {
+                    panic!("expected a 200 result");
+                };
+                r
+            }
+        };
+        let all = || models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        };
+        for _ in 0..200 {
+            if search(all()).await.items.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(search(all()).await.items.len(), 4);
+
+        // Page the two `multi` start subscriptions one at a time.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..4 {
+            let r = search(models::MessageSubscriptionSearchQuery {
+                page: Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(1),
+                    },
+                )),
+                sort: None,
+                filter: Some(models::MessageSubscriptionFilter {
+                    process_definition_id: Some(models::StringFilterProperty::String(
+                        "multi".to_string(),
+                    )),
+                    ..models::MessageSubscriptionFilter::new()
+                }),
+            })
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(|i| i.message_name.clone()));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Sort by toolName ascending: alpha before zeta despite key order.
+        let r = search(models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: Some(vec![models::MessageSubscriptionSearchQuerySortRequest {
+                field: "toolName".to_string(),
+                order: Some(models::SortOrderEnum::Asc),
+            }]),
+            filter: None,
+        })
+        .await;
+        let tools: Vec<String> = r
+            .items
+            .into_iter()
+            .filter_map(|i| match i.tool_name {
+                types::Nullable::Present(t) => Some(t),
+                types::Nullable::Null => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_message_subscriptions_projects_tool_name_on_start_events() {
+        // MCP gateway parity (#1499): a process whose message start event
+        // carries `zeebe:properties` tool markers deploys a definition-scoped
+        // START_EVENT subscription whose `toolName` / `toolProperties` are
+        // projected from `io.camunda.tool:*`, and the `toolName` filter honours
+        // the Zeebe semantics (equality / `$like` on an absent value match no
+        // rows; `$exists: false` matches rows with no tool name; `$exists: true`
+        // matches rows that have one).
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+
+        // A tool-marked message start process (the vendored Camunda e2e
+        // fixture), a plain message start process (no tool markers), and an
+        // instance-scoped catch process (a PROCESS_EVENT row once running).
+        let tool_xml =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let tool = parse_bpmn(tool_xml).expect("tool fixture parses");
+        let plain = ProcessBuilder::new("plain-start")
+            .message_start_event("s", "plain-message")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid plain message-start process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("mcpProcessWithInputs".to_string(), "mcp.bpmn".to_string());
+        names.insert("plain-start".to_string(), "plain.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        let mut defs = tool;
+        defs.push(plain);
+        defs.push(waiter);
+        server
+            .deploy_resources_locally(
+                defs,
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Start an instance of the waiter so a PROCESS_EVENT row exists too.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until all three rows are projected (two START_EVENT + one
+        // PROCESS_EVENT).
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .expect("search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.len() == 3 {
+                items = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            items.len(),
+            3,
+            "two START_EVENT rows plus one PROCESS_EVENT row are projected"
+        );
+
+        // The tool-marked START_EVENT row carries the full tool metadata.
+        let tool_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "mcpProcessWithInputs")
+            .expect("the tool process's start subscription is projected");
+        assert_eq!(
+            tool_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(tool_row.element_id, "StartEvent_1");
+        assert_eq!(tool_row.message_name, "mcp-process-with-inputs");
+        assert_eq!(
+            tool_row.tool_name,
+            types::Nullable::Present("mcp-process-with-inputs".to_string())
+        );
+        assert_eq!(
+            tool_row.tool_properties.get("io.camunda.tool:input_1_name"),
+            Some(&"firstName".to_string())
+        );
+        assert_eq!(tool_row.tool_properties.len(), 9);
+        // A definition-scoped subscription is not bound to an instance.
+        assert_eq!(tool_row.process_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.element_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.correlation_key, types::Nullable::Null);
+        assert_eq!(
+            tool_row.message_subscription_state,
+            models::MessageSubscriptionStateEnum::Created
+        );
+        assert_eq!(
+            tool_row.process_definition_version,
+            types::Nullable::Present(1)
+        );
+
+        // The plain message start row is a START_EVENT with no tool metadata.
+        let plain_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "plain-start")
+            .expect("the plain process's start subscription is projected");
+        assert_eq!(
+            plain_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(plain_row.tool_name, types::Nullable::Null);
+        assert!(plain_row.tool_properties.is_empty());
+
+        // The instance-scoped catch row is a PROCESS_EVENT with no tool metadata.
+        let catch_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "waiter")
+            .expect("the waiter's catch subscription is projected");
+        assert_eq!(
+            catch_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::ProcessEvent
+        );
+        assert_eq!(catch_row.tool_name, types::Nullable::Null);
+        assert!(matches!(
+            catch_row.process_instance_key,
+            types::Nullable::Present(_)
+        ));
+
+        // Helper: run one filter and return the matched processDefinitionIds.
+        async fn matched_ids(
+            server: &ServerImpl,
+            filter: models::MessageSubscriptionFilter,
+        ) -> Vec<String> {
+            let resp = server
+                .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                }))
+                .await
+                .expect("filtered search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            let mut ids: Vec<String> = result
+                .items
+                .into_iter()
+                .map(|i| i.process_definition_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+        let tool_filter = |v: models::StringFilterProperty| models::MessageSubscriptionFilter {
+            tool_name: Some(v),
+            ..models::MessageSubscriptionFilter::new()
+        };
+
+        // toolName equality matches only the tool-marked START_EVENT row.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String(
+                    "mcp-process-with-inputs".to_string()
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // Equality on a value no row carries matches nothing.
+        assert!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String("nope".to_string()))
+            )
+            .await
+            .is_empty(),
+            "equality on an absent tool name matches no rows"
+        );
+        // `$like` behaves like equality w.r.t. absent values.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_like: Some("mcp-process-*".to_string()),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: true` matches only the row that has a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(true),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: false` matches every row without a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["plain-start".to_string(), "waiter".to_string()]
+        );
+
+        // messageSubscriptionType filters select each side.
+        let type_filter =
+            |t: models::MessageSubscriptionTypeEnum| models::MessageSubscriptionFilter {
+                message_subscription_type: Some(
+                    models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(t),
+                ),
+                ..models::MessageSubscriptionFilter::new()
+            };
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::StartEvent)
+            )
+            .await,
+            vec![
+                "mcpProcessWithInputs".to_string(),
+                "plain-start".to_string()
+            ]
+        );
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::ProcessEvent)
+            )
+            .await,
+            vec!["waiter".to_string()]
+        );
+
+        // Correlating the tool message starts a new instance of the tool
+        // process (the subscription mints instances; the START_EVENT row stays).
+        let correlate = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
+                name: "mcp-process-with-inputs".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .expect("correlate returns");
+        assert!(
+            matches!(
+                correlate,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ),
+            "the tool message starts an instance"
+        );
     }
 
     #[tokio::test]
@@ -48965,6 +49530,444 @@ mod search_process_instances_suspend_resume_tests {
 }
 
 #[cfg(test)]
+mod search_filter_honesty_tests {
+    //! Regression coverage for the "silently ignored filter" defect class
+    //! (PR #1586 review): a filter field the API advertises but the predicate
+    //! never evaluates *widens* the caller's restriction while looking like a
+    //! match — the worst failure mode for a search API. Every field the
+    //! incident / process-instance / user-task predicates declare must either
+    //! narrow the result set or honestly exclude (matching against an absent
+    //! value, so `$exists: false` still works). These tests seed the read model
+    //! directly and drive the real `*_impl` handlers.
+
+    use nanobpmn_engine_core::{Event, IncidentKind};
+
+    use super::*;
+
+    /// Seed two process instances on *different* process definitions (so a
+    /// processDefinitionId filter can tell them apart), each with tags and a
+    /// business id.
+    fn seed_instances(server: &ServerImpl) {
+        let created = |key: u64, process_id: &str, tags: &[&str], business_id: Option<&str>| {
+            Event::ProcessInstanceCreated {
+                instance_key: key,
+                process_id: process_id.to_string(),
+                variables: std::collections::HashMap::new(),
+                created_at: 1_700_000_000_000,
+                tags: tags.iter().map(|t| (*t).to_string()).collect(),
+                business_id: business_id.map(str::to_string),
+                process_definition_key: 0,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            }
+        };
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1, "order-process", &["blue"], Some("order-7")),
+                &created(2, "returns-process", &["red"], Some("return-3")),
+            ])
+            .unwrap();
+    }
+
+    async fn search_instances(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_instance_search_honours_tags_suspended_date_and_definition_metadata() {
+        let server = ServerImpl::default();
+        seed_instances(&server);
+        // Suspend instance 1 at a known instant so suspendedDate can select it.
+        server.store.shards()[0]
+            .1
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 1,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // Baseline: both instances.
+        let all = search_instances(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both instances");
+
+        // `tags` narrows to the instance carrying every listed tag.
+        let tagged = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(tagged.page.total_items, 1);
+        assert_eq!(tagged.items[0].process_instance_key.0, "1");
+        let no_tag = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("no-such-tag".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_tag.page.total_items, 0,
+            "a tag nothing carries must match nothing — not widen to all rows"
+        );
+
+        // `suspendedDate` narrows to the instance suspended in the range.
+        let suspended = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "1");
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are not
+        // projected onto the instance row: a value filter honestly matches
+        // nothing (never widens), while `$exists: false` matches both.
+        let by_name = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::String(
+                    "Order Process".to_string(),
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+        let name_absent = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            name_absent.page.total_items, 2,
+            "$exists: false on an unprojected field matches every row"
+        );
+    }
+
+    /// Seed one incident per process instance (different definitions).
+    fn seed_incidents(server: &ServerImpl) {
+        seed_instances(server);
+        let raised = |key: u64, instance: u64, reason: &str, at: u64| Event::IncidentRaised {
+            incident_key: key,
+            instance_key: instance,
+            element_instance_key: 100 + instance,
+            element_id: "task".to_string(),
+            kind: IncidentKind::JobNoRetries,
+            reason: reason.to_string(),
+            job_key: Some(200 + instance),
+            created_at: at,
+            redrive: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &raised(11, 1, "order failed", 1_700_000_100_000),
+                &raised(22, 2, "return failed", 1_700_000_200_000),
+            ])
+            .unwrap();
+    }
+
+    async fn search_incidents(
+        server: &ServerImpl,
+        filter: models::IncidentFilter,
+    ) -> models::IncidentSearchQueryResult {
+        let body = Some(models::IncidentSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_incidents_impl(&body).await {
+            Ok(apis::incident::SearchIncidentsResponse::Status200_TheIncidentSearchResult(r)) => r,
+            other => panic!("expected a 200 incident search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_search_honours_process_definition_id_and_creation_time() {
+        let server = ServerImpl::default();
+        seed_incidents(&server);
+
+        let all = search_incidents(&server, models::IncidentFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both incidents");
+
+        // `processDefinitionId` narrows to the incident of that definition's
+        // instance — the field the PR #1586 review caught being ignored.
+        let narrowed = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "order-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(narrowed.page.total_items, 1);
+        assert_eq!(narrowed.items[0].incident_key.0, "11");
+        let widened = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "no-such-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            widened.page.total_items, 0,
+            "a non-matching processDefinitionId must exclude, not widen"
+        );
+
+        // `creationTime` narrows by the incident's creation timestamp.
+        let recent = search_incidents(
+            &server,
+            models::IncidentFilter {
+                creation_time: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_150_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(recent.page.total_items, 1);
+        assert_eq!(recent.items[0].incident_key.0, "22");
+    }
+
+    /// Seed one user task per instance with distinct business ids, priorities
+    /// and candidate assignments.
+    fn seed_user_tasks(server: &ServerImpl) {
+        seed_instances(server);
+        let task = |key: u64,
+                    instance: u64,
+                    assignee: Option<&str>,
+                    groups: &[&str],
+                    priority: i32,
+                    due: Option<&str>| Event::UserTaskCreated {
+            user_task_key: key,
+            instance_key: instance,
+            element_instance_key: 300 + instance,
+            element_id: "review".to_string(),
+            created_at: 1_700_000_300_000 + key,
+            assignee: assignee.map(str::to_string),
+            candidate_groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            candidate_users: Vec::new(),
+            due_date: due.map(str::to_string),
+            follow_up_date: None,
+            priority,
+            form_key: None,
+            external_form_reference: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &task(
+                    31,
+                    1,
+                    Some("alice"),
+                    &["ops"],
+                    50,
+                    Some("2024-01-01T00:00:00Z"),
+                ),
+                &task(32, 2, None, &["finance"], 80, None),
+            ])
+            .unwrap();
+    }
+
+    async fn search_tasks(
+        server: &ServerImpl,
+        filter: models::UserTaskFilter,
+    ) -> models::UserTaskSearchQueryResult {
+        let body = Some(models::UserTaskSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_user_tasks_impl(&body).await {
+            Ok(apis::user_task::SearchUserTasksResponse::Status200_TheUserTaskSearchResult(r)) => r,
+            other => panic!("expected a 200 user-task search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_task_search_honours_the_advertised_filters() {
+        let server = ServerImpl::default();
+        seed_user_tasks(&server);
+
+        let all = search_tasks(&server, models::UserTaskFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both tasks");
+
+        // `businessId` narrows to the task of the instance carrying it — the
+        // exact case the PR #1586 review cited.
+        let by_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String("order-7".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_business.page.total_items, 1);
+        assert_eq!(by_business.items[0].user_task_key.0, "31");
+        let no_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String(
+                    "no-such-order".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_business.page.total_items, 0,
+            "a non-matching businessId must exclude, not widen"
+        );
+
+        // `priority` narrows numerically.
+        let by_priority = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                priority: Some(models::IntegerFilterProperty::I32(80)),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_priority.page.total_items, 1);
+        assert_eq!(by_priority.items[0].user_task_key.0, "32");
+
+        // `processDefinitionId` narrows to the task of that definition.
+        let by_pd = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                process_definition_id: Some(models::ProcessDefinitionIdFilterProperty::String(
+                    "returns-process".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_pd.page.total_items, 1);
+        assert_eq!(by_pd.items[0].user_task_key.0, "32");
+
+        // `elementInstanceKey` narrows to the task with that element instance.
+        let by_eik = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                element_instance_key: Some(models::ElementInstanceKey("302".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_eik.page.total_items, 1);
+        assert_eq!(by_eik.items[0].user_task_key.0, "32");
+
+        // `candidateGroup` narrows to the tasks listing the group.
+        let by_group = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                candidate_group: Some(models::StringFilterProperty::String("ops".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_group.page.total_items, 1);
+        assert_eq!(by_group.items[0].user_task_key.0, "31");
+
+        // `dueDate` narrows by the parsed stored date; the task without a due
+        // date is excluded by a range operator (honest absent-value semantics).
+        let by_due = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                due_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_lte: Some(
+                            chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                                .unwrap()
+                                .to_utc(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_due.page.total_items, 1);
+        assert_eq!(by_due.items[0].user_task_key.0, "31");
+
+        // `name` is never projected (the result's name is always null): a
+        // value filter honestly matches nothing instead of widening.
+        let by_name = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                name: Some(models::StringFilterProperty::String("Review".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+
+        // `tags` is always empty on Nano tasks: any listed tag excludes.
+        let by_tags = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_tags.page.total_items, 0);
+    }
+}
+
+#[cfg(test)]
 mod call_activity_hierarchy_read_model_tests {
     //! Issue #977 (Zeebe/C8 parity): the process-instance and element-instance
     //! read models surface the native call-activity hierarchy. A child spawned
@@ -52270,3 +53273,37 @@ mod publish_fanout_retry_tests {
         assert!(!retry(1, false, false, 8, 8), "bounded");
     }
 }
+
+/// Sort fields the shared REST sorters project (keep in lockstep with the
+/// `sort_items` match arms in the `search_*_impl` handlers; every other field
+/// falls back to entity-key order). The MCP adapter rejects anything outside
+/// these lists instead of silently mis-ordering.
+pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
+    "incidentKey",
+    "creationTime",
+    "state",
+    "errorType",
+    "processInstanceKey",
+    "elementId",
+];
+pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
+    "processInstanceKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "state",
+    "businessId",
+];
+pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
+    "userTaskKey",
+    "processInstanceKey",
+    "elementId",
+    "state",
+    "creationDate",
+    "businessId",
+];
+pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
+    "processDefinitionKey",
+    "processDefinitionId",
+    "name",
+    "version",
+];

@@ -1374,10 +1374,22 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
 /// Escape the five predefined XML entities for safe emission into attribute values and text
 /// (the inverse of the engine tokenizer's `unescape`). `&` first so we don't double-escape.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;"),
+    )
+}
+
+/// Encode tab / newline / carriage return as numeric character references.
+/// XML attribute-value normalization turns literal whitespace into spaces, so
+/// a multiline value (e.g. an MCP purpose property) would lose its line breaks
+/// on re-import. Shared by every escaper so no emitter can regress.
+fn escape_attr_whitespace(s: String) -> String {
+    s.replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
 }
 
 /// A safe id fragment: keep alphanumerics and `_`/`-`, map everything else to `_`.
@@ -1798,9 +1810,11 @@ fn ensure_nano_namespace(mut xml: String) -> String {
 /// Kept separate from [`xml_escape`] because attribute values need `"`
 /// escaped as well.
 fn xml_escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;"),
+    )
 }
 
 /// Turn a machine id into a readable label: strip a leading kind prefix (`Task_`, `Gateway_`,
@@ -2119,6 +2133,50 @@ fn emit_io_mapping(el: &Element, out: &mut String) {
     out.push_str("        </zeebe:ioMapping>\n");
 }
 
+/// Emit a `zeebe:properties` block (with its nested `zeebe:property` entries)
+/// if the element carries extension properties — e.g. the `io.camunda.tool:*`
+/// MCP tool metadata (#1499). Emitted INSIDE the owner's
+/// `<bpmn:extensionElements>` so the engine parser (`bpmn::walk`, which reads
+/// `zeebe:property` children of a `zeebe:properties` container) round-trips
+/// them. A no-op when the element declares no properties, so unmarked nodes
+/// stay terse.
+fn emit_properties(el: &Element, out: &mut String) {
+    if el.properties.is_empty() {
+        return;
+    }
+    out.push_str("        <zeebe:properties>\n");
+    for (name, value) in &el.properties {
+        out.push_str(&format!(
+            "          <zeebe:property name=\"{}\" value=\"{}\"/>\n",
+            xml_escape(name),
+            xml_escape(value)
+        ));
+    }
+    out.push_str("        </zeebe:properties>\n");
+}
+
+/// Whether the element needs an `<bpmn:extensionElements>` wrapper for the
+/// shared (kind-independent) extensions: io mappings and/or properties.
+fn has_shared_extensions(el: &Element) -> bool {
+    !el.io.inputs.is_empty() || !el.io.outputs.is_empty() || !el.properties.is_empty()
+}
+
+/// Emit the shared (kind-independent) extensions wrapper — io mappings and
+/// `zeebe:properties` — for an element whose kind arm has no extensions of its
+/// own: self-closing when the element carries neither, otherwise an open
+/// `<bpmn:extensionElements>` block. Kind arms that already emit their own
+/// `<bpmn:extensionElements>` block call [`emit_io_mapping`] + [`emit_properties`]
+/// inside it directly instead.
+fn emit_shared_extensions(el: &Element, out: &mut String) {
+    if !has_shared_extensions(el) {
+        return;
+    }
+    out.push_str("      <bpmn:extensionElements>\n");
+    emit_io_mapping(el, out);
+    emit_properties(el, out);
+    out.push_str("      </bpmn:extensionElements>\n");
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
 /// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
@@ -2147,47 +2205,69 @@ fn emit_element(
     );
     match &el.kind {
         ElementKind::StartEvent => {
-            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
+            // Round-trip any `zeebe:properties` (e.g. the `io.camunda.tool:*`
+            // MCP tool markers, #1499) and io mappings: a self-closing tag
+            // would silently strip them on re-parse.
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:startEvent>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::EndEvent => {
-            // Round-trip any `zeebe:ioMapping` the model carries (the parser
-            // pushes an end event onto the io_stack, so mappings attach to it):
-            // a self-closing tag would silently drop them, changing the model on
-            // re-parse. Terse self-closing form only when there is nothing to nest.
-            if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries (the parser pushes an end event onto the io_stack, so
+            // mappings and properties attach to it): a self-closing tag would
+            // silently drop them, changing the model on re-parse. Terse
+            // self-closing form only when there is nothing to nest.
+            if !has_shared_extensions(el) {
                 out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
             } else {
                 out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
                 out.push_str("    </bpmn:endEvent>\n");
             }
         }
         ElementKind::TerminateEndEvent => {
             out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
-            // Preserve any `zeebe:ioMapping` on the terminate end (same io_stack
-            // attachment as a plain end event) so the model round-trips; without
-            // it, re-parsing the emitted BPMN would drop the mapping. Nano — like
-            // Zeebe — does not *apply* io mappings on a terminate end at runtime,
-            // but the serializer must not silently mutate the authored model.
-            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+            // Preserve any `zeebe:ioMapping` / `zeebe:properties` on the
+            // terminate end (same io_stack attachment as a plain end) so the
+            // model round-trips; without it, re-parsing the emitted BPMN would
+            // drop the mapping/properties. Nano — like Zeebe — does not *apply*
+            // io mappings on a terminate end at runtime, but the serializer
+            // must not silently mutate the authored model.
+            if has_shared_extensions(el) {
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
             }
             out.push_str("      <bpmn:terminateEventDefinition />\n");
             out.push_str("    </bpmn:endEvent>\n");
         }
         ElementKind::IntermediateThrowEvent => {
-            out.push_str(&format!(
-                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:intermediateThrowEvent>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
+                ));
+            }
         }
         ElementKind::LinkIntermediateThrowEvent { link_name } => {
             out.push_str(&format!(
                 "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
                 xml_escape(link_name)
@@ -2198,6 +2278,7 @@ fn emit_element(
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
                 xml_escape(link_name)
@@ -2206,19 +2287,19 @@ fn emit_element(
         }
         ElementKind::Task => {
             // An abstract task is a pass-through, but — like the typed tasks — it
-            // still round-trips a `zeebe:ioMapping` and/or
+            // still round-trips a `zeebe:ioMapping`, `zeebe:properties`, and/or
             // `multiInstanceLoopCharacteristics` when the model carries them (the
-            // parser pushes it onto the io_stack, so both attach to the element).
-            // Emit an open tag only when there is something to nest; otherwise a
-            // self-closing tag keeps the common case terse.
-            let has_io = !el.io.inputs.is_empty() || !el.io.outputs.is_empty();
-            if !has_io && el.multi_instance.is_none() {
+            // parser pushes it onto the io_stack, so all three attach to the
+            // element). Emit an open tag only when there is something to nest;
+            // otherwise a self-closing tag keeps the common case terse.
+            if !has_shared_extensions(el) && el.multi_instance.is_none() {
                 out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}/>\n"));
             } else {
                 out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}>\n"));
-                if has_io {
+                if has_shared_extensions(el) {
                     out.push_str("      <bpmn:extensionElements>\n");
                     emit_io_mapping(el, out);
+                    emit_properties(el, out);
                     out.push_str("      </bpmn:extensionElements>\n");
                 }
                 emit_multi_instance(el, out);
@@ -2237,6 +2318,7 @@ fn emit_element(
                 xml_escape(result_variable)
             ));
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:scriptTask>\n");
         }
@@ -2275,6 +2357,7 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 ));
             }
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:callActivity>\n");
@@ -2284,24 +2367,52 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 .get(id)
                 .map(|f| format!(" default=\"{}\"", xml_escape(f)))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:exclusiveGateway>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+                ));
+            }
         }
         ElementKind::ParallelGateway => {
-            out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:parallelGateway>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::InclusiveGateway => {
             let da = default_flows
                 .get(id)
                 .map(|f| format!(" default=\"{}\"", xml_escape(f)))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:inclusiveGateway>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+                ));
+            }
         }
         ElementKind::EventBasedGateway => {
-            out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:eventBasedGateway>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::ServiceTask {
             job_type,
@@ -2403,6 +2514,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 out.push_str("        </zeebe:linkedResources>\n");
             }
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             if let Some(adhoc) = adhoc {
@@ -2444,6 +2556,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 xml_escape(decision_id)
             ));
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:businessRuleTask>\n");
@@ -2495,6 +2608,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 }
                 out.push_str("/>\n");
             }
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:userTask>\n");
         }
@@ -2510,6 +2624,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:errorEventDefinition errorRef=\"{}\"/>\n",
                 xml_escape(&err_id)
@@ -2531,6 +2646,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
             if *repeating && !*interrupting {
                 out.push_str(&format!(
@@ -2565,6 +2681,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2575,6 +2692,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
@@ -2594,6 +2712,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2606,6 +2725,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 .cloned()
                 .unwrap_or_default();
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2617,6 +2737,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             repeating,
         } => {
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
             if *repeating {
                 out.push_str(&format!(
@@ -2637,6 +2758,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
                 xml_escape(&sref)
@@ -2658,6 +2780,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
                 xml_escape(&sref)
@@ -2668,6 +2791,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:conditionalEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
@@ -2690,6 +2814,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:conditionalEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
@@ -2709,15 +2834,17 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "intermediateThrowEvent"
             };
             out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
-            // Round-trip any `zeebe:ioMapping` the model carries: the parser
-            // attaches io mappings on BOTH the `intermediateThrowEvent` and the
-            // `endEvent` form (same io_stack push as a plain/terminate end), so
-            // omitting them here would silently drop inputs/outputs on re-parse.
-            // Mirror the plain/terminate end branches — emit the block before the
-            // event definition. A no-op when there are no mappings.
-            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries: the parser attaches io mappings and properties on BOTH
+            // the `intermediateThrowEvent` and the `endEvent` form (same
+            // io_stack push as a plain/terminate end), so omitting them here
+            // would silently drop inputs/outputs/properties on re-parse. Mirror
+            // the plain/terminate end branches — emit the block before the
+            // event definition. A no-op when there is nothing to nest.
+            if has_shared_extensions(el) {
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
             }
             if escalation_code.is_empty() {
@@ -2748,6 +2875,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             if escalation_code.is_empty() {
                 out.push_str("      <bpmn:escalationEventDefinition/>\n");
             } else {
@@ -2774,6 +2902,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "intermediateThrowEvent"
             };
             out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:compensateEventDefinition/>\n");
             out.push_str(&format!("    </bpmn:{tag}>\n"));
         }
@@ -2785,6 +2914,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:compensateEventDefinition/>\n");
             out.push_str("    </bpmn:boundaryEvent>\n");
             // The compensation handler is wired to this boundary by an
@@ -2801,6 +2931,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
         }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
@@ -3043,6 +3174,7 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: tool.properties.clone(),
                 },
             );
         }
@@ -3870,6 +4002,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -3928,6 +4061,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -4095,6 +4229,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             Ok(format!(
@@ -4232,6 +4367,14 @@ pub fn edit_model_in(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xml_escapers_preserve_attribute_whitespace() {
+        let raw = "line1\nline2\r\n\tindented";
+        for escaped in [super::xml_escape(raw), super::xml_escape_attr(raw)] {
+            assert_eq!(escaped, "line1&#10;line2&#13;&#10;&#9;indented");
+        }
+    }
+
     use super::*;
 
     // A small loan-approval-shaped model: start -> credit-check (service) -> XOR gateway
@@ -4855,6 +4998,62 @@ mod tests {
             assert!(preserved.contains(&authored_di.diagram_block));
             assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
         }
+    }
+
+    #[test]
+    fn adhoc_catalog_leaf_tools_round_trip_zeebe_properties() {
+        // PR #1586 review: a `zeebe:properties` block on a PRUNED ad-hoc leaf
+        // tool (service task AND call activity) must survive edit/layout
+        // re-emission — the catalog retains it and the restorer re-attaches it.
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="external"/>
+        <zeebe:taskDefinition type="agent-worker"/>
+        <zeebe:adHoc outputCollection="results" outputElement="= result"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:serviceTask id="Lookup">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="lookup"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="svc"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:callActivity id="CallSpecialist">
+        <bpmn:extensionElements>
+          <zeebe:calledElement processId="child"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="call"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:callActivity>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let original = parse_bpmn(source).expect("valid ad-hoc model").remove(0);
+        for (id, hint) in [("Lookup", "svc"), ("CallSpecialist", "call")] {
+            let tool = original.adhoc[0]
+                .tools
+                .iter()
+                .find(|t| t.element_id == id)
+                .expect("tool in the catalog");
+            assert_eq!(
+                tool.properties
+                    .get("io.camunda.tool:hint")
+                    .map(String::as_str),
+                Some(hint),
+                "catalog must retain {id}'s zeebe:properties"
+            );
+        }
+        let emitted = definition_to_xml(&original);
+        let restored = parse_bpmn(&emitted).expect("re-parse").remove(0);
+        assert_eq!(restored.adhoc, original.adhoc, "emitted:\n{emitted}");
     }
 
     #[test]
@@ -6656,6 +6855,91 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     fn preserve_nano_extensions_in_is_a_no_op_when_map_is_empty() {
         let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &HashMap::new());
         assert_eq!(same, "<bpmn:definitions/>");
+    }
+
+    /// The MCP tool fixture's `zeebe:properties` (the `io.camunda.tool:*`
+    /// markers, #1499) must survive a BPMN → model → BPMN round trip: dropping
+    /// them would silently unregister the dynamic tool on redeploy (PR #1586
+    /// review). Regression guard for the serializer's `emit_properties`.
+    #[test]
+    fn definition_to_xml_labeled_preserves_zeebe_properties_across_round_trip() {
+        const MCP_FIXTURE: &str =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let def = parse_bpmn(MCP_FIXTURE)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        // The fixture's start event carries the tool markers.
+        let start = &def.elements[&def.start_event];
+        assert!(
+            !start.properties.is_empty(),
+            "fixture start event carries tool properties"
+        );
+
+        let emitted = definition_to_xml_labeled(&def, &HashMap::new());
+        assert!(
+            emitted.contains(
+                "<zeebe:property name=\"io.camunda.tool:name\" value=\"mcp-process-with-inputs\""
+            ),
+            "tool name property survives the round trip: {emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "<zeebe:property name=\"io.camunda.tool:input_1_name\" value=\"firstName\""
+            ),
+            "input metadata survives: {emitted}"
+        );
+
+        // Re-parsing the emitted document reproduces the same properties — the
+        // round trip is lossless, not just textually similar.
+        let redef = parse_bpmn(&emitted)
+            .expect("re-parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let re_start = &redef.elements[&redef.start_event];
+        assert_eq!(
+            re_start.properties, start.properties,
+            "properties round-trip exactly"
+        );
+    }
+
+    /// The IR round trip preserves `zeebe:properties` too (as `property`
+    /// attribute lines), so an IR edit → BPMN re-emit never strips the MCP
+    /// tool markers either.
+    #[test]
+    fn ir_round_trip_preserves_zeebe_properties() {
+        const MCP_FIXTURE: &str =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let def = parse_bpmn(MCP_FIXTURE)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let start_id = def.start_event.clone();
+        let expected = def.elements[&start_id].properties.clone();
+        assert!(!expected.is_empty());
+
+        let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
+        assert!(
+            ir.contains("property \"io.camunda.tool:name\" \"mcp-process-with-inputs\""),
+            "IR carries the tool-name property: {ir}"
+        );
+
+        let parsed = crate::model_ir::ir_to_definition(&ir).expect("IR re-parses");
+        let redef = parsed.definition;
+        assert_eq!(
+            redef.elements[&redef.start_event].properties, expected,
+            "IR round trip preserves the properties exactly"
+        );
+
+        // And the re-lowered definition still serializes the markers to BPMN.
+        let emitted = definition_to_xml_labeled(&redef, &HashMap::new());
+        assert!(
+            emitted.contains("<zeebe:property name=\"io.camunda.tool:name\""),
+            "IR → BPMN re-emits the tool markers: {emitted}"
+        );
     }
 
     #[test]

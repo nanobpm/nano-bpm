@@ -132,6 +132,12 @@ pub(super) struct NodeAcc {
     /// For a start event: the `zeebe:formDefinition formId` declared on it — the
     /// process's start form. `None` on other nodes and start events with no form.
     pub(super) start_form_id: Option<String>,
+    /// `zeebe:properties` extension properties (`<zeebe:property name value/>`)
+    /// declared on this node, in a deterministic map. Carried onto the built
+    /// [`Element::properties`](crate::model::Element::properties) so vendor
+    /// metadata (Camunda MCP tool markers, inbound connector types, …) survives
+    /// parsing (#1499). Empty when the node declares none.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
     /// True when this `intermediateThrowEvent`/`endEvent` carries a
     /// `messageEventDefinition`. Together with a `zeebe:taskDefinition` it is a
     /// Zeebe *job worker* message event: activation creates a job and the job's
@@ -287,6 +293,11 @@ pub(super) struct PendingBoundary {
     /// mis-attached to the enclosing activity on the `io_stack`.
     pub(super) start_listeners: Vec<crate::model::ExecutionListener>,
     pub(super) end_listeners: Vec<crate::model::ExecutionListener>,
+    /// `zeebe:properties` declared on this boundary event (#1499). Captured on
+    /// the pending boundary (it is never on the `io_stack`) so they attach to
+    /// the boundary element itself — never dropped, nor mis-attached to (and
+    /// overwriting) an enclosing subprocess's properties.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -409,6 +420,7 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            properties: std::collections::BTreeMap::new(),
             is_message_throw: false,
             is_compensation_throw: false,
             is_escalation_throw: false,
@@ -1108,6 +1120,7 @@ impl ProcessAcc {
                         name: n.name.clone().unwrap_or_default(),
                         kind,
                         io: n.io.clone(),
+                        properties: n.properties.clone(),
                     });
                 }
             }
@@ -1444,6 +1457,8 @@ impl ProcessAcc {
             let node_start_listeners = node.start_listeners.clone();
             let node_end_listeners = node.end_listeners.clone();
             let node_task_listeners = node.task_listeners.clone();
+            let properties_id = node.id.clone();
+            let node_properties = node.properties.clone();
             // Only treat as multi-instance when an input collection was actually
             // declared; a bare `multiInstanceLoopCharacteristics` with no
             // `zeebe:loopCharacteristics inputCollection` degenerates to an
@@ -1697,6 +1712,9 @@ impl ProcessAcc {
             if let Some(name) = node_name {
                 builder = builder.with_name(name_id, name);
             }
+            if !node_properties.is_empty() {
+                builder = builder.with_properties(properties_id, node_properties);
+            }
         }
         let associations = self.associations;
         // Ids of the compensation boundary events. A compensation boundary is a
@@ -1745,6 +1763,12 @@ impl ProcessAcc {
                     b.end_listeners.clone(),
                 )
             })
+            .collect();
+        let boundary_properties: Vec<(String, std::collections::BTreeMap<String, String>)> = self
+            .boundaries
+            .iter()
+            .filter(|b| !b.properties.is_empty())
+            .map(|b| (b.id.clone(), b.properties.clone()))
             .collect();
         for boundary in self.boundaries {
             let attached_to =
@@ -1997,6 +2021,10 @@ impl ProcessAcc {
         // activity it parsed adjacent to.
         for (id, start_listeners, end_listeners) in boundary_listeners {
             builder = builder.with_listeners(id, start_listeners, end_listeners);
+        }
+        // Likewise re-attach boundary `zeebe:properties` by element id (#1499).
+        for (id, properties) in boundary_properties {
+            builder = builder.with_properties(id, properties);
         }
         // Compensation boundary events and their `isForCompensation` handlers are
         // structural markers, NOT part of ordinary token flow: a compensation

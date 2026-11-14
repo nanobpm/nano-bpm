@@ -1701,6 +1701,20 @@ pub struct MessageStartSubscription {
     pub message_name: String,
     /// The start event element a new instance begins at.
     pub start_element_id: ElementId,
+    /// The MCP tool name declared on the start event via the
+    /// `io.camunda.tool:name` zeebe:property (Camunda 8.10 MCP gateway, #1499),
+    /// when present. Additive: `None` for subscriptions serialized before this
+    /// field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_name: Option<String>,
+    /// The start event's `zeebe:properties` subset whose keys carry the
+    /// `io.camunda.tool:` prefix, retained so API surfaces (the
+    /// `/mcp/processes` tool list, the REST `toolProperties` field) can read
+    /// the tool description / input schema without re-parsing the BPMN XML.
+    /// Empty when the start event declares no tool properties and for
+    /// subscriptions serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_properties: std::collections::BTreeMap<String, String>,
 }
 
 /// A process-level **timer start event**: an armed timer that creates a new
