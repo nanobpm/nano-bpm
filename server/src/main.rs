@@ -9645,7 +9645,11 @@ impl ServerImpl {
     /// is a no-op.
     async fn route_with_redrive(&self, target: u64, command: Command, event: Event) -> Vec<Event> {
         let mut last = String::new();
-        for attempt in 0..ROUTE_REDRIVE.max_attempts {
+        // An unkeyed (zero / legacy) routed command has no dedup, so a retry
+        // after an ambiguous outcome could apply it twice: deliver it at most
+        // once (#1582).
+        let max_attempts = Self::redrive_attempts(&command);
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 self.route_redrives.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
@@ -9672,10 +9676,19 @@ impl ServerImpl {
             }
         }
         tracing::warn!(
-            "subscription routing on partition {target} not delivered after {} attempts: {last}",
-            ROUTE_REDRIVE.max_attempts
+            "subscription routing on partition {target} not delivered after {max_attempts} attempts: {last}"
         );
         Vec::new()
+    }
+
+    /// How many delivery attempts the re-drive may make for `command`: the
+    /// bounded budget for keyed (deduped) commands, exactly one otherwise.
+    fn redrive_attempts(command: &Command) -> u32 {
+        if Self::routed_command_is_idempotent(command) {
+            ROUTE_REDRIVE.max_attempts
+        } else {
+            1
+        }
     }
 
     /// Derives the `(target partition, command)` a cross-partition follow-up event
@@ -9820,8 +9833,22 @@ impl ServerImpl {
     /// Whether a routed command dedups on a source-minted key, so a retry after
     /// an unobserved commit is an exactly-once no-op (#1568). Only such
     /// commands may have their proposal observation time out (#1582).
+    /// A zero key is the legacy "no dedup" sentinel the engine skips, so it
+    /// is NOT idempotent — the single source of truth is
+    /// [`Command::routed_delivery_key`].
     fn routed_command_is_idempotent(command: &Command) -> bool {
-        !matches!(command, Command::CorrelateMessage { .. })
+        command.routed_delivery_key().is_some()
+    }
+
+    /// Removes the routable follow-ups from a proposal result whose detached
+    /// proposer owns their routing (#1582), so the observer never re-routes them.
+    fn strip_routable(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> Result<crate::raft::ReplicatedItem, crate::raft::ProposeError> {
+        result.map(|mut item| {
+            item.events.retain(|e| !Self::is_routable_event(e));
+            item
+        })
     }
 
     /// Classifies a Raft proposal result into a [`RoutedApply`].
@@ -9876,22 +9903,23 @@ impl ServerImpl {
             if !Self::routed_command_is_idempotent(&command) {
                 return Self::classify_proposal(part.propose_result(command, now_millis()).await);
             }
-            // Exactly ONE routing owner for the produced follow-ups: the result
-            // is handed back over a oneshot; if the observer already gave up
-            // (timeout dropped the receiver) the send fails and the detached
-            // task routes the late-committed follow-ups itself, so a late
-            // commit never loses its downstream routing.
+            // Exactly ONE routing owner for the produced follow-ups: the
+            // detached task ALWAYS routes them itself, whether or not the
+            // observer is still listening — a send that races the observer's
+            // timeout can otherwise be dropped unread with its follow-ups
+            // (#1582). The observer receives the result with the routable
+            // follow-ups stripped, so nothing is routed twice.
             let (tx, rx) = tokio::sync::oneshot::channel();
             let server = self.clone();
             tokio::spawn(async move {
                 let result = part.propose_result(command, now_millis()).await;
-                if let Err(Ok(item)) = tx.send(result)
-                    && item.error.is_none()
-                    && Self::has_routable_subscription_events(&item.events)
-                {
-                    server
-                        .route_late_follow_ups(Self::routable_events(&item.events))
-                        .await;
+                let follow_ups = match &result {
+                    Ok(item) if item.error.is_none() => Self::routable_events(&item.events),
+                    _ => Vec::new(),
+                };
+                let _ = tx.send(Self::strip_routable(result));
+                if !follow_ups.is_empty() {
+                    server.route_late_follow_ups(follow_ups).await;
                     server.signal_jobs_available();
                 }
             });
@@ -47415,7 +47443,67 @@ mod subscription_placement_tests {
         };
         let (_, routed) =
             ServerImpl::route_event(&opening, num_partitions).expect("opening is routable");
-        assert!(ServerImpl::routed_command_is_idempotent(&routed));
+        // A zero (legacy) delivery key is the engine's no-dedup sentinel.
+        assert!(!ServerImpl::routed_command_is_idempotent(&routed));
+        assert_eq!(ServerImpl::redrive_attempts(&routed), 1);
+        assert_eq!(ServerImpl::redrive_attempts(&publish), 1);
+        let keyed_opening = match opening {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                ..
+            } => Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key: 7,
+            },
+            other => other,
+        };
+        let (_, keyed) =
+            ServerImpl::route_event(&keyed_opening, num_partitions).expect("opening is routable");
+        assert!(ServerImpl::routed_command_is_idempotent(&keyed));
+        assert_eq!(
+            ServerImpl::redrive_attempts(&keyed),
+            ROUTE_REDRIVE.max_attempts
+        );
+    }
+
+    /// #1582: the observer of a detached proposal never sees routable
+    /// follow-ups — the proposer task alone routes them, so a result that
+    /// races the observer's timeout cannot drop them nor route them twice.
+    #[test]
+    fn observed_proposal_result_excludes_routable_follow_ups() {
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: 9,
+        };
+        let other = Event::DecisionInstanceDeleted {
+            instance_key: 2,
+            decision_evaluation_key: 4,
+        };
+        assert!(ServerImpl::is_routable_event(&opening));
+        let item = crate::raft::ReplicatedItem {
+            events: vec![opening, other.clone()],
+            error: None,
+        };
+        let stripped = ServerImpl::strip_routable(Ok(item)).expect("ok preserved");
+        assert_eq!(stripped.events, vec![other]);
     }
 
     /// #1582: transient non-delivery (5xx, the 503 leader race, transport
