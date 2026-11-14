@@ -6877,6 +6877,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Regression (review finding): an unknown-variant record wrapped in the
+    /// #1556 envelope AND carrying invalid envelope metadata (an unrecognised
+    /// extra field) must still fail closed as the typed
+    /// [`EventDecodeError::UnknownVariant`] — NOT surface as `Malformed`, which
+    /// the active-tail reader would tolerate as a torn write and DROP (#1065
+    /// class). The decoder decodes the inner event before validating the
+    /// envelope metadata precisely so this combination cannot be misclassified.
+    /// The unknown record is the LAST line, where a genuinely torn tail would
+    /// be dropped — proving the fail-closed rejection is not torn-tail luck.
+    #[test]
+    fn read_segment_events_rejects_unknown_variant_envelope_with_extra_field() {
+        let dir = temp_dir("unknown-variant-envelope-extra");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"event\":{\"NoSuchEventFromTheFuture\":{\"instance_key\":9}},\"operation_reference\":9,\"extra\":1}\n",
+        )
+        .unwrap();
+
+        let err = read_segment_events(&path)
+            .expect_err("an unknown variant must fail closed even with invalid envelope metadata");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to the typed EventDecodeError");
+        match decode_err {
+            EventDecodeError::UnknownVariant { variant, .. } => {
+                assert_eq!(variant, "NoSuchEventFromTheFuture")
+            }
+            other => panic!("expected UnknownVariant (not Malformed/torn-drop), got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The tagged multi-partition reader applies the same discipline: an unknown
     /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
     /// dropped record.

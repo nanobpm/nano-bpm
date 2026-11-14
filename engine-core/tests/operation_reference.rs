@@ -141,6 +141,42 @@ fn unknown_variant_inside_an_envelope_is_rejected_not_dropped() {
     ));
 }
 
+/// Regression (review finding): the inner event is decoded BEFORE the envelope
+/// metadata is validated, so an unknown variant wins the typed fail-closed
+/// `UnknownVariant` rejection even when the SAME envelope also carries invalid
+/// metadata (an unrecognised extra field, or a non-integer
+/// `operation_reference`). If the order were reversed these would surface as
+/// `Malformed` — which the journal reader tolerates as a torn tail and DROPS,
+/// silently discarding a real cross-version frame (#1065 class).
+#[test]
+fn unknown_variant_wins_over_invalid_envelope_metadata() {
+    // Unknown event + an unrecognised extra field.
+    let line = r#"{"event":{"FutureEvent":{}},"operation_reference":9,"extra":1}"#;
+    match decode_record_json(line) {
+        Err(EventDecodeError::UnknownVariant { variant, .. }) => {
+            assert_eq!(variant, "FutureEvent");
+        }
+        other => panic!("expected UnknownVariant (not Malformed), got {other:?}"),
+    }
+    // Unknown event + a non-integer operation_reference.
+    let line = r#"{"event":{"FutureEvent":{}},"operation_reference":"not-a-number"}"#;
+    assert!(
+        matches!(
+            decode_record_json(line),
+            Err(EventDecodeError::UnknownVariant { .. })
+        ),
+        "unknown variant must beat a bad operation_reference type"
+    );
+    // A KNOWN event + invalid metadata is still `Malformed` (the event decodes,
+    // so the metadata error is what remains) — the order change does not
+    // legitimize a corrupt envelope.
+    let line = r#"{"event":{"DeploymentCreated":{"deployment_key":1}},"extra":1}"#;
+    assert!(matches!(
+        decode_record_json(line),
+        Err(EventDecodeError::Malformed { .. })
+    ));
+}
+
 /// The envelope is recognised by its parsed `event` member, not by property
 /// order: whitespace and reordered keys (reference first) still decode, and
 /// an unrecognised envelope field is rejected rather than dropped.
@@ -159,6 +195,13 @@ fn envelope_decodes_regardless_of_property_order_and_whitespace() {
             assert_eq!(decode_record_json(&line).unwrap(), record, "{line}");
         }
         let line = format!(r#"{{"operation_reference":null,"event":{event}}}"#);
+        assert_eq!(
+            decode_record_json(&line).unwrap(),
+            Record::bare(record.event.clone())
+        );
+        // An explicit null with surrounding whitespace still means "no reference"
+        // (`RawValue::get` returns the exact source slice, whitespace included).
+        let line = format!(r#"{{"operation_reference": null ,"event":{event}}}"#);
         assert_eq!(
             decode_record_json(&line).unwrap(),
             Record::bare(record.event.clone())

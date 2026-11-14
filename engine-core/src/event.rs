@@ -2678,35 +2678,89 @@ pub fn encode_record_json(
 /// still decodes. The inner event is decoded through [`decode_event_json`], so
 /// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
 /// rejection — never a silent drop.
+///
+/// Two disciplines keep this safe AND cheap on the hot recovery path:
+///
+/// * **Decode the event FIRST, validate the envelope metadata SECOND.** An
+///   envelope whose `event` names a variant this build does not know must
+///   surface the typed [`EventDecodeError::UnknownVariant`] even when the
+///   surrounding metadata is also invalid (a bad `operation_reference` type or
+///   an unrecognised extra field). Validating metadata first would return
+///   [`EventDecodeError::Malformed`], which the journal reader
+///   (`read_segment_with`) tolerates as a torn tail and DROPS — silently
+///   discarding a real cross-version frame (#1065 class). Decoding the event
+///   first guarantees the fail-closed `UnknownVariant` wins.
+/// * **No double parse of the event payload.** The envelope probe borrows the
+///   `event` member as a [`serde_json::value::RawValue`] and hands it straight
+///   to [`decode_event_json`] — the payload is parsed exactly once, never
+///   materialized into a [`serde_json::Value`] DOM and re-serialized. Bare
+///   events (unreferenced commands) skip the probe's payload capture entirely.
 #[cfg(feature = "serde")]
 pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|e| EventDecodeError::Malformed {
-            detail: e.to_string(),
-        })?;
-    let mut map = match value {
-        serde_json::Value::Object(map) if map.contains_key("event") => map,
-        // Not an envelope: a legacy bare event (variant tags are PascalCase, so
-        // they can never be the lowercase `event` key).
-        _ => return decode_event_json(line).map(Record::bare),
-    };
-    let event_value = map.remove("event").unwrap_or(serde_json::Value::Null);
-    let operation_reference = match map.remove("operation_reference") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(v) => {
-            Some(
-                serde_json::from_value::<i64>(v).map_err(|e| EventDecodeError::Malformed {
-                    detail: format!("operation_reference: {e}"),
-                })?,
-            )
+    // A borrowed probe over the raw line: the `event`/`operation_reference`
+    // members are captured by reference as a `RawValue` (no DOM, no copy of the
+    // payload). Any OTHER top-level key is collected into `extra` so an
+    // unrecognised envelope field can be rejected AFTER the event is decoded.
+    // `extra` is a `Value` map only because serde's `flatten` cannot deserialize
+    // into a borrowed `RawValue`; it stays empty for every well-formed record,
+    // so the hot path never builds a DOM.
+    #[derive(serde::Deserialize)]
+    struct Probe<'a> {
+        #[serde(borrow)]
+        event: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        operation_reference: Option<&'a serde_json::value::RawValue>,
+        #[serde(flatten)]
+        extra: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let probe: Probe<'_> = match serde_json::from_str(line) {
+        Ok(probe) => probe,
+        // Not an object the probe recognises. Either a legacy bare event (whose
+        // top-level key is a PascalCase variant tag, collected into `extra` —
+        // but then `event` is absent and we fall through below) or genuinely
+        // malformed JSON. The bare-event decode classifies both precisely.
+        Err(e) => {
+            return match decode_event_json(line) {
+                Ok(event) => Ok(Record::bare(event)),
+                Err(_) => Err(EventDecodeError::Malformed {
+                    detail: e.to_string(),
+                }),
+            }
         }
     };
-    if let Some(extra) = map.keys().next() {
+
+    let event_raw = match probe.event {
+        Some(raw) => raw,
+        // No `event` member: a legacy bare event (variant tags are PascalCase,
+        // never the lowercase `event` key). Decode it directly.
+        None => return decode_event_json(line).map(Record::bare),
+    };
+
+    // Decode the inner event FIRST (straight from the borrowed raw payload, no
+    // re-serialization) so an unknown variant is the typed fail-closed
+    // rejection even when the envelope metadata below is also invalid.
+    let event = decode_event_json(event_raw.get())?;
+
+    // Only now validate the envelope metadata. An unrecognised field or a bad
+    // `operation_reference` is `Malformed` — but the event is already known to
+    // be decodable, so this can never mask an `UnknownVariant`.
+    if let Some(extra) = probe.extra.keys().next() {
         return Err(EventDecodeError::Malformed {
             detail: format!("unknown record envelope field `{extra}`"),
         });
     }
-    let event = decode_event_json(&event_value.to_string())?;
+    let operation_reference = match probe.operation_reference {
+        None => None,
+        // `RawValue::get` returns the exact source slice, so an explicit null
+        // may carry whitespace (`" null"`); trim before comparing.
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => Some(serde_json::from_str::<i64>(raw.get()).map_err(|e| {
+            EventDecodeError::Malformed {
+                detail: format!("operation_reference: {e}"),
+            }
+        })?),
+    };
     Ok(Record {
         event,
         operation_reference,
