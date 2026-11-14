@@ -2817,24 +2817,12 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     let retries: Command =
         serde_json::from_str(r#"{"UpdateJobRetries":{"job_key":7,"retries":3}}"#)
             .expect("legacy UpdateJobRetries without operation_reference must deserialize");
-    assert!(matches!(
-        retries,
-        Command::UpdateJobRetries {
-            operation_reference: None,
-            ..
-        }
-    ));
+    assert!(matches!(retries, Command::UpdateJobRetries { .. }));
 
     let timeout: Command =
         serde_json::from_str(r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5000}}"#)
             .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
-    assert!(matches!(
-        timeout,
-        Command::UpdateJobTimeout {
-            operation_reference: None,
-            ..
-        }
-    ));
+    assert!(matches!(timeout, Command::UpdateJobTimeout { .. }));
 
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
     let throw_empty = Command::ThrowJobError {
@@ -2863,17 +2851,18 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
         "absent operation_reference must be skipped: {s}"
     );
 
-    // Present values still round-trip.
-    let s = serde_json::to_string(&Command::update_job_retries_with_ref(7, 3, Some(42))).unwrap();
-    assert!(s.contains("operation_reference"));
-    let back: Command = serde_json::from_str(&s).unwrap();
-    assert!(matches!(
-        back,
-        Command::UpdateJobRetries {
-            operation_reference: Some(42),
-            ..
-        }
-    ));
+    // #1556: the per-command field moved to the generic record envelope. A
+    // pre-#1556 replicated command still carrying it must keep decoding (the
+    // field is ignored — the reference now rides `ReplicatedCommand`).
+    let back: Command = serde_json::from_str(
+        r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":42}}"#,
+    )
+    .expect("pre-#1556 UpdateJobRetries carrying operation_reference must deserialize");
+    assert!(matches!(back, Command::UpdateJobRetries { retries: 3, .. }));
+    let back: Command =
+        serde_json::from_str(r#"{"ResolveIncident":{"incident_key":7,"operation_reference":42}}"#)
+            .expect("pre-#1556 ResolveIncident carrying operation_reference must deserialize");
+    assert!(matches!(back, Command::ResolveIncident { incident_key: 7 }));
 }
 
 /// Class-scoped companion to the above: variables on an UNHANDLED thrown error

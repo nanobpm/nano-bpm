@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
     ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
-    ProcessInstance, State, Value,
+    ProcessInstance, State, Value, encode_record_json,
 };
 use tokio::sync::oneshot;
 
@@ -369,8 +369,11 @@ pub struct Journal {
     /// command's events are BUFFERED here instead of written, so the whole
     /// entry — plus its [`Event::RaftEntryApplied`] record — is journaled as
     /// ONE atomic frame. `None` outside Raft apply (the direct REST /
-    /// single-node path journals per command as before).
-    raft_entry: Option<Vec<Event>>,
+    /// single-node path journals per command as before). The second vector is
+    /// the per-event `operationReference` (#1556), index-aligned with the
+    /// events, so the frame journals each [`Record`](nanobpmn_engine_core::Record)
+    /// envelope exactly.
+    raft_entry: Option<(Vec<Event>, Vec<Option<i64>>)>,
     /// Set by [`abort_raft_entry`](Self::abort_raft_entry) (#1405): the live
     /// engine may hold a refused entry's partial, NON-durable effects, so this
     /// journal is FENCED until the process rebuilds it from disk — no further
@@ -2728,6 +2731,12 @@ impl Journal {
     /// single command thread never clones them. Empty batches and in-memory
     /// journals are already durable, so they return a ready commit.
     fn persist(&self, events: &Arc<Vec<Event>>) -> Commit {
+        self.persist_with(events, None)
+    }
+
+    /// [`persist`](Self::persist) for one command's events carrying its
+    /// `operationReference` (#1556), journaled on every record.
+    fn persist_with(&self, events: &Arc<Vec<Event>>, operation_reference: Option<i64>) -> Commit {
         if events.is_empty() {
             return Commit::ready();
         }
@@ -2764,17 +2773,25 @@ impl Journal {
         // which a node not owning partition 0 could not otherwise route back. The
         // single-partition / legacy / in-memory paths keep the bare `<json>` line
         // format (their reader does not expect a tag).
-        let bytes = self.serialize_events(events);
+        let refs = match operation_reference {
+            Some(_) => vec![operation_reference; events.len()],
+            None => Vec::new(),
+        };
+        let bytes = self.serialize_events(events, &refs);
         self.send_write(bytes, events, shared_backed)
     }
 
     /// Serializes `events` to the journal's newline-terminated record format
     /// (`<partition>\t<json>` on the shared multi-partition writer, bare
     /// `<json>` otherwise — see [`persist`](Self::persist)).
-    fn serialize_events(&self, events: &[Event]) -> Vec<u8> {
+    ///
+    /// Each line is a record envelope ([`encode_record_json`], #1556):
+    /// `refs[i]` is event `i`'s `operationReference`; a missing entry (e.g. an
+    /// empty `refs`) means none, which journals the legacy bare-`Event` line.
+    fn serialize_events(&self, events: &[Event], refs: &[Option<i64>]) -> Vec<u8> {
         let tagged = self.shared_exporter.is_some();
         let mut bytes = Vec::new();
-        for event in events.iter() {
+        for (i, event) in events.iter().enumerate() {
             if tagged {
                 bytes.extend_from_slice(self.partition_id.to_string().as_bytes());
                 bytes.push(b'\t');
@@ -2787,7 +2804,8 @@ impl Journal {
                 clippy::expect_used,
                 reason = "Event serialization is total (serde derive over value types); Commit carries no error channel"
             )]
-            let line = serde_json::to_string(event).expect("event serializes");
+            let line = encode_record_json(event, refs.get(i).copied().flatten())
+                .expect("event serializes");
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
         }
@@ -2839,6 +2857,20 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        self.apply_command_ref_at(command, now, None)
+    }
+
+    /// [`apply_command_at`](Self::apply_command_at) for a command carrying a
+    /// caller `operationReference` (#1556): the engine stamps it on every
+    /// record the command produces
+    /// ([`Engine::apply_command_records_at`](nanobpmn_engine_core::Engine::apply_command_records_at))
+    /// and the journal persists each as the record envelope.
+    pub fn apply_command_ref_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         if self.fenced {
             // Environmental + retryable: a peer (or this replica once rebuilt
             // from its journal) applies the command; this one must not (#1405).
@@ -2861,7 +2893,13 @@ impl Journal {
             } => Some(*instance_key),
             _ => None,
         };
-        let events = Arc::new(self.engine.apply_command_at(command, now)?);
+        let events = Arc::new(
+            self.engine
+                .apply_command_records_at(command, now, operation_reference)?
+                .into_iter()
+                .map(|record| record.event)
+                .collect::<Vec<_>>(),
+        );
         if let Some(key) = orphan_settled {
             self.settle_orphan_report(key);
         }
@@ -2878,7 +2916,10 @@ impl Journal {
             // spill either — spilling state whose events are not yet durable
             // would let the off-heap store run ahead of the journal; the
             // deferred `maybe_spill` runs in `commit_raft_entry`.
-            buffer.extend(events.iter().cloned());
+            buffer.0.extend(events.iter().cloned());
+            buffer
+                .1
+                .extend(std::iter::repeat_n(operation_reference, events.len()));
             return Ok((events, Commit::ready()));
         }
         // An eventless success (an idempotent settlement replay, #1181) has
@@ -2894,7 +2935,7 @@ impl Journal {
         let commit = if events.is_empty() && settles_job {
             self.barrier()
         } else {
-            self.persist(&events)
+            self.persist_with(&events, operation_reference)
         };
         self.maybe_spill();
         Ok((events, commit))
@@ -2905,7 +2946,7 @@ impl Journal {
     /// [`abort_raft_entry`](Self::abort_raft_entry), applied commands buffer
     /// their events instead of journaling them.
     pub fn begin_raft_entry(&mut self) {
-        self.raft_entry = Some(Vec::new());
+        self.raft_entry = Some((Vec::new(), Vec::new()));
     }
 
     /// Journals the armed Raft entry as ONE atomic frame (#1405): every
@@ -2927,7 +2968,7 @@ impl Journal {
                 "journal fenced after an aborted Raft entry; rebuild from disk (#1405)",
             ));
         }
-        let mut events = self.raft_entry.take().unwrap_or_default();
+        let (mut events, refs) = self.raft_entry.take().unwrap_or_default();
         events.push(Event::RaftEntryApplied {
             index,
             raft_state: raft_state.clone(),
@@ -2938,7 +2979,7 @@ impl Journal {
         let commit = if self.writer.is_some() {
             let compress = self.seg.as_ref().is_some_and(|s| s.compress);
             let frame = crate::seglog::frame_atomic(
-                &self.serialize_events(&events),
+                &self.serialize_events(&events, &refs),
                 events.len() as u64,
                 compress,
             )?;
@@ -2952,6 +2993,7 @@ impl Journal {
         } else {
             // In-memory journal: nothing to frame, but the exporter still sees
             // the entry exactly as `persist` would forward it.
+            let _ = refs;
             self.persist(&events)
         };
         self.engine.set_raft_applied(index, raft_state);
@@ -8646,5 +8688,188 @@ mod tests {
         assert!(journal.incidents().is_empty());
         drop((journal, store));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ---- #1556: disk-backed operationReference persistence ----
+
+    /// Every record in `dir`'s journal segments, in log order (the active `journal.jsonl`
+    /// plus any `journal.seg.<start>.jsonl`; zero-padded starts sort in log order).
+    fn segment_records_1556(dir: &std::path::Path) -> Vec<nanobpmn_engine_core::Record> {
+        let mut segs: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "no journal segments written in {dir:?}");
+        segs.iter()
+            .flat_map(|p| crate::seglog::read_segment_records(p).unwrap())
+            .collect()
+    }
+
+    fn temp_dir_1556(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-journal-1556-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Asserts every record of `events` (a contiguous run inside `records`,
+    /// matched by position from `start`) carries exactly `reference`.
+    fn assert_run_refs(
+        records: &[nanobpmn_engine_core::Record],
+        start: usize,
+        events: &[Event],
+        reference: Option<i64>,
+    ) {
+        for (i, event) in events.iter().enumerate() {
+            let record = &records[start + i];
+            assert_eq!(&record.event, event, "record {} out of order", start + i);
+            assert_eq!(
+                record.operation_reference,
+                reference,
+                "record {} ({event:?}) carries the wrong reference",
+                start + i
+            );
+        }
+    }
+
+    /// Untagged single-partition segmented log: a referenced direct command,
+    /// then a Raft entry batching two distinct references and an unreferenced
+    /// command. Every persisted record carries its OWN command's reference; the
+    /// `RaftEntryApplied` marker carries none; reopening recovers the same state.
+    #[test]
+    fn untagged_segmented_journal_persists_per_command_references_and_recovers() {
+        let dir = temp_dir_1556("untagged");
+        let (key_a, key_b, before) = {
+            let (mut j, _) = Journal::open_segmented(&dir).unwrap();
+            let (deploy, c) = j
+                .apply_command_ref_at(Command::DeployProcess(demo()), 1, None)
+                .unwrap();
+            c.blocking_wait();
+            let (direct, c) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 2, Some(11))
+                .unwrap();
+            c.blocking_wait();
+            let key_a = direct.iter().find_map(|e| e.instance_key()).unwrap();
+
+            j.begin_raft_entry();
+            let (r1, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 3, Some(22))
+                .unwrap();
+            let key_b = r1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (r2, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 4, None)
+                .unwrap();
+            let (r3, _) = j
+                .apply_command_ref_at(Command::cancel_instance(key_a), 5, Some(33))
+                .unwrap();
+            let (entry, c) = j.commit_raft_entry(7, "state".to_string()).unwrap();
+            c.blocking_wait();
+
+            let records = segment_records_1556(&dir);
+            let mut at = 0;
+            for (events, reference) in [
+                (&deploy, None),
+                (&direct, Some(11)),
+                (&r1, Some(22)),
+                (&r2, None),
+                (&r3, Some(33)),
+            ] {
+                assert!(!events.is_empty());
+                assert_run_refs(&records, at, events, reference);
+                at += events.len();
+            }
+            let marker = &records[at];
+            assert!(
+                matches!(marker.event, Event::RaftEntryApplied { index: 7, .. }),
+                "expected the Raft marker, got {:?}",
+                marker.event
+            );
+            assert_eq!(
+                marker.operation_reference, None,
+                "Raft marker must be unreferenced"
+            );
+            assert_eq!(entry.last(), Some(&marker.event));
+            assert_eq!(records.len(), at + 1);
+            let before = (
+                j.instance(key_a).map(|i| format!("{i:?}")),
+                j.instance(key_b).map(|i| format!("{i:?}")),
+                j.raft_applied(),
+            );
+            (key_a, key_b, before)
+        };
+
+        let (j, _) = Journal::open_segmented(&dir).unwrap();
+        let after = (
+            j.instance(key_a).map(|i| format!("{i:?}")),
+            j.instance(key_b).map(|i| format!("{i:?}")),
+            j.raft_applied(),
+        );
+        assert_eq!(after, before, "reopen must recover the same engine state");
+        assert_eq!(after.2, Some((7, "state".to_string())));
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tagged (shared multi-partition writer, `<partition>\t<json>` lines)
+    /// variant of the above.
+    #[test]
+    fn tagged_shared_journal_persists_per_command_references_and_recovers() {
+        let dir = temp_dir_1556("tagged");
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
+        let (key_a, before) = {
+            let (writer, recovery) =
+                SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
+            let mut engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
+            let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
+            j.set_exporter(export_tx, Arc::new(AtomicU64::new(0)));
+            let (deploy, c) = j
+                .apply_command_ref_at(Command::DeployProcess(demo()), 1, Some(5))
+                .unwrap();
+            c.blocking_wait();
+            j.begin_raft_entry();
+            let (r1, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 2, Some(44))
+                .unwrap();
+            let key_a = r1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (r2, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 3, None)
+                .unwrap();
+            let (_, c) = j.commit_raft_entry(3, "s3".to_string()).unwrap();
+            c.blocking_wait();
+
+            let records = segment_records_1556(&dir);
+            let mut at = 0;
+            for (events, reference) in [(&deploy, Some(5)), (&r1, Some(44)), (&r2, None)] {
+                assert_run_refs(&records, at, events, reference);
+                at += events.len();
+            }
+            assert!(matches!(
+                records[at].event,
+                Event::RaftEntryApplied { index: 3, .. }
+            ));
+            assert_eq!(records[at].operation_reference, None);
+            (key_a, j.instance(key_a).map(|i| format!("{i:?}")))
+        };
+
+        let recovery = crate::seglog::recover_multi(&dir, &[0], 1, Some(&varstore)).unwrap();
+        let engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        assert_eq!(
+            engines[&0].instance(key_a).map(|i| format!("{i:?}")),
+            before,
+            "reopen must recover the same engine state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -837,7 +837,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -850,7 +852,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         deadline: u64,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -2562,6 +2566,151 @@ pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
             }
         }
     }
+}
+
+/// One journaled record: an [`Event`] plus the per-record metadata Zeebe
+/// carries on every record (#1556). Today that is the caller's
+/// `operationReference` — the correlation id a client attaches to a command,
+/// propagated **generically** to every record the command produces (Zeebe
+/// parity). [`Event`] itself stays untouched: the reference lives once, on this
+/// envelope, stamped at the engine's single command seam
+/// ([`Engine::apply_command_records_at`](crate::Engine::apply_command_records_at)),
+/// so no per-variant copy can drift.
+///
+/// **Wire form** (`serde` feature): a record WITH a reference serializes as the
+/// envelope `{"event":{…},"operation_reference":N}`; a record WITHOUT one
+/// serializes as the bare legacy [`Event`] (`{"VariantName":{…}}`). Every
+/// pre-#1556 journal line is therefore already a valid record, and
+/// [`decode_record_json`] reads both shapes — no `SNAPSHOT_FORMAT_VERSION`
+/// bump. The `event` key cannot collide with an event tag (variants are
+/// PascalCase).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The domain event.
+    pub event: Event,
+    /// The `operationReference` of the command that produced this record.
+    pub operation_reference: Option<i64>,
+}
+
+impl Record {
+    /// A record with no operation reference (the bare-event wire form).
+    pub fn bare(event: Event) -> Self {
+        Self {
+            event,
+            operation_reference: None,
+        }
+    }
+
+    /// Stamps `operation_reference` onto every event of one command's output —
+    /// the single, generic propagation seam (#1556).
+    pub fn stamp_all(events: Vec<Event>, operation_reference: Option<i64>) -> Vec<Self> {
+        events
+            .into_iter()
+            .map(|event| Self {
+                event,
+                operation_reference,
+            })
+            .collect()
+    }
+}
+
+impl From<Event> for Record {
+    fn from(event: Event) -> Self {
+        Self::bare(event)
+    }
+}
+
+/// Borrowed serialization view of a [`Record`] — the ONE implementation of the
+/// record wire form, shared by `Record`'s `Serialize` and
+/// [`encode_record_json`] (which journals without cloning the event).
+#[cfg(feature = "serde")]
+struct RecordView<'a> {
+    event: &'a Event,
+    operation_reference: Option<i64>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for RecordView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.operation_reference {
+            None => self.event.serialize(serializer),
+            Some(reference) => {
+                let mut s = serializer.serialize_struct("Record", 2)?;
+                s.serialize_field("event", self.event)?;
+                s.serialize_field("operation_reference", &reference)?;
+                s.end()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Record {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RecordView {
+            event: &self.event,
+            operation_reference: self.operation_reference,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Encodes one journal line for `event` produced by a command carrying
+/// `operation_reference` — the writer-side twin of [`decode_record_json`]
+/// (#1556). Without a reference this is exactly the legacy bare-`Event` line.
+#[cfg(feature = "serde")]
+pub fn encode_record_json(
+    event: &Event,
+    operation_reference: Option<i64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RecordView {
+        event,
+        operation_reference,
+    })
+}
+
+/// Decodes one journal line into a [`Record`] — the replay-boundary reader for
+/// the #1556 envelope. Accepts both the envelope and the legacy bare-[`Event`]
+/// form (which decodes with `operation_reference: None`). The envelope is
+/// recognised by the PARSED top-level `event` member, never by property order,
+/// so a producer that reorders keys (`{"operation_reference":N,"event":…}`)
+/// still decodes. The inner event is decoded through [`decode_event_json`], so
+/// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
+/// rejection — never a silent drop.
+#[cfg(feature = "serde")]
+pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| EventDecodeError::Malformed {
+            detail: e.to_string(),
+        })?;
+    let mut map = match value {
+        serde_json::Value::Object(map) if map.contains_key("event") => map,
+        // Not an envelope: a legacy bare event (variant tags are PascalCase, so
+        // they can never be the lowercase `event` key).
+        _ => return decode_event_json(line).map(Record::bare),
+    };
+    let event_value = map.remove("event").unwrap_or(serde_json::Value::Null);
+    let operation_reference = match map.remove("operation_reference") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            Some(
+                serde_json::from_value::<i64>(v).map_err(|e| EventDecodeError::Malformed {
+                    detail: format!("operation_reference: {e}"),
+                })?,
+            )
+        }
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(EventDecodeError::Malformed {
+            detail: format!("unknown record envelope field `{extra}`"),
+        });
+    }
+    let event = decode_event_json(&event_value.to_string())?;
+    Ok(Record {
+        event,
+        operation_reference,
+    })
 }
 
 /// Extract the offending variant name from serde's

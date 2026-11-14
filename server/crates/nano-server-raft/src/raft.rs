@@ -92,10 +92,83 @@ openraft::declare_raft_types!(
 /// wall-clock `now` the leader stamped it with. Carrying `now` keeps `apply`
 /// deterministic across replicas (the engine's time-dependent logic replays
 /// identically), so re-applying the log on any replica yields identical state.
+///
+/// `operation_reference` is the caller's Camunda `operationReference` (#1556):
+/// command-envelope metadata the engine stamps on EVERY record the command
+/// produces ([`Journal::apply_command_ref_at`](nano_server_storage::journal::Journal::apply_command_ref_at)).
+/// Additive on the wire: absent decodes as `None`. A pre-#1556 entry carried
+/// the reference NESTED inside the job-mutation / incident-resolution command
+/// body (`{"UpdateJobRetries":{…,"operation_reference":N}}`); deserialization
+/// promotes that legacy nested value to this envelope field (outer wins) so a
+/// retained historical entry re-applied after upgrade keeps its reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "ReplicatedCommandWire")]
 pub struct ReplicatedCommand {
     pub command: Command,
     pub now: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_reference: Option<i64>,
+}
+
+/// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
+/// `operation_reference` out of the command body (see the type docs).
+#[derive(Deserialize)]
+struct ReplicatedCommandWire {
+    command: LegacyCommand,
+    now: u64,
+    #[serde(default)]
+    operation_reference: Option<i64>,
+}
+
+/// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
+/// nested inside its variant body. Deserialized via a JSON value so the nested
+/// key can be inspected for EVERY variant (fail-safe: any variant that ever
+/// carried the field is promoted, not just a hand-maintained list).
+struct LegacyCommand {
+    command: Command,
+    nested_reference: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for LegacyCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let nested_reference = match value
+            .as_object_mut()
+            .and_then(|tagged| tagged.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|body| body.remove("operation_reference"))
+        {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(serde_json::from_value::<i64>(v).map_err(D::Error::custom)?),
+        };
+        let command = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            command,
+            nested_reference,
+        })
+    }
+}
+
+impl From<ReplicatedCommandWire> for ReplicatedCommand {
+    fn from(wire: ReplicatedCommandWire) -> Self {
+        Self {
+            command: wire.command.command,
+            now: wire.now,
+            operation_reference: wire.operation_reference.or(wire.command.nested_reference),
+        }
+    }
+}
+
+impl ReplicatedCommand {
+    /// A replicated command without an `operationReference`.
+    pub fn new(command: Command, now: u64) -> Self {
+        Self {
+            command,
+            now,
+            operation_reference: None,
+        }
+    }
 }
 
 /// Process-global net-live count of [`ReplicatedBatch`] instances. Every batch
@@ -249,7 +322,7 @@ impl ReplicatedBatch {
 
     /// A single-command batch (the convenience path for `propose`).
     pub fn single(command: Command, now: u64) -> Self {
-        Self::new(vec![ReplicatedCommand { command, now }])
+        Self::new(vec![ReplicatedCommand::new(command, now)])
     }
 }
 
@@ -1902,13 +1975,19 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .with(move |journal| {
                             journal.begin_raft_entry();
                             let mut outcomes = Vec::with_capacity(batch.items.len());
-                            for ReplicatedCommand { command, now } in batch.items {
+                            for ReplicatedCommand {
+                                command,
+                                now,
+                                operation_reference,
+                            } in batch.items
+                            {
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
                                 let timer = crate::cmd_profile::start();
                                 let kind = command.kind();
-                                let outcome = journal.apply_command_at(command, now);
+                                let outcome =
+                                    journal.apply_command_ref_at(command, now, operation_reference);
                                 crate::cmd_profile::finish(timer, kind);
                                 match outcome {
                                     Err(e) if e.is_environmental() => {
@@ -2737,7 +2816,12 @@ impl Batcher {
         }
     }
 
-    async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
+    async fn submit(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
         let command = stamp_for_proposal(&self.engine, command).await;
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
@@ -2749,7 +2833,11 @@ impl Batcher {
             &self.hi_tx
         };
         tx.send(Submission {
-            item: ReplicatedCommand { command, now },
+            item: ReplicatedCommand {
+                command,
+                now,
+                operation_reference,
+            },
             resp,
         })
         .map_err(|_| ProposeError::Other("raft propose batcher stopped".to_string()))?;
@@ -3554,7 +3642,7 @@ impl RaftPartition {
     /// [`Batcher`], so a flood of concurrent proposes coalesces into batched
     /// entries; a lone proposer forms a batch of one.
     pub async fn propose(&self, command: Command, now: u64) -> anyhow::Result<Vec<Event>> {
-        Ok(self.batcher.submit(command, now).await?.events)
+        Ok(self.batcher.submit(command, now, None).await?.events)
     }
 
     /// Like [`propose`](Self::propose) but returns the full per-command
@@ -3566,7 +3654,18 @@ impl RaftPartition {
         command: Command,
         now: u64,
     ) -> Result<ReplicatedItem, ProposeError> {
-        self.batcher.submit(command, now).await
+        self.propose_result_ref(command, now, None).await
+    }
+
+    /// [`propose_result`](Self::propose_result) for a command carrying a
+    /// caller `operationReference` (#1556), replicated on the command envelope.
+    pub async fn propose_result_ref(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
+        self.batcher.submit(command, now, operation_reference).await
     }
 
     /// Whether this partition's Raft core has entered `Shutdown` — it has
@@ -3844,6 +3943,42 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    /// #1556: a retained pre-#1556 Raft entry carried `operation_reference`
+    /// NESTED in the command body. Every such historical variant must promote
+    /// it to the envelope field on decode (else re-applying the entry after
+    /// upgrade silently loses the reference), the outer field wins when both
+    /// are present, and the round trip uses the current (outer) form.
+    #[test]
+    fn legacy_nested_operation_reference_is_promoted_on_decode() {
+        let legacy = [
+            r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":11}}"#,
+            r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5,"operation_reference":11}}"#,
+            r#"{"UpdateJob":{"job_key":7,"retries":2,"operation_reference":11}}"#,
+            r#"{"ResolveIncident":{"incident_key":7,"operation_reference":11}}"#,
+        ];
+        for command in legacy {
+            let line = format!(r#"{{"command":{command},"now":1}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).expect(&line);
+            assert_eq!(decoded.operation_reference, Some(11), "{line}");
+            let reencoded = serde_json::to_string(&decoded).unwrap();
+            let again: ReplicatedCommand = serde_json::from_str(&reencoded).unwrap();
+            assert_eq!(again.operation_reference, Some(11), "{reencoded}");
+            assert!(
+                !serde_json::to_string(&again.command)
+                    .unwrap()
+                    .contains("operation_reference")
+            );
+
+            let line = format!(r#"{{"command":{command},"now":1,"operation_reference":22}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.operation_reference, Some(22), "outer wins: {line}");
+        }
+        let plain: ReplicatedCommand =
+            serde_json::from_str(r#"{"command":{"ResolveIncident":{"incident_key":7}},"now":1}"#)
+                .unwrap();
+        assert_eq!(plain.operation_reference, None);
     }
 
     #[test]
@@ -5780,24 +5915,12 @@ mod tests {
         engine: &DeepthiHandle,
     ) -> (u64, u64) {
         let setup = [
-            ReplicatedCommand {
-                command: wait_process_command(),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 2,
-            },
-            ReplicatedCommand {
-                command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
-                now: 3,
-            },
+            ReplicatedCommand::new(wait_process_command(), 1),
+            ReplicatedCommand::new(Command::create_instance("w"), 2),
+            ReplicatedCommand::new(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3),
             // Release the activation lock so the parked instance goes idle and is
             // cold-spillable (a locked job keeps its instance hot).
-            ReplicatedCommand {
-                command: Command::ExpireJobs { now: 64_000 },
-                now: 64_000,
-            },
+            ReplicatedCommand::new(Command::ExpireJobs { now: 64_000 }, 64_000),
         ];
         let mut job_key = None;
         for (i, cmd) in setup.into_iter().enumerate() {
@@ -5855,14 +5978,8 @@ mod tests {
         // A batch [deploy, complete_job]: the deploy succeeds, the completion hits
         // the unreadable row. The whole entry must abort closed at index 5.
         let batch = vec![
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 6,
-            },
+            ReplicatedCommand::new(deploy_command(), 5),
+            ReplicatedCommand::new(Command::complete_job(job_key), 6),
         ];
         let refused = apply_entry(&sm, 5, batch).await;
         assert!(refused.is_err(), "the impaired replica fails closed");
@@ -5891,14 +6008,8 @@ mod tests {
         // Entry 1: [CompleteJob(unknown key) -> deterministic JobNotFound,
         //           DeployProcess(valid) -> must still apply].
         let batch = vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 2,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 1),
+            ReplicatedCommand::new(deploy_command(), 2),
         ];
         let outcome = apply_entry(&sm, 1, batch)
             .await
@@ -5969,18 +6080,9 @@ mod tests {
     /// that hits the unreadable cold row.
     fn failing_entry(job_key: u64) -> Vec<ReplicatedCommand> {
         vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 6,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 7,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 5),
+            ReplicatedCommand::new(Command::create_instance("w"), 6),
+            ReplicatedCommand::new(Command::complete_job(job_key), 7),
         ]
     }
 
@@ -6252,7 +6354,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let before = {
             let engine = durable_engine(&journal_dir);
             let mut sm = new_sm(&engine);
@@ -6328,7 +6430,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let expected = {
             let engine = durable_engine(&dir.join("peer"));
@@ -6412,7 +6514,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
@@ -6502,7 +6604,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -6581,7 +6683,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -6681,7 +6783,7 @@ mod tests {
                 .build()
                 .expect("valid message-start process"),
         );
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let start = || Command::correlate_message("go", "");
         let journal_dir = dir.join("journal");
         // Both replicas apply entries 1..=3 (a deploy + two round-robin starts).
@@ -6752,18 +6854,12 @@ mod tests {
             apply_entry(
                 &sm,
                 1,
-                vec![ReplicatedCommand {
-                    command: wait_process_command(),
-                    now: 1,
-                }],
+                vec![ReplicatedCommand::new(wait_process_command(), 1)],
             )
             .await
             .expect("entry 1");
             let two_creates = (0..2)
-                .map(|i| ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 2 + i,
-                })
+                .map(|i| ReplicatedCommand::new(Command::create_instance("w"), 2 + i))
                 .collect();
             apply_entry(&sm, 2, two_creates).await.expect("entry 2");
             drop(sm);
@@ -7748,15 +7844,7 @@ mod tests {
         assert!(sm.begin_receiving_snapshot().await.is_err());
 
         // apply: refused, engine untouched.
-        let applied = apply_entry(
-            &sm,
-            1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
-        )
-        .await;
+        let applied = apply_entry(&sm, 1, vec![ReplicatedCommand::new(deploy_command(), 1)]).await;
         assert!(applied.is_err(), "a retired member must refuse an apply");
         let processes = dst.with(|j| j.state().processes.len()).await;
         assert_eq!(processes, 0, "a refused apply never reaches the engine");
@@ -7776,10 +7864,7 @@ mod tests {
         apply_entry(
             &successor,
             1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
+            vec![ReplicatedCommand::new(deploy_command(), 1)],
         )
         .await
         .expect("the successor applies");

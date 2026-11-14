@@ -7311,7 +7311,7 @@ impl ServerImpl {
             );
         }
         let (engine_meta, result) = self
-            .apply_job_command_direct_with(job_key, command, move |engine| {
+            .apply_job_command_direct_with(job_key, command, None, move |engine| {
                 // Capture the job's type/worker authoritatively from engine state
                 // *before* the completion drops the activation, so the
                 // job-statistics attribution is race-free (the read model is
@@ -7516,6 +7516,7 @@ impl ServerImpl {
                     Command::fail_job(job_key, retries, error_message),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -7721,6 +7722,7 @@ impl ServerImpl {
                     ),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -8345,15 +8347,17 @@ impl ServerImpl {
             job_key,
             retries,
             timeout,
-            operation_reference,
             lease_token,
         };
         let commit = if self.raft.is_empty() {
-            let result = self.apply_job_command_direct(job_key, command).await;
+            let result = self
+                .apply_job_command_direct_ref(job_key, command, operation_reference)
+                .await;
             Self::map_job_events(result)?.1
         } else {
             // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false).await?
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
+                .await?
         };
         commit.wait().await;
         self.signal_jobs_available();
@@ -8652,11 +8656,14 @@ impl ServerImpl {
             };
         }
 
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        match self.apply_partition_command(incident_key, command).await {
+        match self
+            .apply_partition_command_ref(
+                incident_key,
+                Command::resolve_incident(incident_key),
+                operation_reference,
+            )
+            .await
+        {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -9815,19 +9822,19 @@ impl ServerImpl {
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_retries_with_ref(job_key, retries, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_retries(job_key, retries), lease_token);
         if !self.raft.is_empty() {
             // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9867,19 +9874,19 @@ impl ServerImpl {
         timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_timeout(job_key, timeout), lease_token);
         if !self.raft.is_empty() {
             // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9904,11 +9911,10 @@ impl ServerImpl {
         incident_key: u64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        let _ = self.apply_partition_command(incident_key, command).await?;
+        let command = Command::resolve_incident(incident_key);
+        let _ = self
+            .apply_partition_command_ref(incident_key, command, operation_reference)
+            .await?;
         self.signal_jobs_available();
         Ok(())
     }
@@ -14040,17 +14046,34 @@ impl ServerImpl {
         key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.apply_partition_command_ref(key, command, None).await
+    }
+
+    /// [`apply_partition_command`](Self::apply_partition_command) carrying the
+    /// caller's `operationReference` (#1556): the ONE by-key funnel through
+    /// which a REST request's reference reaches the engine seam, under Raft or
+    /// direct.
+    async fn apply_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         if !self.raft.is_empty() {
             // `propose_partition_command` already awaits the durable barrier and
             // drives routing / job-sojourn / ad-hoc side effects on the replicated
             // events, so callers must NOT repeat them. `false`: this generic funnel
             // must not record the stream-completion diagnostic (#1306).
-            return self.propose_partition_command(key, command, false).await;
+            return self
+                .propose_partition_command_ref(key, command, false, operation_reference)
+                .await;
         }
         let (events, commit) = self
             .engine
             .by_key(key)
-            .with(move |journal| journal.apply_command_at(command, now_millis()))
+            .with(move |journal| {
+                journal.apply_command_ref_at(command, now_millis(), operation_reference)
+            })
             .await
             .map_err(|error| crate::raft::engine_error_status(&error))?;
         // Mirror the Raft path: wait for durability, then route any
@@ -14087,7 +14110,19 @@ impl ServerImpl {
         job_key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
-        self.apply_job_command_direct_with(job_key, command, |_| ())
+        self.apply_job_command_direct_ref(job_key, command, None)
+            .await
+    }
+
+    /// [`apply_job_command_direct`](Self::apply_job_command_direct) carrying
+    /// the caller's `operationReference` (#1556).
+    async fn apply_job_command_direct_ref(
+        &self,
+        job_key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        self.apply_job_command_direct_with(job_key, command, operation_reference, |_| ())
             .await
             .1
     }
@@ -14103,6 +14138,7 @@ impl ServerImpl {
         &self,
         job_key: Key,
         command: Command,
+        operation_reference: Option<i64>,
         pre_apply: impl FnOnce(&mut Journal) -> M + Send + 'static,
     ) -> (
         M,
@@ -14115,7 +14151,10 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |journal| {
                 let meta = pre_apply(journal);
-                (meta, journal.apply_command_at(command, now_millis()))
+                (
+                    meta,
+                    journal.apply_command_ref_at(command, now_millis(), operation_reference),
+                )
             })
             .await
     }
@@ -20677,15 +20716,24 @@ impl ServerImpl {
     /// diagnostic and is `true` ONLY for the stream `CompleteJob` path — the REST
     /// complete/fail/throw callers pass `false` so a failed REST mutation never
     /// inflates the stream-completion counters (see [`propose_partition_command`]). #1306.
+    ///
+    /// Carries the caller's `operationReference` (#1556) on the replicated
+    /// command envelope.
     async fn propose_job_for_stream(
         &self,
         job_key: u64,
         command: Command,
         record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<Commit, (u16, String)> {
-        self.propose_partition_command(job_key, command, record_stream_outcome)
-            .await
-            .map(|(_, commit)| commit)
+        self.propose_partition_command_ref(
+            job_key,
+            command,
+            record_stream_outcome,
+            operation_reference,
+        )
+        .await
+        .map(|(_, commit)| commit)
     }
 
     /// `record_stream_outcome` gates the `stream_complete_outcome_total`
@@ -20700,6 +20748,20 @@ impl ServerImpl {
         key: Key,
         command: Command,
         record_stream_outcome: bool,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.propose_partition_command_ref(key, command, record_stream_outcome, None)
+            .await
+    }
+
+    /// [`propose_partition_command`](Self::propose_partition_command) carrying
+    /// the caller's `operationReference` (#1556) on the replicated command
+    /// envelope, so every record the command produces is stamped with it.
+    async fn propose_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
@@ -20723,7 +20785,7 @@ impl ServerImpl {
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
-            .propose_result(command, now_millis())
+            .propose_result_ref(command, now_millis(), operation_reference)
             .await
             .map_err(|e| {
                 if record_stream_outcome {
@@ -52966,7 +53028,7 @@ mod no_direct_engine_apply_guard {
     /// it was written for.
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
-        "ServerImpl::apply_partition_command",
+        "ServerImpl::apply_partition_command_ref",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -53057,7 +53119,9 @@ mod no_direct_engine_apply_guard {
     /// runs first and `apply_command` only matches when not already part of an
     /// `apply_command_at` token.
     fn is_direct_apply_call(line: &str) -> bool {
-        contains_call_token(line, "apply_command_at") || contains_call_token(line, "apply_command")
+        contains_call_token(line, "apply_command_at")
+            || contains_call_token(line, "apply_command_ref_at")
+            || contains_call_token(line, "apply_command")
     }
 
     /// True when `line` contains a call to `token` used as either

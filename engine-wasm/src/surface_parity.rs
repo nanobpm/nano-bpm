@@ -391,7 +391,6 @@ mod tests {
                 lease_token: None,
                 job_key: 0,
                 timeout: 0,
-                operation_reference: None,
             }),
             Surface::Surfaced { .. }
         ));
