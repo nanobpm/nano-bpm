@@ -19,15 +19,15 @@
 //! `InstanceCompleted` await routing build on the same link later.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
 use nano_falcon_protocol::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cluster::Topology;
@@ -113,6 +113,25 @@ impl Drop for PendingEntryGuard {
     }
 }
 
+/// Aborts the held task handles on drop unless [`disarm`](Self::disarm)ed.
+/// Used by [`PeerLink::connect`] so a partially-dialed link (first socket up,
+/// second failed or cancelled) never leaks the first socket's tasks (#1582).
+struct AbortOnDrop(Option<Vec<tokio::task::AbortHandle>>);
+
+impl AbortOnDrop {
+    fn disarm(mut self) -> Vec<tokio::task::AbortHandle> {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in self.0.take().unwrap_or_default() {
+            h.abort();
+        }
+    }
+}
+
 /// A live falcon connection to one peer node.
 ///
 /// Cheap to clone (shares the underlying socket writer and correlation table).
@@ -189,6 +208,11 @@ impl PeerLink {
             secret.as_deref(),
         )
         .await?;
+        // Until ownership transfers to the returned `PeerLink`, the app lane's
+        // tasks are held by an abort-on-drop guard: if the Raft dial below fails
+        // or this future is cancelled (e.g. by a forwarding deadline), the
+        // already-spawned app socket tasks are aborted instead of leaking.
+        let app_guard = AbortOnDrop(Some(app_tasks.to_vec()));
         // Raft-lane abort handles are deliberately dropped (not tracked): the
         // lane is never torn down by an app-lane retirement (#1582).
         let (out_raft, _raft_tasks) = Self::dial(
@@ -206,7 +230,7 @@ impl PeerLink {
             pending_raft,
             next_corr: Arc::new(AtomicU64::new(1)),
             connected,
-            app_tasks: Arc::new(std::sync::Mutex::new(app_tasks.into_iter().collect())),
+            app_tasks: Arc::new(std::sync::Mutex::new(app_guard.disarm())),
         })
     }
 
@@ -1155,6 +1179,11 @@ pub struct PeerSet {
     /// to one peer never freezes cache hits or dials to other peers. This removes
     /// the connect-under-global-lock head-of-line stall.
     connect_locks: Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>,
+    /// Links whose APP lane was retired by [`drop_link_if_same`](Self::drop_link_if_same)
+    /// but whose Raft lane is still healthy. [`raft_link`](Self::raft_link) keeps
+    /// replicating over it — without first redialing the app socket — until a
+    /// fresh link is dialed or the Raft socket itself drops (#1582).
+    retired_raft: Arc<Mutex<HashMap<u32, PeerLink>>>,
 }
 
 /// Circuit-breaker state for one down peer.
@@ -1177,6 +1206,7 @@ impl PeerSet {
             unreachable: Arc::new(Mutex::new(HashSet::new())),
             breaker: Arc::new(Mutex::new(HashMap::new())),
             connect_locks: Arc::new(Mutex::new(HashMap::new())),
+            retired_raft: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1191,6 +1221,7 @@ impl PeerSet {
     pub async fn fail_node(&self, node_id: u32) {
         self.unreachable.lock().await.insert(node_id);
         self.links.lock().await.remove(&node_id);
+        self.retired_raft.lock().await.remove(&node_id);
     }
 
     /// Fault injection (tests only): clear a prior `fail_node`, restoring
@@ -1221,6 +1252,9 @@ impl PeerSet {
             let mut links = self.links.lock().await;
             if links.get(&node_id).is_some_and(|l| l.same_connection(used)) {
                 links.remove(&node_id);
+                // Keep the still-healthy Raft lane reachable for replication so
+                // it is not blocked behind an app-socket redial (#1582).
+                self.retired_raft.lock().await.insert(node_id, used.clone());
             }
         }
         // Retire the abandoned connection's APP lane, not just its cache entry:
@@ -1238,6 +1272,31 @@ impl PeerSet {
         let result = self.link_inner(node_id).await;
         crate::metrics::record_peer_link(link_start.elapsed());
         result
+    }
+
+    /// Returns a link whose RAFT lane is live, for replication RPCs. Prefers the
+    /// cached link; otherwise reuses a link whose app lane was retired but whose
+    /// Raft socket is still connected, so replication never waits on (or fails
+    /// with) an app-socket redial. Falls back to [`link`](Self::link).
+    pub async fn raft_link(&self, node_id: u32) -> Result<PeerLink, PeerError> {
+        if self.unreachable.lock().await.contains(&node_id) {
+            return Err(PeerError::Connect(format!(
+                "node {node_id} marked unreachable (fault injection)"
+            )));
+        }
+        if let Some(link) = self.cached_live_link(node_id).await {
+            return Ok(link);
+        }
+        {
+            let mut retired = self.retired_raft.lock().await;
+            if let Some(link) = retired.get(&node_id) {
+                if link.is_connected() {
+                    return Ok(link.clone());
+                }
+                retired.remove(&node_id);
+            }
+        }
+        self.link(node_id).await
     }
 
     async fn link_inner(&self, node_id: u32) -> Result<PeerLink, PeerError> {
@@ -1289,6 +1348,8 @@ impl PeerSet {
             Ok(link) => {
                 self.breaker_clear(node_id).await;
                 self.links.lock().await.insert(node_id, link.clone());
+                // A fresh link carries its own Raft lane; release the retired one.
+                self.retired_raft.lock().await.remove(&node_id);
                 Ok(link)
             }
             Err(e) => {
@@ -1688,6 +1749,39 @@ mod tests {
         ));
         assert!(stalled.pending_raft.lock().await.contains_key(&8));
         assert!(stalled.is_connected(), "raft lane stays usable");
+    }
+
+    /// After an app-lane retirement, replication must keep using the retired
+    /// link's healthy Raft lane WITHOUT redialing the app socket: node 1 is a
+    /// dead port here, so any dial would fail (#1582).
+    #[tokio::test]
+    async fn raft_link_reuses_retired_raft_lane_without_redialing() {
+        let peers = peers_with_dead_peer();
+        let stalled = stalled_link();
+        peers.links.lock().await.insert(1, stalled.clone());
+        peers.drop_link_if_same(1, &stalled).await;
+
+        let raft = peers.raft_link(1).await.expect("retired raft lane reused");
+        assert!(raft.same_connection(&stalled));
+        // The app path still redials (and fails against the dead port).
+        assert!(peers.link(1).await.is_err());
+    }
+
+    /// A partially-built link (first socket dialed, second failed/cancelled)
+    /// must abort the first socket's tasks rather than leak them (#1582).
+    #[tokio::test]
+    async fn abort_on_drop_aborts_unless_disarmed() {
+        let leaked = tokio::spawn(std::future::pending::<()>());
+        drop(AbortOnDrop(Some(vec![leaked.abort_handle()])));
+        assert!(leaked.await.unwrap_err().is_cancelled());
+
+        let kept = tokio::spawn(std::future::pending::<()>());
+        let handles = AbortOnDrop(Some(vec![kept.abort_handle()])).disarm();
+        tokio::task::yield_now().await;
+        assert!(!kept.is_finished());
+        for h in handles {
+            h.abort();
+        }
     }
 
     /// A single-node cluster has no peers, so `PeerSet` is inert.
