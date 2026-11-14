@@ -6845,10 +6845,10 @@ impl ServerImpl {
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // The detached owner already blocked on durability and routed the
-        // cross-partition follow-ups before answering, so a returned 200 means
-        // the create is fsynced and its routing ran; cancelling this handler at
-        // any point strands nothing.
+        // The detached owner already blocked on durability before answering, so
+        // a returned 200 means the create is fsynced; its cross-partition
+        // routing keeps running detached after the answer (#1582), and
+        // cancelling this handler at any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -10144,10 +10144,19 @@ impl ServerImpl {
     /// cross-partition follow-ups nobody ever routed. Here the detached task
     /// owns the outcome end to end: it submits `apply` at create priority,
     /// gates routing on durability exactly as [`Self::route_after_durable`]
-    /// does (a write that never persists routes nothing), drives the routing
-    /// pump itself, and only then delivers the projected outcome over the
-    /// returned oneshot. The caller merely OBSERVES the outcome; cancelling
-    /// that observation strands nothing.
+    /// does (a write that never persists routes nothing), delivers the
+    /// projected outcome over the returned oneshot the moment the create is
+    /// durable, and only then drives the routing pump. The caller merely
+    /// OBSERVES the outcome; cancelling that observation strands nothing.
+    ///
+    /// The answer is sent BEFORE the routing pump is driven: a stalled
+    /// subscription target must not withhold an already-committed create result
+    /// for the whole re-drive budget — a retried forwarded create without a
+    /// business id could then mint a duplicate instance while the first owner's
+    /// routing was still retrying (#1582). Routing keeps its own detached
+    /// ownership below, so it still runs to completion after the answer is
+    /// sent; the caller is answered at commit exactly as
+    /// [`Self::raft_create_core`] answers at Raft commit.
     ///
     /// `accounting` is the admission charge (processing slot + payload bytes)
     /// entered on the caller before submission; it is MOVED in here and held
@@ -10171,8 +10180,26 @@ impl ServerImpl {
         F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
         T: CreateOutcome + Send + 'static,
     {
-        let server = self.clone();
         let engine = self.engine.for_create().clone();
+        self.submit_create_detached_on(accounting, engine, apply)
+    }
+
+    /// [`Self::submit_create_detached`] onto a caller-chosen create actor.
+    /// Production picks the actor via `for_create()` (round-robin); the
+    /// partition-pinned form exists so a test can park a barrier on the SAME
+    /// partition the create will land on, deterministically ordering the create
+    /// behind the barrier on that actor's queue.
+    fn submit_create_detached_on<F, T>(
+        &self,
+        accounting: CreateAccounting,
+        engine: DeepthiHandle,
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
+        let server = self.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut outcome = engine.with_low(apply).await;
@@ -10180,8 +10207,8 @@ impl ServerImpl {
             // its payload is no longer resident in the creation mailbox: the
             // admission charge is released here, not when the caller leaves.
             drop(accounting);
-            if let Ok(outcome) = &mut outcome {
-                let (routable, commit) = outcome.take_routing_parts();
+            if let Ok(created) = &mut outcome {
+                let (routable, commit) = created.take_routing_parts();
                 if !commit.wait_durable().await {
                     // The write never persisted (writer gone unacked): route
                     // nothing — the peer would durably record a delivery
@@ -10197,11 +10224,16 @@ impl ServerImpl {
                     )));
                     return;
                 }
+                // Answer at COMMIT (durable), then drive the follow-ups. A
+                // dropped receiver (caller cancelled) is fine: routing still
+                // runs to completion inside this detached task.
+                let _ = tx.send(outcome);
                 server.drive_subscription_routing(routable).await;
                 server.signal_jobs_available();
+                return;
             }
-            // A dropped receiver (caller cancelled) is fine; the work above
-            // already ran to completion inside this task.
+            // A dropped receiver (caller cancelled) is fine; the apply already
+            // ran to completion inside this task.
             let _ = tx.send(outcome);
         });
         rx
@@ -11290,10 +11322,10 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        // The non-Raft branch's detached owner already awaited durability and
-        // routed the follow-ups before answering (#1582); under Raft the
-        // proposal is durable and routed by its own detached task. Either way
-        // the create is committed and routed by the time we answer.
+        // The non-Raft branch's detached owner already awaited durability before
+        // answering (#1582); under Raft the proposal is durable at commit. Either
+        // way the create is committed by the time we answer, and its routing
+        // keeps running detached after the answer.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -20382,8 +20414,8 @@ impl ServerImpl {
         // definition key/version are unused here.
         let instance_key = created.instance_key;
         let sync_completed = created.sync_completed;
-        // The detached owner already awaited durability and routed the
-        // follow-ups before answering (#1582).
+        // The detached owner already awaited durability before answering
+        // (#1582); its routing keeps running detached after the answer.
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -47587,6 +47619,14 @@ mod subscription_placement_tests {
     /// actor finishes — a caller that is cancelled (drops its observation)
     /// while the create is still queued must NOT release the charge early, or
     /// repeated cancelled requests would undercount the watermarks.
+    ///
+    /// Deterministic: a FIFO barrier job at the same (Low/create) priority is
+    /// queued ahead of the create and parked on a oneshot, so the create is
+    /// guaranteed to still be QUEUED on the engine actor when the caller is
+    /// cancelled. The charge must stay entered across the cancellation and only
+    /// drain once the barrier is released and the actor finishes the create —
+    /// an implementation that released accounting on cancellation would fail
+    /// the "still charged while queued" assertion.
     #[tokio::test]
     async fn cancelled_create_holds_admission_charge_until_actor_finishes() {
         let server = single_node_multi_partition();
@@ -47600,6 +47640,34 @@ mod subscription_placement_tests {
         let payload_bytes = 128u64;
         let processing_before = server.processing.load(Ordering::Relaxed);
         let bytes_before = server.pipeline_bytes.load(Ordering::Relaxed);
+
+        // Park the create-priority queue on ONE chosen partition: a barrier job
+        // at Low priority runs FIRST (FIFO within a priority) and blocks until
+        // released, so the create queued behind it stays pending on the actor.
+        // `for_create()` round-robins across partitions, so the create is
+        // submitted through the partition-pinned `submit_create_detached_on`
+        // onto the SAME actor the barrier parks — otherwise the two could land
+        // on different partitions and the barrier would not order the create.
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let barrier_engine = create_engine.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            barrier_engine
+                .with_low(move |_journal| {
+                    // Signal the barrier holds the actor, then park until released.
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx
+            .await
+            .expect("the barrier job is running on the actor");
+
         let accounting = CreateAccounting::enter(&server, payload_bytes);
         // The charge is visible from the moment the request arrives.
         assert_eq!(
@@ -47610,7 +47678,7 @@ mod subscription_placement_tests {
             server.pipeline_bytes.load(Ordering::Relaxed),
             bytes_before + payload_bytes
         );
-        let rx = server.submit_create_detached(accounting, move |engine| {
+        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
             let (process_id, sel_key, sel_ver) =
                 resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
             apply_create_instance_direct(
@@ -47627,10 +47695,28 @@ mod subscription_placement_tests {
             )
             .map_err(|e| (500, e.to_string()))
         });
-        // Cancel the caller immediately: it never observes the outcome.
+        // Cancel the caller while its create is still QUEUED behind the barrier.
         drop(rx);
-        // The charge is released once the detached owner finishes the actor
-        // round-trip — not by the cancellation. Poll until it drains.
+
+        // Give the detached owner every chance to (wrongly) release the charge
+        // on cancellation: while the barrier holds the actor the create cannot
+        // finish, so the charge MUST remain entered.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1,
+            "the processing slot stays charged while the cancelled create is still queued"
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes,
+            "the payload bytes stay charged while the cancelled create is still queued"
+        );
+
+        // Release the barrier: the create now runs to completion and the
+        // detached owner releases the charge once the actor finishes.
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier job completes");
         let mut released = false;
         for _ in 0..100 {
             if server.processing.load(Ordering::Relaxed) == processing_before
@@ -47645,6 +47731,119 @@ mod subscription_placement_tests {
             released,
             "the detached owner released the admission charge after the actor finished"
         );
+    }
+
+    /// #1582: the non-Raft detached create owner answers its observer the
+    /// moment the create is DURABLE, BEFORE the cross-partition routing pump
+    /// finishes — a stalled subscription target must not withhold an
+    /// already-committed create result for the whole re-drive budget (a retried
+    /// forwarded create without a business id could then mint a duplicate
+    /// instance while the first owner's routing was still retrying).
+    ///
+    /// Model the stall deterministically with a durability gate: the create's
+    /// `Commit` is replaced by a [`Commit::from_ack`] the test holds open. The
+    /// reply is gated on `wait_durable()`, so while the gate is shut the
+    /// observer must NOT have been answered; the instant the gate opens (the
+    /// write is durable) the observer must resolve even though the routing pump
+    /// is still driving the (locally-applied, in-memory) follow-up. Routing
+    /// still runs to completion after the answer: the subscription is armed.
+    #[tokio::test]
+    async fn detached_create_answers_at_durability_before_routing_finishes() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        // A correlation key whose canonical subscription partition differs from
+        // the create's partition, so the opening follow-up is genuinely routed.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("stall-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
+                break;
+            }
+        }
+        let order = chosen.expect("a cross-partition correlation key exists");
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+
+        // The durability gate the test holds open: the create's commit is
+        // replaced by this ack, so the owner blocks in `wait_durable()` until
+        // the test releases it — the stand-in for a stalled routing target.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            created.commit = Commit::from_ack(ack_rx);
+            Ok(created)
+        });
+
+        // While the durability gate is shut the observer must be UNANSWERED —
+        // the reply is gated on durability, and routing has not even started.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut rx = rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "no answer before the create is durable"
+        );
+
+        // Open the gate: the write is now durable. The observer must resolve
+        // immediately — the owner answers at commit and only THEN drives the
+        // routing pump, so the reply is not held for the routing budget.
+        ack_tx.send(()).expect("the durability gate is held");
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered at durability, not after routing")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(created.instance_key > 0, "a real instance key");
+
+        // Routing still ran to completion after the answer: the cross-partition
+        // subscription is armed on its canonical partition.
+        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let handle = server
+            .engine_handle_for(sub_partition)
+            .expect("subscription partition is local");
+        let mut armed = false;
+        for _ in 0..100 {
+            let found = handle
+                .with({
+                    let order = order.clone();
+                    move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.correlation_key == order
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    }
+                })
+                .await;
+            if found {
+                armed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(armed, "routing ran to completion after the answer");
     }
 
     /// #1582: a source with no replica of the target rotates its forwards
