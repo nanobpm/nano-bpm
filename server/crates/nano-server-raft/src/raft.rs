@@ -2994,7 +2994,8 @@ async fn propose_orphan(
         instance_key: key,
         stamp: Some(stamp),
     };
-    let failure = match batcher.submit(command, orphan_now_millis()).await {
+    // No caller operationReference for an internal quarantine proposal (#1556).
+    let failure = match batcher.submit(command, orphan_now_millis(), None).await {
         Ok(item) => item
             .error
             .map(|(status, message)| format!("{status}: {message}")),
