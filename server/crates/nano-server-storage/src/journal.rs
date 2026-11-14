@@ -1772,8 +1772,8 @@ impl Journal {
     /// episode id no longer matched the allocator's position, so the loss is
     /// still outstanding. Take the report out of `in_flight` (it stays in the
     /// backlog) so it is re-stamped at the allocator's now-current position
-    /// and re-proposed — never silently cleared without raising
-    /// `VariablesLost`. The engine already re-offered it to the reissue sink.
+    /// and re-proposed by the next (gated) drain — never silently cleared
+    /// without raising `VariablesLost`.
     pub fn orphan_stamp_superseded(&mut self, key: Key) {
         self.orphans.in_flight.remove(&key);
     }
@@ -3010,10 +3010,11 @@ impl Journal {
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         // A superseded orphan stamp (#1587 review) applied: the report is still
         // pending, so re-enqueue it (out of `in_flight`) for a FRESH stamp at
-        // the allocator's now-current position. The engine already re-offered
-        // it to the reissue sink (→ the propose channel); this clears the
-        // journal-side in-flight marker so the re-proposal is not suppressed
-        // as already-handed-out. A duplicate's reissue re-settles harmlessly.
+        // the allocator's now-current position: clear the in-flight marker,
+        // then re-drain through the GATED backlog drain (#1607 review) — it
+        // proposes only on the leader with a wired sink, and only keys not
+        // already in flight, so followers never propose and a key is never
+        // queued twice.
         //
         // Settlement is decided AFTER the apply (#1607 review): a superseded
         // stamp must NOT settle — `settle_orphan_report` would remove the
@@ -3031,6 +3032,9 @@ impl Journal {
             && !superseded
         {
             self.settle_orphan_report(key);
+        }
+        if superseded {
+            self.drain_orphan_backlog();
         }
         let mut activated: Vec<_> = events
             .iter()
@@ -3738,13 +3742,6 @@ impl Journal {
     /// `&Engine`).
     pub fn engine(&self) -> &Engine {
         &self.engine
-    }
-
-    /// Mutable access to the underlying engine, for host-side wiring that is
-    /// not replicated state (e.g. [`Engine::set_orphan_reissue_sink`], #1587
-    /// review). Never use it to mutate journaled state off the command path.
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        &mut self.engine
     }
 
     /// Sets the cluster-wide partition count on the underlying engine so it
@@ -7531,8 +7528,65 @@ mod tests {
                 .is_some(),
             "the retry remains eligible for stamping"
         );
-        // Taken out of in-flight, so the next drain re-enqueues it.
-        assert_eq!(journal.drain_orphan_backlog(), 1, "re-enqueued for reissue");
+        // The supersede re-drains through the GATED backlog drain (#1607
+        // review): exactly ONE retry is queued (the original + the reissue),
+        // and a later drain does not queue a duplicate for the same key.
+        assert_eq!(
+            sink.keys(),
+            vec![keys[0], keys[0]],
+            "one reissue queued on supersede"
+        );
+        assert_eq!(journal.drain_orphan_backlog(), 0, "no duplicate retry");
+
+        drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1607 review: a FOLLOWER applying a superseded stamp must not propose —
+    // the reissue goes through the leader-gated backlog drain, never directly
+    // into the propose channel.
+    #[test]
+    fn superseded_orphan_stamp_on_follower_queues_nothing() {
+        let path = restart_store_path("orphan-supersede-follower-1607");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "parked");
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        assert!(
+            sink.keys().is_empty(),
+            "a follower never proposes a reissue"
+        );
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "still parked");
 
         drop(journal);
         drop(store);

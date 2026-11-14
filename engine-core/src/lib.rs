@@ -115,7 +115,6 @@ pub use command::{
 pub use command::{OrphanIncidentStamp, OrphanKind};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
-pub use engine::OrphanReissueSink;
 pub use engine::SNAPSHOT_FORMAT_VERSION;
 mod lease;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};

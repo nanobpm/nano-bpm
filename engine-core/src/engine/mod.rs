@@ -255,33 +255,6 @@ pub struct Engine {
     /// without a snapshot seeds `last_applied` from it so journaled entries are
     /// never re-applied. `None` on a non-replicated engine.
     raft_applied: Option<(u64, String)>,
-    /// Host-wired queue a **superseded** orphan report is re-offered to (#1587
-    /// review): when a stamped quarantine applies with an episode id that no
-    /// longer matches the allocator's position (unrelated key-minting work
-    /// advanced it between stamping and commitment), the gate emits
-    /// [`Event::OrphanStampSuperseded`] and enqueues the still-pending report
-    /// here so the leader re-stamps it at its now-current position and
-    /// re-proposes it — instead of silently clearing the pending report
-    /// without raising `VariablesLost`. Pure host-side plumbing: never
-    /// snapshotted, never read on the replay path (replaying an
-    /// `OrphanStampSuperseded` frame does not re-enqueue — the report's
-    /// reissue is itself journaled), so it cannot affect determinism. `None`
-    /// on a non-replicated engine (a supersede then leaves the report parked
-    /// for the next drain, exactly like a refused enqueue).
-    orphan_reissue_sink: Option<std::sync::Arc<dyn OrphanReissueSink>>,
-}
-
-/// The host-side queue a superseded orphan report is re-offered to (#1587
-/// review). Implemented by the storage journal (bridging to the orphan propose
-/// channel) — the engine core never proposes on its own, it only re-offers the
-/// still-pending report. `Send + Sync` so the engine stays shareable across
-/// the actor boundary.
-pub trait OrphanReissueSink: Send + Sync + std::fmt::Debug {
-    /// Re-queues `instance_key` (lost from tier `kind`) for a FRESH stamp +
-    /// proposal. Returns `false` when the queue cannot accept it right now
-    /// (channel closed / shutting down) — the report then stays parked in the
-    /// journal's backlog for the next drain, exactly like a refused enqueue.
-    fn reissue_orphan(&self, instance_key: Key, kind: crate::command::OrphanKind) -> bool;
 }
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
@@ -663,7 +636,6 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied: None,
-            orphan_reissue_sink: None,
         }
     }
 
@@ -820,7 +792,6 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied,
-            orphan_reissue_sink: None,
         }
     }
 
@@ -842,14 +813,6 @@ impl Engine {
     /// replay.
     pub fn set_raft_applied(&mut self, index: u64, raft_state: String) {
         self.raft_applied = Some((index, raft_state));
-    }
-
-    /// Wires the host queue a superseded orphan report is re-offered to (#1587
-    /// review). Called by the replication layer when it wires the orphan
-    /// propose channel, with a bridge into that same channel. Host-side
-    /// plumbing only — never snapshotted, never affects replay determinism.
-    pub fn set_orphan_reissue_sink(&mut self, sink: std::sync::Arc<dyn OrphanReissueSink>) {
-        self.orphan_reissue_sink = Some(sink);
     }
 
     fn mint_key(&mut self) -> Key {
@@ -5681,22 +5644,22 @@ impl Engine {
                 // and must still be reported). So a mismatch never silently
                 // clears the pending report: it emits
                 // [`Event::OrphanStampSuperseded`] — journaled, so the decision
-                // is replica-deterministic — and re-offers the report to the
-                // host's reissue sink, which re-stamps it at the allocator's
-                // now-current position and re-proposes it. A duplicate's
-                // reissue is itself a deterministic no-op (its re-stamp finds
-                // the loss already resolved or re-incidented), so the extra
-                // round trip is harmless; a genuinely fresh report is never
-                // lost. The sink is host plumbing, never replicated state, so
-                // this stays replica-deterministic.
+                // is replica-deterministic. The leader's journal observes that
+                // event, keeps the report in its backlog, and re-drains it
+                // through the gated backlog drain (leader-only, one in-flight
+                // proposal per key), which re-stamps it at the allocator's
+                // now-current position and re-proposes it. A delayed
+                // duplicate's report is already settled out of the backlog, so
+                // it is not re-proposed; a genuinely fresh report is never
+                // silently cleared.
                 let tombstone = self.state.variables_lost_quarantined.get(&instance_key);
                 match (tombstone, stamp.episode) {
                     // An open episode: dedup any repeat of it.
                     (Some(_), _) => return Ok((log, queue)),
                     // A delayed duplicate of a resolved episode OR a fresh
                     // report whose stamp went stale in flight: supersede it —
-                    // journal the decision and re-offer the report for a fresh
-                    // stamp. Equality — the episode IS the next key — means a
+                    // journal the decision so the leader's journal re-stamps
+                    // the still-pending report. Equality — the episode IS the next key — means a
                     // FRESH proposal at the allocator's current position:
                     // apply it.
                     (None, episode) if episode > 0 => {
@@ -5708,14 +5671,6 @@ impl Engine {
                                     episode,
                                 },
                             );
-                            if let Some(sink) = &self.orphan_reissue_sink {
-                                // The report's tier comes from its stamp. A
-                                // refused enqueue (channel closed / shutting
-                                // down) leaves the report parked in the
-                                // journal's backlog for the next drain — the
-                                // same outcome as any refused enqueue (#1447).
-                                let _ = sink.reissue_orphan(instance_key, stamp.kind);
-                            }
                             return Ok((log, queue));
                         }
                     }
@@ -5747,8 +5702,8 @@ impl Engine {
             }
             Command::ReissueOrphanStamp { .. } => {
                 // No engine-state effect (#1587 review): the superseded report
-                // was already re-offered to the host's reissue sink when its
-                // proposal applied (the `OrphanStampSuperseded` arm above), and
+                // is re-drained from the leader journal's backlog when its
+                // `OrphanStampSuperseded` event applies (the arm above), and
                 // the replication layer re-proposes the stamped quarantine from
                 // there. This command exists so that reissue is itself
                 // journaled (replica-deterministic) and so the journal can

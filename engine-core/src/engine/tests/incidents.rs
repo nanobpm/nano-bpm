@@ -4884,28 +4884,12 @@ fn new_loss_after_resolution_is_reported_fresh() {
 // leader's stamp and the proposal's commitment advances the replicated
 // allocator, so the proposal's episode no longer matches `peek_next_key()`.
 // The gate must NOT silently clear the pending report: it journals
-// `OrphanStampSuperseded` and re-offers the report to the reissue sink, which
-// re-stamps it at the now-current position and re-proposes it — the fresh
+// `OrphanStampSuperseded` (the leader's journal keeps the report and re-drains
+// it), which re-stamps it at the now-current position and re-proposes it — the fresh
 // quarantine still raises its `VariablesLost` incident.
 #[test]
 fn superseded_orphan_stamp_is_reissued_not_dropped() {
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Debug, Default)]
-    struct RecordingSink(Mutex<Vec<(Key, crate::OrphanKind)>>);
-    impl crate::OrphanReissueSink for RecordingSink {
-        fn reissue_orphan(&self, instance_key: Key, kind: crate::OrphanKind) -> bool {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((instance_key, kind));
-            true
-        }
-    }
-
     let (mut engine, key) = orphan_replica();
-    let sink = Arc::new(RecordingSink::default());
-    engine.set_orphan_reissue_sink(sink.clone());
 
     // The leader stamps the live orphan (episode = the allocator's next key).
     let stamp = engine
@@ -4920,8 +4904,7 @@ fn superseded_orphan_stamp_is_reissued_not_dropped() {
         .unwrap();
 
     // The stamped proposal now applies SUPERSEDED: it journals the supersede
-    // signal, raises NO incident, records NO tombstone, and re-offers the
-    // still-pending report to the sink.
+    // signal, raises NO incident, and records NO tombstone.
     let first = engine
         .apply_command_at(
             Command::QuarantineOffheapOrphan {
@@ -4947,11 +4930,6 @@ fn superseded_orphan_stamp_is_reissued_not_dropped() {
     assert!(
         !engine.has_active_variables_lost(key),
         "no incident raised by the superseded proposal"
-    );
-    assert_eq!(
-        sink.0.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
-        &[(key, crate::OrphanKind::Resident)],
-        "the still-pending report is re-offered for a fresh stamp"
     );
 
     // The reissue: the leader RE-STAMPS at the allocator's now-current position
