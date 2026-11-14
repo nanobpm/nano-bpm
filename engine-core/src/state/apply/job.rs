@@ -442,7 +442,11 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             // reported fresh. Keyed on the replicated incident key — NOT on the
             // incident record, which is absent on a cold-tiered replica — so
             // every replica lifts identically.
-            if state.variables_lost_quarantined.get(instance_key) == Some(incident_key) {
+            if state
+                .variables_lost_quarantined
+                .get(instance_key)
+                .is_some_and(|t| t.incident_key == *incident_key)
+            {
                 state.variables_lost_quarantined.remove(instance_key);
             }
             // A recoverable job-incident: return the parked job to the

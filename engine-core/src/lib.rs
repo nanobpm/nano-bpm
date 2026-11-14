@@ -150,7 +150,7 @@ pub use state::{
     JobSettlementOutcome, JobState, JobTerminalEnd, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
     ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
-    UserTask, UserTaskState, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK,
-    MAX_PARTITION_ID, PARTITION_BITS, ROUTED_DELIVERY_LEDGER_CAP, SETTLED_JOB_LEDGER_CAP,
-    SETTLED_TOKENS_PER_JOB_CAP,
+    UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES,
+    LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS, ROUTED_DELIVERY_LEDGER_CAP,
+    SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

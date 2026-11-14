@@ -437,3 +437,76 @@ fn callactivity_variant_witness_is_exhaustive() {
     };
     assert_eq!(witness(&k), "callActivity");
 }
+
+/// Issue #1587 review: a snapshot written **before** the episode-bearing
+/// tombstone (`State::variables_lost_quarantined: BTreeMap<Key,
+/// VariablesLostTombstone>`) encodes each active quarantine as the bare
+/// incident key — `"7": 9`. That numeric value cannot deserialize into the new
+/// struct, and `serde(default)` does not convert an EXISTING value, so without
+/// the untagged legacy arm in `VariablesLostTombstone`'s deserializer a legacy
+/// snapshot holding an ACTIVE quarantine fails to load through every direct
+/// `EngineSnapshot` reader — including Raft snapshot installation, exactly the
+/// pre-#1057 upgrade-boot crash class this file guards. The legacy entry must
+/// load as `{ incident_key: 9, episode: 0 }` (the episode-blind sentinel,
+/// matching the pre-#1587 behaviour that snapshot ran under).
+#[test]
+fn legacy_quarantine_snapshot_with_bare_incident_key_still_loads() {
+    // A current snapshot carrying one active quarantine (object form).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            ProcessBuilder::new("p")
+                .start_event("start")
+                .build()
+                .expect("valid definition"),
+        ))
+        .expect("deploy");
+    let snapshot = engine.snapshot();
+    let mut json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+
+    // Rewrite the tombstone map into its legacy (pre-#1587) encoding: each
+    // value is the bare incident key, not the `{incident_key, episode}` object.
+    let quarantined = json
+        .pointer_mut("/state/variables_lost_quarantined")
+        .expect("snapshot carries the quarantine map");
+    *quarantined = serde_json::json!({ "7": 9 });
+
+    // The real path: the legacy shape must still deserialize into an
+    // `EngineSnapshot` a current build can load (as recovery / Raft snapshot
+    // installation does), with the legacy entry read as episode-blind.
+    let decoded: EngineSnapshot = serde_json::from_value(json)
+        .expect("legacy quarantine snapshot (bare incident key) must still deserialize");
+    let tombstone = decoded
+        .state
+        .variables_lost_quarantined
+        .get(&7)
+        .expect("the legacy entry survives");
+    assert_eq!(tombstone.incident_key, 9);
+    assert_eq!(tombstone.episode, 0, "a legacy entry loads episode-blind");
+    let _engine = Engine::from_snapshot(decoded);
+}
+
+/// The inverse: the CURRENT object form round-trips verbatim — the untagged
+/// deserializer must prefer the object shape and never rewrite a present
+/// `episode` to the legacy sentinel.
+#[test]
+fn current_quarantine_tombstone_round_trips_verbatim() {
+    use nanobpmn_engine_core::VariablesLostTombstone;
+    let original = VariablesLostTombstone {
+        incident_key: 9,
+        episode: 42,
+    };
+    let json = serde_json::to_string(&original).expect("serialize tombstone");
+    let back: VariablesLostTombstone = serde_json::from_str(&json).expect("deserialize tombstone");
+    assert_eq!(back, original);
+    // And the bare legacy form decodes at the field granularity too.
+    let legacy: VariablesLostTombstone =
+        serde_json::from_str("9").expect("legacy bare incident key deserializes");
+    assert_eq!(
+        legacy,
+        VariablesLostTombstone {
+            incident_key: 9,
+            episode: 0,
+        }
+    );
+}

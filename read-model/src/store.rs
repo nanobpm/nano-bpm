@@ -7044,7 +7044,10 @@ fn project_event(
         | Event::VariableScopeDestroyed { .. }
         // Engine-internal quarantine dedup tombstone (#1574): the read model
         // projects the companion `IncidentRaised`.
-        | Event::VariablesLostQuarantined { .. } => {}
+        | Event::VariablesLostQuarantined { .. }
+        // Engine-internal orphan-stamp supersede signal (#1587 review): no
+        // projection — the re-proposed quarantine raises its own incident.
+        | Event::OrphanStampSuperseded { .. } => {}
     }
     Ok(delta)
 }

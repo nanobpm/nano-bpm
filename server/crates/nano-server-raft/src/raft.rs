@@ -2888,6 +2888,7 @@ type OrphanQueue = tokio::sync::mpsc::UnboundedSender<(
 /// The journal-facing half of the orphan propose channel (#1447): implements
 /// the storage layer's `OrphanSink` trait so the engine actor can hand an
 /// orphan key off without blocking.
+#[derive(Debug)]
 struct OrphanQueueSink {
     tx: OrphanQueue,
 }
