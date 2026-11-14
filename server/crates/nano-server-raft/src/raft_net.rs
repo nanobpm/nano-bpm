@@ -426,7 +426,7 @@ impl RaftTransport for PeerTransport {
             let (rpc, compressed) = encode_rpc_payload(json);
             let link = self
                 .peers
-                .link(target as u32)
+                .raft_link(target as u32)
                 .await
                 .map_err(|e| TransportError(e.to_string()))?;
             let result = link
