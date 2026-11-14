@@ -1804,9 +1804,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
         })
         .unwrap();
     let retried = engine
-        .apply_command(Command::ResolveIncident {
-            incident_key,
-        })
+        .apply_command(Command::ResolveIncident { incident_key })
         .unwrap();
     let retry_key = retried
         .iter()

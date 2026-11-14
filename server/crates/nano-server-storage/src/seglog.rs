@@ -2167,8 +2167,8 @@ fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
         if line.trim().is_empty() {
             continue;
         }
-        let event =
-            decode_journal_event(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         events.push(event);
     }
     Ok(events)
@@ -2209,8 +2209,8 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
             }
             None => (None, line),
         };
-        let event =
-            decode_journal_event(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });

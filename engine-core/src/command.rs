@@ -1299,7 +1299,6 @@ impl Command {
         }
     }
 
-
     /// Convenience constructor for an `UpdateJobTimeout`.
     pub fn update_job_timeout(job_key: Key, timeout: i64) -> Self {
         Command::UpdateJobTimeout {
@@ -1309,12 +1308,10 @@ impl Command {
         }
     }
 
-
     /// Convenience constructor for a `ResolveIncident`.
     pub fn resolve_incident(incident_key: Key) -> Self {
         Command::ResolveIncident { incident_key }
     }
-
 
     /// Convenience constructor for a propagating (`local = false`) `SetVariables`.
     pub fn set_variables(scope_key: Key, variables: HashMap<String, Value>) -> Self {

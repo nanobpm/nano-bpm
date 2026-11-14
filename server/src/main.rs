@@ -9822,10 +9822,8 @@ impl ServerImpl {
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_retries(job_key, retries),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_retries(job_key, retries), lease_token);
         if !self.raft.is_empty() {
             // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
             self.propose_job_for_stream(job_key, command, false, operation_reference)
@@ -9876,10 +9874,8 @@ impl ServerImpl {
         timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_timeout(job_key, timeout),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_timeout(job_key, timeout), lease_token);
         if !self.raft.is_empty() {
             // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
             self.propose_job_for_stream(job_key, command, false, operation_reference)

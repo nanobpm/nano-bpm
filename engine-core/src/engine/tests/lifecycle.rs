@@ -2817,22 +2817,12 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     let retries: Command =
         serde_json::from_str(r#"{"UpdateJobRetries":{"job_key":7,"retries":3}}"#)
             .expect("legacy UpdateJobRetries without operation_reference must deserialize");
-    assert!(matches!(
-        retries,
-        Command::UpdateJobRetries {
-            ..
-        }
-    ));
+    assert!(matches!(retries, Command::UpdateJobRetries { .. }));
 
     let timeout: Command =
         serde_json::from_str(r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5000}}"#)
             .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
-    assert!(matches!(
-        timeout,
-        Command::UpdateJobTimeout {
-            ..
-        }
-    ));
+    assert!(matches!(timeout, Command::UpdateJobTimeout { .. }));
 
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
     let throw_empty = Command::ThrowJobError {

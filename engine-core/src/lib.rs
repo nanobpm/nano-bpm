@@ -123,11 +123,11 @@ pub use engine::{limit_error_message, MAX_ERROR_MESSAGE_LEN, MAX_JOB_TYPE_LENGTH
 pub use engine::{BreakCondition, DebugSession};
 #[cfg(feature = "serde")]
 pub use event::decode_event_json;
-#[cfg(feature = "serde")]
-pub use event::{decode_record_json, encode_record_json};
 pub use event::Event;
 pub use event::EventDecodeError;
 pub use event::Record;
+#[cfg(feature = "serde")]
+pub use event::{decode_record_json, encode_record_json};
 pub use event::{
     MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
     MigratedSubscriptionTrigger, SubscriptionMigrationAction,
