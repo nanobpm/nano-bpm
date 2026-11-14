@@ -1120,6 +1120,7 @@ impl ProcessAcc {
                         name: n.name.clone().unwrap_or_default(),
                         kind,
                         io: n.io.clone(),
+                        properties: n.properties.clone(),
                     });
                 }
             }

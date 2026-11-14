@@ -3174,7 +3174,7 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
-                    properties: std::collections::BTreeMap::new(),
+                    properties: tool.properties.clone(),
                 },
             );
         }
@@ -4998,6 +4998,62 @@ mod tests {
             assert!(preserved.contains(&authored_di.diagram_block));
             assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
         }
+    }
+
+    #[test]
+    fn adhoc_catalog_leaf_tools_round_trip_zeebe_properties() {
+        // PR #1586 review: a `zeebe:properties` block on a PRUNED ad-hoc leaf
+        // tool (service task AND call activity) must survive edit/layout
+        // re-emission — the catalog retains it and the restorer re-attaches it.
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="external"/>
+        <zeebe:taskDefinition type="agent-worker"/>
+        <zeebe:adHoc outputCollection="results" outputElement="= result"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:serviceTask id="Lookup">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="lookup"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="svc"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:callActivity id="CallSpecialist">
+        <bpmn:extensionElements>
+          <zeebe:calledElement processId="child"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="call"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:callActivity>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let original = parse_bpmn(source).expect("valid ad-hoc model").remove(0);
+        for (id, hint) in [("Lookup", "svc"), ("CallSpecialist", "call")] {
+            let tool = original.adhoc[0]
+                .tools
+                .iter()
+                .find(|t| t.element_id == id)
+                .expect("tool in the catalog");
+            assert_eq!(
+                tool.properties
+                    .get("io.camunda.tool:hint")
+                    .map(String::as_str),
+                Some(hint),
+                "catalog must retain {id}'s zeebe:properties"
+            );
+        }
+        let emitted = definition_to_xml(&original);
+        let restored = parse_bpmn(&emitted).expect("re-parse").remove(0);
+        assert_eq!(restored.adhoc, original.adhoc, "emitted:\n{emitted}");
     }
 
     #[test]

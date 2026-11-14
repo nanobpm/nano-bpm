@@ -104,8 +104,13 @@ fn not_implemented(tool: &str) -> Value {
 /// integral *representations* serde_json stores as floats (`3.0`, `3e0`): those
 /// are accepted when finite, in the `u64` range, and exactly integral — while a
 /// genuinely fractional value (`3.5`) or a negative one stays rejected. The
-/// float upper bound is **exclusive**: `u64::MAX as f64` rounds up to 2^64,
-/// which `as u64` would silently saturate to a different key.
+/// float upper bound is **exclusive** and is 2^53: at or above it an `f64`
+/// no longer represents every integer, so the authored literal (e.g.
+/// `9007199254740993.0` or `9007199254740992.5`) may already have rounded to a
+/// *different* key — those must be sent as an exact integer or string.
+/// 2^53 — the first integer above which `f64` loses integer exactness.
+const MAX_EXACT_F64_KEY: f64 = 9_007_199_254_740_992.0;
+
 pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
     args.get(camel)
         .and_then(|v| {
@@ -113,7 +118,7 @@ pub(super) fn arg_key(args: &Value, camel: &str) -> Result<String, Value> {
                 .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                 .or_else(|| {
                     v.as_f64().and_then(|f| {
-                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64)
+                        (f.fract() == 0.0 && (0.0..MAX_EXACT_F64_KEY).contains(&f))
                             .then_some(f as u64)
                     })
                 })
@@ -375,8 +380,11 @@ async fn assign_user_task(server: &ServerImpl, args: Value) -> Value {
         }
     };
     if let Some(opts) = opts {
-        if let Some(action) = opts.get("action") {
-            body_json["action"] = action.clone();
+        // The shared REST/engine assignment path does not carry a custom
+        // `action` into the task events yet: fail closed rather than accept
+        // and silently drop it (both assign and unassign branches).
+        if opts.get("action").is_some_and(|a| !a.is_null()) {
+            return unsupported_action("assignmentOptions");
         }
         if let Some(allow) = opts.get("allowOverride") {
             body_json["allowOverride"] = allow.clone();
@@ -567,6 +575,15 @@ pub(super) fn translate_date_ranges(filter: &mut Value) -> Result<(), Value> {
     Ok(())
 }
 
+/// 400 for a custom `action` the shared user-task implementation cannot
+/// record yet (fail closed — never accept-and-drop event metadata).
+fn unsupported_action(container: &str) -> Value {
+    tool_error_result(
+        &format!("`{container}.action` is not supported by this Nano gateway yet."),
+        400,
+    )
+}
+
 /// Build the user-task completion body from the flat MCP arguments. Camunda's
 /// `completeUserTask` nests `variables`/`action` under `completionOptions`;
 /// the REST `UserTaskCompletionRequest` expects them at the top level.
@@ -584,6 +601,11 @@ fn completion_body(args: &Value) -> Result<Option<models::UserTaskCompletionRequ
             "`completionOptions` must be an object",
             400,
         ));
+    }
+    // Completion does not carry a custom `action` into the events yet: reject
+    // it instead of completing the task and silently dropping it.
+    if opts.get("action").is_some_and(|a| !a.is_null()) {
+        return Err(unsupported_action("completionOptions"));
     }
     serde_json::from_value(opts.clone())
         .map_err(|e| tool_error_result(&format!("Invalid `completionOptions`: {e}."), 400))

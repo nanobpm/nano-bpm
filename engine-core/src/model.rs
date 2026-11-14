@@ -1325,6 +1325,12 @@ pub struct AdHocTool {
     /// mappings apply on activation, output mappings on completion.
     #[cfg_attr(feature = "serde", serde(default))]
     pub io: IoMapping,
+    /// The tool's own `zeebe:properties` (empty if none). Retained on the
+    /// catalog for the same reason as `io`: the pruned tool element is gone
+    /// from the executable graph, so a re-emitter (processos edit/layout)
+    /// restores them from here instead of silently dropping them.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// The retained metadata + tool catalog of one `adHocSubProcess`.

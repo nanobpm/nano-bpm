@@ -945,6 +945,22 @@ mod tests {
                 "{args}"
             );
         }
+        // Largest exactly-representable float key still accepted; exact
+        // integer / string forms above 2^53 keep working.
+        assert_eq!(
+            cluster_tools::arg_key(&json!({ "k": 9007199254740991.0_f64 }), "k").ok(),
+            Some("9007199254740991".to_string())
+        );
+        for args in [
+            json!({ "k": 9007199254740993_u64 }),
+            json!({ "k": "9007199254740993" }),
+        ] {
+            assert_eq!(
+                cluster_tools::arg_key(&args, "k").ok(),
+                Some("9007199254740993".to_string()),
+                "{args}"
+            );
+        }
         for args in [
             json!({ "k": 3.5 }),
             json!({ "k": -3.0 }),
@@ -952,6 +968,11 @@ mod tests {
             // `u64::MAX as f64` rounds to 2^64: out of range, must not
             // saturate to a different key.
             json!({ "k": 18446744073709551616.0_f64 }),
+            // At/above 2^53 an f64 may already have rounded the authored
+            // literal to a different key: reject rather than mis-target.
+            json!({ "k": 9007199254740992.0_f64 }),
+            json!({ "k": 9007199254740993.0_f64 }),
+            json!({ "k": 9007199254740992.5_f64 }),
         ] {
             assert!(cluster_tools::arg_key(&args, "k").is_err(), "{args}");
         }
@@ -1033,7 +1054,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         let task_key = task_key.expect("user task projected");
-        for opts in [json!([]), json!("x"), json!(3)] {
+        // A custom `action` cannot be recorded yet: rejected, task left open.
+        for opts in [
+            json!([]),
+            json!("x"),
+            json!(3),
+            json!({ "action": "approve" }),
+        ] {
             let r = call(
                 &server,
                 "completeUserTask",
@@ -1298,6 +1325,10 @@ mod tests {
             json!({ "userTaskKey": task_key, "assignee": null, "assignmentOptions": [] }),
             json!({ "userTaskKey": task_key, "assignmentOptions": "x" }),
             json!({ "userTaskKey": task_key, "assignmentOptions": { "allowOverride": "no" } }),
+            // A custom `action` is not recorded yet: fail closed on both
+            // the assign and unassign paths.
+            json!({ "userTaskKey": task_key, "assignee": "bob", "assignmentOptions": { "action": "claim" } }),
+            json!({ "userTaskKey": task_key, "assignee": null, "assignmentOptions": { "action": "drop" } }),
         ] {
             let r = call(&server, "assignUserTask", bad.clone()).await;
             assert_eq!(r["isError"].as_bool(), Some(true), "{bad}: {r}");
