@@ -9608,6 +9608,18 @@ impl ServerImpl {
         }
     }
 
+    /// Routes follow-ups of a routed apply that committed AFTER its observer
+    /// gave up (#1582). A plain fn returning a boxed `dyn Send` future (not an
+    /// `async fn`) so the recursion pump → apply funnel → pump has a concrete
+    /// type and does not form an opaque-type cycle.
+    fn route_late_follow_ups(
+        &self,
+        events: Vec<Event>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let server = self.clone();
+        Box::pin(async move { server.drive_subscription_routing(events).await })
+    }
+
     /// The routing pump body behind [`Self::drive_subscription_routing`]; only
     /// ever run inside that detached task.
     async fn drive_subscription_routing_now(&self, events: Vec<Event>) {
@@ -9643,7 +9655,10 @@ impl ServerImpl {
                 RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
                 // Led by a peer (or a leadership gap): forward to the current
                 // writer, re-resolved on every attempt.
-                RoutedApply::NotHere => self.forward_route_subscription(target, &event).await,
+                RoutedApply::NotHere => {
+                    self.forward_route_subscription(target, &event, attempt)
+                        .await
+                }
             };
             match outcome {
                 RouteAttempt::Delivered => return Vec::new(),
@@ -9775,6 +9790,54 @@ impl ServerImpl {
             .unwrap_or_else(|| topology.owner_of(p))
     }
 
+    /// The node a routed-forward `attempt` addresses for partition `p` (#1582).
+    /// When this node hosts a replica of `p` it knows the elected leader, so that
+    /// is used ([`Self::partition_write_node`]). A source hosting NO replica of
+    /// `p` has no leadership view and would otherwise only ever retry the static
+    /// owner — a dead or former leader after failover — so it rotates through
+    /// `p`'s replica set across attempts instead: a non-leader replica answers
+    /// `503` and the next attempt tries the next replica, reaching the
+    /// replacement leader within one pass of the set.
+    fn route_forward_candidate(&self, p: u64, attempt: u32) -> u32 {
+        if self.raft.is_empty() || self.raft.get(p).is_some() {
+            return self.partition_write_node(p);
+        }
+        let topology = self.engine.topology();
+        Self::rotate_replica(&topology.replicas_of(p), topology.node_id, attempt)
+            .unwrap_or_else(|| topology.owner_of(p))
+    }
+
+    /// Pure rotation behind [`Self::route_forward_candidate`]: the
+    /// `attempt`-th replica (mod the set), skipping `self_id`.
+    fn rotate_replica(replicas: &[u32], self_id: u32, attempt: u32) -> Option<u32> {
+        let others: Vec<u32> = replicas.iter().copied().filter(|n| *n != self_id).collect();
+        if others.is_empty() {
+            return None;
+        }
+        others.get(attempt as usize % others.len()).copied()
+    }
+
+    /// Whether a routed command dedups on a source-minted key, so a retry after
+    /// an unobserved commit is an exactly-once no-op (#1568). Only such
+    /// commands may have their proposal observation time out (#1582).
+    fn routed_command_is_idempotent(command: &Command) -> bool {
+        !matches!(command, Command::CorrelateMessage { .. })
+    }
+
+    /// Classifies a Raft proposal result into a [`RoutedApply`].
+    fn classify_proposal(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> RoutedApply {
+        match result {
+            Ok(item) => match item.error {
+                Some((status, message)) => RoutedApply::Failed(status, message),
+                None => RoutedApply::Applied(item.events),
+            },
+            Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
+            Err(other) => RoutedApply::Failed(500, other.to_string()),
+        }
+    }
+
     /// THE single apply funnel for the cross-partition routing pump
     /// (`correlate_message_everywhere`, `drive_subscription_routing`): applies a
     /// routing-computed `command` on partition `target` — the partition-indexed
@@ -9806,18 +9869,35 @@ impl ServerImpl {
             // key the apply dedups on (#1568), so a retry after the write in
             // fact committed is an exactly-once no-op — timing out can never
             // discard the follow-ups of a later-committed apply.
-            let proposal =
-                tokio::spawn(async move { part.propose_result(command, now_millis()).await });
-            return match tokio::time::timeout(ROUTE_ATTEMPT_OBSERVE, proposal).await {
-                Ok(joined) => match joined {
-                    Ok(Ok(item)) => match item.error {
-                        Some((status, message)) => RoutedApply::Failed(status, message),
-                        None => RoutedApply::Applied(item.events),
-                    },
-                    Ok(Err(crate::raft::ProposeError::Leader)) => RoutedApply::NotHere,
-                    Ok(Err(other)) => RoutedApply::Failed(500, other.to_string()),
-                    Err(join) => RoutedApply::Failed(500, format!("raft proposal task: {join}")),
-                },
+            // An unkeyed publish (`CorrelateMessage`) has no dedup: a retry
+            // after a late commit would mint a second message key / start a
+            // duplicate instance, so its outcome must be observed, never
+            // timed out into a retryable non-delivery (#1582).
+            if !Self::routed_command_is_idempotent(&command) {
+                return Self::classify_proposal(part.propose_result(command, now_millis()).await);
+            }
+            // Exactly ONE routing owner for the produced follow-ups: the result
+            // is handed back over a oneshot; if the observer already gave up
+            // (timeout dropped the receiver) the send fails and the detached
+            // task routes the late-committed follow-ups itself, so a late
+            // commit never loses its downstream routing.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let result = part.propose_result(command, now_millis()).await;
+                if let Err(Ok(item)) = tx.send(result)
+                    && item.error.is_none()
+                    && Self::has_routable_subscription_events(&item.events)
+                {
+                    server
+                        .route_late_follow_ups(Self::routable_events(&item.events))
+                        .await;
+                    server.signal_jobs_available();
+                }
+            });
+            return match tokio::time::timeout(ROUTE_ATTEMPT_OBSERVE, rx).await {
+                Ok(Ok(result)) => Self::classify_proposal(result),
+                Ok(Err(_)) => RoutedApply::Failed(500, "raft proposal task ended".into()),
                 Err(_) => RoutedApply::Failed(
                     503,
                     format!(
@@ -9860,8 +9940,9 @@ impl ServerImpl {
         &self,
         target_partition: u64,
         event: &Event,
+        attempt: u32,
     ) -> RouteAttempt {
-        let owner = self.partition_write_node(target_partition);
+        let owner = self.route_forward_candidate(target_partition, attempt);
         if owner == self.engine.topology().node_id {
             // No peer to hand it to: this node is the best-known writer but does
             // not lead the partition right now (a leadership gap). Never apply
@@ -47289,6 +47370,52 @@ mod subscription_placement_tests {
             closed,
             "the detached task routed the close after the caller was cancelled"
         );
+    }
+
+    /// #1582: a source with no replica of the target rotates its forwards
+    /// through the target's replica set (never pinned to the static owner,
+    /// which may be a dead former leader), skipping itself.
+    #[test]
+    fn forward_candidate_rotates_through_the_replica_set() {
+        let picks: Vec<u32> = (0..6)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 0, a))
+            .collect();
+        assert_eq!(picks, vec![1, 2, 3, 1, 2, 3]);
+        // Self is skipped (a replica host normally uses its leader view, but
+        // the rotation itself must never address this node).
+        let picks: Vec<u32> = (0..4)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 2, a))
+            .collect();
+        assert_eq!(picks, vec![1, 3, 1, 3]);
+        assert_eq!(ServerImpl::rotate_replica(&[2], 2, 0), None);
+    }
+
+    /// #1582: only keyed (deduped) routed commands may have their proposal
+    /// observation time out; an unkeyed publish must not, or a late commit
+    /// plus a republish would create duplicate message-start instances.
+    #[test]
+    fn only_keyed_routed_commands_are_observation_bounded() {
+        let publish = Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: Default::default(),
+            business_id: None,
+        };
+        assert!(!ServerImpl::routed_command_is_idempotent(&publish));
+        let num_partitions = 4;
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: Default::default(),
+        };
+        let (_, routed) =
+            ServerImpl::route_event(&opening, num_partitions).expect("opening is routable");
+        assert!(ServerImpl::routed_command_is_idempotent(&routed));
     }
 
     /// #1582: transient non-delivery (5xx, the 503 leader race, transport

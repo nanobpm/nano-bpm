@@ -341,18 +341,22 @@ impl PeerLink {
             corr,
         };
 
-        // Queue admission is part of the attempt's budget: a stalled socket
-        // whose writer queue never drains fails the attempt with `Timeout`
-        // (not an indefinite wait), and the guard above cleans up the entry.
-        let sent = match tokio::time::timeout(timeout, out.send(Message::Text(txt.into()))).await {
-            Ok(sent) => sent,
-            Err(_) => return Err(PeerError::Timeout),
-        };
+        // ONE absolute deadline covers queue admission AND the response: a
+        // stalled socket whose writer queue never drains fails with `Timeout`,
+        // and slow admission eats into (never extends) the response budget, so
+        // an attempt never exceeds `timeout` in total. The guard above cleans
+        // up the entry either way.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let sent =
+            match tokio::time::timeout_at(deadline, out.send(Message::Text(txt.into()))).await {
+                Ok(sent) => sent,
+                Err(_) => return Err(PeerError::Timeout),
+            };
         if sent.is_err() {
             return Err(PeerError::Closed);
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(PeerError::Closed),
             Err(_) => Err(PeerError::Timeout),
@@ -1491,6 +1495,49 @@ mod tests {
             link.pending_app.lock().await.is_empty(),
             "aborting the parked request cleans up its entry too"
         );
+    }
+
+    #[tokio::test]
+    async fn late_admission_does_not_extend_the_response_deadline() {
+        // Capacity 1, pre-filled: admission blocks until a slot drains at ~80%
+        // of the deadline; the peer then never answers. One absolute deadline
+        // means the attempt ends at ~400ms; separate per-phase budgets would
+        // run ~750ms (350ms admission + a fresh 400ms response wait).
+        let (out_app, mut out_app_rx) = mpsc::channel::<Message>(1);
+        let (out_raft, _out_raft_rx) = mpsc::channel::<Message>(1);
+        out_app
+            .send(Message::Text("filler".into()))
+            .await
+            .expect("prefill");
+        let link = PeerLink {
+            out_app,
+            pending_app: Arc::new(Mutex::new(HashMap::new())),
+            out_raft,
+            pending_raft: Arc::new(Mutex::new(HashMap::new())),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        let frame = |corr| ClientFrame::RouteSubscription {
+            corr,
+            event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+        };
+        let timeout = Duration::from_millis(400);
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let _ = out_app_rx.recv().await;
+            // Keep the receiver alive and never answer.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(out_app_rx);
+        });
+        let started = tokio::time::Instant::now();
+        let res = link.request_within(timeout, frame).await;
+        let elapsed = started.elapsed();
+        assert!(matches!(res, Err(PeerError::Timeout)), "got {res:?}");
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "admission + response must share ONE deadline, took {elapsed:?}"
+        );
+        drain.abort();
     }
 
     #[test]
