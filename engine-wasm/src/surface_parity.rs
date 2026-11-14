@@ -219,8 +219,7 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         // orphan (#1384), never by a worker/JS caller — there is no public
         // "quarantine" API to surface.
         Command::QuarantineOffheapOrphan { .. }
-        | Command::QuarantineColdOrphan { .. }
-        | Command::ReissueOrphanStamp { .. } => Surface::NotSurfaced {
+        | Command::QuarantineColdOrphan { .. } => Surface::NotSurfaced {
             reason: "host-internal durability command raised by the storage layer, not a public worker/JS API",
         },
     }

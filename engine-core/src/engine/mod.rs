@@ -5700,17 +5700,6 @@ impl Engine {
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
             }
-            Command::ReissueOrphanStamp { .. } => {
-                // No engine-state effect (#1587 review): the superseded report
-                // is re-drained from the leader journal's backlog when its
-                // `OrphanStampSuperseded` event applies (the arm above), and
-                // the replication layer re-proposes the stamped quarantine from
-                // there. This command exists so that reissue is itself
-                // journaled (replica-deterministic) and so the journal can
-                // settle the report if the loss has already been incidented or
-                // the instance went terminal in the meantime — both read from
-                // replicated state at proposal time, not here.
-            }
         }
 
         Ok((log, queue))

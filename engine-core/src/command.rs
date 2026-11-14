@@ -771,34 +771,6 @@ pub enum Command {
     /// active `VariablesLost` incident already names the instance. Additive
     /// brand-new variant — old journals never carry it.
     QuarantineColdOrphan { instance_key: Key },
-    /// Re-stamp and re-propose a still-pending orphan report whose stamped
-    /// quarantine was superseded (#1587 review): unrelated key-minting work
-    /// advanced the replicated allocator between the leader stamping the
-    /// report and the proposal committing, so the proposal's loss-episode id
-    /// no longer named the incident key a fresh proposal would mint and the
-    /// apply gate could not apply it. The applying replica emitted
-    /// [`crate::Event::OrphanStampSuperseded`]; the leader's journal (which
-    /// watches applied events) re-enqueued the report and proposes this
-    /// command. Applying it resolves a FRESH stamp from the leader's
-    /// now-current replicated state — so the re-proposal mints its episode at
-    /// the allocator's current position — and proposes the stamped quarantine
-    /// again. It never mutates engine state directly: a live tombstone (the
-    /// report was already quarantined by a concurrent proposal) makes it a
-    /// deterministic no-op, and a `None` re-stamp (the loss is already
-    /// incidented or the instance went terminal) settles the report instead.
-    /// Additive brand-new variant — old journals never carry it.
-    ReissueOrphanStamp {
-        instance_key: Key,
-        /// The orphan tier of the original report, re-used for the re-stamp.
-        /// `None` for a frame written before this field existed: the re-stamp
-        /// then falls back to residency (resident → [`OrphanKind::Resident`],
-        /// absent → [`OrphanKind::Cold`]).
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        kind: Option<OrphanKind>,
-    },
 }
 
 /// Which off-heap tier lost an orphan's payload (#1447).
@@ -1030,7 +1002,6 @@ impl Command {
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
             Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
             Command::QuarantineColdOrphan { .. } => "quarantine_cold_orphan",
-            Command::ReissueOrphanStamp { .. } => "reissue_orphan_stamp",
         }
     }
 
