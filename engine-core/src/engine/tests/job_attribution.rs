@@ -310,7 +310,6 @@ fn a_timeout_update_between_stamping_and_completion_wins_over_the_stamp() {
             job_key,
             lease_token: Some("lease-1".to_string()),
             timeout: 99_000,
-            operation_reference: None,
         })
         .unwrap();
     let updated = leader.state().jobs[&job_key].deadline;
@@ -381,7 +380,6 @@ fn an_unleased_durable_activation_restates_its_replicated_deadline() {
         job_key,
         lease_token: None,
         timeout: 99_000,
-        operation_reference: None,
     };
     leader.apply_command_at(update.clone(), 0).unwrap();
     follower.apply_command_at(update, 0).unwrap();

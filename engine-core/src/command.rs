@@ -328,9 +328,8 @@ pub enum Command {
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
     /// no-retries incident before resolving that incident. Does not by itself
-    /// unblock the job — the incident must still be resolved. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// unblock the job — the incident must still be resolved. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobRetries {
         job_key: Key,
         #[cfg_attr(
@@ -339,11 +338,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         retries: i32,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Reset the activation lock of a currently-activated job to `now + timeout`.
     /// Signed durations may shorten it; zero or negative values make the lock
@@ -352,9 +346,8 @@ pub enum Command {
     /// legitimately holding a long-running job open past its original lock:
     /// without it the lock simply expires (`JobLockExpired`) and the job is
     /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
-    /// that is not currently locked returns `JobUpdateInvalid`. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// that is not currently locked returns `JobUpdateInvalid`. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobTimeout {
         job_key: Key,
         #[cfg_attr(
@@ -363,11 +356,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         timeout: i64,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Atomically validate and update job properties. An empty changeset still
     /// validates job state and a supplied lease token.
@@ -378,8 +366,6 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         timeout: Option<i64>,
         #[cfg_attr(feature = "serde", serde(default))]
-        operation_reference: Option<i64>,
-        #[cfg_attr(feature = "serde", serde(default))]
         lease_token: Option<String>,
     },
     /// Resolve an open incident by retrying the work that failed. A job-incident
@@ -387,11 +373,9 @@ pub enum Command {
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
     /// current variables; an uncaught-error incident re-creates the service-task
     /// job. If the retry fails again a fresh incident is raised. The resolved
-    /// record is retained for audit, tagged with `operation_reference` if given.
-    ResolveIncident {
-        incident_key: Key,
-        operation_reference: Option<i64>,
-    },
+    /// record is retained for audit, tagged with the command's generic
+    /// `operationReference` (#1556) if given.
+    ResolveIncident { incident_key: Key },
     /// Merge variables into a scope, typically to correct data before resolving
     /// an incident. `scope_key` may be a process instance key or an element
     /// instance key; it resolves to the owning instance's variable scope. When
@@ -1312,21 +1296,6 @@ impl Command {
             job_key,
             lease_token: None,
             retries,
-            operation_reference: None,
-        }
-    }
-
-    /// `UpdateJobRetries` tagged with a caller audit `operation_reference`.
-    pub fn update_job_retries_with_ref(
-        job_key: Key,
-        retries: i32,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobRetries {
-            job_key,
-            lease_token: None,
-            retries,
-            operation_reference,
         }
     }
 
@@ -1336,40 +1305,12 @@ impl Command {
             job_key,
             lease_token: None,
             timeout,
-            operation_reference: None,
         }
     }
 
-    /// `UpdateJobTimeout` tagged with a caller audit `operation_reference`.
-    pub fn update_job_timeout_with_ref(
-        job_key: Key,
-        timeout: i64,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobTimeout {
-            job_key,
-            lease_token: None,
-            timeout,
-            operation_reference,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` with no operation
-    /// reference.
+    /// Convenience constructor for a `ResolveIncident`.
     pub fn resolve_incident(incident_key: Key) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` tagged with an operation
-    /// reference for audit.
-    pub fn resolve_incident_with(incident_key: Key, operation_reference: i64) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: Some(operation_reference),
-        }
+        Command::ResolveIncident { incident_key }
     }
 
     /// Convenience constructor for a propagating (`local = false`) `SetVariables`.

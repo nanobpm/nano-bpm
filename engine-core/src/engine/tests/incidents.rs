@@ -984,9 +984,10 @@ fn should_retain_a_resolved_incident_as_an_audit_record() {
 
     // when resolved with an operation reference at a known instant
     engine
-        .apply_command_at(
-            Command::resolve_incident_with(incident_key, 4242),
+        .apply_command_records_at(
+            Command::resolve_incident(incident_key),
             1_700_000_000_500,
+            Some(4242),
         )
         .unwrap();
 
