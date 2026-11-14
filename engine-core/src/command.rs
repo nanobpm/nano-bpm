@@ -808,6 +808,22 @@ pub struct OrphanIncidentStamp {
     /// epoch check and keeps the pre-field behaviour (fail open).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
     pub terminal_epoch: u64,
+    /// The target instance's own replicated terminal epoch
+    /// ([`crate::state::types::ProcessInstance::terminated_epoch`]) observed by
+    /// the leader at stamp time (#1574 review, review 5899722557), recovered
+    /// from the resident record OR the replicated terminal ring (so a leader
+    /// that already evicted its terminal shell still proves it). This is the
+    /// target-specific lifecycle-validity record the apply gate reads: the
+    /// bounded `recently_terminated` ring cannot distinguish "cold but LIVE"
+    /// from "terminated and evicted" once unrelated completions fill it, and the
+    /// global epoch distance counts EVERY terminal transition — so it misreads
+    /// an unrelated completion as the target's termination (suppressing a live
+    /// orphan). `> 0` means the leader observed the target already terminal at
+    /// stamp time — a stale proposal the gate no-ops, identically on every
+    /// replica. `0` = the target was live (or unprovable) at stamp time.
+    /// Additive: `0` for a stamp minted before this field existed (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub target_terminated_epoch: u64,
 }
 
 #[cfg(feature = "serde")]
@@ -1632,6 +1648,7 @@ mod kind_tests {
                 element_id: "e".repeat(10_000),
                 reason: "r".repeat(20_000),
                 terminal_epoch: 0,
+                target_terminated_epoch: 0,
             }),
         }
         .approx_bytes();

@@ -587,6 +587,19 @@ pub struct ProcessInstance {
     #[cfg_attr(feature = "serde", serde(default))]
     pub process_definition_key: Key,
     pub state: ProcessInstanceState,
+    /// The replicated terminal epoch ([`State::terminal_epoch`]) at which this
+    /// instance reached a terminal state (`Completed` / `Terminated`), recorded
+    /// by [`State::note_terminated`] in the same apply arm that set `state`.
+    /// `0` while the instance is live (and for instances written before this
+    /// field existed, via `serde(default)`). This is the **target-specific**
+    /// replicated lifecycle-validity stamp the orphan-quarantine gate reads
+    /// (#1574 review, review 5899722557): unlike the global epoch distance, it
+    /// names THIS instance's terminal transition, so an unrelated instance
+    /// completing between a stamp and its commitment is never misread as the
+    /// target's termination. Replicated-only (derived in `apply_event`), so
+    /// every replica records the identical value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminated_epoch: u64,
     /// When this instance is currently `SUSPENDED`, the millisecond-since-epoch
     /// instant it most recently entered suspension (the `suspendedDate` surfaced
     /// on the REST result). `None` whenever the instance is not currently
@@ -2158,13 +2171,41 @@ pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
 
 impl State {
     /// Records `instance_key` as terminal in the bounded replicated ring and
-    /// advances the replicated terminal epoch.
+    /// advances the replicated terminal epoch. Also stamps the instance's own
+    /// [`ProcessInstance::terminated_epoch`] with the new epoch — the
+    /// target-specific lifecycle-validity record the orphan-quarantine gate
+    /// reads (#1574 review). The epoch is advanced FIRST so the instance records
+    /// the value its own terminal transition produced.
     pub(crate) fn note_terminated(&mut self, instance_key: Key) {
         if self.recently_terminated.len() >= RECENTLY_TERMINATED_CAP {
             self.recently_terminated.pop_front();
         }
         self.recently_terminated.push_back(instance_key);
         self.terminal_epoch += 1;
+        if let Some(instance) = self.instances.get_mut(&instance_key) {
+            instance.terminated_epoch = self.terminal_epoch;
+        }
+    }
+
+    /// The replicated terminal epoch at which `instance_key` reached a terminal
+    /// state, read from whichever replicated record still holds it: the resident
+    /// instance's own [`ProcessInstance::terminated_epoch`], or — for an
+    /// instance already evicted from hot state — its position in the bounded
+    /// [`recently_terminated`](Self::recently_terminated) ring (the oldest
+    /// retained entry is `terminal_epoch - len + 1`, so index `i` is epoch
+    /// `terminal_epoch - len + 1 + i`). `None` when no replicated record can
+    /// prove the instance terminated (live, or terminated so long ago the ring
+    /// has wrapped past it). Replicated-only, so every replica computes the
+    /// identical value for an instance it can still see.
+    pub(crate) fn terminated_epoch_of(&self, instance_key: Key) -> Option<u64> {
+        if let Some(instance) = self.instances.get(&instance_key) {
+            return (instance.terminated_epoch > 0).then_some(instance.terminated_epoch);
+        }
+        let len = self.recently_terminated.len() as u64;
+        self.recently_terminated
+            .iter()
+            .position(|k| *k == instance_key)
+            .map(|i| self.terminal_epoch - len + 1 + i as u64)
     }
 }
 

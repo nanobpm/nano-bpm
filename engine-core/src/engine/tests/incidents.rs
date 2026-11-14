@@ -4162,6 +4162,7 @@ fn stamped_orphan_quarantine_is_residency_independent() {
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }
     );
     let command = Command::QuarantineOffheapOrphan {
@@ -4250,6 +4251,7 @@ fn quarantine_tombstone_replays_identically() {
                         element_id: "orphan".into(),
                         reason: "variables lost: spill row missing".into(),
                         terminal_epoch: 0,
+                        target_terminated_epoch: 0,
                     }),
                 },
                 50,
@@ -4281,6 +4283,7 @@ fn quarantine_tombstone_replays_identically() {
                     element_id: "orphan".into(),
                     reason: "variables lost: spill row missing".into(),
                     terminal_epoch: 0,
+                    target_terminated_epoch: 0,
                 }),
             },
             51,
@@ -4320,6 +4323,7 @@ fn quarantine_offheap_orphan_stamp_is_serde_additive() {
             element_id: String::new(),
             reason: "r".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }),
     };
     let json = serde_json::to_string(&stamped).unwrap();
@@ -4358,6 +4362,7 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }),
     };
     let first = engine.apply_command_at(mk(), 50).unwrap();
@@ -4432,6 +4437,7 @@ fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }),
     };
     let boot = || {
@@ -4527,6 +4533,7 @@ fn quarantine_dedup_is_episode_scoped_across_resolution() {
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }),
     };
 
@@ -4613,6 +4620,7 @@ fn stamped(key: Key) -> Command {
             element_id: "orphan".into(),
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
+            target_terminated_epoch: 0,
         }),
     }
 }
@@ -4781,6 +4789,7 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
                     element_id: "orphan".into(),
                     reason: "variables lost: spill row missing".into(),
                     terminal_epoch: 0,
+                    target_terminated_epoch: 0,
                 }),
             },
             50,
@@ -4806,6 +4815,7 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
                     element_id: String::new(),
                     reason: "variables lost: cold instance row missing".into(),
                     terminal_epoch: 0,
+                    target_terminated_epoch: 0,
                 }),
             },
             51,
@@ -5028,5 +5038,205 @@ fn stamped_orphan_quarantine_with_a_stale_stamp_still_raises() {
             .count(),
         1,
         "a stale stamp (epoch beyond the ring's reach) still raises: {on_a:?}"
+    );
+}
+
+// #1574 review (review 5899722557): the epoch-distance gate must not suppress a
+// LIVE orphan when an UNRELATED instance terminates between stamping and
+// commitment. The global `terminal_epoch` counts every terminal transition, so
+// a stamp at epoch 1 followed by one unrelated completion (epoch 1 -> 2) yields
+// `distance = 1`, within the ring's coverage — the old gate read that as "the
+// target terminated after the stamp" and no-opped, permanently losing a live
+// orphan report (the journal settles the no-op; discovery already cleared the
+// spill flag). The gate must decide from the TARGET's replicated lifecycle
+// validity, not the global epoch distance: the target never terminated, so the
+// incident must be raised.
+#[test]
+fn stamped_orphan_quarantine_after_an_unrelated_completion_still_raises() {
+    use crate::OrphanKind;
+    // The orphan process parks on a service task (never completes), so its
+    // instance stays LIVE for the whole scenario.
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut resident, key) = boot();
+    let (mut cold, _) = boot();
+
+    // An unrelated instance completes BEFORE the stamp, so the leader stamps at
+    // terminal_epoch = 1 (the review's exact scenario: "stamped at
+    // terminal_epoch = 1"). A start->end process completes in its create's RTC
+    // drain.
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut resident, &mut cold] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 3)
+            .unwrap();
+        replica
+            .apply_command_at(Command::create_instance("filler"), 4)
+            .unwrap();
+    }
+
+    // The leader stamps the LIVE orphan at terminal_epoch = 1.
+    let stamp = resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("a live instance stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+
+    // A SECOND unrelated instance completes before the proposal commits,
+    // advancing the global terminal epoch 1 -> 2 (distance = 1, within the
+    // ring's coverage — the false positive the review cites).
+    for replica in [&mut resident, &mut cold] {
+        replica
+            .apply_command_at(Command::create_instance("filler"), 5)
+            .unwrap();
+    }
+    // Replica-local divergence: one replica cold-tiers the (still live) orphan.
+    assert!(cold.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+    assert!(
+        resident.instance(key).is_some(),
+        "the other replica retains it"
+    );
+
+    // The proposal commits on both. The orphan is LIVE (it never terminated), so
+    // BOTH replicas must raise the incident — the unrelated completion must not
+    // read as the target's termination. The gate is target-specific: it no-ops
+    // only when the TARGET is provably terminal (its own `terminated_epoch`, the
+    // ring, or the stamped target epoch), never on the global epoch distance, so
+    // an unrelated completion advancing the epoch is correctly ignored.
+    let on_resident = resident.apply_command_at(command.clone(), 50).unwrap();
+    let on_cold = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(
+        on_resident, on_cold,
+        "resident and cold replicas decide identically (target-specific gate)"
+    );
+    assert_eq!(
+        on_resident
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a live orphan is NOT suppressed by an unrelated completion: {on_resident:?}"
+    );
+}
+
+// #1574 review (review 5899722557), defect-class guard: the cold/evicted path
+// must decide IDENTICALLY to the resident path when a leader-stamped orphan's
+// target terminated BEFORE the stamp but the leader had already evicted its
+// shell (so the stamp's `target_terminated_epoch` is recovered from the ring),
+// and the ring then wraps past it. The resident replica no-ops on the target's
+// own `terminated_epoch`; the cold replica must reach the same no-op from the
+// stamped target epoch — never raise while the resident stays silent, which
+// would split the journals (incident + key mint on one, none on the other).
+#[test]
+fn stamped_orphan_quarantine_cold_path_matches_resident_after_wrap() {
+    use crate::OrphanKind;
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut leader, key) = boot();
+    let (mut resident, _) = boot();
+    let (mut evicted, _) = boot();
+    // The target terminates on every replica; the leader then evicts its shell
+    // (eviction is replica-local), so it stamps with the target's terminal epoch
+    // recovered from the replicated ring.
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .unwrap();
+    }
+    assert!(
+        leader.evict_instance(key),
+        "leader evicted its terminal shell"
+    );
+    let stamp = leader
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("an evicted (cold-looking) instance still stamps");
+    assert!(
+        stamp.target_terminated_epoch > 0,
+        "the leader recovers the target's terminal epoch from the ring"
+    );
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // The ring wraps past the target's terminal record.
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 4)
+            .unwrap();
+    }
+    let mut clock = 10u64;
+    for _ in 0..crate::state::RECENTLY_TERMINATED_CAP {
+        for replica in [&mut leader, &mut resident, &mut evicted] {
+            replica
+                .apply_command_at(Command::create_instance("filler"), clock)
+                .unwrap();
+        }
+        clock += 1;
+    }
+    // Replica-local divergence: ONE replica evicts the terminal target.
+    assert!(evicted.evict_instance(key));
+    assert!(resident.instance(key).is_some());
+
+    // Both must no-op identically: the resident via its own `terminated_epoch`,
+    // the evicted via the stamped target epoch.
+    let on_resident = resident.apply_command_at(command.clone(), clock).unwrap();
+    let on_evicted = evicted.apply_command_at(command, clock).unwrap();
+    assert_eq!(
+        on_resident, on_evicted,
+        "cold and resident replicas decide identically after the wrap"
+    );
+    assert!(
+        on_evicted
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "no incident on the evicted replica: {on_evicted:?}"
     );
 }

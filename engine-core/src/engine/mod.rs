@@ -5524,49 +5524,37 @@ impl Engine {
                 // Terminal gate (#1574 review, cancellation race): a report
                 // queued before a cancel/complete can commit after it and must
                 // not raise an incident on the finished instance. Decided from
-                // REPLICATED state only, so every replica agrees: a resident
-                // terminal instance, or a key in the replicated
-                // `recently_terminated` ring (which survives replica-local
-                // terminal eviction), is a complete no-op. An absent key NOT in
-                // the ring is live-but-cold on this replica (the cold-orphan
-                // case) and proceeds like the resident live case.
-                let resident_terminal = self.state.instances.get(&instance_key).is_some_and(|i| {
-                    !matches!(
-                        i.state,
-                        ProcessInstanceState::Active | ProcessInstanceState::Suspended
-                    )
-                });
-                if resident_terminal || self.state.recently_terminated.contains(&instance_key) {
-                    return Ok((log, queue));
-                }
-                // Ring-wrap gate (#1574 review, terminal-history eviction): the
-                // ring is BOUNDED, so once more terminal transitions commit
-                // than it holds while this proposal was in flight, an evicted
-                // replica can no longer find the key in it — while a replica
-                // retaining the terminal instance still no-ops via residency
-                // above, splitting the journals (incident + key mint on one,
-                // silence on the other). The stamp's terminal epoch closes it:
-                // the distance to the replica's epoch is replicated state, so
-                // every replica computes it identically.
+                // REPLICATED state only, so every replica agrees. The decision
+                // uses the TARGET's own replicated lifecycle validity, never the
+                // global epoch distance (review 5899722557): the global
+                // `terminal_epoch` counts EVERY terminal transition, so an
+                // unrelated instance completing between the stamp and the
+                // commitment would otherwise be misread as the target's
+                // termination and wrongly suppress a LIVE orphan report.
                 //
-                // - distance 0: no terminal transition committed since the
-                //   stamp — the absent key is live-but-cold; proceed.
-                // - distance within the ring's coverage: every transition
-                //   since the stamp is still in the ring, and this key is not —
-                //   so it terminated BEFORE the stamp (a stale proposal
-                //   re-committed after the instance finished); no-op.
-                // - distance beyond the ring's coverage (or a legacy stamp with
-                //   no epoch): the ring can no longer prove ordering — fail
-                //   OPEN (proceed), the pre-epoch behaviour, so a genuine
-                //   stale-stamp loss is still reported identically everywhere.
-                if stamp.terminal_epoch > 0 {
-                    let distance = self
-                        .state
-                        .terminal_epoch
-                        .saturating_sub(stamp.terminal_epoch);
-                    if distance > 0 && distance <= self.state.recently_terminated.len() as u64 {
-                        return Ok((log, queue));
-                    }
+                // The terminal gate must be REPLICA-UNIFORM: every replica
+                // applies the same committed command, so the decision must be a
+                // pure function of replicated state, never of replica-local
+                // residency. The rule is target-specific (review 5899722557):
+                // no-op iff the TARGET is provably terminal — its own
+                // replicated `terminated_epoch` is set (a resident terminal
+                // instance), or its key is in the replicated terminal ring, or
+                // the leader recovered its terminal epoch into the stamp. The
+                // global epoch DISTANCE is deliberately NOT used: it counts
+                // EVERY terminal transition, so an unrelated instance completing
+                // between the stamp and the commitment would be misread as the
+                // target's termination and wrongly suppress a LIVE orphan
+                // report (the review's finding). A live orphan (no terminal
+                // record anywhere) always raises, identically on every replica.
+                let target_terminated = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.terminated_epoch > 0)
+                    || self.state.recently_terminated.contains(&instance_key)
+                    || stamp.target_terminated_epoch > 0;
+                if target_terminated {
+                    return Ok((log, queue));
                 }
                 if self
                     .state
@@ -7664,6 +7652,14 @@ impl Engine {
             element_id,
             reason: reason.to_string(),
             terminal_epoch: self.state.terminal_epoch,
+            // The target's own terminal epoch at stamp time, read from the
+            // resident record OR the replicated terminal ring (a leader that
+            // already evicted its terminal shell still proves the target's
+            // terminal epoch from the ring). `0` while the target is live (a
+            // resident terminal instance returns `None` above) or so old the
+            // ring has wrapped past it. The cold apply path reads it to detect
+            // the target terminating after the stamp.
+            target_terminated_epoch: self.state.terminated_epoch_of(instance_key).unwrap_or(0),
         })
     }
 

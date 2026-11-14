@@ -48,7 +48,7 @@
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState,
+    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState, Key,
     ProcessBuilder, SNAPSHOT_FORMAT_VERSION,
 };
 
@@ -151,6 +151,25 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
                 _ => None,
             })
             .collect();
+        // #1574 review (review 5899722557) stamps each terminal instance's own
+        // `terminated_epoch` with the epoch its terminal transition produced
+        // (the target-specific lifecycle-validity record). Derive it from the
+        // journal BEFORE the journal is consumed by replay: the Nth terminal
+        // event (1-based) sets its instance's `terminated_epoch = N`. Live
+        // instances keep `0`.
+        let mut terminal_epoch_by_instance: std::collections::HashMap<Key, u64> =
+            std::collections::HashMap::new();
+        {
+            let mut epoch = 0u64;
+            for event in &journal {
+                if let Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } = event
+                {
+                    epoch += 1;
+                    terminal_epoch_by_instance.insert(*instance_key, epoch);
+                }
+            }
+        }
         let replayed = Engine::replay_partition(expected.partition_id, journal);
 
         // Replay-compatibility is a NORMALIZED equality, not a byte-identical
@@ -191,6 +210,15 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // per terminal event), normalized the same way.
         expected_state.terminal_epoch = terminal_keys.len() as u64;
         expected_state.recently_terminated = terminal_keys;
+        // Normalize each terminal instance's `terminated_epoch` (derived above
+        // from the journal's own terminal events): archived snapshots predate
+        // the field and load it `0`, but replay under current semantics records
+        // it. Live instances (absent from the map) keep `0`.
+        for (key, instance) in expected_state.instances.iter_mut() {
+            if let Some(epoch) = terminal_epoch_by_instance.get(key) {
+                instance.terminated_epoch = *epoch;
+            }
+        }
         assert_eq!(
             &replayed_state, &expected_state,
             "archived format {version}"

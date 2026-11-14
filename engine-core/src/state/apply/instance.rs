@@ -76,6 +76,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
                     suspended_at: None,
+                    terminated_epoch: 0,
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
