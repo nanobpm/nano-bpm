@@ -1392,12 +1392,17 @@ mod tests {
             link.request_within(Duration::from_secs(3600), |corr| {
                 ClientFrame::RouteSubscription {
                     corr,
-                    event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+                    event: nanobpmn_engine_core::Event::ProcessInstanceCompleted {
+                        instance_key: 1,
+                    },
                 }
             }),
         )
         .await;
-        assert!(outer.is_err(), "the stalled request must still be in flight");
+        assert!(
+            outer.is_err(),
+            "the stalled request must still be in flight"
+        );
         assert!(
             link.pending_app.lock().await.is_empty(),
             "a dropped request future must not leave a pending correlation behind"

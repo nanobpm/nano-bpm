@@ -1502,7 +1502,7 @@ async fn handle_client_frame(
             conn.send(ServerFrame::CommandResult {
                 corr,
                 status,
-                body: (status != 200).then(|| serde_json::Value::String(message)),
+                body: (status != 200).then_some(serde_json::Value::String(message)),
             });
         }
         ClientFrame::UpdateJobRetries {

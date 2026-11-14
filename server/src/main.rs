@@ -9628,9 +9628,7 @@ impl ServerImpl {
             }
             let outcome = match self.apply_routed_command(target, command.clone()).await {
                 RoutedApply::Applied(produced) => return produced,
-                RoutedApply::Failed(status, message) => {
-                    RouteAttempt::from_status(status, message)
-                }
+                RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
                 // Led by a peer (or a leadership gap): forward to the current
                 // writer, re-resolved on every attempt.
                 RoutedApply::NotHere => self.forward_route_subscription(target, &event).await,
@@ -9823,7 +9821,11 @@ impl ServerImpl {
     /// `event` to the node currently writing `target_partition`, over the Falcon
     /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
     /// it and drives its own pump for any further follow-ups.
-    async fn forward_route_subscription(&self, target_partition: u64, event: &Event) -> RouteAttempt {
+    async fn forward_route_subscription(
+        &self,
+        target_partition: u64,
+        event: &Event,
+    ) -> RouteAttempt {
         let owner = self.partition_write_node(target_partition);
         if owner == self.engine.topology().node_id {
             // No peer to hand it to: this node is the best-known writer but does
@@ -42449,7 +42451,8 @@ mod clustered_startup_tests {
                             .values()
                             .filter(|s| {
                                 s.instance_key == instance_key
-                                    && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                                    && s.state
+                                        == nanobpmn_engine_core::MessageSubscriptionState::Open
                             })
                             .count()
                     })
@@ -42504,14 +42507,26 @@ mod clustered_startup_tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(completions, [1, 1], "exactly one completion per surviving replica");
+        assert_eq!(
+            completions,
+            [1, 1],
+            "exactly one completion per surviving replica"
+        );
 
         // No resurrection: the correlated subscription is no longer open and
         // stays so (a late re-delivery of the open is deduped), and a second
         // publish correlates nothing.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(sub_count(&node0).await, 0, "no resurrected subscription (node0)");
-        assert_eq!(sub_count(&node2).await, 0, "no resurrected subscription (node2)");
+        assert_eq!(
+            sub_count(&node0).await,
+            0,
+            "no resurrected subscription (node0)"
+        );
+        assert_eq!(
+            sub_count(&node2).await,
+            0,
+            "no resurrected subscription (node2)"
+        );
         let (_, correlated) = node0
             .correlate_message_cluster("go".into(), order_id, None, None)
             .await
@@ -47015,13 +47030,10 @@ mod subscription_placement_tests {
             async move {
                 handle
                     .with(move |j| {
-                        j.state()
-                            .message_subscriptions
-                            .values()
-                            .any(|s| {
-                                s.instance_key == instance_key
-                                    && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
-                            })
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.instance_key == instance_key
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
                     })
                     .await
             }
@@ -47044,8 +47056,14 @@ mod subscription_placement_tests {
         drop(tx);
         let routed = routing.expect("cancel emits a routable close").await;
         assert!(!routed.expect("gate task"), "no routing before durability");
-        assert!(!caller.wait_durable().await, "the caller sees the same outcome");
-        assert!(armed().await, "the close was withheld from the peer partition");
+        assert!(
+            !caller.wait_durable().await,
+            "the caller sees the same outcome"
+        );
+        assert!(
+            armed().await,
+            "the close was withheld from the peer partition"
+        );
 
         // The same follow-up routes once the source is durable.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -47053,7 +47071,10 @@ mod subscription_placement_tests {
         tx.send(()).expect("gate listening");
         assert!(routing.expect("routable").await.expect("gate task"));
         assert!(caller.wait_durable().await);
-        assert!(!armed().await, "the durable close disarmed the subscription");
+        assert!(
+            !armed().await,
+            "the durable close disarmed the subscription"
+        );
     }
 
     /// #1582: transient non-delivery (5xx, the 503 leader race, transport
@@ -47061,12 +47082,31 @@ mod subscription_placement_tests {
     #[test]
     fn route_attempt_classification_and_backoff_are_bounded() {
         use nano_server_raft::peer::{PeerError, PeerResult};
-        assert_eq!(RouteAttempt::from_status(200, String::new()), RouteAttempt::Delivered);
-        assert!(matches!(RouteAttempt::from_status(404, "x".into()), RouteAttempt::Rejected(404, _)));
-        assert!(matches!(RouteAttempt::from_status(503, "x".into()), RouteAttempt::Transient(_)));
-        assert!(matches!(RouteAttempt::from_status(500, "x".into()), RouteAttempt::Transient(_)));
-        for e in [PeerError::Closed, PeerError::Timeout, PeerError::Connect("refused".into())] {
-            assert!(matches!(RouteAttempt::from_peer(Err(e)), RouteAttempt::Transient(_)));
+        assert_eq!(
+            RouteAttempt::from_status(200, String::new()),
+            RouteAttempt::Delivered
+        );
+        assert!(matches!(
+            RouteAttempt::from_status(404, "x".into()),
+            RouteAttempt::Rejected(404, _)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(503, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(500, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        for e in [
+            PeerError::Closed,
+            PeerError::Timeout,
+            PeerError::Connect("refused".into()),
+        ] {
+            assert!(matches!(
+                RouteAttempt::from_peer(Err(e)),
+                RouteAttempt::Transient(_)
+            ));
         }
         let reply = PeerResult {
             status: 409,
@@ -47076,13 +47116,26 @@ mod subscription_placement_tests {
             RouteAttempt::from_peer(Ok(reply)),
             RouteAttempt::Rejected(409, "conflict".into())
         );
-        assert_eq!(ROUTE_REDRIVE.backoff(1), std::time::Duration::from_millis(50));
-        assert_eq!(ROUTE_REDRIVE.backoff(2), std::time::Duration::from_millis(100));
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(1),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(2),
+            std::time::Duration::from_millis(100)
+        );
         assert_eq!(ROUTE_REDRIVE.backoff(40), ROUTE_REDRIVE.cap);
-        let total: std::time::Duration =
-            (1..ROUTE_REDRIVE.max_attempts).map(|a| ROUTE_REDRIVE.backoff(a)).sum();
-        assert!(total >= std::time::Duration::from_secs(5), "rides out an election: {total:?}");
-        assert!(total <= std::time::Duration::from_secs(30), "bounded: {total:?}");
+        let total: std::time::Duration = (1..ROUTE_REDRIVE.max_attempts)
+            .map(|a| ROUTE_REDRIVE.backoff(a))
+            .sum();
+        assert!(
+            total >= std::time::Duration::from_secs(5),
+            "rides out an election: {total:?}"
+        );
+        assert!(
+            total <= std::time::Duration::from_secs(30),
+            "bounded: {total:?}"
+        );
     }
 
     /// start -> serviceTask "work" with an interrupting message boundary keyed on
