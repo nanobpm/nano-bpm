@@ -2720,13 +2720,26 @@ pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
         // top-level key is a PascalCase variant tag, collected into `extra` —
         // but then `event` is absent and we fall through below) or genuinely
         // malformed JSON. The bare-event decode classifies both precisely.
+        // Probe failures (e.g. duplicate `operation_reference`/`event` keys,
+        // which the derived probe rejects) must never mask the inner event's
+        // typed `UnknownVariant`: this cold path re-parses as a DOM (duplicate
+        // keys are accepted there) and decodes any `event` member FIRST.
+        // Only genuinely unparseable JSON (a torn tail) stays `Malformed`.
         Err(e) => {
-            return match decode_event_json(line) {
-                Ok(event) => Ok(Record::bare(event)),
-                Err(_) => Err(EventDecodeError::Malformed {
-                    detail: e.to_string(),
-                }),
-            }
+            let malformed = || EventDecodeError::Malformed {
+                detail: e.to_string(),
+            };
+            return match serde_json::from_str::<serde_json::Value>(line) {
+                Err(_) => Err(malformed()),
+                Ok(serde_json::Value::Object(map)) => match map.get("event") {
+                    Some(inner) => {
+                        decode_event_json(&inner.to_string())?;
+                        Err(malformed())
+                    }
+                    None => decode_event_json(line).map(Record::bare),
+                },
+                Ok(_) => decode_event_json(line).map(Record::bare),
+            };
         }
     };
 

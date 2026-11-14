@@ -177,6 +177,38 @@ fn unknown_variant_wins_over_invalid_envelope_metadata() {
     ));
 }
 
+/// Probe-failure class (#1603 review): when the derived envelope probe itself
+/// rejects the line (duplicate metadata/event keys), an unknown inner event
+/// must still surface as `UnknownVariant`, not `Malformed` (which a journal
+/// tail would drop). A genuinely torn envelope stays `Malformed`.
+#[test]
+fn unknown_variant_survives_envelope_probe_failure() {
+    for line in [
+        r#"{"event":{"FutureEvent":{}},"operation_reference":1,"operation_reference":2}"#,
+        r#"{"operation_reference":1,"operation_reference":2,"event":{"FutureEvent":{}}}"#,
+        r#"{"event":{"FutureEvent":{}},"event":{"FutureEvent":{}}}"#,
+    ] {
+        match decode_record_json(line) {
+            Err(EventDecodeError::UnknownVariant { variant, .. }) => {
+                assert_eq!(variant, "FutureEvent", "{line}")
+            }
+            other => panic!("expected UnknownVariant for {line}, got {other:?}"),
+        }
+    }
+    // Known event + duplicate metadata: still a corrupt envelope.
+    let line = r#"{"event":{"DeploymentCreated":{"deployment_key":1}},"operation_reference":1,"operation_reference":2}"#;
+    assert!(matches!(
+        decode_record_json(line),
+        Err(EventDecodeError::Malformed { .. })
+    ));
+    // Torn envelope (truncated JSON) is unchanged: Malformed.
+    let line = r#"{"event":{"FutureEvent":{}},"operation_refer"#;
+    assert!(matches!(
+        decode_record_json(line),
+        Err(EventDecodeError::Malformed { .. })
+    ));
+}
+
 /// The envelope is recognised by its parsed `event` member, not by property
 /// order: whitespace and reordered keys (reference first) still decode, and
 /// an unrecognised envelope field is rejected rather than dropped.
