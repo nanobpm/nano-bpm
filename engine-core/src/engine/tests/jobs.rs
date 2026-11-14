@@ -1233,8 +1233,11 @@ fn should_thread_operation_reference_onto_job_update_events() {
 
     // when a retries update carries an operation reference
     let events = engine
-        .apply_command(Command::update_job_retries_with_ref(job_key, 5, Some(4242)))
-        .unwrap();
+        .apply_command_records_at(Command::update_job_retries(job_key, 5), 0, Some(4242))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect::<Vec<_>>();
     // then the reference lands on the JobRetriesUpdated event
     assert!(events.iter().any(|e| matches!(
         e,
@@ -1246,11 +1249,11 @@ fn should_thread_operation_reference_onto_job_update_events() {
 
     // and likewise for a timeout (lock-extension) update
     let events = engine
-        .apply_command_at(
-            Command::update_job_timeout_with_ref(job_key, 5_000, Some(9001)),
-            100,
-        )
-        .unwrap();
+        .apply_command_records_at(Command::update_job_timeout(job_key, 5_000), 100, Some(9001))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect::<Vec<_>>();
     assert!(events.iter().any(|e| matches!(
         e,
         Event::JobTimeoutUpdated {
@@ -1801,10 +1804,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
         })
         .unwrap();
     let retried = engine
-        .apply_command(Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        })
+        .apply_command(Command::ResolveIncident { incident_key })
         .unwrap();
     let retry_key = retried
         .iter()

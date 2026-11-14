@@ -845,7 +845,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -858,7 +860,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         deadline: u64,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -2599,6 +2603,264 @@ pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
             }
         }
     }
+}
+
+/// One journaled record: an [`Event`] plus the per-record metadata Zeebe
+/// carries on every record (#1556). Today that is the caller's
+/// `operationReference` — the correlation id a client attaches to a command,
+/// propagated **generically** to every record the command produces (Zeebe
+/// parity). [`Event`] itself stays untouched: the reference lives once, on this
+/// envelope, stamped at the engine's single command seam
+/// ([`Engine::apply_command_records_at`](crate::Engine::apply_command_records_at)),
+/// so no per-variant copy can drift.
+///
+/// **Wire form** (`serde` feature): a record WITH a reference serializes as the
+/// envelope `{"event":{…},"operation_reference":N}`; a record WITHOUT one
+/// serializes as the bare legacy [`Event`] (`{"VariantName":{…}}`). Every
+/// pre-#1556 journal line is therefore already a valid record, and
+/// [`decode_record_json`] reads both shapes — no `SNAPSHOT_FORMAT_VERSION`
+/// bump. The `event` key cannot collide with an event tag (variants are
+/// PascalCase).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The domain event.
+    pub event: Event,
+    /// The `operationReference` of the command that produced this record.
+    pub operation_reference: Option<i64>,
+}
+
+impl Record {
+    /// A record with no operation reference (the bare-event wire form).
+    pub fn bare(event: Event) -> Self {
+        Self {
+            event,
+            operation_reference: None,
+        }
+    }
+
+    /// Stamps `operation_reference` onto every event of one command's output —
+    /// the single, generic propagation seam (#1556).
+    pub fn stamp_all(events: Vec<Event>, operation_reference: Option<i64>) -> Vec<Self> {
+        events
+            .into_iter()
+            .map(|event| Self {
+                event,
+                operation_reference,
+            })
+            .collect()
+    }
+}
+
+impl From<Event> for Record {
+    fn from(event: Event) -> Self {
+        Self::bare(event)
+    }
+}
+
+/// Borrowed serialization view of a [`Record`] — the ONE implementation of the
+/// record wire form, shared by `Record`'s `Serialize` and
+/// [`encode_record_json`] (which journals without cloning the event).
+#[cfg(feature = "serde")]
+struct RecordView<'a> {
+    event: &'a Event,
+    operation_reference: Option<i64>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for RecordView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.operation_reference {
+            None => self.event.serialize(serializer),
+            Some(reference) => {
+                let mut s = serializer.serialize_struct("Record", 2)?;
+                s.serialize_field("event", self.event)?;
+                s.serialize_field("operation_reference", &reference)?;
+                s.end()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Record {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RecordView {
+            event: &self.event,
+            operation_reference: self.operation_reference,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Encodes one journal line for `event` produced by a command carrying
+/// `operation_reference` — the writer-side twin of [`decode_record_json`]
+/// (#1556). Without a reference this is exactly the legacy bare-`Event` line.
+#[cfg(feature = "serde")]
+pub fn encode_record_json(
+    event: &Event,
+    operation_reference: Option<i64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RecordView {
+        event,
+        operation_reference,
+    })
+}
+
+/// Decodes one journal line into a [`Record`] — the replay-boundary reader for
+/// the #1556 envelope. Accepts both the envelope and the legacy bare-[`Event`]
+/// form (which decodes with `operation_reference: None`). The envelope is
+/// recognised by the PARSED top-level `event` member, never by property order,
+/// so a producer that reorders keys (`{"operation_reference":N,"event":…}`)
+/// still decodes. The inner event is decoded through [`decode_event_json`], so
+/// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
+/// rejection — never a silent drop.
+///
+/// Two disciplines keep this safe AND cheap on the hot recovery path:
+///
+/// * **Decode the event FIRST, validate the envelope metadata SECOND.** An
+///   envelope whose `event` names a variant this build does not know must
+///   surface the typed [`EventDecodeError::UnknownVariant`] even when the
+///   surrounding metadata is also invalid (a bad `operation_reference` type or
+///   an unrecognised extra field). Validating metadata first would return
+///   [`EventDecodeError::Malformed`], which the journal reader
+///   (`read_segment_with`) tolerates as a torn tail and DROPS — silently
+///   discarding a real cross-version frame (#1065 class). Decoding the event
+///   first guarantees the fail-closed `UnknownVariant` wins.
+/// * **No double parse of the event payload.** The envelope probe borrows the
+///   `event` member as a [`serde_json::value::RawValue`] and hands it straight
+///   to [`decode_event_json`] — the payload is parsed exactly once, never
+///   materialized into a [`serde_json::Value`] DOM and re-serialized. Bare
+///   events (unreferenced commands) skip the probe's payload capture entirely.
+#[cfg(feature = "serde")]
+pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
+    // A borrowed probe over the raw line: the `event`/`operation_reference`
+    // members are captured by reference as a `RawValue` (no DOM, no copy of the
+    // payload). Any OTHER top-level key is collected into `extra` so an
+    // unrecognised envelope field can be rejected AFTER the event is decoded.
+    // `extra` is a `Value` map only because serde's `flatten` cannot deserialize
+    // into a borrowed `RawValue`; it stays empty for every well-formed record,
+    // so the hot path never builds a DOM.
+    #[derive(serde::Deserialize)]
+    struct Probe<'a> {
+        #[serde(borrow)]
+        event: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        operation_reference: Option<&'a serde_json::value::RawValue>,
+        #[serde(flatten)]
+        extra: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let probe: Probe<'_> = match serde_json::from_str(line) {
+        Ok(probe) => probe,
+        // Not an object the probe recognises. Either a legacy bare event (whose
+        // top-level key is a PascalCase variant tag, collected into `extra` —
+        // but then `event` is absent and we fall through below) or genuinely
+        // malformed JSON. The bare-event decode classifies both precisely.
+        // Probe failures (e.g. duplicate `operation_reference`/`event` keys,
+        // which the derived probe rejects) must never mask the inner event's
+        // typed `UnknownVariant`: this cold path re-parses as a DOM (duplicate
+        // keys are accepted there) and decodes any `event` member FIRST.
+        // Only genuinely unparseable JSON (a torn tail) stays `Malformed`.
+        Err(e) => {
+            let malformed = || EventDecodeError::Malformed {
+                detail: e.to_string(),
+            };
+            // Walk EVERY top-level member (duplicates included — a DOM would
+            // keep only the last) so each `event` occurrence is classified.
+            return match top_level_members(line) {
+                None => Err(malformed()),
+                Some(members) => {
+                    // Scan ALL `event` occurrences before failing: a malformed
+                    // sibling must never short-circuit past an unknown one, so
+                    // any `UnknownVariant` wins regardless of key order.
+                    let mut saw_event = false;
+                    for (key, raw) in &members {
+                        if key == "event" {
+                            saw_event = true;
+                            if let Err(err @ EventDecodeError::UnknownVariant { .. }) =
+                                decode_event_json(raw.get())
+                            {
+                                return Err(err);
+                            }
+                        }
+                    }
+                    if saw_event {
+                        Err(malformed())
+                    } else {
+                        decode_event_json(line).map(Record::bare)
+                    }
+                }
+            };
+        }
+    };
+
+    let event_raw = match probe.event {
+        Some(raw) => raw,
+        // No `event` member: a legacy bare event (variant tags are PascalCase,
+        // never the lowercase `event` key). Decode it directly.
+        None => return decode_event_json(line).map(Record::bare),
+    };
+
+    // Decode the inner event FIRST (straight from the borrowed raw payload, no
+    // re-serialization) so an unknown variant is the typed fail-closed
+    // rejection even when the envelope metadata below is also invalid.
+    let event = decode_event_json(event_raw.get())?;
+
+    // Only now validate the envelope metadata. An unrecognised field or a bad
+    // `operation_reference` is `Malformed` — but the event is already known to
+    // be decodable, so this can never mask an `UnknownVariant`.
+    if let Some(extra) = probe.extra.keys().next() {
+        return Err(EventDecodeError::Malformed {
+            detail: format!("unknown record envelope field `{extra}`"),
+        });
+    }
+    let operation_reference = match probe.operation_reference {
+        None => None,
+        // `RawValue::get` returns the exact source slice, so an explicit null
+        // may carry whitespace (`" null"`); trim before comparing.
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => Some(serde_json::from_str::<i64>(raw.get()).map_err(|e| {
+            EventDecodeError::Malformed {
+                detail: format!("operation_reference: {e}"),
+            }
+        })?),
+    };
+    Ok(Record {
+        event,
+        operation_reference,
+    })
+}
+
+/// Every top-level `(key, raw value)` member of a JSON object IN SOURCE ORDER,
+/// duplicates preserved (unlike a `Value` map, which keeps only the last).
+/// `None` if `line` is not a parseable JSON object.
+#[cfg(feature = "serde")]
+fn top_level_members(line: &str) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
+    struct Members(Vec<(String, Box<serde_json::value::RawValue>)>);
+    impl<'de> serde::Deserialize<'de> for Members {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Members;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Members, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(entry) = map.next_entry()? {
+                        out.push(entry);
+                    }
+                    Ok(Members(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Members>(line).ok().map(|m| m.0)
 }
 
 /// Extract the offending variant name from serde's
