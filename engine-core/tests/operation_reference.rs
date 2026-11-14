@@ -187,6 +187,10 @@ fn unknown_variant_survives_envelope_probe_failure() {
         r#"{"event":{"FutureEvent":{}},"operation_reference":1,"operation_reference":2}"#,
         r#"{"operation_reference":1,"operation_reference":2,"event":{"FutureEvent":{}}}"#,
         r#"{"event":{"FutureEvent":{}},"event":{"FutureEvent":{}}}"#,
+        // Mixed unknown/known duplicate `event`s, both orders: a last-wins
+        // DOM would keep only one and could hide the unknown variant.
+        r#"{"event":{"FutureEvent":{}},"event":{"DeploymentCreated":{"deployment_key":1}}}"#,
+        r#"{"event":{"DeploymentCreated":{"deployment_key":1}},"event":{"FutureEvent":{}}}"#,
     ] {
         match decode_record_json(line) {
             Err(EventDecodeError::UnknownVariant { variant, .. }) => {

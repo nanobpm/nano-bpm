@@ -2729,16 +2729,24 @@ pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
             let malformed = || EventDecodeError::Malformed {
                 detail: e.to_string(),
             };
-            return match serde_json::from_str::<serde_json::Value>(line) {
-                Err(_) => Err(malformed()),
-                Ok(serde_json::Value::Object(map)) => match map.get("event") {
-                    Some(inner) => {
-                        decode_event_json(&inner.to_string())?;
-                        Err(malformed())
+            // Walk EVERY top-level member (duplicates included — a DOM would
+            // keep only the last) so each `event` occurrence is classified.
+            return match top_level_members(line) {
+                None => Err(malformed()),
+                Some(members) => {
+                    let mut saw_event = false;
+                    for (key, raw) in &members {
+                        if key == "event" {
+                            saw_event = true;
+                            decode_event_json(raw.get())?;
+                        }
                     }
-                    None => decode_event_json(line).map(Record::bare),
-                },
-                Ok(_) => decode_event_json(line).map(Record::bare),
+                    if saw_event {
+                        Err(malformed())
+                    } else {
+                        decode_event_json(line).map(Record::bare)
+                    }
+                }
             };
         }
     };
@@ -2778,6 +2786,37 @@ pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
         event,
         operation_reference,
     })
+}
+
+/// Every top-level `(key, raw value)` member of a JSON object IN SOURCE ORDER,
+/// duplicates preserved (unlike a `Value` map, which keeps only the last).
+/// `None` if `line` is not a parseable JSON object.
+#[cfg(feature = "serde")]
+fn top_level_members(line: &str) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
+    struct Members(Vec<(String, Box<serde_json::value::RawValue>)>);
+    impl<'de> serde::Deserialize<'de> for Members {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Members;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Members, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(entry) = map.next_entry()? {
+                        out.push(entry);
+                    }
+                    Ok(Members(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Members>(line).ok().map(|m| m.0)
 }
 
 /// Extract the offending variant name from serde's
