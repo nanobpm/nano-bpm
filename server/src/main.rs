@@ -11721,6 +11721,21 @@ impl ServerImpl {
                         problem("Conflict", 409, peer_detail(&r)),
                     );
                 }
+                // The link closed (or was retired after an unrelated routing
+                // timeout) AFTER the create was sent: the peer may already have
+                // committed it. Without a business id a retry is not
+                // idempotent and could mint a duplicate instance, so surface
+                // the ambiguous outcome instead of re-driving (#1582).
+                Ok(r)
+                    if business_id.is_none()
+                        && nano_server_raft::peer::is_link_closed_result(&r) =>
+                {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        "the peer link closed before the forwarded create was acknowledged; its outcome is unknown, so it was not retried".into(),
+                    ));
+                }
                 // Transient (peer 5xx, timeout, closed): re-resolve leader & retry.
                 Ok(r) => last_detail = peer_detail(&r),
                 Err(e) => last_detail = e.to_string(),
