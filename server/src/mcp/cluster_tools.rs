@@ -188,6 +188,9 @@ async fn resolve_incident(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_incidents(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_sort(&args, crate::INCIDENT_SORT_FIELDS) {
+        return e;
+    }
     let body: Option<models::IncidentSearchQuery> = match optional_body(args) {
         Ok(b) => b,
         Err(e) => return e,
@@ -227,6 +230,9 @@ async fn get_process_definition_xml(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_process_definitions(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_sort(&args, crate::PROCESS_DEFINITION_SORT_FIELDS) {
+        return e;
+    }
     let body: Option<models::ProcessDefinitionSearchQuery> = match optional_body(args) {
         Ok(b) => b,
         Err(e) => return e,
@@ -259,11 +265,46 @@ fn reject_unsupported(args: &Value, keys: &[&str]) -> Result<(), Value> {
 /// Like [`reject_unsupported`], for advertised `filter.*` keys the shared REST
 /// filter model lacks: deserializing would silently drop the condition and
 /// widen the search, so fail closed instead.
+/// Applies to the top-level filter AND every `$or` clause, so a nested
+/// clause cannot bypass the guard.
 fn reject_unsupported_filter(args: &Value, keys: &[&str]) -> Result<(), Value> {
-    match args.get("filter") {
-        Some(f) => reject_unsupported(f, keys),
-        None => Ok(()),
+    let Some(f) = args.get("filter") else {
+        return Ok(());
+    };
+    reject_unsupported(f, keys)?;
+    for clause in or_clauses(f) {
+        reject_unsupported(clause, keys)?;
     }
+    Ok(())
+}
+
+/// The `$or` clauses of a filter object (empty when absent / not an array).
+fn or_clauses(filter: &Value) -> impl Iterator<Item = &Value> {
+    filter
+        .get("$or")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+/// Fail closed on a `sort[].field` the shared REST sorter has no projection
+/// for: the sorter silently falls back to entity-key order, which returns
+/// mis-ordered results and the wrong page under a `limit`.
+fn reject_unsupported_sort(args: &Value, supported: &[&str]) -> Result<(), Value> {
+    let Some(sorts) = args.get("sort").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for s in sorts {
+        if let Some(field) = s.get("field").and_then(Value::as_str)
+            && !supported.contains(&field)
+        {
+            return Err(tool_error_result(
+                &format!("Sorting by `{field}` is not supported by this Nano gateway yet."),
+                400,
+            ));
+        }
+    }
+    Ok(())
 }
 
 // --- process instances ---------------------------------------------------------
@@ -296,6 +337,9 @@ async fn get_process_instance(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_process_instances(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_sort(&args, crate::PROCESS_INSTANCE_SORT_FIELDS) {
+        return e;
+    }
     let body: Option<models::ProcessInstanceSearchQuery> = match optional_body(args) {
         Ok(b) => b,
         Err(e) => return e,
@@ -394,6 +438,9 @@ async fn get_user_task(server: &ServerImpl, args: Value) -> Value {
 }
 
 async fn search_user_tasks(server: &ServerImpl, args: Value) -> Value {
+    if let Err(e) = reject_unsupported_sort(&args, crate::USER_TASK_SORT_FIELDS) {
+        return e;
+    }
     // Fail closed on advertised filters the shared REST predicate cannot
     // honour: `isSuspended` (Nano has no task suspension), and the two variable
     // filters, which need a variable-store join the user-task predicate does
@@ -460,6 +507,11 @@ pub(super) fn optional_body<T: serde::de::DeserializeOwned + validator::Validate
 ) -> Result<Option<T>, Value> {
     if let Some(filter) = args.get_mut("filter") {
         translate_date_ranges(filter)?;
+        if let Some(clauses) = filter.get_mut("$or").and_then(Value::as_array_mut) {
+            for clause in clauses {
+                translate_date_ranges(clause)?;
+            }
+        }
     }
     let is_empty = args.as_object().map(|o| o.is_empty()).unwrap_or(false);
     if is_empty || args.is_null() {

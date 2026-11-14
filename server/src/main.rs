@@ -53273,3 +53273,37 @@ mod publish_fanout_retry_tests {
         assert!(!retry(1, false, false, 8, 8), "bounded");
     }
 }
+
+/// Sort fields the shared REST sorters project (keep in lockstep with the
+/// `sort_items` match arms in the `search_*_impl` handlers; every other field
+/// falls back to entity-key order). The MCP adapter rejects anything outside
+/// these lists instead of silently mis-ordering.
+pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
+    "incidentKey",
+    "creationTime",
+    "state",
+    "errorType",
+    "processInstanceKey",
+    "elementId",
+];
+pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
+    "processInstanceKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "state",
+    "businessId",
+];
+pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
+    "userTaskKey",
+    "processInstanceKey",
+    "elementId",
+    "state",
+    "creationDate",
+    "businessId",
+];
+pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
+    "processDefinitionKey",
+    "processDefinitionId",
+    "name",
+    "version",
+];

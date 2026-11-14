@@ -1094,6 +1094,81 @@ mod tests {
         }
     }
 
+    /// Unsupported filters nested inside a `$or` clause are rejected too —
+    /// a nested clause must not bypass the top-level guard.
+    #[tokio::test]
+    async fn search_rejects_unsupported_filters_inside_or_clauses() {
+        let server = ServerImpl::default();
+        for (tool, key, val) in [
+            ("searchUserTasks", "isSuspended", json!(true)),
+            (
+                "searchUserTasks",
+                "localVariables",
+                json!([{ "name": "missing", "value": "1" }]),
+            ),
+            ("searchUserTasks", "processInstanceVariables", json!([])),
+            ("searchVariables", "protectionMode", json!("REDACT")),
+        ] {
+            let mut clause = json!({});
+            clause[key] = val;
+            let args = json!({ "filter": { "$or": [{}, clause] } });
+            let result = call(&server, tool, args).await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(key), "{key} named in error: {text}");
+        }
+    }
+
+    /// Date ranges inside `$or` clauses are translated to the REST operator
+    /// form (an untranslated `{from}` would be dropped and widen the clause).
+    #[test]
+    fn date_ranges_translated_inside_or_clauses() {
+        let body: Option<nanobpm_gateway_rest::models::UserTaskSearchQuery> =
+            cluster_tools::optional_body(json!({
+                "filter": { "$or": [{ "dueDate": { "from": "2999-01-01T00:00:00Z" } }] }
+            }))
+            .expect("valid");
+        let v = serde_json::to_value(body.expect("some")).expect("json");
+        assert_eq!(
+            v["filter"]["$or"][0]["dueDate"]["$gte"],
+            json!("2999-01-01T00:00:00Z"),
+            "{v}"
+        );
+    }
+
+    /// Sort fields the shared REST sorter has no projection for are rejected
+    /// (the sorter would silently fall back to key order and page wrongly).
+    #[tokio::test]
+    async fn search_rejects_unsupported_sort_fields() {
+        let server = ServerImpl::default();
+        for (tool, field) in [
+            ("searchIncidents", "processDefinitionId"),
+            ("searchIncidents", "jobKey"),
+            ("searchProcessDefinitions", "resourceName"),
+            ("searchProcessInstances", "startDate"),
+            ("searchProcessInstances", "processDefinitionVersion"),
+            ("searchUserTasks", "priority"),
+            ("searchUserTasks", "dueDate"),
+            ("searchUserTasks", "followUpDate"),
+        ] {
+            let args = json!({ "sort": [{ "field": field, "order": "DESC" }] });
+            let result = call(&server, tool, args).await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(field), "{field} named in error: {text}");
+        }
+        for (tool, field) in [
+            ("searchIncidents", "creationTime"),
+            ("searchProcessDefinitions", "version"),
+            ("searchProcessInstances", "processDefinitionId"),
+            ("searchUserTasks", "creationDate"),
+        ] {
+            let args = json!({ "sort": [{ "field": field, "order": "ASC" }] });
+            let result = call(&server, tool, args).await;
+            assert_eq!(result["isError"].as_bool(), Some(false), "{tool}: {result}");
+        }
+    }
+
     /// Every filter the MCP search tools advertise is either honoured by the
     /// shared REST predicate or rejected — never silently dropped (which would
     /// widen the search beyond the caller's restriction). These calls run

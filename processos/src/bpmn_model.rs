@@ -1374,10 +1374,22 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
 /// Escape the five predefined XML entities for safe emission into attribute values and text
 /// (the inverse of the engine tokenizer's `unescape`). `&` first so we don't double-escape.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;"),
+    )
+}
+
+/// Encode tab / newline / carriage return as numeric character references.
+/// XML attribute-value normalization turns literal whitespace into spaces, so
+/// a multiline value (e.g. an MCP purpose property) would lose its line breaks
+/// on re-import. Shared by every escaper so no emitter can regress.
+fn escape_attr_whitespace(s: String) -> String {
+    s.replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
 }
 
 /// A safe id fragment: keep alphanumerics and `_`/`-`, map everything else to `_`.
@@ -1798,9 +1810,11 @@ fn ensure_nano_namespace(mut xml: String) -> String {
 /// Kept separate from [`xml_escape`] because attribute values need `"`
 /// escaped as well.
 fn xml_escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;"),
+    )
 }
 
 /// Turn a machine id into a readable label: strip a leading kind prefix (`Task_`, `Gateway_`,
@@ -4353,6 +4367,14 @@ pub fn edit_model_in(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xml_escapers_preserve_attribute_whitespace() {
+        let raw = "line1\nline2\r\n\tindented";
+        for escaped in [super::xml_escape(raw), super::xml_escape_attr(raw)] {
+            assert_eq!(escaped, "line1&#10;line2&#13;&#10;&#9;indented");
+        }
+    }
+
     use super::*;
 
     // A small loan-approval-shaped model: start -> credit-check (service) -> XOR gateway
