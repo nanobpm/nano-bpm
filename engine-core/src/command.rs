@@ -733,7 +733,29 @@ pub enum Command {
     /// leader retry / replay), and an unknown or terminal instance is a no-op too
     /// (the orphan may have been cancelled between the quarantine note and this
     /// command landing). Additive brand-new variant — old journals never carry it.
-    QuarantineOffheapOrphan { instance_key: Key },
+    ///
+    /// **Replicated form (#1447).** Under Raft the residency-dependent rules
+    /// above are NOT replica-independent: whether an instance is resident,
+    /// terminal, or already incidented differs per replica (cold tiering,
+    /// follower retirement), so the bare command could raise the incident on
+    /// one replica and no-op on another, diverging their journals and key
+    /// counters. The partition leader therefore proposes it with a
+    /// [`OrphanIncidentStamp`] (`stamp: Some`) — the orphan kind plus the
+    /// incident metadata it resolved from ITS state — and every replica applies
+    /// a stamped command identically: it unconditionally emits exactly one
+    /// `IncidentRaised` carrying the stamp's metadata, whatever its local
+    /// residency (deduped only by the replicated tombstone). It carries no
+    /// variable payload and triggers no replica-local row repair (#1574).
+    /// Additive `#[serde(default)]` field: a journal written before #1447
+    /// decodes as `stamp: None` (the local form).
+    QuarantineOffheapOrphan {
+        instance_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        stamp: Option<OrphanIncidentStamp>,
+    },
     /// Raise a durable [`crate::Event::IncidentRaised`]
     /// ([`crate::IncidentKind::VariablesLost`]) for a **cold** (wholly off-heap)
     /// instance whose cold row the host's storage layer found definitively
@@ -749,6 +771,64 @@ pub enum Command {
     /// active `VariablesLost` incident already names the instance. Additive
     /// brand-new variant — old journals never carry it.
     QuarantineColdOrphan { instance_key: Key },
+}
+
+/// Which off-heap tier lost an orphan's payload (#1447).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OrphanKind {
+    /// A resident instance whose spilled variable row is gone: it keeps its
+    /// surviving resident variables.
+    Resident,
+    /// A cold (wholly off-heap) instance whose cold row is gone: the whole
+    /// instance is unrecoverable.
+    Cold,
+}
+
+/// The leader-resolved incident metadata a replicated
+/// [`Command::QuarantineOffheapOrphan`] carries (#1447), so every replica emits
+/// a byte-identical `IncidentRaised` whatever its local residency. Built by
+/// [`crate::Engine::orphan_incident_stamp`] on the proposing leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OrphanIncidentStamp {
+    /// The tier that lost the payload.
+    pub kind: OrphanKind,
+    /// The incident's `element_id` (the process id when the leader had the
+    /// instance resident; empty for a cold instance whose model is lost).
+    pub element_id: String,
+    /// The incident's `reason`.
+    pub reason: String,
+    /// The leader's replicated terminal epoch
+    /// ([`crate::state::State::terminal_epoch`]) at stamp time (#1574 review).
+    /// The apply gate compares it against the applying replica's epoch and
+    /// terminal ring coverage, so a proposal committing after the ring wrapped
+    /// still decides identically on a resident and an evicted replica.
+    /// Additive: `0` (a stamp minted before this field existed) disables the
+    /// epoch check and keeps the pre-field behaviour (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub terminal_epoch: u64,
+    /// The target instance's own replicated terminal epoch
+    /// ([`crate::state::types::ProcessInstance::terminated_epoch`]) observed by
+    /// the leader at stamp time (#1574 review, review 5899722557), recovered
+    /// from the resident record OR the replicated terminal ring (so a leader
+    /// that already evicted its terminal shell still proves it). This is the
+    /// target-specific lifecycle-validity record the apply gate reads: the
+    /// bounded `recently_terminated` ring cannot distinguish "cold but LIVE"
+    /// from "terminated and evicted" once unrelated completions fill it, and the
+    /// global epoch distance counts EVERY terminal transition — so it misreads
+    /// an unrelated completion as the target's termination (suppressing a live
+    /// orphan). `> 0` means the leader observed the target already terminal at
+    /// stamp time — a stale proposal the gate no-ops, identically on every
+    /// replica. `0` = the target was live (or unprovable) at stamp time.
+    /// Additive: `0` for a stamp minted before this field existed (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub target_terminated_epoch: u64,
+}
+
+#[cfg(feature = "serde")]
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -1001,6 +1081,12 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // The stamp's strings are leader-resolved metadata of unbounded
+            // length (#1574 review): count them so the batcher's byte budget
+            // sees the real proposal size.
+            Command::QuarantineOffheapOrphan {
+                stamp: Some(stamp), ..
+            } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
             _ => 0,
         };
         BASE + payload
@@ -1543,6 +1629,32 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    // #1574 review: a stamped orphan quarantine carries leader-resolved strings;
+    // `approx_bytes` must count them, not treat the command as fixed-size.
+    #[test]
+    fn approx_bytes_counts_the_orphan_quarantine_stamp() {
+        let bare = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: None,
+        }
+        .approx_bytes();
+        let stamped = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: Some(OrphanIncidentStamp {
+                kind: OrphanKind::Resident,
+                element_id: "e".repeat(10_000),
+                reason: "r".repeat(20_000),
+                terminal_epoch: 0,
+                target_terminated_epoch: 0,
+            }),
+        }
+        .approx_bytes();
+        assert!(
+            stamped >= bare + 30_000,
+            "stamp strings must count: stamped={stamped} bare={bare}"
         );
     }
 

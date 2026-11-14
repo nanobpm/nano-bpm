@@ -596,6 +596,12 @@ enum Step {
 /// self / mutually-recursive callees that never terminate.
 const MAX_CALL_ACTIVITY_DEPTH: usize = 1000;
 
+/// `reason` of a resident off-heap orphan's `VariablesLost` incident (#1384).
+const RESIDENT_ORPHAN_REASON: &str = "variables lost: spill row missing";
+/// `reason` of a cold off-heap orphan's `VariablesLost` incident (#1481).
+const COLD_ORPHAN_REASON: &str = "variables lost: cold instance row missing from the spill \
+                                  store; the whole instance is unrecoverable";
+
 impl Engine {
     /// Creates an empty engine for the single-partition (id `0`) namespace.
     pub fn new() -> Self {
@@ -5526,8 +5532,94 @@ impl Engine {
                 self.process_complete_agent_instance(&mut log, agent_instance_key)?;
             }
 
-            Command::QuarantineOffheapOrphan { instance_key } => {
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: None,
+            } => {
                 self.process_quarantine_offheap_orphan(&mut log, instance_key);
+            }
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: Some(stamp),
+            } => {
+                // Replicated form (#1447): no residency branch — that reads
+                // replica-local state. The leader decided the incident metadata. The idempotency
+                // guard, however, reads ONLY replicated state (the dedup
+                // tombstone every replica applies identically), so it is safe
+                // here and required: two committed stamped proposals for the same
+                // outstanding loss (a promoted member re-proposing its parked
+                // report before an inherited quarantine entry applies) must not
+                // mint a second incident (#1574 review).
+                //
+                // A duplicate (the guard already holds this loss episode) is a
+                // complete no-op.
+                //
+                // The guard reads ONLY the replicated tombstone, never the hot
+                // incident map: the latter is residency-dependent (a cold-tiered
+                // replica has drained it), so it would split replicas.
+                //
+                // Terminal gate (#1574 review, cancellation race): a report
+                // queued before a cancel/complete can commit after it and must
+                // not raise an incident on the finished instance. Decided from
+                // REPLICATED state only, so every replica agrees. The decision
+                // uses the TARGET's own replicated lifecycle validity, never the
+                // global epoch distance (review 5899722557): the global
+                // `terminal_epoch` counts EVERY terminal transition, so an
+                // unrelated instance completing between the stamp and the
+                // commitment would otherwise be misread as the target's
+                // termination and wrongly suppress a LIVE orphan report.
+                //
+                // The terminal gate must be REPLICA-UNIFORM: every replica
+                // applies the same committed command, so the decision must be a
+                // pure function of replicated state, never of replica-local
+                // residency. The rule is target-specific (review 5899722557):
+                // no-op iff the TARGET is provably terminal — its own
+                // replicated `terminated_epoch` is set (a resident terminal
+                // instance), or its key is in the replicated terminal ring, or
+                // the leader recovered its terminal epoch into the stamp. The
+                // global epoch DISTANCE is deliberately NOT used: it counts
+                // EVERY terminal transition, so an unrelated instance completing
+                // between the stamp and the commitment would be misread as the
+                // target's termination and wrongly suppress a LIVE orphan
+                // report (the review's finding). A live orphan (no terminal
+                // record anywhere) always raises, identically on every replica.
+                //
+                // The resident record's `terminated_epoch` is deliberately NOT
+                // consulted: whether a terminal instance is still resident is
+                // replica-local (eviction), so once the ring wraps past a
+                // stamp-before-cancel target it would split replicas (one
+                // no-ops, one raises and mints a key). Only replicated inputs —
+                // the stamp and the ring — decide; past the ring's reach every
+                // replica uniformly fails open (raises).
+                let target_terminated = stamp.target_terminated_epoch > 0
+                    || self.state.recently_terminated.contains(&instance_key);
+                if target_terminated {
+                    return Ok((log, queue));
+                }
+                if self
+                    .state
+                    .variables_lost_quarantined
+                    .contains_key(&instance_key)
+                {
+                    return Ok((log, queue));
+                }
+                let incident_key = self.emit_variables_lost(
+                    &mut log,
+                    instance_key,
+                    stamp.element_id,
+                    stamp.reason,
+                );
+                // Record the replicated dedup tombstone. Deliberately NO
+                // variable install and no off-heap row cleanup (#1574): the
+                // command must be replica-deterministic, and a leader-snapshotted
+                // payload is not (it can roll back an intervening SetVariables).
+                self.emit(
+                    &mut log,
+                    Event::VariablesLostQuarantined {
+                        instance_key,
+                        incident_key,
+                    },
+                );
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
@@ -7500,6 +7592,24 @@ impl Engine {
             return;
         }
         let element_id = instance.process_id.clone();
+        self.emit_variables_lost(
+            log,
+            instance_key,
+            element_id,
+            RESIDENT_ORPHAN_REASON.to_string(),
+        );
+    }
+
+    /// Emits the single instance-root `VariablesLost` incident every orphan
+    /// quarantine form shares (#1384/#1481/#1447): one canonical shape, so the
+    /// local and replicated forms cannot drift.
+    fn emit_variables_lost(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: String,
+        reason: String,
+    ) -> Key {
         let incident_key = self.mint_key();
         self.emit(
             log,
@@ -7510,11 +7620,87 @@ impl Engine {
                 element_id,
                 kind: state::IncidentKind::VariablesLost,
                 redrive: None,
-                reason: "variables lost: spill row missing".to_string(),
+                reason,
                 job_key: None,
                 created_at: self.now,
             },
         );
+        incident_key
+    }
+
+    /// Whether an active `VariablesLost` incident already names `instance_key`
+    /// in this engine's state.
+    ///
+    /// The quarantine idempotency guard must be **replica-identical** (#1574
+    /// review), so it reads the replicated dedup tombstone
+    /// ([`State::variables_lost_quarantined`]) first: that set is recorded by the
+    /// quarantine's own event and is independent of instance residency and
+    /// terminal eviction, whereas the `VariablesLost` *incident record* leaves
+    /// hot state when its instance cold-spills and is dropped on eviction — a
+    /// guard reading only `incidents` would go blind on exactly the replica that
+    /// tiered and mint a duplicate incident there. The tombstone is the
+    /// authoritative answer; the incident scan below is the legacy fallback for
+    /// an incident journaled before the tombstone event existed (a pre-#1574
+    /// journal mid-replay) and for the resident fast path.
+    pub fn has_active_variables_lost(&self, instance_key: Key) -> bool {
+        if self
+            .state
+            .variables_lost_quarantined
+            .contains_key(&instance_key)
+        {
+            return true;
+        }
+        self.state.incidents.values().any(|i| {
+            i.instance_key == instance_key
+                && i.state == state::IncidentState::Active
+                && i.kind == state::IncidentKind::VariablesLost
+        })
+    }
+
+    /// Resolves, from THIS (proposing leader's) state, the stamp a replicated
+    /// [`Command::QuarantineOffheapOrphan`] carries (#1447) — every replica then
+    /// applies the identical incident. `None` means nothing should be proposed:
+    /// the leader already holds an active `VariablesLost` incident for the
+    /// instance, or holds it resident in a terminal state (the loss no longer
+    /// matters to any live work). Pure read.
+    pub fn orphan_incident_stamp(
+        &self,
+        instance_key: Key,
+        kind: crate::command::OrphanKind,
+    ) -> Option<crate::command::OrphanIncidentStamp> {
+        if self.has_active_variables_lost(instance_key) {
+            return None;
+        }
+        let element_id = match self.state.instances.get(&instance_key) {
+            Some(instance)
+                if !matches!(
+                    instance.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                ) =>
+            {
+                return None;
+            }
+            Some(instance) => instance.process_id.clone(),
+            None => String::new(),
+        };
+        let reason = match kind {
+            crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
+            crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
+        };
+        Some(crate::command::OrphanIncidentStamp {
+            kind,
+            element_id,
+            reason: reason.to_string(),
+            terminal_epoch: self.state.terminal_epoch,
+            // The target's own terminal epoch at stamp time, read from the
+            // resident record OR the replicated terminal ring (a leader that
+            // already evicted its terminal shell still proves the target's
+            // terminal epoch from the ring). `0` while the target is live (a
+            // resident terminal instance returns `None` above) or so old the
+            // ring has wrapped past it. The cold apply path reads it to detect
+            // the target terminating after the stamp.
+            target_terminated_epoch: self.state.terminated_epoch_of(instance_key).unwrap_or(0),
+        })
     }
 
     /// Process a [`Command::QuarantineColdOrphan`] (#1481): record a durable
@@ -7528,30 +7714,14 @@ impl Engine {
             self.process_quarantine_offheap_orphan(log, instance_key);
             return;
         }
-        let already_raised = self.state.incidents.values().any(|i| {
-            i.instance_key == instance_key
-                && i.state == state::IncidentState::Active
-                && i.kind == state::IncidentKind::VariablesLost
-        });
-        if already_raised {
+        if self.has_active_variables_lost(instance_key) {
             return;
         }
-        let incident_key = self.mint_key();
-        self.emit(
+        self.emit_variables_lost(
             log,
-            Event::IncidentRaised {
-                incident_key,
-                instance_key,
-                element_instance_key: instance_key,
-                element_id: String::new(),
-                kind: state::IncidentKind::VariablesLost,
-                redrive: None,
-                reason: "variables lost: cold instance row missing from the spill store; \
-                         the whole instance is unrecoverable"
-                    .to_string(),
-                job_key: None,
-                created_at: self.now,
-            },
+            instance_key,
+            String::new(),
+            COLD_ORPHAN_REASON.to_string(),
         );
     }
 

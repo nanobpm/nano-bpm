@@ -112,6 +112,7 @@ pub use command::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
     GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
 };
+pub use command::{OrphanIncidentStamp, OrphanKind};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::SNAPSHOT_FORMAT_VERSION;

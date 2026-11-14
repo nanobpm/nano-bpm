@@ -16,7 +16,7 @@
 //! only durable business facts keeps the log small and gives a clean recovery
 //! semantic — after a restart, workers simply re-activate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key,
+    ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
     ProcessInstance, State, Value,
 };
 use tokio::sync::oneshot;
@@ -163,6 +163,90 @@ enum OrphanPolicy {
     Quarantine,
 }
 
+/// The engine-actor → Raft-leader propose channel (#1447): how a journal
+/// running under replicated (Raft) apply hands a detected off-heap orphan to
+/// the replication layer so the LEADER proposes it as a STAMPED
+/// [`Command::QuarantineOffheapOrphan`] (see [`OrphanIncidentStamp`]) — every
+/// replica then applies the identical incident (no replica-local repair, #1574),
+/// instead of minting a replica-local incident (which diverges
+/// replicas whose spill state differs, the #1384 review finding).
+///
+/// The hook is invoked on the single-writer engine actor thread, so it must be
+/// cheap and non-blocking: enqueue onto a channel the replication layer drains
+/// asynchronously. A report stays in the journal's backlog until the stamped
+/// command APPLIES (or the leader resolves that nothing is to be proposed); a
+/// refused enqueue or a failed proposal ([`Journal::orphan_proposal_failed`])
+/// is retried by the next [`Journal::drain_orphan_backlog`].
+///
+/// [`OrphanIncidentStamp`]: nanobpmn_engine_core::OrphanIncidentStamp
+pub trait OrphanSink: Send + Sync {
+    /// Queues `instance_key` (lost from tier `kind`) for a leader-proposed
+    /// quarantine. Returns `false` when the queue cannot accept it right now
+    /// (channel closed / shutting down) — the key stays in the backlog.
+    fn enqueue_orphan(&self, instance_key: Key, kind: OrphanKind) -> bool;
+}
+
+/// Definitive off-heap absences discovered OFF the engine's `&mut` path — a
+/// strict (`&self`) snapshot fold, or the off-thread Raft snapshot writer
+/// ([`crate::snapstream::SpillStores::absences`]) — awaiting hand-off to the
+/// orphan backlog (#1447). Shared by `Arc`; absorbed on the engine actor by
+/// [`Journal::drain_orphan_backlog`] and after every strict capture.
+#[derive(Clone, Default)]
+pub struct OrphanInbox(Arc<Mutex<BTreeMap<Key, OrphanKind>>>);
+
+impl OrphanInbox {
+    /// Records a definitively-absent row for `key` (idempotent).
+    pub fn record(&self, key: Key, kind: OrphanKind) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, kind);
+    }
+
+    fn take(&self) -> BTreeMap<Key, OrphanKind> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn forget(&self, key: Key) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
+    /// Whether `key` currently has a recorded absence (test/diagnostic read).
+    pub fn contains(&self, key: Key) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+    }
+}
+
+/// The leader-propose reporting state for off-heap orphans under replicated
+/// apply (#1447), grouped so every journal constructor seeds it identically.
+#[derive(Default)]
+struct OrphanReporting {
+    /// Wired by the replication layer when this journal drives a Raft state
+    /// machine; `None` parks every report in the backlog.
+    sink: Option<Arc<dyn OrphanSink>>,
+    /// Whether this replica currently leads its Raft partition (only the
+    /// leader proposes). Written by the replication layer's leadership watcher.
+    leader: bool,
+    /// Every reported orphan whose stamped quarantine has NOT yet applied here,
+    /// in key order (deterministic drain, deduped detections). Entries leave
+    /// only when the stamped command applies or the leader resolves there is
+    /// nothing to propose — never on a mere enqueue (a lost proposal must
+    /// not lose the report).
+    backlog: BTreeMap<Key, OrphanKind>,
+    /// Backlog keys currently handed to the sink and awaiting their proposal's
+    /// outcome — not re-enqueued until it fails ([`Journal::orphan_proposal_failed`])
+    /// or leadership changes.
+    in_flight: BTreeSet<Key>,
+    /// Off-`&mut` discoveries awaiting absorption into `backlog`.
+    inbox: OrphanInbox,
+}
+
 /// Blocking-key tracking for the snapshot fold (#1385). A fail-closed fold
 /// aborts at the first unreadable payload; that key is recorded as the current
 /// blocker and its ERROR is logged once per outage (until a fold succeeds)
@@ -267,10 +351,13 @@ pub struct Journal {
     snapshot_blockers: SnapshotBlockers,
     /// `true` when this journal's commands are applied as replicated (Raft)
     /// state-machine application (#1384). There, a quarantine discovered while
-    /// applying a command must stay deterministic across replicas, so it is
-    /// observed (log + metric) only and never raises the `VariablesLost`
-    /// incident (which would mint a replica-local key + wall-clock timestamp).
+    /// applying a command must stay deterministic across replicas, so the
+    /// incident is never raised inline (which would mint a replica-local key +
+    /// wall-clock timestamp); it is reported to the Raft LEADER, which proposes a
+    /// stamped, replica-independent quarantine (#1447).
     replicated_apply: bool,
+    /// Leader-propose reporting of orphans found under replicated apply (#1447).
+    orphans: OrphanReporting,
     /// Per-job-type rotation cursor for cold activation candidates (#1388): the
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
@@ -1057,6 +1144,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1093,6 +1181,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1161,6 +1250,7 @@ impl Journal {
         if let Some(cold) = self.cold.as_mut() {
             cold.index = ColdIndex::default();
         }
+        self.discard_orphan_reports();
         self.fresh = false;
     }
 
@@ -1198,6 +1288,8 @@ impl Journal {
         // whole completed history resident indefinitely (the boot path runs the
         // same post-catch-up `evict_completed` for the same reason).
         self.engine.evict_completed();
+        // Orphan reports describe the superseded engine (#1574 review).
+        self.discard_orphan_reports();
         // The rebuild IS the durable state: the fence and any armed (aborted)
         // raft-entry buffer are predecessor state that must not outlive it.
         self.raft_entry = None;
@@ -1257,6 +1349,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1297,6 +1390,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1342,6 +1436,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1382,6 +1477,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
+            orphans: OrphanReporting::default(),
             activation_cursor: HashMap::new(),
             raft_entry: None,
             fenced: false,
@@ -1473,11 +1569,224 @@ impl Journal {
     /// forget all target this store instead of the destructive spill cache. Set
     /// before serving.
     /// Marks this journal as applied under replicated (Raft) state-machine
-    /// application (#1384): command-path off-heap-orphan quarantines are then
-    /// observed only (log + metric) instead of raising a non-deterministic
-    /// durable incident.
+    /// application (#1384): command-path off-heap-orphan quarantines never raise
+    /// the durable incident inline (that would mint a replica-local key +
+    /// wall-clock timestamp and diverge replicas whose spill state differs).
+    /// With an [`orphan_sink`](Self::set_orphan_sink) wired (#1447) the orphan is
+    /// handed to the Raft leader for a replicated re-propose instead; without
+    /// one it is observed (log + metric) only.
     pub fn set_replicated_apply(&mut self, replicated: bool) {
         self.replicated_apply = replicated;
+    }
+
+    /// Wires the engine-actor → Raft-leader propose channel (#1447). Called by
+    /// the replication layer when this journal drives a Raft state machine.
+    pub fn set_orphan_sink(&mut self, sink: Arc<dyn OrphanSink>) {
+        self.orphans.sink = Some(sink);
+        self.orphans.in_flight.clear();
+        self.drain_orphan_backlog();
+    }
+
+    /// The shared inbox an off-thread snapshot writer records definitive
+    /// absences into (#1447, see [`OrphanInbox`]).
+    pub fn orphan_inbox(&self) -> OrphanInbox {
+        self.orphans.inbox.clone()
+    }
+
+    /// Publishes this replica's current leadership of its Raft partition
+    /// (#1447). Any change forgets the in-flight set (a former leader's
+    /// proposals may never land; a new leader owns no proposals yet), and a
+    /// promotion drains the backlog immediately.
+    pub fn set_orphan_leadership(&mut self, leader: bool) {
+        if self.orphans.leader != leader {
+            self.orphans.in_flight.clear();
+        }
+        self.orphans.leader = leader;
+        if leader {
+            self.drain_orphan_backlog();
+        }
+    }
+
+    /// Absorbs the [`OrphanInbox`] into the backlog, then (leader + sink only)
+    /// hands every backlog key not already in flight to the sink, in key
+    /// order. Keys stay in the backlog until their stamped command applies.
+    /// Returns the number of keys newly enqueued.
+    pub fn drain_orphan_backlog(&mut self) -> usize {
+        for (key, kind) in self.orphans.inbox.take() {
+            // Off-thread (streaming-snapshot) discoveries are revalidated against
+            // CURRENT routing before parking (#1574 review): the capture may have
+            // referenced a spill/cold row that a later command rehydrated and
+            // deleted before the writer read it, so the writer's miss can be
+            // stale. In-apply detections (restore / fold) run on the actor and
+            // are already current, so they park directly.
+            self.park_orphan_revalidated(key, kind, "off-thread snapshot");
+        }
+        // A key whose incident already landed here needs no proposal.
+        let resolved: Vec<Key> = self
+            .orphans
+            .backlog
+            .keys()
+            .copied()
+            .filter(|k| self.engine.has_active_variables_lost(*k))
+            .collect();
+        for key in resolved {
+            self.orphans.backlog.remove(&key);
+            self.orphans.in_flight.remove(&key);
+        }
+        if !self.orphans.leader {
+            return 0;
+        }
+        let Some(sink) = self.orphans.sink.clone() else {
+            return 0;
+        };
+        let mut enqueued = 0;
+        let pending: Vec<(Key, OrphanKind)> = self
+            .orphans
+            .backlog
+            .iter()
+            .filter(|(k, _)| !self.orphans.in_flight.contains(k))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        for (key, kind) in pending {
+            if !sink.enqueue_orphan(key, kind) {
+                break; // channel closed: everything stays parked
+            }
+            self.orphans.in_flight.insert(key);
+            enqueued += 1;
+        }
+        enqueued
+    }
+
+    /// The replication layer's proposal for `key` failed (leadership lost,
+    /// batcher teardown, rejected): it stays in the backlog and is re-enqueued
+    /// by the next drain (#1447).
+    pub fn orphan_proposal_failed(&mut self, key: Key) {
+        self.orphans.in_flight.remove(&key);
+    }
+
+    /// The leader resolved that `key` needs no proposal (already incidented or
+    /// terminal in its state, [`Engine::orphan_incident_stamp`] → `None`): the
+    /// report is settled (#1447).
+    pub fn orphan_proposal_settled(&mut self, key: Key) {
+        self.orphans.in_flight.remove(&key);
+        self.orphans.backlog.remove(&key);
+    }
+
+    /// Orphan keys reported but whose stamped quarantine has not applied here
+    /// yet, in key order (#1447).
+    pub fn orphan_backlog(&self) -> Vec<Key> {
+        self.orphans.backlog.keys().copied().collect()
+    }
+
+    /// Discards every pending orphan report — backlog, in-flight set, and the
+    /// off-thread inbox — on ENGINE ADOPTION (snapshot install or durable
+    /// rebuild, #1574 review). Every report was detected against the
+    /// superseded engine's off-heap routing; the adopted engine is
+    /// self-contained, so a stale report proposed after promotion would stamp a
+    /// false `VariablesLost` incident on a healthy instance. A proposal already
+    /// queued in the sink is dropped too: [`orphan_pending_stamp`](Self::orphan_pending_stamp)
+    /// stamps only keys still in the backlog. A genuine loss in the adopted
+    /// state is re-detected afresh by its next restore/fold.
+    fn discard_orphan_reports(&mut self) {
+        self.orphans.backlog.clear();
+        self.orphans.in_flight.clear();
+        let _ = self.orphans.inbox.take();
+    }
+
+    /// The leader's stamp for a queued orphan proposal (#1447): `None` when the
+    /// report is no longer pending here (settled, or discarded on engine
+    /// adoption — the queued item is stale and must not be proposed);
+    /// `Some(stamp)` otherwise, where `stamp` is
+    /// [`Engine::orphan_incident_stamp`] (`None` = nothing to propose).
+    pub fn orphan_pending_stamp(
+        &self,
+        key: Key,
+        kind: OrphanKind,
+    ) -> Option<Option<nanobpmn_engine_core::OrphanIncidentStamp>> {
+        self.orphans
+            .backlog
+            .contains_key(&key)
+            .then(|| self.engine.orphan_incident_stamp(key, kind))
+    }
+
+    /// Adds a report to the backlog (deduped; counted once per new report).
+    fn park_orphan(&mut self, key: Key, kind: OrphanKind, context: &str) {
+        if self.engine.has_active_variables_lost(key) {
+            return;
+        }
+        if self.orphans.backlog.insert(key, kind).is_none() {
+            crate::metrics::record_offheap_orphan_unreported();
+            tracing::error!(
+                instance_key = key,
+                ?kind,
+                leader = self.orphans.leader,
+                backlog = self.orphans.backlog.len(),
+                "{context}: off-heap orphan detected during replicated apply; \
+                 VariablesLost incident deferred to a leader-proposed stamped \
+                 QuarantineOffheapOrphan (#1447)"
+            );
+        }
+    }
+
+    /// [`park_orphan`](Self::park_orphan) for an OFF-THREAD (streaming-snapshot)
+    /// discovery, which can be stale (#1574 review): the capture referenced a
+    /// spill/cold row that a later command rehydrated and deleted before the
+    /// writer read it, so the writer's miss may describe a legitimately-gone row
+    /// rather than a lost payload. The report is revalidated against CURRENT
+    /// routing and parked only when the row is still DEFINITIVELY absent
+    /// (`Ok(None)`); a now-readable payload (`Ok(Some)`), a spill flag that has
+    /// since cleared, or a merely UNREADABLE row (`Err` — possibly transient,
+    /// fail closed) drops the report instead of quarantining an intact instance.
+    fn park_orphan_revalidated(&mut self, key: Key, kind: OrphanKind, context: &str) {
+        let still_absent = match kind {
+            // A resident report is stale once the instance is no longer spilled
+            // (a later command rehydrated it) — there is no outstanding loss.
+            OrphanKind::Resident if !self.engine.is_variables_spilled(key) => false,
+            OrphanKind::Resident => matches!(self.peek_spilled_variables(key), Ok(None)),
+            // A cold report is stale once the key has left the cold index (a
+            // successful rehydrate_cold removed it AND its row): the miss then
+            // describes a legitimately-consumed row, not a lost payload (#1574).
+            OrphanKind::Cold
+                if !self
+                    .cold
+                    .as_ref()
+                    .is_some_and(|cold| cold.index.contains(key)) =>
+            {
+                false
+            }
+            OrphanKind::Cold => matches!(self.peek_cold_instance(key), Ok(None)),
+        };
+        if !still_absent {
+            tracing::info!(
+                instance_key = key,
+                ?kind,
+                "{context}: off-heap orphan report is stale (payload since rehydrated \
+                 or only transiently unreadable); not quarantining an intact instance"
+            );
+            return;
+        }
+        self.park_orphan(key, kind, context);
+    }
+
+    /// Routes an orphan detected under replicated apply to the leader-propose
+    /// channel (#1447): parked in the backlog, then drained (a no-op on a
+    /// follower or with no sink wired). The apply itself stays deterministic —
+    /// no key is minted and no event emitted here.
+    fn report_orphan_for_replication(&mut self, key: Key, kind: OrphanKind, context: &str) {
+        self.park_orphan(key, kind, context);
+        self.drain_orphan_backlog();
+    }
+
+    /// Settles the replica-local orphan report once a STAMPED
+    /// `QuarantineOffheapOrphan` for `key` applies (#1447). Proposal bookkeeping
+    /// only: it touches no engine state and no off-heap row. The
+    /// payload-carrying repair (variable install, spill/cold row forget) was
+    /// dropped (#1574) because it was not replica-deterministic; deterministic
+    /// apply-time repair is the #1447 follow-up.
+    fn settle_orphan_report(&mut self, key: Key) {
+        self.orphans.backlog.remove(&key);
+        self.orphans.in_flight.remove(&key);
+        self.orphans.inbox.forget(key);
     }
 
     pub fn set_varstore(&mut self, store: Arc<VarStore>) {
@@ -1796,12 +2105,15 @@ impl Journal {
                 // `raise_quarantine_incident` routes it through
                 // `QuarantineColdOrphan` while the key is still indexed and
                 // drops the entry on success. Under replicated (Raft) apply a
-                // locally minted incident would diverge replicas, so observe
-                // only (same rule as the resident quarantine path, #1384).
-                // On a failed raise the entry is KEPT so the sealing fold
-                // retries the incident rather than losing it.
+                // locally minted incident would diverge replicas, so the orphan
+                // goes to the leader-propose channel instead (#1447; same rule
+                // as the resident quarantine path, #1384). The index entry is
+                // still dropped — the loss is durably reported by the
+                // replicated incident, and keeping the entry would re-quarantine
+                // on every poll. A failed enqueue keeps the key in the orphan
+                // backlog, so the next drain retries the report.
                 if self.strict_cold_reads() {
-                    crate::metrics::record_offheap_orphan_unreported();
+                    self.report_orphan_for_replication(key, OrphanKind::Cold, "cold rehydration");
                     if let Some(cold) = self.cold.as_mut() {
                         cold.index.remove(key);
                     }
@@ -2540,7 +2852,19 @@ impl Journal {
             command,
             Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
         ) || command.routed_delivery_key().is_some();
+        // A STAMPED orphan quarantine (#1447) settles this replica's pending
+        // report for the key once it applies (dup or not).
+        let orphan_settled = match &command {
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: Some(_),
+            } => Some(*instance_key),
+            _ => None,
+        };
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
+        if let Some(key) = orphan_settled {
+            self.settle_orphan_report(key);
+        }
         let mut activated: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -3172,16 +3496,13 @@ impl Journal {
                 // Under replicated (Raft) application this path runs inside the
                 // state machine: raising the incident here would mint a
                 // replica-local key and stamp wall-clock time, diverging replicas
-                // whose spill state differs. Observe only (#1384; the
-                // leader-propose redesign is tracked separately).
+                // whose spill state differs. Hand the orphan to the leader-propose
+                // channel instead (#1447): the Raft leader re-proposes it as a
+                // `QuarantineOffheapOrphan` with a replicated timestamp, so every
+                // replica applies the identical incident. A follower (or an
+                // unwired sink) parks the key in the backlog for the next drain.
                 if self.replicated_apply {
-                    crate::metrics::record_offheap_orphan_unreported();
-                    tracing::error!(
-                        instance_key,
-                        "{context}: off-heap orphan quarantined during replicated \
-                         apply; VariablesLost incident NOT raised (replica \
-                         determinism) — observed only"
-                    );
+                    self.report_orphan_for_replication(instance_key, OrphanKind::Resident, context);
                     return Ok(());
                 }
                 // Raise the durable incident (#1384) — idempotent, so
@@ -3435,11 +3756,24 @@ impl Journal {
         // Under replicated (Raft) application the classic rotation still runs on
         // the Raft-owned actor, but raising an incident here would mint a
         // replica-local key + wall-clock stamp outside any Raft proposal and
-        // diverge replicas (#1384 review). Capture STRICT there instead: an
-        // orphan aborts the rotation, exactly like the Raft snapshot builder,
-        // until the leader-propose redesign (#1447) lands.
+        // diverge replicas (#1384 review). Route each orphan to the
+        // leader-propose channel instead (#1447) and capture STRICT: the orphan
+        // aborts this rotation (exactly like the Raft snapshot builder) and the
+        // leader's replicated incident lands on every replica. Reporting does
+        // NOT unblock rotation: the incident leaves `variables_spilled` and the
+        // off-heap rows untouched, so subsequent strict captures stay blocked
+        // for a snapshot-only orphan until the deterministic apply-time repair
+        // lands (#1587). The loss is reported without a replicated transition
+        // ever discarding state.
         if self.replicated_apply {
-            return self.try_engine_snapshot();
+            // A strict fold records the aborting absence in the orphan inbox
+            // BEFORE returning `None`, so it is reported even though the
+            // capture fails (#1447 review): drain it before propagating.
+            let mut snap = self.engine.snapshot();
+            let folded = self.fold_offheap_into(&mut snap, OrphanPolicy::Strict);
+            self.drain_orphan_backlog();
+            folded?;
+            return Some(snap);
         }
         let mut snap = self.engine.snapshot();
         let orphans = self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
@@ -3498,7 +3832,10 @@ impl Journal {
         let command = if cold {
             Command::QuarantineColdOrphan { instance_key: key }
         } else {
-            Command::QuarantineOffheapOrphan { instance_key: key }
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: None,
+            }
         };
         match self.engine.apply_command_at(command, now_millis()) {
             Ok(events) => {
@@ -3579,6 +3916,11 @@ impl Journal {
                         "snapshot (strict): spilled instance has no variable row; aborting \
                          this snapshot",
                     );
+                    // Definitive absence: report it (#1447) even though the
+                    // strict capture fails.
+                    self.orphans
+                        .inbox
+                        .record(instance.key, OrphanKind::Resident);
                     return None;
                 }
                 // Unreadable (SQLite/IO/decode): possibly transient — fail closed
@@ -3846,6 +4188,9 @@ impl Journal {
                         None,
                         "snapshot (strict): cold instance has no row; aborting this snapshot",
                     );
+                    // Definitive absence: report it (#1447) even though the
+                    // strict capture fails.
+                    self.orphans.inbox.record(key, OrphanKind::Cold);
                     return None;
                 }
                 // Unreadable: possibly transient — fail closed and retry.
@@ -3916,6 +4261,18 @@ impl Journal {
             cold: self.cold.as_ref().map(|c| Arc::clone(&c.store)),
             spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
             varstore: self.varstore.as_ref().map(Arc::clone),
+            // Legacy fallback for a lean var-store miss (#1574 review): the same
+            // spill-or-cold tier `peek_spilled_variables` consults before it
+            // refuses to declare a loss.
+            legacy: self
+                .spill
+                .as_ref()
+                .map(|s| Arc::clone(&s.store))
+                .or_else(|| self.cold.as_ref().map(|c| Arc::clone(&c.store))),
+            // Under replicated apply this capture feeds the off-thread Raft
+            // snapshot writer: a definitive absence it hits is reported to the
+            // leader-propose machinery (#1447) before the build fails closed.
+            absences: self.replicated_apply.then(|| self.orphans.inbox.clone()),
         };
         Some((
             crate::snapstream::StreamingCapture { control, resident },
@@ -3992,11 +4349,17 @@ impl Journal {
                 // Don't restore the (possibly stale) legacy row; just refuse to
                 // call the payload lost while it still exists.
                 None => match legacy {
-                    Some(store) => match store.try_get(key).map_err(|e| e.to_string())? {
-                        Some(_) => Err("var store has no row but a legacy spill row exists \
-                                        (unmigrated lean-over-legacy state)"
+                    // Either legacy table (spill row OR whole-instance cold row)
+                    // keeps the payload alive (#1574 review) — the same check the
+                    // streaming writer makes (`try_has_legacy_payload`).
+                    Some(store) => match store
+                        .try_has_legacy_payload(key)
+                        .map_err(|e| e.to_string())?
+                    {
+                        true => Err("var store has no row but a legacy spill/cold row exists \
+                                     (unmigrated lean-over-legacy state)"
                             .to_string()),
-                        None => Ok(None),
+                        false => Ok(None),
                     },
                     // No legacy tier to check: an empty var store cannot prove
                     // a lean-over-legacy placeholder's payload is gone — fail
@@ -4127,8 +4490,10 @@ impl Journal {
     /// closed (`None` — abort before the seal, retry next tick). A DEFINITIVELY
     /// ABSENT row is quarantined and its `VariablesLost` incident journaled
     /// before the seal (local policy; under replicated apply the capture is
-    /// STRICT — an orphan aborts the rotation, #1384). Returns the cold keys
-    /// proven absent (to be excluded from the streaming write).
+    /// STRICT — an orphan aborts the rotation, #1384 — but is first handed to
+    /// the leader-propose channel so the loss is reported by a replicated
+    /// incident, #1447). Returns the cold keys proven absent (to be excluded
+    /// from the streaming write).
     fn validate_offheap_for_streaming(&mut self) -> Option<Vec<Key>> {
         use std::collections::HashSet;
         let strict = self.replicated_apply;
@@ -4166,6 +4531,9 @@ impl Journal {
                         "snapshot (strict): spilled instance has no variable row; aborting \
                          this snapshot",
                     );
+                    // Under replicated apply the strict capture aborts, but the
+                    // definitive absence is still reported (#1447).
+                    self.report_orphan_for_replication(key, OrphanKind::Resident, "snapshot");
                     return None;
                 }
                 Err(err) => {
@@ -4204,6 +4572,7 @@ impl Journal {
                         None,
                         "snapshot (strict): cold instance has no row; aborting this snapshot",
                     );
+                    self.report_orphan_for_replication(key, OrphanKind::Cold, "snapshot");
                     return None;
                 }
                 Err(err) => {
@@ -4380,10 +4749,15 @@ impl Journal {
         // A definitively-absent cold row (#1481): journal its durable
         // `VariablesLost` incident BEFORE the seal, then recapture so the sealed
         // checkpoint carries it (the orphan leaves the cold index once recorded,
-        // so the recapture cannot re-quarantine it). Under replicated apply,
-        // abort instead (see `try_engine_snapshot_quarantining_with_incidents`).
+        // so the recapture cannot re-quarantine it). Under replicated apply the
+        // checkpoint aborts (the orphan's row cannot be folded in), but the
+        // orphan is first handed to the leader-propose channel so the loss is
+        // still reported by a replicated incident (#1447).
         if !cold_orphans.is_empty() {
             if self.replicated_apply {
+                for key in cold_orphans {
+                    self.report_orphan_for_replication(key, OrphanKind::Cold, "lean snapshot");
+                }
                 return None;
             }
             drop(snap);
@@ -6745,6 +7119,413 @@ mod tests {
         let _ = std::fs::remove_dir_all(empty_path.parent().unwrap());
     }
 
+    /// Test sink capturing every enqueued orphan key (#1447).
+    #[derive(Default)]
+    struct RecordingSink {
+        enqueued: Mutex<Vec<(Key, OrphanKind)>>,
+        /// When `true`, `enqueue_orphan` refuses (simulating a closed channel).
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingSink {
+        fn keys(&self) -> Vec<Key> {
+            self.enqueued
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(k, _)| *k)
+                .collect()
+        }
+    }
+
+    impl OrphanSink for RecordingSink {
+        fn enqueue_orphan(&self, instance_key: Key, kind: OrphanKind) -> bool {
+            if self.refuse.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.enqueued
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((instance_key, kind));
+            true
+        }
+    }
+
+    /// The stamped quarantine the leader would propose for `key` (#1447).
+    fn stamped_quarantine(journal: &Journal, key: Key, kind: OrphanKind) -> Command {
+        Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: journal.engine().orphan_incident_stamp(key, kind),
+        }
+    }
+
+    // #1447: an orphan detected during replicated apply on the LEADER is handed
+    // to the propose channel immediately (never raised inline, so the apply
+    // stays deterministic) — but stays in the backlog until its stamped
+    // quarantine APPLIES (an enqueue is not a delivery).
+    #[test]
+    fn replicated_orphan_on_leader_is_enqueued_and_kept_until_applied() {
+        let path = restart_store_path("orphan-propose-leader-1447");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(
+            journal.quarantined_orphans(),
+            vec![keys[0]],
+            "loss observed"
+        );
+        assert!(journal.incidents().is_empty(), "no replica-local incident");
+        assert_eq!(
+            *sink.enqueued.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![(keys[0], OrphanKind::Resident)],
+            "the leader hands the orphan (and its kind) to the propose channel"
+        );
+        assert_eq!(
+            journal.orphan_backlog(),
+            vec![keys[0]],
+            "kept until applied"
+        );
+        // In flight: a repeat drain does not double-enqueue.
+        assert_eq!(journal.drain_orphan_backlog(), 0);
+
+        let command = stamped_quarantine(&journal, keys[0], OrphanKind::Resident);
+        let (_events, commit) = journal.apply_command_at(command, 42).unwrap();
+        commit.blocking_wait();
+        assert_eq!(journal.incidents().len(), 1, "replicated incident applied");
+        assert!(journal.orphan_backlog().is_empty(), "settled on apply");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1447 review: a proposal that FAILS (leadership lost mid-flight) must not
+    // lose the report — it stays parked and the next drain re-enqueues it; a
+    // leadership change forgets the in-flight set so the new leader re-proposes.
+    #[test]
+    fn failed_orphan_proposal_is_reenqueued_by_the_next_drain() {
+        let path = restart_store_path("orphan-propose-failed-1447");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(sink.keys(), vec![keys[0]]);
+
+        journal.orphan_proposal_failed(keys[0]);
+        assert_eq!(
+            journal.drain_orphan_backlog(),
+            1,
+            "re-enqueued after failure"
+        );
+        assert_eq!(sink.keys(), vec![keys[0], keys[0]]);
+
+        // Leadership flaps: the in-flight proposal of the old term may never
+        // land, so the regained leadership re-proposes it.
+        journal.set_orphan_leadership(false);
+        journal.set_orphan_leadership(true);
+        assert_eq!(sink.keys(), vec![keys[0], keys[0], keys[0]]);
+
+        // The leader resolves nothing is left to propose: settled.
+        journal.orphan_proposal_settled(keys[0]);
+        assert!(journal.orphan_backlog().is_empty());
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1447: a FOLLOWER parks the orphan; a refused enqueue keeps it parked;
+    // promotion drains it in key order; an orphan whose incident has since
+    // landed is dropped from the backlog instead of being re-proposed.
+    #[test]
+    fn replicated_orphan_on_follower_parks_then_drains_on_promotion() {
+        let path = restart_store_path("orphan-propose-follower-1447");
+        let (mut journal, keys) = spilled_journal(&path, 2);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&keys).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 2, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), keys, "both parked (key order)");
+        assert!(sink.keys().is_empty());
+
+        sink.refuse.store(true, Ordering::Relaxed);
+        journal.set_orphan_leadership(true);
+        assert!(sink.keys().is_empty(), "refused enqueue keeps the backlog");
+        assert_eq!(journal.orphan_backlog().len(), 2);
+
+        sink.refuse.store(false, Ordering::Relaxed);
+        let command = stamped_quarantine(&journal, keys[0], OrphanKind::Resident);
+        let (_events, commit) = journal.apply_command_at(command, 42).unwrap();
+        commit.blocking_wait();
+        assert_eq!(journal.drain_orphan_backlog(), 1, "one already settled");
+        assert_eq!(sink.keys(), vec![keys[1]]);
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1447: without a wired sink the orphan is still parked, and wiring the
+    // sink later (with leadership) reports it.
+    #[test]
+    fn replicated_orphan_without_sink_parks_for_later_drain() {
+        let path = restart_store_path("orphan-propose-unsunk-1447");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert!(journal.incidents().is_empty());
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]]);
+
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_leadership(true);
+        journal.set_orphan_sink(sink.clone());
+        assert_eq!(
+            sink.keys(),
+            vec![keys[0]],
+            "wiring drains the parked orphan"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1447 review: under replicated apply the classic rotation captures
+    // STRICT and aborts on an absent row — the absence must still be reported
+    // before the capture returns `None`.
+    #[test]
+    fn strict_replicated_rotation_reports_the_orphan_before_aborting() {
+        let path = restart_store_path("orphan-strict-rotation-1447");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        assert!(
+            journal
+                .try_engine_snapshot_quarantining_with_incidents()
+                .is_none(),
+            "strict capture aborts"
+        );
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "but reports it");
+        assert!(journal.incidents().is_empty(), "nothing minted locally");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 (scope B): the stamped quarantine is replica-deterministic. Applied
+    // on a replica where the instance is resident-spilled and on one where it
+    // is cold, it yields identical events and incidents, and it leaves every
+    // off-heap reference intact (no row forget, no cold-index drop, no spill
+    // flag clear) — cold rows are never discarded. Rehydrating the cold
+    // replica then yields the same instance state as the resident one.
+    #[test]
+    fn stamped_quarantine_converges_resident_and_cold_replicas() {
+        let resident_path = restart_store_path("orphan-converge-resident-1447");
+        let cold_path = restart_store_path("orphan-converge-cold-1447");
+        let (mut resident, keys) = spilled_journal(&resident_path, 1);
+        // The cold replica applied the SAME commands, then tiered the
+        // instance wholly off-heap.
+        let mut cold = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap());
+        cold.set_cold_spill(store, 1, 0);
+        let _ = cold.apply_command(Command::DeployProcess(demo())).unwrap();
+        let vars = std::collections::HashMap::from([(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("payload-0".into()),
+        )]);
+        let (events, _) = cold
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let cold_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(keys[0], cold_key, "same deterministic key on both replicas");
+        assert_eq!(cold.force_cold_spill_all(), 1);
+        resident.set_replicated_apply(true);
+        cold.set_replicated_apply(true);
+
+        let command = stamped_quarantine(&resident, keys[0], OrphanKind::Resident);
+        let (on_resident, commit) = resident.apply_command_at(command.clone(), 42).unwrap();
+        commit.blocking_wait();
+        let (on_cold, commit) = cold.apply_command_at(command, 42).unwrap();
+        commit.blocking_wait();
+        assert_eq!(on_resident, on_cold, "identical events on both replicas");
+        let incidents = |j: &Journal| {
+            let mut v = j
+                .state()
+                .incidents
+                .values()
+                .map(|i| (i.key, i.instance_key, i.created_at, i.reason.clone()))
+                .collect::<Vec<_>>();
+            v.sort();
+            v
+        };
+        assert_eq!(incidents(&resident).len(), 1);
+        assert_eq!(
+            resident.state().variables_lost_quarantined,
+            cold.state().variables_lost_quarantined,
+            "identical tombstones"
+        );
+        // No replica-local repair: references intact on both replicas.
+        assert!(
+            resident.engine.is_variables_spilled(keys[0]),
+            "resident spill reference kept"
+        );
+        assert_eq!(raw_row_count(&resident_path, "spill", keys[0]), 1);
+        assert_eq!(cold.cold_count(), 1, "cold row never forgotten");
+
+        // Rehydrate both replicas through a command touching the instance:
+        // identical post-state and incidents.
+        for j in [&mut resident, &mut cold] {
+            let _ = j.activate_jobs("demo-work", "w", 1, 60_000, 50);
+        }
+        assert_eq!(
+            incidents(&resident),
+            incidents(&cold),
+            "identical incidents"
+        );
+        let view = |j: &Journal| {
+            let inst = j.engine().instance(keys[0]).expect("resident");
+            (inst.variables.as_ref().clone(), inst.state)
+        };
+        assert_eq!(view(&resident), view(&cold), "identical instance state");
+        drop(resident);
+        drop(cold);
+        let _ = std::fs::remove_dir_all(resident_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(cold_path.parent().unwrap());
+    }
+
+    // #1574 review: a stale off-thread discovery must not quarantine an intact
+    // instance. A streaming capture can reference a spill row that a later
+    // command rehydrates and deletes before the writer reads it; the writer's
+    // miss then describes a legitimately-gone row, not a loss. `park_orphan`
+    // revalidates against current routing, so the stale report is dropped.
+    #[test]
+    fn stale_orphan_report_after_rehydration_is_not_quarantined() {
+        let path = restart_store_path("orphan-stale-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let key = keys[0];
+        // The capture records the absence into the inbox while the instance is
+        // still spilled (as the off-thread writer would on a miss).
+        journal.orphans.inbox.record(key, OrphanKind::Resident);
+        // Before the drain, a later command rehydrates the instance (its row is
+        // consumed and the spill flag clears) — the report is now stale.
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(jobs.len(), 1, "rehydrated for activation");
+        assert!(!journal.engine.is_variables_spilled(key), "flag cleared");
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "the stale report is not parked"
+        );
+        assert!(
+            journal.incidents().is_empty(),
+            "no VariablesLost incident for an intact instance"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: a still-spilled instance whose row is only UNREADABLE (not
+    // definitively absent) must not be quarantined off a stale report either —
+    // fail closed and keep it for a later, accurate detection.
+    #[test]
+    fn unreadable_orphan_report_is_not_quarantined() {
+        let path = restart_store_path("orphan-unreadable-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let key = keys[0];
+        corrupt_row(&path, "spill", "vars", key);
+        journal.orphans.inbox.record(key, OrphanKind::Resident);
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "an unreadable row is not a definitive absence"
+        );
+        assert!(journal.incidents().is_empty(), "no incident");
+        assert!(journal.engine.is_variables_spilled(key), "still spilled");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: a COLD off-thread (streaming-writer) report that arrives
+    // AFTER the instance was rehydrated out of the cold tier must not quarantine
+    // it. A successful `rehydrate_cold` removes BOTH the cold index entry and its
+    // stored row, so the writer's physical-row miss describes a
+    // legitimately-consumed row, not a lost payload. `park_orphan_revalidated`
+    // requires the key to still be in the cold index, so the stale report is
+    // dropped. Covers capture → cold rehydration → writer miss → drain.
+    #[test]
+    fn stale_cold_report_after_rehydration_is_not_quarantined() {
+        let path = restart_store_path("orphan-stale-cold-1574");
+        let (mut journal, key) = cold_file_journal(&path);
+        journal.set_replicated_apply(true);
+        assert_eq!(journal.cold_count(), 1, "precondition: cold");
+        // The off-thread writer records the cold miss into the inbox while the
+        // instance is still cold-indexed.
+        journal.orphans.inbox.record(key, OrphanKind::Cold);
+        // Before the drain, a command rehydrates the instance out of the cold
+        // tier: the index entry AND the row are consumed.
+        let _ = journal
+            .apply_command(Command::cancel_instance(key))
+            .unwrap();
+        assert_eq!(journal.cold_count(), 0, "rehydrated out of the cold tier");
+        assert!(
+            journal.instance(key).is_some() || journal.state().instances.contains_key(&key),
+            "instance resident again"
+        );
+
+        journal.drain_orphan_backlog();
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "the stale cold report is not parked"
+        );
+        assert!(
+            journal
+                .incidents()
+                .iter()
+                .all(|i| i.kind != nanobpmn_engine_core::IncidentKind::VariablesLost),
+            "no VariablesLost incident for a rehydrated instance"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1447 review: the Raft snapshot builder streams off-thread from the
+    // store handles; a definitive absence it hits must reach the orphan
+    // backlog (through the shared inbox) while the write still fails closed.
+    #[test]
+    fn off_thread_streaming_write_reports_definitive_absence() {
+        let path = restart_store_path("orphan-offthread-1447");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let (capture, cold_keys, stores) = journal.streaming_snapshot_parts().unwrap();
+        let out = path.with_file_name("raft-snap.stream");
+        let result = crate::snapstream::write_streaming_snapshot_from_stores(
+            &out, "{}", 0, None, capture, &cold_keys, stores, false,
+        );
+        assert!(result.is_err(), "fails closed");
+        assert!(journal.orphan_backlog().is_empty(), "not yet absorbed");
+        journal.drain_orphan_backlog();
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "reported");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn absent_spill_row_on_activation_is_quarantined() {
         let path = restart_store_path("absent-spill-1388");
@@ -7771,5 +8552,99 @@ mod tests {
         drop(rebooted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
+    }
+
+    // #1574 review: a lean var-store miss whose payload survives ONLY in the
+    // legacy tier's whole-instance COLD row (not its spill row) is not a loss.
+    // Both the inbox revalidation and the strict reconcile must consult both
+    // legacy tables (`try_has_legacy_payload`) before declaring `Ok(None)`.
+    #[test]
+    fn lean_over_legacy_cold_row_report_is_not_parked() {
+        let path = restart_store_path("orphan-lean-legacy-cold");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        // Borrow any cold row and store it under the spilled key, then drop
+        // the spill row: only the legacy COLD table holds a payload now.
+        let cold_path = restart_store_path("orphan-lean-legacy-cold-src");
+        let (cold_journal, cold_key) = cold_file_journal(&cold_path);
+        let cold_store = crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap();
+        let row = cold_store.try_get_cold(cold_key).unwrap().unwrap();
+        drop((cold_journal, cold_store));
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        store.put_cold(keys[0], &row).unwrap();
+        assert!(store.try_get(keys[0]).unwrap().is_none());
+
+        let vpath = restart_store_path("orphan-lean-legacy-cold-vs");
+        let mut rebooted = reboot_from(&path, legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+        rebooted.set_replicated_apply(true);
+
+        assert!(
+            rebooted.peek_spilled_variables(keys[0]).is_err(),
+            "not lost"
+        );
+        rebooted.orphans.inbox.record(keys[0], OrphanKind::Resident);
+        rebooted.drain_orphan_backlog();
+        assert!(rebooted.orphan_backlog().is_empty(), "stale report dropped");
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.incidents().is_empty());
+
+        drop((rebooted, store));
+        for p in [&path, &cold_path, &vpath] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    // #1574 review: a report parked against the superseded engine must not
+    // survive a healthy snapshot install — neither in the backlog (drained on
+    // promotion) nor as an already-queued proposal (stamped by the leader).
+    #[test]
+    fn orphan_reports_are_discarded_on_engine_adoption() {
+        let path = restart_store_path("orphan-adopt-1574");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        let healthy = journal.engine.snapshot();
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        // Follower detects the loss and parks it; an off-thread miss also waits
+        // in the inbox.
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "parked");
+        journal
+            .orphans
+            .inbox
+            .record(keys[0] + 1, OrphanKind::Resident);
+        assert!(
+            journal
+                .orphan_pending_stamp(keys[0], OrphanKind::Resident)
+                .is_some(),
+            "pending before adoption"
+        );
+
+        // A healthy, self-contained snapshot is installed.
+        journal.restore_engine_from_snapshot(healthy);
+        assert!(journal.orphan_backlog().is_empty(), "backlog discarded");
+        assert!(
+            !journal.orphans.inbox.contains(keys[0] + 1),
+            "inbox discarded"
+        );
+        assert!(
+            journal
+                .orphan_pending_stamp(keys[0], OrphanKind::Resident)
+                .is_none(),
+            "a queued stale proposal is not stamped"
+        );
+
+        // Promotion proposes nothing.
+        journal.set_orphan_leadership(true);
+        assert!(sink.keys().is_empty(), "nothing proposed after promotion");
+        assert!(journal.incidents().is_empty());
+        drop((journal, store));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

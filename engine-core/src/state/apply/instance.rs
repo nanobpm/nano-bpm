@@ -76,6 +76,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
                     suspended_at: None,
+                    terminated_epoch: 0,
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
@@ -253,7 +254,20 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // untouched (no record is created for an idempotent retry).
         Event::AgentHistoryDeduplicated { .. } => {}
 
+        // Off-heap orphan quarantine (#1574): record the replicated dedup
+        // tombstone only. Residency-independent, so every replica lands
+        // identically; no instance state is touched.
+        Event::VariablesLostQuarantined {
+            instance_key,
+            incident_key,
+        } => {
+            state
+                .variables_lost_quarantined
+                .insert(*instance_key, *incident_key);
+        }
+
         Event::ProcessInstanceCompleted { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
@@ -498,6 +512,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
             // gone the parked tokens are gone too, so `hasIncident` must clear.

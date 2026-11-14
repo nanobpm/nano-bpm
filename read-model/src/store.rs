@@ -7041,7 +7041,10 @@ fn project_event(
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
         | Event::VariableScopeCreated { .. }
-        | Event::VariableScopeDestroyed { .. } => {}
+        | Event::VariableScopeDestroyed { .. }
+        // Engine-internal quarantine dedup tombstone (#1574): the read model
+        // projects the companion `IncidentRaised`.
+        | Event::VariablesLostQuarantined { .. } => {}
     }
     Ok(delta)
 }
@@ -8289,6 +8292,7 @@ mod writability_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -8752,6 +8756,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -9014,6 +9019,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),

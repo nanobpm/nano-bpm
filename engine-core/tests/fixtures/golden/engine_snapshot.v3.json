@@ -642,6 +642,7 @@
         "state": "Suspended",
         "suspended_at": 1700000000007,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {
           "amount": {
             "Int": 999
@@ -677,6 +678,7 @@
         "state": "Completed",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 2,
         "variables": {},
         "variables_spilled": false
       },
@@ -725,6 +727,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       },
@@ -781,6 +784,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       },
@@ -841,6 +845,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       },
@@ -872,6 +877,7 @@
         "state": "Completed",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 3,
         "variables": {},
         "variables_spilled": false
       },
@@ -903,6 +909,7 @@
         "state": "Completed",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 1,
         "variables": {},
         "variables_spilled": false
       },
@@ -934,6 +941,7 @@
         "state": "Completed",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 4,
         "variables": {},
         "variables_spilled": false
       },
@@ -969,6 +977,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {
           "lang": {
             "Str": "xx"
@@ -1008,6 +1017,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       },
@@ -1041,6 +1051,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       },
@@ -1076,6 +1087,7 @@
         "state": "Active",
         "suspended_at": null,
         "tags": [],
+        "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
       }
@@ -4341,11 +4353,19 @@
         "version": 1
       }
     },
+    "recently_terminated": [
+      7,
+      20,
+      54,
+      70
+    ],
     "resource_versions": {},
     "resources": {},
     "signal_subscriptions": {},
     "start_timers": {},
+    "terminal_epoch": 4,
     "timers": {},
-    "user_tasks": {}
+    "user_tasks": {},
+    "variables_lost_quarantined": {}
   }
 }

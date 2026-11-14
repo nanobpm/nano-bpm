@@ -50,6 +50,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::AgentHistoryCommitted { .. }
         | Event::AgentHistoryDiscarded { .. }
         | Event::AgentHistoryDeduplicated { .. }
+        | Event::VariablesLostQuarantined { .. }
         | Event::ProcessInstanceCompleted { .. }
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessInstanceSuspended { .. }
