@@ -197,6 +197,13 @@ pub struct Engine {
     /// `plan_command_at`, so a rejected command's stamp can never leak into a
     /// later one. Never snapshotted.
     terminal_deadline_stamp: Option<(Key, Option<u64>)>,
+    /// The current command's caller `operationReference` (#1556), set ONLY by
+    /// [`Engine::apply_command_records_at`] — the single seam that stamps it on
+    /// every [`Record`](crate::Record) the command produces — and read at the
+    /// [`Engine::emit`] choke point for the legacy per-event audit fields.
+    /// Per-command scratch: reset by every `plan_command_at`. Never
+    /// snapshotted.
+    operation_reference: Option<i64>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -629,6 +636,7 @@ impl Engine {
             start_dispatch_rr: 0,
             lenient_completion: false,
             terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -785,6 +793,7 @@ impl Engine {
             start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -2115,11 +2124,45 @@ impl Engine {
         command: Command,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let (mut log, queue) = self.plan_command_at(command, now)?;
-        self.run(&mut log, queue);
-        self.cascade_cancel_children(&mut log);
-        self.finish_command(&log);
-        Ok(log)
+        self.apply_command_events(command, now, None)
+    }
+
+    /// Applies a command carrying a caller `operationReference` (#1556) and
+    /// returns its output as [`Record`](crate::Record)s, each stamped with the
+    /// reference. This is THE single propagation seam — Zeebe stamps a
+    /// command's `operationReference` on every record it produces, generically
+    /// — so no command variant carries its own copy. The legacy per-event
+    /// audit fields (`JobRetriesUpdated`/`JobTimeoutUpdated`/`IncidentResolved`
+    /// `.operation_reference`) are derived from the same value at
+    /// [`emit`](Self::emit).
+    pub fn apply_command_records_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<crate::Record>, EngineError> {
+        let events = self.apply_command_events(command, now, operation_reference)?;
+        Ok(crate::Record::stamp_all(events, operation_reference))
+    }
+
+    fn apply_command_events(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<Event>, EngineError> {
+        // Armed BEFORE planning: the planner itself emits (e.g. the
+        // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
+        // a reference can never leak into a later command.
+        self.operation_reference = operation_reference;
+        let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
+            self.run(&mut log, queue);
+            self.cascade_cancel_children(&mut log);
+            self.finish_command(&log);
+            log
+        });
+        self.operation_reference = None;
+        result
     }
 
     /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
@@ -3420,14 +3463,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 retries,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     Some(retries),
                     None,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3436,14 +3477,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 timeout,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     None,
                     Some(timeout),
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3451,7 +3490,6 @@ impl Engine {
                 job_key,
                 retries,
                 timeout,
-                operation_reference,
                 lease_token,
             } => {
                 self.update_job_properties(
@@ -3459,15 +3497,11 @@ impl Engine {
                     job_key,
                     retries,
                     timeout,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
 
-            Command::ResolveIncident {
-                incident_key,
-                operation_reference,
-            } => {
+            Command::ResolveIncident { incident_key } => {
                 let incident = self
                     .state
                     .incidents
@@ -3507,7 +3541,7 @@ impl Engine {
                         instance_key,
                         job_key,
                         resolved_at: self.now,
-                        operation_reference,
+                        operation_reference: None,
                     },
                 );
                 // Resolution retries the failed work rather than merely clearing
@@ -15674,6 +15708,44 @@ impl Engine {
             // (`disarm_subscription_event` and the `&self` teardown helpers
             // above it) cannot mint. A `0` means "not yet minted"; a non-zero
             // value (none today — the disarm path always emits `0`) is kept.
+            // Legacy per-event audit fields (#1556): derived from the
+            // command's single generic `operationReference`, never set by an
+            // emission site, so they cannot drift from the record envelope.
+            Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: _,
+            } => Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: self.operation_reference,
+            },
+            Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: _,
+            } => Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: self.operation_reference,
+            },
+            Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: _,
+            } => Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: self.operation_reference,
+            },
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -15858,7 +15930,6 @@ impl Engine {
         job_key: Key,
         retries: Option<i32>,
         timeout: Option<i64>,
-        operation_reference: Option<i64>,
         lease_token: Option<&str>,
     ) -> Result<(), EngineError> {
         let job = self
@@ -15887,6 +15958,8 @@ impl Engine {
             });
         }
         let instance_key = job.instance_key;
+        // `operation_reference: None` here: `emit` derives it from the
+        // command's generic reference (#1556).
         if let Some(retries) = retries {
             self.emit(
                 log,
@@ -15894,7 +15967,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     retries,
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }
@@ -15905,7 +15978,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     deadline: self.now.saturating_add_signed(timeout),
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }

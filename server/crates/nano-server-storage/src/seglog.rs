@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
-    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_event_json,
+    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_record_json,
     partition_of,
 };
 
@@ -498,7 +498,7 @@ enum TailPolicy {
 fn valid_segment_len(path: &Path) -> io::Result<u64> {
     read_segment_with(path, TailPolicy::DropTorn, |line| {
         let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
-        decode_event_json(json).map(|_| ())
+        decode_journal_event(json).map(|_| ())
     })
     .map(|(_, end)| end)
 }
@@ -1479,16 +1479,36 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
+/// THE journal-line decoder every segment / cold-archive reader goes through
+/// (#1556): a line is a [`Record`](nanobpmn_engine_core::Record) — the
+/// `{"event":…,"operation_reference":N}` envelope or a legacy bare `Event` —
+/// decoded via [`decode_record_json`], so an unknown variant is still the typed
+/// `UnknownVariant` rejection. Replay needs only the event; the reference is
+/// read-side metadata ([`read_segment_records`]).
+fn decode_journal_event(json: &str) -> Result<Event, EventDecodeError> {
+    decode_record_json(json).map(|record| record.event)
+}
+
+/// Reads every journal record (event + `operationReference`, #1556) from a
+/// single segment/log file — the bare `<json>` or the shared writer's
+/// `<partition>\t<json>` line form. Torn-tail contract: [`read_segment_with`].
+pub fn read_segment_records(path: &Path) -> io::Result<Vec<nanobpmn_engine_core::Record>> {
+    read_segment_with(path, TailPolicy::DropTorn, |line| {
+        decode_record_json(line.split_once('\t').map_or(line, |(_, rest)| rest))
+    })
+    .map(|(records, _)| records)
+}
+
 /// Reads and deserializes every event from a single segment/log file (empty if
 /// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::DropTorn, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::DropTorn, decode_journal_event).map(|(events, _)| events)
 }
 
 /// [`read_segment_events`] for a SEALED segment: no torn-tail tolerance — a
 /// damaged final record fails closed ([`TailPolicy::Strict`]).
 fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::Strict, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::Strict, decode_journal_event).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -1514,7 +1534,7 @@ fn read_segment_events_tagged_with(
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
-        let event = decode_event_json(json)?;
+        let event = decode_journal_event(json)?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
@@ -2147,8 +2167,8 @@ fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
         if line.trim().is_empty() {
             continue;
         }
-        let event =
-            decode_event_json(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         events.push(event);
     }
     Ok(events)
@@ -2189,8 +2209,8 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
             }
             None => (None, line),
         };
-        let event =
-            decode_event_json(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
@@ -6853,6 +6873,43 @@ mod tests {
                 assert_eq!(variant, "NoSuchEventFromTheFuture")
             }
             other => panic!("expected UnknownVariant, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (review finding): an unknown-variant record wrapped in the
+    /// #1556 envelope AND carrying invalid envelope metadata (an unrecognised
+    /// extra field) must still fail closed as the typed
+    /// [`EventDecodeError::UnknownVariant`] — NOT surface as `Malformed`, which
+    /// the active-tail reader would tolerate as a torn write and DROP (#1065
+    /// class). The decoder decodes the inner event before validating the
+    /// envelope metadata precisely so this combination cannot be misclassified.
+    /// The unknown record is the LAST line, where a genuinely torn tail would
+    /// be dropped — proving the fail-closed rejection is not torn-tail luck.
+    #[test]
+    fn read_segment_events_rejects_unknown_variant_envelope_with_extra_field() {
+        let dir = temp_dir("unknown-variant-envelope-extra");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"event\":{\"NoSuchEventFromTheFuture\":{\"instance_key\":9}},\"operation_reference\":9,\"extra\":1}\n",
+        )
+        .unwrap();
+
+        let err = read_segment_events(&path)
+            .expect_err("an unknown variant must fail closed even with invalid envelope metadata");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to the typed EventDecodeError");
+        match decode_err {
+            EventDecodeError::UnknownVariant { variant, .. } => {
+                assert_eq!(variant, "NoSuchEventFromTheFuture")
+            }
+            other => panic!("expected UnknownVariant (not Malformed/torn-drop), got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
