@@ -4831,9 +4831,10 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
 // `recently_terminated` ring is BOUNDED — once more than
 // [`RECENTLY_TERMINATED_CAP`] terminal transitions commit while a stamped
 // proposal is still in flight, the ring no longer names the instance. The gate
-// must still decide IDENTICALLY on every replica: a replica retaining the
-// terminal instance no-ops via residency, so an evicted replica must no-op too
-// — never raise an incident and mint a key there alone. The leader's stamp
+// must still decide IDENTICALLY on every replica: residency is replica-local,
+// so the gate must never consult it — a replica retaining the terminal
+// instance and one that evicted it must raise (or no-op) together, never mint
+// a key on one alone. The leader's stamp
 // carries the replicated terminal epoch at proposal time; the apply gate reads
 // the epoch distance against the ring's coverage, which is replicated state, so
 // the resident/evicted split after the ring wraps cannot diverge.
@@ -5021,9 +5022,10 @@ fn stamped_orphan_quarantine_with_a_stale_stamp_still_raises() {
         }
         clock += 1;
     }
-    // BOTH replicas evict the terminal instance (so neither can no-op via
-    // residency — the epoch distance alone decides).
-    assert!(resident.evict_instance(key));
+    // ONLY one replica evicts the terminal instance: residency is
+    // replica-local, so the gate must not consult it (stamp-before-cancel
+    // divergence) — both replicas must still decide identically.
+    assert!(resident.instance(key).is_some());
     assert!(evicted.evict_instance(key));
 
     // The stamp's epoch is now further back than the ring reaches: the gate

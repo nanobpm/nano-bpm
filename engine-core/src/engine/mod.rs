@@ -5546,13 +5546,16 @@ impl Engine {
                 // target's termination and wrongly suppress a LIVE orphan
                 // report (the review's finding). A live orphan (no terminal
                 // record anywhere) always raises, identically on every replica.
-                let target_terminated = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .is_some_and(|i| i.terminated_epoch > 0)
-                    || self.state.recently_terminated.contains(&instance_key)
-                    || stamp.target_terminated_epoch > 0;
+                //
+                // The resident record's `terminated_epoch` is deliberately NOT
+                // consulted: whether a terminal instance is still resident is
+                // replica-local (eviction), so once the ring wraps past a
+                // stamp-before-cancel target it would split replicas (one
+                // no-ops, one raises and mints a key). Only replicated inputs —
+                // the stamp and the ring — decide; past the ring's reach every
+                // replica uniformly fails open (raises).
+                let target_terminated = stamp.target_terminated_epoch > 0
+                    || self.state.recently_terminated.contains(&instance_key);
                 if target_terminated {
                     return Ok((log, queue));
                 }
