@@ -6846,10 +6846,11 @@ impl ServerImpl {
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // The detached owner already blocked on durability before answering, so
-        // a returned 200 means the create is fsynced; its cross-partition
-        // routing keeps running detached after the answer (#1582), and
-        // cancelling this handler at any point strands nothing.
+        // The detached owner blocked on durability AND drove the cross-partition
+        // routing pump before answering (#1582): a returned 200 means the create
+        // is fsynced and a publish issued now finds the subscription open (the
+        // create-then-publish ordering clients rely on); cancelling this handler
+        // at any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -10169,19 +10170,25 @@ impl ServerImpl {
     /// cross-partition follow-ups nobody ever routed. Here the detached task
     /// owns the outcome end to end: it submits `apply` at create priority,
     /// gates routing on durability exactly as [`Self::route_after_durable`]
-    /// does (a write that never persists routes nothing), delivers the
-    /// projected outcome over the returned oneshot the moment the create is
-    /// durable, and only then drives the routing pump. The caller merely
-    /// OBSERVES the outcome; cancelling that observation strands nothing.
+    /// does (a write that never persists routes nothing), drives the routing
+    /// pump, and only then delivers the projected outcome over the returned
+    /// oneshot. The caller merely OBSERVES the outcome; cancelling that
+    /// observation strands nothing.
     ///
-    /// The answer is sent BEFORE the routing pump is driven: a stalled
-    /// subscription target must not withhold an already-committed create result
-    /// for the whole re-drive budget — a retried forwarded create without a
-    /// business id could then mint a duplicate instance while the first owner's
-    /// routing was still retrying (#1582). Routing keeps its own detached
-    /// ownership below, so it still runs to completion after the answer is
-    /// sent; the caller is answered at commit exactly as
-    /// [`Self::raft_create_core`] answers at Raft commit.
+    /// The answer is sent only AFTER the routing pump has driven the
+    /// cross-partition subscription follow-ups: clients rely on the
+    /// create-then-publish ordering `main` has always given — a publish issued
+    /// the moment the create returns must find the subscription already open,
+    /// or the unmatched message is discarded and the instance stays parked
+    /// (#1582). The cost of that guarantee is bounded: a stalled subscription
+    /// target can delay the create response by at most the bounded re-drive
+    /// budget ([`ROUTE_REDRIVE`]: 16 attempts of exponential backoff capped at
+    /// 1s, plus the per-attempt forward deadline), never indefinitely. Routing
+    /// still completes when the caller has gone away: a dropped receiver
+    /// (caller cancelled) leaves this task running to completion, exactly as
+    /// [`Self::raft_create_core`] routes after Raft commit. The latency-optimal
+    /// alternative — answer at commit and gate publications on pending
+    /// subscription opens — is tracked as #1604.
     ///
     /// `accounting` is the admission charge (processing slot + payload bytes)
     /// entered on the caller before submission; it is MOVED in here and held
@@ -10249,12 +10256,15 @@ impl ServerImpl {
                     )));
                     return;
                 }
-                // Answer at COMMIT (durable), then drive the follow-ups. A
-                // dropped receiver (caller cancelled) is fine: routing still
-                // runs to completion inside this detached task.
-                let _ = tx.send(outcome);
+                // Route the follow-ups FIRST, then answer: a publish issued the
+                // moment the create returns must find the subscription already
+                // open (the create-then-publish ordering clients rely on,
+                // #1582). The wait is bounded by the re-drive budget, and a
+                // dropped receiver (caller cancelled) is fine: routing already
+                // ran to completion inside this detached task.
                 server.drive_subscription_routing(routable).await;
                 server.signal_jobs_available();
+                let _ = tx.send(outcome);
                 return;
             }
             // A dropped receiver (caller cancelled) is fine; the apply already
@@ -11347,10 +11357,12 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        // The non-Raft branch's detached owner already awaited durability before
-        // answering (#1582); under Raft the proposal is durable at commit. Either
-        // way the create is committed by the time we answer, and its routing
-        // keeps running detached after the answer.
+        // The non-Raft branch's detached owner awaited durability AND drove the
+        // cross-partition routing pump before answering (#1582); under Raft the
+        // proposal is durable at commit and `raft_create_core` routes before
+        // answering too. Either way the create is committed and its
+        // subscriptions routed by the time we answer, so a publish issued right
+        // after finds them open.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -20508,8 +20520,9 @@ impl ServerImpl {
         // definition key/version are unused here.
         let instance_key = created.instance_key;
         let sync_completed = created.sync_completed;
-        // The detached owner already awaited durability before answering
-        // (#1582); its routing keeps running detached after the answer.
+        // The detached owner already awaited durability and drove the
+        // cross-partition routing pump before answering (#1582), so a publish
+        // issued now finds the subscription open.
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -20761,8 +20774,9 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                // Routing already ran inside `raft_create_core`'s detached task
-                // (#1582 cancellation safety); the events are only reported.
+                // Routing ran inside `raft_create_core`'s detached task BEFORE
+                // the answer (#1582 cancellation safety + create-then-publish
+                // ordering); the events are only reported.
                 _routable,
             )) => {
                 self.signal_jobs_available();
@@ -20950,8 +20964,9 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        // Routing already ran inside `raft_create_core`'s detached task (#1582
-        // cancellation safety); nothing further to route here.
+        // Routing ran inside `raft_create_core`'s detached task BEFORE the
+        // answer (#1582 cancellation safety + create-then-publish ordering);
+        // nothing further to route here.
         self.signal_jobs_available();
 
         let (variables_out, process_completed) = if await_completion {
@@ -21037,13 +21052,17 @@ impl ServerImpl {
         // create without its cross-partition routing — the Raft batcher keeps
         // running past the cancellation, and the detached task still observes
         // the proposal outcome and routes. The result is handed back over a
-        // oneshot the moment the create COMMITS, BEFORE the routing re-drive:
-        // a stalled subscription target must not withhold an already-committed
-        // create result for the whole re-drive budget (a retried forwarded
-        // create without a business id could then mint a duplicate, #1582).
-        // Routing keeps its own detached ownership below, so it still runs to
-        // completion after the answer is sent. Awaiting the receiver only
-        // OBSERVES the outcome; dropping it leaves the work running.
+        // oneshot only AFTER the routing re-drive has driven the
+        // cross-partition subscription follow-ups: clients rely on the
+        // create-then-publish ordering `main` has always given — a publish
+        // issued the moment the create returns must find the subscription
+        // already open, or the unmatched message is discarded and the instance
+        // stays parked (#1582). The cost is bounded: a stalled subscription
+        // target can delay the create response by at most the bounded re-drive
+        // budget ([`ROUTE_REDRIVE`]), never indefinitely. Awaiting the receiver
+        // only OBSERVES the outcome; dropping it leaves the work running. The
+        // latency-optimal alternative — answer at commit and gate publications
+        // on pending subscription opens — is tracked as #1604.
         let server = self.clone();
         let process_id_for_propose = process_id.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -21097,13 +21116,17 @@ impl ServerImpl {
                 });
             match proposed {
                 Ok((instance_key, sync_completed, routable)) => {
-                    // Answer at COMMIT, then drive the follow-ups. A dropped
-                    // receiver (caller cancelled) is fine: routing still runs.
-                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable.clone())));
+                    // Route the follow-ups FIRST, then answer: a publish issued
+                    // the moment the create returns must find the subscription
+                    // already open (the create-then-publish ordering clients
+                    // rely on, #1582). The wait is bounded by the re-drive
+                    // budget, and a dropped receiver (caller cancelled) is fine:
+                    // routing already ran to completion inside this task.
                     if !routable.is_empty() {
-                        server.drive_subscription_routing(routable).await;
+                        server.drive_subscription_routing(routable.clone()).await;
                     }
                     server.signal_jobs_available();
+                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
                 }
                 Err(err) => {
                     let _ = result_tx.send(Err(err));
@@ -48347,22 +48370,22 @@ mod subscription_placement_tests {
         );
     }
 
-    /// #1582: the non-Raft detached create owner answers its observer the
-    /// moment the create is DURABLE, BEFORE the cross-partition routing pump
-    /// finishes — a stalled subscription target must not withhold an
-    /// already-committed create result for the whole re-drive budget (a retried
-    /// forwarded create without a business id could then mint a duplicate
-    /// instance while the first owner's routing was still retrying).
+    /// #1582: the non-Raft detached create owner drives the cross-partition
+    /// routing pump BEFORE answering its observer, so a client that publishes a
+    /// message the moment the create returns finds the subscription already
+    /// open — the create-then-publish ordering `main` has always given. An
+    /// answer-before-routing implementation lets that immediate publish
+    /// overtake the subscription open; the unmatched message is discarded and
+    /// the instance stays parked.
     ///
-    /// Model the stall deterministically with a durability gate: the create's
-    /// `Commit` is replaced by a [`Commit::from_ack`] the test holds open. The
-    /// reply is gated on `wait_durable()`, so while the gate is shut the
-    /// observer must NOT have been answered; the instant the gate opens (the
-    /// write is durable) the observer must resolve even though the routing pump
-    /// is still driving the (locally-applied, in-memory) follow-up. Routing
-    /// still runs to completion after the answer: the subscription is armed.
+    /// Deterministic: the create's `Commit` is replaced by a
+    /// [`Commit::from_ack`] the test holds open, so the owner provably parks in
+    /// `wait_durable()` (with routing not yet started) until the gate opens.
+    /// After the gate opens the observer must resolve only because routing
+    /// already ran: the publish right after the answer MUST correlate, with no
+    /// wait for the subscription to arm.
     #[tokio::test]
-    async fn detached_create_answers_at_durability_before_routing_finishes() {
+    async fn detached_create_publish_right_after_answer_correlates() {
         let server = single_node_multi_partition();
         server
             .deploy_centralized(
@@ -48389,7 +48412,7 @@ mod subscription_placement_tests {
 
         // The durability gate the test holds open: the create's commit is
         // replaced by this ack, so the owner blocks in `wait_durable()` until
-        // the test releases it — the stand-in for a stalled routing target.
+        // the test releases it — the stand-in for a slow routing target.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
         let accounting = CreateAccounting::enter(&server, 0);
         let rx = server.submit_create_detached(accounting, move |engine| {
@@ -48421,43 +48444,35 @@ mod subscription_placement_tests {
             "no answer before the create is durable"
         );
 
-        // Open the gate: the write is now durable. The observer must resolve
-        // immediately — the owner answers at commit and only THEN drives the
-        // routing pump, so the reply is not held for the routing budget.
+        // Open the gate: the write is now durable. The owner drives the routing
+        // pump FIRST and answers only once the cross-partition subscription is
+        // open, so the observer resolves with routing already complete.
         ack_tx.send(()).expect("the durability gate is held");
         let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
-            .expect("the create is answered at durability, not after routing")
+            .expect("the create is answered once routing has run")
             .expect("the detached owner is alive")
             .expect("the create applied");
         assert!(created.instance_key > 0, "a real instance key");
 
-        // Routing still ran to completion after the answer: the cross-partition
-        // subscription is armed on its canonical partition.
-        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
-        let handle = server
-            .engine_handle_for(sub_partition)
-            .expect("subscription partition is local");
-        let mut armed = false;
-        for _ in 0..100 {
-            let found = handle
-                .with({
-                    let order = order.clone();
-                    move |j| {
-                        j.state().message_subscriptions.values().any(|s| {
-                            s.correlation_key == order
-                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
-                        })
-                    }
-                })
-                .await;
-            if found {
-                armed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(armed, "routing ran to completion after the answer");
+        // The guarantee the ordering buys: a publish issued the MOMENT the
+        // create returns correlates — the subscription is already open on its
+        // canonical partition, so the message is not discarded as unmatched.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".to_string(),
+                order.clone(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("the publish applies");
+        assert_eq!(
+            correlated,
+            Some(created.instance_key),
+            "a publish right after the create answer correlates to the new instance"
+        );
     }
 
     /// #1582: a source with no replica of the target rotates its forwards
