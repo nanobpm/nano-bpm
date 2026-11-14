@@ -129,21 +129,24 @@ pub struct PeerLink {
     pending_raft: Pending,
     next_corr: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
-    /// Abort handles for the per-socket writer/reader tasks, so a retired link
-    /// can be torn down explicitly instead of lingering on a stalled socket
-    /// (#1582).
-    tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Abort handles for the APP lane's writer/reader tasks only, so a link
+    /// retired after a stalled app request can tear down that lane without
+    /// touching the independent Raft socket (#1582). The Raft lane is never
+    /// aborted here: it self-terminates when the last sender clone drops.
+    app_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 impl PeerLink {
-    /// Explicitly tears the connection down: aborts both sockets' writer and
-    /// reader tasks (dropping any queued outbound frames and closing the
-    /// sockets), marks the link disconnected, and fails every pending waiter
-    /// on both lanes with a 502 so no caller hangs on a retired link (#1582).
-    pub async fn shutdown(&self) {
-        self.connected.store(false, Ordering::Relaxed);
+    /// Retires the APP lane only: aborts the app socket's writer and reader
+    /// tasks (dropping queued app frames and closing that socket) and fails
+    /// every pending app waiter with a 502. The Raft lane, its pending
+    /// requests and the shared `connected` flag are left untouched: an app
+    /// request timing out behind a slow handler says nothing about the health
+    /// of the separate replication socket, so it must never disrupt in-flight
+    /// Raft RPCs (#1582). Idempotent.
+    pub async fn retire_app_lane(&self) {
         let handles: Vec<_> = self
-            .tasks
+            .app_tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
@@ -151,14 +154,12 @@ impl PeerLink {
         for h in handles {
             h.abort();
         }
-        for pending in [&self.pending_app, &self.pending_raft] {
-            let mut map = pending.lock().await;
-            for (_, tx) in map.drain() {
-                let _ = tx.send(PeerResult {
-                    status: 502,
-                    body: Some(Value::String("peer link closed".into())),
-                });
-            }
+        let mut map = self.pending_app.lock().await;
+        for (_, tx) in map.drain() {
+            let _ = tx.send(PeerResult {
+                status: 502,
+                body: Some(Value::String("peer link closed".into())),
+            });
         }
     }
 
@@ -188,7 +189,9 @@ impl PeerLink {
             secret.as_deref(),
         )
         .await?;
-        let (out_raft, raft_tasks) = Self::dial(
+        // Raft-lane abort handles are deliberately dropped (not tracked): the
+        // lane is never torn down by an app-lane retirement (#1582).
+        let (out_raft, _raft_tasks) = Self::dial(
             &raft_ws_url(base_url),
             pending_raft.clone(),
             connected.clone(),
@@ -203,9 +206,7 @@ impl PeerLink {
             pending_raft,
             next_corr: Arc::new(AtomicU64::new(1)),
             connected,
-            tasks: Arc::new(std::sync::Mutex::new(
-                app_tasks.into_iter().chain(raft_tasks).collect(),
-            )),
+            app_tasks: Arc::new(std::sync::Mutex::new(app_tasks.into_iter().collect())),
         })
     }
 
@@ -1222,10 +1223,11 @@ impl PeerSet {
                 links.remove(&node_id);
             }
         }
-        // Retire the abandoned connection itself, not just its cache entry:
+        // Retire the abandoned connection's APP lane, not just its cache entry:
         // otherwise its socket tasks and queued frames outlive the attempt and
-        // accumulate across re-drives (#1582). Idempotent.
-        used.shutdown().await;
+        // accumulate across re-drives. The Raft lane is left intact so in-flight
+        // replication RPCs are never failed by an app-request timeout (#1582).
+        used.retire_app_lane().await;
     }
 
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
@@ -1456,7 +1458,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
-            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         // The stalled peer never answers; the inner deadline is far away, so
         // only the drop of the outer future can clean the entry up.
@@ -1500,7 +1502,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
-            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1574,7 +1576,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
-            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1629,7 +1631,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
-            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1655,17 +1657,18 @@ mod tests {
         assert!(kept.same_connection(&fresh));
     }
 
-    /// #1582: retiring an abandoned link must tear the connection down, not
-    /// just un-cache it — its socket tasks are aborted and every pending waiter
-    /// (both lanes) is failed, so re-drives cannot accumulate stalled tasks.
+    /// #1582: retiring an abandoned link tears down its APP lane (tasks
+    /// aborted, app waiters failed) so re-drives cannot accumulate stalled
+    /// tasks — but a stalled app request must leave active Raft requests and
+    /// the link's connected state intact.
     #[tokio::test]
-    async fn drop_link_if_same_tears_down_tasks_and_waiters() {
+    async fn drop_link_if_same_retires_app_lane_but_keeps_raft_intact() {
         let peers = peers_with_dead_peer();
         let stalled = stalled_link();
         let task = tokio::spawn(std::future::pending::<()>());
-        stalled.tasks.lock().unwrap().push(task.abort_handle());
+        stalled.app_tasks.lock().unwrap().push(task.abort_handle());
         let (tx_app, rx_app) = tokio::sync::oneshot::channel();
-        let (tx_raft, rx_raft) = tokio::sync::oneshot::channel();
+        let (tx_raft, mut rx_raft) = tokio::sync::oneshot::channel();
         stalled.pending_app.lock().await.insert(7, tx_app);
         stalled.pending_raft.lock().await.insert(8, tx_raft);
         peers.links.lock().await.insert(1, stalled.clone());
@@ -1674,12 +1677,17 @@ mod tests {
 
         assert!(
             task.await.unwrap_err().is_cancelled(),
-            "socket task aborted"
+            "app socket task aborted"
         );
         assert_eq!(rx_app.await.unwrap().status, 502);
-        assert_eq!(rx_raft.await.unwrap().status, 502);
-        assert!(!stalled.is_connected());
-        assert!(stalled.tasks.lock().unwrap().is_empty());
+        assert!(stalled.app_tasks.lock().unwrap().is_empty());
+        // Raft lane untouched: its waiter is still pending, not failed.
+        assert!(matches!(
+            rx_raft.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(stalled.pending_raft.lock().await.contains_key(&8));
+        assert!(stalled.is_connected(), "raft lane stays usable");
     }
 
     /// A single-node cluster has no peers, so `PeerSet` is inert.
