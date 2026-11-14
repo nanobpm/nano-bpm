@@ -10028,20 +10028,32 @@ impl ServerImpl {
                 "partition {target_partition} has no reachable leader"
             ));
         }
-        let link = match self.peers.link(owner).await {
-            Ok(link) => link,
-            Err(e) => {
-                return RouteAttempt::Transient(format!(
-                    "node {owner} (partition {target_partition}) unreachable: {e}"
-                ));
+        // ONE absolute deadline covers link acquisition (dial lock + connect)
+        // AND the request, so a stalled dial can never stretch an attempt past
+        // the fast write-forward budget and stall the re-drive / clock loop.
+        let attempt = async {
+            let link = match self.peers.link(owner).await {
+                Ok(link) => link,
+                Err(e) => {
+                    return RouteAttempt::Transient(format!(
+                        "node {owner} (partition {target_partition}) unreachable: {e}"
+                    ));
+                }
+            };
+            let result = link.route_subscription(event.clone()).await;
+            if result.is_err() {
+                // A dead/stalled link: drop it so the next attempt redials.
+                self.peers.drop_link(owner).await;
             }
+            RouteAttempt::from_peer(result)
         };
-        let result = link.route_subscription(event.clone()).await;
-        if result.is_err() {
-            // A dead/stalled link: drop it so the next attempt redials.
-            self.peers.drop_link(owner).await;
+        match tokio::time::timeout(write_forward_timeout(), attempt).await {
+            Ok(outcome) => outcome,
+            Err(_) => RouteAttempt::Transient(format!(
+                "node {owner} (partition {target_partition}) forward attempt exceeded {:?}",
+                write_forward_timeout()
+            )),
         }
-        RouteAttempt::from_peer(result)
     }
 
     /// Peer-side handler for a forwarded subscription follow-up: applies the
@@ -47403,7 +47415,17 @@ mod subscription_placement_tests {
                     .await
             }
         };
-        assert!(armed().await, "the routed subscription is armed");
+        // `create_for_stream` answers at source durability, before its detached
+        // routing task opens the subscription: wait (bounded) for it to arm.
+        let mut is_armed = false;
+        for _ in 0..200 {
+            if armed().await {
+                is_armed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(is_armed, "the routed subscription is armed");
 
         let (events, commit) = server
             .engine
