@@ -132,6 +132,11 @@ pub struct PeerLink {
 }
 
 impl PeerLink {
+    /// Whether `self` and `other` are clones of the same underlying connection.
+    pub fn same_connection(&self, other: &PeerLink) -> bool {
+        Arc::ptr_eq(&self.connected, &other.connected)
+    }
+
     /// Opens a falcon client connection to `base_url` (a peer's HTTP base
     /// URL, e.g. `http://10.0.0.2:8080`). The reader/writer tasks run until the
     /// socket closes, at which point the link is marked disconnected and every
@@ -1172,6 +1177,18 @@ impl PeerSet {
         self.links.lock().await.remove(&node_id);
     }
 
+    /// Drops the cached link to `node_id` only if it is still the very link
+    /// `used` (same connection identity). A caller abandoning a stalled attempt
+    /// (#1582) must evict the link IT used — never a fresh link a concurrent
+    /// caller has since dialed — so the next attempt redials instead of
+    /// reusing a connected-but-stalled socket.
+    pub async fn drop_link_if_same(&self, node_id: u32, used: &PeerLink) {
+        let mut links = self.links.lock().await;
+        if links.get(&node_id).is_some_and(|l| l.same_connection(used)) {
+            links.remove(&node_id);
+        }
+    }
+
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
@@ -1558,6 +1575,41 @@ mod tests {
         // Port 1 is privileged/unused — connect must fail, not hang.
         let err = PeerLink::connect("http://127.0.0.1:1").await;
         assert!(matches!(err, Err(PeerError::Connect(_))));
+    }
+
+    fn stalled_link() -> PeerLink {
+        let (out_app, _rx) = mpsc::channel::<Message>(1);
+        let (out_raft, _rx2) = mpsc::channel::<Message>(1);
+        PeerLink {
+            out_app,
+            pending_app: Arc::new(Mutex::new(HashMap::new())),
+            out_raft,
+            pending_raft: Arc::new(Mutex::new(HashMap::new())),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            connected: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// #1582: an abandoned (timed-out) attempt evicts the connected-but-stalled
+    /// link it used, so the next `link()` cannot hand the same stalled socket
+    /// back; but it must never evict a different, fresher link.
+    #[tokio::test]
+    async fn drop_link_if_same_evicts_only_the_used_link() {
+        let peers = peers_with_dead_peer();
+        let stalled = stalled_link();
+        peers.links.lock().await.insert(1, stalled.clone());
+        assert!(peers.cached_live_link(1).await.is_some());
+        peers.drop_link_if_same(1, &stalled).await;
+        assert!(
+            peers.cached_live_link(1).await.is_none(),
+            "the stalled link must be evicted"
+        );
+
+        let fresh = stalled_link();
+        peers.links.lock().await.insert(1, fresh.clone());
+        peers.drop_link_if_same(1, &stalled).await;
+        let kept = peers.cached_live_link(1).await.expect("fresh link kept");
+        assert!(kept.same_connection(&fresh));
     }
 
     /// A single-node cluster has no peers, so `PeerSet` is inert.

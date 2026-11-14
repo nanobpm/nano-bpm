@@ -10031,6 +10031,11 @@ impl ServerImpl {
         // ONE absolute deadline covers link acquisition (dial lock + connect)
         // AND the request, so a stalled dial can never stretch an attempt past
         // the fast write-forward budget and stall the re-drive / clock loop.
+        // The link this attempt used, recorded so an OUTER-deadline expiry can
+        // evict exactly it: the outer timeout can cancel a stalled request
+        // before its own error branch runs, and a connected-but-stalled link
+        // left cached would be reused by every remaining attempt.
+        let mut used: Option<nano_server_raft::peer::PeerLink> = None;
         let attempt = async {
             let link = match self.peers.link(owner).await {
                 Ok(link) => link,
@@ -10040,19 +10045,26 @@ impl ServerImpl {
                     ));
                 }
             };
+            used = Some(link.clone());
             let result = link.route_subscription(event.clone()).await;
             if result.is_err() {
                 // A dead/stalled link: drop it so the next attempt redials.
-                self.peers.drop_link(owner).await;
+                self.peers.drop_link_if_same(owner, &link).await;
             }
             RouteAttempt::from_peer(result)
         };
-        match tokio::time::timeout(write_forward_timeout(), attempt).await {
+        let outcome = tokio::time::timeout(write_forward_timeout(), attempt).await;
+        match outcome {
             Ok(outcome) => outcome,
-            Err(_) => RouteAttempt::Transient(format!(
-                "node {owner} (partition {target_partition}) forward attempt exceeded {:?}",
-                write_forward_timeout()
-            )),
+            Err(_) => {
+                if let Some(link) = used.as_ref() {
+                    self.peers.drop_link_if_same(owner, link).await;
+                }
+                RouteAttempt::Transient(format!(
+                    "node {owner} (partition {target_partition}) forward attempt exceeded {:?}",
+                    write_forward_timeout()
+                ))
+            }
         }
     }
 
