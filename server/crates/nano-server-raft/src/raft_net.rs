@@ -30,13 +30,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use crate::peer::PeerSet;
@@ -84,7 +84,7 @@ pub(crate) fn encode_rpc_payload(json: String) -> (String, bool) {
     use std::io::Write;
 
     use base64::Engine;
-    use flate2::{write::DeflateEncoder, Compression};
+    use flate2::{Compression, write::DeflateEncoder};
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
     if enc.write_all(json.as_bytes()).is_err() {
         return (json, false);

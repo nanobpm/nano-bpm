@@ -19,15 +19,15 @@
 //! `InstanceCompleted` await routing build on the same link later.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
+use futures_util::stream::StreamExt;
 use nano_falcon_protocol::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cluster::Topology;
