@@ -917,10 +917,13 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // The #1447 off-heap-orphan quarantine tombstone frame (additive
         // variant, no version bump): pins its field names so a rename fails
-        // the drift guard instead of breaking replay of old journals.
+        // the drift guard instead of breaking replay of old journals. The
+        // #1587 `episode` field is additive (`serde(default)`), pinned here
+        // non-default.
         Event::VariablesLostQuarantined {
             instance_key: 25,
             incident_key: 26,
+            episode: 26,
         },
     ]
 }

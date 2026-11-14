@@ -825,6 +825,18 @@ impl Engine {
         state::compose_key(self.partition_id, self.next_local)
     }
 
+    /// The key [`mint_key`](Self::mint_key) will issue next, WITHOUT advancing
+    /// the allocator. Pure read. Used by the orphan-quarantine leader to stamp
+    /// its proposal's loss-episode id (#1587): the episode IS the incident key
+    /// the committed command will mint, so two stamped copies of one detection
+    /// episode agree and a delayed duplicate of a resolved episode is a no-op.
+    /// Valid only because the leader mints it while no tombstone is live (so no
+    /// active `VariablesLost` incident can exist), guaranteeing the apply-time
+    /// `mint_key` issues exactly this key.
+    fn peek_next_key(&self) -> Key {
+        state::compose_key(self.partition_id, self.next_local.saturating_add(1))
+    }
+
     /// The root (top-level ancestor) process instance key for `instance_key`:
     /// walks up the call-activity parent chain, returning `instance_key` itself
     /// for a top-level instance. Bounded against a pathological cycle.
@@ -5596,12 +5608,44 @@ impl Engine {
                 if target_terminated {
                     return Ok((log, queue));
                 }
-                if self
-                    .state
-                    .variables_lost_quarantined
-                    .contains_key(&instance_key)
-                {
-                    return Ok((log, queue));
+                // Episode gate (#1587). The stamp carries the replicated
+                // loss-episode id the leader resolved at stamp time. Decide
+                // from the replicated tombstone alone (never the residency-
+                // dependent hot incident map), so every replica agrees:
+                //
+                // - A live tombstone for this instance means the episode is
+                //   still open: a duplicate of it is a no-op. (A stamp whose
+                //   episode DIFFERS from the live tombstone's cannot be
+                //   produced by the leader — `orphan_incident_stamp` returns
+                //   `None` while a tombstone is live — so any such frame is a
+                //   legacy/episode-0 frame, handled below.)
+                // - NO live tombstone + a NONZERO episode means this proposal's
+                //   episode already ran its course: its incident was resolved
+                //   and the tombstone lifted, so this is a DELAYED DUPLICATE of
+                //   a resolved episode. It must be a deterministic no-op — it
+                //   must NOT raise a fresh incident (today's tombstone-less
+                //   behaviour re-reported it as a new episode). A genuinely new
+                //   loss after resolution stamps a FRESH, distinct episode id
+                //   (the leader mints it from its advanced allocator), so it
+                //   still applies and is reported.
+                //
+                // `episode == 0` is a legacy (pre-#1587) stamp: keep the
+                // episode-blind #1574 dedup (tombstone-presence only).
+                let tombstone = self.state.variables_lost_quarantined.get(&instance_key);
+                match (tombstone, stamp.episode) {
+                    // An open episode: dedup any repeat of it.
+                    (Some(_), _) => return Ok((log, queue)),
+                    // A delayed duplicate of a resolved episode: its id is not
+                    // the allocator's next key (a fresh loss re-stamps to the
+                    // next key), so it is a no-op. Equality — the episode IS the
+                    // next key — means a FRESH proposal: apply it.
+                    (None, episode) if episode > 0 => {
+                        if episode != self.peek_next_key() {
+                            return Ok((log, queue));
+                        }
+                    }
+                    // Legacy episode-blind stamp with no live tombstone: apply.
+                    (None, _) => {}
                 }
                 let incident_key = self.emit_variables_lost(
                     &mut log,
@@ -5609,15 +5653,17 @@ impl Engine {
                     stamp.element_id,
                     stamp.reason,
                 );
-                // Record the replicated dedup tombstone. Deliberately NO
-                // variable install and no off-heap row cleanup (#1574): the
-                // command must be replica-deterministic, and a leader-snapshotted
-                // payload is not (it can roll back an intervening SetVariables).
+                // Record the replicated dedup tombstone (with its episode id,
+                // #1587). Deliberately NO variable install and no off-heap row
+                // cleanup (#1574): the command must be replica-deterministic,
+                // and a leader-snapshotted payload is not (it can roll back an
+                // intervening SetVariables).
                 self.emit(
                     &mut log,
                     Event::VariablesLostQuarantined {
                         instance_key,
                         incident_key,
+                        episode: stamp.episode,
                     },
                 );
             }
@@ -7700,6 +7746,14 @@ impl Engine {
             // ring has wrapped past it. The cold apply path reads it to detect
             // the target terminating after the stamp.
             target_terminated_epoch: self.state.terminated_epoch_of(instance_key).unwrap_or(0),
+            // The loss-episode id (#1587): the incident key this proposal will
+            // mint, resolved as the allocator's next key. Reached only when no
+            // tombstone is live (`has_active_variables_lost` returned `None`
+            // above), so no active `VariablesLost` incident exists and the
+            // apply-time `mint_key` issues exactly this key — making the two
+            // stamped copies of one episode agree, and a delayed duplicate of a
+            // resolved episode (whose tombstone lifted) a deterministic no-op.
+            episode: self.peek_next_key(),
         })
     }
 

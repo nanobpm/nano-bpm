@@ -12,6 +12,14 @@ use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
 
+/// `skip_serializing_if` predicate for an optional-by-zero [`Key`] field: a
+/// zero key is the legacy/absent sentinel (additive fields default to it), so
+/// it is omitted from the serialized frame.
+#[cfg(feature = "serde")]
+fn is_zero_key(k: &Key) -> bool {
+    *k == 0
+}
+
 /// One activation instruction of a [`crate::command::Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
 /// scope. Mirrors Zeebe's `ProcessInstanceModificationActivateInstruction`:
@@ -1826,6 +1834,14 @@ pub enum Event {
         /// on the replicated `IncidentResolved.incident_key` so the lift does
         /// not depend on whether the incident record is resident.
         incident_key: Key,
+        /// The replicated loss-episode id the quarantine's stamp carried
+        /// (#1587), recorded into the tombstone so a delayed duplicate of the
+        /// SAME episode (applying after the incident was resolved and the
+        /// tombstone lifted) is a deterministic no-op instead of a fresh
+        /// incident. `0` for a frame written before this field existed
+        /// (episode-blind, pre-#1587 behaviour). Additive: `serde(default)`.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
+        episode: Key,
     },
 }
 

@@ -2135,7 +2135,7 @@ pub struct State {
     /// for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource_versions: HashMap<Key, DeployedResource>,
-    /// Instance key → the `VariablesLost` incident key of its active loss
+    /// Instance key → the [`VariablesLostTombstone`] of its active loss
     /// episode (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
     /// tombstone** (#1574 review). The `VariablesLost` incident record itself
     /// leaves hot state when its instance cold-spills
@@ -2149,7 +2149,7 @@ pub struct State {
     /// before it deserialize empty (such a snapshot predates the quarantine
     /// event, so there is nothing to dedup yet).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables_lost_quarantined: BTreeMap<Key, Key>,
+    pub variables_lost_quarantined: BTreeMap<Key, VariablesLostTombstone>,
     /// The most recent instance keys to reach a terminal state
     /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
     /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
@@ -2182,6 +2182,29 @@ pub struct State {
 /// orphan proposal's round trip (enqueue → commit), so a few thousand terminal
 /// transitions is ample while keeping the snapshot cost tiny (8 bytes/key).
 pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
+
+/// The replicated dedup tombstone one active off-heap-orphan loss episode
+/// leaves in [`State::variables_lost_quarantined`] (#1574, episode id #1587).
+/// Recorded by [`crate::Event::VariablesLostQuarantined`]; lifted when the
+/// episode's incident is resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VariablesLostTombstone {
+    /// The `VariablesLost` incident the quarantine raised: resolving exactly
+    /// this incident lifts the tombstone, keyed on the replicated
+    /// `IncidentResolved.incident_key` so the lift does not depend on whether
+    /// the incident record is resident.
+    pub incident_key: Key,
+    /// The replicated loss-episode id the quarantine's stamp carried (#1587).
+    /// A delayed duplicate of the SAME episode applies after the incident was
+    /// resolved (and the tombstone lifted) and must be a no-op: with no live
+    /// tombstone its episode matches nothing, so the apply gate suppresses it
+    /// instead of raising a fresh incident. A genuinely new loss stamps a
+    /// fresh, distinct episode id and is still reported. `0` for a tombstone
+    /// written before this field existed (episode-blind, pre-#1587 behaviour).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub episode: u64,
+}
 
 impl State {
     /// Records `instance_key` as terminal in the bounded replicated ring and
@@ -2624,9 +2647,10 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
 /// unindexed and a later termination would resolve it only on peers that held
 /// the instance resident — diverging the event log.
 fn reconcile_incident_index(state: &mut State, instance_key: Key) {
-    let Some(&incident_key) = state.variables_lost_quarantined.get(&instance_key) else {
+    let Some(&tombstone) = state.variables_lost_quarantined.get(&instance_key) else {
         return;
     };
+    let incident_key = tombstone.incident_key;
     let Some(incident) = state.incidents.get(&incident_key) else {
         return;
     };

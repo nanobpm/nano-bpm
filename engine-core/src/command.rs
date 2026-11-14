@@ -824,6 +824,19 @@ pub struct OrphanIncidentStamp {
     /// Additive: `0` for a stamp minted before this field existed (fail open).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
     pub target_terminated_epoch: u64,
+    /// The replicated **loss-episode id** (#1587): the incident key this
+    /// proposal will mint, resolved by the leader at stamp time as the next key
+    /// its replicated allocator will issue. Two stamped copies of one detection
+    /// episode carry the SAME episode id, so a delayed duplicate applying after
+    /// the episode's incident was resolved is a deterministic no-op (it matches
+    /// no live episode) instead of raising a fresh incident — while a genuinely
+    /// new loss after resolution stamps a fresh, distinct episode id and is
+    /// still reported. The id is a *replicated* key (never wall-clock, never
+    /// replica-local), so every replica compares it identically. Additive: `0`
+    /// for a stamp minted before this field existed, which keeps the pre-#1587
+    /// (episode-blind) dedup behaviour.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub episode: u64,
 }
 
 #[cfg(feature = "serde")]
@@ -1649,6 +1662,7 @@ mod kind_tests {
                 reason: "r".repeat(20_000),
                 terminal_epoch: 0,
                 target_terminated_epoch: 0,
+                episode: 0,
             }),
         }
         .approx_bytes();

@@ -4151,10 +4151,13 @@ fn stamped_orphan_quarantine_is_residency_independent() {
     assert!(cold.snapshot_instance(key).is_some(), "cold-shed");
     assert!(cold.instance(key).is_none(), "precondition: cold replica");
 
-    // The leader (resident) resolves the stamp from ITS state.
+    // The leader (resident) resolves the stamp from ITS state. The episode id
+    // is the allocator's next key (#1587) — the incident key the proposal will
+    // mint — so it is nonzero and deterministic for this fixture.
     let stamp = resident
         .orphan_incident_stamp(key, OrphanKind::Resident)
         .expect("leader stamps a live orphan");
+    assert!(stamp.episode > 0, "the leader mints a nonzero episode id");
     assert_eq!(
         stamp,
         OrphanIncidentStamp {
@@ -4163,6 +4166,7 @@ fn stamped_orphan_quarantine_is_residency_independent() {
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: stamp.episode,
         }
     );
     let command = Command::QuarantineOffheapOrphan {
@@ -4209,9 +4213,22 @@ fn variables_lost_quarantined_round_trips() {
     let current = Event::VariablesLostQuarantined {
         instance_key: 7,
         incident_key: 9,
+        episode: 9,
     };
     let json = serde_json::to_string(&current).unwrap();
     assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), current);
+    // A pre-#1587 frame (no `episode` field) still decodes, defaulting to the
+    // episode-blind sentinel 0.
+    let legacy = r#"{"VariablesLostQuarantined":{"instance_key":7,"incident_key":9}}"#;
+    let decoded = serde_json::from_str::<Event>(legacy).unwrap();
+    assert!(matches!(
+        decoded,
+        Event::VariablesLostQuarantined {
+            instance_key: 7,
+            incident_key: 9,
+            episode: 0,
+        }
+    ));
 }
 
 // #1574: the quarantine's dedup tombstone rides the replicated event log, so it
@@ -4252,6 +4269,7 @@ fn quarantine_tombstone_replays_identically() {
                         reason: "variables lost: spill row missing".into(),
                         terminal_epoch: 0,
                         target_terminated_epoch: 0,
+                        episode: 0,
                     }),
                 },
                 50,
@@ -4284,6 +4302,7 @@ fn quarantine_tombstone_replays_identically() {
                     reason: "variables lost: spill row missing".into(),
                     terminal_epoch: 0,
                     target_terminated_epoch: 0,
+                    episode: 0,
                 }),
             },
             51,
@@ -4324,6 +4343,7 @@ fn quarantine_offheap_orphan_stamp_is_serde_additive() {
             reason: "r".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: 0,
         }),
     };
     let json = serde_json::to_string(&stamped).unwrap();
@@ -4363,6 +4383,7 @@ fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: 0,
         }),
     };
     let first = engine.apply_command_at(mk(), 50).unwrap();
@@ -4438,6 +4459,7 @@ fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: 0,
         }),
     };
     let boot = || {
@@ -4534,6 +4556,7 @@ fn quarantine_dedup_is_episode_scoped_across_resolution() {
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: 0,
         }),
     };
 
@@ -4621,6 +4644,7 @@ fn stamped(key: Key) -> Command {
             reason: "variables lost: spill row missing".into(),
             terminal_epoch: 0,
             target_terminated_epoch: 0,
+            episode: 0,
         }),
     }
 }
@@ -4700,18 +4724,34 @@ fn stamped_quarantine_converges_resident_and_cold_replicas() {
     );
 }
 
-// #1574 (scope B): a delayed duplicate of an already-resolved quarantine is
-// harmless and replica-deterministic. With no payload it cannot overwrite
-// variables updated after the resolve; it is reported as a fresh episode
-// (exact per-episode dedup is the #1447 follow-up), identically on a resident
-// and a cold replica.
+// #1587 (acceptance 1 + 2): a delayed duplicate of an already-resolved
+// quarantine episode is a deterministic NO-OP — it raises no new incident and
+// never touches variables. The stamp's replicated loss-episode id matches no
+// live tombstone once the episode's incident was resolved, so the apply gate
+// suppresses the duplicate instead of re-reporting it as a fresh episode (the
+// pre-#1587 behaviour). Identical on a resident and a cold replica, and the
+// `SetVariables` committed after the resolve is never rolled back.
 #[test]
-fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
+fn delayed_duplicate_after_resolve_is_a_noop_and_touches_no_variables() {
     let (mut resident, key) = orphan_replica();
     let (mut cold, _) = orphan_replica();
+    // The leader stamps episode 1 once; BOTH the first proposal and its delayed
+    // duplicate carry that SAME stamped command (same episode id).
+    let episode1 = resident
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("episode 1 stamps");
+    assert!(
+        episode1.episode > 0,
+        "the leader mints a nonzero episode id"
+    );
+    let cmd1 = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(episode1),
+    };
     let run = |engine: &mut Engine, shed: bool| {
-        engine.apply_command_at(stamped(key), 50).unwrap();
-        let incident_key = engine.state.variables_lost_quarantined[&key];
+        // Episode 1: apply the stamped proposal, then resolve its incident.
+        engine.apply_command_at(cmd1.clone(), 50).unwrap();
+        let incident_key = engine.state.variables_lost_quarantined[&key].incident_key;
         engine
             .apply_command_at(Command::resolve_incident(incident_key), 51)
             .unwrap();
@@ -4719,6 +4759,8 @@ fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
             !engine.state.variables_lost_quarantined.contains_key(&key),
             "resolve lifts the tombstone"
         );
+        // A `SetVariables` commits after the resolve (the intervening write the
+        // repair must never roll back).
         engine
             .apply_command_at(
                 Command::set_variables(key, HashMap::from([("x".into(), Value::Int(2))])),
@@ -4726,7 +4768,8 @@ fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
             )
             .unwrap();
         let row = shed.then(|| engine.snapshot_instance(key).expect("cold-shed"));
-        let dup = engine.apply_command_at(stamped(key), 53).unwrap();
+        // The DELAYED DUPLICATE of episode 1 (the SAME stamped command) applies.
+        let dup = engine.apply_command_at(cmd1.clone(), 53).unwrap();
         if let Some(row) = row {
             engine.rehydrate_instance(row);
         }
@@ -4735,22 +4778,99 @@ fn delayed_duplicate_after_resolve_is_deterministic_and_touches_no_variables() {
     let dup_resident = run(&mut resident, false);
     let dup_cold = run(&mut cold, true);
     assert_eq!(dup_resident, dup_cold, "identical events on both replicas");
-    assert!(dup_resident.iter().all(|e| !matches!(
-        e,
-        Event::VariablesUpdated { .. } | Event::ScopedVariablesUpdated { .. }
-    )));
+    assert!(
+        dup_resident.is_empty(),
+        "a delayed duplicate of a resolved episode is a complete no-op: {dup_resident:?}"
+    );
     for engine in [&resident, &cold] {
+        // Exactly one VariablesLost incident ever (episode 1's, now resolved) —
+        // the duplicate raised none.
+        assert_eq!(
+            engine
+                .incidents()
+                .iter()
+                .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+                .count(),
+            1,
+            "no new incident from the delayed duplicate"
+        );
+        assert!(
+            !engine.state.variables_lost_quarantined.contains_key(&key),
+            "the duplicate re-records no tombstone"
+        );
         assert_eq!(
             engine.instance(key).unwrap().variables.get("x"),
             Some(&Value::Int(2)),
             "the post-resolve SetVariables is never rolled back"
         );
     }
-    assert_eq!(
-        resident.state.variables_lost_quarantined,
-        cold.state.variables_lost_quarantined
-    );
     assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
+}
+
+// #1587: a GENUINELY NEW loss after a resolution is still reported. The leader
+// stamps it with a FRESH episode id (its allocator advanced past episode 1's
+// incident key), so the apply gate sees a new episode — not a duplicate of the
+// resolved one — and raises a fresh incident.
+#[test]
+fn new_loss_after_resolution_is_reported_fresh() {
+    let (mut engine, key) = orphan_replica();
+    // Episode 1: the leader stamps, the proposal applies, the incident resolves.
+    let episode1 = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("episode 1 stamps");
+    engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(episode1.clone()),
+            },
+            50,
+        )
+        .unwrap();
+    let incident_key = engine.state.variables_lost_quarantined[&key].incident_key;
+    assert_eq!(
+        incident_key, episode1.episode,
+        "the episode id IS the incident key the proposal minted"
+    );
+    engine
+        .apply_command_at(Command::resolve_incident(incident_key), 51)
+        .unwrap();
+    assert!(!engine.has_active_variables_lost(key), "episode 1 resolved");
+
+    // Episode 2: the leader re-stamps AFTER the resolution. Its allocator has
+    // advanced past episode 1's incident key, so the new stamp carries a
+    // DISTINCT episode id.
+    let stamp2 = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a fresh loss stamps");
+    assert_ne!(
+        stamp2.episode, incident_key,
+        "a new episode gets a fresh id, distinct from the resolved episode"
+    );
+    let second = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stamp2),
+            },
+            52,
+        )
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a genuinely new loss after resolution raises a fresh incident"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
+        "the new episode records a fresh tombstone"
+    );
+    assert!(engine.has_active_variables_lost(key), "episode 2 is active");
 }
 
 // #1574 review (cancellation race): an orphan report can be queued before the
@@ -4790,6 +4910,7 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
                     reason: "variables lost: spill row missing".into(),
                     terminal_epoch: 0,
                     target_terminated_epoch: 0,
+                    episode: 0,
                 }),
             },
             50,
@@ -4816,6 +4937,7 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
                     reason: "variables lost: cold instance row missing".into(),
                     terminal_epoch: 0,
                     target_terminated_epoch: 0,
+                    episode: 0,
                 }),
             },
             51,
@@ -4982,13 +5104,20 @@ fn stamped_orphan_quarantine_with_a_stale_stamp_still_raises() {
     let (mut resident, key) = boot();
     let (mut evicted, _) = boot();
     // The stamp predates the terminal transition (the leader stamped while the
-    // instance was live, one terminal epoch earlier).
+    // instance was live, one terminal epoch earlier). The stamp is a LEGACY
+    // (pre-#1587) one — `episode: 0` — so the apply gate stays episode-blind
+    // and decides on the terminal gate alone (a nonzero episode would no-op as
+    // a duplicate-of-a-resolved-episode once no tombstone is live, which is
+    // not what this terminal-gate test exercises).
     let stamp = resident
         .orphan_incident_stamp(key, OrphanKind::Resident)
         .expect("a live instance stamps");
     let command = Command::QuarantineOffheapOrphan {
         instance_key: key,
-        stamp: Some(stamp),
+        stamp: Some(crate::OrphanIncidentStamp {
+            episode: 0,
+            ..stamp
+        }),
     };
 
     // The instance terminates and the ring wraps PAST the stamp's epoch (more
@@ -5099,13 +5228,19 @@ fn stamped_orphan_quarantine_after_an_unrelated_completion_still_raises() {
             .unwrap();
     }
 
-    // The leader stamps the LIVE orphan at terminal_epoch = 1.
+    // The leader stamps the LIVE orphan at terminal_epoch = 1. As above, the
+    // stamp is made LEGACY (`episode: 0`) so the apply gate stays episode-blind
+    // and decides on the terminal gate alone — this test pins the terminal
+    // gate's target-specificity, not the episode dedup.
     let stamp = resident
         .orphan_incident_stamp(key, OrphanKind::Resident)
         .expect("a live instance stamps");
     let command = Command::QuarantineOffheapOrphan {
         instance_key: key,
-        stamp: Some(stamp),
+        stamp: Some(crate::OrphanIncidentStamp {
+            episode: 0,
+            ..stamp
+        }),
     };
 
     // A SECOND unrelated instance completes before the proposal commits,
