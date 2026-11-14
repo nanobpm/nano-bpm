@@ -51,6 +51,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::AgentHistoryDiscarded { .. }
         | Event::AgentHistoryDeduplicated { .. }
         | Event::VariablesLostQuarantined { .. }
+        | Event::OrphanStampSuperseded { .. }
         | Event::ProcessInstanceCompleted { .. }
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessInstanceSuspended { .. }

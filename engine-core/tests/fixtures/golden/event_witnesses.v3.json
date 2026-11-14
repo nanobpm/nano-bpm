@@ -219,8 +219,15 @@
   },
   {
     "VariablesLostQuarantined": {
+      "episode": 26,
       "incident_key": 26,
       "instance_key": 25
+    }
+  },
+  {
+    "OrphanStampSuperseded": {
+      "episode": 26,
+      "instance_key": 27
     }
   }
 ]

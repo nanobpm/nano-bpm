@@ -12,6 +12,14 @@ use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
 
+/// `skip_serializing_if` predicate for an optional-by-zero [`Key`] field: a
+/// zero key is the legacy/absent sentinel (additive fields default to it), so
+/// it is omitted from the serialized frame.
+#[cfg(feature = "serde")]
+fn is_zero_key(k: &Key) -> bool {
+    *k == 0
+}
+
 /// One activation instruction of a [`crate::command::Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
 /// scope. Mirrors Zeebe's `ProcessInstanceModificationActivateInstruction`:
@@ -1826,6 +1834,34 @@ pub enum Event {
         /// on the replicated `IncidentResolved.incident_key` so the lift does
         /// not depend on whether the incident record is resident.
         incident_key: Key,
+        /// The replicated loss-episode id the quarantine's stamp carried
+        /// (#1587), recorded into the tombstone so a delayed duplicate of the
+        /// SAME episode (applying after the incident was resolved and the
+        /// tombstone lifted) is a deterministic no-op instead of a fresh
+        /// incident. `0` for a frame written before this field existed
+        /// (episode-blind, pre-#1587 behaviour). Additive: `serde(default)`.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
+        episode: Key,
+    },
+
+    /// A stamped orphan-quarantine proposal could not apply because its
+    /// loss-episode id no longer matches the incident key a fresh proposal
+    /// would mint (#1587 review): unrelated key-minting work advanced the
+    /// replicated allocator between the leader stamping the report and the
+    /// proposal committing. The report itself is still pending in the leader's
+    /// journal backlog, so this event is the **replicated** signal every
+    /// replica (and the leader's journal, which watches applied events)
+    /// observes identically: the leader re-stamps the still-pending report at
+    /// its now-current allocator position and re-proposes it, instead of
+    /// silently clearing the pending report without raising `VariablesLost`.
+    /// Carries no state change — the reducers ignore it; it exists so the
+    /// supersede decision is journaled and replica-deterministic. Additive
+    /// variant: no snapshot-format bump.
+    OrphanStampSuperseded {
+        instance_key: Key,
+        /// The superseded loss-episode id (the stamp's `episode`), recorded so
+        /// the journal can correlate the reissue with the report it parked.
+        episode: Key,
     },
 }
 
@@ -1919,6 +1955,7 @@ impl Event {
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::VariablesLostQuarantined { instance_key, .. }
+            | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no

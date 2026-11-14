@@ -1672,6 +1672,16 @@ impl Journal {
         self.orphans.backlog.remove(&key);
     }
 
+    /// A stamped quarantine for `key` applied SUPERSEDED (#1587 review): its
+    /// episode id no longer matched the allocator's position, so the loss is
+    /// still outstanding. Take the report out of `in_flight` (it stays in the
+    /// backlog) so it is re-stamped at the allocator's now-current position
+    /// and re-proposed — never silently cleared without raising
+    /// `VariablesLost`. The engine already re-offered it to the reissue sink.
+    pub fn orphan_stamp_superseded(&mut self, key: Key) {
+        self.orphans.in_flight.remove(&key);
+    }
+
     /// Orphan keys reported but whose stamped quarantine has not applied here
     /// yet, in key order (#1447).
     pub fn orphan_backlog(&self) -> Vec<Key> {
@@ -2853,7 +2863,9 @@ impl Journal {
             Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
         ) || command.routed_delivery_key().is_some();
         // A STAMPED orphan quarantine (#1447) settles this replica's pending
-        // report for the key once it applies (dup or not).
+        // report for the key once it applies — unless it applies SUPERSEDED
+        // (#1607 review), in which case the report stays pending for the
+        // reissue. The decision is taken after the apply, from its events.
         let orphan_settled = match &command {
             Command::QuarantineOffheapOrphan {
                 instance_key,
@@ -2862,7 +2874,28 @@ impl Journal {
             _ => None,
         };
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
-        if let Some(key) = orphan_settled {
+        // A superseded orphan stamp (#1587 review) applied: the report is still
+        // pending, so re-enqueue it (out of `in_flight`) for a FRESH stamp at
+        // the allocator's now-current position. The engine already re-offered
+        // it to the reissue sink (→ the propose channel); this clears the
+        // journal-side in-flight marker so the re-proposal is not suppressed
+        // as already-handed-out. A duplicate's reissue re-settles harmlessly.
+        //
+        // Settlement is decided AFTER the apply (#1607 review): a superseded
+        // stamp must NOT settle — `settle_orphan_report` would remove the
+        // backlog entry, and the queued retry would then get `None` from
+        // `orphan_pending_stamp` and be discarded, losing the loss report. So
+        // a stamped quarantine settles only when it did NOT supersede.
+        let mut superseded = false;
+        for event in events.iter() {
+            if let Event::OrphanStampSuperseded { instance_key, .. } = event {
+                superseded = true;
+                self.orphan_stamp_superseded(*instance_key);
+            }
+        }
+        if let Some(key) = orphan_settled
+            && !superseded
+        {
             self.settle_orphan_report(key);
         }
         let mut activated: Vec<_> = events
@@ -3571,6 +3604,13 @@ impl Journal {
     /// `&Engine`).
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Mutable access to the underlying engine, for host-side wiring that is
+    /// not replicated state (e.g. [`Engine::set_orphan_reissue_sink`], #1587
+    /// review). Never use it to mutate journaled state off the command path.
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
     }
 
     /// Sets the cluster-wide partition count on the underlying engine so it
@@ -7200,6 +7240,82 @@ mod tests {
         assert_eq!(journal.incidents().len(), 1, "replicated incident applied");
         assert!(journal.orphan_backlog().is_empty(), "settled on apply");
         drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1607 review: when intervening key-minting work supersedes a fresh stamp,
+    // the apply emits `OrphanStampSuperseded` and the report must STAY in the
+    // backlog — settling it would remove the entry, and the queued retry would
+    // then get `None` from `orphan_pending_stamp` and be discarded, losing the
+    // loss report. The superseded report stays eligible for a fresh stamp.
+    #[test]
+    fn superseded_orphan_stamp_keeps_retry_eligible_for_stamping() {
+        let path = restart_store_path("orphan-supersede-1607");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        // Detect the loss and park the report (leader: enqueued + in flight).
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "parked");
+
+        // The leader stamps the report at the allocator's current position.
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+
+        // Intervening key-minting work commits BEFORE the stamped proposal,
+        // advancing the shared allocator past the stamped episode.
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+
+        // The stamped proposal now applies SUPERSEDED.
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        assert!(
+            !journal.engine.has_active_variables_lost(keys[0]),
+            "no incident raised by the superseded proposal"
+        );
+
+        // The report is NOT settled: it stays in the backlog, so the queued
+        // retry still resolves a FRESH stamp (Some) instead of being discarded
+        // (None). This is the regression the #1607 review cited.
+        assert_eq!(
+            journal.orphan_backlog(),
+            vec![keys[0]],
+            "a superseded stamp does not settle the report"
+        );
+        assert!(
+            journal
+                .orphan_pending_stamp(keys[0], OrphanKind::Resident)
+                .is_some(),
+            "the retry remains eligible for stamping"
+        );
+        // Taken out of in-flight, so the next drain re-enqueues it.
+        assert_eq!(journal.drain_orphan_backlog(), 1, "re-enqueued for reissue");
+
+        drop(journal);
+        drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

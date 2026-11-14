@@ -256,15 +256,28 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
 
         // Off-heap orphan quarantine (#1574): record the replicated dedup
         // tombstone only. Residency-independent, so every replica lands
-        // identically; no instance state is touched.
+        // identically; no instance state is touched. The tombstone carries the
+        // loss-episode id (#1587) so a delayed duplicate of the same episode,
+        // applying after the incident was resolved and the tombstone lifted, is
+        // a deterministic no-op instead of a fresh incident.
         Event::VariablesLostQuarantined {
             instance_key,
             incident_key,
+            episode,
         } => {
-            state
-                .variables_lost_quarantined
-                .insert(*instance_key, *incident_key);
+            state.variables_lost_quarantined.insert(
+                *instance_key,
+                crate::state::types::VariablesLostTombstone {
+                    incident_key: *incident_key,
+                    episode: *episode,
+                },
+            );
         }
+
+        // A superseded orphan stamp (#1587 review) carries no state change —
+        // it only journals the replica-deterministic decision so the leader's
+        // journal re-enqueues the still-pending report. Nothing to apply.
+        Event::OrphanStampSuperseded { .. } => {}
 
         Event::ProcessInstanceCompleted { instance_key } => {
             state.note_terminated(*instance_key);
