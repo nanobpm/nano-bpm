@@ -335,6 +335,18 @@ pub struct SpillStores {
     pub spill: Option<Arc<VarSpillStore>>,
     /// The lean mode's authoritative variable store.
     pub varstore: Option<Arc<VarStore>>,
+    /// Legacy fallback tier consulted before a lean var-store miss is declared a
+    /// definitive absence (#1574 review): the cold store holds whole-instance
+    /// rows (with their variables inline) for instances that were cold-shed, so
+    /// a var-store miss for such an instance is a routing artifact, not a loss.
+    /// [`Journal::peek_spilled_variables`](crate::journal::Journal) makes the
+    /// same check (spill-or-cold) before refusing to declare a loss; without it
+    /// here a cold-only configuration quarantines recoverable variables.
+    pub legacy: Option<Arc<VarSpillStore>>,
+    /// Where a DEFINITIVELY absent row (readable store, no row) is recorded
+    /// before the write fails closed (#1447), so the off-thread Raft snapshot
+    /// writer still reports the orphan to the leader-propose machinery.
+    pub absences: Option<crate::journal::OrphanInbox>,
 }
 
 /// Store-backed streaming write (#1337): the production entry point. Streams
@@ -370,6 +382,8 @@ pub fn write_streaming_snapshot_from_stores(
         cold: cold_store,
         spill: spill_store,
         varstore,
+        legacy,
+        absences,
     } = stores;
     write_streaming_snapshot(StreamWrite {
         path,
@@ -379,68 +393,18 @@ pub fn write_streaming_snapshot_from_stores(
         control: capture.control,
         instances: capture.resident,
         cold: cold_keys,
-        read_cold: move |key| {
-            let store = cold_store.as_ref().ok_or_else(|| {
-                invalid_data("cold index references a key but no cold store is wired")
-            })?;
-            store
-                .try_get_cold(key)
-                .map_err(|e| invalid_data(&e.to_string()))?
-                .ok_or_else(|| {
-                    invalid_data(&format!(
-                        "cold instance {key} has no row in the spill store"
-                    ))
-                })
+        read_cold: {
+            let absences = absences.clone();
+            move |key| read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())
         },
         resolve_spilled: move |snap| {
-            let key = snap.instance.key;
-            // Lean mode reads the authoritative var store; classic reads the
-            // spill cache. Mirror `Journal::peek_spilled_variables`'s preference
-            // AND its fail-closed semantics (#1464 review): a store read ERROR is
-            // propagated (never swallowed into a silent `None`), so a
-            // transient/corrupt row aborts the snapshot instead of being mistaken
-            // for a definitively-absent payload.
-            let resolved = if let Some(vs) = varstore.as_ref() {
-                match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
-                    Some(vars) => Some(vars),
-                    // The authoritative var store has NO row. A legacy spill row
-                    // may still exist from an unmigrated lean-over-legacy
-                    // transition; that row is potentially STALE (the var store is
-                    // authoritative), so accepting it would seal outdated
-                    // variables into a self-contained snapshot whose covered log
-                    // is then purged. `Journal::peek_spilled_variables` refuses
-                    // exactly this state (journal.rs) — fail closed here too
-                    // rather than seal a payload the restore side would reject.
-                    None => {
-                        let legacy_row = match spill_store.as_ref() {
-                            Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
-                            None => None,
-                        };
-                        if legacy_row.is_some() {
-                            return Err(invalid_data(&format!(
-                                "spilled instance {key}: var store has no row but a legacy \
-                                 spill row exists (unmigrated lean-over-legacy state); refusing \
-                                 to seal a potentially stale payload"
-                            )));
-                        }
-                        None
-                    }
-                }
-            } else if let Some(sp) = spill_store.as_ref() {
-                sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
-            } else {
-                None
-            };
-            match resolved {
-                Some(vars) => {
-                    snap.instance.variables = Arc::new(vars);
-                    snap.instance.variables_spilled = false;
-                    Ok(())
-                }
-                None => Err(invalid_data(&format!(
-                    "spilled instance {key} has no variable row in any wired store"
-                ))),
-            }
+            resolve_spilled_from_stores(
+                snap,
+                varstore.as_ref(),
+                spill_store.as_ref(),
+                legacy.as_ref(),
+                absences.as_ref(),
+            )
         },
         control_only,
     })
@@ -808,10 +772,18 @@ fn write_multi_streaming_snapshot_inner(
             cold: cold_store,
             spill: spill_store,
             varstore,
+            legacy,
+            absences,
         } = stores;
         // Reuse the single-partition spill-resolution closure logic per row.
         let resolve = |snap: &mut InstanceSnapshot| {
-            resolve_spilled_from_stores(snap, varstore.as_ref(), spill_store.as_ref())
+            resolve_spilled_from_stores(
+                snap,
+                varstore.as_ref(),
+                spill_store.as_ref(),
+                legacy.as_ref(),
+                absences.as_ref(),
+            )
         };
         let push = |chunk: &mut Vec<(u64, InstanceSnapshot)>,
                     w: &mut BufWriter<File>,
@@ -832,17 +804,7 @@ fn write_multi_streaming_snapshot_inner(
             push(&mut chunk, &mut w, snap)?;
         }
         for key in cold_keys {
-            let store = cold_store.as_ref().ok_or_else(|| {
-                invalid_data("cold index references a key but no cold store is wired")
-            })?;
-            let snap = store
-                .try_get_cold(key)
-                .map_err(|e| invalid_data(&e.to_string()))?
-                .ok_or_else(|| {
-                    invalid_data(&format!(
-                        "cold instance {key} has no row in the spill store"
-                    ))
-                })?;
+            let snap = read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())?;
             push(&mut chunk, &mut w, snap)?;
         }
     }
@@ -895,25 +857,71 @@ fn flush_multi_chunk(
 /// Resolves a variable-spilled instance's payload from the wired stores,
 /// mirroring [`write_streaming_snapshot_from_stores`]'s fail-closed semantics
 /// (a lean var-store miss with a surviving legacy spill row is refused).
+/// Reads a cold instance's row, failing closed when absent or unreadable. A
+/// DEFINITIVE absence is recorded in `absences` first (#1447).
+fn read_cold_from_store(
+    key: Key,
+    cold_store: Option<&Arc<VarSpillStore>>,
+    absences: Option<&crate::journal::OrphanInbox>,
+) -> std::io::Result<InstanceSnapshot> {
+    let store = cold_store
+        .ok_or_else(|| invalid_data("cold index references a key but no cold store is wired"))?;
+    match store
+        .try_get_cold(key)
+        .map_err(|e| invalid_data(&e.to_string()))?
+    {
+        Some(snap) => Ok(snap),
+        None => {
+            if let Some(absences) = absences {
+                absences.record(key, nanobpmn_engine_core::OrphanKind::Cold);
+            }
+            Err(invalid_data(&format!(
+                "cold instance {key} has no row in the spill store"
+            )))
+        }
+    }
+}
+
 fn resolve_spilled_from_stores(
     snap: &mut InstanceSnapshot,
     varstore: Option<&Arc<VarStore>>,
     spill_store: Option<&Arc<VarSpillStore>>,
+    legacy: Option<&Arc<VarSpillStore>>,
+    absences: Option<&crate::journal::OrphanInbox>,
 ) -> std::io::Result<()> {
     let key = snap.instance.key;
     let resolved = if let Some(vs) = varstore {
         match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
             Some(vars) => Some(vars),
             None => {
-                let legacy_row = match spill_store {
-                    Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
-                    None => None,
+                // A lean var-store miss is a definitive absence ONLY once the
+                // legacy tier (spill-or-cold, mirroring
+                // `Journal::peek_spilled_variables`) is wired and also has no
+                // row (#1574 review): a cold-shed instance's payload lives in
+                // its cold row, so a cold-only configuration must not report
+                // the miss as a loss.
+                let legacy = spill_store.or(legacy);
+                let Some(legacy_store) = legacy else {
+                    // No legacy tier to check: the miss proves nothing about a
+                    // possibly unmigrated legacy row — fail closed, do NOT
+                    // record an absence.
+                    return Err(invalid_data(&format!(
+                        "spilled instance {key}: var store has no row and no legacy \
+                         spill/cold tier is wired to rule out an unmigrated legacy row; \
+                         refusing to declare the payload lost"
+                    )));
                 };
-                if legacy_row.is_some() {
+                // The legacy tier holds a payload in EITHER its variable-spill
+                // row or its whole-instance cold row (which carries variables
+                // inline); either means the payload survives.
+                let legacy_row = legacy_store
+                    .try_has_legacy_payload(key)
+                    .map_err(|e| invalid_data(&e.to_string()))?;
+                if legacy_row {
                     return Err(invalid_data(&format!(
                         "spilled instance {key}: var store has no row but a legacy \
-                         spill row exists (unmigrated lean-over-legacy state); refusing \
-                         to seal a potentially stale payload"
+                         spill/cold row exists (unmigrated lean-over-legacy state); \
+                         refusing to seal a potentially stale payload"
                     )));
                 }
                 None
@@ -930,9 +938,17 @@ fn resolve_spilled_from_stores(
             snap.instance.variables_spilled = false;
             Ok(())
         }
-        None => Err(invalid_data(&format!(
-            "spilled instance {key} has no variable row in any wired store"
-        ))),
+        None => {
+            // Only a wired, readable tier's miss is a definitive absence.
+            if (varstore.is_some() || spill_store.is_some())
+                && let Some(absences) = absences
+            {
+                absences.record(key, nanobpmn_engine_core::OrphanKind::Resident);
+            }
+            Err(invalid_data(&format!(
+                "spilled instance {key} has no variable row in any wired store"
+            )))
+        }
     }
 }
 
@@ -1513,6 +1529,8 @@ mod tests {
                 cold: None,
                 spill: Some(spill),
                 varstore: Some(varstore),
+                legacy: None,
+                absences: None,
             },
             false,
         );
@@ -1525,6 +1543,63 @@ mod tests {
         assert!(
             !path.exists(),
             "the rejected snapshot's partial file must be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1574 review: with a lean var store wired but the legacy SPILL store
+    // absent, a var-store miss for a spilled instance must consult the COLD tier
+    // (spill-or-cold, like `Journal::peek_spilled_variables`) before declaring a
+    // definitive absence. A cold-shed instance's payload lives in its cold row,
+    // so a cold-only configuration must not record an orphan / must fail closed.
+    #[test]
+    fn streaming_writer_checks_the_cold_tier_before_declaring_a_loss() {
+        let engine = engine_with_instances(1);
+        let (control, instances) = Engine::decompose_state_for_streaming(engine.state().clone());
+        let mut snap = instances.into_iter().next().expect("one instance");
+        let key = snap.instance.key;
+
+        // Mark the resident instance variable-spilled (empty placeholder + flag).
+        snap.instance.variables = Arc::new(HashMap::new());
+        snap.instance.variables_spilled = true;
+
+        // Stores: a lean var store with NO row for `key`, NO legacy spill store,
+        // and a COLD store that DOES hold the instance's row (payload inline).
+        let varstore = Arc::new(VarStore::open(None).expect("var store"));
+        let cold = Arc::new(VarSpillStore::open(None).expect("cold store"));
+        cold.put_cold(key, &snap).expect("seed cold row");
+        let absences = crate::journal::OrphanInbox::default();
+
+        let path = tmp_path("cold-tier-1574");
+        let result = write_streaming_snapshot_from_stores(
+            &path,
+            &header_line(),
+            7,
+            None,
+            StreamingCapture {
+                control: control_snapshot(&control, &engine),
+                resident: vec![snap],
+            },
+            &[],
+            SpillStores {
+                cold: None,
+                spill: None,
+                varstore: Some(varstore),
+                legacy: Some(cold),
+                absences: Some(absences.clone()),
+            },
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a var-store miss with a surviving cold row must fail closed, not seal"
+        );
+        // Crucially the cold row's presence means NO definitive absence is
+        // recorded — the payload is recoverable, so it must not be quarantined.
+        assert!(
+            !absences.contains(key),
+            "no orphan recorded while the cold tier holds the payload"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

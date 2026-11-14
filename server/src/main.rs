@@ -5923,9 +5923,11 @@ impl SpillConfig {
     /// Installs the configured spill tiers onto `journal`. Idempotent per
     /// journal; call once per engine actor at construction.
     fn apply(&self, journal: &mut Journal) {
-        // #1384: under Raft, command-path orphan quarantines run inside
-        // state-machine application and must not raise a non-deterministic
-        // incident — observe only.
+        // #1384/#1447: under Raft, command-path orphan quarantines run inside
+        // state-machine application and never raise a non-deterministic
+        // incident inline — they are handed to the leader-propose channel the
+        // replication layer wires (`set_orphan_sink`) so the leader re-proposes
+        // them with a replicated timestamp.
         journal.set_replicated_apply(raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
@@ -19784,6 +19786,16 @@ impl ServerImpl {
         let Some(handle) = self.engine_handle_for(p) else {
             return (false, Vec::new());
         };
+        // Drain any off-heap orphans parked while this replica was a follower
+        // (#1447): each is re-proposed as a leader-stamped
+        // `QuarantineOffheapOrphan`, so a loss detected before promotion (or
+        // before the orphan sink was wired) still becomes a durable, replicated
+        // `VariablesLost` incident.
+        handle
+            .with(|journal| {
+                journal.drain_orphan_backlog();
+            })
+            .await;
         // One read on the leader: variable/cold spill + what (if anything) is due
         // now. Only the leader runs this gate; followers never propose, so safe.
         let (timers_due, jobs_due) = handle

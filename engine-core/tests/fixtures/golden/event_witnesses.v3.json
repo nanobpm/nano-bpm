@@ -216,5 +216,11 @@
       "lease_token": "nano-lease:0000000000000019",
       "outcome": "failed"
     }
+  },
+  {
+    "VariablesLostQuarantined": {
+      "incident_key": 26,
+      "instance_key": 25
+    }
   }
 ]

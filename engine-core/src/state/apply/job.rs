@@ -437,6 +437,14 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.incidents.retain(|k| k != incident_key);
             }
+            // Resolving the incident a quarantine raised ends its loss episode
+            // (#1574): lift the dedup tombstone so a later, distinct loss is
+            // reported fresh. Keyed on the replicated incident key — NOT on the
+            // incident record, which is absent on a cold-tiered replica — so
+            // every replica lifts identically.
+            if state.variables_lost_quarantined.get(instance_key) == Some(incident_key) {
+                state.variables_lost_quarantined.remove(instance_key);
+            }
             // A recoverable job-incident: return the parked job to the
             // activatable pool so a worker can pick it up again — but *only* if
             // it is still `Failed` (parked). A job already driven to a terminal

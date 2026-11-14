@@ -548,9 +548,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
 
     let offheap_orphans_unreported_total = IntCounter::new(
         "nanobpm_offheap_orphans_unreported_total",
-        "Off-heap-orphan quarantines observed inside replicated (Raft) state-machine \
-         application, where no durable VariablesLost incident is raised (to keep \
-         replicas deterministic); the loss is logged and counted only.",
+        "Off-heap-orphan quarantines detected inside replicated (Raft) state-machine \
+         application. The durable VariablesLost incident is never raised inline (it \
+         would diverge replicas); it is handed to the leader-propose channel \
+         (#1447), so this counts detections whose replicated incident is still \
+         pending (or, with no channel wired, will never be raised — #1384).",
     )
     .expect("valid counter");
 
@@ -1766,9 +1768,10 @@ pub fn record_read_model_export_drop() {
     METRICS.read_model_export_drops_total.inc();
 }
 
-/// Records one off-heap-orphan quarantine observed inside replicated (Raft)
-/// state-machine application, where the durable incident is deliberately not
-/// raised (#1384) — the loss is logged and counted only.
+/// Records one off-heap-orphan quarantine detected inside replicated (Raft)
+/// state-machine application (#1384). The durable incident is never raised
+/// inline; it is handed to the leader-propose channel (#1447), so this counts
+/// detections whose replicated `VariablesLost` incident is still pending.
 pub fn record_offheap_orphan_unreported() {
     METRICS.offheap_orphans_unreported_total.inc();
 }

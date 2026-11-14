@@ -1808,6 +1808,25 @@ pub enum Event {
         /// duplicate resolves to.
         original_agent_history_key: Key,
     },
+
+    /// An instance's off-heap variable payload was quarantined as lost (#1574).
+    /// Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
+    /// alongside its `IncidentRaised`, its reducer records the instance in
+    /// [`crate::state::State::variables_lost_quarantined`], the replicated
+    /// dedup tombstone the quarantine idempotency guard reads (lifted when
+    /// `incident_key` is resolved). It carries **no** variable payload
+    /// and mutates no instance state: the payload-carrying repair was dropped
+    /// because a leader-snapshotted payload is not safe under Raft ordering
+    /// (it can roll back an intervening `SetVariables`). Deterministic
+    /// apply-time repair is the #1447 follow-up.
+    VariablesLostQuarantined {
+        instance_key: Key,
+        /// The `VariablesLost` incident this quarantine raised: the loss
+        /// episode. Resolving exactly this incident lifts the tombstone, keyed
+        /// on the replicated `IncidentResolved.incident_key` so the lift does
+        /// not depend on whether the incident record is resident.
+        incident_key: Key,
+    },
 }
 
 impl Event {
@@ -1899,6 +1918,7 @@ impl Event {
             | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
+            | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no

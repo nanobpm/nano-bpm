@@ -587,6 +587,19 @@ pub struct ProcessInstance {
     #[cfg_attr(feature = "serde", serde(default))]
     pub process_definition_key: Key,
     pub state: ProcessInstanceState,
+    /// The replicated terminal epoch ([`State::terminal_epoch`]) at which this
+    /// instance reached a terminal state (`Completed` / `Terminated`), recorded
+    /// by [`State::note_terminated`] in the same apply arm that set `state`.
+    /// `0` while the instance is live (and for instances written before this
+    /// field existed, via `serde(default)`). This is the **target-specific**
+    /// replicated lifecycle-validity stamp the orphan-quarantine gate reads
+    /// (#1574 review, review 5899722557): unlike the global epoch distance, it
+    /// names THIS instance's terminal transition, so an unrelated instance
+    /// completing between a stamp and its commitment is never misread as the
+    /// target's termination. Replicated-only (derived in `apply_event`), so
+    /// every replica records the identical value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminated_epoch: u64,
     /// When this instance is currently `SUSPENDED`, the millisecond-since-epoch
     /// instant it most recently entered suspension (the `suspendedDate` surfaced
     /// on the REST result). `None` whenever the instance is not currently
@@ -2122,6 +2135,92 @@ pub struct State {
     /// for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource_versions: HashMap<Key, DeployedResource>,
+    /// Instance key → the `VariablesLost` incident key of its active loss
+    /// episode (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
+    /// tombstone** (#1574 review). The `VariablesLost` incident record itself
+    /// leaves hot state when its instance cold-spills
+    /// ([`crate::Engine::snapshot_instance`] drains `incidents` into the cold
+    /// row) and is dropped on terminal eviction, so a dedup guard that reads
+    /// only `incidents` goes blind on exactly the replica that tiered — a
+    /// duplicate committed quarantine then mints a second incident on that
+    /// replica while a resident replica skips it, diverging the journals. This
+    /// set is independent of instance residency and eviction, so the guard
+    /// stays identical on every replica. `serde(default)` so snapshots written
+    /// before it deserialize empty (such a snapshot predates the quarantine
+    /// event, so there is nothing to dedup yet).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables_lost_quarantined: BTreeMap<Key, Key>,
+    /// The most recent instance keys to reach a terminal state
+    /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
+    /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
+    /// **replicated** record — appended only by `apply_event`, so identical on
+    /// every replica and independent of host-driven terminal eviction (which is
+    /// replica-local in timing). It closes the orphan-quarantine cancellation
+    /// race: a stamped `QuarantineOffheapOrphan` queued before a cancel can
+    /// commit after it, when one replica still holds the terminal instance and
+    /// another has already evicted it; both must no-op identically.
+    /// `serde(default)`: older snapshots load empty.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub recently_terminated: std::collections::VecDeque<Key>,
+    /// Total terminal transitions ever applied (`ProcessInstanceCompleted` /
+    /// `ProcessInstanceTerminated`) — a **replicated** monotonic epoch
+    /// (#1574 review). The [`recently_terminated`](Self::recently_terminated)
+    /// ring is bounded, so once it wraps it can no longer answer "did this key
+    /// terminate after the leader stamped its orphan proposal?" for an evicted
+    /// instance. The epoch can: the leader stamps the value it saw, and the
+    /// apply gate compares the distance against the ring's coverage
+    /// (`terminal_epoch - stamp_epoch <= recently_terminated.len()` ⇒ every
+    /// transition since the stamp is still in the ring). Replicated-only, so
+    /// every replica computes the identical distance and decides identically.
+    /// `serde(default)`: older snapshots load `0` (they predate the quarantine
+    /// command, so no stamped proposal can be outstanding against them).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminal_epoch: u64,
+}
+
+/// Bound on [`State::recently_terminated`]. The window it must cover is one
+/// orphan proposal's round trip (enqueue → commit), so a few thousand terminal
+/// transitions is ample while keeping the snapshot cost tiny (8 bytes/key).
+pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
+
+impl State {
+    /// Records `instance_key` as terminal in the bounded replicated ring and
+    /// advances the replicated terminal epoch. Also stamps the instance's own
+    /// [`ProcessInstance::terminated_epoch`] with the new epoch — the
+    /// target-specific lifecycle-validity record the orphan-quarantine gate
+    /// reads (#1574 review). The epoch is advanced FIRST so the instance records
+    /// the value its own terminal transition produced.
+    pub(crate) fn note_terminated(&mut self, instance_key: Key) {
+        if self.recently_terminated.len() >= RECENTLY_TERMINATED_CAP {
+            self.recently_terminated.pop_front();
+        }
+        self.recently_terminated.push_back(instance_key);
+        self.terminal_epoch += 1;
+        if let Some(instance) = self.instances.get_mut(&instance_key) {
+            instance.terminated_epoch = self.terminal_epoch;
+        }
+    }
+
+    /// The replicated terminal epoch at which `instance_key` reached a terminal
+    /// state, read from whichever replicated record still holds it: the resident
+    /// instance's own [`ProcessInstance::terminated_epoch`], or — for an
+    /// instance already evicted from hot state — its position in the bounded
+    /// [`recently_terminated`](Self::recently_terminated) ring (the oldest
+    /// retained entry is `terminal_epoch - len + 1`, so index `i` is epoch
+    /// `terminal_epoch - len + 1 + i`). `None` when no replicated record can
+    /// prove the instance terminated (live, or terminated so long ago the ring
+    /// has wrapped past it). Replicated-only, so every replica computes the
+    /// identical value for an instance it can still see.
+    pub(crate) fn terminated_epoch_of(&self, instance_key: Key) -> Option<u64> {
+        if let Some(instance) = self.instances.get(&instance_key) {
+            return (instance.terminated_epoch > 0).then_some(instance.terminated_epoch);
+        }
+        let len = self.recently_terminated.len() as u64;
+        self.recently_terminated
+            .iter()
+            .position(|k| *k == instance_key)
+            .map(|i| self.terminal_epoch - len + 1 + i as u64)
+    }
 }
 
 /// A deployed decision requirements graph together with the identity the engine
@@ -2510,6 +2609,37 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
     }
     for incident in incidents {
         state.incidents.insert(incident.key, incident);
+    }
+    reconcile_incident_index(state, key);
+}
+
+/// Folds the ACTIVE incident raised while `instance_key` was cold into that
+/// instance's `incidents` index (#1574 review). The only incident that can be
+/// raised against a non-resident instance is the off-heap-orphan
+/// `VariablesLost` quarantine, and it is always recorded in the replicated
+/// tombstone [`State::variables_lost_quarantined`] (instance → incident). That
+/// map is the O(1) instance-keyed lookup, so restore never scans the
+/// partition-wide incident map (which would make bulk snapshot loading
+/// quadratic). Restoring the stale cold row alone would leave the incident
+/// unindexed and a later termination would resolve it only on peers that held
+/// the instance resident — diverging the event log.
+fn reconcile_incident_index(state: &mut State, instance_key: Key) {
+    let Some(&incident_key) = state.variables_lost_quarantined.get(&instance_key) else {
+        return;
+    };
+    let Some(incident) = state.incidents.get(&incident_key) else {
+        return;
+    };
+    if incident.instance_key != instance_key || incident.state != IncidentState::Active {
+        return;
+    }
+    let owed = incident.owed_activation();
+    if let Some(instance) = state.instances.get_mut(&instance_key) {
+        if instance.incidents.contains(&incident_key) {
+            return;
+        }
+        instance.incidents.push(incident_key);
+        instance.activating.extend(owed);
     }
 }
 
