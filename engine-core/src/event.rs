@@ -2734,11 +2734,18 @@ pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
             return match top_level_members(line) {
                 None => Err(malformed()),
                 Some(members) => {
+                    // Scan ALL `event` occurrences before failing: a malformed
+                    // sibling must never short-circuit past an unknown one, so
+                    // any `UnknownVariant` wins regardless of key order.
                     let mut saw_event = false;
                     for (key, raw) in &members {
                         if key == "event" {
                             saw_event = true;
-                            decode_event_json(raw.get())?;
+                            if let Err(err @ EventDecodeError::UnknownVariant { .. }) =
+                                decode_event_json(raw.get())
+                            {
+                                return Err(err);
+                            }
                         }
                     }
                     if saw_event {

@@ -191,6 +191,10 @@ fn unknown_variant_survives_envelope_probe_failure() {
         // DOM would keep only one and could hide the unknown variant.
         r#"{"event":{"FutureEvent":{}},"event":{"DeploymentCreated":{"deployment_key":1}}}"#,
         r#"{"event":{"DeploymentCreated":{"deployment_key":1}},"event":{"FutureEvent":{}}}"#,
+        // Malformed known payload + unknown duplicate, both orders: the
+        // malformed sibling must not short-circuit past the unknown one.
+        r#"{"event":{"DeploymentCreated":{}},"event":{"FutureEvent":{}}}"#,
+        r#"{"event":{"FutureEvent":{}},"event":{"DeploymentCreated":{}}}"#,
     ] {
         match decode_record_json(line) {
             Err(EventDecodeError::UnknownVariant { variant, .. }) => {
