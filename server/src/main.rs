@@ -1969,6 +1969,15 @@ const ROUTE_REDRIVE: RouteRedrive = RouteRedrive {
     cap: std::time::Duration::from_secs(1),
 };
 
+/// How long ONE routing attempt observes a LOCAL Raft proposal before giving
+/// up and letting the re-drive retry (#1582). Detached from the write itself —
+/// the proposal still completes (or is answered by the batcher on a leadership
+/// change) on its own; this only bounds how long the routing pump (and through
+/// it the clock loop) waits on a leader that may have silently lost quorum.
+/// Sized with the write-forward fast deadline (2.5s) so one attempt rides out a
+/// healthy commit round-trip yet fails fast enough for the bounded re-drive.
+const ROUTE_ATTEMPT_OBSERVE: std::time::Duration = std::time::Duration::from_millis(2500);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobMetricStatus {
     Completed,
@@ -6779,13 +6788,16 @@ impl ServerImpl {
         crate::metrics::record_create("rest");
 
         // Block on durability before acknowledging: a returned 200 means the
-        // create is fsynced.
-        commit.wait().await;
+        // create is fsynced. The wait + post-commit routing run DETACHED
+        // (#1582): a caller cancelled while awaiting must not strand a
+        // committed create without its cross-partition routing — the journal
+        // writer keeps running past the cancellation, and the detached task
+        // still observes the outcome and routes. Awaiting the handle only
+        // OBSERVES completion here.
         // The instance may have parked on an off-partition message catch: route
         // the subscription open to its canonical partition (no-op single-node).
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        let routing = self.drive_routing_after_commit(routable, commit);
+        Self::observe_routing(routing).await;
         // Starting an instance parks it on its first service task, so new jobs
         // may now be activatable: wake any long-pollers.
         self.signal_jobs_available();
@@ -9783,13 +9795,36 @@ impl ServerImpl {
             if part.raft.metrics().borrow().current_leader != Some(node_id) {
                 return RoutedApply::NotHere;
             }
-            return match part.propose_result(command, now_millis()).await {
-                Ok(item) => match item.error {
-                    Some((status, message)) => RoutedApply::Failed(status, message),
-                    None => RoutedApply::Applied(item.events),
+            // Bound OBSERVATION of the local proposal (#1582): a node that still
+            // reports itself leader but has lost quorum can keep `client_write`
+            // pending indefinitely, and the routing pump's callers include the
+            // clock loop — an unbounded await there blocks later timer and
+            // lease sweeps. The proposal is detached so the write itself keeps
+            // its apply result and completes independently; only this attempt's
+            // OBSERVATION times out. A timeout is transient (the re-drive
+            // retries), and the routed command carries a source-minted delivery
+            // key the apply dedups on (#1568), so a retry after the write in
+            // fact committed is an exactly-once no-op — timing out can never
+            // discard the follow-ups of a later-committed apply.
+            let proposal =
+                tokio::spawn(async move { part.propose_result(command, now_millis()).await });
+            return match tokio::time::timeout(ROUTE_ATTEMPT_OBSERVE, proposal).await {
+                Ok(joined) => match joined {
+                    Ok(Ok(item)) => match item.error {
+                        Some((status, message)) => RoutedApply::Failed(status, message),
+                        None => RoutedApply::Applied(item.events),
+                    },
+                    Ok(Err(crate::raft::ProposeError::Leader)) => RoutedApply::NotHere,
+                    Ok(Err(other)) => RoutedApply::Failed(500, other.to_string()),
+                    Err(join) => RoutedApply::Failed(500, format!("raft proposal task: {join}")),
                 },
-                Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
-                Err(other) => RoutedApply::Failed(500, other.to_string()),
+                Err(_) => RoutedApply::Failed(
+                    503,
+                    format!(
+                        "partition {target} local proposal not observed within {:?}",
+                        ROUTE_ATTEMPT_OBSERVE
+                    ),
+                ),
             };
         }
         let Some(handle) = self.engine.local_for_partition(target) else {
@@ -9941,6 +9976,45 @@ impl ServerImpl {
             true
         });
         (caller, Some(task))
+    }
+
+    /// Cancellation-safe post-commit routing (#1582): awaits `commit` and routes
+    /// `routable` inside a DETACHED task, so a caller that is cancelled (or
+    /// drops this future) while waiting cannot strand a committed source command
+    /// without its routing — the journal writer / Raft batcher keeps running
+    /// past the caller's cancellation, and the detached task still observes the
+    /// outcome and drives the routing pump. Returns a handle the caller may
+    /// await to OBSERVE completion; dropping the handle leaves the work
+    /// running. A source write that never becomes durable routes nothing (the
+    /// same gate as [`Self::route_after_durable`]).
+    fn drive_routing_after_commit(
+        &self,
+        routable: Vec<Event>,
+        commit: Commit,
+    ) -> tokio::task::JoinHandle<()> {
+        let server = self.clone();
+        tokio::spawn(async move {
+            // A write that never persisted (writer gone unacked) must route
+            // nothing: the peer would durably record a delivery identity the
+            // source then loses (#1582).
+            if !commit.wait_durable().await {
+                tracing::warn!(
+                    "subscription routing withheld: the source write never became durable"
+                );
+                return;
+            }
+            server.drive_subscription_routing(routable).await;
+        })
+    }
+
+    /// Awaits the detached commit+ routing task, mapping a task failure to a
+    /// warn (the caller's own commit outcome is unchanged — routing is
+    /// post-commit work). Awaiting only OBSERVES; cancelling this await leaves
+    /// the detached task running.
+    async fn observe_routing(task: tokio::task::JoinHandle<()>) {
+        if let Err(e) = task.await {
+            tracing::warn!("subscription routing task failed: {e}");
+        }
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -11020,10 +11094,9 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // Cancellation-safe commit wait + routing (#1582): see the REST create.
+        let routing = self.drive_routing_after_commit(routable, commit);
+        Self::observe_routing(routing).await;
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -20119,10 +20192,9 @@ impl ServerImpl {
                 .await
         };
         let (instance_key, sync_completed, routable, commit) = outcome?;
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // Cancellation-safe commit wait + routing (#1582): see the REST create.
+        let routing = self.drive_routing_after_commit(routable, commit);
+        Self::observe_routing(routing).await;
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -20374,11 +20446,10 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                routable,
+                // Routing already ran inside `raft_create_core`'s detached task
+                // (#1582 cancellation safety); the events are only reported.
+                _routable,
             )) => {
-                if !routable.is_empty() {
-                    self.drive_subscription_routing(routable).await;
-                }
                 self.signal_jobs_available();
                 // Local commit on a partition THIS node leads: count the stream
                 // create once, here. The forward branches below deliberately do
@@ -20525,7 +20596,7 @@ impl ServerImpl {
                 business_id.clone(),
             )
             .await;
-        let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+        let (process_id, version, definition_key, instance_key, sync_completed, _routable) =
             match core {
                 Ok(fields) => fields,
                 // Stale leadership / leads-nothing-now: forward to the current
@@ -20564,9 +20635,8 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // Routing already ran inside `raft_create_core`'s detached task (#1582
+        // cancellation safety); nothing further to route here.
         self.signal_jobs_available();
 
         let (variables_out, process_completed) = if await_completion {
@@ -20647,38 +20717,74 @@ impl ServerImpl {
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
-        let response = part
-            .propose_result(
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    tags,
-                    business_id,
-                    sel_key,
-                    sel_ver,
-                ),
-                now_millis(),
-            )
-            .await
-            .map_err(|e| match e {
-                // Leadership race on the batched write is retryable, not 500. #1306.
-                crate::raft::ProposeError::Leader => {
-                    (503, format!("partition {p} leader unavailable; retry"))
-                }
-                other => (500, other.to_string()),
-            })?;
-        if let Some((status, message)) = response.error {
-            return Err((status, message));
-        }
-        let events = response.events;
+        // The propose + post-commit routing run DETACHED (#1582): a caller
+        // cancelled while awaiting the Raft commit must not strand a committed
+        // create without its cross-partition routing — the Raft batcher keeps
+        // running past the cancellation, and the detached task still observes
+        // the proposal outcome and routes. Awaiting the handle below only
+        // OBSERVES completion; dropping it leaves the work running.
+        let server = self.clone();
+        let process_id_for_propose = process_id.clone();
+        let proposed = tokio::spawn(async move {
+            let response = part
+                .propose_result(
+                    Command::create_instance_versioned(
+                        process_id_for_propose,
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    now_millis(),
+                )
+                .await
+                .map_err(|e| match e {
+                    // Leadership race on the batched write is retryable, not 500. #1306.
+                    crate::raft::ProposeError::Leader => {
+                        (503, format!("partition {p} leader unavailable; retry"))
+                    }
+                    other => (500, other.to_string()),
+                })?;
+            if let Some((status, message)) = response.error {
+                return Err((status, message));
+            }
+            let events = response.events;
 
-        let instance_key = events
-            .iter()
-            .find_map(Event::instance_key)
-            .ok_or((500, "raft create produced no instance key".to_string()))?;
-        let sync_completed = events.iter().any(|e| {
-            matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+            let instance_key = events
+                .iter()
+                .find_map(Event::instance_key)
+                .ok_or((500, "raft create produced no instance key".to_string()))?;
+            let sync_completed = events.iter().any(|e| {
+                matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+            });
+            let routable: Vec<Event> = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::MessageSubscriptionOpening { .. }
+                            | Event::RemoteMessageCorrelation { .. }
+                            | Event::MessageSubscriptionClosing { .. }
+                            | Event::StartInstanceDispatched { .. }
+                    )
+                })
+                .cloned()
+                .collect();
+            // Post-commit routing, still inside the detached task: the create
+            // is committed, so its follow-ups route even if the caller is gone.
+            if !routable.is_empty() {
+                server.drive_subscription_routing(routable.clone()).await;
+            }
+            Ok((instance_key, sync_completed, routable))
         });
+        // Observe the detached proposal; a task failure is a 500, never a hang.
+        let (instance_key, sync_completed, routable) = match proposed.await {
+            Ok(result) => result?,
+            Err(join) => {
+                return Err((500, format!("raft create task failed: {join}")));
+            }
+        };
         // Project the deployed key + version of the version the instance was
         // pinned to (not the latest), so by-id and by-key creates agree.
         let pid_for_read = process_id.clone();
@@ -20693,18 +20799,6 @@ impl ServerImpl {
                     .unwrap_or((pid_for_read, 1))
             })
             .await;
-        let routable: Vec<Event> = events
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::MessageSubscriptionOpening { .. }
-                        | Event::RemoteMessageCorrelation { .. }
-                        | Event::MessageSubscriptionClosing { .. }
-                        | Event::StartInstanceDispatched { .. }
-                )
-            })
-            .collect();
         Ok((
             process_id,
             version,
@@ -42396,12 +42490,14 @@ mod clustered_startup_tests {
     }
 
     /// #1582: bounded re-drive of a routed forward across an RF=3 leader change.
-    /// Deterministic fixture: the subscription partition's leader (node 1) is
-    /// STOPPED before the instance is created, so the FIRST forward of the
-    /// routed subscription open cannot be delivered (stale leader view / dead
-    /// link / no leader yet). The re-drive must re-resolve the new leader and
-    /// deliver it, with exactly-once effects: one instance, exactly one armed
-    /// subscription on every surviving replica, one completion — and no
+    /// Deterministic fixture: the FIRST forward of the routed subscription open
+    /// is forced to fail with a test barrier — the source's peer view of the
+    /// subscription partition's owner (node 1) is fault-injected unreachable for
+    /// exactly the first attempt, then healed — so the re-drive path is
+    /// exercised by construction, not by racing an election. Node 1 is then
+    /// stopped (a real leader change), and the re-drive must re-resolve the new
+    /// leader and deliver, with exactly-once effects: one instance, exactly one
+    /// armed subscription on every surviving replica, one completion — and no
     /// resurrection of the subscription after the correlation closes it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn routed_forward_is_redriven_across_a_leader_change() {
@@ -42421,20 +42517,51 @@ mod clustered_startup_tests {
             .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == sub_partition)
             .expect("some key hashes to partition 1");
 
-        // Stop partition 1's leader BEFORE any routing happens.
+        // Force the FIRST forward to fail deterministically: from node 0's peer
+        // view, node 1 (partition 1's current leader) is unreachable. `fail_node`
+        // drops the cached link and fails the dial, so attempt 0 is a transient
+        // transport failure regardless of election timing. `PeerSet` is `Clone`
+        // over shared state, so healing through this handle lifts the barrier.
+        let node0_peers = node0.peers.clone();
+        node0_peers.fail_node(1).await;
+
+        let create = {
+            let node = node0.clone();
+            let order = order_id.clone();
+            tokio::spawn(async move {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("orderId".to_string(), Value::Str(order));
+                node.create_for_stream(Some("waiter".into()), None, vars)
+                    .await
+            })
+        };
+        // Wait until the re-drive has actually retried once — proof the first
+        // forward failed — then heal the link so the NEXT attempt can deliver.
+        let mut retried = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0.route_redrives.load(Ordering::Relaxed) > 0 {
+                retried = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            retried,
+            "the first forward must fail under the injected partition, forcing a re-drive"
+        );
+        // Now stop node 1 for real (the leader change) and heal the source's
+        // peer view so the re-drive re-resolves and reaches the NEW leader.
         for p in 0..3u64 {
             if let Some(part) = node1.raft_registry().get(p) {
                 part.raft.shutdown().await.ok();
             }
         }
         handles[1].abort();
-        let redrives_before = node0.route_redrives.load(Ordering::Relaxed);
+        node0_peers.heal_node(1).await;
 
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
-        let (instance_key, _) = node0
-            .create_for_stream(Some("waiter".into()), None, vars)
+        let (instance_key, _) = create
             .await
+            .expect("create task")
             .expect("create commits on partition 0 (quorum node0+node2)");
         assert_ne!(partition_of(instance_key), sub_partition);
 
@@ -42471,10 +42598,9 @@ mod clustered_startup_tests {
             delivered,
             "the re-drive must deliver the routed open to the new partition-1 leader"
         );
-        assert!(
-            node0.route_redrives.load(Ordering::Relaxed) > redrives_before,
-            "the first forward failed, so the re-drive path must have been exercised"
-        );
+        // The re-drive was already proven above (the test waited for the first
+        // retry before healing the barrier), so no second timing-dependent
+        // assertion on `route_redrives` is needed here.
         let instances = node0
             .engine_handle_for(partition_of(instance_key))
             .expect("instance partition")
@@ -47074,6 +47200,94 @@ mod subscription_placement_tests {
         assert!(
             !armed().await,
             "the durable close disarmed the subscription"
+        );
+    }
+
+    /// #1582 (cancellation window): the commit wait + post-commit routing run
+    /// DETACHED from the caller, so a caller that is cancelled (drops its
+    /// await) while the source write is still committing cannot strand a
+    /// committed command without its routing — the detached task still observes
+    /// the durable outcome and drives the pump. Model the cancellable caller by
+    /// dropping the observation handle before acking the commit: routing must
+    /// still run once the source becomes durable.
+    #[tokio::test]
+    async fn routing_survives_cancellation_before_acknowledgement() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("cancel-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, _) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            let sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if sub != nanobpmn_engine_core::partition_of(key) {
+                chosen = Some((sub, key));
+                break;
+            }
+        }
+        let (sub_partition, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let armed = || {
+            let handle = server
+                .engine_handle_for(sub_partition)
+                .expect("subscription partition is local");
+            async move {
+                handle
+                    .with(move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.instance_key == instance_key
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    })
+                    .await
+            }
+        };
+        assert!(armed().await, "the routed subscription is armed");
+
+        let (events, _commit) = server
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+            .expect("cancel succeeds");
+
+        // The detached commit+routing task, gated on a commit the test controls.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let routable = ServerImpl::routable_events(&events);
+        assert!(!routable.is_empty(), "cancel emits a routable close");
+        let routing = server.drive_routing_after_commit(routable, Commit::from_ack(rx));
+
+        // The caller is CANCELLED before the source is acknowledged: it drops
+        // its observation of the commit+routing task. The detached task must
+        // keep running and route once the source write becomes durable.
+        drop(routing);
+        assert!(armed().await, "nothing routed before the commit lands");
+        tx.send(()).expect("the detached gate is still listening");
+
+        // Routing ran despite the dropped observation: the close is delivered.
+        let mut closed = false;
+        for _ in 0..100 {
+            if !armed().await {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            closed,
+            "the detached task routed the close after the caller was cancelled"
         );
     }
 

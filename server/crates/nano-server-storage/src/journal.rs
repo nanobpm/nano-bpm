@@ -121,8 +121,21 @@ enum WriterMsg {
 pub struct Commit(CommitInner);
 
 enum CommitInner {
+    /// Already fsync-durable: an in-memory journal, a command that produced no
+    /// events, or a write whose durability is carried by an enclosing barrier
+    /// (a Raft entry's events are buffered, not written — see
+    /// [`Journal::apply_command_at`], #1405).
     Ready,
+    /// Resolves when the writer acks the write. The ack fires once the write is
+    /// **fsynced** in `sync` durability mode, but at the earlier **page-cache**
+    /// point in `async` mode (`writer_loop_async`), so an ack is not, by
+    /// itself, an fsync guarantee.
     Pending(oneshot::Receiver<()>),
+    /// The write never reached the writer (enqueue failed / writer thread
+    /// gone). Never durable: [`Commit::wait_durable`] reports `false`, while
+    /// [`Commit::wait`] still resolves (never hangs), matching the historical
+    /// "writer gone ⇒ treat as settled" contract.
+    Failed,
 }
 
 impl Commit {
@@ -130,8 +143,16 @@ impl Commit {
         Commit(CommitInner::Ready)
     }
 
+    /// A write that could not be enqueued (the writer thread is gone). Distinct
+    /// from [`ready`](Self::ready): it resolves immediately but is NOT durable,
+    /// and [`wait_durable`](Self::wait_durable) says so (#1582).
+    pub fn failed() -> Self {
+        Commit(CommitInner::Failed)
+    }
+
     /// Waits until the write backing this commit has been fsynced. If the writer
-    /// thread is gone (shutdown), it resolves immediately rather than hanging.
+    /// thread is gone (shutdown / enqueue failed), it resolves immediately rather
+    /// than hanging.
     pub async fn wait(self) {
         if let CommitInner::Pending(rx) = self.0 {
             let start = std::time::Instant::now();
@@ -149,14 +170,22 @@ impl Commit {
 
     /// Waits until the write backing this commit has been fsynced and reports
     /// whether it actually **became durable**: `true` once the writer acked the
-    /// fsync (or for a `Ready` commit), `false` when the writer went away without
-    /// acknowledging it (shutdown / writer failure). Unlike [`wait`](Self::wait),
-    /// which resolves either way, this lets a caller gate a side effect that must
-    /// never outrun the source write — e.g. forwarding a keyed cross-partition
-    /// event a peer will durably dedup on (#1582).
+    /// write's durability point (or for a `Ready` commit), `false` when the
+    /// writer went away without acknowledging it (shutdown / writer failure) or
+    /// the write never reached the writer at all (`Failed`). Unlike
+    /// [`wait`](Self::wait), which resolves either way, this lets a caller gate
+    /// a side effect that must never outrun the source write — e.g. forwarding
+    /// a keyed cross-partition event a peer will durably dedup on (#1582).
+    ///
+    /// Note the durability point the ack marks depends on the configured mode:
+    /// **fsync** under `NANOBPMN_DURABILITY=sync` (the default), the **page
+    /// cache** under `async` (whose bounded unfsynced tail is the documented
+    /// power-loss trade-off of that mode). Callers needing the stricter
+    /// guarantee must run the journal in `sync` mode.
     pub async fn wait_durable(self) -> bool {
         match self.0 {
             CommitInner::Ready => true,
+            CommitInner::Failed => false,
             CommitInner::Pending(rx) => {
                 let start = std::time::Instant::now();
                 let durable = rx.await.is_ok();
@@ -169,12 +198,14 @@ impl Commit {
     /// Splits this durability handle into two independent handles that both
     /// resolve when (and with the same outcome as) the original write: a durable
     /// ack is relayed to both, a writer that vanished without acking leaves both
-    /// un-acked (so [`wait_durable`](Self::wait_durable) reports `false` on each).
-    /// A pending commit is relayed by a detached task, so this must be called
-    /// within a Tokio runtime.
+    /// un-acked (so [`wait_durable`](Self::wait_durable) reports `false` on
+    /// each), and a `Failed` commit stays `Failed` on both. A pending commit is
+    /// relayed by a detached task, so this must be called within a Tokio
+    /// runtime.
     pub fn tee(self) -> (Commit, Commit) {
         match self.0 {
             CommitInner::Ready => (Commit::ready(), Commit::ready()),
+            CommitInner::Failed => (Commit::failed(), Commit::failed()),
             CommitInner::Pending(rx) => {
                 let (tx_a, rx_a) = oneshot::channel();
                 let (tx_b, rx_b) = oneshot::channel();
@@ -243,6 +274,13 @@ pub struct Journal {
     /// Joined on drop so any not-yet-acked writes are flushed before the journal
     /// goes away (matters for synchronous callers that never await the commit).
     writer_thread: Option<JoinHandle<()>>,
+    /// Whether this journal was BUILT to persist (a writer-backed open). Set at
+    /// construction and never changed: an in-memory journal is `false` (its
+    /// writes are trivially durable), a file/shared-backed journal `true` —
+    /// even after its writer dies, so a write that then fails to enqueue
+    /// reports [`Commit::failed`] (never durable) instead of being mistaken for
+    /// an in-memory journal's trivially-ready commit (#1582).
+    durable: bool,
     /// Shared seal/boundary state when this journal is backed by a *segmented*
     /// log (the single-partition bounded-disk path). `None` for in-memory and the
     /// legacy single-file paths. Lets the snapshot/compaction task read segment
@@ -1098,6 +1136,7 @@ impl Journal {
             partition_id,
             writer: None,
             writer_thread: None,
+            durable: false,
             seg: None,
             exporter: None,
             shared_exporter: None,
@@ -1134,6 +1173,7 @@ impl Journal {
             partition_id,
             writer: None,
             writer_thread: None,
+            durable: false,
             seg: None,
             exporter: None,
             shared_exporter: None,
@@ -1298,6 +1338,7 @@ impl Journal {
             partition_id,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
+            durable: true,
             seg: None,
             exporter: None,
             shared_exporter: None,
@@ -1338,6 +1379,7 @@ impl Journal {
             partition_id: 0,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
+            durable: true,
             seg: Some(shared),
             exporter: None,
             shared_exporter: None,
@@ -1383,6 +1425,7 @@ impl Journal {
             partition_id,
             writer: Some(shared.sender()),
             writer_thread: None,
+            durable: true,
             seg: shared.seg.clone(),
             exporter: None,
             shared_exporter: shared.exporter.clone(),
@@ -1423,6 +1466,7 @@ impl Journal {
             partition_id,
             writer: Some(shared.sender()),
             writer_thread: None,
+            durable: true,
             seg: shared.seg.clone(),
             exporter: None,
             shared_exporter: shared.exporter.clone(),
@@ -2215,6 +2259,19 @@ impl Journal {
         self.cold.is_some()
     }
 
+    /// Test hook: kills the journal writer thread (drops this handle's sender
+    /// and joins the thread), so every subsequent write/barrier fails to
+    /// enqueue and returns [`Commit::failed`]. Models a crashed writer for
+    /// durability-gating tests (#1582): a write that never reached the writer
+    /// must report non-durable, not the historical "treat as settled".
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn kill_writer(&mut self) {
+        self.writer = None;
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
@@ -2436,10 +2493,19 @@ impl Journal {
     /// The barrier rides the writer's strictly ordered queue (an empty write
     /// request), so it joins the same group-commit batch as the still-pending
     /// original and resolves with it. An in-memory journal (no writer) is
-    /// already durable, so the barrier is ready immediately.
+    /// already durable, so the barrier is ready immediately; a durable journal
+    /// whose writer is GONE fails closed — the barrier never enqueued, so it
+    /// reports [`Commit::failed`] (never durable, #1582).
     pub fn barrier(&self) -> Commit {
         let Some(writer) = self.writer.as_ref() else {
-            return Commit::ready();
+            // No writer: trivially durable only when this journal never
+            // persisted (in-memory); a durable journal whose writer was killed
+            // must not report a barrier it never enqueued as settled.
+            return if self.durable {
+                Commit::failed()
+            } else {
+                Commit::ready()
+            };
         };
         let (ack, rx) = oneshot::channel();
         match writer.send(WriterMsg::Write(WriteRequest {
@@ -2455,9 +2521,10 @@ impl Journal {
                 crate::metrics::inflight_inc();
                 Commit(CommitInner::Pending(rx))
             }
-            // The writer thread is gone (shutting down); treat as already
-            // settled so callers never hang.
-            Err(_) => Commit::ready(),
+            // The writer thread is gone (shutting down): the barrier never
+            // enqueued, so it must not report durable (#1582) — `wait` still
+            // resolves immediately, so callers never hang.
+            Err(_) => Commit::failed(),
         }
     }
 
@@ -2492,7 +2559,14 @@ impl Journal {
         }
 
         if self.writer.is_none() {
-            return Commit::ready();
+            // No writer: trivially durable only for a journal that never
+            // persisted (in-memory); a durable journal whose writer is gone
+            // must not report the write it never enqueued as durable (#1582).
+            return if self.durable {
+                Commit::failed()
+            } else {
+                Commit::ready()
+            };
         }
 
         // The shared multi-partition segmented writer records each event line
@@ -2538,7 +2612,14 @@ impl Journal {
     /// returns their durability barrier.
     fn send_write(&self, bytes: Vec<u8>, events: &Arc<Vec<Event>>, shared_backed: bool) -> Commit {
         let Some(writer) = self.writer.as_ref() else {
-            return Commit::ready();
+            // As in `persist`: only an in-memory journal is trivially durable
+            // with no writer; a durable journal whose writer is gone fails
+            // closed (#1582).
+            return if self.durable {
+                Commit::failed()
+            } else {
+                Commit::ready()
+            };
         };
         let (ack, rx) = oneshot::channel();
         let events_count = events.len();
@@ -2559,9 +2640,10 @@ impl Journal {
                 crate::metrics::journal_inflight_add(bytes_len);
                 Commit(CommitInner::Pending(rx))
             }
-            // The writer thread is gone (shutting down); treat as already settled
-            // so callers never hang.
-            Err(_) => Commit::ready(),
+            // The writer thread is gone (shutting down): the write never
+            // enqueued, so it must not report durable (#1582) — `wait` still
+            // resolves immediately, so callers never hang.
+            Err(_) => Commit::failed(),
         }
     }
 
@@ -4551,6 +4633,69 @@ mod tests {
         drop(tx);
         assert!(!a.wait_durable().await);
         assert!(!b.wait_durable().await);
+    }
+
+    /// #1582: a write that never reached the writer (enqueue failed / writer
+    /// gone) must NOT report durable — otherwise a routing gate could forward a
+    /// delivery key whose source records were lost, and the peer's durable
+    /// dedup would silently discard the real delivery when the key is reused.
+    /// `wait`/`blocking_wait` still resolve immediately (callers never hang).
+    #[tokio::test]
+    async fn failed_commit_is_never_durable_but_never_hangs() {
+        assert!(!Commit::failed().wait_durable().await);
+        // `wait` resolves (does not hang) on a failed commit.
+        Commit::failed().wait().await;
+        // `tee` propagates the failure to both halves.
+        let (a, b) = Commit::failed().tee();
+        assert!(!a.wait_durable().await);
+        assert!(!b.wait_durable().await);
+    }
+
+    /// #1582: a journal whose writer thread is gone reports non-durable on
+    /// `wait_durable` for both real writes and barriers, instead of the
+    /// historical "treat as settled" that let a routing gate forward an
+    /// unpersisted write — while `wait` still resolves (callers never hang).
+    #[tokio::test]
+    async fn dead_writer_reports_not_durable() {
+        let dir = std::env::temp_dir().join(format!("nanobpmn-dead-writer-{}", std::process::id()));
+        let path = dir.join("test.journal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut journal = Journal::open(&path).unwrap();
+        // A file-backed journal with a live writer IS durable once acked.
+        let (_events, commit) = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        assert!(
+            commit.wait_durable().await,
+            "a live writer acks a durable write"
+        );
+
+        // Kill the writer: a real write and a barrier now fail to enqueue, so
+        // both must report NOT durable (never hang, never "settled").
+        journal.kill_writer();
+        let write_commit = journal.persist(&Arc::new(vec![Event::ProcessInstanceCompleted {
+            instance_key: 1,
+        }]));
+        assert!(
+            !write_commit.wait_durable().await,
+            "a write that never reached the writer is not durable"
+        );
+        assert!(
+            !journal.barrier().wait_durable().await,
+            "a barrier that never reached the writer is not durable"
+        );
+        // `wait` still resolves immediately on the failed enqueue path.
+        journal.barrier().wait().await;
+
+        // An in-memory journal (no writer at all) is already durable.
+        let mem = Journal::in_memory();
+        assert!(
+            mem.barrier().wait_durable().await,
+            "an in-memory journal is already durable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Minimal no-runtime `block_on` for the commit handles (a `Commit` resolves

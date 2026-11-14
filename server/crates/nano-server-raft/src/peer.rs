@@ -304,6 +304,11 @@ impl PeerLink {
     /// `CommandResult`, giving up after `timeout`. Shared by the app-forwarding
     /// lane ([`request`]) and the dedicated Raft lane ([`raft_rpc`]); each lane
     /// carries its own socket and pending table, so neither can stall the other.
+    ///
+    /// The WHOLE request — outbound-queue admission included — is bounded by
+    /// `timeout` (#1582): a stalled peer socket that fills the writer queue
+    /// must not park the caller past its deadline (a bounded re-drive attempt
+    /// would otherwise wait forever instead of failing fast and retrying).
     async fn request_on<F>(
         &self,
         out: &mpsc::Sender<Message>,
@@ -336,7 +341,14 @@ impl PeerLink {
             corr,
         };
 
-        if out.send(Message::Text(txt.into())).await.is_err() {
+        // Queue admission is part of the attempt's budget: a stalled socket
+        // whose writer queue never drains fails the attempt with `Timeout`
+        // (not an indefinite wait), and the guard above cleans up the entry.
+        let sent = match tokio::time::timeout(timeout, out.send(Message::Text(txt.into()))).await {
+            Ok(sent) => sent,
+            Err(_) => return Err(PeerError::Timeout),
+        };
+        if sent.is_err() {
             return Err(PeerError::Closed);
         }
 
@@ -1406,6 +1418,78 @@ mod tests {
         assert!(
             link.pending_app.lock().await.is_empty(),
             "a dropped request future must not leave a pending correlation behind"
+        );
+    }
+
+    /// #1582: the request deadline covers OUTBOUND-QUEUE ADMISSION, not just the
+    /// response wait. A stalled peer socket whose writer queue is full must fail
+    /// the attempt with `Timeout` (so a bounded re-drive retries or drops the
+    /// link) instead of parking the caller in `out.send` forever — and the
+    /// pending-correlation entry the attempt registered must be cleaned up.
+    #[tokio::test]
+    async fn full_outbound_queue_fails_the_attempt_within_its_deadline() {
+        // Capacity 1, and the receiver is NEVER polled: the first send fills
+        // the queue, the second parks on admission.
+        let (out_app, _out_app_rx) = mpsc::channel::<Message>(1);
+        let (out_raft, _out_raft_rx) = mpsc::channel::<Message>(1);
+        let link = PeerLink {
+            out_app,
+            pending_app: Arc::new(Mutex::new(HashMap::new())),
+            out_raft,
+            pending_raft: Arc::new(Mutex::new(HashMap::new())),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        let frame = |corr| ClientFrame::RouteSubscription {
+            corr,
+            event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+        };
+        // Occupy the single queue slot with an in-flight request (spawned so
+        // it actually runs while the test body continues).
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.request_within(Duration::from_secs(3600), frame).await }
+        });
+        // Let the first request enqueue and park on its (far-away) response.
+        let mut parked = false;
+        for _ in 0..100 {
+            if link.pending_app.lock().await.len() == 1 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            parked,
+            "the first request is queued and awaiting a response"
+        );
+
+        // The second request cannot even enter the queue; its 50ms deadline
+        // must fire on ADMISSION, long before the 3600s response timeout.
+        let started = std::time::Instant::now();
+        let second = link.request_within(Duration::from_millis(50), frame).await;
+        assert!(
+            matches!(second, Err(PeerError::Timeout)),
+            "a full outbound queue must fail as Timeout, got {second:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the admission wait must be bounded by the attempt deadline"
+        );
+        // Its pending entry is gone (the guard cleaned up on the timeout).
+        assert_eq!(
+            link.pending_app.lock().await.len(),
+            1,
+            "only the first (still parked) request may hold a pending entry"
+        );
+
+        // Abort the parked request: its future is dropped, so the guard cleans
+        // its entry up.
+        first.abort();
+        let _ = first.await;
+        assert!(
+            link.pending_app.lock().await.is_empty(),
+            "aborting the parked request cleans up its entry too"
         );
     }
 
