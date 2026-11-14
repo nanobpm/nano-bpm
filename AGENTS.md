@@ -58,6 +58,24 @@ do **not** do this for you:
 ./scripts/fmt-stub-codegen.sh --cleanup # remove the stubs it created
 ```
 
+`make fmt` / `make fmt-check` **fail** if rustfmt prints the "unstable features
+are only available in nightly" warning: on some hosts `rustup run <nightly> cargo fmt`
+resolves the `cargo-fmt` shim to *stable* and silently skips `group_imports`. If you
+hit it, invoke the toolchain binary directly:
+`$(rustup which --toolchain nightly-2026-06-26 cargo-fmt) -- --check`.
+
+### Building `server` from a fresh clone / agent worktree
+
+- Run `make generate` once first (needs Java): `generated/`, `server/src/stub_impls.rs`
+  and `response_contract_schema.json` are gitignored codegen inputs.
+- Building `nano-server-console` (or `server --features console`) without a built
+  frontend needs the RustEmbed folder: `mkdir -p console/dist && touch console/dist/index.html`
+  (delete it afterwards).
+- `tikv-jemalloc-sys`'s autoconf breaks if the **target dir path contains a space**
+  (e.g. `~/Library/Application Support/...`): set a space-free `CARGO_TARGET_DIR`.
+  Avoid small tmpfs `/tmp` for it — a disk-full mid-build leaves corrupted artifacts
+  (bogus E0277 / "multiple versions of crate serde_core"); fix by deleting the target dir.
+
 **Install the git hooks** so the same gate runs locally before every push —
 catching drift before it reaches CI:
 

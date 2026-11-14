@@ -439,14 +439,22 @@ processos-run: ## Run ProcessOS (PROCESSOS_PORT=8090, NANO_BASE_URL=http://local
 fmt: ## Format every hand-written crate with the pinned nightly rustfmt (see FMT_TOOLCHAIN)
 	@for d in $(FMT_CRATES); do \
 		echo "fmt $$d"; \
-		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt) || exit 1; \
+out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt 2>&1); rc=$$?; \
+		[ -z "$$out" ] || printf '%s\n' "$$out"; \
+		if printf '%s' "$$out" | grep -q "only available in nightly"; then \
+			echo "error: rustfmt ran as STABLE, not $(FMT_TOOLCHAIN) (cargo-fmt shim mis-resolved); see AGENTS.md Formatting" >&2; exit 1; fi; \
+		[ $$rc -eq 0 ] || exit 1; \
 	done
 
 .PHONY: fmt-check
 fmt-check: ## Verify formatting with the pinned nightly rustfmt (CI gate; fails on drift)
 	@for d in $(FMT_CRATES); do \
 		echo "fmt-check $$d"; \
-		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check) || exit 1; \
+out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check 2>&1); rc=$$?; \
+		[ -z "$$out" ] || printf '%s\n' "$$out"; \
+		if printf '%s' "$$out" | grep -q "only available in nightly"; then \
+			echo "error: rustfmt ran as STABLE, not $(FMT_TOOLCHAIN) (cargo-fmt shim mis-resolved); see AGENTS.md Formatting" >&2; exit 1; fi; \
+		[ $$rc -eq 0 ] || exit 1; \
 	done
 
 .PHONY: console-fmt
