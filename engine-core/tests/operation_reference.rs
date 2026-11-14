@@ -11,8 +11,7 @@
 )]
 
 use nanobpmn_engine_core::{
-    decode_record_json, Command, Engine, Event,
-    EventDecodeError, ProcessBuilder, Record,
+    decode_record_json, Command, Engine, Event, EventDecodeError, ProcessBuilder, Record,
 };
 
 fn engine_with_waiting_instance() -> (Engine, u64) {
@@ -140,4 +139,34 @@ fn unknown_variant_inside_an_envelope_is_rejected_not_dropped() {
         decode_record_json(r#"{"event":{"ProcessInstanceTerminated":"#),
         Err(EventDecodeError::Malformed { .. })
     ));
+}
+
+/// The envelope is recognised by its parsed `event` member, not by property
+/// order: whitespace and reordered keys (reference first) still decode, and
+/// an unrecognised envelope field is rejected rather than dropped.
+#[test]
+fn envelope_decodes_regardless_of_property_order_and_whitespace() {
+    let (mut engine, key) = engine_with_waiting_instance();
+    let records = engine
+        .apply_command_records_at(Command::cancel_instance(key), 5, Some(42))
+        .unwrap();
+    for record in records {
+        let event = serde_json::to_string(&record.event).unwrap();
+        for line in [
+            format!(r#"{{"operation_reference":42,"event":{event}}}"#),
+            format!(" {{ \n \"operation_reference\" : 42 , \"event\" : {event} }}"),
+        ] {
+            assert_eq!(decode_record_json(&line).unwrap(), record, "{line}");
+        }
+        let line = format!(r#"{{"operation_reference":null,"event":{event}}}"#);
+        assert_eq!(
+            decode_record_json(&line).unwrap(),
+            Record::bare(record.event.clone())
+        );
+        let line = format!(r#"{{"bogus":1,"event":{event}}}"#);
+        assert!(matches!(
+            decode_record_json(&line),
+            Err(EventDecodeError::Malformed { .. })
+        ));
+    }
 }

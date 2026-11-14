@@ -2670,39 +2670,46 @@ pub fn encode_record_json(
     })
 }
 
-/// Whether a journal line is the #1556 envelope form (`{"event": …}`) rather
-/// than a legacy bare [`Event`] (`{"VariantName": …}`).
-#[cfg(feature = "serde")]
-fn is_record_envelope(line: &str) -> bool {
-    line.trim_start()
-        .strip_prefix('{')
-        .is_some_and(|rest| rest.trim_start().starts_with("\"event\""))
-}
-
 /// Decodes one journal line into a [`Record`] — the replay-boundary reader for
 /// the #1556 envelope. Accepts both the envelope and the legacy bare-[`Event`]
-/// form (which decodes with `operation_reference: None`). The inner event is
-/// decoded through [`decode_event_json`], so an unknown variant is still the
-/// typed [`EventDecodeError::UnknownVariant`] rejection — never a silent drop.
+/// form (which decodes with `operation_reference: None`). The envelope is
+/// recognised by the PARSED top-level `event` member, never by property order,
+/// so a producer that reorders keys (`{"operation_reference":N,"event":…}`)
+/// still decodes. The inner event is decoded through [`decode_event_json`], so
+/// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
+/// rejection — never a silent drop.
 #[cfg(feature = "serde")]
 pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
-    if !is_record_envelope(line) {
-        return decode_event_json(line).map(Record::bare);
-    }
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        event: serde_json::Value,
-        #[serde(default)]
-        operation_reference: Option<i64>,
-    }
-    let envelope: Envelope =
+    let value: serde_json::Value =
         serde_json::from_str(line).map_err(|e| EventDecodeError::Malformed {
             detail: e.to_string(),
         })?;
-    let event = decode_event_json(&envelope.event.to_string())?;
+    let mut map = match value {
+        serde_json::Value::Object(map) if map.contains_key("event") => map,
+        // Not an envelope: a legacy bare event (variant tags are PascalCase, so
+        // they can never be the lowercase `event` key).
+        _ => return decode_event_json(line).map(Record::bare),
+    };
+    let event_value = map.remove("event").unwrap_or(serde_json::Value::Null);
+    let operation_reference = match map.remove("operation_reference") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            Some(
+                serde_json::from_value::<i64>(v).map_err(|e| EventDecodeError::Malformed {
+                    detail: format!("operation_reference: {e}"),
+                })?,
+            )
+        }
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(EventDecodeError::Malformed {
+            detail: format!("unknown record envelope field `{extra}`"),
+        });
+    }
+    let event = decode_event_json(&event_value.to_string())?;
     Ok(Record {
         event,
-        operation_reference: envelope.operation_reference,
+        operation_reference,
     })
 }
 

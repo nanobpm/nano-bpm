@@ -96,13 +96,68 @@ openraft::declare_raft_types!(
 /// `operation_reference` is the caller's Camunda `operationReference` (#1556):
 /// command-envelope metadata the engine stamps on EVERY record the command
 /// produces ([`Journal::apply_command_ref_at`](nano_server_storage::journal::Journal::apply_command_ref_at)).
-/// Additive on the wire: absent (pre-#1556 entries) decodes as `None`.
+/// Additive on the wire: absent decodes as `None`. A pre-#1556 entry carried
+/// the reference NESTED inside the job-mutation / incident-resolution command
+/// body (`{"UpdateJobRetries":{…,"operation_reference":N}}`); deserialization
+/// promotes that legacy nested value to this envelope field (outer wins) so a
+/// retained historical entry re-applied after upgrade keeps its reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "ReplicatedCommandWire")]
 pub struct ReplicatedCommand {
     pub command: Command,
     pub now: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_reference: Option<i64>,
+}
+
+/// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
+/// `operation_reference` out of the command body (see the type docs).
+#[derive(Deserialize)]
+struct ReplicatedCommandWire {
+    command: LegacyCommand,
+    now: u64,
+    #[serde(default)]
+    operation_reference: Option<i64>,
+}
+
+/// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
+/// nested inside its variant body. Deserialized via a JSON value so the nested
+/// key can be inspected for EVERY variant (fail-safe: any variant that ever
+/// carried the field is promoted, not just a hand-maintained list).
+struct LegacyCommand {
+    command: Command,
+    nested_reference: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for LegacyCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let nested_reference = match value
+            .as_object_mut()
+            .and_then(|tagged| tagged.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|body| body.remove("operation_reference"))
+        {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(serde_json::from_value::<i64>(v).map_err(D::Error::custom)?),
+        };
+        let command = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            command,
+            nested_reference,
+        })
+    }
+}
+
+impl From<ReplicatedCommandWire> for ReplicatedCommand {
+    fn from(wire: ReplicatedCommandWire) -> Self {
+        Self {
+            command: wire.command.command,
+            now: wire.now,
+            operation_reference: wire.operation_reference.or(wire.command.nested_reference),
+        }
+    }
 }
 
 impl ReplicatedCommand {
@@ -3888,6 +3943,42 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    /// #1556: a retained pre-#1556 Raft entry carried `operation_reference`
+    /// NESTED in the command body. Every such historical variant must promote
+    /// it to the envelope field on decode (else re-applying the entry after
+    /// upgrade silently loses the reference), the outer field wins when both
+    /// are present, and the round trip uses the current (outer) form.
+    #[test]
+    fn legacy_nested_operation_reference_is_promoted_on_decode() {
+        let legacy = [
+            r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":11}}"#,
+            r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5,"operation_reference":11}}"#,
+            r#"{"UpdateJob":{"job_key":7,"retries":2,"operation_reference":11}}"#,
+            r#"{"ResolveIncident":{"incident_key":7,"operation_reference":11}}"#,
+        ];
+        for command in legacy {
+            let line = format!(r#"{{"command":{command},"now":1}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).expect(&line);
+            assert_eq!(decoded.operation_reference, Some(11), "{line}");
+            let reencoded = serde_json::to_string(&decoded).unwrap();
+            let again: ReplicatedCommand = serde_json::from_str(&reencoded).unwrap();
+            assert_eq!(again.operation_reference, Some(11), "{reencoded}");
+            assert!(
+                !serde_json::to_string(&again.command)
+                    .unwrap()
+                    .contains("operation_reference")
+            );
+
+            let line = format!(r#"{{"command":{command},"now":1,"operation_reference":22}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.operation_reference, Some(22), "outer wins: {line}");
+        }
+        let plain: ReplicatedCommand =
+            serde_json::from_str(r#"{"command":{"ResolveIncident":{"incident_key":7}},"now":1}"#)
+                .unwrap();
+        assert_eq!(plain.operation_reference, None);
     }
 
     #[test]
@@ -7753,12 +7844,7 @@ mod tests {
         assert!(sm.begin_receiving_snapshot().await.is_err());
 
         // apply: refused, engine untouched.
-        let applied = apply_entry(
-            &sm,
-            1,
-            vec![ReplicatedCommand::new(deploy_command(), 1)],
-        )
-        .await;
+        let applied = apply_entry(&sm, 1, vec![ReplicatedCommand::new(deploy_command(), 1)]).await;
         assert!(applied.is_err(), "a retired member must refuse an apply");
         let processes = dst.with(|j| j.state().processes.len()).await;
         assert_eq!(processes, 0, "a refused apply never reaches the engine");
