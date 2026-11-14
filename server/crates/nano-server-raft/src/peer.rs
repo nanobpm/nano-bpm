@@ -129,9 +129,39 @@ pub struct PeerLink {
     pending_raft: Pending,
     next_corr: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
+    /// Abort handles for the per-socket writer/reader tasks, so a retired link
+    /// can be torn down explicitly instead of lingering on a stalled socket
+    /// (#1582).
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 impl PeerLink {
+    /// Explicitly tears the connection down: aborts both sockets' writer and
+    /// reader tasks (dropping any queued outbound frames and closing the
+    /// sockets), marks the link disconnected, and fails every pending waiter
+    /// on both lanes with a 502 so no caller hangs on a retired link (#1582).
+    pub async fn shutdown(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+        let handles: Vec<_> = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for h in handles {
+            h.abort();
+        }
+        for pending in [&self.pending_app, &self.pending_raft] {
+            let mut map = pending.lock().await;
+            for (_, tx) in map.drain() {
+                let _ = tx.send(PeerResult {
+                    status: 502,
+                    body: Some(Value::String("peer link closed".into())),
+                });
+            }
+        }
+    }
+
     /// Whether `self` and `other` are clones of the same underlying connection.
     pub fn same_connection(&self, other: &PeerLink) -> bool {
         Arc::ptr_eq(&self.connected, &other.connected)
@@ -151,14 +181,14 @@ impl PeerLink {
         // App-forwarding traffic and Raft RPCs ride separate sockets so a backlog
         // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
         // election deadline (head-of-line isolation for the replication transport).
-        let out_app = Self::dial(
+        let (out_app, app_tasks) = Self::dial(
             &ws_url(base_url),
             pending_app.clone(),
             connected.clone(),
             secret.as_deref(),
         )
         .await?;
-        let out_raft = Self::dial(
+        let (out_raft, raft_tasks) = Self::dial(
             &raft_ws_url(base_url),
             pending_raft.clone(),
             connected.clone(),
@@ -173,6 +203,9 @@ impl PeerLink {
             pending_raft,
             next_corr: Arc::new(AtomicU64::new(1)),
             connected,
+            tasks: Arc::new(std::sync::Mutex::new(
+                app_tasks.into_iter().chain(raft_tasks).collect(),
+            )),
         })
     }
 
@@ -185,7 +218,7 @@ impl PeerLink {
         pending: Pending,
         connected: Arc<AtomicBool>,
         secret: Option<&str>,
-    ) -> Result<mpsc::Sender<Message>, PeerError> {
+    ) -> Result<(mpsc::Sender<Message>, [tokio::task::AbortHandle; 2]), PeerError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = ws_url
             .into_client_request()
@@ -227,7 +260,7 @@ impl PeerLink {
         let (out, mut out_rx) = mpsc::channel::<Message>(1024);
 
         // Writer: serialize outbound frames onto the socket in submission order.
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 if sink.send(msg).await.is_err() {
                     break;
@@ -239,7 +272,7 @@ impl PeerLink {
         // Reader: decode peer frames and resolve the matching pending request.
         let reader_pending = pending.clone();
         let reader_connected = connected.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(frame) = stream.next().await {
                 match frame {
                     Ok(Message::Text(txt)) => {
@@ -268,7 +301,7 @@ impl PeerLink {
             }
         });
 
-        Ok(out)
+        Ok((out, [writer.abort_handle(), reader.abort_handle()]))
     }
 
     /// Whether the link is still up.
@@ -1183,10 +1216,16 @@ impl PeerSet {
     /// caller has since dialed — so the next attempt redials instead of
     /// reusing a connected-but-stalled socket.
     pub async fn drop_link_if_same(&self, node_id: u32, used: &PeerLink) {
-        let mut links = self.links.lock().await;
-        if links.get(&node_id).is_some_and(|l| l.same_connection(used)) {
-            links.remove(&node_id);
+        {
+            let mut links = self.links.lock().await;
+            if links.get(&node_id).is_some_and(|l| l.same_connection(used)) {
+                links.remove(&node_id);
+            }
         }
+        // Retire the abandoned connection itself, not just its cache entry:
+        // otherwise its socket tasks and queued frames outlive the attempt and
+        // accumulate across re-drives (#1582). Idempotent.
+        used.shutdown().await;
     }
 
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
@@ -1417,6 +1456,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         // The stalled peer never answers; the inner deadline is far away, so
         // only the drop of the outer future can clean the entry up.
@@ -1460,6 +1500,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1533,6 +1574,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1587,6 +1629,7 @@ mod tests {
             pending_raft: Arc::new(Mutex::new(HashMap::new())),
             next_corr: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(true)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1610,6 +1653,33 @@ mod tests {
         peers.drop_link_if_same(1, &stalled).await;
         let kept = peers.cached_live_link(1).await.expect("fresh link kept");
         assert!(kept.same_connection(&fresh));
+    }
+
+    /// #1582: retiring an abandoned link must tear the connection down, not
+    /// just un-cache it — its socket tasks are aborted and every pending waiter
+    /// (both lanes) is failed, so re-drives cannot accumulate stalled tasks.
+    #[tokio::test]
+    async fn drop_link_if_same_tears_down_tasks_and_waiters() {
+        let peers = peers_with_dead_peer();
+        let stalled = stalled_link();
+        let task = tokio::spawn(std::future::pending::<()>());
+        stalled.tasks.lock().unwrap().push(task.abort_handle());
+        let (tx_app, rx_app) = tokio::sync::oneshot::channel();
+        let (tx_raft, rx_raft) = tokio::sync::oneshot::channel();
+        stalled.pending_app.lock().await.insert(7, tx_app);
+        stalled.pending_raft.lock().await.insert(8, tx_raft);
+        peers.links.lock().await.insert(1, stalled.clone());
+
+        peers.drop_link_if_same(1, &stalled).await;
+
+        assert!(
+            task.await.unwrap_err().is_cancelled(),
+            "socket task aborted"
+        );
+        assert_eq!(rx_app.await.unwrap().status, 502);
+        assert_eq!(rx_raft.await.unwrap().status, 502);
+        assert!(!stalled.is_connected());
+        assert!(stalled.tasks.lock().unwrap().is_empty());
     }
 
     /// A single-node cluster has no peers, so `PeerSet` is inert.
