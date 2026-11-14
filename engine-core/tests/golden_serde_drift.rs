@@ -925,6 +925,14 @@ fn build_event_witnesses() -> Vec<Event> {
             incident_key: 26,
             episode: 26,
         },
+        // The #1587-review orphan-stamp supersede signal (additive variant, no
+        // version bump): emitted when a stamped quarantine's episode no longer
+        // matches the allocator's position, so the report is re-stamped and
+        // re-proposed rather than silently dropped.
+        Event::OrphanStampSuperseded {
+            instance_key: 27,
+            episode: 26,
+        },
     ]
 }
 

@@ -274,6 +274,11 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             );
         }
 
+        // A superseded orphan stamp (#1587 review) carries no state change —
+        // it only journals the replica-deterministic decision so the leader's
+        // journal re-enqueues the still-pending report. Nothing to apply.
+        Event::OrphanStampSuperseded { .. } => {}
+
         Event::ProcessInstanceCompleted { instance_key } => {
             state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);

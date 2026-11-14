@@ -2800,12 +2800,32 @@ type OrphanQueue = tokio::sync::mpsc::UnboundedSender<(
 /// The journal-facing half of the orphan propose channel (#1447): implements
 /// the storage layer's `OrphanSink` trait so the engine actor can hand an
 /// orphan key off without blocking.
+#[derive(Debug)]
 struct OrphanQueueSink {
     tx: OrphanQueue,
 }
 
 impl nano_server_storage::journal::OrphanSink for OrphanQueueSink {
     fn enqueue_orphan(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        kind: nanobpmn_engine_core::OrphanKind,
+    ) -> bool {
+        self.tx.send((instance_key, kind)).is_ok()
+    }
+}
+
+/// The engine-facing half of the orphan REISSUE path (#1587 review): bridges
+/// the engine's `OrphanReissueSink` into the same propose channel, so a
+/// superseded stamp's still-pending report is re-stamped and re-proposed
+/// rather than silently cleared.
+#[derive(Debug)]
+struct OrphanReissueBridge {
+    tx: OrphanQueue,
+}
+
+impl nanobpmn_engine_core::OrphanReissueSink for OrphanReissueBridge {
+    fn reissue_orphan(
         &self,
         instance_key: nanobpmn_engine_core::Key,
         kind: nanobpmn_engine_core::OrphanKind,
@@ -2998,7 +3018,14 @@ fn wire_orphan_propose(
 ) {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
+    let sink: Arc<dyn nano_server_storage::journal::OrphanSink> =
+        Arc::new(OrphanQueueSink { tx: tx.clone() });
+    // The engine-side reissue sink (#1587 review): a superseded orphan stamp
+    // re-offers its still-pending report here, bridged into the SAME propose
+    // channel so the drainer re-stamps it at the allocator's now-current
+    // position and re-proposes it — the report is never silently cleared.
+    let reissue: Arc<dyn nanobpmn_engine_core::OrphanReissueSink> =
+        Arc::new(OrphanReissueBridge { tx });
     let node_id = raft.metrics().borrow().id;
     let mut metrics = raft.metrics();
     let engine_for_watch = engine.clone();
@@ -3009,6 +3036,7 @@ fn wire_orphan_propose(
         let work = async move {
             let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
                 journal.set_orphan_sink(sink);
+                journal.engine_mut().set_orphan_reissue_sink(reissue);
             })
             .await;
             if seeded.is_none() {

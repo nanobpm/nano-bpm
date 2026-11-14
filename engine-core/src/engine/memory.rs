@@ -82,6 +82,7 @@ impl Engine {
             torn_down_scopes: std::collections::HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied: snapshot.raft_applied,
+            orphan_reissue_sink: None,
         }
     }
 

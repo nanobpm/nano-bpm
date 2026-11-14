@@ -1672,6 +1672,16 @@ impl Journal {
         self.orphans.backlog.remove(&key);
     }
 
+    /// A stamped quarantine for `key` applied SUPERSEDED (#1587 review): its
+    /// episode id no longer matched the allocator's position, so the loss is
+    /// still outstanding. Take the report out of `in_flight` (it stays in the
+    /// backlog) so it is re-stamped at the allocator's now-current position
+    /// and re-proposed — never silently cleared without raising
+    /// `VariablesLost`. The engine already re-offered it to the reissue sink.
+    pub fn orphan_stamp_superseded(&mut self, key: Key) {
+        self.orphans.in_flight.remove(&key);
+    }
+
     /// Orphan keys reported but whose stamped quarantine has not applied here
     /// yet, in key order (#1447).
     pub fn orphan_backlog(&self) -> Vec<Key> {
@@ -2865,6 +2875,17 @@ impl Journal {
         if let Some(key) = orphan_settled {
             self.settle_orphan_report(key);
         }
+        // A superseded orphan stamp (#1587 review) applied: the report is still
+        // pending, so re-enqueue it (out of `in_flight`) for a FRESH stamp at
+        // the allocator's now-current position. The engine already re-offered
+        // it to the reissue sink (→ the propose channel); this clears the
+        // journal-side in-flight marker so the re-proposal is not suppressed
+        // as already-handed-out. A duplicate's reissue re-settles harmlessly.
+        for event in events.iter() {
+            if let Event::OrphanStampSuperseded { instance_key, .. } = event {
+                self.orphan_stamp_superseded(*instance_key);
+            }
+        }
         let mut activated: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -3571,6 +3592,13 @@ impl Journal {
     /// `&Engine`).
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Mutable access to the underlying engine, for host-side wiring that is
+    /// not replicated state (e.g. [`Engine::set_orphan_reissue_sink`], #1587
+    /// review). Never use it to mutate journaled state off the command path.
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
     }
 
     /// Sets the cluster-wide partition count on the underlying engine so it

@@ -4725,12 +4725,15 @@ fn stamped_quarantine_converges_resident_and_cold_replicas() {
 }
 
 // #1587 (acceptance 1 + 2): a delayed duplicate of an already-resolved
-// quarantine episode is a deterministic NO-OP — it raises no new incident and
-// never touches variables. The stamp's replicated loss-episode id matches no
-// live tombstone once the episode's incident was resolved, so the apply gate
-// suppresses the duplicate instead of re-reporting it as a fresh episode (the
-// pre-#1587 behaviour). Identical on a resident and a cold replica, and the
-// `SetVariables` committed after the resolve is never rolled back.
+// quarantine episode raises no new incident and never touches variables. The
+// stamp's replicated loss-episode id matches no live tombstone once the
+// episode's incident was resolved, so the apply gate supersedes the duplicate
+// instead of re-reporting it as a fresh episode (the pre-#1587 behaviour).
+// The supersede emits only the engine-internal `OrphanStampSuperseded` signal
+// (no incident, no tombstone, no variable write) — identical on a resident and
+// a cold replica — and the `SetVariables` committed after the resolve is never
+// rolled back. With no reissue sink wired (as here) the duplicate is simply
+// not re-proposed; the journal-side reissue is covered by the storage tests.
 #[test]
 fn delayed_duplicate_after_resolve_is_a_noop_and_touches_no_variables() {
     let (mut resident, key) = orphan_replica();
@@ -4778,9 +4781,13 @@ fn delayed_duplicate_after_resolve_is_a_noop_and_touches_no_variables() {
     let dup_resident = run(&mut resident, false);
     let dup_cold = run(&mut cold, true);
     assert_eq!(dup_resident, dup_cold, "identical events on both replicas");
+    // The supersede emits ONLY the engine-internal signal — no incident, no
+    // tombstone, no variable write — so the duplicate changes no state.
     assert!(
-        dup_resident.is_empty(),
-        "a delayed duplicate of a resolved episode is a complete no-op: {dup_resident:?}"
+        dup_resident
+            .iter()
+            .all(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+        "a delayed duplicate of a resolved episode only journals its supersede: {dup_resident:?}"
     );
     for engine in [&resident, &cold] {
         // Exactly one VariablesLost incident ever (episode 1's, now resolved) —
@@ -4871,6 +4878,141 @@ fn new_loss_after_resolution_is_reported_fresh() {
         "the new episode records a fresh tombstone"
     );
     assert!(engine.has_active_variables_lost(key), "episode 2 is active");
+}
+
+// #1587 review (allocator race): unrelated key-minting work between the
+// leader's stamp and the proposal's commitment advances the replicated
+// allocator, so the proposal's episode no longer matches `peek_next_key()`.
+// The gate must NOT silently clear the pending report: it journals
+// `OrphanStampSuperseded` and re-offers the report to the reissue sink, which
+// re-stamps it at the now-current position and re-proposes it — the fresh
+// quarantine still raises its `VariablesLost` incident.
+#[test]
+fn superseded_orphan_stamp_is_reissued_not_dropped() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingSink(Mutex<Vec<(Key, crate::OrphanKind)>>);
+    impl crate::OrphanReissueSink for RecordingSink {
+        fn reissue_orphan(&self, instance_key: Key, kind: crate::OrphanKind) -> bool {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((instance_key, kind));
+            true
+        }
+    }
+
+    let (mut engine, key) = orphan_replica();
+    let sink = Arc::new(RecordingSink::default());
+    engine.set_orphan_reissue_sink(sink.clone());
+
+    // The leader stamps the live orphan (episode = the allocator's next key).
+    let stamp = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a live orphan stamps");
+    assert!(stamp.episode > 0, "nonzero episode");
+
+    // Unrelated key-minting work commits BEFORE the proposal: a new instance
+    // creation advances the shared allocator past the stamped episode.
+    engine
+        .apply_command_at(Command::create_instance("orphan"), 49)
+        .unwrap();
+
+    // The stamped proposal now applies SUPERSEDED: it journals the supersede
+    // signal, raises NO incident, records NO tombstone, and re-offers the
+    // still-pending report to the sink.
+    let first = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stamp),
+            },
+            50,
+        )
+        .unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::OrphanStampSuperseded { instance_key, .. } if *instance_key == key)),
+        "the stale stamp journals its supersede: {first:?}"
+    );
+    assert!(
+        first.iter().all(|e| !matches!(
+            e,
+            Event::IncidentRaised { .. } | Event::VariablesLostQuarantined { .. }
+        )),
+        "a superseded stamp raises no incident and records no tombstone: {first:?}"
+    );
+    assert!(
+        !engine.has_active_variables_lost(key),
+        "no incident raised by the superseded proposal"
+    );
+    assert_eq!(
+        sink.0.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+        &[(key, crate::OrphanKind::Resident)],
+        "the still-pending report is re-offered for a fresh stamp"
+    );
+
+    // The reissue: the leader RE-STAMPS at the allocator's now-current position
+    // and re-proposes. That proposal applies and raises the incident — the
+    // fresh quarantine is never lost to the allocator race.
+    let restamp = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("the reissue re-stamps");
+    let second = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(restamp),
+            },
+            51,
+        )
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "the re-stamped re-proposal raises the VariablesLost incident: {second:?}"
+    );
+    assert!(
+        engine.has_active_variables_lost(key),
+        "the fresh quarantine applies after reissue"
+    );
+}
+
+// #1587 review (allocator race, replica-determinism): the supersede decision
+// is a pure function of replicated state, so a resident and a cold replica
+// emit the identical `OrphanStampSuperseded` frame and stay converged.
+#[test]
+fn superseded_orphan_stamp_is_replica_deterministic() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    let stamp = resident
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a live orphan stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // Advance BOTH replicas' allocators identically (the replicated work that
+    // raced the proposal), then apply the same stamped command to each.
+    for engine in [&mut resident, &mut cold] {
+        engine
+            .apply_command_at(Command::create_instance("orphan"), 49)
+            .unwrap();
+    }
+    let a = resident.apply_command_at(command.clone(), 50).unwrap();
+    let b = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(a, b, "identical supersede frames on both replicas");
+    assert!(
+        a.iter()
+            .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+        "both replicas journal the supersede"
+    );
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
 }
 
 // #1574 review (cancellation race): an orphan report can be queued before the

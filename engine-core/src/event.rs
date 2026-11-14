@@ -1843,6 +1843,26 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
         episode: Key,
     },
+
+    /// A stamped orphan-quarantine proposal could not apply because its
+    /// loss-episode id no longer matches the incident key a fresh proposal
+    /// would mint (#1587 review): unrelated key-minting work advanced the
+    /// replicated allocator between the leader stamping the report and the
+    /// proposal committing. The report itself is still pending in the leader's
+    /// journal backlog, so this event is the **replicated** signal every
+    /// replica (and the leader's journal, which watches applied events)
+    /// observes identically: the leader re-stamps the still-pending report at
+    /// its now-current allocator position and re-proposes it, instead of
+    /// silently clearing the pending report without raising `VariablesLost`.
+    /// Carries no state change — the reducers ignore it; it exists so the
+    /// supersede decision is journaled and replica-deterministic. Additive
+    /// variant: no snapshot-format bump.
+    OrphanStampSuperseded {
+        instance_key: Key,
+        /// The superseded loss-episode id (the stamp's `episode`), recorded so
+        /// the journal can correlate the reissue with the report it parked.
+        episode: Key,
+    },
 }
 
 impl Event {
@@ -1935,6 +1955,7 @@ impl Event {
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::VariablesLostQuarantined { instance_key, .. }
+            | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no

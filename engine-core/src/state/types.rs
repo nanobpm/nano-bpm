@@ -2147,7 +2147,11 @@ pub struct State {
     /// set is independent of instance residency and eviction, so the guard
     /// stays identical on every replica. `serde(default)` so snapshots written
     /// before it deserialize empty (such a snapshot predates the quarantine
-    /// event, so there is nothing to dedup yet).
+    /// event, so there is nothing to dedup yet). The value deserializer accepts
+    /// BOTH the legacy encoding (`"7": 9` — the bare incident key, pre-#1587)
+    /// and the current tombstone object, so a legacy snapshot holding an ACTIVE
+    /// quarantine still loads (as episode `0`, the episode-blind sentinel);
+    /// `serde(default)` alone does not convert an existing numeric value.
     #[cfg_attr(feature = "serde", serde(default))]
     pub variables_lost_quarantined: BTreeMap<Key, VariablesLostTombstone>,
     /// The most recent instance keys to reach a terminal state
@@ -2188,7 +2192,7 @@ pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
 /// Recorded by [`crate::Event::VariablesLostQuarantined`]; lifted when the
 /// episode's incident is resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct VariablesLostTombstone {
     /// The `VariablesLost` incident the quarantine raised: resolving exactly
     /// this incident lifts the tombstone, keyed on the replicated
@@ -2202,8 +2206,56 @@ pub struct VariablesLostTombstone {
     /// instead of raising a fresh incident. A genuinely new loss stamps a
     /// fresh, distinct episode id and is still reported. `0` for a tombstone
     /// written before this field existed (episode-blind, pre-#1587 behaviour).
+    /// The id is the leader's allocator position at stamp time — unrelated
+    /// key-minting work can advance the allocator before the proposal commits,
+    /// so a position mismatch at apply time supersedes the stamp (re-stamp +
+    /// re-propose via [`crate::Event::OrphanStampSuperseded`]) rather than
+    /// dropping the report (#1587 review).
     #[cfg_attr(feature = "serde", serde(default))]
     pub episode: u64,
+}
+
+/// Backward-compatible deserialization for [`VariablesLostTombstone`]: a
+/// snapshot written before #1587 encodes each map entry as the bare incident
+/// key (`"7": 9`), which cannot deserialize into the struct — and
+/// `serde(default)` does not convert an EXISTING numeric value, so without
+/// this a legacy snapshot holding an active quarantine fails to load through
+/// every direct `EngineSnapshot` reader, including Raft snapshot installation.
+/// Accept the legacy bare key (as `{ incident_key, episode: 0 }` — the
+/// episode-blind sentinel, matching the pre-#1587 behaviour that snapshot ran
+/// under) alongside the current object form.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// Current form: the tombstone object.
+            Current {
+                incident_key: Key,
+                #[serde(default)]
+                episode: u64,
+            },
+            /// Legacy (pre-#1587) form: the bare incident key.
+            Legacy(Key),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Current {
+                incident_key,
+                episode,
+            } => VariablesLostTombstone {
+                incident_key,
+                episode,
+            },
+            Repr::Legacy(incident_key) => VariablesLostTombstone {
+                incident_key,
+                episode: 0,
+            },
+        })
+    }
 }
 
 impl State {
