@@ -8689,4 +8689,187 @@ mod tests {
         drop((journal, store));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    // ---- #1556: disk-backed operationReference persistence ----
+
+    /// Every record in `dir`'s journal segments, in log order (the active `journal.jsonl`
+    /// plus any `journal.seg.<start>.jsonl`; zero-padded starts sort in log order).
+    fn segment_records_1556(dir: &std::path::Path) -> Vec<nanobpmn_engine_core::Record> {
+        let mut segs: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "no journal segments written in {dir:?}");
+        segs.iter()
+            .flat_map(|p| crate::seglog::read_segment_records(p).unwrap())
+            .collect()
+    }
+
+    fn temp_dir_1556(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-journal-1556-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Asserts every record of `events` (a contiguous run inside `records`,
+    /// matched by position from `start`) carries exactly `reference`.
+    fn assert_run_refs(
+        records: &[nanobpmn_engine_core::Record],
+        start: usize,
+        events: &[Event],
+        reference: Option<i64>,
+    ) {
+        for (i, event) in events.iter().enumerate() {
+            let record = &records[start + i];
+            assert_eq!(&record.event, event, "record {} out of order", start + i);
+            assert_eq!(
+                record.operation_reference,
+                reference,
+                "record {} ({event:?}) carries the wrong reference",
+                start + i
+            );
+        }
+    }
+
+    /// Untagged single-partition segmented log: a referenced direct command,
+    /// then a Raft entry batching two distinct references and an unreferenced
+    /// command. Every persisted record carries its OWN command's reference; the
+    /// `RaftEntryApplied` marker carries none; reopening recovers the same state.
+    #[test]
+    fn untagged_segmented_journal_persists_per_command_references_and_recovers() {
+        let dir = temp_dir_1556("untagged");
+        let (key_a, key_b, before) = {
+            let (mut j, _) = Journal::open_segmented(&dir).unwrap();
+            let (deploy, c) = j
+                .apply_command_ref_at(Command::DeployProcess(demo()), 1, None)
+                .unwrap();
+            c.blocking_wait();
+            let (direct, c) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 2, Some(11))
+                .unwrap();
+            c.blocking_wait();
+            let key_a = direct.iter().find_map(|e| e.instance_key()).unwrap();
+
+            j.begin_raft_entry();
+            let (r1, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 3, Some(22))
+                .unwrap();
+            let key_b = r1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (r2, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 4, None)
+                .unwrap();
+            let (r3, _) = j
+                .apply_command_ref_at(Command::cancel_instance(key_a), 5, Some(33))
+                .unwrap();
+            let (entry, c) = j.commit_raft_entry(7, "state".to_string()).unwrap();
+            c.blocking_wait();
+
+            let records = segment_records_1556(&dir);
+            let mut at = 0;
+            for (events, reference) in [
+                (&deploy, None),
+                (&direct, Some(11)),
+                (&r1, Some(22)),
+                (&r2, None),
+                (&r3, Some(33)),
+            ] {
+                assert!(!events.is_empty());
+                assert_run_refs(&records, at, events, reference);
+                at += events.len();
+            }
+            let marker = &records[at];
+            assert!(
+                matches!(marker.event, Event::RaftEntryApplied { index: 7, .. }),
+                "expected the Raft marker, got {:?}",
+                marker.event
+            );
+            assert_eq!(
+                marker.operation_reference, None,
+                "Raft marker must be unreferenced"
+            );
+            assert_eq!(entry.last(), Some(&marker.event));
+            assert_eq!(records.len(), at + 1);
+            let before = (
+                j.instance(key_a).map(|i| format!("{i:?}")),
+                j.instance(key_b).map(|i| format!("{i:?}")),
+                j.raft_applied(),
+            );
+            (key_a, key_b, before)
+        };
+
+        let (j, _) = Journal::open_segmented(&dir).unwrap();
+        let after = (
+            j.instance(key_a).map(|i| format!("{i:?}")),
+            j.instance(key_b).map(|i| format!("{i:?}")),
+            j.raft_applied(),
+        );
+        assert_eq!(after, before, "reopen must recover the same engine state");
+        assert_eq!(after.2, Some((7, "state".to_string())));
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tagged (shared multi-partition writer, `<partition>\t<json>` lines)
+    /// variant of the above.
+    #[test]
+    fn tagged_shared_journal_persists_per_command_references_and_recovers() {
+        let dir = temp_dir_1556("tagged");
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
+        let (key_a, before) = {
+            let (writer, recovery) =
+                SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
+            let mut engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
+            let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
+            j.set_exporter(export_tx, Arc::new(AtomicU64::new(0)));
+            let (deploy, c) = j
+                .apply_command_ref_at(Command::DeployProcess(demo()), 1, Some(5))
+                .unwrap();
+            c.blocking_wait();
+            j.begin_raft_entry();
+            let (r1, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 2, Some(44))
+                .unwrap();
+            let key_a = r1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (r2, _) = j
+                .apply_command_ref_at(Command::create_instance("demo"), 3, None)
+                .unwrap();
+            let (_, c) = j.commit_raft_entry(3, "s3".to_string()).unwrap();
+            c.blocking_wait();
+
+            let records = segment_records_1556(&dir);
+            let mut at = 0;
+            for (events, reference) in [(&deploy, Some(5)), (&r1, Some(44)), (&r2, None)] {
+                assert_run_refs(&records, at, events, reference);
+                at += events.len();
+            }
+            assert!(matches!(
+                records[at].event,
+                Event::RaftEntryApplied { index: 3, .. }
+            ));
+            assert_eq!(records[at].operation_reference, None);
+            (key_a, j.instance(key_a).map(|i| format!("{i:?}")))
+        };
+
+        let recovery = crate::seglog::recover_multi(&dir, &[0], 1, Some(&varstore)).unwrap();
+        let engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        assert_eq!(
+            engines[&0].instance(key_a).map(|i| format!("{i:?}")),
+            before,
+            "reopen must recover the same engine state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
