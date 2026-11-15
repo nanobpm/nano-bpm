@@ -186,7 +186,7 @@ pub struct Cycle {
 
 /// Parses an ISO-8601 repeating interval (`R/PT1H`, `R5/PT1H`, or a bare
 /// duration) into its repetition count and interval. Returns `None` if the
-/// repetition prefix or the interval is malformed.
+/// repetition prefix or the interval is malformed, or the count is `R0`.
 pub fn parse_cycle(raw: &str) -> Option<Cycle> {
     let s = raw.trim();
     let (repetitions, interval) = match s.split_once('/') {
@@ -195,7 +195,13 @@ pub fn parse_cycle(raw: &str) -> Option<Cycle> {
             let repetitions = if count.is_empty() {
                 None
             } else if count.bytes().all(|b| b.is_ascii_digit()) {
-                Some(count.parse::<u32>().ok()?)
+                // `R0` (a cycle that never fires) is rejected rather than
+                // accepted as `Some(0)`: every arming path would otherwise
+                // schedule (and fire) the initial occurrence (#1596).
+                match count.parse::<u32>().ok()? {
+                    0 => return None,
+                    n => Some(n),
+                }
             } else {
                 return None;
             };
@@ -336,6 +342,10 @@ mod tests {
         );
         assert_eq!(parse_cycle("R/PT1M").and_then(|c| c.repetitions), None);
         assert_eq!(parse_cycle("PT1M").and_then(|c| c.repetitions), None);
+        // Zero repetitions is rejected, never armed (#1596).
+        assert_eq!(parse_cycle("R0/PT1M"), None);
+        assert_eq!(parse_cycle("R00/PT1M"), None);
+        assert_eq!(parse_cycle_millis("R0/PT1M"), None);
     }
 
     #[test]
