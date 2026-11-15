@@ -2941,3 +2941,79 @@ fn migration_resolves_destination_by_the_unchanged_target_parent_id() {
         "the consumed one-shot timer is not re-armed in the subB host"
     );
 }
+
+#[test]
+fn migration_does_not_rearm_a_consumed_timer_moved_between_live_siblings() {
+    // #1379 review r4579525797: a consumed one-shot timer ESP hosted by live
+    // `subA` moves to live sibling `subB`; its destination resolves through
+    // the nearest shared runtime ancestor (the root), so it stays suppressed.
+    let model = |esp_parent: &str| {
+        ProcessBuilder::new("p")
+            .start_event("s")
+            .parallel_gateway("fork")
+            .sub_process("subA", "a_s")
+            .start_event("a_s")
+            .service_task("a_w", "aw")
+            .end_event("a_e")
+            .sub_process("subB", "b_s")
+            .start_event("b_s")
+            .service_task("b_w", "bw")
+            .end_event("b_e")
+            .end_event("e1")
+            .end_event("e2")
+            .connect("s", "fork")
+            .connect("fork", "subA")
+            .connect("fork", "subB")
+            .connect("subA", "e1")
+            .connect("subB", "e2")
+            .connect("a_s", "a_w")
+            .connect("a_w", "a_e")
+            .connect("b_s", "b_w")
+            .connect("b_w", "b_e")
+            .contained_in("a_s", "subA")
+            .contained_in("a_w", "subA")
+            .contained_in("a_e", "subA")
+            .contained_in("b_s", "subB")
+            .contained_in("b_w", "subB")
+            .contained_in("b_e", "subB")
+            .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+            .start_event("esp_start")
+            .service_task("esp_w", "ew")
+            .end_event("esp_e")
+            .connect("esp_start", "esp_w")
+            .connect("esp_w", "esp_e")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_w", "esp")
+            .contained_in("esp_e", "esp")
+            .contained_in("esp", esp_parent)
+            .build()
+            .unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model("subA"));
+    assert_eq!(armed(&engine, inst), 1, "armed in subA");
+    for t in engine.state.timers.values_mut() {
+        if t.instance_key == inst && t.state == crate::state::TimerState::Created {
+            t.state = crate::state::TimerState::Triggered;
+        }
+    }
+    assert_eq!(armed(&engine, inst), 0);
+    let target_key = deploy_for_migration(&mut engine, model("subB"));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("subA".into(), "subA".into()),
+                ("a_w".into(), "a_w".into()),
+                ("subB".into(), "subB".into()),
+                ("b_w".into(), "b_w".into()),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "the consumed one-shot timer is not re-armed in sibling subB"
+    );
+}

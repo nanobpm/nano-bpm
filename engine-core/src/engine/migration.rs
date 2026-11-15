@@ -937,34 +937,46 @@ impl Engine {
             let Some(parent) = parent else {
                 return vec![0];
             };
-            let mut c = host;
-            loop {
-                if scope_target.get(&c).and_then(|t| t.as_deref()) == Some(parent.as_str()) {
-                    return vec![c];
-                }
-                if c == 0 {
-                    break;
-                }
-                c = self.scope_of(instance_key, c);
-            }
-            scope_target
-                .iter()
-                .filter(|(eik, t)| {
-                    t.as_deref() == Some(parent.as_str()) && {
-                        let mut a = **eik;
-                        loop {
-                            if a == 0 {
-                                break host == 0;
-                            }
-                            a = self.scope_of(instance_key, a);
-                            if a == host {
-                                break true;
-                            }
-                        }
+            // Widen from `host` outward one runtime ancestor at a time; at
+            // each level take the live scopes targeting `parent` that are that
+            // ancestor itself or its descendants. The nearest level with a
+            // match wins: covers moves outward (the ancestor itself), inward
+            // (a descendant) and sideways between live sibling scopes (a
+            // descendant of the nearest shared ancestor) without letting
+            // concurrent instances alias (#1379 review).
+            let within = |a: Key, root: Key| -> bool {
+                let mut c = a;
+                loop {
+                    if c == root {
+                        return true;
                     }
-                })
-                .map(|(eik, _)| *eik)
-                .collect()
+                    if c == 0 {
+                        return false;
+                    }
+                    c = self.scope_of(instance_key, c);
+                }
+            };
+            let mut anc = host;
+            loop {
+                // The ancestor itself wins over its descendants (a move
+                // outward lands in exactly that instance).
+                if scope_target.get(&anc).and_then(|t| t.as_deref()) == Some(parent.as_str()) {
+                    return vec![anc];
+                }
+                let mut hits: Vec<Key> = scope_target
+                    .iter()
+                    .filter(|(eik, t)| t.as_deref() == Some(parent.as_str()) && within(**eik, anc))
+                    .map(|(eik, _)| *eik)
+                    .collect();
+                if !hits.is_empty() {
+                    hits.sort_unstable();
+                    return hits;
+                }
+                if anc == 0 {
+                    return Vec::new();
+                }
+                anc = self.scope_of(instance_key, anc);
+            }
         };
         // `(destination scope, target esp id)` pairs a CONSUMED source
         // counterpart lands in (staying or moved).
