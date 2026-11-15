@@ -182,10 +182,11 @@ fn error_end_event_is_caught_by_an_error_event_subprocess() {
 }
 
 #[test]
-fn error_end_event_catch_prefers_an_exact_code_over_a_catch_all() {
-    // A catch-all error boundary on the sub-process AND an exact-code error
-    // event sub-process at the root: the walk finds the exact boundary first
-    // (the innermost scope wins before the root's ESP is even offered).
+fn error_end_event_catch_prefers_the_innermost_scope_over_an_outer_exact_esp() {
+    // Scope-depth check: an exact-code error boundary on the sub-process AND an
+    // exact-code error event sub-process at the root: the walk finds the inner
+    // boundary first (the innermost scope wins before the root's ESP is even
+    // offered).
     let mut engine = Engine::new();
     let def = sub_with_error_end()
         // Repurpose: the boundary catches ALL codes; an exact ESP sits at root.
@@ -217,6 +218,50 @@ fn error_end_event_catch_prefers_an_exact_code_over_a_catch_all() {
         "the inner boundary catches before the root ESP is offered"
     );
     assert!(!activated(&events, "esp"));
+    complete_one(&mut engine, "handle");
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn error_end_event_catch_prefers_an_exact_code_over_a_catch_all_at_the_same_scope() {
+    // Specificity check at ONE scope level: a catch-all error boundary and an
+    // exact-code (`E1`) boundary both attached to `sub`. The catch-all is
+    // declared FIRST so declaration order alone would pick it; the exact code
+    // must win regardless.
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .error_end_event("err_end", "E1")
+        .contained_in("sub_s", "sub")
+        .contained_in("err_end", "sub")
+        .error_boundary_event("bnd_all", "sub", "")
+        .error_boundary_event("bnd", "sub", "E1")
+        .service_task("all_handler", "handle_all")
+        .service_task("handler", "handle")
+        .end_event("e")
+        .end_event("all_end")
+        .end_event("handler_end")
+        .connect("s", "sub")
+        .connect("sub_s", "err_end")
+        .connect("sub", "e")
+        .connect("bnd_all", "all_handler")
+        .connect("all_handler", "all_end")
+        .connect("bnd", "handler")
+        .connect("handler", "handler_end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let (inst, events) = start(&mut engine, def);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "bnd" && to == "handler"
+        )),
+        "the exact-code boundary catches over the same-scope catch-all"
+    );
+    assert!(!activated(&events, "all_handler"), "catch-all not taken");
     complete_one(&mut engine, "handle");
     assert!(engine.is_completed(inst));
 }
