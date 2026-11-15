@@ -802,6 +802,34 @@ impl Default for ProcGovConfig {
     }
 }
 
+/// Pure resolver for the `NANOBPMN_TIER2` actuation switch (split out so it is
+/// unit-testable without the process environment). **Default is observe-only
+/// (`false`)**: the per-definition compressors always run and publish their
+/// pressure metrics (`nanobpm_tier2_pressure`), but they do **not** shed creates
+/// unless the operator explicitly opts in. This is the safe default for two
+/// reasons:
+/// - ADR-0021 ("shedding must be latency-causal") blocks Tier-2 as a customer
+///   latency-SLA control until a causal shed predicate lands — observe-only is
+///   the explicitly-sanctioned mode in the meantime.
+/// - Issue #1532: a backlog with no workers draining (a legitimate pattern —
+///   batch pre-creation, workers deployed later, a worker outage) cannot meet
+///   any latency budget however slowly instances arrive, so an on-by-default
+///   Tier-2 sheds legitimate intake and never recovers. Camunda 8 does not
+///   reject on this pattern, so the opt-out default is also a C8-compat gap.
+/// - `None` (unset), `off`, `observe`, `observe-only`, `0`, `false`, `no`,
+///   `disabled` → `false` (observe-only; never shed);
+/// - `on`, `1`, `true`, `yes`, `enabled`, `enforce`, `shed` → `true` (actuate);
+/// - anything else → `false` (fail safe: never silently *enable* shedding).
+pub fn parse_tier2_enabled(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "on" | "1" | "true" | "yes" | "enabled" | "enforce" | "shed"
+    )
+}
+
 impl ProcGovConfig {
     /// Resolve the config from the `NANOBPMN_TIER2_*` environment, falling back to
     /// [`Default`] for any unset/unparseable knob.
@@ -1464,6 +1492,49 @@ mod tests {
     fn sla_mode_sheds_for_latency_only_in_latency_mode() {
         assert!(SlaMode::Latency.sheds_for_latency());
         assert!(!SlaMode::Admission.sheds_for_latency());
+    }
+
+    // --- NANOBPMN_TIER2 actuation switch (default observe-only, issue #1532) ---
+
+    #[test]
+    fn tier2_defaults_to_observe_only() {
+        // Unset → observe-only (never shed). This is the issue-#1532 default flip:
+        // a backlog with no workers draining must not be rejected out of the box.
+        assert!(!parse_tier2_enabled(None));
+    }
+
+    #[test]
+    fn tier2_observe_only_aliases_disable() {
+        for raw in [
+            "off",
+            "observe",
+            "observe-only",
+            "0",
+            "false",
+            "no",
+            "disabled",
+            "OFF",
+            " Observe-Only ",
+        ] {
+            assert!(!parse_tier2_enabled(Some(raw)), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn tier2_actuate_aliases_enable() {
+        for raw in [
+            "on", "1", "true", "yes", "enabled", "enforce", "shed", "ON", " On ",
+        ] {
+            assert!(parse_tier2_enabled(Some(raw)), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn tier2_unrecognised_fails_safe_to_observe_only() {
+        // Never silently *enable* shedding on a typo.
+        for raw in ["garbage", "2", "auto", ""] {
+            assert!(!parse_tier2_enabled(Some(raw)), "{raw:?}");
+        }
     }
 
     #[test]

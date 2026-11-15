@@ -168,6 +168,17 @@ only `B`, whereas fan-in would over-throttle healthy `A`.
   EWMA-smoothed with a deadband as a fraction of `λ_P` (raw `dL/dt` is noisy).
 - **Actuation.** `admit(createProcessInstance P) ⟺ p_P < 1` (throttled in
   proportion to `p_P`). No incidence map, no fan-in.
+- **Default: observe-only (2026-11, issue #1532).** The compressors always run and
+  publish `nanobpm_tier2_pressure{proc}`, but they do **not** shed creates unless
+  the operator opts in with `NANOBPMN_TIER2=on`. Two reasons: (1) ADR-0021's
+  latency-causal release blocker (below) — a shed that does not relieve a *locally
+  contended* resource buys no latency; (2) a backlog with **no workers draining**
+  (batch pre-creation, workers deployed later, a worker outage) cannot meet any
+  latency budget however slowly instances arrive, so an on-by-default Tier-2 shed
+  legitimate intake and never recovered — and Camunda 8 does not reject on this
+  pattern, making the opt-out default a C8-compatibility gap as well. Tier-1
+  (engine-saturation) and the memory-safety rails still shed real overload in
+  every mode; only the per-definition latency-SLA shed is opt-in.
 
 Two behaviours are **correct by design**, not bugs:
 - a definition whose instances drain healthily is **never** throttled (the entire
