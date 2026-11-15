@@ -925,25 +925,35 @@ impl Engine {
         // The live scope instance(s) a counterpart `tgt_esp` of an event
         // sub-process hosted by source scope instance `host` lands in. The
         // target parent id is a TARGET id and is used unchanged. It is
-        // resolved through `host`'s OWN runtime lineage — `host` itself or its
-        // nearest ancestor whose target is that parent (a move outward), else
-        // the live descendants of `host` with that target (a move inward) —
-        // so concurrent instances of one scope element never alias each other
-        // (#1379 review).
+        // resolved through `host`'s OWN runtime lineage, bounded by the
+        // MAPPED COMMON MODEL ANCESTOR: the nearest runtime ancestor of
+        // `host` whose mapped target id is a model ancestor of the target
+        // parent (the root when that parent sits at the process level). Only
+        // that instance's subtree is searched — itself first (a move
+        // outward), then its live descendants with that target (a move inward
+        // or sideways between siblings) — so the search never climbs past it
+        // into an unrelated concurrent host instance and suppresses that
+        // host's own trigger (#1379 review).
         let destinations_of = |host: Key, tgt_esp: &str| -> Vec<Key> {
             let Some(parent) = target.element(tgt_esp).map(|el| el.parent.clone()) else {
                 return Vec::new();
             };
             let Some(parent) = parent else {
+                // A process-level target ESP lives in the root scope.
                 return vec![0];
             };
-            // Widen from `host` outward one runtime ancestor at a time; at
-            // each level take the live scopes targeting `parent` that are that
-            // ancestor itself or its descendants. The nearest level with a
-            // match wins: covers moves outward (the ancestor itself), inward
-            // (a descendant) and sideways between live sibling scopes (a
-            // descendant of the nearest shared ancestor) without letting
-            // concurrent instances alias (#1379 review).
+            // The mapped target ids of the target parent's MODEL ancestors
+            // (itself included): the nearest runtime ancestor of `host` whose
+            // mapped target id is in this set is the mapped common ancestor —
+            // the search must not climb past it. An ancestor id absent from
+            // the source model contributes nothing (its source counterpart
+            // does not exist, so no live scope can map to it).
+            let mut chain: HashSet<ElementId> = HashSet::new();
+            let mut cur = Some(parent.clone());
+            while let Some(id) = cur {
+                chain.insert(id.clone());
+                cur = target.element(&id).and_then(|el| el.parent.clone());
+            }
             let within = |a: Key, root: Key| -> bool {
                 let mut c = a;
                 loop {
@@ -956,8 +966,21 @@ impl Engine {
                     c = self.scope_of(instance_key, c);
                 }
             };
+            // Widen from `host` outward one runtime ancestor at a time. The
+            // first ancestor whose mapped target id is a model ancestor of
+            // the target parent BOUNDS the search: it wins itself when its
+            // target IS the parent (a move outward), else only its own live
+            // descendants with that target are destinations (a move inward or
+            // sideways between siblings below it). When no runtime ancestor
+            // maps into the chain the root bounds the search, preserving the
+            // root-level sibling resolution (#1379 review).
             let mut anc = host;
             loop {
+                let bounds = anc == 0
+                    || scope_target
+                        .get(&anc)
+                        .and_then(|t| t.as_deref())
+                        .is_some_and(|t| chain.contains(t));
                 // The ancestor itself wins over its descendants (a move
                 // outward lands in exactly that instance).
                 if scope_target.get(&anc).and_then(|t| t.as_deref()) == Some(parent.as_str()) {
@@ -972,7 +995,9 @@ impl Engine {
                     hits.sort_unstable();
                     return hits;
                 }
-                if anc == 0 {
+                if bounds {
+                    // The mapped common ancestor has no matching scope in its
+                    // subtree: the destination does not exist on this side.
                     return Vec::new();
                 }
                 anc = self.scope_of(instance_key, anc);

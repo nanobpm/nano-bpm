@@ -3017,3 +3017,128 @@ fn migration_does_not_rearm_a_consumed_timer_moved_between_live_siblings() {
         "the consumed one-shot timer is not re-armed in sibling subB"
     );
 }
+
+#[test]
+fn migration_bounds_destination_search_to_the_mapped_common_ancestor_instance() {
+    // #1379 review r4579614315: two concurrent `esp1` hosts. Host 0's `subA`
+    // timer fired (consumed); host 1 has a live `subB`. The consumed ESP moves
+    // to `subB` in the target. Host 0 has no live `subB`, so its consumed
+    // counterpart must resolve to NO destination (its mapped common ancestor
+    // is its own `esp1` instance) — the search must NOT climb to the root and
+    // pick host 1's `subB`, which would suppress host 1's own new timer.
+    let model = |esp_parent: &str| {
+        ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .event_sub_process("esp1", "esp1_start", sig(), false)
+            .start_event("esp1_start")
+            .sub_process("subA", "a_s")
+            .start_event("a_s")
+            .service_task("a_w", "aw")
+            .end_event("a_e")
+            .sub_process("subB", "b_s")
+            .start_event("b_s")
+            .service_task("b_w", "bw")
+            .end_event("b_e")
+            .end_event("esp1_end")
+            .connect("esp1_start", "subA")
+            .connect("a_s", "a_w")
+            .connect("a_w", "a_e")
+            .connect("subA", "subB")
+            .connect("b_s", "b_w")
+            .connect("b_w", "b_e")
+            .connect("subB", "esp1_end")
+            .contained_in("esp1_start", "esp1")
+            .contained_in("subA", "esp1")
+            .contained_in("a_s", "subA")
+            .contained_in("a_w", "subA")
+            .contained_in("a_e", "subA")
+            .contained_in("subB", "esp1")
+            .contained_in("b_s", "subB")
+            .contained_in("b_w", "subB")
+            .contained_in("b_e", "subB")
+            .contained_in("esp1_end", "esp1")
+            .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+            .start_event("esp_start")
+            .service_task("esp_w", "ew")
+            .end_event("esp_e")
+            .connect("esp_start", "esp_w")
+            .connect("esp_w", "esp_e")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_w", "esp")
+            .contained_in("esp_e", "esp")
+            .contained_in("esp", esp_parent)
+            .build()
+            .unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model("subA"));
+    // Two concurrent `esp1` hosts; each parks in its `subA` (its `subB` is
+    // not yet entered).
+    fire(&mut engine, inst, T::Signal, 0);
+    fire(&mut engine, inst, T::Signal, 0);
+    let mut sub_a: Vec<Key> = engine.state.instances[&inst]
+        .active
+        .iter()
+        .filter_map(|(k, id)| (id == "subA").then_some(*k))
+        .collect();
+    sub_a.sort_unstable();
+    assert_eq!(sub_a.len(), 2, "two concurrent hosts each in subA");
+    // Consume host 0's timer only.
+    let key = engine
+        .state
+        .timers
+        .values()
+        .find(|t| {
+            t.instance_key == inst
+                && t.element_instance_key == sub_a[0]
+                && t.state == crate::state::TimerState::Created
+        })
+        .map(|t| t.key)
+        .expect("host 0 timer armed");
+    engine.state.timers.get_mut(&key).expect("timer").state = crate::state::TimerState::Triggered;
+    // Host 1 completes `subA` and enters its `subB` (host 0 never does).
+    let b_w_job = engine
+        .activate_jobs("aw", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .find(|j| engine.scope_of(inst, j.element_instance_key) == sub_a[1])
+        .map(|j| j.key)
+        .expect("host 1 a_w job");
+    engine
+        .apply_command(Command::complete_job(b_w_job))
+        .unwrap();
+    let sub_b1: Vec<Key> = engine.state.instances[&inst]
+        .active
+        .iter()
+        .filter_map(|(k, id)| (id == "subB").then_some(*k))
+        .collect();
+    assert_eq!(sub_b1.len(), 1, "only host 1 has a live subB");
+    // Migrate: the timer ESP moves from `subA` to `subB`.
+    let target_key = deploy_for_migration(&mut engine, model("subB"));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("work".into(), "work".into()),
+                ("esp1".into(), "esp1".into()),
+                ("subA".into(), "subA".into()),
+                ("a_w".into(), "a_w".into()),
+                ("subB".into(), "subB".into()),
+                ("b_w".into(), "b_w".into()),
+            ],
+        ))
+        .unwrap();
+    // Host 1's live `subB` arms the moved-in timer (its source `subA`
+    // counterpart was still armed). Host 0's consumed counterpart resolves to
+    // NO destination — bounded by its own `esp1` instance — and must NOT
+    // suppress host 1's timer.
+    assert_eq!(
+        armed_timer_hosts(&engine, inst),
+        sub_b1,
+        "host 1's subB carries the timer; host 0's consumed timer suppresses nothing"
+    );
+}
