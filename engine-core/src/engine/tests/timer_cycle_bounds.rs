@@ -8,6 +8,17 @@ fn parse(xml: &str) -> ProcessDefinition {
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
 }
 
+/// The armed timer's placement — host element instance, element id, kind —
+/// i.e. everything but its due time and remaining count.
+fn armed_placement(engine: &Engine) -> Vec<(Key, ElementId, state::TimerKind)> {
+    engine
+        .timers()
+        .iter()
+        .filter(|t| t.state == state::TimerState::Created)
+        .map(|t| (t.element_instance_key, t.element_id.clone(), t.kind.clone()))
+        .collect()
+}
+
 fn armed(engine: &Engine) -> Vec<u64> {
     let mut v: Vec<u64> = engine
         .timers()
@@ -212,6 +223,8 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
     assert_eq!(armed(&engine), vec![6_000]);
     engine.trigger_timers(6_000); // fire 1 of 3
     assert_eq!(armed(&engine), vec![11_000]);
+    let placement = armed_placement(&engine);
+    assert_eq!(placement.len(), 1);
 
     engine
         .apply_command(Command::set_variables(
@@ -239,10 +252,22 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
             HashMap::from([("cyc".to_string(), cycle)]),
         ))
         .unwrap();
-    engine
+    let resolved = engine
         .apply_command_at(Command::resolve_incident(incident_key), 13_000)
         .unwrap();
     assert!(engine.active_incidents().is_empty());
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::ElementActivating { .. } | Event::ElementActivated { .. }
+        )),
+        "resolution re-arms the timer only — it must not activate any element: {resolved:?}"
+    );
+    assert_eq!(
+        armed_placement(&engine),
+        placement,
+        "the re-armed timer keeps its host scope, element id and kind"
+    );
     assert_eq!(
         armed(&engine),
         vec![16_000],
@@ -289,6 +314,42 @@ fn event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
 </bpmn:definitions>"#,
     );
     assert_rearm_incident_resumes_remaining_count(def, "esp-feel");
+}
+
+/// #1583: an event sub-process hosted by an EMBEDDED sub-process — the re-arm
+/// incident's redrive must re-arm the timer in the sub-process scope (the host
+/// element instance), never retry the ESP's activation.
+#[test]
+fn embedded_event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
+    let def = parse(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="esp-embedded" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="host">
+      <bpmn:startEvent id="host_start" />
+      <bpmn:serviceTask id="work">
+        <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="host_end" />
+      <bpmn:sequenceFlow id="hf1" sourceRef="host_start" targetRef="work" />
+      <bpmn:sequenceFlow id="hf2" sourceRef="work" targetRef="host_end" />
+      <bpmn:subProcess id="esp" triggeredByEvent="true">
+        <bpmn:startEvent id="esp_start" isInterrupting="false">
+          <bpmn:timerEventDefinition><bpmn:timeCycle>=cyc</bpmn:timeCycle></bpmn:timerEventDefinition>
+        </bpmn:startEvent>
+        <bpmn:endEvent id="esp_end" />
+        <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+      </bpmn:subProcess>
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="host" />
+    <bpmn:sequenceFlow id="f2" sourceRef="host" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#,
+    );
+    assert_rearm_incident_resumes_remaining_count(def, "esp-embedded");
 }
 
 // ---------------------------------------------------------------------------
