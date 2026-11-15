@@ -41,6 +41,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::TerminateEndEvent => "terminateEndEvent",
+        ElementKind::ErrorEndEvent { .. } => "errorEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -118,6 +119,9 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
             error_code,
         } => {
             m.insert("attachedTo".into(), json!(attached_to));
+            m.insert("errorCode".into(), json!(error_code));
+        }
+        ElementKind::ErrorEndEvent { error_code } => {
             m.insert("errorCode".into(), json!(error_code));
         }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
@@ -673,6 +677,9 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
     let is_end_id = |id: &str| {
         def.element(id).is_some_and(|e| match &e.kind {
             ElementKind::EndEvent | ElementKind::TerminateEndEvent => true,
+            // An error end event is always terminal (#1592): it never has an
+            // outgoing flow (the parser rejects one).
+            ElementKind::ErrorEndEvent { .. } => true,
             // An escalation throw with no outgoing flow is an escalation *end*
             // event (terminal); one with outgoing is an intermediate throw and
             // is not a closing node.
@@ -862,17 +869,20 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
 
     let mut findings = Vec::new();
 
-    // No explicit end event. An escalation throw with no outgoing flow is an
-    // escalation *end* event, so it counts as a terminal node here — otherwise a
-    // process whose only terminal is an escalation end would draw a false
-    // `no-end-event` warning (#1173).
+    // No explicit end event. An error end event is always terminal (#1592), and
+    // an escalation throw with no outgoing flow is an escalation *end* event, so
+    // both count as terminal nodes here — otherwise a process whose only
+    // terminal is an error/escalation end would draw a false `no-end-event`
+    // warning (#1173).
     let end_events = ids
         .iter()
         .filter(|id| {
             let el = &def.elements[**id];
             matches!(
                 el.kind,
-                ElementKind::EndEvent | ElementKind::TerminateEndEvent
+                ElementKind::EndEvent
+                    | ElementKind::TerminateEndEvent
+                    | ElementKind::ErrorEndEvent { .. }
             ) || (matches!(el.kind, ElementKind::EscalationThrowEvent { .. })
                 && el.outgoing.is_empty())
         })
@@ -906,11 +916,16 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        // An escalation throw with no outgoing flow is an escalation *end* event
-        // (terminal), so — like a plain end event — it must not be flagged as a
-        // dead end (#1173).
-        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent)
-            || (matches!(kind, ElementKind::EscalationThrowEvent { .. }) && el.outgoing.is_empty());
+        // An error end event is always terminal (#1592), and an escalation throw
+        // with no outgoing flow is an escalation *end* event (terminal), so —
+        // like a plain end event — neither is flagged as a dead end (#1173).
+        let is_event_end = matches!(
+            kind,
+            ElementKind::EndEvent
+                | ElementKind::TerminateEndEvent
+                | ElementKind::ErrorEndEvent { .. }
+        ) || (matches!(kind, ElementKind::EscalationThrowEvent { .. })
+            && el.outgoing.is_empty());
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.
@@ -1919,15 +1934,28 @@ fn millis_to_iso8601(ms: u64) -> String {
 }
 
 /// Collect the definitions-level `<bpmn:error>` declarations a model needs: one per distinct
-/// error code carried by an error boundary event. Returns a code → synthesized-error-id map.
-fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
-    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+/// error code carried by an error boundary event, thrown by an error end event (#1592), or caught
+/// by an error event sub-process. Returns a code → synthesized-error-id map.
+///
+/// `id_fragment` is not injective (`A.B` and `A/B` both normalize to `A_B`), so ids are minted via
+/// [`alloc_unique_id`] in sorted code order against `reserved` — the same scheme as
+/// [`collect_escalations`] — so two distinct codes can never share one `<bpmn:error id>` (which
+/// would reparse both refs onto the last declaration's code and misroute the throw).
+fn collect_error_ids(
+    def: &ProcessDefinition,
+    reserved: &HashSet<String>,
+) -> BTreeMap<String, String> {
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
         match &el.kind {
             ElementKind::ErrorBoundaryEvent { error_code, .. } => {
-                codes
-                    .entry(error_code.clone())
-                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+                codes.insert(error_code.clone());
+            }
+            // An error end event with a code needs a definitions-level
+            // `<bpmn:error>` for its `errorRef` (an unnamed throw — empty code —
+            // carries no ref and needs no declaration).
+            ElementKind::ErrorEndEvent { error_code } if !error_code.is_empty() => {
+                codes.insert(error_code.clone());
             }
             // An event sub-process error trigger with a code needs a
             // definitions-level `<bpmn:error>` for its start event's `errorRef`.
@@ -1938,14 +1966,18 @@ fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
                     },
                 ..
             } => {
-                codes
-                    .entry(error_code.clone())
-                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+                codes.insert(error_code.clone());
             }
             _ => {}
         }
     }
-    codes
+    let mut used: HashSet<String> = reserved.clone();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for code in codes {
+        let id = alloc_unique_id(format!("Error_{}", id_fragment(&code)), &mut used);
+        out.insert(code, id);
+    }
+    out
 }
 
 /// A definitions-level `<bpmn:message>` declaration needed by a message start/catch/boundary.
@@ -2299,6 +2331,35 @@ fn emit_element(
                 out.push_str("      </bpmn:extensionElements>\n");
             }
             out.push_str("      <bpmn:terminateEventDefinition />\n");
+            out.push_str("    </bpmn:endEvent>\n");
+        }
+        ElementKind::ErrorEndEvent { error_code } => {
+            // An error end event (#1592) is always an `<endEvent>` (never an
+            // intermediate throw — it never carries an outgoing flow). An empty
+            // code emits no `errorRef` (an unnamed throw); a named one resolves
+            // to the synthesized `<bpmn:error>` declaration id.
+            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries (same io_stack attachment as a plain end) — emit the block
+            // before the event definition, mirroring the plain/terminate ends.
+            if has_shared_extensions(el) {
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                emit_properties(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+            }
+            if error_code.is_empty() {
+                out.push_str("      <bpmn:errorEventDefinition/>\n");
+            } else {
+                let err_id = errors
+                    .get(error_code)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Error_{}", id_fragment(error_code)));
+                out.push_str(&format!(
+                    "      <bpmn:errorEventDefinition errorRef=\"{}\"/>\n",
+                    xml_escape(&err_id)
+                ));
+            }
             out.push_str("    </bpmn:endEvent>\n");
         }
         ElementKind::IntermediateThrowEvent => {
@@ -3446,7 +3507,7 @@ fn serialize_definition(
     if let Some(d) = preserve {
         reserved_ids.extend(d.di_ids.iter().cloned());
     }
-    let errors = collect_error_ids(def);
+    let errors = collect_error_ids(def, &reserved_ids);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
     let escalations = collect_escalations(def, &reserved_ids);
@@ -6019,6 +6080,51 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     }
 
     #[test]
+    fn definition_to_xml_round_trips_an_error_end_event() {
+        // An error end event (#1592) must round-trip: the serializer emits an
+        // `<endEvent>` carrying an `errorEventDefinition` whose `errorRef`
+        // resolves to a synthesized `<bpmn:error>` declaration, and the re-parse
+        // reproduces the exact structure (including the terminal flavour — an
+        // error end has no outgoing flow).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Err")
+            .start_event("Start")
+            .service_task("Charge", "charge-card")
+            .error_end_event("Failed", "CARD_DECLINED")
+            .connect("Start", "Charge")
+            .connect("Charge", "Failed")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(xml.contains("<bpmn:error "), "emits an error declaration");
+        assert!(
+            xml.contains("errorEventDefinition"),
+            "emits the error event definition"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_unnamed_error_end_event() {
+        // An error end event with no code (an unnamed throw) emits a bare
+        // `errorEventDefinition` with no `errorRef` and no `<bpmn:error>`
+        // declaration, and round-trips.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Err")
+            .start_event("Start")
+            .error_end_event("Failed", "")
+            .connect("Start", "Failed")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:errorEventDefinition/>"),
+            "emits a bare error event definition: {xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_signal_events() {
         // A signal intermediate catch and an interrupting signal boundary on a task must
         // round-trip: the serializer synthesizes the <bpmn:signal> declaration + signalRef,
@@ -6091,6 +6197,55 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn collect_error_ids_assigns_distinct_ids_to_colliding_codes() {
+        // `A.B` and `A/B` both normalize to `Error_A_B`; each code must still get
+        // its own `<bpmn:error>` id, or both throws reparse onto one code (#1592).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("CollideErr")
+            .start_event("Start")
+            .parallel_gateway("Split")
+            .error_end_event("Throw1", "A.B")
+            .error_end_event("Throw2", "A/B")
+            .connect("Start", "Split")
+            .connect("Split", "Throw1")
+            .connect("Split", "Throw2")
+            .build()
+            .unwrap();
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_eq!(errors.len(), 2, "both codes get a declaration");
+        let ids: std::collections::HashSet<&String> = errors.values().collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "colliding codes need distinct ids: {errors:?}"
+        );
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for (id, code) in [("Throw1", "A.B"), ("Throw2", "A/B")] {
+            match &reparsed[0].elements[id].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(error_code, code),
+                other => panic!("{id}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collect_error_ids_reserves_model_ids() {
+        // A model element literally named `Error_OOPS` must not be shadowed.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("ReserveErr")
+            .start_event("Error_OOPS")
+            .error_end_event("Throw", "OOPS")
+            .connect("Error_OOPS", "Throw")
+            .build()
+            .unwrap();
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_ne!(errors["OOPS"], "Error_OOPS");
+        let xml = definition_to_xml(&def);
+        parse_bpmn(&xml).expect("serialized model re-parses");
     }
 
     #[test]

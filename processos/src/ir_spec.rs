@@ -88,6 +88,19 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "errorEndEvent",
+        doc: "Error end event. Throws `errorCode` on completion, caught exactly like a \
+              job-thrown error (error boundary / error event sub-process, exact code beats \
+              catch-all); an uncaught error raises an UNHANDLED_ERROR incident.",
+        attrs: &[AttrSpec {
+            key: "errorCode",
+            required: false,
+            ty: AttrType::Str,
+            doc: "The BPMN error code thrown (empty throws an unnamed error, matched by \
+                  catch-alls only).",
+        }],
+    },
+    KindSpec {
         keyword: "serviceTask",
         doc: "Job-based task. Creates a job of `jobType` and rests until completion. \
               Optional agent metadata does not change the job-worker lifecycle.",
@@ -949,6 +962,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         StartEvent => "startEvent",
         EndEvent => "endEvent",
         TerminateEndEvent => "terminateEndEvent",
+        ErrorEndEvent { .. } => "errorEndEvent",
         ServiceTask { .. } => "serviceTask",
         BusinessRuleTask { .. } => "businessRuleTask",
         UserTask(_) => "userTask",
@@ -993,6 +1007,12 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         ("startEvent", ElementKind::StartEvent),
         ("endEvent", ElementKind::EndEvent),
         ("terminateEndEvent", ElementKind::TerminateEndEvent),
+        (
+            "errorEndEvent",
+            ElementKind::ErrorEndEvent {
+                error_code: "OUT_OF_STOCK".into(),
+            },
+        ),
         (
             "serviceTask",
             ElementKind::ServiceTask {

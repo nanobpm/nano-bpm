@@ -395,6 +395,7 @@ fn callactivity_variant_witness_is_exhaustive() {
             StartEvent => "startEvent",
             EndEvent => "endEvent",
             TerminateEndEvent => "terminateEndEvent",
+            ErrorEndEvent { .. } => "errorEndEvent",
             ServiceTask { .. } => "serviceTask",
             BusinessRuleTask { .. } => "businessRuleTask",
             UserTask(_) => "userTask",

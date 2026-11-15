@@ -14,9 +14,13 @@
 //! ## Supported subset
 //!
 //! * `process` (one or more per file) with its `id`.
-//! * Flow nodes: `startEvent`, `endEvent` (plain none end, or — with a nested
+//! * Flow nodes: `startEvent`, `endEvent` (plain none end; with a nested
 //!   `terminateEventDefinition` — a terminate end that kills the remaining
-//!   tokens in its enclosing scope), `task`/`manualTask` (abstract
+//!   tokens in its enclosing scope; or with a nested `errorEventDefinition`
+//!   `errorRef` — an **error end event** that throws the referenced error code
+//!   on completion, caught exactly like a job-thrown error by a matching error
+//!   boundary or error event sub-process, else an `UNHANDLED_ERROR` incident,
+//!   #1592), `task`/`manualTask` (abstract
 //!   pass-through), `serviceTask`, `sendTask` (a job-based service task — its
 //!   throwing cousin of `receiveTask`; a message `intermediateThrowEvent` /
 //!   `endEvent` carrying a `zeebe:taskDefinition` is the same job worker),

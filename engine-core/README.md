@@ -315,9 +315,20 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   precedence: an exact code beats a catch-all, and an event sub-process beats
   a boundary event of equal match; an uncaught error raises an
   `UNHANDLED_ERROR` incident. Event payload variables (message / signal /
-  error) propagate from the host scope. Error *end* events do not throw yet
-  (#1592). `ProcessDefinition::event_subprocesses_in_scope` enumerates the
+  error) propagate from the host scope.
+  `ProcessDefinition::event_subprocesses_in_scope` enumerates the
   event sub-processes directly contained in a scope.
+- An **error end event** (`<endEvent>` with an `<errorEventDefinition>`, #1592)
+  throws the referenced BPMN error on completion, resolved to a catch exactly
+  like a job-thrown error (`ThrowJobError`): the shared catch walk
+  (`Engine::find_error_catch`, Zeebe `CatchEventAnalyzer` parity) walks outward
+  from the throwing element instance through its enclosing scopes — an exact
+  code beats a catch-all, an error event sub-process beats an error boundary of
+  equal match. A catch interrupts the caught activity (the throwing token is
+  consumed by the throw) and routes the error-handling path; an uncaught error
+  raises an `UNHANDLED_ERROR` incident on the end event's element instance and
+  the token parks there (its `ElementCompleted` is not journaled), re-driven on
+  resolution — the same lifecycle as an unhandled job error.
 - A **call activity** invokes another deployed process as a distinct **child
   process instance** of its `calledElement` / `zeebe:calledElement processId`
   (Zeebe/C8 parity), linked back to the caller via `parentProcessInstanceKey` /
@@ -390,7 +401,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > sub-process — an interrupting one terminates the whole inner scope and routes to
 > its handler), and **terminate end events** (an `endEvent` with a
 > `terminateEventDefinition` that kills the remaining tokens in its enclosing
-> scope, then completes that scope), and **escalation events** (an
+> scope, then completes that scope), and **error end events** (an `endEvent`
+> with an `errorEventDefinition` that throws the referenced BPMN error on
+> completion — caught by a matching error boundary or error event sub-process
+> exactly like a job-thrown error, else an `UNHANDLED_ERROR` incident), and
+> **escalation events** (an
 > `escalationEventDefinition` on an intermediate throw event or an escalation
 > **end event** raises an escalation that propagates up the scope hierarchy; an
 > **escalation boundary event** on a sub-process whose `escalationCode` matches —

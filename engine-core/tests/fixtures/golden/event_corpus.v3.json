@@ -534,10 +534,78 @@
     }
   },
   {
+    "DeploymentCreated": {
+      "deployment_key": 7
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 7,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "err_end": {
+            "end_listeners": [],
+            "id": "err_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ErrorEndEvent": {
+                "error_code": "E1"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "err_end"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "error_end",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 8,
+      "version": 1
+    }
+  },
+  {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000001,
-      "instance_key": 7,
+      "instance_key": 9,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -557,53 +625,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 8,
-      "instance_key": 7,
+      "element_instance_key": 10,
+      "instance_key": 9,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 8,
-      "instance_key": 7,
+      "element_instance_key": 10,
+      "instance_key": 9,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 8,
-      "instance_key": 7
+      "element_instance_key": 10,
+      "instance_key": 9
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 8,
-      "instance_key": 7
+      "element_instance_key": 10,
+      "instance_key": 9
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 7,
+      "instance_key": 9,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 9,
-      "instance_key": 7,
+      "element_instance_key": 11,
+      "instance_key": 9,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 9,
-      "instance_key": 7,
+      "element_instance_key": 11,
+      "instance_key": 9,
       "scope": 0
     }
   },
@@ -611,9 +679,9 @@
     "JobCreated": {
       "created_at": 1700000000001,
       "element_id": "charge",
-      "element_instance_key": 9,
-      "instance_key": 7,
-      "job_key": 10,
+      "element_instance_key": 11,
+      "instance_key": 9,
+      "job_key": 12,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -624,16 +692,16 @@
       "activated_at": 1700000000002,
       "deadline": 1700000030002,
       "durable": true,
-      "instance_key": 7,
-      "job_key": 10,
+      "instance_key": 9,
+      "job_key": 12,
       "worker": "worker-1"
     }
   },
   {
     "JobFailed": {
       "error_message": "transient: upstream 503",
-      "instance_key": 7,
-      "job_key": 10,
+      "instance_key": 9,
+      "job_key": 12,
       "retries": 2,
       "worker": "worker-1"
     }
@@ -643,15 +711,15 @@
       "activated_at": 1700000000002,
       "deadline": 1700000030002,
       "durable": true,
-      "instance_key": 7,
-      "job_key": 10,
+      "instance_key": 9,
+      "job_key": 12,
       "worker": "worker-1"
     }
   },
   {
     "ProcessInstanceBusinessIdAssigned": {
       "business_id": "order-A",
-      "instance_key": 7
+      "instance_key": 9
     }
   },
   {
@@ -659,15 +727,15 @@
       "completed_at": 1700000000003,
       "created_at": 1700000000001,
       "deadline": 1700000030002,
-      "instance_key": 7,
-      "job_key": 10,
+      "instance_key": 9,
+      "job_key": 12,
       "job_type": "payment",
       "worker": "worker-1"
     }
   },
   {
     "VariablesUpdated": {
-      "instance_key": 7,
+      "instance_key": 9,
       "variables": {
         "approved": {
           "Bool": true
@@ -678,64 +746,64 @@
   {
     "ElementCompleting": {
       "element_id": "charge",
-      "element_instance_key": 9,
-      "instance_key": 7
+      "element_instance_key": 11,
+      "instance_key": 9
     }
   },
   {
     "ElementCompleted": {
       "element_id": "charge",
-      "element_instance_key": 9,
-      "instance_key": 7
+      "element_instance_key": 11,
+      "instance_key": 9
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "charge",
-      "instance_key": 7,
+      "instance_key": 9,
       "to": "end"
     }
   },
   {
     "ElementActivating": {
       "element_id": "end",
-      "element_instance_key": 11,
-      "instance_key": 7,
+      "element_instance_key": 13,
+      "instance_key": 9,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "end",
-      "element_instance_key": 11,
-      "instance_key": 7,
+      "element_instance_key": 13,
+      "instance_key": 9,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "end",
-      "element_instance_key": 11,
-      "instance_key": 7
+      "element_instance_key": 13,
+      "instance_key": 9
     }
   },
   {
     "ElementCompleted": {
       "element_id": "end",
-      "element_instance_key": 11,
-      "instance_key": 7
+      "element_instance_key": 13,
+      "instance_key": 9
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 7
+      "instance_key": 9
     }
   },
   {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000004,
-      "instance_key": 12,
+      "instance_key": 14,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -752,53 +820,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 13,
-      "instance_key": 12,
+      "element_instance_key": 15,
+      "instance_key": 14,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 13,
-      "instance_key": 12,
+      "element_instance_key": 15,
+      "instance_key": 14,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 13,
-      "instance_key": 12
+      "element_instance_key": 15,
+      "instance_key": 14
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 13,
-      "instance_key": 12
+      "element_instance_key": 15,
+      "instance_key": 14
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 12,
+      "instance_key": 14,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 14,
-      "instance_key": 12,
+      "element_instance_key": 16,
+      "instance_key": 14,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 14,
-      "instance_key": 12,
+      "element_instance_key": 16,
+      "instance_key": 14,
       "scope": 0
     }
   },
@@ -806,9 +874,9 @@
     "JobCreated": {
       "created_at": 1700000000004,
       "element_id": "charge",
-      "element_instance_key": 14,
-      "instance_key": 12,
-      "job_key": 15,
+      "element_instance_key": 16,
+      "instance_key": 14,
+      "job_key": 17,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -817,28 +885,28 @@
   {
     "ProcessInstanceSuspended": {
       "at": 1700000000005,
-      "instance_key": 12
+      "instance_key": 14
     }
   },
   {
     "ProcessInstanceResumed": {
-      "instance_key": 12
+      "instance_key": 14
     }
   },
   {
     "ProcessInstanceSuspended": {
       "at": 1700000000007,
-      "instance_key": 12
+      "instance_key": 14
     }
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 16
+      "deployment_key": 18
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 16,
+      "deployment_key": 18,
       "process": {
         "adhoc": [],
         "elements": {
@@ -944,18 +1012,18 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 17,
+      "process_definition_key": 19,
       "version": 1
     }
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 18
+      "deployment_key": 20
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 18,
+      "deployment_key": 20,
       "process": {
         "adhoc": [],
         "elements": {
@@ -1092,7 +1160,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 19,
+      "process_definition_key": 21,
       "version": 1
     }
   },
@@ -1100,10 +1168,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000009,
-      "instance_key": 20,
+      "instance_key": 22,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 17,
+      "process_definition_key": 19,
       "process_id": "dup",
       "tags": [],
       "variables": {},
@@ -1113,74 +1181,74 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 21,
-      "instance_key": 20,
+      "element_instance_key": 23,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 21,
-      "instance_key": 20,
+      "element_instance_key": 23,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 21,
-      "instance_key": 20
+      "element_instance_key": 23,
+      "instance_key": 22
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 21,
-      "instance_key": 20
+      "element_instance_key": 23,
+      "instance_key": 22
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 20,
+      "instance_key": 22,
       "to": "fork"
     }
   },
   {
     "ElementActivating": {
       "element_id": "fork",
-      "element_instance_key": 22,
-      "instance_key": 20,
+      "element_instance_key": 24,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "fork",
-      "element_instance_key": 22,
-      "instance_key": 20,
+      "element_instance_key": 24,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "fork",
-      "element_instance_key": 22,
-      "instance_key": 20
+      "element_instance_key": 24,
+      "instance_key": 22
     }
   },
   {
     "ElementCompleted": {
       "element_id": "fork",
-      "element_instance_key": 22,
-      "instance_key": 20
+      "element_instance_key": 24,
+      "instance_key": 22
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "fork",
-      "instance_key": 20,
+      "instance_key": 22,
       "to": "join"
     }
   },
@@ -1191,14 +1259,14 @@
         "from": "fork",
         "ordinal": 1
       },
-      "instance_key": 20,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "fork",
-      "instance_key": 20,
+      "instance_key": 22,
       "to": "join"
     }
   },
@@ -1209,97 +1277,97 @@
         "from": "fork",
         "ordinal": 0
       },
-      "instance_key": 20,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementActivating": {
       "element_id": "join",
-      "element_instance_key": 23,
-      "instance_key": 20,
+      "element_instance_key": 25,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "join",
-      "element_instance_key": 23,
-      "instance_key": 20,
+      "element_instance_key": 25,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ParallelJoinFired": {
       "element_id": "join",
-      "instance_key": 20,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "join",
-      "element_instance_key": 23,
-      "instance_key": 20
+      "element_instance_key": 25,
+      "instance_key": 22
     }
   },
   {
     "ElementCompleted": {
       "element_id": "join",
-      "element_instance_key": 23,
-      "instance_key": 20
+      "element_instance_key": 25,
+      "instance_key": 22
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "join",
-      "instance_key": 20,
+      "instance_key": 22,
       "to": "e"
     }
   },
   {
     "ElementActivating": {
       "element_id": "e",
-      "element_instance_key": 24,
-      "instance_key": 20,
+      "element_instance_key": 26,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "e",
-      "element_instance_key": 24,
-      "instance_key": 20,
+      "element_instance_key": 26,
+      "instance_key": 22,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "e",
-      "element_instance_key": 24,
-      "instance_key": 20
+      "element_instance_key": 26,
+      "instance_key": 22
     }
   },
   {
     "ElementCompleted": {
       "element_id": "e",
-      "element_instance_key": 24,
-      "instance_key": 20
+      "element_instance_key": 26,
+      "instance_key": 22
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 20
+      "instance_key": 22
     }
   },
   {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000010,
-      "instance_key": 25,
+      "instance_key": 27,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 19,
+      "process_definition_key": 21,
       "process_id": "sync",
       "tags": [],
       "variables": {},
@@ -1309,74 +1377,74 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 26,
-      "instance_key": 25,
+      "element_instance_key": 28,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 26,
-      "instance_key": 25,
+      "element_instance_key": 28,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 26,
-      "instance_key": 25
+      "element_instance_key": 28,
+      "instance_key": 27
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 26,
-      "instance_key": 25
+      "element_instance_key": 28,
+      "instance_key": 27
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 25,
+      "instance_key": 27,
       "to": "fork"
     }
   },
   {
     "ElementActivating": {
       "element_id": "fork",
-      "element_instance_key": 27,
-      "instance_key": 25,
+      "element_instance_key": 29,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "fork",
-      "element_instance_key": 27,
-      "instance_key": 25,
+      "element_instance_key": 29,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "fork",
-      "element_instance_key": 27,
-      "instance_key": 25
+      "element_instance_key": 29,
+      "instance_key": 27
     }
   },
   {
     "ElementCompleted": {
       "element_id": "fork",
-      "element_instance_key": 27,
-      "instance_key": 25
+      "element_instance_key": 29,
+      "instance_key": 27
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "fork",
-      "instance_key": 25,
+      "instance_key": 27,
       "to": "join"
     }
   },
@@ -1387,38 +1455,38 @@
         "from": "fork",
         "ordinal": 0
       },
-      "instance_key": 25,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "fork",
-      "instance_key": 25,
+      "instance_key": 27,
       "to": "t"
     }
   },
   {
     "ParallelJoinOpened": {
       "element_id": "join",
-      "element_instance_key": 28,
-      "instance_key": 25,
+      "element_instance_key": 30,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementActivating": {
       "element_id": "t",
-      "element_instance_key": 29,
-      "instance_key": 25,
+      "element_instance_key": 31,
+      "instance_key": 27,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "t",
-      "element_instance_key": 29,
-      "instance_key": 25,
+      "element_instance_key": 31,
+      "instance_key": 27,
       "scope": 0
     }
   },
@@ -1426,9 +1494,9 @@
     "JobCreated": {
       "created_at": 1700000000010,
       "element_id": "t",
-      "element_instance_key": 29,
-      "instance_key": 25,
-      "job_key": 30,
+      "element_instance_key": 31,
+      "instance_key": 27,
+      "job_key": 32,
       "job_type": "sync-task",
       "priority": 50,
       "retries": 3
@@ -1436,12 +1504,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 31
+      "deployment_key": 33
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 31,
+      "deployment_key": 33,
       "process": {
         "adhoc": [],
         "elements": {
@@ -1595,7 +1663,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 32,
+      "process_definition_key": 34,
       "version": 1
     }
   },
@@ -1603,10 +1671,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000011,
-      "instance_key": 33,
+      "instance_key": 35,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 32,
+      "process_definition_key": 34,
       "process_id": "trip",
       "tags": [],
       "variables": {},
@@ -1616,76 +1684,76 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 34,
-      "instance_key": 33,
+      "element_instance_key": 36,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 34,
-      "instance_key": 33,
+      "element_instance_key": 36,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 34,
-      "instance_key": 33
+      "element_instance_key": 36,
+      "instance_key": 35
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 34,
-      "instance_key": 33
+      "element_instance_key": 36,
+      "instance_key": 35
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 33,
+      "instance_key": 35,
       "to": "book"
     }
   },
   {
     "ElementActivating": {
       "element_id": "book",
-      "element_instance_key": 35,
-      "instance_key": 33,
+      "element_instance_key": 37,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "book",
-      "element_instance_key": 35,
-      "instance_key": 33,
+      "element_instance_key": 37,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book",
-      "element_instance_key": 35,
-      "instance_key": 33
+      "element_instance_key": 37,
+      "instance_key": 35
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book",
-      "element_instance_key": 35,
-      "instance_key": 33
+      "element_instance_key": 37,
+      "instance_key": 35
     }
   },
   {
     "CompensationSubscriptionCreated": {
       "element_id": "book",
-      "element_instance_key": 35,
+      "element_instance_key": 37,
       "handler": "cancel",
-      "instance_key": 33,
+      "instance_key": 35,
       "scope": 0,
       "scope_subscription": false
     }
@@ -1693,33 +1761,33 @@
   {
     "SequenceFlowTaken": {
       "from": "book",
-      "instance_key": 33,
+      "instance_key": 35,
       "to": "throw"
     }
   },
   {
     "ElementActivating": {
       "element_id": "throw",
-      "element_instance_key": 36,
-      "instance_key": 33,
+      "element_instance_key": 38,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "throw",
-      "element_instance_key": 36,
-      "instance_key": 33,
+      "element_instance_key": 38,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "CompensationTriggered": {
       "consumed": [
-        35
+        37
       ],
       "handler_instance_keys": [
-        38
+        40
       ],
       "handler_scopes": [
         0
@@ -1727,71 +1795,71 @@
       "handlers": [
         "cancel"
       ],
-      "instance_key": 33,
+      "instance_key": 35,
       "scope": 0,
       "scope_subscription_parents": [],
       "scope_subscriptions": [],
       "throw_element_id": "throw",
-      "throw_element_instance_key": 36
+      "throw_element_instance_key": 38
     }
   },
   {
     "ElementActivating": {
       "element_id": "book-comp",
-      "element_instance_key": 37,
-      "instance_key": 33,
+      "element_instance_key": 39,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "book-comp",
-      "element_instance_key": 37,
-      "instance_key": 33,
+      "element_instance_key": 39,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book-comp",
-      "element_instance_key": 37,
-      "instance_key": 33
+      "element_instance_key": 39,
+      "instance_key": 35
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book-comp",
-      "element_instance_key": 37,
-      "instance_key": 33
+      "element_instance_key": 39,
+      "instance_key": 35
     }
   },
   {
     "ElementActivating": {
       "element_id": "cancel",
-      "element_instance_key": 38,
-      "instance_key": 33,
+      "element_instance_key": 40,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "cancel",
-      "element_instance_key": 38,
-      "instance_key": 33,
+      "element_instance_key": 40,
+      "instance_key": 35,
       "scope": 0
     }
   },
   {
     "VariableScopeCreated": {
-      "instance_key": 33,
+      "instance_key": 35,
       "parent_scope_key": 0,
-      "scope_key": 38
+      "scope_key": 40
     }
   },
   {
     "ScopedVariablesUpdated": {
-      "instance_key": 33,
-      "scope_key": 38,
+      "instance_key": 35,
+      "scope_key": 40,
       "variables": {
         "mapped": "Null"
       }
@@ -1801,9 +1869,9 @@
     "JobCreated": {
       "created_at": 1700000000011,
       "element_id": "cancel",
-      "element_instance_key": 38,
-      "instance_key": 33,
-      "job_key": 39,
+      "element_instance_key": 40,
+      "instance_key": 35,
+      "job_key": 41,
       "job_type": "cancel-job",
       "priority": 50,
       "retries": 3
@@ -1811,12 +1879,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 40
+      "deployment_key": 42
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 40,
+      "deployment_key": 42,
       "process": {
         "adhoc": [],
         "elements": {
@@ -2040,7 +2108,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 41,
+      "process_definition_key": 43,
       "version": 1
     }
   },
@@ -2048,10 +2116,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000013,
-      "instance_key": 42,
+      "instance_key": 44,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 41,
+      "process_definition_key": 43,
       "process_id": "whole",
       "tags": [],
       "variables": {},
@@ -2061,197 +2129,197 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 43,
-      "instance_key": 42,
+      "element_instance_key": 45,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 43,
-      "instance_key": 42,
+      "element_instance_key": 45,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 43,
-      "instance_key": 42
+      "element_instance_key": 45,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 43,
-      "instance_key": 42
+      "element_instance_key": 45,
+      "instance_key": 44
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 42,
+      "instance_key": 44,
       "to": "sub"
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub",
-      "element_instance_key": 44,
-      "instance_key": 42,
+      "element_instance_key": 46,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub",
-      "element_instance_key": 44,
-      "instance_key": 42,
+      "element_instance_key": 46,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "VariableScopeCreated": {
-      "instance_key": 42,
+      "instance_key": 44,
       "parent_scope_key": 0,
-      "scope_key": 44
+      "scope_key": 46
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub_start",
-      "element_instance_key": 45,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 47,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub_start",
-      "element_instance_key": 45,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 47,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub_start",
-      "element_instance_key": 45,
-      "instance_key": 42
+      "element_instance_key": 47,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub_start",
-      "element_instance_key": 45,
-      "instance_key": 42
+      "element_instance_key": 47,
+      "instance_key": 44
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "sub_start",
-      "instance_key": 42,
+      "instance_key": 44,
       "to": "book"
     }
   },
   {
     "ElementActivating": {
       "element_id": "book",
-      "element_instance_key": 46,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 48,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementActivated": {
       "element_id": "book",
-      "element_instance_key": 46,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 48,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book",
-      "element_instance_key": 46,
-      "instance_key": 42
+      "element_instance_key": 48,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book",
-      "element_instance_key": 46,
-      "instance_key": 42
+      "element_instance_key": 48,
+      "instance_key": 44
     }
   },
   {
     "CompensationSubscriptionCreated": {
       "element_id": "book",
-      "element_instance_key": 46,
+      "element_instance_key": 48,
       "handler": "cancel",
-      "instance_key": 42,
-      "scope": 44,
+      "instance_key": 44,
+      "scope": 46,
       "scope_subscription": false
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "book",
-      "instance_key": 42,
+      "instance_key": 44,
       "to": "sub_end"
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub_end",
-      "element_instance_key": 47,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 49,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub_end",
-      "element_instance_key": 47,
-      "instance_key": 42,
-      "scope": 44
+      "element_instance_key": 49,
+      "instance_key": 44,
+      "scope": 46
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub_end",
-      "element_instance_key": 47,
-      "instance_key": 42
+      "element_instance_key": 49,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub_end",
-      "element_instance_key": 47,
-      "instance_key": 42
+      "element_instance_key": 49,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub",
-      "element_instance_key": 44,
-      "instance_key": 42
+      "element_instance_key": 46,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub",
-      "element_instance_key": 44,
-      "instance_key": 42
+      "element_instance_key": 46,
+      "instance_key": 44
     }
   },
   {
     "CompensationSubscriptionCreated": {
       "element_id": "sub",
-      "element_instance_key": 44,
+      "element_instance_key": 46,
       "handler": "",
-      "instance_key": 42,
+      "instance_key": 44,
       "scope": 0,
       "scope_subscription": true
     }
@@ -2259,110 +2327,110 @@
   {
     "SequenceFlowTaken": {
       "from": "sub",
-      "instance_key": 42,
+      "instance_key": 44,
       "to": "throw"
     }
   },
   {
     "ElementActivating": {
       "element_id": "throw",
-      "element_instance_key": 48,
-      "instance_key": 42,
+      "element_instance_key": 50,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "throw",
-      "element_instance_key": 48,
-      "instance_key": 42,
+      "element_instance_key": 50,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "CompensationTriggered": {
       "consumed": [
-        44,
-        46
+        46,
+        48
       ],
       "handler_instance_keys": [
-        50
+        52
       ],
       "handler_scopes": [
-        44
+        46
       ],
       "handlers": [
         "cancel"
       ],
-      "instance_key": 42,
+      "instance_key": 44,
       "scope": 0,
       "scope_subscription_parents": [
         0
       ],
       "scope_subscriptions": [
-        44
+        46
       ],
       "throw_element_id": "throw",
-      "throw_element_instance_key": 48
+      "throw_element_instance_key": 50
     }
   },
   {
     "ElementActivating": {
       "element_id": "book-comp",
-      "element_instance_key": 49,
-      "instance_key": 42,
+      "element_instance_key": 51,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "book-comp",
-      "element_instance_key": 49,
-      "instance_key": 42,
+      "element_instance_key": 51,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book-comp",
-      "element_instance_key": 49,
-      "instance_key": 42
+      "element_instance_key": 51,
+      "instance_key": 44
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book-comp",
-      "element_instance_key": 49,
-      "instance_key": 42
+      "element_instance_key": 51,
+      "instance_key": 44
     }
   },
   {
     "ElementActivating": {
       "element_id": "cancel",
-      "element_instance_key": 50,
-      "instance_key": 42,
+      "element_instance_key": 52,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "cancel",
-      "element_instance_key": 50,
-      "instance_key": 42,
+      "element_instance_key": 52,
+      "instance_key": 44,
       "scope": 0
     }
   },
   {
     "VariableScopeCreated": {
-      "instance_key": 42,
+      "instance_key": 44,
       "parent_scope_key": 0,
-      "scope_key": 50
+      "scope_key": 52
     }
   },
   {
     "ScopedVariablesUpdated": {
-      "instance_key": 42,
-      "scope_key": 50,
+      "instance_key": 44,
+      "scope_key": 52,
       "variables": {
         "mapped": "Null"
       }
@@ -2372,9 +2440,9 @@
     "JobCreated": {
       "created_at": 1700000000013,
       "element_id": "cancel",
-      "element_instance_key": 50,
-      "instance_key": 42,
-      "job_key": 51,
+      "element_instance_key": 52,
+      "instance_key": 44,
+      "job_key": 53,
       "job_type": "whole-cancel-job",
       "priority": 50,
       "retries": 3
@@ -2382,12 +2450,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 52
+      "deployment_key": 54
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 52,
+      "deployment_key": 54,
       "process": {
         "adhoc": [],
         "elements": {
@@ -2599,7 +2667,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 53,
+      "process_definition_key": 55,
       "version": 1
     }
   },
@@ -2607,10 +2675,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000015,
-      "instance_key": 54,
+      "instance_key": 56,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 53,
+      "process_definition_key": 55,
       "process_id": "whole-done",
       "tags": [],
       "variables": {},
@@ -2620,197 +2688,197 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 55,
-      "instance_key": 54,
+      "element_instance_key": 57,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 55,
-      "instance_key": 54,
+      "element_instance_key": 57,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 55,
-      "instance_key": 54
+      "element_instance_key": 57,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 55,
-      "instance_key": 54
+      "element_instance_key": 57,
+      "instance_key": 56
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 54,
+      "instance_key": 56,
       "to": "sub"
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub",
-      "element_instance_key": 56,
-      "instance_key": 54,
+      "element_instance_key": 58,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub",
-      "element_instance_key": 56,
-      "instance_key": 54,
+      "element_instance_key": 58,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "VariableScopeCreated": {
-      "instance_key": 54,
+      "instance_key": 56,
       "parent_scope_key": 0,
-      "scope_key": 56
+      "scope_key": 58
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub_start",
-      "element_instance_key": 57,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 59,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub_start",
-      "element_instance_key": 57,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 59,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub_start",
-      "element_instance_key": 57,
-      "instance_key": 54
+      "element_instance_key": 59,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub_start",
-      "element_instance_key": 57,
-      "instance_key": 54
+      "element_instance_key": 59,
+      "instance_key": 56
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "sub_start",
-      "instance_key": 54,
+      "instance_key": 56,
       "to": "book"
     }
   },
   {
     "ElementActivating": {
       "element_id": "book",
-      "element_instance_key": 58,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 60,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementActivated": {
       "element_id": "book",
-      "element_instance_key": 58,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 60,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book",
-      "element_instance_key": 58,
-      "instance_key": 54
+      "element_instance_key": 60,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book",
-      "element_instance_key": 58,
-      "instance_key": 54
+      "element_instance_key": 60,
+      "instance_key": 56
     }
   },
   {
     "CompensationSubscriptionCreated": {
       "element_id": "book",
-      "element_instance_key": 58,
+      "element_instance_key": 60,
       "handler": "cancel",
-      "instance_key": 54,
-      "scope": 56,
+      "instance_key": 56,
+      "scope": 58,
       "scope_subscription": false
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "book",
-      "instance_key": 54,
+      "instance_key": 56,
       "to": "sub_end"
     }
   },
   {
     "ElementActivating": {
       "element_id": "sub_end",
-      "element_instance_key": 59,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 61,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementActivated": {
       "element_id": "sub_end",
-      "element_instance_key": 59,
-      "instance_key": 54,
-      "scope": 56
+      "element_instance_key": 61,
+      "instance_key": 56,
+      "scope": 58
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub_end",
-      "element_instance_key": 59,
-      "instance_key": 54
+      "element_instance_key": 61,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub_end",
-      "element_instance_key": 59,
-      "instance_key": 54
+      "element_instance_key": 61,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleting": {
       "element_id": "sub",
-      "element_instance_key": 56,
-      "instance_key": 54
+      "element_instance_key": 58,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "sub",
-      "element_instance_key": 56,
-      "instance_key": 54
+      "element_instance_key": 58,
+      "instance_key": 56
     }
   },
   {
     "CompensationSubscriptionCreated": {
       "element_id": "sub",
-      "element_instance_key": 56,
+      "element_instance_key": 58,
       "handler": "",
-      "instance_key": 54,
+      "instance_key": 56,
       "scope": 0,
       "scope_subscription": true
     }
@@ -2818,193 +2886,193 @@
   {
     "SequenceFlowTaken": {
       "from": "sub",
-      "instance_key": 54,
+      "instance_key": 56,
       "to": "throw"
     }
   },
   {
     "ElementActivating": {
       "element_id": "throw",
-      "element_instance_key": 60,
-      "instance_key": 54,
+      "element_instance_key": 62,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "throw",
-      "element_instance_key": 60,
-      "instance_key": 54,
+      "element_instance_key": 62,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "CompensationTriggered": {
       "consumed": [
-        56,
-        58
+        58,
+        60
       ],
       "handler_instance_keys": [
-        62
+        64
       ],
       "handler_scopes": [
-        56
+        58
       ],
       "handlers": [
         "cancel"
       ],
-      "instance_key": 54,
+      "instance_key": 56,
       "scope": 0,
       "scope_subscription_parents": [
         0
       ],
       "scope_subscriptions": [
-        56
+        58
       ],
       "throw_element_id": "throw",
-      "throw_element_instance_key": 60
+      "throw_element_instance_key": 62
     }
   },
   {
     "ElementActivating": {
       "element_id": "book-comp",
-      "element_instance_key": 61,
-      "instance_key": 54,
+      "element_instance_key": 63,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "book-comp",
-      "element_instance_key": 61,
-      "instance_key": 54,
+      "element_instance_key": 63,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "book-comp",
-      "element_instance_key": 61,
-      "instance_key": 54
+      "element_instance_key": 63,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "book-comp",
-      "element_instance_key": 61,
-      "instance_key": 54
+      "element_instance_key": 63,
+      "instance_key": 56
     }
   },
   {
     "ElementActivating": {
       "element_id": "cancel",
-      "element_instance_key": 62,
-      "instance_key": 54,
+      "element_instance_key": 64,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "cancel",
-      "element_instance_key": 62,
-      "instance_key": 54,
+      "element_instance_key": 64,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "cancel",
-      "element_instance_key": 62,
-      "instance_key": 54
+      "element_instance_key": 64,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "cancel",
-      "element_instance_key": 62,
-      "instance_key": 54
+      "element_instance_key": 64,
+      "instance_key": 56
     }
   },
   {
     "CompensationHandlerCompleted": {
       "handler_element_id": "cancel",
-      "handler_element_instance_key": 62,
-      "instance_key": 54,
-      "throw_element_instance_key": 60
+      "handler_element_instance_key": 64,
+      "instance_key": 56,
+      "throw_element_instance_key": 62
     }
   },
   {
     "CompensationScopeSubscriptionCompleted": {
-      "instance_key": 54,
-      "scope_subscription_key": 56,
-      "throw_element_instance_key": 60
+      "instance_key": 56,
+      "scope_subscription_key": 58,
+      "throw_element_instance_key": 62
     }
   },
   {
     "ElementCompleting": {
       "element_id": "throw",
-      "element_instance_key": 60,
-      "instance_key": 54
+      "element_instance_key": 62,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "throw",
-      "element_instance_key": 60,
-      "instance_key": 54
+      "element_instance_key": 62,
+      "instance_key": 56
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "throw",
-      "instance_key": 54,
+      "instance_key": 56,
       "to": "done"
     }
   },
   {
     "ElementActivating": {
       "element_id": "done",
-      "element_instance_key": 63,
-      "instance_key": 54,
+      "element_instance_key": 65,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "done",
-      "element_instance_key": 63,
-      "instance_key": 54,
+      "element_instance_key": 65,
+      "instance_key": 56,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "done",
-      "element_instance_key": 63,
-      "instance_key": 54
+      "element_instance_key": 65,
+      "instance_key": 56
     }
   },
   {
     "ElementCompleted": {
       "element_id": "done",
-      "element_instance_key": 63,
-      "instance_key": 54
+      "element_instance_key": 65,
+      "instance_key": 56
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 54
+      "instance_key": 56
     }
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 64
+      "deployment_key": 66
     }
   },
   {
     "DecisionRequirementsDeployed": {
-      "decision_requirements_key": 65,
-      "deployment_key": 64,
+      "decision_requirements_key": 67,
+      "deployment_key": 66,
       "drg": {
         "decisions": [
           {
@@ -3088,31 +3156,31 @@
   {
     "DecisionDeployed": {
       "decision_id": "base",
-      "decision_key": 66,
+      "decision_key": 68,
       "decision_name": "Base",
-      "decision_requirements_key": 65,
-      "deployment_key": 64,
+      "decision_requirements_key": 67,
+      "deployment_key": 66,
       "version": 1
     }
   },
   {
     "DecisionDeployed": {
       "decision_id": "root",
-      "decision_key": 67,
+      "decision_key": 69,
       "decision_name": "Root",
-      "decision_requirements_key": 65,
-      "deployment_key": 64,
+      "decision_requirements_key": 67,
+      "deployment_key": 66,
       "version": 1
     }
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 68
+      "deployment_key": 70
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 68,
+      "deployment_key": 70,
       "process": {
         "adhoc": [],
         "elements": {
@@ -3194,7 +3262,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 69,
+      "process_definition_key": 71,
       "version": 1
     }
   },
@@ -3202,10 +3270,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000012,
-      "instance_key": 70,
+      "instance_key": 72,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 69,
+      "process_definition_key": 71,
       "process_id": "decide",
       "tags": [],
       "variables": {
@@ -3219,87 +3287,87 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 71,
-      "instance_key": 70,
+      "element_instance_key": 73,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 71,
-      "instance_key": 70,
+      "element_instance_key": 73,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 71,
-      "instance_key": 70
+      "element_instance_key": 73,
+      "instance_key": 72
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 71,
-      "instance_key": 70
+      "element_instance_key": 73,
+      "instance_key": 72
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 70,
+      "instance_key": 72,
       "to": "brt"
     }
   },
   {
     "ElementActivating": {
       "element_id": "brt",
-      "element_instance_key": 72,
-      "instance_key": 70,
+      "element_instance_key": 74,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "brt",
-      "element_instance_key": 72,
-      "instance_key": 70,
+      "element_instance_key": 74,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "brt",
-      "element_instance_key": 72,
-      "instance_key": 70
+      "element_instance_key": 74,
+      "instance_key": 72
     }
   },
   {
     "ElementCompleted": {
       "element_id": "brt",
-      "element_instance_key": 72,
-      "instance_key": 70
+      "element_instance_key": 74,
+      "instance_key": 72
     }
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 73,
+      "decision_evaluation_key": 75,
       "decision_id": "root",
-      "decision_key": 67,
+      "decision_key": 69,
       "decision_output": {
         "Str": "b"
       },
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 65,
+      "decision_requirements_key": 67,
       "element_id": "brt",
-      "element_instance_key": 72,
+      "element_instance_key": 74,
       "evaluated_at": 1700000000012,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 66,
+          "decision_key": 68,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -3311,7 +3379,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 67,
+          "decision_key": 69,
           "decision_name": "Root",
           "decision_output": {
             "Str": "b"
@@ -3345,12 +3413,12 @@
         }
       ],
       "failure": null,
-      "instance_key": 70
+      "instance_key": 72
     }
   },
   {
     "VariablesUpdated": {
-      "instance_key": 70,
+      "instance_key": 72,
       "variables": {
         "out": {
           "Str": "b"
@@ -3361,53 +3429,53 @@
   {
     "SequenceFlowTaken": {
       "from": "brt",
-      "instance_key": 70,
+      "instance_key": 72,
       "to": "e"
     }
   },
   {
     "ElementActivating": {
       "element_id": "e",
-      "element_instance_key": 74,
-      "instance_key": 70,
+      "element_instance_key": 76,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "e",
-      "element_instance_key": 74,
-      "instance_key": 70,
+      "element_instance_key": 76,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "e",
-      "element_instance_key": 74,
-      "instance_key": 70
+      "element_instance_key": 76,
+      "instance_key": 72
     }
   },
   {
     "ElementCompleted": {
       "element_id": "e",
-      "element_instance_key": 74,
-      "instance_key": 70
+      "element_instance_key": 76,
+      "instance_key": 72
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 70
+      "instance_key": 72
     }
   },
   {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000013,
-      "instance_key": 75,
+      "instance_key": 77,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 69,
+      "process_definition_key": 71,
       "process_id": "decide",
       "tags": [],
       "variables": {
@@ -3421,71 +3489,71 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 76,
-      "instance_key": 75,
+      "element_instance_key": 78,
+      "instance_key": 77,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 76,
-      "instance_key": 75,
+      "element_instance_key": 78,
+      "instance_key": 77,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 76,
-      "instance_key": 75
+      "element_instance_key": 78,
+      "instance_key": 77
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 76,
-      "instance_key": 75
+      "element_instance_key": 78,
+      "instance_key": 77
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 75,
+      "instance_key": 77,
       "to": "brt"
     }
   },
   {
     "ElementActivating": {
       "element_id": "brt",
-      "element_instance_key": 77,
-      "instance_key": 75,
+      "element_instance_key": 79,
+      "instance_key": 77,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "brt",
-      "element_instance_key": 77,
-      "instance_key": 75,
+      "element_instance_key": 79,
+      "instance_key": 77,
       "scope": 0
     }
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 78,
+      "decision_evaluation_key": 80,
       "decision_id": "root",
-      "decision_key": 67,
+      "decision_key": 69,
       "decision_output": "Null",
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 65,
+      "decision_requirements_key": 67,
       "element_id": "brt",
-      "element_instance_key": 77,
+      "element_instance_key": 79,
       "evaluated_at": 1700000000013,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 66,
+          "decision_key": 68,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -3497,7 +3565,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 67,
+          "decision_key": 69,
           "decision_name": "Root",
           "decision_output": "Null",
           "decision_type": "DecisionTable",
@@ -3510,16 +3578,16 @@
         "failed_decision_id": "root",
         "message": "hit policy UNIQUE requires at most one matching rule, but 2 rules matched"
       },
-      "instance_key": 75
+      "instance_key": 77
     }
   },
   {
     "IncidentRaised": {
       "created_at": 1700000000013,
       "element_id": "brt",
-      "element_instance_key": 77,
-      "incident_key": 79,
-      "instance_key": 75,
+      "element_instance_key": 79,
+      "incident_key": 81,
+      "instance_key": 77,
       "job_key": null,
       "kind": "DecisionEvaluation",
       "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
@@ -3528,21 +3596,21 @@
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 80,
+      "decision_evaluation_key": 82,
       "decision_id": "root",
-      "decision_key": 67,
+      "decision_key": 69,
       "decision_output": {
         "Str": "b"
       },
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 65,
+      "decision_requirements_key": 67,
       "element_id": "",
       "element_instance_key": 0,
       "evaluated_at": 1700000000014,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 66,
+          "decision_key": 68,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -3554,7 +3622,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 67,
+          "decision_key": 69,
           "decision_name": "Root",
           "decision_output": {
             "Str": "b"
@@ -3595,7 +3663,7 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000015,
-      "instance_key": 81,
+      "instance_key": 83,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -3608,53 +3676,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 82,
-      "instance_key": 81,
+      "element_instance_key": 84,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 82,
-      "instance_key": 81,
+      "element_instance_key": 84,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 82,
-      "instance_key": 81
+      "element_instance_key": 84,
+      "instance_key": 83
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 82,
-      "instance_key": 81
+      "element_instance_key": 84,
+      "instance_key": 83
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 81,
+      "instance_key": 83,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 83,
-      "instance_key": 81,
+      "element_instance_key": 85,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 83,
-      "instance_key": 81,
+      "element_instance_key": 85,
+      "instance_key": 83,
       "scope": 0
     }
   },
@@ -3662,9 +3730,9 @@
     "JobCreated": {
       "created_at": 1700000000015,
       "element_id": "charge",
-      "element_instance_key": 83,
-      "instance_key": 81,
-      "job_key": 84,
+      "element_instance_key": 85,
+      "instance_key": 83,
+      "job_key": 86,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -3675,8 +3743,8 @@
       "activated_at": 1700000000016,
       "deadline": 1700000030016,
       "durable": true,
-      "instance_key": 81,
-      "job_key": 84,
+      "instance_key": 83,
+      "job_key": 86,
       "worker": "worker-3"
     }
   },
@@ -3684,8 +3752,8 @@
     "JobErrorThrown": {
       "error_code": "CARD_DECLINED",
       "error_message": "card declined",
-      "instance_key": 81,
-      "job_key": 84,
+      "instance_key": 83,
+      "job_key": 86,
       "worker": "worker-3"
     }
   },
@@ -3693,9 +3761,9 @@
     "IncidentRaised": {
       "created_at": 1700000000017,
       "element_id": "charge",
-      "element_instance_key": 83,
-      "incident_key": 85,
-      "instance_key": 81,
+      "element_instance_key": 85,
+      "incident_key": 87,
+      "instance_key": 83,
       "job_key": null,
       "kind": "UnhandledError",
       "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
@@ -3706,7 +3774,7 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000018,
-      "instance_key": 86,
+      "instance_key": 88,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -3719,53 +3787,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 87,
-      "instance_key": 86,
+      "element_instance_key": 89,
+      "instance_key": 88,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 87,
-      "instance_key": 86,
+      "element_instance_key": 89,
+      "instance_key": 88,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 87,
-      "instance_key": 86
+      "element_instance_key": 89,
+      "instance_key": 88
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 87,
-      "instance_key": 86
+      "element_instance_key": 89,
+      "instance_key": 88
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 86,
+      "instance_key": 88,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 88,
-      "instance_key": 86,
+      "element_instance_key": 90,
+      "instance_key": 88,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 88,
-      "instance_key": 86,
+      "element_instance_key": 90,
+      "instance_key": 88,
       "scope": 0
     }
   },
@@ -3773,9 +3841,9 @@
     "JobCreated": {
       "created_at": 1700000000018,
       "element_id": "charge",
-      "element_instance_key": 88,
-      "instance_key": 86,
-      "job_key": 89,
+      "element_instance_key": 90,
+      "instance_key": 88,
+      "job_key": 91,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -3783,12 +3851,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 90
+      "deployment_key": 92
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 90,
+      "deployment_key": 92,
       "process": {
         "adhoc": [],
         "elements": {
@@ -3872,7 +3940,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 91,
+      "process_definition_key": 93,
       "version": 1
     }
   },
@@ -3885,11 +3953,11 @@
           "charge2"
         ]
       ],
-      "instance_key": 86,
+      "instance_key": 88,
       "join_scoped": true,
       "migrated_flow_scopes": [],
       "subscriptions": [],
-      "target_process_definition_key": 91,
+      "target_process_definition_key": 93,
       "target_process_id": "order-v2"
     }
   },
@@ -3897,7 +3965,7 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000022,
-      "instance_key": 92,
+      "instance_key": 94,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -3910,53 +3978,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 93,
-      "instance_key": 92,
+      "element_instance_key": 95,
+      "instance_key": 94,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 93,
-      "instance_key": 92,
+      "element_instance_key": 95,
+      "instance_key": 94,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 93,
-      "instance_key": 92
+      "element_instance_key": 95,
+      "instance_key": 94
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 93,
-      "instance_key": 92
+      "element_instance_key": 95,
+      "instance_key": 94
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 92,
+      "instance_key": 94,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 94,
-      "instance_key": 92,
+      "element_instance_key": 96,
+      "instance_key": 94,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 94,
-      "instance_key": 92,
+      "element_instance_key": 96,
+      "instance_key": 94,
       "scope": 0
     }
   },
@@ -3964,9 +4032,9 @@
     "JobCreated": {
       "created_at": 1700000000022,
       "element_id": "charge",
-      "element_instance_key": 94,
-      "instance_key": 92,
-      "job_key": 95,
+      "element_instance_key": 96,
+      "instance_key": 94,
+      "job_key": 97,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -3976,9 +4044,9 @@
     "IncidentRaised": {
       "created_at": 1700000000023,
       "element_id": "order",
-      "element_instance_key": 92,
-      "incident_key": 96,
-      "instance_key": 92,
+      "element_instance_key": 94,
+      "incident_key": 98,
+      "instance_key": 94,
       "job_key": null,
       "kind": "VariablesLost",
       "reason": "variables lost: spill row missing",
@@ -3987,12 +4055,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 97
+      "deployment_key": 99
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 97,
+      "deployment_key": 99,
       "process": {
         "adhoc": [],
         "elements": {
@@ -4155,7 +4223,7 @@
         "start_form_id": null,
         "xml": "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"\n                      xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\">\n         <bpmn:message id=\"Msg\" name=\"esp-msg\">\n           <bpmn:extensionElements><zeebe:subscription correlationKey=\"=orderId\" /></bpmn:extensionElements>\n         </bpmn:message>\n         <bpmn:process id=\"esp-held\" isExecutable=\"true\">\n           <bpmn:startEvent id=\"s\" />\n           <bpmn:intermediateCatchEvent id=\"work\">\n             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>\n           </bpmn:intermediateCatchEvent>\n           <bpmn:endEvent id=\"e\" />\n           <bpmn:sequenceFlow id=\"f1\" sourceRef=\"s\" targetRef=\"work\" />\n           <bpmn:sequenceFlow id=\"f2\" sourceRef=\"work\" targetRef=\"e\" />\n           <bpmn:subProcess id=\"esp\" triggeredByEvent=\"true\">\n             <bpmn:extensionElements>\n               <zeebe:executionListeners>\n                 <zeebe:executionListener eventType=\"start\" type=\"esp-gate\" />\n               </zeebe:executionListeners>\n             </bpmn:extensionElements>\n             <bpmn:startEvent id=\"esp_start\" isInterrupting=\"false\">\n               <bpmn:extensionElements>\n                 <zeebe:ioMapping><zeebe:output source=\"=payload\" target=\"mapped\" /></zeebe:ioMapping>\n               </bpmn:extensionElements>\n               <bpmn:messageEventDefinition messageRef=\"Msg\" />\n             </bpmn:startEvent>\n             <bpmn:endEvent id=\"esp_end\" />\n             <bpmn:sequenceFlow id=\"ef1\" sourceRef=\"esp_start\" targetRef=\"esp_end\" />\n           </bpmn:subProcess>\n         </bpmn:process>\n       </bpmn:definitions>"
       },
-      "process_definition_key": 98,
+      "process_definition_key": 100,
       "version": 1
     }
   },
@@ -4163,10 +4231,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000025,
-      "instance_key": 99,
+      "instance_key": 101,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 98,
+      "process_definition_key": 100,
       "process_id": "esp-held",
       "tags": [],
       "variables": {
@@ -4180,16 +4248,16 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 100,
-      "instance_key": 99,
+      "element_instance_key": 102,
+      "instance_key": 101,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 100,
-      "instance_key": 99,
+      "element_instance_key": 102,
+      "instance_key": 101,
       "scope": 0
     }
   },
@@ -4198,7 +4266,7 @@
       "correlation_key": "7",
       "element_id": "esp_start",
       "element_instance_key": 0,
-      "instance_key": 99,
+      "instance_key": 101,
       "kind": {
         "EventSubProcess": {
           "esp_element_id": "esp",
@@ -4206,43 +4274,43 @@
         }
       },
       "message_name": "esp-msg",
-      "subscription_key": 101
+      "subscription_key": 103
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 100,
-      "instance_key": 99
+      "element_instance_key": 102,
+      "instance_key": 101
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 100,
-      "instance_key": 99
+      "element_instance_key": 102,
+      "instance_key": 101
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 99,
+      "instance_key": 101,
       "to": "work"
     }
   },
   {
     "ElementActivating": {
       "element_id": "work",
-      "element_instance_key": 102,
-      "instance_key": 99,
+      "element_instance_key": 104,
+      "instance_key": 101,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "work",
-      "element_instance_key": 102,
-      "instance_key": 99,
+      "element_instance_key": 104,
+      "instance_key": 101,
       "scope": 0
     }
   },
@@ -4250,16 +4318,16 @@
     "TimerCreated": {
       "due_at": 1700003600025,
       "element_id": "work",
-      "element_instance_key": 102,
-      "instance_key": 99,
+      "element_instance_key": 104,
+      "instance_key": 101,
       "kind": "IntermediateCatch",
-      "timer_key": 103
+      "timer_key": 105
     }
   },
   {
     "MessagePublished": {
       "correlation_key": "7",
-      "message_key": 104,
+      "message_key": 106,
       "message_name": "esp-msg"
     }
   },
@@ -4267,30 +4335,30 @@
     "MessageCorrelated": {
       "element_id": "esp_start",
       "element_instance_key": 0,
-      "instance_key": 99,
-      "message_key": 104,
-      "subscription_key": 101
+      "instance_key": 101,
+      "message_key": 106,
+      "subscription_key": 103
     }
   },
   {
     "ElementActivating": {
       "element_id": "esp",
-      "element_instance_key": 105,
-      "instance_key": 99,
+      "element_instance_key": 107,
+      "instance_key": 101,
       "scope": 0
     }
   },
   {
     "VariableScopeCreated": {
-      "instance_key": 99,
+      "instance_key": 101,
       "parent_scope_key": 0,
-      "scope_key": 105
+      "scope_key": 107
     }
   },
   {
     "EventSubProcessPayloadHeld": {
-      "instance_key": 99,
-      "scope_key": 105,
+      "instance_key": 101,
+      "scope_key": 107,
       "variables": {
         "payload": {
           "Int": 42
@@ -4302,10 +4370,10 @@
     "ExecutionListenerJobCreated": {
       "created_at": 1700000000026,
       "element_id": "esp",
-      "element_instance_key": 105,
+      "element_instance_key": 107,
       "event_type": "Start",
-      "instance_key": 99,
-      "job_key": 106,
+      "instance_key": 101,
+      "job_key": 108,
       "job_type": "esp-gate",
       "listener_index": 0,
       "retries": 3,

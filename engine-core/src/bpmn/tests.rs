@@ -940,6 +940,109 @@ fn should_parse_an_escalation_end_event() {
 }
 
 #[test]
+fn should_parse_an_error_end_event() {
+    // An error end event (#1592): an `endEvent` carrying an
+    // `errorEventDefinition` builds as an `ErrorEndEvent` whose code is
+    // resolved from the referenced `<error>`.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" name="Declined" errorCode="CARD_DECLINED" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: "CARD_DECLINED".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_error_end_event_without_a_ref_as_an_unnamed_throw() {
+    // An `errorEventDefinition` with no `errorRef` throws an unnamed error
+    // (empty code), matched by catch-alls only.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: String::new(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_an_outgoing_flow() {
+    // An error `<endEvent>` is remapped to an `ErrorEndEvent`, so the
+    // model-level `end_events_have_no_outgoing` rule cannot see it — the
+    // end-event outgoing-flow guard in `build` covers every flavour (#1592,
+    // mirroring the #1173 escalation guard).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="after" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ErrEnd" targetRef="after" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_a_competing_definition() {
+    // An end event carrying BOTH an error and a terminate definition has no
+    // combined-semantics element in the supported subset: refuse the ambiguous
+    // model at deploy rather than pick one arm (#1173's multi-definition guard,
+    // now covering the error flavour).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
 fn should_reject_an_escalation_end_event_with_an_outgoing_flow() {
     // Regression (#1173): an escalation `<endEvent>` is remapped to an
     // `EscalationThrowEvent`, so the model-level `end_events_have_no_outgoing`
@@ -1271,6 +1374,40 @@ fn should_reject_an_end_event_with_escalation_and_terminate_definitions() {
 }
 
 #[test]
+fn should_reject_an_intermediate_throw_with_error_and_escalation_definitions() {
+    // Regression (#1592 review): an error definition on an
+    // `intermediateThrowEvent` (with or without an errorRef) must still count
+    // as a competing definition — otherwise the node deploys as a bare
+    // escalation throw and the error definition is silently discarded.
+    for error_def in [
+        r#"<bpmn:errorEventDefinition errorRef="Err" />"#,
+        r#"<bpmn:errorEventDefinition />"#,
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:error id="Err" name="Boom" errorCode="BOOM" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Bad">
+      {error_def}
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Bad" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        assert!(
+            parse_bpmn(&xml).is_err(),
+            "{error_def}: an error+escalation intermediate throw must be rejected"
+        );
+    }
+}
+
+#[test]
 fn should_reject_an_intermediate_throw_with_competing_definitions() {
     // Regression (#1173): the throw form of the same class — an
     // `intermediateThrowEvent` carrying BOTH an escalation and a compensation
@@ -1383,6 +1520,45 @@ fn should_reject_a_duplicate_escalation_definition_on_a_throw() {
         ),
         "expected InvalidEndEvent for the duplicate-escalation end event Bad, got {err:?}"
     );
+}
+
+#[test]
+fn should_reject_a_duplicate_error_definition_on_an_end_event() {
+    // Regression (#1592 review): a SECOND `errorEventDefinition` on one end
+    // event silently overwrote `error_ref` (last-wins) while the presence flag
+    // stayed a single boolean, so the competing-definition guard accepted it.
+    // Covers named/named and named/unnamed pairs, both orders.
+    for (first, second) in [
+        (r#"errorRef="ErrA""#, r#"errorRef="ErrB""#),
+        (r#"errorRef="ErrA""#, ""),
+        ("", r#"errorRef="ErrA""#),
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="ErrA" name="A" errorCode="A" />
+  <bpmn:error id="ErrB" name="B" errorCode="B" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition {first} />
+      <bpmn:errorEventDefinition {second} />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        let err =
+            parse_bpmn(&xml).expect_err("two error definitions on one end event are rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, reason, .. }
+                    if element_id == "Bad" && reason.contains("more than one errorEventDefinition")
+            ),
+            "expected InvalidEndEvent for ({first}, {second}), got {err:?}"
+        );
+    }
 }
 
 #[test]
