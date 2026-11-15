@@ -918,7 +918,57 @@ impl Engine {
             .iter()
             .map(|t| (t.scope_eik, t.esp_id.as_str()))
             .collect();
-        let mut consumed: HashSet<(Key, ElementId)> = HashSet::new();
+        // Each live scope instance's mapped TARGET scope-element id (`None`
+        // for the root).
+        let scope_target: HashMap<Key, Option<ElementId>> =
+            scopes.iter().map(|(eik, _, t)| (*eik, t.clone())).collect();
+        // The live scope instance(s) a counterpart `tgt_esp` of an event
+        // sub-process hosted by source scope instance `host` lands in. The
+        // target parent id is a TARGET id and is used unchanged. It is
+        // resolved through `host`'s OWN runtime lineage — `host` itself or its
+        // nearest ancestor whose target is that parent (a move outward), else
+        // the live descendants of `host` with that target (a move inward) —
+        // so concurrent instances of one scope element never alias each other
+        // (#1379 review).
+        let destinations_of = |host: Key, tgt_esp: &str| -> Vec<Key> {
+            let Some(parent) = target.element(tgt_esp).map(|el| el.parent.clone()) else {
+                return Vec::new();
+            };
+            let Some(parent) = parent else {
+                return vec![0];
+            };
+            let mut c = host;
+            loop {
+                if scope_target.get(&c).and_then(|t| t.as_deref()) == Some(parent.as_str()) {
+                    return vec![c];
+                }
+                if c == 0 {
+                    break;
+                }
+                c = self.scope_of(instance_key, c);
+            }
+            scope_target
+                .iter()
+                .filter(|(eik, t)| {
+                    t.as_deref() == Some(parent.as_str()) && {
+                        let mut a = **eik;
+                        loop {
+                            if a == 0 {
+                                break host == 0;
+                            }
+                            a = self.scope_of(instance_key, a);
+                            if a == host {
+                                break true;
+                            }
+                        }
+                    }
+                })
+                .map(|(eik, _)| *eik)
+                .collect()
+        };
+        // `(destination scope, target esp id)` pairs a CONSUMED source
+        // counterpart lands in (staying or moved).
+        let mut consumed_in: HashSet<(Key, ElementId)> = HashSet::new();
         for (scope_eik, source_scope, _) in &scopes {
             if self.activation_pending(instance_key, *scope_eik, source, active) {
                 continue;
@@ -927,48 +977,28 @@ impl Engine {
                 if e.trigger.is_subscription()
                     && !armed_source.contains(&(*scope_eik, e.esp_id.as_str()))
                 {
-                    consumed.insert((*scope_eik, counterpart(&e.esp_id)));
+                    let tgt = counterpart(&e.esp_id);
+                    for d in destinations_of(*scope_eik, &tgt) {
+                        consumed_in.insert((d, tgt.clone()));
+                    }
                 }
             }
         }
-        // The live scope instance hosting each target scope-element (the
-        // destination a moved counterpart lands in): target scope-element id ->
-        // host eik, with the root (`0`) hosting the top level.
-        let target_scope_hosts: HashMap<ElementId, Key> = scopes
-            .iter()
-            .filter_map(|(eik, _, target_id)| target_id.clone().map(|t| (t, *eik)))
-            .collect();
-        // The destination scope a source event sub-process's counterpart lands
-        // in: the host of its target parent (mapped) when the counterpart stays
-        // embedded, or the root when it moved out to the top level.
-        let destination_scope_of = |esp_id: &ElementId| -> Option<Key> {
-            let tgt_parent = target
-                .element(esp_id)
-                .and_then(|el| el.parent.as_deref())
-                .map(|p| counterpart(&p.to_owned()));
-            match tgt_parent {
-                None => Some(0),
-                Some(p) => target_scope_hosts.get(&p).copied(),
-            }
-        };
         // Target event sub-process ids with an ARMED source counterpart in any
         // scope: arming one in a different scope (a cross-scope move) replaces
         // an existing trigger, so it is audited as `Recreated`, not `Created`.
         let armed_targets: HashSet<ElementId> =
             armed.iter().map(|t| counterpart(&t.esp_id)).collect();
-        // ARMED source triggers whose counterpart moved OUT of their host scope
-        // (the target has no matching event sub-process there): `(source host
-        // scope, target esp id)`. Each is cancelled in its host and re-armed at
-        // its destination scope below — unless a CONSUMED counterpart from the
-        // SAME source host accounts for it. A consumed counterpart from a
-        // DIFFERENT host must not suppress the re-arm (#1379 review).
-        let mut rearm_moved: HashSet<(Key, ElementId)> = HashSet::new();
-        for (scope_eik, _, target_scope) in &scopes {
-            let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
-            for t in armed.iter().filter(|t| t.scope_eik == *scope_eik) {
-                let tgt_id = counterpart(&t.esp_id);
-                if !target_esps.iter().any(|g| g.esp_id == tgt_id) {
-                    rearm_moved.insert((*scope_eik, t.esp_id.clone()));
+        // `(destination scope, TARGET esp id)` pairs an ARMED source trigger
+        // moves INTO from a different host scope: it is cancelled in its host
+        // and re-armed at exactly that destination, which a consumed
+        // counterpart from another host must not suppress (#1379 review).
+        let mut armed_in: HashSet<(Key, ElementId)> = HashSet::new();
+        for t in &armed {
+            let tgt = counterpart(&t.esp_id);
+            for d in destinations_of(t.scope_eik, &tgt) {
+                if d != t.scope_eik {
+                    armed_in.insert((d, tgt.clone()));
                 }
             }
         }
@@ -981,7 +1011,7 @@ impl Engine {
             // timer) that STAYS in this scope must not be re-armed. A source
             // event sub-process the migration MOVES OUT of this scope covers
             // nothing here — its consumed counterpart is suppressed by the
-            // host-keyed `consumed` set instead, so a sibling host's still-armed
+            // lineage-resolved `consumed_in` set instead, so a sibling host's still-armed
             // counterpart moving into this same scope is not hidden by it
             // (#1379 review). Error / escalation triggers are never
             // subscriptions — they have nothing to retain or re-create — so
@@ -1001,6 +1031,8 @@ impl Engine {
             // Target event sub-processes re-armed in place of a deleted source
             // trigger (vs newly created ones), by start-event id.
             let mut recreated: HashSet<ElementId> = HashSet::new();
+            // Target ids whose armed trigger is retained in place here.
+            let mut handled: HashSet<ElementId> = HashSet::new();
             for t in armed.iter().filter(|t| t.scope_eik == scope_eik) {
                 let src = source_esps.iter().find(|e| e.esp_id == t.esp_id);
                 let tgt_id = counterpart(&t.esp_id);
@@ -1028,6 +1060,7 @@ impl Engine {
                     _ => false,
                 };
                 if retained {
+                    handled.insert(tgt_id.clone());
                     if let Some(trigger) = t.report.clone() {
                         plan.subscriptions.push(MigratedSubscription {
                             element_instance_key: scope_eik,
@@ -1075,19 +1108,15 @@ impl Engine {
                     // scope (its host IS this scope), or one moved in from
                     // another host that did NOT cancel an armed trigger of its
                     // own for the same target. When a sibling host's armed
-                    // trigger moved in (in `rearm_moved`), THIS scope arms that
+                    // trigger moved in (in `armed_in`), THIS scope arms that
                     // trigger — a consumed counterpart from a DIFFERENT host
                     // must not suppress it (#1379 review).
-                    let armed_move_in = rearm_moved
-                        .iter()
-                        .any(|(host, id)| *id == g.esp_id && *host != scope_eik);
-                    let consumed_here = !armed_move_in
-                        && consumed.iter().any(|(host, id)| {
-                            *id == g.esp_id
-                                && (*host == scope_eik
-                                    || destination_scope_of(id) == Some(scope_eik))
-                        });
-                    if !covered.contains(&g.esp_id) && !consumed_here && !to_arm.contains(&g.esp_id)
+                    let key = (scope_eik, g.esp_id.clone());
+                    let armed_move_in = armed_in.contains(&key);
+                    let consumed_here = consumed_in.contains(&key);
+                    if !handled.contains(&g.esp_id)
+                        && (armed_move_in || (!covered.contains(&g.esp_id) && !consumed_here))
+                        && !to_arm.contains(&g.esp_id)
                     {
                         if armed_targets.contains(&g.esp_id) {
                             recreated.insert(g.start_id.clone());

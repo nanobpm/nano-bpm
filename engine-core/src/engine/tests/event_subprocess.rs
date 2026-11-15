@@ -2700,3 +2700,244 @@ fn migration_keeps_an_armed_trigger_when_a_sibling_hosts_consumed_counterpart_mo
         "the surviving timer fires its handler"
     );
 }
+
+/// Two concurrent `esp1` instances, each hosting `sub`, which hosts a one-shot
+/// timer event sub-process `inner`. In the target, `inner` is renamed to
+/// `inner_id` and contained in `inner_parent` (`None` = the root). Marks the
+/// timer of each host whose `consumed` flag is set as fired, migrates, and
+/// returns the engine, instance, and the source `sub` / `esp1` hosts (sorted,
+/// paired).
+fn two_host_inner_move(
+    consumed: [bool; 2],
+    inner_id: &str,
+    inner_parent: Option<&str>,
+) -> (Engine, Key, Vec<(Key, Key)>) {
+    let model = |inner_id: &str, inner_parent: Option<&str>| {
+        let start = format!("{inner_id}_start");
+        let work = format!("{inner_id}_work");
+        let end = format!("{inner_id}_end");
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .event_sub_process("esp1", "esp1_start", sig(), false)
+            .start_event("esp1_start")
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .service_task("sub_work", "sw")
+            .end_event("sub_e")
+            .end_event("esp1_end")
+            .connect("esp1_start", "sub")
+            .connect("sub_s", "sub_work")
+            .connect("sub_work", "sub_e")
+            .connect("sub", "esp1_end")
+            .contained_in("esp1_start", "esp1")
+            .contained_in("sub", "esp1")
+            .contained_in("sub_s", "sub")
+            .contained_in("sub_work", "sub")
+            .contained_in("sub_e", "sub")
+            .contained_in("esp1_end", "esp1")
+            .event_sub_process(inner_id, &start, trig_of(T::Timer), false)
+            .start_event(&start)
+            .service_task(&work, "inner")
+            .end_event(&end)
+            .connect(&start, &work)
+            .connect(&work, &end)
+            .contained_in(&start, inner_id)
+            .contained_in(&work, inner_id)
+            .contained_in(&end, inner_id);
+        if let Some(p) = inner_parent {
+            b = b.contained_in(inner_id, p);
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model("inner", Some("sub")));
+    fire(&mut engine, inst, T::Signal, 0);
+    fire(&mut engine, inst, T::Signal, 0);
+    let mut subs: Vec<Key> = engine.state.instances[&inst]
+        .active
+        .iter()
+        .filter_map(|(k, id)| (id == "sub").then_some(*k))
+        .collect();
+    subs.sort_unstable();
+    let hosts: Vec<(Key, Key)> = subs
+        .iter()
+        .map(|s| (*s, engine.scope_of(inst, *s)))
+        .collect();
+    for (i, (sub, _)) in hosts.iter().enumerate() {
+        if !consumed[i] {
+            continue;
+        }
+        let key = engine
+            .state
+            .timers
+            .values()
+            .find(|t| {
+                t.instance_key == inst
+                    && t.element_instance_key == *sub
+                    && t.state == crate::state::TimerState::Created
+            })
+            .map(|t| t.key)
+            .expect("host timer armed");
+        engine.state.timers.get_mut(&key).expect("timer").state =
+            crate::state::TimerState::Triggered;
+    }
+    let target_key = deploy_for_migration(&mut engine, model(inner_id, inner_parent));
+    let mut mappings: Vec<(ElementId, ElementId)> = vec![
+        ("work".into(), "work".into()),
+        ("esp1".into(), "esp1".into()),
+        ("sub".into(), "sub".into()),
+        ("sub_work".into(), "sub_work".into()),
+    ];
+    if inner_id != "inner" {
+        mappings.push(("inner".into(), inner_id.into()));
+    }
+    engine
+        .apply_command(Command::migrate_instance(inst, target_key, mappings))
+        .unwrap();
+    (engine, inst, hosts)
+}
+
+/// Element instance keys hosting the instance's armed timers.
+fn armed_timer_hosts(engine: &Engine, inst: Key) -> Vec<Key> {
+    let mut v: Vec<Key> = engine
+        .state
+        .timers
+        .values()
+        .filter(|t| t.instance_key == inst && t.state == crate::state::TimerState::Created)
+        .map(|t| t.element_instance_key)
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+#[test]
+fn migration_moving_consumed_timers_into_distinct_parent_hosts_rearms_none() {
+    // #1379 review r4579460688: both hosts' `inner` timers fired; moving
+    // `inner` from each `sub` into its enclosing `esp1` must re-arm neither —
+    // each consumed counterpart resolves to ITS OWN `esp1` instance.
+    let (engine, inst, _) = two_host_inner_move([true, true], "inner", Some("esp1"));
+    assert!(
+        armed_timer_hosts(&engine, inst).is_empty(),
+        "no inner timer re-armed"
+    );
+}
+
+#[test]
+fn migration_mixed_armed_and_consumed_into_distinct_parent_hosts() {
+    // #1379 review r4579460688: host 0's timer fired, host 1's is armed. The
+    // armed timer is re-armed in host 1's `esp1` only; host 0's `esp1` stays
+    // unarmed (its counterpart is consumed).
+    for consumed in [[true, false], [false, true]] {
+        let (engine, inst, hosts) = two_host_inner_move(consumed, "inner", Some("esp1"));
+        let armed_idx = if consumed[0] { 1 } else { 0 };
+        assert_eq!(
+            armed_timer_hosts(&engine, inst),
+            vec![hosts[armed_idx].1],
+            "only the armed host's esp1 carries the timer ({consumed:?})"
+        );
+    }
+}
+
+#[test]
+fn migration_rearms_a_moved_armed_trigger_across_an_esp_rename() {
+    // #1379 review r4579460727: the armed host's timer moves to the root AND
+    // `inner` is renamed; the other host's consumed `renamed` counterpart must
+    // not suppress the replacement.
+    let (engine, inst, _) = two_host_inner_move([true, false], "renamed", None);
+    assert_eq!(
+        armed_timer_hosts(&engine, inst),
+        vec![0],
+        "re-armed at the root"
+    );
+}
+
+#[test]
+fn migration_resolves_destination_by_the_unchanged_target_parent_id() {
+    // #1379 review r4579460715: live scopes mapped `subA -> subB` and
+    // `subB -> subC`; a consumed root timer ESP moving into target `subB` must
+    // be suppressed in the `subB` host (the source `subA` instance), not
+    // looked up as the host of `subC`.
+    let model = |esp_parent: Option<&str>| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .parallel_gateway("fork")
+            .sub_process("subA", "a_s")
+            .start_event("a_s")
+            .service_task("a_w", "aw")
+            .end_event("a_e")
+            .sub_process("subB", "b_s")
+            .start_event("b_s")
+            .service_task("b_w", "bw")
+            .end_event("b_e")
+            .sub_process("subC", "c_s")
+            .start_event("c_s")
+            .service_task("c_w", "cw")
+            .end_event("c_e")
+            .end_event("e1")
+            .end_event("e2")
+            .connect("s", "fork")
+            .connect("fork", "subA")
+            .connect("fork", "subB")
+            .connect("subA", "e1")
+            .connect("subB", "e2")
+            .connect("a_s", "a_w")
+            .connect("a_w", "a_e")
+            .connect("b_s", "b_w")
+            .connect("b_w", "b_e")
+            .connect("c_s", "c_w")
+            .connect("c_w", "c_e")
+            .contained_in("a_s", "subA")
+            .contained_in("a_w", "subA")
+            .contained_in("a_e", "subA")
+            .contained_in("b_s", "subB")
+            .contained_in("b_w", "subB")
+            .contained_in("b_e", "subB")
+            .contained_in("c_s", "subC")
+            .contained_in("c_w", "subC")
+            .contained_in("c_e", "subC")
+            .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+            .start_event("esp_start")
+            .service_task("esp_w", "ew")
+            .end_event("esp_e")
+            .connect("esp_start", "esp_w")
+            .connect("esp_w", "esp_e")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_w", "esp")
+            .contained_in("esp_e", "esp");
+        if let Some(p) = esp_parent {
+            b = b.contained_in("esp", p);
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model(None));
+    // The root timer fires once (consumed).
+    for t in engine.state.timers.values_mut() {
+        if t.instance_key == inst && t.state == crate::state::TimerState::Created {
+            t.state = crate::state::TimerState::Triggered;
+        }
+    }
+    assert_eq!(armed(&engine, inst), 0);
+    let target_key = deploy_for_migration(&mut engine, model(Some("subB")));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("subA".into(), "subB".into()),
+                ("a_w".into(), "b_w".into()),
+                ("subB".into(), "subC".into()),
+                ("b_w".into(), "c_w".into()),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "the consumed one-shot timer is not re-armed in the subB host"
+    );
+}
