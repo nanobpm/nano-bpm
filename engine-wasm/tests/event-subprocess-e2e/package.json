@@ -1,0 +1,13 @@
+{
+  "name": "engine-wasm-event-subprocess-e2e-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Real-WASM end-to-end guard for event sub-processes (#1555/#1616): a non-interrupting timer ESP runs alongside the main flow; an interrupting message ESP terminates siblings and completes the instance via its own end event. Runs against both entrypoints.",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "dependencies": {
+    "@nanobpm/engine-wasm": "file:../../pkg"
+  }
+}
