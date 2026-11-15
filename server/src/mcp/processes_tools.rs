@@ -570,6 +570,42 @@ mod tests {
         );
     }
 
+    /// A model authored with the console's built-in "MCP start event"
+    /// component (#1611) lists under `/mcp/processes` with the Camunda
+    /// description and the Nano typed `inputSchema`; the unfilled optional
+    /// groups contribute nothing.
+    #[tokio::test]
+    async fn console_mcp_start_event_template_model_lists_typed_tool() {
+        let server = ServerImpl::default();
+        deploy_xml(
+            &server,
+            include_str!("../../../engine-core/tests/fixtures/mcp-start-event-template.bpmn"),
+        )
+        .await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let tool = &tools[0];
+        let name = tool["name"].as_str().unwrap();
+        assert!(name.starts_with("lookup_customer_"), "{name}");
+        assert_eq!(
+            tool["description"],
+            json!(
+                "Look up a customer record.\n\n## Inputs\nA customer email and an optional limit.\n\n## When to use\nThe user asks about a customer."
+            )
+        );
+        assert_eq!(
+            tool["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "email": { "type": "string", "description": "The customer's email." },
+                    "limit": { "type": "integer" },
+                    "businessId": { "type": "string", "description": BUSINESS_ID_DESCRIPTION },
+                },
+                "required": ["email"],
+            })
+        );
+    }
+
     #[test]
     fn description_assembles_every_part_with_camunda_labels() {
         let mut props = BTreeMap::new();

@@ -1585,7 +1585,7 @@ function EditorPane({
   // project's own (`components/` + `.camunda/element-templates/`, increment 2)
   // layered over the set contributed by installed packs (ADR 0033 §4, increment
   // 6). Load both when a BPMN model is open; reload on file switch. Project
-  // components win on an id collision. Absent → empty palette.
+  // components win on an id collision. Absent → built-ins only.
   const [components, setComponents] = useState<ElementTemplate[]>([]);
   useEffect(() => {
     if (kind !== "bpmn") {
@@ -1611,7 +1611,7 @@ function EditorPane({
         const gatedPack = filterEnabledPackComponents(pack, enabledTaskTypes);
         setComponents(combineComponents(gatedPack, project));
       })
-      .catch(() => alive && setComponents([]));
+      .catch(() => alive && setComponents(combineComponents([], [])));
     return () => {
       alive = false;
     };
