@@ -894,59 +894,107 @@ impl Engine {
         let armed = self.armed_event_subprocess_triggers(instance_key);
         let counterpart = |id: &ElementId| mapped.get(id).cloned().unwrap_or_else(|| id.clone());
         // Target event sub-process ids accounted for by a CONSUMED source
-        // counterpart: a source event sub-process (in ANY live scope) that
-        // carries a subscription trigger but is no longer armed (a one-shot
-        // timer that already fired). Such a counterpart must never be
-        // (re-)armed — its handler already ran. This set is GLOBAL across
-        // scopes so a consumed source event sub-process that the migration
-        // moves into a different (already-live) scope still suppresses its
-        // target counterpart: a per-scope `covered` set would lose it the
-        // moment it crosses a scope boundary and arm it again, running its
-        // handler twice (#1379 review).
+        // counterpart: a source event sub-process that carries a subscription
+        // trigger but is no longer armed (a one-shot timer that already fired).
+        // Such a counterpart must never be (re-)armed — its handler already
+        // ran. Each entry is keyed by `(source host scope, target esp id)`: the
+        // host lineage is kept because the same definition id can be hosted by
+        // several live instances of one scope element (e.g. two concurrent
+        // instances of a non-interrupting event sub-process each embedding a
+        // further sub-process), so a consumed trigger in one host must not
+        // suppress the still-armed counterpart another host moves into the same
+        // destination scope (#1379 review).
         //
-        // Armedness is keyed by `(scope_eik, esp_id)`: the same definition id
-        // can be hosted by several live instances of one scope element, so an
+        // Armedness is keyed by `(scope_eik, esp_id)` for the same reason: an
         // armed trigger in one host must not hide a consumed one in another.
-        // A scope that is not in its steady phase (activation pending) never
-        // armed its triggers yet, so its unarmed event sub-processes are NOT
-        // consumed — they are skipped here (#1379 review).
+        // A scope whose activation is still pending (a start-listener chain or
+        // an activation-phase incident will (re-)run its activation body, which
+        // arms its triggers) never armed its triggers yet, so its unarmed event
+        // sub-processes are NOT consumed — they are skipped here. A
+        // completion-pending scope (an end-listener chain or a
+        // completion-phase incident) HAS armed them already: its unarmed
+        // subscription triggers fired and ARE consumed (#1379 review).
         let armed_source: HashSet<(Key, &str)> = armed
             .iter()
             .map(|t| (t.scope_eik, t.esp_id.as_str()))
             .collect();
-        let mut consumed: HashSet<ElementId> = HashSet::new();
+        let mut consumed: HashSet<(Key, ElementId)> = HashSet::new();
         for (scope_eik, source_scope, _) in &scopes {
-            if not_armable.contains(scope_eik)
-                || self.root_pending(instance_key, *scope_eik, source, active)
-            {
+            if self.activation_pending(instance_key, *scope_eik, source, active) {
                 continue;
             }
             for e in ArmableEsp::in_scope(source, source_scope.as_deref()) {
                 if e.trigger.is_subscription()
                     && !armed_source.contains(&(*scope_eik, e.esp_id.as_str()))
                 {
-                    consumed.insert(counterpart(&e.esp_id));
+                    consumed.insert((*scope_eik, counterpart(&e.esp_id)));
                 }
             }
         }
+        // The live scope instance hosting each target scope-element (the
+        // destination a moved counterpart lands in): target scope-element id ->
+        // host eik, with the root (`0`) hosting the top level.
+        let target_scope_hosts: HashMap<ElementId, Key> = scopes
+            .iter()
+            .filter_map(|(eik, _, target_id)| target_id.clone().map(|t| (t, *eik)))
+            .collect();
+        // The destination scope a source event sub-process's counterpart lands
+        // in: the host of its target parent (mapped) when the counterpart stays
+        // embedded, or the root when it moved out to the top level.
+        let destination_scope_of = |esp_id: &ElementId| -> Option<Key> {
+            let tgt_parent = target
+                .element(esp_id)
+                .and_then(|el| el.parent.as_deref())
+                .map(|p| counterpart(&p.to_owned()));
+            match tgt_parent {
+                None => Some(0),
+                Some(p) => target_scope_hosts.get(&p).copied(),
+            }
+        };
         // Target event sub-process ids with an ARMED source counterpart in any
         // scope: arming one in a different scope (a cross-scope move) replaces
         // an existing trigger, so it is audited as `Recreated`, not `Created`.
         let armed_targets: HashSet<ElementId> =
             armed.iter().map(|t| counterpart(&t.esp_id)).collect();
+        // ARMED source triggers whose counterpart moved OUT of their host scope
+        // (the target has no matching event sub-process there): `(source host
+        // scope, target esp id)`. Each is cancelled in its host and re-armed at
+        // its destination scope below — unless a CONSUMED counterpart from the
+        // SAME source host accounts for it. A consumed counterpart from a
+        // DIFFERENT host must not suppress the re-arm (#1379 review).
+        let mut rearm_moved: HashSet<(Key, ElementId)> = HashSet::new();
+        for (scope_eik, _, target_scope) in &scopes {
+            let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
+            for t in armed.iter().filter(|t| t.scope_eik == *scope_eik) {
+                let tgt_id = counterpart(&t.esp_id);
+                if !target_esps.iter().any(|g| g.esp_id == tgt_id) {
+                    rearm_moved.insert((*scope_eik, t.esp_id.clone()));
+                }
+            }
+        }
         for (scope_eik, source_scope, target_scope) in scopes {
             let source_esps = ArmableEsp::in_scope(source, source_scope.as_deref());
             let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
-            // Target event sub-processes a source counterpart accounts for:
-            // its armed trigger (if any) is retained or re-created above, and
-            // one with NO armed trigger (a fired one-shot timer) must not be
-            // re-armed. Error / escalation triggers are never subscriptions —
-            // they have nothing to retain or re-create — so they cover
-            // nothing: a target that turns one into a subscription trigger is
-            // newly armed below (#1379 review).
+            // Target event sub-processes a source counterpart accounts for
+            // IN THIS SCOPE: its armed trigger (if any) is retained or
+            // re-created above, and one with NO armed trigger (a fired one-shot
+            // timer) that STAYS in this scope must not be re-armed. A source
+            // event sub-process the migration MOVES OUT of this scope covers
+            // nothing here — its consumed counterpart is suppressed by the
+            // host-keyed `consumed` set instead, so a sibling host's still-armed
+            // counterpart moving into this same scope is not hidden by it
+            // (#1379 review). Error / escalation triggers are never
+            // subscriptions — they have nothing to retain or re-create — so
+            // they cover nothing: a target that turns one into a subscription
+            // trigger is newly armed below (#1379 review).
             let covered: HashSet<ElementId> = source_esps
                 .iter()
-                .filter(|e| e.trigger.is_subscription())
+                .filter(|e| {
+                    e.trigger.is_subscription()
+                        && ArmableEsp::in_scope(target, target_scope.as_deref())
+                            .iter()
+                            .any(|g| g.esp_id == counterpart(&e.esp_id))
+                })
                 .map(|e| counterpart(&e.esp_id))
                 .collect();
             let mut to_arm: Vec<ElementId> = Vec::new();
@@ -1022,9 +1070,24 @@ impl Engine {
                 && !self.root_pending(instance_key, scope_eik, source, active)
             {
                 for g in &target_esps {
-                    if !covered.contains(&g.esp_id)
-                        && !consumed.contains(&g.esp_id)
-                        && !to_arm.contains(&g.esp_id)
+                    // A CONSUMED source counterpart suppresses arming here only
+                    // when it is THIS scope's own trigger: one staying in this
+                    // scope (its host IS this scope), or one moved in from
+                    // another host that did NOT cancel an armed trigger of its
+                    // own for the same target. When a sibling host's armed
+                    // trigger moved in (in `rearm_moved`), THIS scope arms that
+                    // trigger — a consumed counterpart from a DIFFERENT host
+                    // must not suppress it (#1379 review).
+                    let armed_move_in = rearm_moved
+                        .iter()
+                        .any(|(host, id)| *id == g.esp_id && *host != scope_eik);
+                    let consumed_here = !armed_move_in
+                        && consumed.iter().any(|(host, id)| {
+                            *id == g.esp_id
+                                && (*host == scope_eik
+                                    || destination_scope_of(id) == Some(scope_eik))
+                        });
+                    if !covered.contains(&g.esp_id) && !consumed_here && !to_arm.contains(&g.esp_id)
                     {
                         if armed_targets.contains(&g.esp_id) {
                             recreated.insert(g.start_id.clone());
@@ -1073,6 +1136,71 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Whether scope `scope_eik`'s activation body will still (re-)run — the
+    /// state in which its event sub-process triggers have NOT all been armed
+    /// yet, so an unarmed one must not be read as consumed (#1379 review).
+    ///
+    /// Unlike [`Engine::hosts_not_armable_now`] (which gates ARMING new
+    /// triggers and so also excludes completion-pending hosts), this predicate
+    /// gates CONSUMED detection only: a completion-pending scope (an
+    /// end-listener chain or a completion-phase incident) already ran its
+    /// activation body and armed its triggers, so an unarmed subscription
+    /// trigger there fired and IS consumed — excluding it would re-arm the
+    /// fired trigger on a scope move and run its handler twice.
+    ///
+    /// A scope is activation-pending while
+    ///
+    /// * a **start** execution-listener job is outstanding on the scope element
+    ///   itself (the chain runs before the activation body), or
+    /// * an active **activation-phase** incident parks the scope element (its
+    ///   redrive re-runs the activation body — a legacy no-redrive ioMapping
+    ///   incident also replays activation), or
+    /// * it is the process root whose start event is still activation-pending
+    ///   ([`Engine::root_pending`]).
+    fn activation_pending(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+        source: &ProcessDefinition,
+        active: &[(Key, ElementId)],
+    ) -> bool {
+        if self.root_pending(instance_key, scope_eik, source, active) {
+            return true;
+        }
+        if scope_eik == 0 {
+            // The root's own activation is its start event's (covered by
+            // `root_pending` above); it carries no listeners or incidents of
+            // its own.
+            return false;
+        }
+        let start_listener_pending = self.state.jobs.values().any(|j| {
+            j.element_instance_key == scope_eik
+                && matches!(
+                    j.kind,
+                    state::JobKind::ExecutionListener {
+                        event_type: crate::model::ListenerEventType::Start,
+                        ..
+                    }
+                )
+                && matches!(
+                    j.state,
+                    state::JobState::Created | state::JobState::Activated | state::JobState::Failed
+                )
+        });
+        if start_listener_pending {
+            return true;
+        }
+        self.state.incidents.values().any(|inc| {
+            inc.element_instance_key == scope_eik
+                && inc.state == state::IncidentState::Active
+                && match &inc.redrive {
+                    // A legacy no-redrive ioMapping incident replays activation.
+                    None => inc.kind == state::IncidentKind::IoMapping,
+                    Some(redrive) => redrive.redrives_activation(),
+                }
+        })
     }
 
     /// Whether scope `scope_eik` is the process root and its arming is still

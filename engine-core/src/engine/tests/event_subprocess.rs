@@ -2484,3 +2484,219 @@ fn migration_arms_an_event_subprocess_moved_out_of_an_activation_pending_scope()
         .unwrap();
     assert_eq!(armed(&engine, inst), 1, "armed at the steady root");
 }
+
+#[test]
+fn migration_does_not_rearm_a_consumed_event_subprocess_moved_out_of_a_completion_pending_scope() {
+    // #1379 review: a scope parked in its COMPLETION phase (here: an
+    // end-listener job is outstanding) already ran its activation body and
+    // armed its event sub-process triggers, so a one-shot trigger that is no
+    // longer armed there FIRED and is consumed. Moving that event sub-process
+    // to the steady root must not arm it again — its handler already ran.
+    //
+    // Only ACTIVATION-pending scopes are exempt from consumed detection; a
+    // completion-pending scope is not (#1379 review r4579294280).
+    use crate::model::{ExecutionListener, ListenerEventType};
+    let model = |esp_in_sub: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .service_task("work", "w")
+            .end_event("sub_e")
+            .end_event("e")
+            .connect("s", "sub")
+            .connect("sub_s", "work")
+            .connect("work", "sub_e")
+            .connect("sub", "e")
+            .contained_in("sub_s", "sub")
+            .contained_in("work", "sub")
+            .contained_in("sub_e", "sub")
+            .with_listeners(
+                "sub",
+                vec![],
+                vec![ExecutionListener {
+                    event_type: ListenerEventType::End,
+                    job_type: "gate".into(),
+                    retries: None,
+                }],
+            )
+            .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+            .start_event("esp_start")
+            .service_task("esp_work", "esp")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_work")
+            .connect("esp_work", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_work", "esp")
+            .contained_in("esp_end", "esp");
+        if esp_in_sub {
+            b = b.contained_in("esp", "sub");
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model(true));
+    assert_eq!(armed(&engine, inst), 1, "sub armed its timer on activation");
+    // Fire the one-shot timer inside `sub`; its handler runs and is consumed.
+    let fired = fire(&mut engine, inst, T::Timer, 5_000);
+    assert!(esp_activated(&fired));
+    complete_one(&mut engine, "esp");
+    assert_eq!(armed(&engine, inst), 0, "consumed: no armed trigger");
+    // Complete `work`: `sub` enters its completion phase and parks on the
+    // outstanding end-listener job — completion-pending, not activation-pending.
+    complete_one(&mut engine, "w");
+    assert_eq!(
+        job_count(&mut engine, "gate"),
+        1,
+        "end listener outstanding"
+    );
+    assert!(
+        engine.state.instances[&inst]
+            .active
+            .values()
+            .any(|id| id == "sub"),
+        "the completion-pending sub-process is still live"
+    );
+
+    // Migrate: `esp` moves from the completion-pending `sub` to the root.
+    let target_key = deploy_for_migration(&mut engine, model(false));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("sub".into(), "sub".into())],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "the fired timer is not re-armed at the root"
+    );
+    let fired = fire(&mut engine, inst, T::Timer, 10_000);
+    assert!(
+        !esp_activated(&fired),
+        "the consumed handler does not run a second time"
+    );
+}
+
+#[test]
+fn migration_keeps_an_armed_trigger_when_a_sibling_hosts_consumed_counterpart_moves() {
+    // #1379 review r4579294264: two concurrent instances of a non-interrupting
+    // event sub-process `esp1` each host the embedded sub-process `sub`, which
+    // hosts a one-shot timer event sub-process `inner`. The timer already fired
+    // in the FIRST host (consumed) and is still armed in the SECOND. Moving
+    // `inner` from the first host's `sub` into `sub` itself cancels the second
+    // host's armed timer — the consumed counterpart must suppress a replacement
+    // only in ITS OWN destination scope, never in the second host's.
+    let model = |inner_in_sub: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            // Non-interrupting signal event sub-process at the root; each fire
+            // starts another instance hosting `sub`.
+            .event_sub_process("esp1", "esp1_start", sig(), false)
+            .start_event("esp1_start")
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .service_task("sub_work", "sw")
+            .end_event("sub_e")
+            .end_event("esp1_end")
+            .connect("esp1_start", "sub")
+            .connect("sub_s", "sub_work")
+            .connect("sub_work", "sub_e")
+            .connect("sub", "esp1_end")
+            .contained_in("esp1_start", "esp1")
+            .contained_in("sub", "esp1")
+            .contained_in("sub_s", "sub")
+            .contained_in("sub_work", "sub")
+            .contained_in("sub_e", "sub")
+            .contained_in("esp1_end", "esp1")
+            // One-shot timer event sub-process (in `sub` in the source, at the
+            // root in the target when `inner_in_sub` is false).
+            .event_sub_process("inner", "inner_start", trig_of(T::Timer), false)
+            .start_event("inner_start")
+            .service_task("inner_work", "inner")
+            .end_event("inner_end")
+            .connect("inner_start", "inner_work")
+            .connect("inner_work", "inner_end")
+            .contained_in("inner_start", "inner")
+            .contained_in("inner_work", "inner")
+            .contained_in("inner_end", "inner");
+        if inner_in_sub {
+            b = b.contained_in("inner", "sub");
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model(true));
+    // Two concurrent `esp1` instances, each hosting a live `sub`.
+    fire(&mut engine, inst, T::Signal, 0);
+    fire(&mut engine, inst, T::Signal, 0);
+    let mut subs: Vec<Key> = engine.state.instances[&inst]
+        .active
+        .iter()
+        .filter_map(|(k, id)| (id == "sub").then_some(*k))
+        .collect();
+    subs.sort_unstable();
+    assert_eq!(subs.len(), 2, "two live `sub` hosts");
+    assert_eq!(armed(&engine, inst), 3, "esp1's signal + two inner timers");
+    // The FIRST host's one-shot timer fired: its `inner` ran and is consumed.
+    // (`trigger_timers` would fire BOTH hosts' timers, so mark the fired one
+    // directly — a `Triggered` timer is exactly what a real fire leaves behind,
+    // and `armed_event_subprocess_triggers` reads only `Created` ones.)
+    let fired_key = engine
+        .state
+        .timers
+        .values()
+        .find(|t| {
+            t.instance_key == inst
+                && t.element_instance_key == subs[0]
+                && t.state == crate::state::TimerState::Created
+        })
+        .map(|t| t.key)
+        .expect("the first host's inner timer is armed");
+    engine
+        .state
+        .timers
+        .get_mut(&fired_key)
+        .expect("the timer exists")
+        .state = crate::state::TimerState::Triggered;
+    assert_eq!(
+        armed(&engine, inst),
+        2,
+        "the second host's timer is still armed"
+    );
+
+    // Migrate: `inner` moves from each host's `sub` to the ROOT.
+    let target_key = deploy_for_migration(&mut engine, model(false));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("work".into(), "work".into()),
+                ("esp1".into(), "esp1".into()),
+                ("sub".into(), "sub".into()),
+                ("sub_work".into(), "sub_work".into()),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        2,
+        "the armed host's timer is re-armed at the root; the consumed one is not"
+    );
+    // The surviving timer is armed at the root: firing it activates `inner`
+    // (the consumed counterpart stays silent).
+    let fired = fire(&mut engine, inst, T::Timer, 10_000);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::ElementActivated { element_id, .. } if element_id == "inner"
+        )),
+        "the surviving timer fires its handler"
+    );
+}
