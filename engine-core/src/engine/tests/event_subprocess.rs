@@ -2106,3 +2106,279 @@ fn migration_does_not_arm_root_triggers_while_the_start_listener_is_pending() {
     complete_one(&mut engine, "gate");
     assert_eq!(armed(&engine, inst), 1, "armed exactly once");
 }
+
+#[test]
+fn migration_arms_a_new_root_event_subprocess_despite_a_completion_incident() {
+    // #1379 review r4579023810: a root start event parked in COMPLETING — an
+    // output-mapping (`Completion`) incident, or an `end`-listener job that
+    // failed to mint — resumes COMPLETION on resolution, never its activation
+    // body (which is what arms the root's event sub-processes). The root is
+    // therefore already steady, so migration must arm a newly added root event
+    // sub-process, not skip it as "activation pending".
+    use crate::model::{ExecutionListener, IoMapping, ListenerEventType, Mapping};
+
+    // Case (a): an output-mapping (`Completion`) incident on the start event.
+    let out_mapping = || IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![Mapping {
+            source: "=assert(bad, bad instance of number) + 1".into(),
+            target: "exported".into(),
+        }],
+    };
+    let base = |with_esp: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .with_io("s", out_mapping())
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e");
+        if with_esp {
+            b = b
+                .event_sub_process("esp", "esp_start", sig(), false)
+                .start_event("esp_start")
+                .service_task("esp_work", "esp")
+                .end_event("esp_end")
+                .connect("esp_start", "esp_work")
+                .connect("esp_work", "esp_end")
+                .contained_in("esp_start", "esp")
+                .contained_in("esp_work", "esp")
+                .contained_in("esp_end", "esp");
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(base(false)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("bad", Value::Str("oops".into()))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The start event's output mapping fails on completion: it parks in
+    // COMPLETING with a `Completion` incident (its activation already ran).
+    let incident = engine.active_incidents();
+    assert_eq!(incident.len(), 1, "output mapping parked one incident");
+    assert_eq!(incident[0].element_id, "s");
+    assert_eq!(armed(&engine, inst), 0, "source has no event sub-process");
+    let target_key = deploy_for_migration(&mut engine, base(true));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("s".into(), "s".into()), ("work".into(), "work".into())],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        1,
+        "completion-phase incident does not block arming a new root event sub-process"
+    );
+
+    // Case (b): an `end`-listener job-type failure on the start event (an
+    // `ExecutionListenerJob { End }` incident — resolution resumes completion).
+    let end_listener = || {
+        vec![ExecutionListener {
+            event_type: ListenerEventType::End,
+            // A job-type expression that fails to evaluate -> the listener job
+            // cannot be minted, parking the start event in COMPLETING.
+            job_type: "=missing_var".into(),
+            retries: None,
+        }]
+    };
+    let base_el = |with_esp: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .with_listeners("s", vec![], end_listener());
+        if with_esp {
+            b = b
+                .event_sub_process("esp", "esp_start", sig(), false)
+                .start_event("esp_start")
+                .service_task("esp_work", "esp")
+                .end_event("esp_end")
+                .connect("esp_start", "esp_work")
+                .connect("esp_work", "esp_end")
+                .contained_in("esp_start", "esp")
+                .contained_in("esp_work", "esp")
+                .contained_in("esp_end", "esp");
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, base_el(false));
+    let incident = engine.active_incidents();
+    assert_eq!(incident.len(), 1, "end-listener mint parked one incident");
+    assert_eq!(incident[0].element_id, "s");
+    assert_eq!(armed(&engine, inst), 0);
+    let target_key = deploy_for_migration(&mut engine, base_el(true));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("s".into(), "s".into()), ("work".into(), "work".into())],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        1,
+        "end-listener completion incident does not block arming a new root event sub-process"
+    );
+}
+
+#[test]
+fn migration_recreates_a_retained_trigger_whose_start_event_is_remapped() {
+    // #1379 review (previously missed): an unchanged event sub-process whose
+    // START EVENT is mapped away (`esp_start -> s`, onto the process start
+    // event) must NOT be retained — `ProcessInstanceMigrated` would re-point
+    // the retained trigger's `element_id` at that wrong element. It is deleted
+    // and re-created under the target event sub-process's actual start event.
+    for t in ALL {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, esp_model(trig_of(t), false, false));
+        assert_eq!(armed(&engine, inst), 1, "{t:?}: source trigger armed");
+        // Identical event sub-process in the target (same `esp`/`esp_start`),
+        // but the mapping redirects `esp_start` onto the process start event.
+        let mut target = esp_model(trig_of(t), false, false);
+        target.name = Some("v2".into());
+        let target_key = deploy_for_migration(&mut engine, target);
+        let events = engine
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![
+                    ("work".into(), "work".into()),
+                    ("esp".into(), "esp".into()),
+                    ("esp_start".into(), "s".into()),
+                ],
+            ))
+            .unwrap();
+        // Exactly one trigger survives, and it is re-created (not retained).
+        assert_eq!(armed(&engine, inst), 1, "{t:?}: exactly one trigger");
+        let recreated = events.iter().any(|e| match e {
+            Event::ProcessInstanceMigrated { subscriptions, .. } => {
+                matches!(t, T::Conditional)
+                    || subscriptions.iter().any(|s| {
+                        s.element_id == "esp_start"
+                            && s.action == crate::event::SubscriptionMigrationAction::Recreated
+                    })
+            }
+            _ => false,
+        });
+        assert!(recreated, "{t:?}: re-created under the real start event");
+        // The live trigger names the event sub-process's start event, not the
+        // process start event the mapping pointed at.
+        let names_esp_start = match t {
+            T::Timer => engine
+                .state
+                .timers
+                .values()
+                .any(|x| x.instance_key == inst && x.element_id == "esp_start"),
+            T::Message => engine
+                .state
+                .message_subscriptions
+                .values()
+                .any(|x| x.instance_key == inst && x.element_id == "esp_start"),
+            T::Signal => engine
+                .state
+                .signal_subscriptions
+                .values()
+                .any(|x| x.instance_key == inst && x.element_id == "esp_start"),
+            T::Conditional => engine
+                .state
+                .conditional_subscriptions
+                .values()
+                .any(|x| x.instance_key == inst && x.element_id == "esp_start"),
+        };
+        assert!(names_esp_start, "{t:?}: trigger names esp_start, not s");
+        let fired = fire(&mut engine, inst, t, 5_000);
+        assert!(esp_activated(&fired), "{t:?}: re-created trigger fires");
+    }
+}
+
+#[test]
+fn migration_does_not_rearm_a_consumed_event_subprocess_moved_into_a_live_scope() {
+    // #1379 review (previously missed): a non-interrupting one-shot timer event
+    // sub-process that already FIRED (and completed) at the root, then moved
+    // into an already-live embedded sub-process, must not be armed again — its
+    // handler already ran. The consumed source counterpart is preserved across
+    // the scope move.
+    //
+    // Target: the SAME event sub-process now lives inside the embedded
+    // sub-process `sub` (which is already live in the source instance).
+    let target = esp_model(trig_of(T::Timer), false, true);
+
+    let mut engine = Engine::new();
+    // Source: the event sub-process at the ROOT, with a live embedded
+    // sub-process `sub` alongside (so `sub` is an active scope at migration).
+    let src_with_sub = ProcessBuilder::new("p")
+        .start_event("s")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("work", "w")
+        .end_event("sub_e")
+        .end_event("e")
+        .connect("s", "sub")
+        .connect("sub_s", "work")
+        .connect("work", "sub_e")
+        .connect("sub", "e")
+        .contained_in("sub_s", "sub")
+        .contained_in("work", "sub")
+        .contained_in("sub_e", "sub")
+        // The event sub-process at the ROOT (not inside `sub`).
+        .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .build()
+        .unwrap();
+    let inst = start(&mut engine, src_with_sub);
+    // Fire the root one-shot timer: the event sub-process runs and is consumed.
+    let fired = fire(&mut engine, inst, T::Timer, 5_000);
+    assert!(esp_activated(&fired));
+    complete_one(&mut engine, "esp");
+    assert_eq!(armed(&engine, inst), 0, "consumed: no armed trigger");
+    assert!(
+        engine.state.instances[&inst]
+            .active
+            .values()
+            .any(|id| id == "sub"),
+        "the embedded sub-process is still live"
+    );
+
+    // Migrate: `esp` moves from the root into the live `sub` scope.
+    let target_key = deploy_for_migration(&mut engine, target);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("sub".into(), "sub".into()),
+                ("work".into(), "work".into()),
+                ("esp".into(), "esp".into()),
+                ("esp_work".into(), "esp_work".into()),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "consumed event sub-process is not re-armed after the scope move"
+    );
+    let fired = fire(&mut engine, inst, T::Timer, 10_000);
+    assert!(
+        !esp_activated(&fired),
+        "the consumed handler does not run a second time"
+    );
+}

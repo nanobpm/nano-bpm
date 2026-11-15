@@ -893,6 +893,26 @@ impl Engine {
         }
         let armed = self.armed_event_subprocess_triggers(instance_key);
         let counterpart = |id: &ElementId| mapped.get(id).cloned().unwrap_or_else(|| id.clone());
+        // Target event sub-process ids accounted for by a CONSUMED source
+        // counterpart: a source event sub-process (in ANY live scope) that
+        // carries a subscription trigger but is no longer armed (a one-shot
+        // timer that already fired). Such a counterpart must never be
+        // (re-)armed — its handler already ran. This set is GLOBAL across
+        // scopes so a consumed source event sub-process that the migration
+        // moves into a different (already-live) scope still suppresses its
+        // target counterpart: a per-scope `covered` set would lose it the
+        // moment it crosses a scope boundary and arm it again, running its
+        // handler twice (#1379 review).
+        let armed_source_esp_ids: HashSet<&str> = armed.iter().map(|t| t.esp_id.as_str()).collect();
+        let mut consumed: HashSet<ElementId> = HashSet::new();
+        for (_, source_scope, _) in &scopes {
+            for e in ArmableEsp::in_scope(source, source_scope.as_deref()) {
+                if e.trigger.is_subscription() && !armed_source_esp_ids.contains(e.esp_id.as_str())
+                {
+                    consumed.insert(counterpart(&e.esp_id));
+                }
+            }
+        }
         for (scope_eik, source_scope, target_scope) in scopes {
             let source_esps = ArmableEsp::in_scope(source, source_scope.as_deref());
             let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
@@ -918,8 +938,20 @@ impl Engine {
                 let tgt = target_esps.iter().find(|e| e.esp_id == tgt_id);
                 let retained = match (src, tgt) {
                     (Some(s), Some(g)) => {
+                        // The trigger is retained only when it survives the
+                        // `ProcessInstanceMigrated` remap naming the TARGET
+                        // start event: the source start event's mapped
+                        // counterpart must be the target's start event.
+                        // Otherwise (a mapping such as `esp_start -> s`
+                        // redirects it, e.g. onto the process start event) the
+                        // applier would re-point the retained trigger's
+                        // `element_id` at that wrong element, and a repeating
+                        // timer would keep the incorrect id — so delete and
+                        // re-create it under the target's actual start event
+                        // instead (#1379 review).
                         s.esp_id == g.esp_id
                             && s.start_id == g.start_id
+                            && counterpart(&s.start_id) == g.start_id
                             && t.start_id == g.start_id
                             && s.trigger == g.trigger
                             && s.interrupting == g.interrupting
@@ -966,10 +998,13 @@ impl Engine {
             });
             if !interrupted
                 && !not_armable.contains(&scope_eik)
-                && !self.root_pending(instance_key, scope_eik, source, active, not_armable)
+                && !self.root_pending(instance_key, scope_eik, source, active)
             {
                 for g in &target_esps {
-                    if !covered.contains(&g.esp_id) && !to_arm.contains(&g.esp_id) {
+                    if !covered.contains(&g.esp_id)
+                        && !consumed.contains(&g.esp_id)
+                        && !to_arm.contains(&g.esp_id)
+                    {
                         to_arm.push(g.esp_id.clone());
                     }
                 }
@@ -1018,40 +1053,68 @@ impl Engine {
 
     /// Whether scope `scope_eik` is the process root and its arming is still
     /// pending: the root arms its event sub-processes in the process start
-    /// event's activation body, so while that start event waits on a start
-    /// execution listener (or an activation-redriving incident) the root is
-    /// not steady — arming now would be repeated when the start event's body
-    /// runs (#1379 review).
+    /// event's activation body, so while that start event's activation will
+    /// still (re-)run the root is not steady — arming now would be repeated
+    /// when the start event's body runs (#1379 review).
+    ///
+    /// The start event's activation re-runs in exactly two parked states:
+    ///
+    /// * a **start** execution-listener job is outstanding (the chain runs
+    ///   before the body), or
+    /// * an **activation-phase** incident parks it (its redrive re-runs the
+    ///   activation body — see [`state::IoMappingRedrive::redrives_activation`];
+    ///   a legacy no-redrive ioMapping incident also replays activation).
+    ///
+    /// A **completion-phase** incident (an output-mapping `Completion` failure,
+    /// or an `end`-listener chain that failed to mint) does NOT make the root
+    /// pending: resolving it resumes the start event's completion, never its
+    /// activation, so the root is already steady and may be armed (#1379
+    /// review r4579023810).
     fn root_pending(
         &self,
         instance_key: Key,
         scope_eik: Key,
         source: &ProcessDefinition,
         active: &[(Key, ElementId)],
-        not_armable: &HashSet<Key>,
     ) -> bool {
         scope_eik == 0
             && active.iter().any(|(eik, id)| {
-                not_armable.contains(eik)
-                    && self.scope_of(instance_key, *eik) == 0
+                self.scope_of(instance_key, *eik) == 0
                     && source.element(id).is_some_and(|e| e.kind.is_start_event())
-                    && !self.state.jobs.values().any(|j| {
-                        j.element_instance_key == *eik
-                            && matches!(
-                                j.kind,
-                                state::JobKind::ExecutionListener {
-                                    event_type: crate::model::ListenerEventType::End,
-                                    ..
-                                }
-                            )
-                            && matches!(
-                                j.state,
-                                state::JobState::Created
-                                    | state::JobState::Activated
-                                    | state::JobState::Failed
-                            )
-                    })
+                    && self.start_event_activation_pending(*eik)
             })
+    }
+
+    /// Whether element instance `eik` (a process-level start event) is parked
+    /// in a state that will re-run its activation body: an outstanding **start**
+    /// execution-listener job, or an active **activation-phase** incident.
+    fn start_event_activation_pending(&self, eik: Key) -> bool {
+        let start_listener_pending = self.state.jobs.values().any(|j| {
+            j.element_instance_key == eik
+                && matches!(
+                    j.kind,
+                    state::JobKind::ExecutionListener {
+                        event_type: crate::model::ListenerEventType::Start,
+                        ..
+                    }
+                )
+                && matches!(
+                    j.state,
+                    state::JobState::Created | state::JobState::Activated | state::JobState::Failed
+                )
+        });
+        if start_listener_pending {
+            return true;
+        }
+        self.state.incidents.values().any(|inc| {
+            inc.element_instance_key == eik
+                && inc.state == state::IncidentState::Active
+                && match &inc.redrive {
+                    // A legacy no-redrive ioMapping incident replays activation.
+                    None => inc.kind == state::IncidentKind::IoMapping,
+                    Some(redrive) => redrive.redrives_activation(),
+                }
+        })
     }
 
     /// The `hosts` NOT in their steady active phase (computed in one pass), i.e. a
