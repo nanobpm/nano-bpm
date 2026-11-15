@@ -467,6 +467,19 @@ enum Step {
         /// scope — the same view the failed arming used).
         base: Key,
     },
+    /// Retry ONLY the re-arm of a fired repeating timer cycle whose FEEL
+    /// expression failed ([`state::IoMappingRedrive::TimerCycleRearm`], #1596
+    /// review), resuming its partially consumed repetition count from the
+    /// fired timer's due time — never the host's activation, which would reset
+    /// a bounded cycle to its full count.
+    RetryTimerCycleRearm {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    },
     /// Re-drive the completion of an already-activated multi-instance child
     /// whose `outputElement` / the body's `completionCondition` raised
     /// ([`state::IoMappingRedrive::MiChildCompletion`], #1398 review).
@@ -3132,60 +3145,20 @@ impl Engine {
                                 scope: self.scope_of(instance_key, element_instance_key),
                                 via: None,
                             });
-                            if let Some(ElementKind::TimerBoundaryEvent {
-                                duration_millis,
-                                repeating: true,
-                                ..
-                            }) = self.element_kind(instance_key, &boundary_element_id)
-                            {
-                                // A bounded `Rn/…` cycle stops after its n-th
-                                // fire (Zeebe parity, #1596).
-                                if let Some(next_repetitions) = rearm_repetitions(repetitions) {
-                                    let next_timer_key = self.mint_key();
-                                    // Re-evaluate a FEEL cycle against current vars so
-                                    // the next interval reflects any updated variable;
-                                    // a static cycle keeps its parsed interval.
-                                    let timer_def =
-                                        self.timer_def_of(instance_key, &boundary_element_id);
-                                    let rearm_vars = self
-                                        .variables_for_element(instance_key, element_instance_key);
-                                    match self.resolve_timer(
-                                        &rearm_vars,
-                                        timer_def.as_ref(),
-                                        due_at,
-                                        duration_millis,
-                                    ) {
-                                        Ok(next) => self.emit(
-                                            &mut log,
-                                            Event::TimerCreated {
-                                                timer_key: next_timer_key,
-                                                instance_key,
-                                                element_instance_key,
-                                                element_id: element_id.clone(),
-                                                due_at: next.due_at,
-                                                kind: state::TimerKind::NonInterruptingBoundary {
-                                                    boundary_element_id,
-                                                },
-                                                repetitions: next_repetitions,
-                                            },
-                                        ),
-                                        // The cycle no longer evaluates (a variable it
-                                        // reads changed): raise the host's
-                                        // EXTRACT_VALUE_ERROR rather than silently
-                                        // re-arming on the static interval (#1398).
-                                        Err(failure) => {
-                                            let incident = self.expression_incident(
-                                                instance_key,
-                                                element_instance_key,
-                                                element_id.clone(),
-                                                failure,
-                                                None,
-                                            );
-                                            self.emit(&mut log, incident);
-                                        }
-                                    }
-                                }
-                            }
+                            // A repeating cycle re-arms for the next interval; a
+                            // bounded `Rn/…` cycle stops after its n-th fire
+                            // (Zeebe parity, #1596).
+                            self.rearm_fired_cycle(
+                                &mut log,
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                state::TimerKind::NonInterruptingBoundary {
+                                    boundary_element_id,
+                                },
+                                due_at,
+                                repetitions,
+                            );
                         }
                         // Event sub-process timer: `element_instance_key` is the
                         // enclosing scope, `element_id` the ESP start event. A
@@ -3195,27 +3168,18 @@ impl Engine {
                             interrupting,
                         } => {
                             if !interrupting {
-                                match self.rearm_event_subprocess_timer(
+                                self.rearm_fired_cycle(
+                                    &mut log,
                                     instance_key,
                                     element_instance_key,
-                                    &element_id,
-                                    &esp_element_id,
+                                    element_id.clone(),
+                                    state::TimerKind::EventSubProcess {
+                                        esp_element_id: esp_element_id.clone(),
+                                        interrupting,
+                                    },
                                     due_at,
                                     repetitions,
-                                ) {
-                                    Ok(Some(event)) => self.emit(&mut log, event),
-                                    Ok(None) => {}
-                                    Err(failure) => {
-                                        let incident = self.expression_incident(
-                                            instance_key,
-                                            element_instance_key,
-                                            element_id.clone(),
-                                            failure,
-                                            None,
-                                        );
-                                        self.emit(&mut log, incident);
-                                    }
-                                }
+                                );
                             }
                             self.trigger_event_subprocess(
                                 &mut log,
@@ -3871,6 +3835,22 @@ impl Engine {
                                 boundary_element_id,
                                 base,
                             });
+                        } else if let Some(state::IoMappingRedrive::TimerCycleRearm {
+                            kind,
+                            previous_due_at,
+                            remaining,
+                        }) = redrive
+                        {
+                            // A fired cycle's re-arm failed (#1596 review): retry
+                            // only that re-arm, resuming its remaining count.
+                            queue.push_back(Step::RetryTimerCycleRearm {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                kind,
+                                previous_due_at,
+                                remaining,
+                            });
                         } else if let Some(state::IoMappingRedrive::MiChildCompletion {
                             body_key,
                             output_overlay,
@@ -4069,6 +4049,20 @@ impl Engine {
                                 element_id,
                                 boundary_element_id,
                                 base,
+                            }),
+                            // A fired cycle's re-arm failed (#1596 review):
+                            // retry only that re-arm with its remaining count.
+                            Some(state::IoMappingRedrive::TimerCycleRearm {
+                                kind,
+                                previous_due_at,
+                                remaining,
+                            }) => Some(Step::RetryTimerCycleRearm {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                kind,
+                                previous_due_at,
+                                remaining,
                             }),
                             // An MI child's completion failed: re-drive it,
                             // reusing the preserved call-activity output overlay.
@@ -6851,6 +6845,11 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::RetryTimerCycleRearm {
+                instance_key,
+                element_instance_key: scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
@@ -7266,6 +7265,24 @@ impl Engine {
                 }
                 (events, Vec::new())
             }
+            Step::RetryTimerCycleRearm {
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                previous_due_at,
+                remaining,
+            } => (
+                self.cycle_rearm_events(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    kind,
+                    previous_due_at,
+                    remaining,
+                ),
+                Vec::new(),
+            ),
             Step::RetryMiChildCompletion {
                 instance_key,
                 element_id,
@@ -8001,6 +8018,130 @@ impl Engine {
             job_key: None,
             created_at: self.now,
         }
+    }
+
+    /// Re-arm a fired repeating cycle timer (a non-interrupting boundary or a
+    /// non-interrupting event sub-process timer) for its next interval and emit
+    /// the outcome into `log`: the next `TimerCreated`, nothing once a bounded
+    /// `Rn/…` cycle is exhausted (#1596), or — when the cycle's FEEL expression
+    /// no longer evaluates — the host's `EXTRACT_VALUE_ERROR` (#1398) carrying a
+    /// [`state::IoMappingRedrive::TimerCycleRearm`] descriptor, so resolution
+    /// retries exactly this re-arm with the partially consumed repetition count.
+    #[allow(clippy::too_many_arguments)]
+    fn rearm_fired_cycle(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) {
+        for event in self.cycle_rearm_events(
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind,
+            previous_due_at,
+            remaining,
+        ) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The single canonical cycle re-arm (#1596 review), shared by the timer
+    /// fire path and the [`Step::RetryTimerCycleRearm`] incident redrive so
+    /// both schedule from the same base with the same remaining count.
+    fn cycle_rearm_events(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) -> Vec<Event> {
+        let rearmed = match &kind {
+            state::TimerKind::NonInterruptingBoundary {
+                boundary_element_id,
+            } => self.rearm_boundary_cycle_timer(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                boundary_element_id,
+                previous_due_at,
+                remaining,
+            ),
+            state::TimerKind::EventSubProcess {
+                esp_element_id,
+                interrupting: false,
+            } => self.rearm_event_subprocess_timer(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                esp_element_id,
+                previous_due_at,
+                remaining,
+            ),
+            // One-shot / interrupting timers never re-arm.
+            _ => Ok(None),
+        };
+        match rearmed {
+            Ok(event) => event.into_iter().collect(),
+            Err(failure) => vec![self.expression_incident(
+                instance_key,
+                element_instance_key,
+                element_id,
+                failure,
+                Some(state::IoMappingRedrive::TimerCycleRearm {
+                    kind,
+                    previous_due_at,
+                    remaining,
+                }),
+            )],
+        }
+    }
+
+    /// Re-arm a fired non-interrupting boundary cycle for its next interval.
+    /// A FEEL cycle re-evaluates against current variables; a static cycle
+    /// keeps its parsed interval. `Ok(None)` when the boundary is not a
+    /// repeating cycle or a bounded cycle is exhausted (#1596).
+    fn rearm_boundary_cycle_timer(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        boundary_element_id: &str,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) -> Result<Option<Event>, expression::Failure> {
+        let Some(ElementKind::TimerBoundaryEvent {
+            duration_millis,
+            repeating: true,
+            ..
+        }) = self.element_kind(instance_key, boundary_element_id)
+        else {
+            return Ok(None);
+        };
+        let Some(repetitions) = rearm_repetitions(remaining) else {
+            return Ok(None);
+        };
+        let timer_def = self.timer_def_of(instance_key, boundary_element_id);
+        let vars = self.variables_for_element(instance_key, element_instance_key);
+        let next =
+            self.resolve_timer(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
+        Ok(Some(Event::TimerCreated {
+            timer_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            due_at: next.due_at,
+            kind: state::TimerKind::NonInterruptingBoundary {
+                boundary_element_id: boundary_element_id.to_string(),
+            },
+            repetitions,
+        }))
     }
 
     fn expression_incident(

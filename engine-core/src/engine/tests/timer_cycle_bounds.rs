@@ -184,3 +184,109 @@ fn bounded_cycle_start_timer_stops_after_n_fires() {
         assert_eq!(e.state().instances.len(), 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1596 review: a FEEL cycle whose re-arm fails raises an incident; resolving
+// it must resume the PARTIALLY CONSUMED cycle (remaining count + the fired
+// timer's due time), never reset it to the definition's full `Rn` count. Both
+// re-arm paths (non-interrupting boundary, non-interrupting ESP) are covered.
+// ---------------------------------------------------------------------------
+
+/// Drive an `R3` FEEL cycle (`=cyc`): fire once, break `cyc`, fire again (the
+/// re-arm raises an incident), repair `cyc`, resolve — the resumed cycle must
+/// fire exactly once more (3 fires total) on the original schedule.
+fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process_id: &str) {
+    let cycle = Value::Str("R3/PT5S".into());
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                process_id,
+                HashMap::from([("cyc".to_string(), cycle.clone())]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(armed(&engine), vec![6_000]);
+    engine.trigger_timers(6_000); // fire 1 of 3
+    assert_eq!(armed(&engine), vec![11_000]);
+
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+        ))
+        .unwrap();
+    engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
+    assert!(armed(&engine).is_empty());
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the failed re-arm parks an incident");
+    assert!(matches!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::TimerCycleRearm {
+            previous_due_at: 11_000,
+            remaining: Some(2),
+            ..
+        })
+    ));
+    let incident_key = incidents[0].key;
+
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), cycle)]),
+        ))
+        .unwrap();
+    engine
+        .apply_command_at(Command::resolve_incident(incident_key), 13_000)
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        armed(&engine),
+        vec![16_000],
+        "the retry re-arms only the cycle, from the fired timer's due time"
+    );
+    let fired = engine.trigger_timers(16_000); // fire 3 of 3 — the last
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::TimerTriggered { .. })));
+    assert!(
+        armed(&engine).is_empty(),
+        "R3 fires exactly three times — resolution must not reset the count"
+    );
+    assert!(engine.trigger_timers(1_000_000).is_empty());
+}
+
+#[test]
+fn boundary_cycle_rearm_incident_resumes_remaining_count() {
+    assert_rearm_incident_resumes_remaining_count(boundary_process("=cyc"), "ticker");
+}
+
+#[test]
+fn event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
+    let def = parse(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="esp-feel" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="end" />
+    <bpmn:subProcess id="esp" triggeredByEvent="true">
+      <bpmn:startEvent id="esp_start" isInterrupting="false">
+        <bpmn:timerEventDefinition><bpmn:timeCycle>=cyc</bpmn:timeCycle></bpmn:timerEventDefinition>
+      </bpmn:startEvent>
+      <bpmn:endEvent id="esp_end" />
+      <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+    </bpmn:subProcess>
+  </bpmn:process>
+</bpmn:definitions>"#,
+    );
+    assert_rearm_incident_resumes_remaining_count(def, "esp-feel");
+}
