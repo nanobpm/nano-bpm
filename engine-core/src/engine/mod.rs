@@ -3141,49 +3141,49 @@ impl Engine {
                                 // A bounded `Rn/…` cycle stops after its n-th
                                 // fire (Zeebe parity, #1596).
                                 if let Some(next_repetitions) = rearm_repetitions(repetitions) {
-                                let next_timer_key = self.mint_key();
-                                // Re-evaluate a FEEL cycle against current vars so
-                                // the next interval reflects any updated variable;
-                                // a static cycle keeps its parsed interval.
-                                let timer_def =
-                                    self.timer_def_of(instance_key, &boundary_element_id);
-                                let rearm_vars =
-                                    self.variables_for_element(instance_key, element_instance_key);
-                                match self.resolve_timer(
-                                    &rearm_vars,
-                                    timer_def.as_ref(),
-                                    due_at,
-                                    duration_millis,
-                                ) {
-                                    Ok(next) => self.emit(
-                                        &mut log,
-                                        Event::TimerCreated {
-                                            timer_key: next_timer_key,
-                                            instance_key,
-                                            element_instance_key,
-                                            element_id: element_id.clone(),
-                                            due_at: next.due_at,
-                                            kind: state::TimerKind::NonInterruptingBoundary {
-                                                boundary_element_id,
+                                    let next_timer_key = self.mint_key();
+                                    // Re-evaluate a FEEL cycle against current vars so
+                                    // the next interval reflects any updated variable;
+                                    // a static cycle keeps its parsed interval.
+                                    let timer_def =
+                                        self.timer_def_of(instance_key, &boundary_element_id);
+                                    let rearm_vars = self
+                                        .variables_for_element(instance_key, element_instance_key);
+                                    match self.resolve_timer(
+                                        &rearm_vars,
+                                        timer_def.as_ref(),
+                                        due_at,
+                                        duration_millis,
+                                    ) {
+                                        Ok(next) => self.emit(
+                                            &mut log,
+                                            Event::TimerCreated {
+                                                timer_key: next_timer_key,
+                                                instance_key,
+                                                element_instance_key,
+                                                element_id: element_id.clone(),
+                                                due_at: next.due_at,
+                                                kind: state::TimerKind::NonInterruptingBoundary {
+                                                    boundary_element_id,
+                                                },
+                                                repetitions: next_repetitions,
                                             },
-                                            repetitions: next_repetitions,
-                                        },
-                                    ),
-                                    // The cycle no longer evaluates (a variable it
-                                    // reads changed): raise the host's
-                                    // EXTRACT_VALUE_ERROR rather than silently
-                                    // re-arming on the static interval (#1398).
-                                    Err(failure) => {
-                                        let incident = self.expression_incident(
-                                            instance_key,
-                                            element_instance_key,
-                                            element_id.clone(),
-                                            failure,
-                                            None,
-                                        );
-                                        self.emit(&mut log, incident);
+                                        ),
+                                        // The cycle no longer evaluates (a variable it
+                                        // reads changed): raise the host's
+                                        // EXTRACT_VALUE_ERROR rather than silently
+                                        // re-arming on the static interval (#1398).
+                                        Err(failure) => {
+                                            let incident = self.expression_incident(
+                                                instance_key,
+                                                element_instance_key,
+                                                element_id.clone(),
+                                                failure,
+                                                None,
+                                            );
+                                            self.emit(&mut log, incident);
+                                        }
                                     }
-                                }
                                 }
                             }
                         }
@@ -3254,13 +3254,12 @@ impl Engine {
                     };
                     // A bounded `Rn/…` start cycle stops re-arming after its
                     // n-th fire (#1596).
-                    let next_due_at = if timer.repeating
-                        && rearm_repetitions(timer.repetitions).is_some()
-                    {
-                        Some(due_at.saturating_add(timer.interval_millis))
-                    } else {
-                        None
-                    };
+                    let next_due_at =
+                        if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
+                            Some(due_at.saturating_add(timer.interval_millis))
+                        } else {
+                            None
+                        };
                     self.emit(
                         &mut log,
                         Event::ProcessStartTimerFired {

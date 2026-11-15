@@ -59,7 +59,9 @@ fn assert_boundary_fires_twice(cycle: &str) {
         Event::SequenceFlowTaken { from, to, .. } if from == "tick" && to == "ticked"
     )));
     assert!(
-        !fired.iter().any(|e| matches!(e, Event::TimerCreated { .. })),
+        !fired
+            .iter()
+            .any(|e| matches!(e, Event::TimerCreated { .. })),
         "{cycle}: the 2nd fire is the last — no third TimerCreated"
     );
     assert!(armed(&engine).is_empty());
@@ -136,11 +138,13 @@ fn bounded_cycle_event_subprocess_stops_after_n_fires_and_survives_replay() {
     let mut recovered = Engine::replay(log);
     for e in [&mut engine, &mut recovered] {
         let fired = e.trigger_timers(120_000);
-        assert!(fired
-            .iter()
-            .any(|ev| matches!(ev, Event::TimerTriggered { element_id, .. } if element_id == "esp_start")));
+        assert!(fired.iter().any(
+            |ev| matches!(ev, Event::TimerTriggered { element_id, .. } if element_id == "esp_start")
+        ));
         assert!(
-            !fired.iter().any(|ev| matches!(ev, Event::TimerCreated { .. })),
+            !fired
+                .iter()
+                .any(|ev| matches!(ev, Event::TimerCreated { .. })),
             "R2 fires exactly twice"
         );
         assert!(armed(e).is_empty());

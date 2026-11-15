@@ -468,6 +468,7 @@ mod tests {
             due_at: 5_000,
             state: TimerState::Created,
             kind: TimerKind::IntermediateCatch,
+            repetitions: None,
         });
         idx.insert(&snap);
 

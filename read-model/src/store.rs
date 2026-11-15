@@ -5282,6 +5282,7 @@ fn project_event(
             element_id,
             due_at,
             kind,
+            ..
         } => insert_event_wait(
             tx,
             *timer_key,
@@ -9964,6 +9965,7 @@ mod definition_xml_tests {
         store
             .export(&[
                 &Event::TimerCreated {
+                    repetitions: None,
                     timer_key: 10,
                     instance_key: 7,
                     element_instance_key: 20,
@@ -10287,6 +10289,7 @@ mod definition_xml_tests {
         let store = ReadStore::open(Some(&path)).unwrap();
         let mut state = State::default();
         let timer = |key, state| Timer {
+            repetitions: None,
             key,
             instance_key: 7,
             element_instance_key: 20,
@@ -14147,6 +14150,7 @@ mod element_instance_tests {
         store
             .export(&[
                 &Event::TimerCreated {
+                    repetitions: None,
                     timer_key: 6001,
                     instance_key: INST,
                     element_instance_key: 0,
@@ -14231,6 +14235,7 @@ mod element_instance_tests {
         state.timers.insert(
             4,
             Timer {
+                repetitions: None,
                 key: 4,
                 instance_key: INST,
                 element_instance_key: 0,
