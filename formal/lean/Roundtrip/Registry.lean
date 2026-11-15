@@ -62,6 +62,8 @@ def registry : List KindSpec :=
   [ { keyword := "startEvent", attrs := [] }
   , { keyword := "endEvent", attrs := [] }
   , { keyword := "terminateEndEvent", attrs := [] }
+  , { keyword := "errorEndEvent"
+    , attrs := [ { key := "errorCode", required := false, ty := .str } ] }
   , { keyword := "serviceTask"
     , attrs :=
         [ { key := "jobType", required := true, ty := .str }

@@ -89,6 +89,7 @@ def toBpmn : Kind → BpmnShape
   | .startEvent => ⟨.startEvent, .none, false⟩
   | .endEvent => ⟨.endEvent, .none, false⟩
   | .terminateEndEvent => ⟨.endEvent, .terminate, false⟩
+  | .errorEndEvent => ⟨.endEvent, .error, false⟩
   | .serviceTask => ⟨.serviceTask, .none, false⟩
   | .businessRuleTask => ⟨.businessRuleTask, .none, false⟩
   | .userTask => ⟨.userTask, .none, false⟩
@@ -129,6 +130,7 @@ def fromBpmn : BpmnShape → Option Kind
   | ⟨.startEvent, .timer, false⟩ => some .timerStartEvent
   | ⟨.endEvent, .none, false⟩ => some .endEvent
   | ⟨.endEvent, .terminate, false⟩ => some .terminateEndEvent
+  | ⟨.endEvent, .error, false⟩ => some .errorEndEvent
   | ⟨.serviceTask, .none, false⟩ => some .serviceTask
   | ⟨.businessRuleTask, .none, false⟩ => some .businessRuleTask
   | ⟨.userTask, .none, false⟩ => some .userTask

@@ -585,6 +585,26 @@ pub enum ElementKind {
     /// an embedded sub-process terminates only that sub-process scope and lets
     /// the parent instance continue on the sub-process's outgoing flow.
     TerminateEndEvent,
+    /// An error end event (`<endEvent>` with an `<errorEventDefinition>`, #1592).
+    ///
+    /// On completion it **throws** the BPMN error `error_code` (resolved from the
+    /// `errorRef`'s `<error … errorCode="…">`; empty when the definition carries
+    /// no `errorRef`) exactly like a worker `ThrowJobError`: the catch is resolved
+    /// by [`Engine::find_error_catch`] — walking outward from the throwing element
+    /// instance through its enclosing scopes, an exact code beats a catch-all, and
+    /// an error event sub-process beats an error boundary of equal match (Zeebe
+    /// `CatchEventAnalyzer`). A catch **interrupts** the caught activity (the
+    /// throwing token is consumed by the throw) and routes the error-handling
+    /// path: the boundary's outgoing flow, or the error event sub-process. An
+    /// **uncaught** error raises an `UNHANDLED_ERROR` incident on the end event's
+    /// element instance (the token parks there, its completion withheld, re-driven
+    /// on resolution), matching the unhandled job-error lifecycle.
+    ErrorEndEvent {
+        /// The BPMN error code this event throws (resolved from the `errorRef`'s
+        /// `<error … errorCode="…">`). Empty when the definition carries no
+        /// `errorRef` (an unnamed throw, matched by catch-alls only).
+        error_code: String,
+    },
     /// A service task. On activation it creates a job of `job_type` and the token
     /// rests until the job is completed. `priority` is the *raw* (un-evaluated)
     /// job-priority expression declared via `zeebe:priorityDefinition` (a literal
@@ -1128,6 +1148,7 @@ impl ElementKind {
             ElementKind::StartEvent
             | ElementKind::EndEvent
             | ElementKind::TerminateEndEvent
+            | ElementKind::ErrorEndEvent { .. }
             | ElementKind::ServiceTask { .. }
             | ElementKind::BusinessRuleTask { .. }
             | ElementKind::UserTask(_)
@@ -1174,6 +1195,7 @@ impl ElementKind {
             ElementKind::StartEvent
             | ElementKind::EndEvent
             | ElementKind::TerminateEndEvent
+            | ElementKind::ErrorEndEvent { .. }
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
             | ElementKind::IntermediateThrowEvent
@@ -1212,6 +1234,7 @@ impl ElementKind {
             | ElementKind::TimerStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::TerminateEndEvent => "END_EVENT",
+            ElementKind::ErrorEndEvent { .. } => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::LinkIntermediateThrowEvent { .. } => "INTERMEDIATE_THROW_EVENT",
             ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
@@ -2208,6 +2231,18 @@ impl ProcessBuilder {
     /// then completes that scope.
     pub fn terminate_end_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::TerminateEndEvent)
+    }
+
+    /// Adds an error end event (`<endEvent>` with an `<errorEventDefinition>`;
+    /// see [`ElementKind::ErrorEndEvent`]). Reaching it throws the BPMN error
+    /// `error_code`, resolved to a catch exactly like a job-thrown error.
+    pub fn error_end_event(self, id: impl Into<String>, error_code: impl Into<String>) -> Self {
+        self.add(
+            id,
+            ElementKind::ErrorEndEvent {
+                error_code: error_code.into(),
+            },
+        )
     }
 
     /// Adds a none intermediate throw event (a pass-through; see

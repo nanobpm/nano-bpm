@@ -42,6 +42,7 @@ inductive Kind where
   | startEvent
   | endEvent
   | terminateEndEvent
+  | errorEndEvent
   | serviceTask
   | businessRuleTask
   | userTask
@@ -77,7 +78,7 @@ inductive Kind where
 /-- Every `Kind`, in registry order. The `kinds_complete` theorem certifies this
 list omits nothing. -/
 def Kind.all : List Kind :=
-  [ .startEvent, .endEvent, .terminateEndEvent, .serviceTask, .businessRuleTask
+  [ .startEvent, .endEvent, .terminateEndEvent, .errorEndEvent, .serviceTask, .businessRuleTask
   , .userTask, .exclusiveGateway, .parallelGateway, .inclusiveGateway
   , .eventBasedGateway, .errorBoundaryEvent, .timerIntermediateCatchEvent
   , .timerBoundaryEvent, .messageIntermediateCatchEvent, .messageBoundaryEvent
@@ -94,6 +95,7 @@ def Kind.keyword : Kind → String
   | .startEvent => "startEvent"
   | .endEvent => "endEvent"
   | .terminateEndEvent => "terminateEndEvent"
+  | .errorEndEvent => "errorEndEvent"
   | .serviceTask => "serviceTask"
   | .businessRuleTask => "businessRuleTask"
   | .userTask => "userTask"
@@ -133,6 +135,8 @@ def Kind.schema : Kind → List AttrDecl
   | .startEvent => []
   | .endEvent => []
   | .terminateEndEvent => []
+  | .errorEndEvent =>
+      [ { key := "errorCode", required := false, ty := .str } ]
   | .serviceTask =>
       [ { key := "jobType", required := true, ty := .str }
       , { key := "priority", required := false, ty := .str }

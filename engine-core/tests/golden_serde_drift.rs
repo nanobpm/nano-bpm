@@ -262,6 +262,26 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy escalation"),
     );
 
+    // An error-end-event witness process. Deployed but never instantiated: its
+    // only purpose is to embed `ElementKind::ErrorEndEvent` in the snapshot's
+    // persisted process definitions, so the checked-in golden pins its
+    // serialized tag/fields. Without a witness here the #1069 drift guard would
+    // stay green if a field were added to (or the tag of) the variant changed —
+    // exactly the variant-exhaustiveness blind spot
+    // `snapshot_forward_compat.rs` documents (#1592).
+    let error_end: ProcessDefinition = ProcessBuilder::new("error_end")
+        .start_event("s")
+        .error_end_event("err_end", "E1")
+        .connect("s", "err_end")
+        .build()
+        .expect("build error-end process");
+
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(error_end), T0)
+            .expect("deploy error end"),
+    );
+
     // Instance A: created with variables, its one job activated + completed, so
     // it walks the full lifecycle to a retained-terminal instance. Leaves the
     // `Activated` set empty again (the job completed).
