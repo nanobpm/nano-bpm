@@ -8,6 +8,17 @@ fn parse(xml: &str) -> ProcessDefinition {
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
 }
 
+/// The armed timer's placement — host element instance, element id, kind —
+/// i.e. everything but its due time and remaining count.
+fn armed_placement(engine: &Engine) -> Vec<(Key, ElementId, state::TimerKind)> {
+    engine
+        .timers()
+        .iter()
+        .filter(|t| t.state == state::TimerState::Created)
+        .map(|t| (t.element_instance_key, t.element_id.clone(), t.kind.clone()))
+        .collect()
+}
+
 fn armed(engine: &Engine) -> Vec<u64> {
     let mut v: Vec<u64> = engine
         .timers()
@@ -212,6 +223,8 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
     assert_eq!(armed(&engine), vec![6_000]);
     engine.trigger_timers(6_000); // fire 1 of 3
     assert_eq!(armed(&engine), vec![11_000]);
+    let placement = armed_placement(&engine);
+    assert_eq!(placement.len(), 1);
 
     engine
         .apply_command(Command::set_variables(
@@ -239,10 +252,22 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
             HashMap::from([("cyc".to_string(), cycle)]),
         ))
         .unwrap();
-    engine
+    let resolved = engine
         .apply_command_at(Command::resolve_incident(incident_key), 13_000)
         .unwrap();
     assert!(engine.active_incidents().is_empty());
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::ElementActivating { .. } | Event::ElementActivated { .. }
+        )),
+        "resolution re-arms the timer only — it must not activate any element: {resolved:?}"
+    );
+    assert_eq!(
+        armed_placement(&engine),
+        placement,
+        "the re-armed timer keeps its host scope, element id and kind"
+    );
     assert_eq!(
         armed(&engine),
         vec![16_000],
