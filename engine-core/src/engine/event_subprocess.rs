@@ -37,17 +37,48 @@ use std::collections::{HashMap, VecDeque};
 
 use super::{expression, Engine, Step};
 use crate::{
-    model::{ElementKind, EventSubProcessTrigger, TimerDef},
+    model::{ElementKind, EventSubProcessTrigger, ProcessDefinition, TimerDef},
     state, Event, Key, Value,
 };
 
 /// One armable event sub-process of a scope, cloned out of the definition so
 /// the engine can be mutably borrowed while arming.
-struct ArmableEsp {
-    esp_id: String,
-    start_id: String,
-    trigger: EventSubProcessTrigger,
-    interrupting: bool,
+pub(super) struct ArmableEsp {
+    pub(super) esp_id: String,
+    pub(super) start_id: String,
+    pub(super) trigger: EventSubProcessTrigger,
+    pub(super) interrupting: bool,
+}
+
+impl ArmableEsp {
+    /// The event sub-processes directly contained in scope element `scope`
+    /// (`None` = the process root) of `definition`, sorted by id.
+    pub(super) fn in_scope(definition: &ProcessDefinition, scope: Option<&str>) -> Vec<Self> {
+        definition
+            .event_subprocesses_in_scope(scope)
+            .map(|(esp, start, trigger, interrupting)| ArmableEsp {
+                esp_id: esp.clone(),
+                start_id: start.clone(),
+                trigger: trigger.clone(),
+                interrupting,
+            })
+            .collect()
+    }
+}
+
+/// One still-armed event sub-process trigger of an instance, as migration's
+/// scope-owned reconciliation (#1379) sees it.
+pub(super) struct ArmedEspTrigger {
+    pub(super) key: Key,
+    /// The host scope (`0` = process root).
+    pub(super) scope_eik: Key,
+    pub(super) esp_id: String,
+    /// The start event the trigger is recorded under.
+    pub(super) start_id: String,
+    /// The event disarming it.
+    pub(super) cancel: Event,
+    /// Its audit form (`None` for a conditional subscription).
+    pub(super) report: Option<crate::event::MigratedSubscriptionTrigger>,
 }
 
 impl Engine {
@@ -60,16 +91,7 @@ impl Engine {
         scope_element: Option<&str>,
     ) -> Vec<ArmableEsp> {
         self.process_of_instance(instance_key)
-            .map(|p| {
-                p.event_subprocesses_in_scope(scope_element)
-                    .map(|(esp, start, trigger, interrupting)| ArmableEsp {
-                        esp_id: esp.clone(),
-                        start_id: start.clone(),
-                        trigger: trigger.clone(),
-                        interrupting,
-                    })
-                    .collect()
-            })
+            .map(|p| ArmableEsp::in_scope(p, scope_element))
             .unwrap_or_default()
     }
 
@@ -92,6 +114,21 @@ impl Engine {
         vars: &HashMap<String, Value>,
     ) -> Result<Vec<Event>, expression::Failure> {
         let esps = self.armable_event_subprocesses(instance_key, scope_element);
+        self.arm_event_subprocess_triggers(instance_key, scope_eik, esps, vars)
+    }
+
+    /// Arms the start-event triggers of `esps` on scope `scope_eik` — the one
+    /// arming implementation shared by scope activation
+    /// ([`Self::arm_event_subprocesses`]) and migration's scope-owned trigger
+    /// reconciliation (#1379), which arms the *target* definition's event
+    /// sub-processes before the instance is re-pointed at it.
+    pub(super) fn arm_event_subprocess_triggers(
+        &mut self,
+        instance_key: Key,
+        scope_eik: Key,
+        esps: Vec<ArmableEsp>,
+        vars: &HashMap<String, Value>,
+    ) -> Result<Vec<Event>, expression::Failure> {
         if esps.is_empty() {
             return Ok(Vec::new());
         }
@@ -306,10 +343,14 @@ impl Engine {
         events
     }
 
-    /// The event sub-process element ids (sorted, deduplicated) of every
-    /// still-armed event sub-process trigger of `instance_key`, across all four
-    /// trigger families. Migration rejects an instance with any (#1379).
-    pub(super) fn armed_event_subprocess_ids(&self, instance_key: Key) -> Vec<String> {
+    /// Every still-armed event sub-process trigger of `instance_key` across
+    /// all four trigger families, sorted by key. Migration reconciles them per
+    /// host scope against the target definition (#1379).
+    pub(super) fn armed_event_subprocess_triggers(
+        &self,
+        instance_key: Key,
+    ) -> Vec<ArmedEspTrigger> {
+        use crate::event::MigratedSubscriptionTrigger as Report;
         let esp_of = |k: &state::MessageSubscriptionKind| match k {
             state::MessageSubscriptionKind::EventSubProcess { esp_element_id, .. } => {
                 Some(esp_element_id.clone())
@@ -323,38 +364,94 @@ impl Engine {
             )
         };
         let s = &self.state;
-        let mut ids: Vec<String> = s
-            .timers
-            .values()
-            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
-            .filter_map(|t| match &t.kind {
-                state::TimerKind::EventSubProcess { esp_element_id, .. } => {
-                    Some(esp_element_id.clone())
-                }
-                _ => None,
-            })
-            .chain(
-                s.message_subscriptions
-                    .values()
-                    .filter(|x| x.instance_key == instance_key && open(x.state))
-                    .filter_map(|x| esp_of(&x.kind)),
-            )
-            .chain(
-                s.signal_subscriptions
-                    .values()
-                    .filter(|x| x.instance_key == instance_key && open(x.state))
-                    .filter_map(|x| esp_of(&x.kind)),
-            )
-            .chain(
-                s.conditional_subscriptions
-                    .values()
-                    .filter(|x| x.instance_key == instance_key && open(x.state))
-                    .filter_map(|x| esp_of(&x.kind)),
-            )
-            .collect();
-        ids.sort();
-        ids.dedup();
-        ids
+        let mut out = Vec::new();
+        for t in s.timers.values() {
+            if t.instance_key != instance_key || t.state != state::TimerState::Created {
+                continue;
+            }
+            if let state::TimerKind::EventSubProcess { esp_element_id, .. } = &t.kind {
+                out.push(ArmedEspTrigger {
+                    key: t.key,
+                    scope_eik: t.element_instance_key,
+                    esp_id: esp_element_id.clone(),
+                    start_id: t.element_id.clone(),
+                    cancel: Event::TimerCanceled {
+                        timer_key: t.key,
+                        instance_key: t.instance_key,
+                        element_instance_key: t.element_instance_key,
+                        element_id: t.element_id.clone(),
+                    },
+                    report: Some(Report::Timer {
+                        timer_key: t.key,
+                        due_at: t.due_at,
+                    }),
+                });
+            }
+        }
+        for x in s.message_subscriptions.values() {
+            if x.instance_key != instance_key || !open(x.state) {
+                continue;
+            }
+            if let Some(esp_id) = esp_of(&x.kind) {
+                out.push(ArmedEspTrigger {
+                    key: x.key,
+                    scope_eik: x.element_instance_key,
+                    esp_id,
+                    start_id: x.element_id.clone(),
+                    cancel: Self::disarm_subscription_event(x),
+                    report: Some(Report::Message {
+                        subscription_key: x.key,
+                        message_name: x.message_name.clone(),
+                        correlation_key: x.correlation_key.clone(),
+                    }),
+                });
+            }
+        }
+        for x in s.signal_subscriptions.values() {
+            if x.instance_key != instance_key || !open(x.state) {
+                continue;
+            }
+            if let Some(esp_id) = esp_of(&x.kind) {
+                out.push(ArmedEspTrigger {
+                    key: x.key,
+                    scope_eik: x.element_instance_key,
+                    esp_id,
+                    start_id: x.element_id.clone(),
+                    cancel: Event::SignalSubscriptionCanceled {
+                        subscription_key: x.key,
+                        instance_key: x.instance_key,
+                        element_instance_key: x.element_instance_key,
+                        element_id: x.element_id.clone(),
+                    },
+                    report: Some(Report::Signal {
+                        subscription_key: x.key,
+                        signal_name: x.signal_name.clone(),
+                    }),
+                });
+            }
+        }
+        for x in s.conditional_subscriptions.values() {
+            if x.instance_key != instance_key || !open(x.state) {
+                continue;
+            }
+            if let Some(esp_id) = esp_of(&x.kind) {
+                out.push(ArmedEspTrigger {
+                    key: x.key,
+                    scope_eik: x.element_instance_key,
+                    esp_id,
+                    start_id: x.element_id.clone(),
+                    cancel: Event::ConditionalSubscriptionCanceled {
+                        subscription_key: x.key,
+                        instance_key: x.instance_key,
+                        element_instance_key: x.element_instance_key,
+                        element_id: x.element_id.clone(),
+                    },
+                    report: None,
+                });
+            }
+        }
+        out.sort_by_key(|t| t.key);
+        out
     }
 
     /// Every element instance inside scope `scope_eik` of `instance_key`

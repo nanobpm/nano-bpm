@@ -1106,35 +1106,215 @@ fn conditional_event_subprocess_true_on_entry_fires_before_scope_drains() {
     }
 }
 
+/// `esp_model` without the event sub-process (`s -> work -> e`, or nested in
+/// `sub` when `embedded`).
+fn no_esp_model(embedded: bool) -> ProcessDefinition {
+    let b = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e");
+    let b = if embedded {
+        b.sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .end_event("sub_e")
+            .service_task("after", "after")
+            .connect("s", "sub")
+            .connect("sub_s", "work")
+            .connect("work", "sub_e")
+            .connect("sub", "after")
+            .connect("after", "e")
+            .contained_in("sub_s", "sub")
+            .contained_in("work", "sub")
+            .contained_in("sub_e", "sub")
+    } else {
+        b.connect("s", "work").connect("work", "e")
+    };
+    b.build().unwrap()
+}
+
+fn migrate(engine: &mut Engine, inst: Key, target_key: Key, embedded: bool) -> Vec<Event> {
+    let mut mappings = vec![("work".to_string(), "work".to_string())];
+    if embedded {
+        mappings.push(("sub".into(), "sub".into()));
+    }
+    engine
+        .apply_command(Command::migrate_instance(inst, target_key, mappings))
+        .unwrap()
+}
+
+/// The keys of every still-armed trigger of `inst` (sorted).
+fn armed_keys(engine: &Engine, inst: Key) -> Vec<Key> {
+    use crate::state::{MessageSubscriptionState as S, TimerState};
+    let s = &engine.state;
+    let mut keys: Vec<Key> = s
+        .timers
+        .values()
+        .filter(|t| t.instance_key == inst && t.state == TimerState::Created)
+        .map(|t| t.key)
+        .chain(
+            s.message_subscriptions
+                .values()
+                .filter(|x| x.instance_key == inst && matches!(x.state, S::Open | S::Opening))
+                .map(|x| x.key),
+        )
+        .chain(
+            s.signal_subscriptions
+                .values()
+                .filter(|x| x.instance_key == inst && x.state == S::Open)
+                .map(|x| x.key),
+        )
+        .chain(
+            s.conditional_subscriptions
+                .values()
+                .filter(|x| x.instance_key == inst && x.state == S::Open)
+                .map(|x| x.key),
+        )
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn esp_activated(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "esp"))
+}
+
 #[test]
-fn migrating_an_instance_with_armed_event_subprocess_triggers_is_rejected() {
-    // Scope-owned ESP triggers are not reconciled by migration yet (#1379):
-    // reject explicitly rather than keep a stale trigger armed.
-    for t in ALL {
-        let mut engine = Engine::new();
-        let inst = start(&mut engine, esp_model(trig_of(t), false, false));
-        // A changed target (interrupting flag flipped) so the redeploy is a new
-        // version.
-        let target_key = deploy_for_migration(&mut engine, esp_model(trig_of(t), true, false));
-        let err = engine
-            .apply_command(Command::migrate_instance(
-                inst,
-                target_key,
-                vec![("work".into(), "work".into())],
-            ))
-            .unwrap_err();
-        match err {
-            EngineError::UnsupportedMigration {
-                element_id, reason, ..
-            } => {
-                assert_eq!(element_id, "esp", "{t:?}");
-                assert!(reason.contains("#1379"), "{t:?}: {reason}");
-            }
-            other => panic!("{t:?}: expected UnsupportedMigration, got {other:?}"),
+fn migration_recreates_a_changed_event_subprocess_trigger_on_its_scope() {
+    // #1379: scope-owned ESP triggers are reconciled, not rejected. Flipping
+    // the interrupting flag closes the source trigger and arms the target's;
+    // firing it afterwards runs the TARGET semantics (interrupting: the
+    // sibling `work` is torn down).
+    for embedded in [false, true] {
+        for t in ALL {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
+            let before = armed_keys(&engine, inst);
+            assert_eq!(before.len(), 1, "{t:?}/{embedded}");
+            let target_key =
+                deploy_for_migration(&mut engine, esp_model(trig_of(t), true, embedded));
+            let events = migrate(&mut engine, inst, target_key, embedded);
+            let after = armed_keys(&engine, inst);
+            assert_eq!(after.len(), 1, "{t:?}/{embedded}: exactly one trigger");
+            assert_ne!(after, before, "{t:?}/{embedded}: re-created, not kept");
+            let audited = events.iter().any(|e| match e {
+                Event::ProcessInstanceMigrated { subscriptions, .. } => {
+                    matches!(t, T::Conditional)
+                        || subscriptions.iter().any(|s| {
+                            s.element_id == "esp_start"
+                                && s.action == crate::event::SubscriptionMigrationAction::Recreated
+                        })
+                }
+                _ => false,
+            });
+            assert!(audited, "{t:?}/{embedded}: recreation audited");
+            let fired = fire(&mut engine, inst, t, 5_000);
+            assert!(esp_activated(&fired), "{t:?}/{embedded}: target ESP fires");
+            assert_eq!(
+                job_count(&mut engine, "w"),
+                0,
+                "{t:?}/{embedded}: interrupting"
+            );
+            assert_eq!(job_count(&mut engine, "esp"), 1, "{t:?}/{embedded}");
         }
-        assert_eq!(armed(&engine, inst), 1, "{t:?}: nothing changed");
     }
 }
+
+#[test]
+fn migration_retains_an_unchanged_event_subprocess_trigger() {
+    for embedded in [false, true] {
+        for t in ALL {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
+            let before = armed_keys(&engine, inst);
+            // A distinct version (an extra element) with an identical ESP.
+            let mut target = esp_model(trig_of(t), false, embedded);
+            target.name = Some("v2".into());
+            let target_key = deploy_for_migration(&mut engine, target);
+            migrate(&mut engine, inst, target_key, embedded);
+            assert_eq!(
+                armed_keys(&engine, inst),
+                before,
+                "{t:?}/{embedded}: retained"
+            );
+            let fired = fire(&mut engine, inst, t, 5_000);
+            assert!(esp_activated(&fired), "{t:?}/{embedded}: still fires");
+            assert_eq!(
+                job_count(&mut engine, "w"),
+                1,
+                "{t:?}/{embedded}: non-interrupting"
+            );
+        }
+    }
+}
+
+#[test]
+fn migration_disarms_the_trigger_of_a_removed_event_subprocess() {
+    for embedded in [false, true] {
+        for t in ALL {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
+            let target_key = deploy_for_migration(&mut engine, no_esp_model(embedded));
+            migrate(&mut engine, inst, target_key, embedded);
+            assert_eq!(
+                armed(&engine, inst),
+                0,
+                "{t:?}/{embedded}: no stale trigger"
+            );
+            let fired = fire(&mut engine, inst, t, 5_000);
+            assert!(
+                !esp_activated(&fired),
+                "{t:?}/{embedded}: removed ESP never fires"
+            );
+        }
+    }
+}
+
+#[test]
+fn migration_arms_a_newly_added_event_subprocess() {
+    for embedded in [false, true] {
+        for t in ALL {
+            let mut engine = Engine::new();
+            let inst = start(&mut engine, no_esp_model(embedded));
+            assert_eq!(armed(&engine, inst), 0);
+            let target_key =
+                deploy_for_migration(&mut engine, esp_model(trig_of(t), false, embedded));
+            migrate(&mut engine, inst, target_key, embedded);
+            assert_eq!(armed(&engine, inst), 1, "{t:?}/{embedded}: new ESP armed");
+            let fired = fire(&mut engine, inst, t, 5_000);
+            assert!(esp_activated(&fired), "{t:?}/{embedded}: new ESP fires");
+        }
+    }
+}
+
+#[test]
+fn migration_does_not_rearm_a_fired_one_shot_event_subprocess_timer() {
+    // A non-interrupting one-shot timer ESP that already fired has no armed
+    // trigger; migrating onto the same ESP must not arm it again (its handler
+    // would run twice).
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, esp_model(trig_of(T::Timer), false, false));
+    let fired = fire(&mut engine, inst, T::Timer, 5_000);
+    assert!(esp_activated(&fired));
+    assert_eq!(armed(&engine, inst), 0);
+    let mut target = esp_model(trig_of(T::Timer), false, false);
+    target.name = Some("v2".into());
+    let target_key = deploy_for_migration(&mut engine, target);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("work".into(), "work".into()),
+                ("esp".into(), "esp".into()),
+                ("esp_work".into(), "esp_work".into()),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(armed(&engine, inst), 0, "fired one-shot timer stays fired");
+}
+
 #[test]
 fn esp_output_satisfying_a_sibling_condition_fires_before_the_host_drains() {
     // Review r4557686184: a non-interrupting ESP whose completion output

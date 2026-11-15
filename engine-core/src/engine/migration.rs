@@ -608,6 +608,7 @@ impl Engine {
             .map(|(k, _)| *k)
             .collect();
         let children = self.call_activity_children_of(&call_eiks);
+        let active_snapshot = active.clone();
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
                 // An unmapped host still active here is a withdrawn race member
@@ -775,7 +776,175 @@ impl Engine {
                 }
             }
         }
+        self.plan_event_subprocess_migration(
+            &mut plan,
+            instance_key,
+            source,
+            target,
+            mapped,
+            &active_snapshot,
+            &not_armable,
+        )?;
         Ok(plan)
+    }
+
+    /// Scope-owned event sub-process trigger reconciliation (#1379, Zeebe
+    /// `ProcessInstanceMigrationMigrateProcessor` event-sub-process start
+    /// subscription parity). An event sub-process trigger rests on its host
+    /// *scope* — the process root (`0`) or a migrated embedded / event
+    /// sub-process instance — not on an active element, so the per-element
+    /// pass above never sees it. For every live scope:
+    ///
+    /// * an armed trigger whose event sub-process keeps its id, start event,
+    ///   trigger definition and interrupting flag in the target scope is
+    ///   **retained** untouched;
+    /// * any other armed trigger (event sub-process removed, moved out of the
+    ///   scope, renamed via a mapping instruction, or its trigger changed) is
+    ///   **deleted**, and its target counterpart (if any) is **re-created**;
+    /// * a target event sub-process with no source counterpart in the scope is
+    ///   newly **created** — unless the scope is not in its steady phase or an
+    ///   interrupting event sub-process already took it over.
+    ///
+    /// A source event sub-process whose trigger is no longer armed (a one-shot
+    /// timer that already fired) is never re-armed, so its handler cannot run
+    /// twice. Arming goes through the single shared implementation
+    /// ([`Engine::arm_event_subprocess_triggers`]).
+    #[allow(clippy::too_many_arguments, reason = "planner internals")]
+    fn plan_event_subprocess_migration(
+        &mut self,
+        plan: &mut MigrationPlan,
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &HashMap<String, String>,
+        active: &[(Key, ElementId)],
+        not_armable: &HashSet<Key>,
+    ) -> Result<(), (ElementId, ElementId, expression::Failure)> {
+        use super::event_subprocess::ArmableEsp;
+        // Live scopes: the root, plus every active scope-owning element
+        // instance (embedded / event sub-process) with its mapped target.
+        let mut scopes: Vec<(Key, Option<ElementId>, Option<ElementId>)> = vec![(0, None, None)];
+        for (eik, source_id) in active {
+            let owns = source
+                .element(source_id)
+                .is_some_and(|e| e.kind.owns_token_scope());
+            if !owns {
+                continue;
+            }
+            if let Some(target_id) = mapped.get(source_id) {
+                scopes.push((*eik, Some(source_id.clone()), Some(target_id.clone())));
+            }
+        }
+        let armed = self.armed_event_subprocess_triggers(instance_key);
+        let counterpart = |id: &ElementId| mapped.get(id).cloned().unwrap_or_else(|| id.clone());
+        for (scope_eik, source_scope, target_scope) in scopes {
+            let source_esps = ArmableEsp::in_scope(source, source_scope.as_deref());
+            let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
+            let covered: HashSet<ElementId> =
+                source_esps.iter().map(|e| counterpart(&e.esp_id)).collect();
+            let mut to_arm: Vec<ElementId> = Vec::new();
+            // Target event sub-processes re-armed in place of a deleted source
+            // trigger (vs newly created ones), by start-event id.
+            let mut recreated: HashSet<ElementId> = HashSet::new();
+            for t in armed.iter().filter(|t| t.scope_eik == scope_eik) {
+                let src = source_esps.iter().find(|e| e.esp_id == t.esp_id);
+                let tgt_id = counterpart(&t.esp_id);
+                let tgt = target_esps.iter().find(|e| e.esp_id == tgt_id);
+                let retained = match (src, tgt) {
+                    (Some(s), Some(g)) => {
+                        s.esp_id == g.esp_id
+                            && s.start_id == g.start_id
+                            && t.start_id == g.start_id
+                            && s.trigger == g.trigger
+                            && s.interrupting == g.interrupting
+                    }
+                    _ => false,
+                };
+                if retained {
+                    if let Some(trigger) = t.report.clone() {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: scope_eik,
+                            element_id: t.start_id.clone(),
+                            action: SubscriptionMigrationAction::Retained,
+                            trigger,
+                        });
+                    }
+                    continue;
+                }
+                plan.before.push(t.cancel.clone());
+                if let Some(trigger) = t.report.clone() {
+                    plan.subscriptions.push(MigratedSubscription {
+                        element_instance_key: scope_eik,
+                        element_id: t.start_id.clone(),
+                        action: SubscriptionMigrationAction::Deleted,
+                        trigger,
+                    });
+                }
+                if let Some(g) = tgt {
+                    recreated.insert(g.start_id.clone());
+                    if !to_arm.contains(&tgt_id) {
+                        to_arm.push(tgt_id);
+                    }
+                }
+            }
+            // New target event sub-processes (no source counterpart) arm only
+            // in a steady, not-yet-interrupted scope.
+            let interrupted = active.iter().any(|(eik, id)| {
+                matches!(
+                    source.element(id).map(|e| &e.kind),
+                    Some(ElementKind::EventSubProcess {
+                        interrupting: true,
+                        ..
+                    })
+                ) && self.scope_of(instance_key, *eik) == scope_eik
+            });
+            if !interrupted && !not_armable.contains(&scope_eik) {
+                for g in &target_esps {
+                    if !covered.contains(&g.esp_id) && !to_arm.contains(&g.esp_id) {
+                        to_arm.push(g.esp_id.clone());
+                    }
+                }
+            }
+            let esps: Vec<ArmableEsp> = target_esps
+                .into_iter()
+                .filter(|g| to_arm.contains(&g.esp_id))
+                .collect();
+            if esps.is_empty() {
+                continue;
+            }
+            let vars = self.variables_for_element(instance_key, scope_eik);
+            let fail_ids = (
+                source_scope.unwrap_or_else(|| source.id.clone()),
+                target_scope.unwrap_or_else(|| target.id.clone()),
+            );
+            let events = self
+                .arm_event_subprocess_triggers(instance_key, scope_eik, esps, &vars)
+                .map_err(|f| (fail_ids.0.clone(), fail_ids.1.clone(), f))?;
+            for event in events {
+                if let Some(trigger) = Self::report_of(&event) {
+                    let start_id = match &event {
+                        Event::TimerCreated { element_id, .. }
+                        | Event::MessageSubscriptionCreated { element_id, .. }
+                        | Event::MessageSubscriptionOpening { element_id, .. }
+                        | Event::SignalSubscriptionCreated { element_id, .. } => element_id.clone(),
+                        _ => String::new(),
+                    };
+                    let source_had = recreated.contains(&start_id);
+                    plan.subscriptions.push(MigratedSubscription {
+                        element_instance_key: scope_eik,
+                        element_id: start_id,
+                        action: if source_had {
+                            SubscriptionMigrationAction::Recreated
+                        } else {
+                            SubscriptionMigrationAction::Created
+                        },
+                        trigger,
+                    });
+                }
+                plan.after.push(event);
+            }
+        }
+        Ok(())
     }
 
     /// The `hosts` NOT in their steady active phase (computed in one pass), i.e. a
