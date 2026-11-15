@@ -166,17 +166,53 @@ pub fn parse_duration_millis(raw: &str) -> Option<u64> {
 
 /// BPMN timer helper: parses an ISO-8601 repeating interval (a BPMN `timeCycle`,
 /// e.g. `R/PT1H` or `R5/PT1H`) into the interval in **milliseconds**. The `Rn`
-/// repetition-count prefix is accepted but ignored (the engine repeats
-/// unboundedly). A bare duration without the `R[n]/` prefix is also accepted.
-/// Returns `None` if the interval portion is not a recognisable duration.
+/// repetition count is validated but not returned — see [`parse_cycle`] for the
+/// bounded form. A bare duration without the `R[n]/` prefix is also accepted.
+/// Returns `None` if the cycle is not recognisable.
 pub fn parse_cycle_millis(raw: &str) -> Option<u64> {
+    parse_cycle(raw).map(|c| c.interval_millis)
+}
+
+/// A parsed ISO-8601 repeating interval (a BPMN `timeCycle`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cycle {
+    /// The `n` of an `Rn/…` prefix: the total number of times the cycle fires
+    /// (Zeebe fires an `R2/PT1M` cycle exactly twice, #1596). `None` for an
+    /// unbounded `R/…` cycle or a bare duration.
+    pub repetitions: Option<u32>,
+    /// The period between fires (and the initial delay), in milliseconds.
+    pub interval_millis: u64,
+}
+
+/// Parses an ISO-8601 repeating interval (`R/PT1H`, `R5/PT1H`, or a bare
+/// duration) into its repetition count and interval. Returns `None` if the
+/// repetition prefix or the interval is malformed, or the count is `R0`.
+pub fn parse_cycle(raw: &str) -> Option<Cycle> {
     let s = raw.trim();
-    let interval = match s.split_once('/') {
-        Some((repeat, interval)) if repeat.starts_with('R') => interval,
-        Some(_) => return None,
-        None => s,
+    let (repetitions, interval) = match s.split_once('/') {
+        Some((repeat, interval)) => {
+            let count = repeat.strip_prefix('R')?;
+            let repetitions = if count.is_empty() {
+                None
+            } else if count.bytes().all(|b| b.is_ascii_digit()) {
+                // `R0` (a cycle that never fires) is rejected rather than
+                // accepted as `Some(0)`: every arming path would otherwise
+                // schedule (and fire) the initial occurrence (#1596).
+                match count.parse::<u32>().ok()? {
+                    0 => return None,
+                    n => Some(n),
+                }
+            } else {
+                return None;
+            };
+            (repetitions, interval)
+        }
+        None => (None, s),
     };
-    parse_duration_millis(interval)
+    Some(Cycle {
+        repetitions,
+        interval_millis: parse_duration_millis(interval)?,
+    })
 }
 
 /// Accumulates an integer-valued unit (`num` × `factor` nanoseconds). Returns
@@ -296,6 +332,20 @@ mod tests {
         assert_eq!(parse_cycle_millis("R5/PT1H"), Some(3_600_000));
         assert_eq!(parse_cycle_millis("PT1H"), Some(3_600_000));
         assert_eq!(parse_cycle_millis("X/PT1H"), None);
+        assert_eq!(parse_cycle_millis("Rx/PT1H"), None);
+        assert_eq!(
+            parse_cycle("R2/PT1M"),
+            Some(Cycle {
+                repetitions: Some(2),
+                interval_millis: 60_000
+            })
+        );
+        assert_eq!(parse_cycle("R/PT1M").and_then(|c| c.repetitions), None);
+        assert_eq!(parse_cycle("PT1M").and_then(|c| c.repetitions), None);
+        // Zero repetitions is rejected, never armed (#1596).
+        assert_eq!(parse_cycle("R0/PT1M"), None);
+        assert_eq!(parse_cycle("R00/PT1M"), None);
+        assert_eq!(parse_cycle_millis("R0/PT1M"), None);
     }
 
     #[test]

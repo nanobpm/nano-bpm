@@ -103,17 +103,24 @@ impl Engine {
             };
             match &esp.trigger {
                 EventSubProcessTrigger::Timer(def) => {
-                    let (due_at, _) = self.resolve_timer(vars, Some(def), self.now, 0)?;
+                    let resolved = self.resolve_timer(vars, Some(def), self.now, 0)?;
                     let timer_key = self.mint_key();
                     events.push(Event::TimerCreated {
                         timer_key,
                         instance_key,
                         element_instance_key: scope_eik,
                         element_id: esp.start_id.clone(),
-                        due_at,
+                        due_at: resolved.due_at,
                         kind: state::TimerKind::EventSubProcess {
                             esp_element_id: esp.esp_id.clone(),
                             interrupting: esp.interrupting,
+                        },
+                        // Only a non-interrupting cycle re-arms, so only it
+                        // carries a bounded fire count.
+                        repetitions: if esp.interrupting {
+                            None
+                        } else {
+                            resolved.repetitions
                         },
                     });
                 }
@@ -449,6 +456,7 @@ impl Engine {
         start_id: &str,
         esp_element_id: &str,
         previous_due_at: u64,
+        remaining: Option<u32>,
     ) -> Result<Option<Event>, expression::Failure> {
         let def: Option<TimerDef> = match self.element_kind(instance_key, esp_element_id) {
             Some(ElementKind::EventSubProcess {
@@ -461,8 +469,14 @@ impl Engine {
         let Some(def) = def else {
             return Ok(None);
         };
+        // A bounded `Rn/…` cycle stops after its n-th fire (#1596).
+        let Some(repetitions) = super::rearm_repetitions(remaining) else {
+            return Ok(None);
+        };
         let vars = self.variables_for_element(instance_key, scope_eik);
-        let (due_at, _) = self.resolve_timer(&vars, Some(&def), previous_due_at, 0)?;
+        let due_at = self
+            .resolve_timer(&vars, Some(&def), previous_due_at, 0)?
+            .due_at;
         Ok(Some(Event::TimerCreated {
             timer_key: self.mint_key(),
             instance_key,
@@ -473,6 +487,7 @@ impl Engine {
                 esp_element_id: esp_element_id.to_string(),
                 interrupting: false,
             },
+            repetitions,
         }))
     }
 

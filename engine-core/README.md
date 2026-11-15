@@ -307,7 +307,7 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   event sub-process triggers, then runs the event sub-process; the scope
   completes when it does. A **non-interrupting** trigger runs the event
   sub-process concurrently and **repeatedly** (message / signal stay armed, a
-  timer cycle re-arms — the `Rn` repetition count is not yet honoured, #1596);
+  timer cycle re-arms until its `Rn` repetition count is exhausted, #1596);
   the scope waits for running ones before completing. **Error** (job error by
   code, or catch-all without a code — always interrupting) and **escalation**
   (by code or catch-all, interrupting or non-interrupting) start events catch

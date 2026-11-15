@@ -2040,10 +2040,23 @@ pub(crate) fn parse_with_captures(
                             acc.nodes[idx].timer_repeating = Some(true);
                             acc.nodes[idx].timer_literal = Some(trimmed.to_string());
                             acc.nodes[idx].timer_def_kind = Some(crate::model::TimerDefKind::Cycle);
+                            // Retain the literal as the element's timer
+                            // definition so its `Rn` repetition count bounds
+                            // the cycle at runtime (#1596).
+                            acc.nodes[idx].timer_expr = Some(crate::model::TimerDef {
+                                kind: crate::model::TimerDefKind::Cycle,
+                                expr: trimmed.to_string(),
+                            });
                         } else if let Some(boundary) = cur_boundary.as_mut() {
-                            // A recurring (cycle) timer boundary event.
+                            // A recurring (cycle) timer boundary event. The
+                            // literal is retained as its timer definition so
+                            // its `Rn` repetition count bounds the cycle (#1596).
                             boundary.timer_duration_millis = parse_iso8601_cycle(trimmed);
                             boundary.timer_repeating = true;
+                            boundary.timer_expr = Some(crate::model::TimerDef {
+                                kind: crate::model::TimerDefKind::Cycle,
+                                expr: trimmed.to_string(),
+                            });
                         }
                     }
                 }

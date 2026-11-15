@@ -1255,9 +1255,10 @@ impl Engine {
             ElementKind::TimerBoundaryEvent {
                 duration_millis,
                 interrupting,
+                repeating,
                 ..
             } => {
-                let (due_at, _) = self
+                let resolved = self
                     .resolve_timer(
                         host_vars,
                         boundary.timer.as_ref(),
@@ -1286,7 +1287,14 @@ impl Engine {
                     instance_key,
                     element_instance_key,
                     element_id: host_element_id.to_string(),
-                    due_at,
+                    due_at: resolved.due_at,
+                    // Only a non-interrupting cycle re-arms, so only it carries
+                    // a bounded fire count (#1596).
+                    repetitions: if !*interrupting && *repeating {
+                        resolved.repetitions
+                    } else {
+                        None
+                    },
                     kind,
                 }))
             }
@@ -1399,8 +1407,9 @@ impl Engine {
         let element_id = element.id.clone();
         Ok(match &element.kind {
             ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
-                let (due_at, _) =
-                    self.resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis)?;
+                let due_at = self
+                    .resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis)?
+                    .due_at;
                 let timer_key = self.mint_key();
                 vec![Event::TimerCreated {
                     timer_key,
@@ -1409,6 +1418,7 @@ impl Engine {
                     element_id,
                     due_at,
                     kind: state::TimerKind::IntermediateCatch,
+                    repetitions: None,
                 }]
             }
             ElementKind::MessageIntermediateCatchEvent {

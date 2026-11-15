@@ -1622,6 +1622,22 @@ pub enum IoMappingRedrive {
         /// scope), captured so the retry sees the same view arming did.
         base: Key,
     },
+    /// A **repeating timer cycle**'s FEEL expression failed while the fired
+    /// timer was being re-armed for its next interval (#1596 review): a
+    /// non-interrupting boundary or non-interrupting event sub-process timer
+    /// whose cycle no longer evaluates. Resolution retries ONLY that re-arm —
+    /// never the host's activation, which would re-arm the cycle with the
+    /// definition's full `Rn` repetition count and let a bounded cycle fire
+    /// more than `n` times. Carries the fired timer's `kind`, its `due_at`
+    /// (`previous_due_at`, the base the next interval is scheduled from) and its
+    /// pre-fire `remaining` repetition count, so the re-armed timer resumes the
+    /// partially consumed cycle exactly. Additive brand-new variant — old
+    /// journals never carry it.
+    TimerCycleRearm {
+        kind: TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    },
     /// A multi-instance **child**'s completion failed (its `outputElement` or
     /// the body's `completionCondition` raised — #1398 review): resolution
     /// re-drives the child's completion. `output_overlay` preserves the
@@ -1806,6 +1822,10 @@ pub struct Timer {
     pub state: TimerState,
     /// What the timer guards, and so what firing it does.
     pub kind: TimerKind,
+    /// Remaining fires of a bounded cycle (`Rn/…`) including the next one
+    /// (#1596); `None` when unbounded or not a cycle.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub repetitions: Option<u32>,
 }
 
 /// Lifecycle state of a message subscription.
@@ -2047,6 +2067,10 @@ pub struct StartTimer {
     pub interval_millis: u64,
     /// Whether the timer re-arms after firing (a cycle) or fires once.
     pub repeating: bool,
+    /// Remaining fires of a bounded cycle (`Rn/…`) including the next one
+    /// (#1596); `None` when unbounded or not a cycle.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub repetitions: Option<u32>,
 }
 
 /// A deployed process definition together with the identity the engine assigned

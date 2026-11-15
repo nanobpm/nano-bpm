@@ -1392,6 +1392,17 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
 
 /// Escape the five predefined XML entities for safe emission into attribute values and text
 /// (the inverse of the engine tokenizer's `unescape`). `&` first so we don't double-escape.
+/// The single canonical rendering of a retained [`TimerDef`] as its
+/// `<bpmn:timeDuration|timeCycle|timeDate>` child element.
+fn timer_def_child_xml(def: &nanobpmn_engine_core::TimerDef) -> String {
+    let tag = match def.kind {
+        nanobpmn_engine_core::TimerDefKind::Duration => "timeDuration",
+        nanobpmn_engine_core::TimerDefKind::Cycle => "timeCycle",
+        nanobpmn_engine_core::TimerDefKind::Date => "timeDate",
+    };
+    format!("<bpmn:{tag}>{}</bpmn:{tag}>", xml_escape(&def.expr))
+}
+
 fn xml_escape(s: &str) -> String {
     escape_attr_whitespace(
         s.replace('&', "&amp;")
@@ -2760,7 +2771,11 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             ));
             emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
-            if *repeating && !*interrupting {
+            if let Some(def) = &el.timer {
+                // The retained definition (e.g. a bounded `R2/…` cycle) wins
+                // over the millis fallback so round-trips stay lossless (#1596).
+                out.push_str(&format!("        {}\n", timer_def_child_xml(def)));
+            } else if *repeating && !*interrupting {
                 out.push_str(&format!(
                     "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
                     millis_to_iso8601(*duration_millis)
@@ -2851,7 +2866,9 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
             emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
-            if *repeating {
+            if let Some(def) = &el.timer {
+                out.push_str(&format!("        {}\n", timer_def_child_xml(def)));
+            } else if *repeating {
                 out.push_str(&format!(
                     "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
                     millis_to_iso8601(*interval_millis)
@@ -3166,17 +3183,10 @@ fn emit_esp_start_event(
                 xml_escape(&mid)
             )
         }
-        T::Timer(def) => {
-            let tag = match def.kind {
-                nanobpmn_engine_core::TimerDefKind::Duration => "timeDuration",
-                nanobpmn_engine_core::TimerDefKind::Cycle => "timeCycle",
-                nanobpmn_engine_core::TimerDefKind::Date => "timeDate",
-            };
-            format!(
-                "<bpmn:timerEventDefinition><bpmn:{tag}>{}</bpmn:{tag}></bpmn:timerEventDefinition>",
-                xml_escape(&def.expr)
-            )
-        }
+        T::Timer(def) => format!(
+            "<bpmn:timerEventDefinition>{}</bpmn:timerEventDefinition>",
+            timer_def_child_xml(def)
+        ),
         T::Signal { signal_name } => {
             let sid = signals.get(signal_name).cloned().unwrap_or_default();
             format!(
@@ -5836,6 +5846,40 @@ mod tests {
             reparsed[0].elements["Esp"].kind,
             ElementKind::EventSubProcess { .. }
         ));
+    }
+
+    #[test]
+    fn definition_to_xml_preserves_bounded_start_and_boundary_cycles() {
+        // #1596: a bounded `R2/…` cycle must not widen to unbounded `R/…`
+        // on an XML round-trip, for start and boundary timers alike.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="t">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:timerEventDefinition><bpmn:timeCycle>R2/PT1M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:startEvent>
+    <bpmn:userTask id="T"/>
+    <bpmn:boundaryEvent id="B" attachedToRef="T" cancelActivity="false"><bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT5M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="BE"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="BE"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = parse_bpmn(xml).expect("parses").remove(0);
+        let out = definition_to_xml(&def);
+        assert!(
+            out.contains("<bpmn:timeCycle>R2/PT1M</bpmn:timeCycle>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<bpmn:timeCycle>R3/PT5M</bpmn:timeCycle>"),
+            "{out}"
+        );
+        let reparsed = parse_bpmn(&out).expect("re-parses").remove(0);
+        for id in ["S", "B"] {
+            assert_eq!(def.elements[id].timer, reparsed.elements[id].timer, "{id}");
+            assert_eq!(def.elements[id].kind, reparsed.elements[id].kind, "{id}");
+        }
     }
 
     #[test]
