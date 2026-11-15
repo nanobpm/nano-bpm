@@ -32,7 +32,7 @@
 )]
 
 use nanobpmn_engine_core::{
-    Command, Engine, Event, Key, ProcessDefinition, TimerState, bpmn::parse_bpmn, decode_event_json,
+    bpmn::parse_bpmn, decode_event_json, Command, Engine, Event, Key, ProcessDefinition, TimerState,
 };
 
 fn parse(xml: &str) -> ProcessDefinition {
