@@ -903,16 +903,37 @@ impl Engine {
         // target counterpart: a per-scope `covered` set would lose it the
         // moment it crosses a scope boundary and arm it again, running its
         // handler twice (#1379 review).
-        let armed_source_esp_ids: HashSet<&str> = armed.iter().map(|t| t.esp_id.as_str()).collect();
+        //
+        // Armedness is keyed by `(scope_eik, esp_id)`: the same definition id
+        // can be hosted by several live instances of one scope element, so an
+        // armed trigger in one host must not hide a consumed one in another.
+        // A scope that is not in its steady phase (activation pending) never
+        // armed its triggers yet, so its unarmed event sub-processes are NOT
+        // consumed — they are skipped here (#1379 review).
+        let armed_source: HashSet<(Key, &str)> = armed
+            .iter()
+            .map(|t| (t.scope_eik, t.esp_id.as_str()))
+            .collect();
         let mut consumed: HashSet<ElementId> = HashSet::new();
-        for (_, source_scope, _) in &scopes {
+        for (scope_eik, source_scope, _) in &scopes {
+            if not_armable.contains(scope_eik)
+                || self.root_pending(instance_key, *scope_eik, source, active)
+            {
+                continue;
+            }
             for e in ArmableEsp::in_scope(source, source_scope.as_deref()) {
-                if e.trigger.is_subscription() && !armed_source_esp_ids.contains(e.esp_id.as_str())
+                if e.trigger.is_subscription()
+                    && !armed_source.contains(&(*scope_eik, e.esp_id.as_str()))
                 {
                     consumed.insert(counterpart(&e.esp_id));
                 }
             }
         }
+        // Target event sub-process ids with an ARMED source counterpart in any
+        // scope: arming one in a different scope (a cross-scope move) replaces
+        // an existing trigger, so it is audited as `Recreated`, not `Created`.
+        let armed_targets: HashSet<ElementId> =
+            armed.iter().map(|t| counterpart(&t.esp_id)).collect();
         for (scope_eik, source_scope, target_scope) in scopes {
             let source_esps = ArmableEsp::in_scope(source, source_scope.as_deref());
             let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
@@ -1005,6 +1026,9 @@ impl Engine {
                         && !consumed.contains(&g.esp_id)
                         && !to_arm.contains(&g.esp_id)
                     {
+                        if armed_targets.contains(&g.esp_id) {
+                            recreated.insert(g.start_id.clone());
+                        }
                         to_arm.push(g.esp_id.clone());
                     }
                 }

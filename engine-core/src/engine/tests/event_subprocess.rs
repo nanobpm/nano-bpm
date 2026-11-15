@@ -2317,32 +2317,7 @@ fn migration_does_not_rearm_a_consumed_event_subprocess_moved_into_a_live_scope(
     let mut engine = Engine::new();
     // Source: the event sub-process at the ROOT, with a live embedded
     // sub-process `sub` alongside (so `sub` is an active scope at migration).
-    let src_with_sub = ProcessBuilder::new("p")
-        .start_event("s")
-        .sub_process("sub", "sub_s")
-        .start_event("sub_s")
-        .service_task("work", "w")
-        .end_event("sub_e")
-        .end_event("e")
-        .connect("s", "sub")
-        .connect("sub_s", "work")
-        .connect("work", "sub_e")
-        .connect("sub", "e")
-        .contained_in("sub_s", "sub")
-        .contained_in("work", "sub")
-        .contained_in("sub_e", "sub")
-        // The event sub-process at the ROOT (not inside `sub`).
-        .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
-        .start_event("esp_start")
-        .service_task("esp_work", "esp")
-        .end_event("esp_end")
-        .connect("esp_start", "esp_work")
-        .connect("esp_work", "esp_end")
-        .contained_in("esp_start", "esp")
-        .contained_in("esp_work", "esp")
-        .contained_in("esp_end", "esp")
-        .build()
-        .unwrap();
+    let src_with_sub = root_esp_beside_sub(trig_of(T::Timer));
     let inst = start(&mut engine, src_with_sub);
     // Fire the root one-shot timer: the event sub-process runs and is consumed.
     let fired = fire(&mut engine, inst, T::Timer, 5_000);
@@ -2381,4 +2356,131 @@ fn migration_does_not_rearm_a_consumed_event_subprocess_moved_into_a_live_scope(
         !esp_activated(&fired),
         "the consumed handler does not run a second time"
     );
+}
+
+/// A source model: event sub-process `esp` at the ROOT beside a live embedded
+/// sub-process `sub` (hosting `work`).
+fn root_esp_beside_sub(trigger: Trig) -> ProcessDefinition {
+    ProcessBuilder::new("p")
+        .start_event("s")
+        .sub_process("sub", "sub_s")
+        .start_event("sub_s")
+        .service_task("work", "w")
+        .end_event("sub_e")
+        .end_event("e")
+        .connect("s", "sub")
+        .connect("sub_s", "work")
+        .connect("work", "sub_e")
+        .connect("sub", "e")
+        .contained_in("sub_s", "sub")
+        .contained_in("work", "sub")
+        .contained_in("sub_e", "sub")
+        // The event sub-process at the ROOT (not inside `sub`).
+        .event_sub_process("esp", "esp_start", trigger, false)
+        .start_event("esp_start")
+        .service_task("esp_work", "esp")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_work")
+        .connect("esp_work", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_work", "esp")
+        .contained_in("esp_end", "esp")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn migration_audits_an_armed_trigger_moved_across_scopes_as_recreated() {
+    // #1379 review: an ARMED root event sub-process moved into a live embedded
+    // scope is re-armed there, and the audit reports it as `Recreated` (an
+    // existing trigger replaced), not `Created`.
+    for t in [T::Timer, T::Message, T::Signal] {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, root_esp_beside_sub(trig_of(t)));
+        assert_eq!(armed(&engine, inst), 1, "{t:?}: armed at the root");
+        let target_key = deploy_for_migration(&mut engine, esp_model(trig_of(t), false, true));
+        let events = engine
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![("sub".into(), "sub".into()), ("work".into(), "work".into())],
+            ))
+            .unwrap();
+        assert_eq!(armed(&engine, inst), 1, "{t:?}: re-armed in `sub`");
+        let created = |action| {
+            events.iter().any(|e| match e {
+                Event::ProcessInstanceMigrated { subscriptions, .. } => subscriptions
+                    .iter()
+                    .any(|s| s.element_id == "esp_start" && s.action == action),
+                _ => false,
+            })
+        };
+        assert!(
+            created(crate::event::SubscriptionMigrationAction::Recreated),
+            "{t:?}"
+        );
+        assert!(
+            !created(crate::event::SubscriptionMigrationAction::Created),
+            "{t:?}"
+        );
+    }
+}
+
+#[test]
+fn migration_arms_an_event_subprocess_moved_out_of_an_activation_pending_scope() {
+    // #1379 review: an embedded scope still waiting on its start listener has
+    // never armed its event sub-processes, so they are NOT consumed — moving
+    // one to the steady root arms it there.
+    use crate::model::{ExecutionListener, ListenerEventType};
+    let model = |esp_in_sub: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .service_task("work", "w")
+            .end_event("sub_e")
+            .end_event("e")
+            .connect("s", "sub")
+            .connect("sub_s", "work")
+            .connect("work", "sub_e")
+            .connect("sub", "e")
+            .contained_in("sub_s", "sub")
+            .contained_in("work", "sub")
+            .contained_in("sub_e", "sub")
+            .with_listeners(
+                "sub",
+                vec![ExecutionListener {
+                    event_type: ListenerEventType::Start,
+                    job_type: "gate".into(),
+                    retries: None,
+                }],
+                vec![],
+            )
+            .event_sub_process("esp", "esp_start", sig(), false)
+            .start_event("esp_start")
+            .service_task("esp_work", "esp")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_work")
+            .connect("esp_work", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_work", "esp")
+            .contained_in("esp_end", "esp");
+        if esp_in_sub {
+            b = b.contained_in("esp", "sub");
+        }
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, model(true));
+    assert_eq!(job_count(&mut engine, "gate"), 1);
+    assert_eq!(armed(&engine, inst), 0, "sub not yet activated");
+    let target_key = deploy_for_migration(&mut engine, model(false));
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("sub".into(), "sub".into())],
+        ))
+        .unwrap();
+    assert_eq!(armed(&engine, inst), 1, "armed at the steady root");
 }
