@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A model as the console's built-in "MCP start event" component
+     (io.camunda.mcp.start-message, console/src/lib/builtinComponents.ts)
+     emits it: Camunda's tool fields (unfilled non-optional fields persist as
+     empty values), typed-input groups 1-2 filled, groups 3-5 left empty and
+     therefore absent. Guarded by builtinComponents.test.ts (console) and
+     processes_tools.rs (server). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.0">
+  <bpmn:process id="mcpStartEventTemplate" name="MCP Start Event Template" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="Lookup customer" zeebe:modelerTemplate="io.camunda.mcp.start-message" zeebe:modelerTemplateVersion="1">
+      <bpmn:extensionElements>
+        <zeebe:properties>
+          <zeebe:property name="io.camunda.tool:name" value="lookup_customer" />
+          <zeebe:property name="io.camunda.tool:purpose" value="Look up a customer record." />
+          <zeebe:property name="io.camunda.tool:inputs" value="A customer email and an optional limit." />
+          <zeebe:property name="io.camunda.tool:when_to_use" value="The user asks about a customer." />
+          <zeebe:property name="io.camunda.tool:when_not_to_use" value="" />
+          <zeebe:property name="io.camunda.tool:results" value="" />
+          <zeebe:property name="io.camunda.tool:input_1_name" value="email" />
+          <zeebe:property name="io.camunda.tool:input_1_type" value="string" />
+          <zeebe:property name="io.camunda.tool:input_1_description" value="The customer's email." />
+          <zeebe:property name="io.camunda.tool:input_1_required" value="true" />
+          <zeebe:property name="io.camunda.tool:input_2_name" value="limit" />
+          <zeebe:property name="io.camunda.tool:input_2_type" value="integer" />
+        </zeebe:properties>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_1" messageRef="Message_1" />
+    </bpmn:startEvent>
+    <bpmn:endEvent id="EndEvent_1">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="EndEvent_1" />
+  </bpmn:process>
+  <bpmn:message id="Message_1" name="3f2b8c1e-5d4a-4b6f-9c7e-1a2b3c4d5e6f" />
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="mcpStartEventTemplate">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="150" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_1_di" bpmnElement="EndEvent_1">
+        <dc:Bounds x="242" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="118" />
+        <di:waypoint x="242" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -646,7 +646,10 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             };
             entries[`create.urban-${tpl.id}`] = {
               group: "urban-components",
-              className: "bpmn-icon-service-task",
+              className:
+                tpl.elementType?.value === "bpmn:StartEvent"
+                  ? "bpmn-icon-start-event-message"
+                  : "bpmn-icon-service-task",
               title: tpl.name,
               action: { dragstart: start, click: start },
             };

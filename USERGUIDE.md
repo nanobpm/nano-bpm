@@ -507,6 +507,25 @@ AI agent or MCP client configured for Camunda's `/mcp/cluster` and
 | `/mcp/cluster` | Camunda's 18 static cluster tools: `getClusterStatus`, `getTopology`, `getIncident`, `resolveIncident`, `searchIncidents`, `getProcessDefinition`, `getProcessDefinitionXml`, `searchProcessDefinitions`, `createProcessInstance`, `getProcessInstance`, `searchProcessInstances`, `assignUserTask`, `completeUserTask`, `getUserTask`, `searchUserTaskVariables`, `searchUserTasks`, `getVariable`, `searchVariables`. |
 | `/mcp/processes` | One tool per deployed process whose message start event carries `io.camunda.tool:*` `zeebe:properties` (named `<toolName>_<subscriptionKey>`; description and input schema come from those properties; a call starts an instance and returns `{processInstanceKey}`), plus `searchIncidents`, `getProcessInstance`, and `searchVariables`. |
 
+**Authoring a process tool in the console.** The console modeler ships a
+built-in **MCP start event** component (Camunda's `io.camunda.mcp.start-message`
+element template — same id and version, so models round-trip with Camunda
+Modeler). Apply it to a message start event (or drag it from the palette) and
+fill in *Name*, *What it does*, *Which inputs it needs*, *When to use*, *When not
+to use* and *What the tool returns* — these write Camunda's
+`io.camunda.tool:{name,purpose,inputs,when_to_use,when_not_to_use,results}`
+properties, from which the tool description is built.
+
+**Typed inputs (Nano superset).** Camunda's tool input schema is only
+`businessId`. Nano additionally reads optional
+`io.camunda.tool:input_N_{name,type,description,required}` groups and advertises
+each as a typed property of the tool's `inputSchema` (`type` is one of `string`,
+`integer`, `number`, `boolean`, `object`, `array`, `null`; `required` is `true`
+or `false`); calls are validated against it. The component offers five such
+groups, collapsed as *Typed input N (Nano, optional)*. An unfilled group writes
+no properties, and Camunda ignores `input_N_*`, so the model stays portable —
+on Camunda the tool simply exposes `businessId` only.
+
 Every tool dispatches through the same handler as the matching REST operation,
 and a failed call returns an MCP result with `isError: true` and a
 ProblemDetail payload.
