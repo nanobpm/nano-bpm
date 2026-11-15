@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
-    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_event_json,
+    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_record_json,
     partition_of,
 };
 
@@ -498,7 +498,7 @@ enum TailPolicy {
 fn valid_segment_len(path: &Path) -> io::Result<u64> {
     read_segment_with(path, TailPolicy::DropTorn, |line| {
         let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
-        decode_event_json(json).map(|_| ())
+        decode_journal_event(json).map(|_| ())
     })
     .map(|(_, end)| end)
 }
@@ -1479,16 +1479,36 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
+/// THE journal-line decoder every segment / cold-archive reader goes through
+/// (#1556): a line is a [`Record`](nanobpmn_engine_core::Record) — the
+/// `{"event":…,"operation_reference":N}` envelope or a legacy bare `Event` —
+/// decoded via [`decode_record_json`], so an unknown variant is still the typed
+/// `UnknownVariant` rejection. Replay needs only the event; the reference is
+/// read-side metadata ([`read_segment_records`]).
+fn decode_journal_event(json: &str) -> Result<Event, EventDecodeError> {
+    decode_record_json(json).map(|record| record.event)
+}
+
+/// Reads every journal record (event + `operationReference`, #1556) from a
+/// single segment/log file — the bare `<json>` or the shared writer's
+/// `<partition>\t<json>` line form. Torn-tail contract: [`read_segment_with`].
+pub fn read_segment_records(path: &Path) -> io::Result<Vec<nanobpmn_engine_core::Record>> {
+    read_segment_with(path, TailPolicy::DropTorn, |line| {
+        decode_record_json(line.split_once('\t').map_or(line, |(_, rest)| rest))
+    })
+    .map(|(records, _)| records)
+}
+
 /// Reads and deserializes every event from a single segment/log file (empty if
 /// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::DropTorn, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::DropTorn, decode_journal_event).map(|(events, _)| events)
 }
 
 /// [`read_segment_events`] for a SEALED segment: no torn-tail tolerance — a
 /// damaged final record fails closed ([`TailPolicy::Strict`]).
 fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, TailPolicy::Strict, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::Strict, decode_journal_event).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -1514,9 +1534,9 @@ fn read_segment_events_tagged_with(
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
-        let event = decode_event_json(json)?;
+        let event = decode_journal_event(json)?;
         let tag = tag.unwrap_or_else(|| {
-            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+            (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         Ok((tag, event))
     })
@@ -2147,8 +2167,8 @@ fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
         if line.trim().is_empty() {
             continue;
         }
-        let event =
-            decode_event_json(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         events.push(event);
     }
     Ok(events)
@@ -2189,10 +2209,10 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
             }
             None => (None, line),
         };
-        let event =
-            decode_event_json(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let event = decode_journal_event(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tag = tag.unwrap_or_else(|| {
-            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+            (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         events.push((tag, event));
     }
@@ -2714,11 +2734,35 @@ pub struct MultiSegRecovery {
 /// partition's engine from the combined snapshot + its surviving tail (or a full
 /// replay when there is no snapshot), and returns the shared state plus the
 /// surviving events for the caller's global read-model catch-up.
+///
+/// This is the COLD-start form: every owned partition's engine is being
+/// rebuilt, so every owned partition's not-yet-checkpointed spill rows are
+/// discarded (see [`recover_multi_scoped`]). An online repair that rebuilds
+/// only SOME partitions must call [`recover_multi_scoped`] with just those —
+/// otherwise it deletes a healthy sibling's LIVE spilled payloads (#1575).
 pub fn recover_multi(
     dir: &Path,
     owned: &[u64],
     num_partitions: usize,
     varstore: Option<&crate::varstore::VarStore>,
+) -> io::Result<MultiSegRecovery> {
+    recover_multi_scoped(dir, owned, num_partitions, varstore, owned)
+}
+
+/// [`recover_multi`] with an explicit pending-spill discard scope
+/// (#1487/#1575): recovery discards the not-yet-checkpointed spill rows of
+/// `discard_pending_for` only — exactly the partitions whose engines the
+/// caller is REPLACING with the rebuilt ones (a pending row is stale once the
+/// rebuilt engine holds every variable resident). A partition whose live
+/// engine keeps serving must NOT be in the scope: its pending rows are the
+/// only copy rehydration reads, so deleting them loses or rolls back its
+/// spilled variables.
+pub fn recover_multi_scoped(
+    dir: &Path,
+    owned: &[u64],
+    num_partitions: usize,
+    varstore: Option<&crate::varstore::VarStore>,
+    discard_pending_for: &[u64],
 ) -> io::Result<MultiSegRecovery> {
     fs::create_dir_all(dir)?;
     let active_path = dir.join(ACTIVE_NAME);
@@ -3016,6 +3060,18 @@ pub fn recover_multi(
     // snapshot — same reconstruction as an unsnapshotted partition, but over the
     // complete history rather than only the tail.
     let stored_vars = varstore.map(|vs| vs.load_all());
+    // Pending (not-yet-checkpointed) spill rows are never recovery input
+    // (#1487): one may carry the effect of a torn, re-applied frame. The engines
+    // rebuilt below hold every owned instance's variables resident, so drop the
+    // rebuilt partitions' rows before they could be promoted by a later
+    // checkpoint. The scope is the caller's: a cold boot rebuilds (and discards
+    // for) every owned partition, while an online repair discards ONLY for the
+    // partitions whose engines it actually swaps in — discarding a healthy
+    // sibling's rows would delete its live spilled payloads (#1575 review).
+    if let Some(vs) = varstore {
+        vs.discard_pending(discard_pending_for)
+            .map_err(io::Error::other)?;
+    }
     let engines: Vec<(u64, Engine)> = owned
         .iter()
         .map(|&p| {
@@ -3232,6 +3288,40 @@ pub fn plan_catch_up(exported: u64, floor: u64, surviving: u64) -> CatchUpPlan {
             skip: (exported - floor) as usize,
         }
     }
+}
+
+/// Catches one read-model shard up from the LEGACY single-file journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`), given the full event log and the engine
+/// `state` already rebuilt from it.
+///
+/// Mirrors [`catch_up_shard`]'s `Resume` path so both single-partition boot
+/// paths share one backfill rule: a store migrated from an older schema first
+/// backfills its pending projections (`event_waits`,
+/// `message_start_subscriptions`) from `state`, THEN replays the unexported
+/// tail. A store ahead of the log (truncated/corrupt journal) is reset and
+/// rebuilt from scratch. Returns whether a backfill ran.
+pub fn catch_up_shard_legacy(
+    shard: &crate::readstore::ReadStore,
+    events: &[Event],
+    state: &nanobpmn_engine_core::State,
+) -> rusqlite::Result<bool> {
+    let mut pos = shard.exported_position();
+    if pos > events.len() {
+        shard.reset()?;
+        pos = 0;
+    }
+    let backfilled = shard.backfill_pending_event_waits(state)?;
+    if backfilled {
+        tracing::info!(
+            "backfilled pending read-model projections from the engine state \
+             after the read-model schema upgrade (legacy journal)"
+        );
+    }
+    if pos < events.len() {
+        let refs: Vec<&Event> = events[pos..].iter().collect();
+        shard.export(&refs)?;
+    }
+    Ok(backfilled)
 }
 
 /// Catches one read-model shard up from a segmented recovery, using the single
@@ -3552,6 +3642,119 @@ mod tests {
         );
         assert_eq!(reopened.state().processes.len(), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1481: a COLD (wholly off-heap) instance whose spill-store row is
+    /// definitively absent is quarantined by the rotation fold — and its loss
+    /// must be durably journaled BEFORE the seal, so that once the covered prefix
+    /// compacts away a reopen still reports a `VariablesLost` incident for it.
+    /// Previously the resident-only quarantine command was a no-op for the
+    /// non-resident cold instance, and the loss vanished on restart.
+    #[test]
+    fn cold_orphan_loss_survives_snapshot_compaction_and_reopen() {
+        use nanobpmn_engine_core::{IncidentKind, IncidentState};
+
+        let dir = temp_dir("cold-orphan-durable");
+        let key = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let store =
+                Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+            journal.set_cold_spill(Arc::clone(&store), 1, 0);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
+            assert!(journal.instance(key).is_none(), "precondition: off-heap");
+            store.forget(&[key]).unwrap();
+
+            let (snap, covered) = journal
+                .snapshot_and_rotate()
+                .expect("rotation proceeds past a definitive cold orphan");
+            assert_eq!(journal.quarantined_orphans(), vec![key]);
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "covered prefix compacted");
+
+            // A second rotation does not re-raise (idempotent, index dropped).
+            let (snap2, _) = journal.snapshot_and_rotate().expect("second rotation");
+            assert_eq!(
+                snap2
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| i.instance_key == key)
+                    .count(),
+                1
+            );
+            key
+        };
+
+        let (reopened, _) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(
+            reopened.state().incidents.values().any(|i| {
+                i.instance_key == key
+                    && i.kind == IncidentKind::VariablesLost
+                    && i.state == IncidentState::Active
+            }),
+            "the cold orphan's VariablesLost incident must survive compaction + restart"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1481 review: a cold orphan DISCOVERED by rehydration (a poll / tick /
+    /// command paging it in) BEFORE any rotation drops its cold-index entry, so
+    /// the sealing fold can never rediscover it. Its `VariablesLost` incident
+    /// must therefore be journaled at discovery, or compaction + restart lose it.
+    #[test]
+    fn cold_orphan_found_by_rehydration_before_rotation_survives_reopen() {
+        use nanobpmn_engine_core::{IncidentKind, IncidentState};
+
+        let dir = temp_dir("cold-orphan-rehydrate");
+        let key = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let store =
+                Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+            journal.set_cold_spill(Arc::clone(&store), 1, 0);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
+            store.forget(&[key]).unwrap();
+
+            // Discovery via rehydration, before any rotation.
+            let (_, failed) = journal.rehydrate_all_cold();
+            assert_eq!(failed, 1, "the orphan cannot be restored");
+            assert_eq!(journal.cold_count(), 0, "routing entry dropped");
+
+            let (snap, covered) = journal.snapshot_and_rotate().expect("rotation");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "covered prefix compacted");
+            key
+        };
+
+        let (reopened, _) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(
+            reopened.state().incidents.values().any(|i| {
+                i.instance_key == key
+                    && i.kind == IncidentKind::VariablesLost
+                    && i.state == IncidentState::Active
+            }),
+            "a cold orphan found by rehydration must keep its incident across restart"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4537,6 +4740,161 @@ mod tests {
             inst.variables.get("c"),
             Some(&Value::Int(3i64)),
             "post-checkpoint merge from the journal tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1487 / #1575 review RED/GREEN: an ONLINE repair rebuilds one fenced
+    /// partition's engine from durable state while its healthy siblings keep
+    /// serving — so the recovery-time discard of not-yet-checkpointed spill
+    /// rows must be scoped to the partitions whose engines are actually being
+    /// replaced. Discarding a sibling's pending rows deletes its LIVE spilled
+    /// payloads (the only copy rehydration reads), so its next rehydration
+    /// returns an older checkpointed value or reports the variables missing.
+    /// `recover_multi_scoped` carries the discard scope; a cold boot passes the
+    /// full owned set (every engine is being rebuilt), the online repair only
+    /// the partition it swaps in.
+    #[test]
+    fn scoped_recovery_discards_pending_spills_only_for_rebuilt_partitions() {
+        use std::collections::HashMap;
+
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("lean-scoped-discard");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            assert!(recovery.fresh);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            j1.set_varstore(Arc::clone(&varstore));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // One instance per partition, then a lean checkpoint on both so the
+            // post-checkpoint spills below are genuinely PENDING (never promoted).
+            // Each carries an initial variable so the checkpointed `vars` row is
+            // distinguishable from the pending spill row.
+            let mut init0 = HashMap::new();
+            init0.insert("base".to_string(), Value::Int(0i64));
+            let (e0, c0) = j0
+                .apply_command(Command::create_instance_with("demo", init0))
+                .unwrap();
+            c0.blocking_wait();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let mut init1 = HashMap::new();
+            init1.insert("base".to_string(), Value::Int(0i64));
+            let (e1, c1) = j1
+                .apply_command(Command::create_instance_with("demo", init1))
+                .unwrap();
+            c1.blocking_wait();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            let mut entries = Vec::new();
+            for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
+                let (snap, covered, upserts, forgets) =
+                    j.snapshot_and_rotate_lean().expect("lean checkpoint");
+                let ups: Vec<(nanobpmn_engine_core::Key, &HashMap<String, Value>)> =
+                    upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
+                entries.push((pid, covered, snap));
+            }
+            write_multi_snapshot(&dir, entries).expect("write lean snapshot");
+
+            // Post-checkpoint spills on BOTH partitions: each lands as a pending
+            // row — partition 1's models the healthy sibling's LIVE spill. (The
+            // spill write-through itself is `Journal`-internal, so the test
+            // stages the same pending row directly, exactly as
+            // `Journal::shed_variables` does via `VarStore::put_current`.)
+            let mut v0 = HashMap::new();
+            v0.insert("p0".to_string(), Value::Int(10i64));
+            let (_, c) = j0
+                .apply_command(Command::set_variables(key0, v0.clone()))
+                .unwrap();
+            c.blocking_wait();
+            varstore.put_current(0, key0, &v0).unwrap();
+            let mut v1 = HashMap::new();
+            v1.insert("p1".to_string(), Value::Int(11i64));
+            let (_, c) = j1
+                .apply_command(Command::set_variables(key1, v1.clone()))
+                .unwrap();
+            c.blocking_wait();
+            varstore.put_current(1, key1, &v1).unwrap();
+
+            (key0, key1)
+        };
+
+        // Online repair of partition 0 ONLY: its pending row is stale by
+        // construction (the rebuilt engine holds every variable resident), but
+        // partition 1's engine is NOT being replaced, so its pending row is the
+        // live spilled payload and must survive.
+        let recovery =
+            recover_multi_scoped(&dir, &[0, 1], 2, Some(&varstore), &[0]).expect("scoped recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let rebuilt0 = engines[&0].instance(key0).expect("partition 0 instance");
+        assert_eq!(
+            rebuilt0.variables.get("p0"),
+            Some(&Value::Int(10i64)),
+            "rebuilt from the durable journal tail"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key0)
+                .unwrap()
+                .and_then(|v| v.get("p0").cloned()),
+            None,
+            "rebuilt partition's pending row discarded (only the checkpointed base remains)"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key1)
+                .unwrap()
+                .and_then(|v| v.get("p1").cloned()),
+            Some(Value::Int(11i64)),
+            "untouched sibling's live spill preserved"
+        );
+
+        // A COLD boot rebuilds every owned engine, so the full-scope wrapper
+        // still discards both partitions' pending rows.
+        let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("cold recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert_eq!(
+            engines[&1]
+                .instance(key1)
+                .and_then(|i| i.variables.get("p1")),
+            Some(&Value::Int(11i64)),
+            "cold rebuild restores the sibling from its journal tail"
+        );
+        assert_eq!(
+            varstore
+                .try_get(key1)
+                .unwrap()
+                .and_then(|v| v.get("p1").cloned()),
+            None,
+            "cold boot discards every owned partition's pending rows"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -6519,6 +6877,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Regression (review finding): an unknown-variant record wrapped in the
+    /// #1556 envelope AND carrying invalid envelope metadata (an unrecognised
+    /// extra field) must still fail closed as the typed
+    /// [`EventDecodeError::UnknownVariant`] — NOT surface as `Malformed`, which
+    /// the active-tail reader would tolerate as a torn write and DROP (#1065
+    /// class). The decoder decodes the inner event before validating the
+    /// envelope metadata precisely so this combination cannot be misclassified.
+    /// The unknown record is the LAST line, where a genuinely torn tail would
+    /// be dropped — proving the fail-closed rejection is not torn-tail luck.
+    #[test]
+    fn read_segment_events_rejects_unknown_variant_envelope_with_extra_field() {
+        let dir = temp_dir("unknown-variant-envelope-extra");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"event\":{\"NoSuchEventFromTheFuture\":{\"instance_key\":9}},\"operation_reference\":9,\"extra\":1}\n",
+        )
+        .unwrap();
+
+        let err = read_segment_events(&path)
+            .expect_err("an unknown variant must fail closed even with invalid envelope metadata");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to the typed EventDecodeError");
+        match decode_err {
+            EventDecodeError::UnknownVariant { variant, .. } => {
+                assert_eq!(variant, "NoSuchEventFromTheFuture")
+            }
+            other => panic!("expected UnknownVariant (not Malformed/torn-drop), got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The tagged multi-partition reader applies the same discipline: an unknown
     /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
     /// dropped record.
@@ -7386,6 +7781,54 @@ mod tests {
     /// the `process_instances` table (via a second connection to the same
     /// file-backed store) that the projection writes, so `export` fails with a
     /// typed SQLite error.
+    /// Regression (#1540 review): a warm v13→v14 upgrade on the LEGACY
+    /// single-file journal must backfill already-deployed message start
+    /// subscriptions from the engine state. With an up-to-date export cursor
+    /// the tail replays no creation events, so without the backfill the starts
+    /// stay absent from search across restarts.
+    #[test]
+    fn catch_up_shard_legacy_backfills_message_starts_after_a_warm_upgrade() {
+        use nanobpmn_engine_core::{MessageStartSubscription, State};
+
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("legacy-backfill");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("read-model.sqlite");
+        drop(ReadStore::open(Some(&store_path)).expect("open file-backed read store"));
+        // Wind the store back to v13 (no `message_start_subscriptions`).
+        {
+            let conn = rusqlite::Connection::open(&store_path).expect("second connection");
+            conn.execute_batch(
+                "DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .expect("wind back to v13");
+        }
+        let store = ReadStore::open(Some(&store_path)).expect("reopen migrated store");
+        assert!(store.message_start_subscriptions().is_empty());
+
+        let mut state = State::default();
+        state.message_start_subscriptions.insert(
+            "go".into(),
+            MessageStartSubscription {
+                process_definition_key: 5,
+                process_id: "p".into(),
+                message_name: "go".into(),
+                start_element_id: "s".into(),
+                tool_name: Some("tool".into()),
+                tool_properties: std::collections::BTreeMap::new(),
+            },
+        );
+        // Up-to-date cursor: no tail to replay.
+        let backfilled = catch_up_shard_legacy(&store, &[], &state).expect("catch up");
+        let rows = store.message_start_subscriptions();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(backfilled);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("tool"));
+    }
+
     #[test]
     fn catch_up_shard_propagates_export_failure_as_typed_error() {
         use crate::readstore::ReadStore;

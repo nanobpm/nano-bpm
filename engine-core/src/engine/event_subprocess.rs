@@ -138,6 +138,9 @@ impl Engine {
                                 kind,
                             }
                         } else {
+                            // Stable routed-delivery identity (#1497), minted on
+                            // this (source) partition like every other Opening.
+                            let delivery_key = self.mint_key();
                             Event::MessageSubscriptionOpening {
                                 subscription_key,
                                 instance_key,
@@ -146,6 +149,7 @@ impl Engine {
                                 message_name,
                                 correlation_key: correlation_value,
                                 kind,
+                                delivery_key,
                             }
                         },
                     );

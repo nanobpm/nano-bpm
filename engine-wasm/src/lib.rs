@@ -818,7 +818,6 @@ impl TestEngine {
             job_key: key,
             retries,
             lease_token,
-            operation_reference: None,
         })
         .map_err(|e| js_err(&format!("update retries error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -838,7 +837,6 @@ impl TestEngine {
             job_key: parse_key(job_key)?,
             timeout,
             lease_token,
-            operation_reference: None,
         })
         .map_err(|e| js_err(&format!("update timeout error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -852,11 +850,8 @@ impl TestEngine {
     pub fn resolve_incident(&mut self, incident_key: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(incident_key)?;
-        self.apply(Command::ResolveIncident {
-            incident_key: key,
-            operation_reference: None,
-        })
-        .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
+        self.apply(Command::ResolveIncident { incident_key: key })
+            .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 

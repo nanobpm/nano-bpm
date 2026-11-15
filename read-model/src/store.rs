@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 16;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -55,6 +55,30 @@ const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 /// below `exported_position`, so the migration backfills the column to that
 /// cursor (see [`ReadStore::ensure_schema_on`]).
 const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
+/// The schema version whose migration normalizes legacy terminal job rows to
+/// the single backward-clock policy (#1494, `bounded_creation`): a terminal
+/// row projected before the policy can carry `created_at_ms > end_ms` (a
+/// backward clock adjustment or a legacy batch-time creation fallback), which
+/// a clean reseed would resolve to `created_at_ms == end_ms`. The migration
+/// bounds those rows in place so a warm upgrade converges with a reseed
+/// without replaying the journal (see [`ReadStore::ensure_schema_on`]).
+const JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION: i64 = 14;
+/// The schema version that introduced `message_start_subscriptions` (the
+/// definition-scoped message start event subscriptions carrying the MCP tool
+/// metadata, #1499). A database migrated across it starts with the table empty
+/// while the warm cursor keeps the already-deployed subscriptions' creation
+/// events below it, so the migration flags an engine-state backfill
+/// ([`MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY`]).
+const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 15;
+/// The schema version that introduced the durable replay identity of a
+/// message start subscription (`message_start_subscriptions.last_event_position`).
+/// A database migrated across it receives `0`; every existing row already
+/// reflects every event below the warm cursor, so the migration stamps it.
+const MESSAGE_START_POSITION_SCHEMA_VERSION: i64 = 16;
+/// `meta` key flagging that `message_start_subscriptions` awaits an
+/// engine-state backfill (see [`ReadStore::backfill_pending_event_waits`]).
+const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
+    "message_start_subscriptions_backfill_pending";
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -64,7 +88,7 @@ const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6165013068443496289;
+const SCHEMA_FINGERPRINT: i64 = 5936058379013217281;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -320,6 +344,19 @@ CREATE TABLE message_subscriptions (
     non_interrupting       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE message_start_subscriptions (
+    message_name           TEXT PRIMARY KEY,
+    process_definition_key INTEGER NOT NULL,
+    process_id             TEXT NOT NULL,
+    start_element_id       TEXT NOT NULL,
+    tool_name              TEXT,
+    tool_properties        TEXT NOT NULL DEFAULT '{}',
+    created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- journal position of the creation event the row reflects (a seed stamps
+    -- the shard cursor): a same-definition replacement applies only from a
+    -- strictly later position, so an overlapping replay never regresses it.
+    last_event_position    INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE event_waits (
     wait_key               INTEGER PRIMARY KEY,
     wait_type              TEXT NOT NULL,
@@ -1067,6 +1104,18 @@ fn terminal_instant(event_at: u64, now_ms: u64) -> u64 {
     if event_at != 0 { event_at } else { now_ms }
 }
 
+/// The single backward-clock policy for a job's `creationTime` (#1494), shared
+/// by the event-driven terminal projection (`MIN(created_at_ms, terminal)` in
+/// the `JobCompleted`/`JobCanceled` SQL) and the snapshot reseed: the engine
+/// does not enforce clock monotonicity, so a creation recorded after the
+/// terminal instant (backward clock adjustment, or a legacy batch-time
+/// fallback) is bounded by that instant. `creationTime <= endTime` therefore
+/// holds on both paths, and they agree. A live (non-terminal) job keeps its
+/// recorded creation.
+fn bounded_creation(created_ms: u64, end_ms: Option<u64>) -> u64 {
+    end_ms.map_or(created_ms, |end| created_ms.min(end))
+}
+
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
     match kind {
         JobKind::BpmnElement => (0, 0),
@@ -1547,6 +1596,40 @@ pub struct MessageSubscriptionRow {
     /// The owning process instance's `businessId` as it stood when this
     /// artifact was created (snapshot — a later assignment does not enrich it).
     pub business_id: Option<String>,
+}
+
+/// A projected **message start event** subscription: the definition-scoped
+/// subscription a deployed process's message start event holds, materialized
+/// from `MessageStartSubscriptionCreated` (Camunda 8.10 `START_EVENT` type,
+/// #1499). Keyed by message name — re-deploying a process with the same start
+/// message replaces the row. Unlike a [`MessageSubscriptionRow`] it is not
+/// bound to an instance (`instance_key`/`element_instance_key` are absent) and
+/// never settles; it stays open for the life of the deployment. Carries the MCP
+/// tool metadata the start event declared via `zeebe:properties`
+/// (`io.camunda.tool:*`).
+pub struct MessageStartSubscriptionRow {
+    /// The stable, unique `messageSubscriptionKey` of this subscription,
+    /// derived by [`message_start_subscription_key`] from
+    /// `(process_definition_key, message_name)`. A process may declare several
+    /// message start events, so the definition key alone is not unique.
+    pub subscription_key: Key,
+    /// The BPMN message name that triggers a new instance (the primary key).
+    pub message_name: String,
+    /// The definition (and version) whose instances this start event creates.
+    pub process_definition_key: Key,
+    pub process_id: String,
+    /// The start event element a new instance begins at.
+    pub start_element_id: String,
+    /// The MCP tool name (`io.camunda.tool:name`), when the start event
+    /// declares one.
+    pub tool_name: Option<String>,
+    /// The start event's `io.camunda.tool:*` zeebe:properties subset as a JSON
+    /// object string (the wire representation of the REST `toolProperties`
+    /// field). `"{}"` when the start event declares no tool properties.
+    pub tool_properties: String,
+    /// Projection-time timestamp (ms since epoch) of when this row was
+    /// materialised; surfaces as `lastUpdatedDate` in the search API.
+    pub created_at_ms: u64,
 }
 
 /// The kind of a non-job, non-message event wait (the TIMER / SIGNAL /
@@ -2058,6 +2141,17 @@ impl ReadStore {
         // and then returned to `Created` before the upgrade, whose activation
         // instant is unrecoverable) is closed by the v13 durable-position
         // backfill below, which holds any replay at or below the warm cursor.
+        // `message_start_subscriptions` (v15) is likewise projected from
+        // creation events only: flag the same boot-time engine-state backfill
+        // so already-deployed message start subscriptions are not missing
+        // from search after a warm upgrade.
+        if stored_version.is_none_or(|v| v < MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION) {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+            rekey_legacy_start_correlations(conn)?;
+        }
         if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
             conn.execute(
                 "UPDATE jobs SET last_event_identity_ms = \
@@ -2073,6 +2167,32 @@ impl ReadStore {
         // now held, while every event the exporter delivers past it applies.
         if stored_version.is_none_or(|v| v < JOB_EVENT_POSITION_SCHEMA_VERSION) {
             stamp_job_positions_to_cursor(conn)?;
+        }
+        // #1494: a terminal row projected before the single backward-clock
+        // policy can carry `created_at_ms > end_ms` (a backward clock
+        // adjustment or a legacy batch-time creation fallback), while a clean
+        // reseed of the same job bounds creation by the retained terminal
+        // instant (`bounded_creation`). Bound those rows in place — the same
+        // `MIN(created_at_ms, end_ms)` the event-driven terminal projection
+        // applies — so a warm upgrade converges with a reseed without
+        // replaying the journal. Only `created_at_ms` moves: the terminal
+        // instant (`end_ms`, `last_update_ms`) and the replay floors
+        // (`last_event_identity_ms`, `last_event_position`) are preserved, so
+        // terminal history and replay identity are untouched.
+        if stored_version.is_none_or(|v| v < JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE jobs SET created_at_ms = MIN(created_at_ms, end_ms) \
+                 WHERE end_ms IS NOT NULL AND created_at_ms > end_ms",
+                [],
+            )?;
+        }
+        if stored_version.is_none_or(|v| v < MESSAGE_START_POSITION_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE message_start_subscriptions SET last_event_position = \
+                 MAX(last_event_position, \
+                 COALESCE((SELECT v FROM meta WHERE k = 'exported_position'), 0))",
+                [],
+            )?;
         }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
         conn.execute(
@@ -2337,9 +2457,10 @@ impl ReadStore {
         restored
     }
 
-    /// Backfills `event_waits` from the boot engine `state` if this store was
-    /// migrated from a schema predating it (see [`Self::ensure_schema_on`]),
-    /// then clears the pending flag. Call it BEFORE replaying the journal tail
+    /// Backfills `event_waits` (and, independently, `message_start_subscriptions`)
+    /// from the boot engine `state` if this store was migrated from a schema
+    /// predating it (see [`Self::ensure_schema_on`]), then clears the pending
+    /// flag(s). Call it BEFORE replaying the journal tail
     /// the `state` already reflects: replaying a `*Created` for a backfilled
     /// wait is a no-op and a later settle event deletes it, so the result
     /// matches a full projection. Returns whether a backfill ran.
@@ -2365,8 +2486,23 @@ impl ReadStore {
                 params![EVENT_WAITS_BACKFILL_KEY],
             )?;
         }
+        let start_pending = tx
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if start_pending {
+            project_message_start_subscriptions_from_state(&tx, state, now_ms())?;
+            tx.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+        }
         tx.commit()?;
-        Ok(pending)
+        Ok(pending || start_pending)
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
@@ -2956,6 +3092,22 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// All message **start event** subscriptions in this shard (the
+    /// definition-scoped `START_EVENT` subscriptions, #1499), keyed by message
+    /// name.
+    pub fn message_start_subscriptions(&self) -> Vec<MessageStartSubscriptionRow> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_START_SUBSCRIPTION_COLS} FROM message_start_subscriptions"
+            ))
+            .or_corrupt("prepare message_start_subscriptions");
+        let rows = stmt
+            .query_map([], map_message_start_subscription)
+            .or_corrupt("query message_start_subscriptions");
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// All open timer / signal / conditional waits in this shard.
     pub fn event_waits(&self) -> Vec<EventWaitRow> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -3493,6 +3645,81 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         correlation_key: r.get(5)?,
         created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
         business_id: r.get(7)?,
+    })
+}
+
+/// Re-keys pre-v14 start-event correlation history (#1499) to the canonical
+/// derived [`message_start_subscription_key`], preserving every other column
+/// (notably `correlation_time_ms`). Before v14 a `MessageStartEventCorrelated`
+/// row stored the event's definition-key placeholder as its `subscription_key`
+/// (start correlations are the only rows with `element_instance_key = 0`), so
+/// filtering by a `START_EVENT` row's derived key would miss them and a
+/// replayed old correlation would insert a duplicate under the new key instead
+/// of conflicting with the retained row. Derived keys live in `[2^62, 2^63)`,
+/// so already-migrated rows are skipped and the step is idempotent.
+fn rekey_legacy_start_correlations(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT message_key, subscription_key, message_name \
+             FROM correlated_message_subscriptions \
+             WHERE element_instance_key = 0 AND subscription_key < ?1",
+        )?;
+        stmt.query_map(params![1i64 << 62], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut update = conn.prepare(
+        "UPDATE correlated_message_subscriptions SET subscription_key = ?3 \
+         WHERE message_key = ?1 AND subscription_key = ?2",
+    )?;
+    for (message_key, definition_key, message_name) in legacy {
+        let derived = message_start_subscription_key(definition_key as Key, &message_name) as i64;
+        update.execute(params![message_key, definition_key, derived])?;
+    }
+    Ok(())
+}
+
+/// The canonical `messageSubscriptionKey` of a definition-scoped message start
+/// subscription (#1499): a deterministic FNV-1a hash of
+/// `(process_definition_key, message_name)`. Stable across restarts and
+/// reseeds (it depends only on the subscription's identity), unique per start
+/// event of a definition, and confined to `[2^62, 2^63)` so it stays a
+/// positive `i64` and is disjoint from engine-allocated keys (which are far
+/// below `2^62`).
+pub fn message_start_subscription_key(process_definition_key: Key, message_name: &str) -> Key {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in process_definition_key
+        .to_le_bytes()
+        .iter()
+        .chain(message_name.as_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(PRIME);
+    }
+    (h & ((1u64 << 62) - 1)) | (1u64 << 62)
+}
+
+/// Column list for `message_start_subscriptions` selects.
+const MESSAGE_START_SUBSCRIPTION_COLS: &str = "message_name, process_definition_key, process_id, \
+     start_element_id, tool_name, tool_properties, created_at_ms";
+
+fn map_message_start_subscription(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<MessageStartSubscriptionRow> {
+    let message_name: String = r.get(0)?;
+    let process_definition_key = r.get::<_, i64>(1)? as Key;
+    Ok(MessageStartSubscriptionRow {
+        subscription_key: message_start_subscription_key(process_definition_key, &message_name),
+        message_name,
+        process_definition_key,
+        process_id: r.get(2)?,
+        start_element_id: r.get(3)?,
+        tool_name: r.get(4)?,
+        tool_properties: r.get(5)?,
+        created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
     })
 }
 
@@ -4184,7 +4411,15 @@ fn project_engine_state(
         // pre-terminal value would surface a stale `lastUpdateTime` that no
         // later terminal-event delivery can repair (the terminal projection is
         // `end_ms`-guarded, so it is a no-op once `end_ms` is set). When an
-        // end time already exists, both values are preserved. Seed `created_at_ms` with
+        // end time already exists, both values are preserved — except that
+        // `created_at_ms` is STILL bounded against the retained `end_ms`
+        // (`MIN(created_at_ms, end_ms)`, the single backward-clock policy of
+        // #1494): a terminal row projected before the policy can carry
+        // `created_at_ms > end_ms`, and a reseed must converge it with a
+        // clean seed (which bounds creation by the terminal instant via
+        // `bounded_creation`) instead of preserving the pre-policy pair
+        // forever. The v14 warm-upgrade migration applies the same bound to
+        // rows that never see a reseed. Seed `created_at_ms` with
         // the SAME batch-observation fallback as `last_update_ms` when the
         // snapshot predates `created_at` (legacy `0`), so a recovered legacy
         // job surfaces a non-null `creationTime` (== `lastUpdateTime`) rather
@@ -4214,7 +4449,7 @@ fn project_engine_state(
         } else {
             end_ms.unwrap_or(now_ms)
         };
-        let creation_ms = last_update;
+        let creation_ms = bounded_creation(last_update, end_ms);
         let last_update = end_ms.unwrap_or(last_update);
         let deadline = job.deadline.or(terminal_end.and_then(|t| t.deadline));
         let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
@@ -4232,6 +4467,11 @@ fn project_engine_state(
              error_code = excluded.error_code, \
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
              end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
+             created_at_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
+                 THEN MIN(jobs.created_at_ms, excluded.end_ms) \
+                 WHEN jobs.end_ms IS NOT NULL \
+                 THEN MIN(jobs.created_at_ms, jobs.end_ms) \
+                 ELSE jobs.created_at_ms END, \
              last_update_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
                  THEN excluded.last_update_ms ELSE jobs.last_update_ms END, \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
@@ -4262,7 +4502,18 @@ fn project_engine_state(
                 // them to the compacted `JobFailed`/`JobErrorThrown` events.
                 job.error_message,
                 job.error_code,
-                i64::from(job.has_failed_with_retries_left),
+                // A terminal job is never retry-eligible (#1551 review): a
+                // snapshot recorded before the engine cleared the flag at the
+                // terminal transition can carry `true` on a Completed/Canceled
+                // job, and seeding it verbatim would let that terminal job
+                // select its instance for `hasRetriesLeft` searches and
+                // migration batches. Converge with the current reducer
+                // semantics (which clear the flag on every terminal
+                // transition) instead of preserving the pre-change value.
+                i64::from(
+                    job.has_failed_with_retries_left
+                        && !matches!(job.state, JobState::Completed | JobState::Canceled),
+                ),
                 creation_ms as i64,
                 last_update as i64,
                 replay_floor as i64,
@@ -4379,7 +4630,111 @@ fn project_engine_state(
         }
     }
 
+    // 11) Message start event subscriptions (definition-scoped, #1499). These
+    //     never settle, so every one held in engine state is live; project them
+    //     all, keyed by message name like the event projector.
+    project_message_start_subscriptions_from_state(tx, state, now_ms)?;
+
     project_event_waits_from_state(tx, state)
+}
+
+/// Projects every message start subscription held by the live engine `state`
+/// (definition-scoped, never settle — so all are live). Shared by the #732
+/// reseed and the schema-v15 upgrade backfill
+/// ([`ReadStore::backfill_pending_event_waits`]); idempotent.
+fn project_message_start_subscriptions_from_state(
+    tx: &rusqlite::Transaction,
+    state: &nanobpmn_engine_core::State,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    // Seeded rows reflect every event below the cursor: that is their floor.
+    let cursor: i64 = tx
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'exported_position'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    for sub in state.message_start_subscriptions.values() {
+        upsert_message_start_subscription(
+            tx,
+            &sub.message_name,
+            sub.process_definition_key,
+            &sub.process_id,
+            &sub.start_element_id,
+            sub.tool_name.as_deref(),
+            &sub.tool_properties,
+            cursor.max(0) as u64,
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// The single upsert for a `message_start_subscriptions` row, shared by the
+/// event projector and the engine-state seed/backfill.
+///
+/// Replay-safe under `ReadStore::export`'s overlapping-prefix contract: a row
+/// is only replaced by a **strictly newer** definition (process definition
+/// keys are allocated monotonically, so a later deployment always carries a
+/// larger key). Replaying the same or an older deployment's creation is a
+/// no-op — it neither regresses the definition/tool metadata nor re-stamps
+/// `created_at_ms` (`lastUpdatedDate`). The ordering is durable in the row
+/// itself, so it holds equally after a snapshot seed.
+///
+/// Same-definition conflict (older journals: two starts in one definition whose
+/// names resolve to the same message, e.g. `go` and `="go"`): the engine keeps
+/// the **later** creation, so a same-key creation for a *different* element
+/// replaces the element/tool fields — but only from a **strictly later**
+/// journal `position` than the row's `last_event_position` (seeds stamp the
+/// cursor), so replaying the earlier creation after the later one is a no-op.
+/// It never re-stamps `created_at_ms`.
+#[allow(clippy::too_many_arguments)]
+fn upsert_message_start_subscription(
+    tx: &rusqlite::Transaction,
+    message_name: &str,
+    process_definition_key: Key,
+    process_id: &str,
+    start_element_id: &str,
+    tool_name: Option<&str>,
+    tool_properties: &std::collections::BTreeMap<String, String>,
+    position: u64,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    let tool_properties_json =
+        serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
+    tx.cexecute(
+        "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
+         process_id, start_element_id, tool_name, tool_properties, created_at_ms, \
+         last_event_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(message_name) DO UPDATE SET \
+         process_definition_key = excluded.process_definition_key, \
+         process_id = excluded.process_id, \
+         start_element_id = excluded.start_element_id, \
+         tool_name = excluded.tool_name, \
+         tool_properties = excluded.tool_properties, \
+         created_at_ms = CASE WHEN excluded.process_definition_key > \
+         message_start_subscriptions.process_definition_key THEN excluded.created_at_ms \
+         ELSE message_start_subscriptions.created_at_ms END, \
+         last_event_position = MAX(excluded.last_event_position, \
+         message_start_subscriptions.last_event_position) \
+         WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key \
+         OR (excluded.process_definition_key = message_start_subscriptions.process_definition_key \
+         AND excluded.start_element_id <> message_start_subscriptions.start_element_id \
+         AND excluded.last_event_position > message_start_subscriptions.last_event_position)",
+        params![
+            message_name,
+            process_definition_key as i64,
+            process_id,
+            start_element_id,
+            tool_name,
+            tool_properties_json,
+            now_ms as i64,
+            position as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Projects every open timer / signal / conditional wait held by the live engine
@@ -5032,6 +5387,34 @@ fn project_event(
             }
         }
 
+        // A process-level message start event subscription opened at deploy time
+        // (#1499): the definition-scoped `START_EVENT` row, carrying the MCP tool
+        // metadata the start event declared via `zeebe:properties`. Keyed by
+        // message name — a redeploy with the same start message replaces the row
+        // (mirroring the engine's `message_start_subscriptions` map). The
+        // `tool_properties` map is stored as a JSON object string (the REST
+        // `toolProperties` wire shape).
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key,
+            process_id,
+            message_name,
+            start_element_id,
+            tool_name,
+            tool_properties,
+        } => {
+            upsert_message_start_subscription(
+                tx,
+                message_name,
+                *process_definition_key,
+                process_id,
+                start_element_id,
+                tool_name.as_deref(),
+                tool_properties,
+                position,
+                now_ms,
+            )?;
+        }
+
         // A message correlated to an open subscription: record it in the
         // correlated (history) table. The open row still holds the message name,
         // correlation key and interrupting flag at this point (none of which are
@@ -5118,10 +5501,15 @@ fn project_event(
         // message name / correlation key itself. The start event has not been
         // activated yet, so its element instance key is unknown (0). The
         // business id is snapshotted from the instance the message created
-        // (projected by the preceding `ProcessInstanceCreated`).
+        // (projected by the preceding `ProcessInstanceCreated`). The
+        // subscription key is the canonical derived start-subscription key
+        // ([`message_start_subscription_key`]) — the same identity the
+        // `START_EVENT` search rows carry — rather than the event's
+        // definition-key placeholder, which is shared by every message start
+        // event of one definition (#1499).
         Event::MessageStartEventCorrelated {
             message_key,
-            subscription_key,
+            process_definition_key,
             instance_key,
             element_id,
             message_name,
@@ -5136,7 +5524,7 @@ fn project_event(
                  ON CONFLICT(message_key, subscription_key) DO NOTHING",
                 params![
                     *message_key as i64,
-                    *subscription_key as i64,
+                    message_start_subscription_key(*process_definition_key, message_name) as i64,
                     *instance_key as i64,
                     element_id,
                     message_name,
@@ -5685,17 +6073,22 @@ fn project_event(
             // (`?6`); only a pre-field record (`completed_at == 0`, `?5 == 0`)
             // falls back to keeping the row's value.
             //
-            // `created_at_ms` is NOT clamped here (#1440 review): the engine
-            // stamps `JobCreated.created_at` and `JobCompleted.completed_at`
-            // from the same wall clock without enforcing monotonicity, so a
-            // backward clock adjustment can leave a GENUINE creation after the
-            // completion instant. Clamping would rewrite that real creation
-            // timestamp and diverge from a snapshot reseed (which preserves
-            // `job.created_at`). The projection therefore keeps the recorded
-            // creation, matching the reseed; a single backward-clock policy for
-            // BOTH paths is part of the #963 follow-up.
+            // Backward-clock policy (#1494, shared with the snapshot reseed via
+            // `bounded_creation`): the engine stamps `JobCreated.created_at` and
+            // the terminal instant from the same wall clock without enforcing
+            // monotonicity, so a backward clock adjustment (or a legacy
+            // batch-time creation fallback) can leave creation AFTER the
+            // terminal instant. BOTH paths bound creation by the terminal
+            // instant at the first terminal transition, so `creationTime <=
+            // endTime` always holds and live and reseeded rows agree.
+            //
+            // The retries-left flag clears unconditionally (#1551 review): a
+            // completed job is no longer retry-eligible, so `hasRetriesLeft`
+            // must stop matching it even when the completion is a re-delivery.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?4) ELSE created_at_ms END, \
+                 has_failed_with_retries_left = 0, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
@@ -5720,12 +6113,16 @@ fn project_event(
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
             // Instant and deadline come from the event exactly as for
             // `JobCompleted` (#1440) — including the modern-record deadline
-            // authority — and `created_at_ms` is likewise NOT clamped (see
-            // there). Guard on the first terminal transition so a re-delivery
+            // authority and the shared backward-clock creation bound (#1494,
+            // see there). Guard on the first terminal transition so a re-delivery
             // is a no-op; a job that was already FAILED/ERRORED (no `end_ms`)
-            // still gets its cancellation `endTime` here (#1344).
+            // still gets its cancellation `endTime` here (#1344). The
+            // retries-left flag clears too (#1551 review): a canceled job is no
+            // longer retry-eligible, so `hasRetriesLeft` must stop matching it.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?3) ELSE created_at_ms END, \
+                 has_failed_with_retries_left = 0, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
@@ -5766,11 +6163,31 @@ fn project_event(
             // legitimately receive a retries update (the engine rejects it), so
             // one observed there is always a replay, and `lastUpdateTime` stays
             // frozen at `endTime`.
+            //
+            // Retries-left flag (#1551 review): the column feeds the
+            // process-instance `hasRetriesLeft` filter, so it must track the
+            // update — a failure whose retries are drained to zero stops
+            // matching, a parked zero-retry failure topped up (the
+            // incident-resolution flow) starts matching. Derive it from the
+            // failure-bearing states (Failed/Errored) plus the NEW retries: a
+            // job that returned to the activatable pool keeps the flag its
+            // retryable failure set (it can only lose retries here), and the
+            // `end_ms IS NULL` guard keeps a replayed update from re-arming a
+            // Completed/Canceled row.
             tx.cexecute(
                 "UPDATE jobs SET retries = ?2, \
+                 has_failed_with_retries_left = CASE WHEN end_ms IS NULL THEN \
+                     ((?2 > 0) AND (has_failed_with_retries_left OR state IN (?4, ?5))) \
+                     ELSE has_failed_with_retries_left END, \
                  last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
                  WHERE key = ?1",
-                params![*job_key as i64, retries, now_ms as i64],
+                params![
+                    *job_key as i64,
+                    retries,
+                    now_ms as i64,
+                    job_state_code(JobState::Failed),
+                    job_state_code(JobState::Errored),
+                ],
             )?;
         }
 
@@ -6616,7 +7033,6 @@ fn project_event(
         | Event::ElementCompleting { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
-        | Event::MessageStartSubscriptionCreated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -6633,6 +7049,9 @@ fn project_event(
         | Event::ProcessStartTimerFired { .. }
         // A Raft applied-entry record (#1405): no read-model state.
         | Event::RaftEntryApplied { .. }
+        // Engine-internal routed-delivery dedup / close-tombstone ledger
+        // (#1497): no read-model projection.
+        | Event::RoutedDeliveryRecorded { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
@@ -6645,7 +7064,13 @@ fn project_event(
         | Event::UserTaskTransitionResolved { .. }
         | Event::VariableScopeCreated { .. }
         | Event::VariableScopeDestroyed { .. }
-        | Event::EventSubProcessPayloadHeld { .. } => {}
+        | Event::EventSubProcessPayloadHeld { .. }
+        // Engine-internal quarantine dedup tombstone (#1574): the read model
+        // projects the companion `IncidentRaised`.
+        | Event::VariablesLostQuarantined { .. }
+        // Engine-internal orphan-stamp supersede signal (#1587 review): no
+        // projection — the re-proposed quarantine raises its own incident.
+        | Event::OrphanStampSuperseded { .. } => {}
     }
     Ok(delta)
 }
@@ -7810,6 +8235,158 @@ mod writability_tests {
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
+    /// #1494 review: a terminal row projected BEFORE the single backward-clock
+    /// policy can carry `created_at_ms > end_ms` (creation 900, end 600), and a
+    /// normal restart never reseeds — so without a versioned normalization the
+    /// row keeps the pre-policy pair forever while a clean reseed of the same
+    /// job resolves it to `(600, 600)`. The v14 migration bounds every such
+    /// row in place (`MIN(created_at_ms, end_ms)`), preserving the terminal
+    /// instant and the replay floors.
+    #[test]
+    fn migration_normalizes_a_pre_policy_terminal_creation() {
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            // A pre-policy terminal row: creation (900) AFTER the terminal
+            // instant (600), with its replay floors already backfilled.
+            conn.execute_batch(
+                "INSERT INTO jobs \
+                 (key, instance_key, element_instance_key, element_id, job_type, \
+                  state, retries, process_definition_id, process_definition_key, \
+                  created_at_ms, last_update_ms, end_ms, last_event_identity_ms) \
+                 VALUES (14, 1, 1, 'e', 't', 1, 3, 'p', '1', 900, 600, 600, 900);
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = ReadStore::open(Some(&path)).expect("warm upgrade migrates");
+        let row = job_row(&store, 14);
+        assert_eq!(
+            row.created_at_ms, 600,
+            "a pre-policy terminal creation is bounded by endTime on upgrade"
+        );
+        assert_eq!(row.end_ms, Some(600), "the terminal instant is preserved");
+        assert_eq!(
+            row.last_update_ms,
+            Some(600),
+            "lastUpdateTime stays at the terminal instant"
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// #1494 review: a compaction-floor reseed CONFLICTING with a pre-policy
+    /// terminal row must converge it with a clean seed — bound the existing
+    /// `created_at_ms` against the retained `end_ms` even when the terminal
+    //  instant itself is preserved (not overwritten from the snapshot).
+    #[test]
+    fn reseed_bounds_a_conflicting_pre_policy_terminal_creation() {
+        use nanobpmn_engine_core::{Job, JobKind, JobTerminalEnd, ProcessInstance, State};
+
+        let store = ReadStore::open(None).unwrap();
+        // The pre-policy row: creation 900 after the terminal instant 600.
+        apply_at(
+            &store,
+            &Event::JobCreated {
+                job_key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 900,
+                priority: 0,
+                retries: 3,
+            },
+            900,
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET state = 1, end_ms = 600, last_update_ms = 600 \
+                 WHERE key = 8700",
+                [],
+            )
+            .unwrap();
+        }
+        // The snapshot reseed carries the same job, terminal at 600.
+        let mut state = State::default();
+        let mut inst = ProcessInstance {
+            key: 7_700,
+            process_id: "p".to_string(),
+            process_definition_key: 0,
+            state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
+            suspended_at: None,
+            created_at: 50,
+            tags: Vec::new(),
+            business_id: None,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+            active: Default::default(),
+            scopes: Default::default(),
+            variables: Default::default(),
+            join_counts: Default::default(),
+            join_flow_arrivals: Default::default(),
+            join_instances: Default::default(),
+            parked_joins: Default::default(),
+            activating: Default::default(),
+            gateway_routes: Default::default(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+            multi_instances: Default::default(),
+            adhoc_instances: Default::default(),
+            scope_parents: Default::default(),
+            scope_variables: Default::default(),
+            compensable: Default::default(),
+            compensation_waits: Default::default(),
+            agent_instances: Default::default(),
+            esp_held_payloads: Default::default(),
+            agent_history: Default::default(),
+        };
+        inst.active.insert(7_701, "t".to_string());
+        state.instances.insert(7_700, inst);
+        state.jobs.insert(
+            8_700,
+            Job {
+                key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Completed,
+                worker: None,
+                deadline: None,
+                activated_at: None,
+                activation_timeout: None,
+                lease_token: None,
+                durable_activation: false,
+                activated: false,
+                retries: 3,
+                priority: 0,
+                created_at: 900,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
+                terminal_end: Some(JobTerminalEnd {
+                    at: 600,
+                    deadline: None,
+                }),
+            },
+        );
+        store.seed_from_engine_state(&state).unwrap();
+        let row = job_row(&store, 8_700);
+        assert_eq!(row.end_ms, Some(600), "the terminal instant is preserved");
+        assert_eq!(
+            row.created_at_ms, 600,
+            "a reseed bounds a conflicting pre-policy creation by endTime"
+        );
+    }
+
     #[test]
     fn migration_backfills_the_job_replay_identity_floor() {
         // Defect-class guard (#1346 review): the additive migration adds
@@ -8206,6 +8783,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -8469,6 +9047,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -8542,8 +9121,67 @@ mod definition_xml_tests {
         legacy.created_at = 0;
         state.jobs.insert(8_601, legacy);
 
+        // A GENUINE creation recorded after the terminal instant (backward
+        // clock adjustment, #1494): bounded by the terminal instant under the
+        // single backward-clock policy shared with the event projection.
+        let mut backward = state.jobs.get(&8_600).unwrap().clone();
+        backward.key = 8_602;
+        backward.created_at = 900;
+        state.jobs.insert(8_602, backward);
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
+
+        let backward = job_row(&store, 8_602);
+        assert_eq!(backward.end_ms, Some(600));
+        assert_eq!(
+            backward.created_at_ms, 600,
+            "a backward-clock creation is bounded by endTime on reseed"
+        );
+
+        // The event-driven projection applies the SAME policy (#1494).
+        let projected = ReadStore::open(None).unwrap();
+        apply_at(
+            &projected,
+            &Event::JobCreated {
+                job_key: 8_602,
+                instance_key: 7_600,
+                element_instance_key: 7_601,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 900,
+                priority: 0,
+                retries: 3,
+            },
+            900,
+        );
+        apply_at(
+            &projected,
+            &Event::JobCompleted {
+                job_key: 8_602,
+                instance_key: 7_600,
+                created_at: 900,
+                job_type: "worker".to_string(),
+                worker: None,
+                completed_at: 600,
+                deadline: Some(70_000),
+            },
+            950,
+        );
+        let projected = job_row(&projected, 8_602);
+        assert_eq!(
+            (
+                projected.created_at_ms,
+                projected.end_ms,
+                projected.last_update_ms
+            ),
+            (
+                backward.created_at_ms,
+                backward.end_ms,
+                backward.last_update_ms
+            ),
+            "event projection and reseed agree on a backward clock"
+        );
 
         let legacy = job_row(&store, 8_601);
         assert_eq!(legacy.end_ms, Some(600));
@@ -9413,6 +10051,188 @@ mod definition_xml_tests {
             .export(&[&Event::ProcessInstanceTerminated { instance_key: 7 }])
             .unwrap();
         assert!(waits(&store).is_empty());
+    }
+
+    #[test]
+    fn message_start_subscription_keys_are_unique_per_start_event_and_stable() {
+        let a = super::message_start_subscription_key(7, "order");
+        let b = super::message_start_subscription_key(7, "refund");
+        assert_ne!(
+            a, b,
+            "two start events of one definition need distinct keys"
+        );
+        assert_eq!(a, super::message_start_subscription_key(7, "order"));
+        assert_ne!(a, super::message_start_subscription_key(8, "order"));
+        assert!((1 << 62..1 << 63).contains(&a));
+    }
+
+    fn start_created(def_key: super::Key, tool: &str) -> Event {
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key: def_key,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: "s".into(),
+            tool_name: Some(tool.into()),
+            tool_properties: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn replaying_older_or_duplicate_message_start_creations_leaves_the_row_unchanged() {
+        let store = ReadStore::open(None).unwrap();
+        replay_at(&store, &start_created(20, "new"), 1, 1_000);
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.process_definition_key, r.tool_name, r.created_at_ms)
+        };
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Duplicate replay: no re-stamp of lastUpdatedDate.
+        replay_at(&store, &start_created(20, "new"), 1, 5_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Older deployment replay: no regression of definition/tool metadata.
+        replay_at(&store, &start_created(10, "old"), 0, 6_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // A genuine later deployment replaces it.
+        replay_at(&store, &start_created(30, "newer"), 2, 7_000);
+        assert_eq!(row(&store), (30, Some("newer".into()), 7_000));
+    }
+
+    /// Regression (#1586 review): an older journal can hold two starts in ONE
+    /// definition resolving to the same message name; the engine keeps the
+    /// later creation, so cold replay must expose the second element — without
+    /// re-stamping `created_at_ms`, and a same-element duplicate stays a no-op.
+    #[test]
+    fn same_definition_message_name_conflict_keeps_the_later_start() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |element: &str| Event::MessageStartSubscriptionCreated {
+            process_definition_key: 20,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: element.into(),
+            tool_name: None,
+            tool_properties: std::collections::BTreeMap::new(),
+        };
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.start_element_id, r.created_at_ms)
+        };
+        replay_at(&store, &created("first"), 1, 1_000);
+        replay_at(&store, &created("second"), 2, 2_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        replay_at(&store, &created("second"), 2, 3_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        // Overlapping replay of the EARLIER creation must not regress the row.
+        replay_at(&store, &created("first"), 1, 4_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+    }
+
+    /// Regression (#1540 review): a warm v13→v15 upgrade must re-key retained
+    /// start-correlation history from the definition-key placeholder to the
+    /// derived start-subscription key — so filtering by a `START_EVENT` row's
+    /// key finds it — while preserving its timestamp, and a replayed old
+    /// correlation must conflict with (not duplicate) the migrated row.
+    #[test]
+    fn upgrading_to_v15_rekeys_legacy_start_correlations() {
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-start-corr-rekey-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                 correlation_time_ms, partition_id, business_id) \
+                 VALUES (55, 900, 7001, 0, 'start', 'order-placed', 'c-1', 1234, 1, NULL); \
+                 DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        let derived = super::message_start_subscription_key(900, "order-placed");
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].subscription_key, derived);
+        assert_eq!(corr[0].correlation_time_ms, 1234, "timestamp preserved");
+
+        // Overlapping replay of the old correlation: conflicts, no duplicate.
+        store
+            .export(&[&Event::MessageStartEventCorrelated {
+                message_key: 55,
+                subscription_key: 900,
+                process_definition_key: 900,
+                process_id: "p".into(),
+                instance_key: 7001,
+                element_id: "start".into(),
+                message_name: "order-placed".into(),
+                correlation_key: "c-1".into(),
+            }])
+            .unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].correlation_time_ms, 1234);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrading_from_before_message_start_subscriptions_backfills_them_from_engine_state() {
+        use nanobpmn_engine_core::{MessageStartSubscription, State};
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-msg-start-backfill-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(
+            !store
+                .backfill_pending_event_waits(&State::default())
+                .unwrap()
+        );
+        // Wind it back to a v13 store (no `message_start_subscriptions`).
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(store.message_start_subscriptions().is_empty());
+        let mut state = State::default();
+        state.message_start_subscriptions.insert(
+            "go".into(),
+            MessageStartSubscription {
+                process_definition_key: 5,
+                process_id: "p".into(),
+                message_name: "go".into(),
+                start_element_id: "s".into(),
+                tool_name: Some("tool".into()),
+                tool_properties: std::collections::BTreeMap::new(),
+            },
+        );
+        assert!(store.backfill_pending_event_waits(&state).unwrap());
+        let rows = store.message_start_subscriptions();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("tool"));
+        // The flag is cleared: the backfill runs once.
+        assert!(!store.backfill_pending_event_waits(&state).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -11527,6 +12347,7 @@ mod element_instance_tests {
                 element_id: "await".to_string(),
                 kind: MessageSubscriptionKind::IntermediateCatch,
                 variables: std::collections::HashMap::new(),
+                delivery_key: 0,
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
@@ -12231,6 +13052,23 @@ mod element_instance_tests {
             j
         });
 
+        // Pre-#1551 snapshot shapes: a terminal job whose retries-left flag was
+        // never cleared (the engine only began clearing it at the terminal
+        // transition in #1551). Seeding must not let these select their
+        // instance for `hasRetriesLeft` searches / migration batches.
+        state.jobs.insert(9604, {
+            let mut j = base_job(9604, JobState::Completed);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+        state.jobs.insert(9605, {
+            let mut j = base_job(9605, JobState::Canceled);
+            j.retries = 2;
+            j.has_failed_with_retries_left = true;
+            j
+        });
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
         let seeded: HashMap<Key, super::JobRow> =
@@ -12249,6 +13087,18 @@ mod element_instance_tests {
             Some("card declined")
         );
         assert!(seeded[&9603].has_failed_with_retries_left);
+
+        // #1551 review — the pre-change snapshot shapes seed with the flag
+        // CLEARED: a terminal job is never retry-eligible, so it must not
+        // select its instance for `hasRetriesLeft` searches / migration batches.
+        assert!(
+            !seeded[&9604].has_failed_with_retries_left,
+            "a completed job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
+        assert!(
+            !seeded[&9605].has_failed_with_retries_left,
+            "a canceled job seeded from a pre-#1551 snapshot must not match hasRetriesLeft"
+        );
     }
 
     #[test]
@@ -12972,6 +13822,135 @@ mod element_instance_tests {
     }
 
     #[test]
+    fn retries_left_flag_tracks_retry_updates_and_terminal_transitions() {
+        // #1551 review — the read-model `has_failed_with_retries_left` column
+        // feeds the process-instance `hasRetriesLeft` filter (search + batch
+        // migration), so it must describe retry eligibility NOW, not the last
+        // failure record: track `JobRetriesUpdated` in both directions and clear
+        // on the terminal transitions.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+        };
+        let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &job(7001),
+                &job(7002),
+                &job(7003),
+                &job(7004),
+            ])
+            .unwrap();
+
+        // Direction 1: retryable failure, retries later drained to zero.
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7001).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobRetriesUpdated {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 0,
+                operation_reference: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7001).has_failed_with_retries_left,
+            "a failure whose retries were drained to zero must stop matching hasRetriesLeft"
+        );
+
+        // Direction 2: zero-retry failure topped up (the incident-resolution flow).
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7002,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: Some("gave up".to_string()),
+            }])
+            .unwrap();
+        assert!(!row(&store, 7002).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobRetriesUpdated {
+                job_key: 7002,
+                instance_key: INST,
+                retries: 3,
+                operation_reference: None,
+            }])
+            .unwrap();
+        assert!(
+            row(&store, 7002).has_failed_with_retries_left,
+            "a parked zero-retry failure topped up must start matching hasRetriesLeft"
+        );
+
+        // Terminal transitions clear the flag on a retryable failure.
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7003,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7003).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobCompleted {
+                job_key: 7003,
+                instance_key: INST,
+                created_at: 1,
+                job_type: "worker".to_string(),
+                worker: None,
+                completed_at: 2,
+                deadline: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7003).has_failed_with_retries_left,
+            "a completed job must not keep matching hasRetriesLeft"
+        );
+
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7004,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("flaky".to_string()),
+            }])
+            .unwrap();
+        assert!(row(&store, 7004).has_failed_with_retries_left);
+        store
+            .export(&[&Event::JobCanceled {
+                job_key: 7004,
+                instance_key: INST,
+                canceled_at: 2,
+                deadline: None,
+            }])
+            .unwrap();
+        assert!(
+            !row(&store, 7004).has_failed_with_retries_left,
+            "a canceled job must not keep matching hasRetriesLeft"
+        );
+    }
+
+    #[test]
     fn projects_the_declared_read_set_from_job_activated_onto_the_row() {
         // #986 — a `JobActivated` that carries a declared read-set (`fetchVariables`)
         // must surface it on the read-model job row (engine-native read provenance
@@ -13336,7 +14315,11 @@ mod element_instance_tests {
         let row = &corr[0];
         assert_eq!(
             (row.message_key, row.subscription_key, row.instance_key),
-            (55, 900, 7001)
+            (
+                55,
+                super::message_start_subscription_key(900, "order-placed"),
+                7001
+            )
         );
         assert_eq!(row.element_instance_key, 0, "start event not yet activated");
         assert_eq!(row.element_id, "start");
@@ -13717,13 +14700,9 @@ mod read_surface_tests {
     /// Defect-class guard (#1440 review): a MIXED-VERSION replay projects a
     /// legacy `JobCreated` (`created_at == 0`) at its batch observation time,
     /// then a MODERN terminal event whose command instant is EARLIER (export
-    /// lag). The projection must NOT clamp the recorded creation down to the
-    /// terminal instant: the engine stamps both from the same wall clock without
-    /// enforcing monotonicity, so a backward clock adjustment can leave a
-    /// genuine creation after the terminal instant, and clamping would rewrite
-    /// it and diverge from a snapshot reseed (which preserves `job.created_at`).
-    /// The projection keeps the recorded creation, matching the reseed; a single
-    /// backward-clock policy for both paths is part of the #963 follow-up. A
+    /// lag). Under the single backward-clock policy (#1494, `bounded_creation`)
+    /// BOTH the projection and the snapshot reseed bound creation by the
+    /// terminal instant, so `creationTime <= endTime` holds and they agree. A
     /// re-delivery of the terminal event must stay a no-op. Both terminal
     /// projectors share the class.
     #[test]
@@ -13774,18 +14753,11 @@ mod read_surface_tests {
             let row = job_row(&store, 8350);
             assert_eq!(row.state, want_state);
             assert_eq!(row.end_ms, Some(5_000));
-            // The projection does NOT clamp creation down to the terminal
-            // instant (#1440 review): the engine stamps `JobCreated.created_at`
-            // and the terminal instant from the same wall clock without
-            // enforcing monotonicity, so a backward clock adjustment can leave
-            // a genuine creation after the terminal instant. Clamping would
-            // rewrite that real timestamp and diverge from a snapshot reseed
-            // (which preserves `job.created_at`). The projection keeps the
-            // recorded creation, matching the reseed; a single backward-clock
-            // policy for both paths is part of the #963 follow-up.
+            // Creation is bounded by the terminal instant (#1494), exactly
+            // as the snapshot reseed seeds it.
             assert_eq!(
-                row.created_at_ms, 9_000,
-                "creation is preserved (not clamped), matching the snapshot reseed"
+                row.created_at_ms, 5_000,
+                "creation bounded by the terminal instant, matching the reseed"
             );
             assert_eq!(row.last_update_ms, Some(5_000));
 
@@ -13793,7 +14765,7 @@ mod read_surface_tests {
             // guarded by `end_ms IS NULL`).
             apply_at(&store, &terminal, 9_900);
             let again = job_row(&store, 8350);
-            assert_eq!(again.created_at_ms, 9_000);
+            assert_eq!(again.created_at_ms, 5_000);
             assert_eq!(again.end_ms, Some(5_000));
             assert_eq!(again.last_update_ms, Some(5_000));
         }

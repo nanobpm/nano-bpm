@@ -72,8 +72,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::deepthi::{DeepthiHandle, LifecycleExclusive, LifecycleShared};
-#[cfg(test)]
+use crate::deepthi::{DeepthiHandle, LifecycleExclusive, LifecycleShared, SnapshotPublishGuard};
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
@@ -93,10 +92,83 @@ openraft::declare_raft_types!(
 /// wall-clock `now` the leader stamped it with. Carrying `now` keeps `apply`
 /// deterministic across replicas (the engine's time-dependent logic replays
 /// identically), so re-applying the log on any replica yields identical state.
+///
+/// `operation_reference` is the caller's Camunda `operationReference` (#1556):
+/// command-envelope metadata the engine stamps on EVERY record the command
+/// produces ([`Journal::apply_command_ref_at`](nano_server_storage::journal::Journal::apply_command_ref_at)).
+/// Additive on the wire: absent decodes as `None`. A pre-#1556 entry carried
+/// the reference NESTED inside the job-mutation / incident-resolution command
+/// body (`{"UpdateJobRetries":{…,"operation_reference":N}}`); deserialization
+/// promotes that legacy nested value to this envelope field (outer wins) so a
+/// retained historical entry re-applied after upgrade keeps its reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "ReplicatedCommandWire")]
 pub struct ReplicatedCommand {
     pub command: Command,
     pub now: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_reference: Option<i64>,
+}
+
+/// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
+/// `operation_reference` out of the command body (see the type docs).
+#[derive(Deserialize)]
+struct ReplicatedCommandWire {
+    command: LegacyCommand,
+    now: u64,
+    #[serde(default)]
+    operation_reference: Option<i64>,
+}
+
+/// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
+/// nested inside its variant body. Deserialized via a JSON value so the nested
+/// key can be inspected for EVERY variant (fail-safe: any variant that ever
+/// carried the field is promoted, not just a hand-maintained list).
+struct LegacyCommand {
+    command: Command,
+    nested_reference: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for LegacyCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let nested_reference = match value
+            .as_object_mut()
+            .and_then(|tagged| tagged.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|body| body.remove("operation_reference"))
+        {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(serde_json::from_value::<i64>(v).map_err(D::Error::custom)?),
+        };
+        let command = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            command,
+            nested_reference,
+        })
+    }
+}
+
+impl From<ReplicatedCommandWire> for ReplicatedCommand {
+    fn from(wire: ReplicatedCommandWire) -> Self {
+        Self {
+            command: wire.command.command,
+            now: wire.now,
+            operation_reference: wire.operation_reference.or(wire.command.nested_reference),
+        }
+    }
+}
+
+impl ReplicatedCommand {
+    /// A replicated command without an `operationReference`.
+    pub fn new(command: Command, now: u64) -> Self {
+        Self {
+            command,
+            now,
+            operation_reference: None,
+        }
+    }
 }
 
 /// Process-global net-live count of [`ReplicatedBatch`] instances. Every batch
@@ -250,7 +322,7 @@ impl ReplicatedBatch {
 
     /// A single-command batch (the convenience path for `propose`).
     pub fn single(command: Command, now: u64) -> Self {
-        Self::new(vec![ReplicatedCommand { command, now }])
+        Self::new(vec![ReplicatedCommand::new(command, now)])
     }
 }
 
@@ -614,6 +686,11 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
 pub struct SnapshotFile {
     file: tokio::fs::File,
     path: PathBuf,
+    /// Set on the RECEIVE path only (#1488 review): the in-flight registration
+    /// for this `incoming-*.tmp` file, taken by `install_snapshot` so the file
+    /// is registered from its creation until its promotion rename — a
+    /// concurrent build's reap can never delete it mid-receive.
+    in_flight: Option<InFlightSnapshot>,
 }
 
 impl tokio::io::AsyncRead for SnapshotFile {
@@ -873,6 +950,13 @@ pub struct PartitionStateMachine {
     /// (one partition can receive successive snapshots over its lifetime).
     recv_idx: AtomicU64,
     current_snapshot: Mutex<Option<StoredSnapshot>>,
+    /// Snapshot files a build or install is still writing / promoting and has
+    /// not yet published (#1488). [`reap_superseded_snapshots`] never removes a
+    /// path in this set, so an install's prompt reap cannot delete the file a
+    /// concurrent DETACHED `build_snapshot` is mid-writing (or an install's
+    /// promoted-but-unpublished file) out from under it. Registered via
+    /// [`InFlightSnapshot`] BEFORE the file exists, removed on drop.
+    in_flight_snapshots: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
@@ -992,6 +1076,7 @@ impl PartitionStateMachine {
             snapshot_idx: AtomicU64::new(0),
             recv_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(restored),
+            in_flight_snapshots: Arc::default(),
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -1001,6 +1086,14 @@ impl PartitionStateMachine {
             epoch,
             generation,
         })
+    }
+
+    /// The partition this state machine replicates.
+    fn partition_id(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .partition_id
     }
 
     /// A unique per-process, per-partition snapshot directory under the system
@@ -1067,6 +1160,28 @@ impl PartitionStateMachine {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )
+    }
+
+    /// Test-only continuation member (#1488 review regression): a second SM on
+    /// the SAME snapshot dir that shares this member's receive epoch — its
+    /// `recv_idx` (so its receive file names continue this member's sequence)
+    /// and its in-flight set (so a receive this member has in flight is
+    /// registered for the continuation's constructor sweep too). Models a
+    /// detached build openraft queued on a rebuilt member while a receive is
+    /// still streaming.
+    #[cfg(test)]
+    fn new_continuation_for_test(&self, engine: DeepthiHandle) -> std::io::Result<Self> {
+        let mut member = Self::new(
+            engine,
+            self.partition_id(),
+            self.snapshot_dir.clone(),
+            self.node_id,
+            false,
+            Arc::clone(&self.leader),
+        )?;
+        member.recv_idx = AtomicU64::new(self.recv_idx.load(Ordering::Relaxed));
+        member.in_flight_snapshots = Arc::clone(&self.in_flight_snapshots);
+        Ok(member)
     }
 
     /// Restore the engine to the state captured by the durable current snapshot,
@@ -1227,6 +1342,194 @@ impl PartitionStateMachine {
         }
         Ok(())
     }
+
+    /// Test-only install variant (#1488 review regression): runs the whole
+    /// publish side (promote, durable pointer, size metric, reap, cache) but
+    /// skips the engine adoption, so a test can interleave an install publish
+    /// with a paused build on the SAME engine — the adoption's checkpoint
+    /// permit is held by that build's capture path, and the state being
+    /// adopted is that engine's own.
+    #[cfg(test)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helper returning openraft's StorageError verbatim; the production install signature is fixed by the RaftStateMachine trait"
+    )]
+    async fn install_snapshot_skip_adoption_for_test(
+        &self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot: Box<SnapshotFile>,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.install_snapshot_inner(meta, snapshot, false).await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "internal split of install_snapshot, whose signature (and Err size) is fixed by the RaftStateMachine trait"
+    )]
+    async fn install_snapshot_inner(
+        &self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot: Box<SnapshotFile>,
+        adopt: bool,
+    ) -> Result<(), StorageError<NodeId>> {
+        // Engine lifecycle lock (#1473): held SHARED across the WHOLE install —
+        // deserialize, publish the pointer, adopt into the engine. A retired
+        // member is refused BEFORE deserialization or adoption (so an old
+        // snapshot can never overwrite the engine a successor reuses), and
+        // retirement cannot complete while an install is mid-flight. Lock
+        // order: lifecycle → the snapshot publication lock (the publish) →
+        // the journal's checkpoint permit (the adoption); the publication
+        // lock is always released before the checkpoint permit is taken.
+        let _lifecycle = self.enter_lifecycle().await.ok_or_else(|| {
+            PartitionStateMachine::retired_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                "install a Raft snapshot",
+            )
+        })?;
+        let SnapshotFile {
+            file,
+            path,
+            in_flight,
+        } = *snapshot;
+        // Register the received `incoming-*.tmp` file in flight from here until
+        // its promotion rename below (#1488 review): a concurrent build's reap
+        // matches every `snap-`/`incoming-` artifact, so an unregistered
+        // receive would be deleted out from under the promotion.
+        let _received_in_flight = in_flight
+            .unwrap_or_else(|| InFlightSnapshot::register(&self.in_flight_snapshots, &path));
+
+        // Stream-deserialize the received chunked snapshot (#1337) from a
+        // blocking task: read the control skeleton, then restore each instance
+        // chunk-by-chunk, so the receive side never holds more than one chunk in
+        // flight before it is folded into the rebuilt state. openraft leaves the
+        // write cursor at the end, so rewind first.
+        let std_file = file.into_std().await;
+        let captured: nanobpmn_engine_core::EngineSnapshot = tokio::task::spawn_blocking(
+            move || -> std::io::Result<nanobpmn_engine_core::EngineSnapshot> {
+                use std::io::Seek;
+                let mut f = std_file;
+                f.seek(std::io::SeekFrom::Start(0))?;
+                nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
+            },
+        )
+        .await
+        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?
+        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+
+        // Promote the received file to the current snapshot (a rename within the
+        // same dir — cheap, no re-serialize, no extra copy) and drop the old one.
+        // The name is generation-stamped (#1473) so a late predecessor install
+        // can never collide with the successor's artifacts on the reopened dir.
+        let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let current_path = self.snapshot_dir.join(format!(
+            "snap-installed-g{}-{snapshot_idx}.bin",
+            self.generation
+        ));
+        // In flight until published (#1488): a concurrent build's reap must not
+        // delete the promoted-but-unpublished file.
+        let _in_flight = InFlightSnapshot::register(&self.in_flight_snapshots, &current_path);
+        std::fs::rename(&path, &current_path).map_err(|e| {
+            StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::new(
+                    e.kind(),
+                    format!("promote {path:?} -> {current_path:?}: {e}"),
+                ),
+            )
+        })?;
+        // fsync the promoted file, then record it as the durable current snapshot
+        // BEFORE unlinking the one it replaces — an installed snapshot is just as
+        // much a restart recovery point as a locally-built one, and the log store
+        // will purge below it (see [`PersistedSnapshotPtr`]).
+        if let Ok(f) = std::fs::File::open(&current_path) {
+            let _ = f.sync_all();
+        }
+        // Serialize publication with reaping (#1488 review): the durable
+        // pointer write, the current-snapshot cache update, and the
+        // superseded-artifact reap run under the partition's snapshot
+        // publication lock, so a concurrent build's sweep can never delete
+        // the file this install just made the durable recovery point (the
+        // in-flight guard alone cannot: it drops when this install returns,
+        // while the build's sweep may run afterwards). The lock is dropped
+        // BEFORE the adoption below — adoption takes the journal's checkpoint
+        // permit, a different lock domain that must never be held together
+        // with the publication lock.
+        let publish_guard: SnapshotPublishGuard = self.engine.snapshot_publish_lock().await;
+        // Never regress the published snapshot (#1488 review): if a newer
+        // snapshot is already published, this install is stale — discard its
+        // file and leave the pointer, cache and engine untouched.
+        if published_snapshot_supersedes(&self.current_snapshot, meta).is_some() {
+            let _ = std::fs::remove_file(&current_path);
+            return Ok(());
+        }
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            path: current_path,
+        };
+        write_snapshot_ptr(&self.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // #1488: publish the installed snapshot's per-partition/per-replica size
+        // (+ the oversize alert) and promptly reap every OTHER superseded
+        // snapshot artifact on this follower — under a catch-up retry loop the
+        // orphaned leftovers are multi-GB each (the #100 follower blowup) and
+        // must not accumulate until the next process restart sweeps them.
+        let partition_id = self.partition_id();
+        let installed_bytes = std::fs::metadata(&stored.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        observe_snapshot_file_size(partition_id, self.node_id, installed_bytes);
+        reap_superseded_snapshots(
+            &self.snapshot_dir,
+            &stored.path,
+            &self.in_flight_snapshots,
+            partition_id,
+            self.node_id,
+        );
+        let previous = self
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(stored);
+        if let Some(previous) = previous {
+            let _ = std::fs::remove_file(&previous.path);
+        }
+        // Publication + reap are complete: release the publication lock BEFORE
+        // the adoption below enters the journal's checkpoint-permit domain.
+        drop(publish_guard);
+
+        if adopt {
+            // Rebuild the engine actor's state from the captured snapshot IN
+            // PLACE. The engine journal is in-memory under Raft (the Raft log is
+            // the durable tier), so adopting the snapshot's engine state is the
+            // install — but the journal's read-model exporter wiring (and
+            // partition id / var store / spill tiers) MUST survive it, or an
+            // owned partition catching up via a snapshot install stops
+            // projecting and leaks its completed backlog. Adopt it through the
+            // single adoption routine, which also checkpoints it as the
+            // journal's recovery base BEFORE any later entry is accepted
+            // (#1405). The captured engine state carries the snapshot's applied
+            // record, so a crash before the pointer above is published still
+            // boots from a journal that wins at the snapshot's index. Fail
+            // closed: a replica whose journal cannot hold the base must not
+            // keep applying.
+            self.adopt_engine_snapshot(captured, meta)
+                .await
+                .map_err(|e| {
+                    StorageIOError::write_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    )
+                })?;
+        }
+
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.last_applied = meta.last_log_id;
+            inner.last_membership = meta.last_membership.clone();
+        }
+        Ok(())
+    }
 }
 
 /// Filename prefix for the per-process, per-partition snapshot staging dirs a
@@ -1334,6 +1637,20 @@ pub struct PartitionSnapshotBuilder {
     )>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
+    /// Test-only barrier waited on just before the build takes the snapshot
+    /// publication lock (#1488 review regression): lets a test hold a build at
+    /// "file written, publish not yet started" while a concurrent install
+    /// publishes and returns, deterministically forcing the
+    /// build-sweep-after-install-publish interleaving the snapshot publication
+    /// lock protects against.
+    #[cfg(test)]
+    test_writer_barrier: Option<Arc<tokio::sync::Barrier>>,
+    /// Test-only `(reached, release)` barrier pair (#1488 review regression):
+    /// parks the build INSIDE the publication lock — after the pointer +
+    /// cache publish, before the reap — so a test can prove a competing
+    /// publisher cannot publish until this one releases the lock.
+    #[cfg(test)]
+    test_publish_barrier: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
@@ -1418,6 +1735,15 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .sm
             .snapshot_dir
             .join(format!("snap-g{}-{snapshot_idx}.bin", self.sm.generation));
+        // Register the path as in flight BEFORE the file exists (#1488), so a
+        // concurrent install's reap never deletes it mid-write / pre-publish.
+        // The streaming writer stages the body in `path.with_extension("tmp")`
+        // and renames it into place, so the `.tmp` staging file is registered
+        // too — it matches the reaper's `snap-` prefix and is otherwise
+        // deletable out from under the writer's reopen/rename.
+        let _in_flight = InFlightSnapshot::register(&self.sm.in_flight_snapshots, &path);
+        let _in_flight_tmp =
+            InFlightSnapshot::register(&self.sm.in_flight_snapshots, &path.with_extension("tmp"));
         let covered = self.last_applied.map(|l| l.index).unwrap_or(0);
         let serialize_start = std::time::Instant::now();
         // The streaming serialize blocks on file I/O and the spill-store reads;
@@ -1476,6 +1802,41 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // one it replaces AND before build_snapshot returns: openraft may purge
         // the log this snapshot subsumes as soon as it returns, so a restartable
         // recovery point must already be on disk (see [`PersistedSnapshotPtr`]).
+        // The publish + reap below run under the partition's snapshot
+        // publication lock (#1488 review): a concurrent install's publish can
+        // then never interleave with this sweep, so the sweep can never delete
+        // a file the install just made the durable recovery point.
+        //
+        // Test-only barrier (#1488 review regression): park the build just
+        // BEFORE it takes the publication lock, so a test can interleave a
+        // full install publish+return and then release this build into its
+        // publish+sweep — the exact "build sweeps after the install's guard
+        // dropped" interleaving the publication lock protects against.
+        #[cfg(test)]
+        if let Some(barrier) = self.test_writer_barrier.take() {
+            barrier.wait().await;
+        }
+        let _publish = self.sm.engine.snapshot_publish_lock().await;
+        // Never regress the published snapshot (#1488 review): a build
+        // captured at index N that reaches publication after a concurrent
+        // install already published M > N must not replace the pointer/cache
+        // (OpenRaft may already purge through M). Discard this stale build and
+        // hand back the newer published snapshot instead.
+        let newer = published_snapshot_supersedes(&self.sm.current_snapshot, &meta);
+        if let Some(newer) = newer {
+            let _ = std::fs::remove_file(&path);
+            let tokio_file = tokio::fs::File::open(&newer.path)
+                .await
+                .map_err(|e| StorageIOError::read_snapshot(Some(newer.meta.signature()), &e))?;
+            return Ok(Snapshot {
+                meta: newer.meta,
+                snapshot: Box::new(SnapshotFile {
+                    file: tokio_file,
+                    path: newer.path,
+                    in_flight: None,
+                }),
+            });
+        }
         let stored = StoredSnapshot {
             meta: meta.clone(),
             path: path.clone(),
@@ -1493,6 +1854,24 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
+        #[cfg(test)]
+        if let Some((reached, release)) = self.test_publish_barrier.take() {
+            reached.wait().await;
+            release.wait().await;
+        }
+        // #1488: publish the per-partition/per-replica snapshot size (+ the
+        // oversize alert) and reap every OTHER superseded artifact still in the
+        // dir — an orphaned older-generation or un-tagged file must not
+        // accumulate until the next process restart sweeps it.
+        let partition_id = self.sm.partition_id();
+        observe_snapshot_file_size(partition_id, self.sm.node_id, snapshot_bytes);
+        reap_superseded_snapshots(
+            &self.sm.snapshot_dir,
+            &path,
+            &self.sm.in_flight_snapshots,
+            partition_id,
+            self.sm.node_id,
+        );
 
         let tokio_file = tokio::fs::File::open(&path)
             .await
@@ -1502,6 +1881,7 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             snapshot: Box::new(SnapshotFile {
                 file: tokio_file,
                 path,
+                in_flight: None,
             }),
         })
     }
@@ -1597,13 +1977,19 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .with(move |journal| {
                             journal.begin_raft_entry();
                             let mut outcomes = Vec::with_capacity(batch.items.len());
-                            for ReplicatedCommand { command, now } in batch.items {
+                            for ReplicatedCommand {
+                                command,
+                                now,
+                                operation_reference,
+                            } in batch.items
+                            {
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
                                 let timer = crate::cmd_profile::start();
                                 let kind = command.kind();
-                                let outcome = journal.apply_command_at(command, now);
+                                let outcome =
+                                    journal.apply_command_ref_at(command, now, operation_reference);
                                 crate::cmd_profile::finish(timer, kind);
                                 match outcome {
                                     Err(e) if e.is_environmental() => {
@@ -1764,6 +2150,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             captured,
             last_applied,
             last_membership,
+            #[cfg(test)]
+            test_writer_barrier: None,
+            #[cfg(test)]
+            test_publish_barrier: None,
         }
     }
 
@@ -1813,6 +2203,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         let path = self
             .snapshot_dir
             .join(format!("incoming-{}-{seq}.tmp", std::process::id()));
+        // Register the receive in flight BEFORE the file is created (#1488
+        // review): a concurrent build's publish+reap sweeps every unmatched
+        // artifact, so an unregistered receive would be deleted mid-stream.
+        let in_flight = InFlightSnapshot::register(&self.in_flight_snapshots, &path);
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1821,7 +2215,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .open(&path)
             .await
             .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
-        Ok(Box::new(SnapshotFile { file, path }))
+        Ok(Box::new(SnapshotFile {
+            file,
+            path,
+            in_flight: Some(in_flight),
+        }))
     }
 
     async fn install_snapshot(
@@ -1829,99 +2227,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<NodeId>> {
-        // Engine lifecycle lock (#1473): held SHARED across the WHOLE install —
-        // deserialize, adopt into the engine, publish the pointer. A retired
-        // member is refused BEFORE deserialization or adoption (so an old
-        // snapshot can never overwrite the engine a successor reuses), and
-        // retirement cannot complete while an install is mid-flight. Lock
-        // order: lifecycle → the journal's checkpoint permit (the adoption).
-        let _lifecycle = self.enter_lifecycle().await.ok_or_else(|| {
-            PartitionStateMachine::retired_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Write,
-                "install a Raft snapshot",
-            )
-        })?;
-        let SnapshotFile { file, path } = *snapshot;
-
-        // Stream-deserialize the received chunked snapshot (#1337) from a
-        // blocking task: read the control skeleton, then restore each instance
-        // chunk-by-chunk, so the receive side never holds more than one chunk in
-        // flight before it is folded into the rebuilt state. openraft leaves the
-        // write cursor at the end, so rewind first.
-        let std_file = file.into_std().await;
-        let captured: nanobpmn_engine_core::EngineSnapshot = tokio::task::spawn_blocking(
-            move || -> std::io::Result<nanobpmn_engine_core::EngineSnapshot> {
-                use std::io::Seek;
-                let mut f = std_file;
-                f.seek(std::io::SeekFrom::Start(0))?;
-                nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
-            },
-        )
-        .await
-        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?
-        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
-
-        // Rebuild the engine actor's state from the captured snapshot IN PLACE.
-        // The engine journal is in-memory under Raft (the Raft log is the durable
-        // tier), so adopting the snapshot's engine state is the install — but the
-        // journal's read-model exporter wiring (and partition id / var store /
-        // spill tiers) MUST survive it, or an owned partition catching up via a
-        // snapshot install stops projecting and leaks its completed backlog.
-        // Adopt it through the single adoption routine, which also checkpoints
-        // it as the journal's recovery base BEFORE any later entry is accepted
-        // (#1405). The captured engine state carries the snapshot's applied
-        // record, so a crash before the pointer below is published still boots
-        // from a journal that wins at the snapshot's index. Fail closed: a
-        // replica whose journal cannot hold the base must not keep applying.
-        self.adopt_engine_snapshot(captured, meta)
-            .await
-            .map_err(|e| {
-                StorageIOError::write_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                )
-            })?;
-
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.last_applied = meta.last_log_id;
-            inner.last_membership = meta.last_membership.clone();
-        }
-
-        // Promote the received file to the current snapshot (a rename within the
-        // same dir — cheap, no re-serialize, no extra copy) and drop the old one.
-        // The name is generation-stamped (#1473) so a late predecessor install
-        // can never collide with the successor's artifacts on the reopened dir.
-        let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-        let current_path = self.snapshot_dir.join(format!(
-            "snap-installed-g{}-{snapshot_idx}.bin",
-            self.generation
-        ));
-        std::fs::rename(&path, &current_path)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        // fsync the promoted file, then record it as the durable current snapshot
-        // BEFORE unlinking the one it replaces — an installed snapshot is just as
-        // much a restart recovery point as a locally-built one, and the log store
-        // will purge below it (see [`PersistedSnapshotPtr`]).
-        if let Ok(f) = std::fs::File::open(&current_path) {
-            let _ = f.sync_all();
-        }
-        let stored = StoredSnapshot {
-            meta: meta.clone(),
-            path: current_path,
-        };
-        write_snapshot_ptr(&self.snapshot_dir, &stored)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let previous = self
-            .current_snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(stored);
-        if let Some(previous) = previous {
-            let _ = std::fs::remove_file(&previous.path);
-        }
-        Ok(())
+        self.install_snapshot_inner(meta, snapshot, true).await
     }
 
     async fn get_current_snapshot(
@@ -1943,7 +2249,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
                 Ok(Some(Snapshot {
                     meta,
-                    snapshot: Box::new(SnapshotFile { file, path }),
+                    snapshot: Box::new(SnapshotFile {
+                        file,
+                        path,
+                        in_flight: None,
+                    }),
                 }))
             }
             None => Ok(None),
@@ -1970,6 +2280,168 @@ fn snapshot_build_concurrency() -> u32 {
 /// (`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES`, default 32 MiB).
 fn snapshot_recovery_bytes_threshold() -> u64 {
     raft_env_u64("NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES", 32 * 1024 * 1024)
+}
+
+/// Snapshot-FILE byte ceiling for the oversize alert (#1488): when a partition's
+/// current snapshot `.bin` on this replica exceeds this, the publish helper logs
+/// a WARN naming the partition, the replica, and the size. This is the "cap/alert"
+/// half of #100's residual scope — the #100 blowup wrote 8.4 GB follower
+/// snapshots against a 435 KB leader snapshot of the same partition, and nothing
+/// flagged it until the disk filled. The default (1 GiB) is ~2000x the healthy
+/// per-partition snapshot size observed in that soak, so it fires only on a real
+/// blowup, never on ordinary growth. `0` disables the WARN (the
+/// `nanobpm_raft_snapshot_file_bytes` gauge is still published for a
+/// Prometheus-side threshold alert).
+/// (`NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES`, default 1 GiB.)
+fn snapshot_alert_bytes_threshold() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES", 1024 * 1024 * 1024)
+}
+
+/// Publish one partition's current snapshot-file size on this replica: the
+/// per-partition/per-replica `nanobpm_raft_snapshot_file_bytes` gauge plus the
+/// oversize WARN alert (#1488). Called on every local snapshot build and every
+/// follower snapshot install, so both the leader's and the followers' snapshot
+/// files carry a size series — an oversized snapshot on ONE replica of ONE
+/// partition is then visible per-replica instead of hiding inside the
+/// process-wide `raft_snapshot_bytes` last-write gauge.
+fn observe_snapshot_file_size(partition_id: u64, node_id: NodeId, bytes: u64) {
+    crate::metrics::set_raft_snapshot_file_bytes(partition_id, node_id, bytes);
+    let threshold = snapshot_alert_bytes_threshold();
+    if threshold > 0 && bytes > threshold {
+        tracing::warn!(
+            partition = partition_id,
+            node = node_id,
+            snapshot_bytes = bytes,
+            threshold_bytes = threshold,
+            "Raft snapshot file exceeds the alert threshold \
+             (NANOBPMN_RAFT_SNAPSHOT_ALERT_BYTES): an oversized snapshot on one \
+             replica of one partition is the #100 blowup signature — check for \
+             follower snapshot divergence before the disk fills"
+        );
+    }
+}
+
+/// The single non-regression rule for snapshot publication (#1488 review):
+/// returns the currently published snapshot iff it is strictly NEWER than
+/// `candidate`, in which case publishing `candidate` would move the durable
+/// recovery point backwards. Must be called under the snapshot publication
+/// lock so the check and the publish are atomic.
+fn published_snapshot_supersedes(
+    current: &Mutex<Option<StoredSnapshot>>,
+    candidate: &SnapshotMeta<NodeId, BasicNode>,
+) -> Option<StoredSnapshot> {
+    current
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cur| cur.meta.last_log_id > candidate.last_log_id)
+        .cloned()
+}
+
+/// Reap every superseded snapshot artifact in `snapshot_dir` that is not the
+/// CURRENT snapshot `keep` (#1488). `build_snapshot` and `install_snapshot`
+/// unlink only the one file they directly replace, so any older artifact — a
+/// pre-#1473 un-tagged `snap-<idx>.bin`, a same-generation file orphaned by a
+/// crash between the file write and the durable-pointer write, or a
+/// predecessor-generation file a late build/install left behind — accumulated
+/// on the replica until a process restart swept it. Under a catch-up retry
+/// loop those orphans are multi-GB each (the #100 follower blowup), so they are
+/// reaped here, the moment a newer snapshot becomes current, rather than at
+/// the next boot. Only recognized snapshot artifacts (`snap-*.bin` /
+/// `snap-installed-*.bin`) are touched; the durable pointer and foreign files
+/// are left alone, as is every path still registered in `in_flight` (a
+/// concurrent build/install that has not yet published it). Best-effort: a
+/// removal failure is logged, never fatal.
+fn reap_superseded_snapshots(
+    snapshot_dir: &Path,
+    keep: &Path,
+    in_flight: &Mutex<std::collections::HashSet<PathBuf>>,
+    partition_id: u64,
+    node_id: NodeId,
+) {
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                partition = partition_id,
+                node = node_id,
+                error = %e,
+                "could not list the snapshot dir to reap superseded snapshots"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("snap-"))
+            .unwrap_or(false);
+        if !ours {
+            continue;
+        }
+        // Registration precedes file creation, so a listed file a concurrent
+        // build/install is still producing is always visible here.
+        if in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&path)
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    partition = partition_id,
+                    node = node_id,
+                    reaped = ?path,
+                    "reaped a superseded Raft snapshot file"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    partition = partition_id,
+                    node = node_id,
+                    reaped = ?path,
+                    error = %e,
+                    "could not reap a superseded Raft snapshot file"
+                );
+            }
+        }
+    }
+}
+
+/// RAII registration of a snapshot file a build/install is still producing
+/// (#1488): while alive, [`reap_superseded_snapshots`] skips the path. Dropped
+/// on every exit path (success or error), so a failed build never pins a path.
+struct InFlightSnapshot {
+    set: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl InFlightSnapshot {
+    fn register(set: &Arc<Mutex<std::collections::HashSet<PathBuf>>>, path: &Path) -> Self {
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+        Self {
+            set: Arc::clone(set),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for InFlightSnapshot {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
+    }
 }
 
 /// Whether this node's resident state machine is currently large enough that its
@@ -2245,6 +2717,7 @@ fn is_creation_intake(command: &Command) -> bool {
 /// capacity the drain path leaves — the log-layer analogue of Zeebe's
 /// `WhiteListedCommands`, and the fix for the credit-starvation latch where a
 /// create flood at the single FIFO starved job completion.
+#[derive(Clone)]
 struct Batcher {
     hi_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
     lo_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
@@ -2345,7 +2818,12 @@ impl Batcher {
         }
     }
 
-    async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
+    async fn submit(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
         let command = stamp_for_proposal(&self.engine, command).await;
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
@@ -2357,7 +2835,11 @@ impl Batcher {
             &self.hi_tx
         };
         tx.send(Submission {
-            item: ReplicatedCommand { command, now },
+            item: ReplicatedCommand {
+                command,
+                now,
+                operation_reference,
+            },
             resp,
         })
         .map_err(|_| ProposeError::Other("raft propose batcher stopped".to_string()))?;
@@ -2392,6 +2874,273 @@ async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command
         .await
 }
 
+/// The engine-actor → Raft-leader propose channel for off-heap orphans
+/// (#1447): an orphan detected inside replicated state-machine application is
+/// handed to this queue (via [`OrphanQueueSink`]) and proposed by the
+/// partition LEADER as a STAMPED `Command::QuarantineOffheapOrphan` — the
+/// leader resolves the incident metadata from its own state, so every replica
+/// applies the identical incident whatever its local residency. Unbounded:
+/// orphan detection is rare (a lost spill row) and each item is tiny; the
+/// journal's in-flight set keeps a key from being queued twice.
+type OrphanQueue = tokio::sync::mpsc::UnboundedSender<(
+    nanobpmn_engine_core::Key,
+    nanobpmn_engine_core::OrphanKind,
+)>;
+
+/// The journal-facing half of the orphan propose channel (#1447): implements
+/// the storage layer's `OrphanSink` trait so the engine actor can hand an
+/// orphan key off without blocking.
+#[derive(Debug)]
+struct OrphanQueueSink {
+    tx: OrphanQueue,
+}
+
+impl nano_server_storage::journal::OrphanSink for OrphanQueueSink {
+    fn enqueue_orphan(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        kind: nanobpmn_engine_core::OrphanKind,
+    ) -> bool {
+        self.tx.send((instance_key, kind)).is_ok()
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the leader's replicated
+/// `now` stamp on a proposed quarantine command (#1447).
+fn orphan_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the engine actor under this member's lifecycle epoch (#1473):
+/// `None` (and nothing runs) once the member is retired, so a delayed task of a
+/// retired predecessor can never touch the successor's journal state.
+///
+/// The shared lifecycle guard is moved INTO the queued actor closure, not held
+/// by this future (#1574 review): the orphan drainer/watcher run under a
+/// shutdown `select!`, so this future can be CANCELLED after the callback was
+/// queued — a future-held guard would drop with it, letting retirement's
+/// exclusive lock advance the epoch while the queued update still runs. Owned
+/// by the closure, the guard is released only when the job has finished (or
+/// when the actor drains it on death), so the epoch cannot advance underneath
+/// a pending update.
+async fn with_member_engine<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+) -> Option<R> {
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
+}
+
+/// [`with_member_engine`] with a probe fired once the shared lifecycle guard
+/// is held, before the actor callback is queued — so the cancellation test can
+/// drop the calling future at the exact point the #1574-review race needs.
+#[cfg(test)]
+async fn with_member_engine_observed<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+    on_guard: impl FnOnce() + Send,
+) -> Option<R> {
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    on_guard();
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
+}
+
+/// Proposes one orphan report as a leader-STAMPED quarantine (#1447). The
+/// report stays in the journal's backlog until the command applies: a stamp of
+/// `None` (the leader already holds the incident, or the instance is terminal
+/// here) settles it; a failed or rejected proposal returns it to the backlog
+/// for the next drain. Returns `false` once the member is retired.
+async fn propose_orphan(
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+    epoch: u64,
+    key: nanobpmn_engine_core::Key,
+    kind: nanobpmn_engine_core::OrphanKind,
+) -> bool {
+    let Some(pending) = with_member_engine(engine, epoch, move |journal| {
+        journal.orphan_pending_stamp(key, kind)
+    })
+    .await
+    else {
+        return false;
+    };
+    // Stale queued item (#1574 review): the report was settled or discarded on
+    // engine adoption (a healthy snapshot install) — never propose it.
+    let Some(stamp) = pending else {
+        return true;
+    };
+    let Some(stamp) = stamp else {
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_settled(key))
+            .await
+            .is_some();
+    };
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // No caller operationReference for an internal quarantine proposal (#1556).
+    let failure = match batcher.submit(command, orphan_now_millis(), None).await {
+        Ok(item) => item
+            .error
+            .map(|(status, message)| format!("{status}: {message}")),
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(error) = failure {
+        tracing::error!(
+            instance_key = key,
+            %error,
+            "orphan quarantine proposal failed (#1447); the report stays in the \
+             backlog and is re-proposed by the next drain"
+        );
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_failed(key))
+            .await
+            .is_some();
+    }
+    true
+}
+
+/// Stop handle for the orphan propose tasks of one partition member (#1574
+/// review). The drainer task holds the engine handle and a [`Batcher`] (which
+/// holds the Raft), while the channel's sender lives inside that same engine's
+/// journal — an ownership cycle in which `rx.recv()` alone never returns
+/// `None`. The tasks therefore also exit on an EXPLICIT stop: when this handle
+/// is [stopped](Self::stop) or dropped (it is owned by [`RaftPartition`]), or
+/// when the Raft core has shut down. Exiting drops their engine/Batcher/Raft
+/// clones, breaking the cycle.
+struct OrphanProposeStop {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl OrphanProposeStop {
+    fn stop(&self) {
+        self.tx.send_replace(true);
+    }
+}
+
+impl Drop for OrphanProposeStop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Resolves once the orphan propose tasks must exit (#1574 review): the stop
+/// handle fired or was dropped, or the Raft core shut down (its metrics report
+/// `Shutdown`, or the metrics channel closed with the core).
+async fn orphan_propose_stopped(
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>>,
+) {
+    let stop_fired = async move {
+        // `wait_for` errs when the sender is dropped — also a stop.
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    };
+    let raft_down = async move {
+        let _ = metrics
+            .wait_for(|m| m.state == openraft::ServerState::Shutdown)
+            .await;
+    };
+    tokio::select! {
+        () = stop_fired => {}
+        () = raft_down => {}
+    }
+}
+
+/// Wires the orphan propose channel for one partition member (#1447). Every
+/// task is bound to the member's lifecycle `epoch` (#1473) and stops once it is
+/// retired, so a rebuilt successor sharing the engine actor cannot have its
+/// sink or leadership flag overwritten by a delayed predecessor. Both tasks
+/// also exit when the returned [`OrphanProposeStop`] fires / drops or the Raft
+/// core shuts down (#1574 review), so the drainer ⇄ journal ownership cycle
+/// cannot keep them (and the Raft they hold) alive past shutdown:
+///
+/// 1. The journal gets an [`OrphanQueueSink`] plus the member's CURRENT
+///    leadership (wiring drains anything parked before it).
+/// 2. A drainer proposes each queued orphan through the partition's
+///    [`Batcher`] as a leader-stamped quarantine ([`propose_orphan`]).
+/// 3. A metrics watcher keeps the journal's leadership flag fresh, draining the
+///    parked backlog on promotion.
+fn wire_orphan_propose(
+    raft: &openraft::Raft<RaftConfig>,
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+    epoch: u64,
+) -> (
+    OrphanProposeStop,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
+    let node_id = raft.metrics().borrow().id;
+    let mut metrics = raft.metrics();
+    let engine_for_watch = engine.clone();
+    let watch_stopped = orphan_propose_stopped(stop_rx.clone(), raft.metrics());
+    // Seed the sink first, then keep the leadership flag fresh — one task, so
+    // the seed is ordered before the first leadership publish.
+    let watcher = tokio::spawn(async move {
+        let work = async move {
+            let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                journal.set_orphan_sink(sink);
+            })
+            .await;
+            if seeded.is_none() {
+                return; // retired before wiring
+            }
+            loop {
+                let is_leader = metrics.borrow().current_leader == Some(node_id);
+                let published = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                    journal.set_orphan_leadership(is_leader)
+                })
+                .await;
+                if published.is_none() || metrics.changed().await.is_err() {
+                    break; // retired, or Raft dropped
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            () = watch_stopped => {}
+        }
+    });
+    let batcher = batcher.clone();
+    let engine = engine.clone();
+    let drain_stopped = orphan_propose_stopped(stop_rx, raft.metrics());
+    let drainer = tokio::spawn(async move {
+        let work = async move {
+            while let Some((key, kind)) = rx.recv().await {
+                if !propose_orphan(&batcher, &engine, epoch, key, kind).await {
+                    break; // retired: the successor wires its own channel
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            () = drain_stopped => {}
+        }
+    });
+    (OrphanProposeStop { tx: stop_tx }, watcher, drainer)
+}
+
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
 pub struct RaftPartition {
     pub raft: openraft::Raft<RaftConfig>,
@@ -2423,6 +3172,13 @@ pub struct RaftPartition {
     /// dir). Only a volatile dir is reclaimed on retire; a durable recovery
     /// directory is never touched.
     sm_volatile_snap: bool,
+    /// Stops this member's orphan propose tasks on retire / drop (#1574
+    /// review), breaking the drainer ⇄ journal ownership cycle.
+    orphan_stop: OrphanProposeStop,
+    /// The orphan watcher + drainer task handles (#1574 review), kept so tests
+    /// can assert they exit on shutdown.
+    #[cfg_attr(not(test), allow(dead_code))]
+    orphan_tasks: [tokio::task::JoinHandle<()>; 2],
 }
 
 impl RaftPartition {
@@ -2443,6 +3199,7 @@ impl RaftPartition {
 
         let log_store = MemLogStore::default();
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
@@ -2458,6 +3215,8 @@ impl RaftPartition {
         raft.initialize(members).await?;
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -2470,6 +3229,8 @@ impl RaftPartition {
             sm_snapshot_dir,
             // A single in-memory voter anchors its snapshots in a temp dir.
             sm_volatile_snap: true,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -2492,6 +3253,7 @@ impl RaftPartition {
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -2522,6 +3284,8 @@ impl RaftPartition {
         }
 
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -2534,6 +3298,8 @@ impl RaftPartition {
             sm_snapshot_dir,
             // Snapshots anchor next to the durable log — never reclaimed on retire.
             sm_volatile_snap: false,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -2573,6 +3339,7 @@ impl RaftPartition {
         // metrics watcher spawned below once the Raft handle exists.
         let leader = Arc::new(AtomicU64::new(u64::MAX));
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -2622,6 +3389,8 @@ impl RaftPartition {
             }
         };
         let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.
@@ -2648,6 +3417,8 @@ impl RaftPartition {
             sm_epoch,
             sm_snapshot_dir,
             sm_volatile_snap: volatile_snap,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
         })
     }
 
@@ -2875,7 +3646,7 @@ impl RaftPartition {
     /// [`Batcher`], so a flood of concurrent proposes coalesces into batched
     /// entries; a lone proposer forms a batch of one.
     pub async fn propose(&self, command: Command, now: u64) -> anyhow::Result<Vec<Event>> {
-        Ok(self.batcher.submit(command, now).await?.events)
+        Ok(self.batcher.submit(command, now, None).await?.events)
     }
 
     /// Like [`propose`](Self::propose) but returns the full per-command
@@ -2887,7 +3658,18 @@ impl RaftPartition {
         command: Command,
         now: u64,
     ) -> Result<ReplicatedItem, ProposeError> {
-        self.batcher.submit(command, now).await
+        self.propose_result_ref(command, now, None).await
+    }
+
+    /// [`propose_result`](Self::propose_result) for a command carrying a
+    /// caller `operationReference` (#1556), replicated on the command envelope.
+    pub async fn propose_result_ref(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
+        self.batcher.submit(command, now, operation_reference).await
     }
 
     /// Whether this partition's Raft core has entered `Shutdown` — it has
@@ -2936,6 +3718,7 @@ impl RaftPartition {
         &self,
         bound: std::time::Duration,
     ) -> std::io::Result<LifecycleExclusive> {
+        self.orphan_stop.stop();
         self.raft.shutdown().await.ok();
         let Ok(exclusive) = tokio::time::timeout(bound, self.sm_engine.lifecycle_exclusive()).await
         else {
@@ -3164,6 +3947,42 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    /// #1556: a retained pre-#1556 Raft entry carried `operation_reference`
+    /// NESTED in the command body. Every such historical variant must promote
+    /// it to the envelope field on decode (else re-applying the entry after
+    /// upgrade silently loses the reference), the outer field wins when both
+    /// are present, and the round trip uses the current (outer) form.
+    #[test]
+    fn legacy_nested_operation_reference_is_promoted_on_decode() {
+        let legacy = [
+            r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":11}}"#,
+            r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5,"operation_reference":11}}"#,
+            r#"{"UpdateJob":{"job_key":7,"retries":2,"operation_reference":11}}"#,
+            r#"{"ResolveIncident":{"incident_key":7,"operation_reference":11}}"#,
+        ];
+        for command in legacy {
+            let line = format!(r#"{{"command":{command},"now":1}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).expect(&line);
+            assert_eq!(decoded.operation_reference, Some(11), "{line}");
+            let reencoded = serde_json::to_string(&decoded).unwrap();
+            let again: ReplicatedCommand = serde_json::from_str(&reencoded).unwrap();
+            assert_eq!(again.operation_reference, Some(11), "{reencoded}");
+            assert!(
+                !serde_json::to_string(&again.command)
+                    .unwrap()
+                    .contains("operation_reference")
+            );
+
+            let line = format!(r#"{{"command":{command},"now":1,"operation_reference":22}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.operation_reference, Some(22), "outer wins: {line}");
+        }
+        let plain: ReplicatedCommand =
+            serde_json::from_str(r#"{"command":{"ResolveIncident":{"incident_key":7}},"now":1}"#)
+                .unwrap();
+        assert_eq!(plain.operation_reference, None);
     }
 
     #[test]
@@ -3549,6 +4368,534 @@ mod tests {
     }
 
     #[test]
+    fn reap_superseded_snapshots_removes_stale_artifacts_and_keeps_current() {
+        // #1488: the prompt-reaping helper. A snapshot dir holding the current
+        // snapshot plus the stale shapes a real replica accrues — an un-tagged
+        // pre-#1473 file, a predecessor-generation file, a same-generation
+        // orphan — must be reduced to just the current file, while the durable
+        // pointer and foreign files survive.
+        let dir = std::env::temp_dir().join(format!(
+            "nano-reap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create snapshot dir");
+        let keep = dir.join("snap-installed-g3-9.bin");
+        let stale = [
+            dir.join("snap-7.bin"),              // pre-#1473 un-tagged
+            dir.join("snap-g1-3.bin"),           // predecessor generation
+            dir.join("snap-installed-g2-8.bin"), // superseded install
+            dir.join("snap-g3-8.bin"),           // same-generation orphan
+        ];
+        for path in stale.iter().chain(std::iter::once(&keep)) {
+            std::fs::write(path, b"snapshot-bytes").expect("write snapshot file");
+        }
+        let ptr = dir.join("current-snapshot.json");
+        std::fs::write(&ptr, b"{}").expect("write pointer");
+        let foreign = dir.join("notes.txt");
+        std::fs::write(&foreign, b"not ours").expect("write foreign file");
+        let incoming = dir.join(format!("incoming-{}-0.tmp", std::process::id()));
+        std::fs::write(&incoming, b"partial").expect("write in-flight partial");
+
+        let in_flight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // A file a concurrent build is still writing (registered in flight)
+        // must survive the reap; once its guard drops it is reapable again.
+        let building = dir.join("snap-g3-10.bin");
+        std::fs::write(&building, b"partial build").expect("write in-flight build");
+        let guard = InFlightSnapshot::register(&in_flight, &building);
+        // The streaming writer's `.tmp` staging file (snapstream.rs renames it
+        // into place) is registered alongside its final path and must likewise
+        // survive the reap — it matches the `snap-` prefix, so an unregistered
+        // one would be deleted out from under the writer's reopen/rename.
+        let staging = dir.join("snap-g3-10.tmp");
+        std::fs::write(&staging, b"partial build staging").expect("write staging file");
+        let staging_guard = InFlightSnapshot::register(&in_flight, &staging);
+        // Likewise an install's promoted-but-unpublished file.
+        let promoted = dir.join("snap-installed-g3-11.bin");
+        std::fs::write(&promoted, b"promoted").expect("write promoted install");
+        let promoted_guard = InFlightSnapshot::register(&in_flight, &promoted);
+
+        reap_superseded_snapshots(&dir, &keep, &in_flight, 0, 0);
+        assert!(building.exists(), "an in-flight build is never reaped");
+        assert!(
+            staging.exists(),
+            "an in-flight build's .tmp staging file is never reaped"
+        );
+        assert!(promoted.exists(), "an unpublished install is never reaped");
+        drop(guard);
+        drop(staging_guard);
+        drop(promoted_guard);
+        assert!(
+            in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "guards deregister on drop"
+        );
+        reap_superseded_snapshots(&dir, &keep, &in_flight, 0, 0);
+        assert!(
+            !building.exists(),
+            "a superseded build is reaped once published"
+        );
+        assert!(
+            !staging.exists(),
+            "a leftover .tmp staging file is reaped once its guard drops"
+        );
+        assert!(
+            !promoted.exists(),
+            "a superseded install is reaped once published"
+        );
+
+        assert!(keep.exists(), "the current snapshot survives");
+        for path in &stale {
+            assert!(!path.exists(), "stale artifact reaped: {path:?}");
+        }
+        assert!(ptr.exists(), "the durable pointer is never reaped");
+        assert!(foreign.exists(), "a foreign file is never reaped");
+        assert!(
+            incoming.exists(),
+            "an in-flight receive is never reaped out from under openraft"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_build_reap_never_deletes_a_concurrently_published_install() {
+        // #1488 review regression for the interleaving: a local build's sweep
+        // runs while a follower install has published and returned (dropping
+        // its in-flight guard); the build's `keep` names only its OWN file, so
+        // without the per-partition snapshot publication lock the sweep deletes
+        // the install's file even though `current-snapshot.json` references it
+        // — leaving recovery without that snapshot after the covered log is
+        // purged. The test drives the exact interleaving deterministically: a
+        // barrier parks the build just BEFORE it takes the publication lock,
+        // the install publishes and returns (dropping its guard), and only
+        // then is the build released into its publish+sweep.
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+
+        // The install's snapshot body comes from a throwaway builder on the
+        // same engine; its published file is the stale artifact the racing
+        // sweep later reaps.
+        let mut donor_builder = sm.get_snapshot_builder().await;
+        let mut donor = donor_builder.build_snapshot().await.expect("donor build");
+        let donor_meta = donor.meta.clone();
+        let mut donor_bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            donor
+                .snapshot
+                .read_to_end(&mut donor_bytes)
+                .await
+                .expect("read donor snapshot");
+        }
+        let donor_file = sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path.clone())
+            .expect("the donor build published");
+        assert!(
+            donor_file.exists(),
+            "the donor snapshot is on disk before the race"
+        );
+
+        // The build's member is constructed BEFORE the receive starts: a
+        // continuation member (shares the receive epoch — recv_idx and the
+        // in-flight set — so a later receive is registered for it too), so its
+        // construction sweep runs on a dir with no live incoming file.
+        let build_engine = engine.clone();
+        let build_member = Arc::new(
+            sm.new_continuation_for_test(build_engine)
+                .expect("continuation snapshot dir"),
+        );
+
+        // The receive starts now — registered in flight on the shared set, so
+        // the build's publish sweep below cannot delete it mid-stream (the
+        // second regression this round covers).
+        let mut received = sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&donor_bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+
+        // The racing build: parks at the barrier just before its publish.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let build_barrier = Arc::clone(&barrier);
+        let build = tokio::spawn(async move {
+            let mut sm = build_member;
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.test_writer_barrier = Some(build_barrier);
+            builder.build_snapshot().await.expect("racing build");
+            sm
+        });
+
+        // The install publishes and returns while the build is parked before
+        // its own publish. Its adoption is skipped: this replica shares the
+        // engine whose state the snapshot was captured from, and the
+        // checkpoint permit the adoption would take is held by the paused
+        // build's own capture path — the race under test is the PUBLISH side
+        // (pointer + reap), which runs in full.
+        let install_sm = sm.clone();
+        let install_meta = donor_meta.clone();
+        let install = tokio::spawn(async move {
+            install_sm
+                .install_snapshot_skip_adoption_for_test(&install_meta, received)
+                .await
+                .expect("install snapshot");
+            install_sm
+        });
+        let install_sm = install.await.expect("install task");
+        let installed = install_sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path.clone())
+            .expect("the install published a current snapshot");
+        assert!(
+            installed.exists(),
+            "the installed snapshot is on disk before the build's sweep"
+        );
+        assert!(
+            !install_sm
+                .in_flight_snapshots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&installed),
+            "the install's in-flight guard dropped when it returned"
+        );
+
+        // Release the build into its publish+sweep: the exact interleaving
+        // that used to delete the published install — the build's `keep`
+        // names only its own file and the install's guard is gone, so only
+        // the publication lock (which serializes the install's publish with
+        // this sweep) keeps the pointer's file alive.
+        barrier.wait().await;
+        let build_sm = build.await.expect("build task");
+
+        // The build is newer, so it wins the pointer; the install's file is
+        // reaped as superseded. The invariant under test: the pointer names
+        // the build's file and that file is physically present — recovery
+        // never references a reaped file.
+        let ptr = read_snapshot_ptr(&dir).expect("a durable pointer is published");
+        let build_file = build_sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path.clone())
+            .expect("the build published");
+        assert_eq!(
+            ptr.path, build_file,
+            "the durable pointer names the newer build's snapshot"
+        );
+        assert!(
+            ptr.path.exists(),
+            "the pointer's snapshot file survives every reap"
+        );
+        assert!(
+            !installed.exists(),
+            "the superseded install is reaped once the newer build publishes"
+        );
+        assert!(
+            !donor_file.exists(),
+            "the superseded donor snapshot is reaped"
+        );
+    }
+
+    /// Shared fixture for the publication-race regressions (#1488 review): a
+    /// replica with a published donor snapshot, a continuation member to run
+    /// the racing build on, and a received (not yet installed) copy of the
+    /// donor body.
+    async fn publication_race_fixture() -> (
+        Arc<PartitionStateMachine>,
+        PathBuf,
+        SnapshotMeta<NodeId, BasicNode>,
+        Arc<PartitionStateMachine>,
+        Box<SnapshotFile>,
+    ) {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let mut donor_builder = sm.get_snapshot_builder().await;
+        let mut donor = donor_builder.build_snapshot().await.expect("donor build");
+        let donor_meta = donor.meta.clone();
+        let mut donor_bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            donor
+                .snapshot
+                .read_to_end(&mut donor_bytes)
+                .await
+                .expect("read donor snapshot");
+        }
+        let build_member = Arc::new(
+            sm.new_continuation_for_test(engine)
+                .expect("continuation snapshot dir"),
+        );
+        let mut received = sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&donor_bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+        (sm, dir, donor_meta, build_member, received)
+    }
+
+    #[tokio::test]
+    async fn a_competing_publisher_waits_for_the_publication_lock() {
+        // #1488 review regression: park a build INSIDE the publication lock
+        // (pointer + cache published, reap not yet run) and prove a concurrent
+        // install cannot publish until the build releases the lock. Removing
+        // either `snapshot_publish_lock` acquisition makes the install finish
+        // inside the window and fails this test.
+        let (sm, dir, donor_meta, build_member, received) = publication_race_fixture().await;
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (b_reached, b_release) = (Arc::clone(&reached), Arc::clone(&release));
+        let build = tokio::spawn(async move {
+            let mut sm = build_member;
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.test_publish_barrier = Some((b_reached, b_release));
+            builder.build_snapshot().await.expect("racing build");
+            sm
+        });
+        reached.wait().await;
+
+        let install_sm = sm.clone();
+        let install = tokio::spawn(async move {
+            install_sm
+                .install_snapshot_skip_adoption_for_test(&donor_meta, received)
+                .await
+                .expect("install snapshot");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !install.is_finished(),
+            "the install must not publish while the build holds the publication lock"
+        );
+        release.wait().await;
+        let _build_sm = build.await.expect("build task");
+        install.await.expect("install task");
+
+        let ptr = read_snapshot_ptr(&dir).expect("a durable pointer is published");
+        assert!(
+            ptr.path.exists(),
+            "the pointer's snapshot file survives every reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_build_never_regresses_a_newer_installed_snapshot() {
+        // #1488 review regression: a build captured at index N reaches
+        // publication after an install at M > N published. The build must not
+        // replace the pointer/cache nor reap the installed file (OpenRaft may
+        // already purge through M); it hands back the newer snapshot instead.
+        let (sm, dir, donor_meta, _build_member, received) = publication_race_fixture().await;
+        let mut newer_meta = donor_meta.clone();
+        // The donor build captured no applied log id (None); any Some(..) is
+        // strictly newer than both it and the racing build's capture.
+        newer_meta.last_log_id = Some(LogId::new(openraft::CommittedLeaderId::new(1, 0), 100));
+        newer_meta.snapshot_id = format!("{}-newer", newer_meta.snapshot_id);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let build_barrier = Arc::clone(&barrier);
+        // Build on the SAME state machine the install publishes to: the
+        // non-regression check reads its published-snapshot cache. Capture
+        // the builder BEFORE spawning/installing so it deterministically
+        // records the pre-install (older) applied index.
+        let mut build_sm = sm.clone();
+        let mut builder = build_sm.get_snapshot_builder().await;
+        builder.test_writer_barrier = Some(build_barrier);
+        let build =
+            tokio::spawn(async move { builder.build_snapshot().await.expect("racing build") });
+
+        sm.install_snapshot_skip_adoption_for_test(&newer_meta, received)
+            .await
+            .expect("install snapshot");
+        let installed = sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path.clone())
+            .expect("the install published");
+
+        barrier.wait().await;
+        let built = build.await.expect("build task");
+        assert_eq!(
+            built.meta.last_log_id, newer_meta.last_log_id,
+            "the stale build hands back the newer published snapshot"
+        );
+        let ptr = read_snapshot_ptr(&dir).expect("a durable pointer is published");
+        assert_eq!(ptr.path, installed, "the pointer never regresses");
+        assert!(
+            installed.exists(),
+            "the newer installed snapshot is never reaped"
+        );
+        let current = sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.meta.last_log_id);
+        assert_eq!(
+            current,
+            Some(newer_meta.last_log_id),
+            "the cache never regresses"
+        );
+    }
+
+    #[test]
+    fn snapshot_alert_threshold_defaults_positive() {
+        // #1488: the alert threshold helper. The env var is read per call; the
+        // test env never sets it, so this asserts the documented default (1 GiB,
+        // ~2000x the healthy per-partition snapshot size observed in the #100
+        // soak) — high enough that ordinary growth never pages, low enough that
+        // a multi-GB follower blowup fires immediately.
+        assert_eq!(
+            snapshot_alert_bytes_threshold(),
+            1024 * 1024 * 1024,
+            "the default alert ceiling is 1 GiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_publishes_size_metric_and_reaps_superseded_files() {
+        // #1488 end-to-end at the state-machine surface: a follower installing a
+        // snapshot publishes the per-partition/per-replica size series AND
+        // promptly reaps the superseded snapshot files already in its dir.
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        src.with(|j| {
+            let _ = j
+                .apply_command_at(deploy_command(), 1)
+                .expect("deploy applies");
+        })
+        .await;
+        let mut src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
+        let mut builder = src_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+        let mut reader = snap.snapshot;
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read snapshot body");
+        }
+
+        // The follower: an empty replica whose snapshot dir already holds a
+        // superseded artifact (as a lagging follower's would after earlier
+        // installs / crashed receives). Its replica label is unique to this
+        // test, so neither the source build's `{node="0"}` series nor any
+        // parallel test can satisfy (or clobber) the destination assertion.
+        const DST_NODE: NodeId = 1_488_550_001;
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let mut dst_sm: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                dst.clone(),
+                0,
+                PartitionStateMachine::temp_snapshot_dir(0),
+                DST_NODE,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("snapshot dir"),
+        );
+        let series =
+            format!("nanobpm_raft_snapshot_file_bytes{{node=\"{DST_NODE}\",partition=\"0\"}}");
+        assert!(
+            !crate::metrics::gather().contains(&series),
+            "the destination series must be absent before install"
+        );
+        let stale = dst_sm.snapshot_dir.join("snap-g1-1.bin");
+        std::fs::write(&stale, b"stale").expect("write stale snapshot");
+
+        let mut received = dst_sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+        dst_sm
+            .install_snapshot(&snap.meta, received)
+            .await
+            .expect("install snapshot");
+
+        // The superseded file is reaped promptly, the installed snapshot is the
+        // only one left, and the per-partition/per-replica gauge carries the
+        // installed file's size for this replica.
+        assert!(
+            !stale.exists(),
+            "the superseded snapshot was reaped at install time"
+        );
+        let remaining: Vec<_> = std::fs::read_dir(&dst_sm.snapshot_dir)
+            .expect("list snapshot dir")
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(str::to_owned)
+                    .filter(|n| n.starts_with("snap-"))
+            })
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly the installed snapshot remains, got {remaining:?}"
+        );
+        let gauge = crate::metrics::gather();
+        let expected = format!("{series} {}", bytes.len());
+        assert!(
+            gauge.contains(&expected),
+            "the per-replica size series is published ({expected}):\n{gauge}"
+        );
+    }
+
+    #[test]
     fn snapshot_build_concurrency_defaults_and_floors() {
         // Env-free default is 2 concurrent builds (steady-state co-hosted partitions
         // rarely coincide thanks to the jitter, so a small cap is unobtrusive).
@@ -3676,6 +5023,160 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// #1574 review: the lifecycle guard a member-bound engine op takes must
+    /// survive CANCELLATION of the calling future. The orphan drainer/watcher
+    /// run under a shutdown `select!`; if the stop branch wins after the actor
+    /// callback was queued, the outer future is dropped — the guard must live
+    /// in the QUEUED CLOSURE so the queued update still finishes under the
+    /// shared hold, and retirement's exclusive lock waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_member_engine_op_holds_its_guard_until_the_job_runs() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let epoch = engine.lifecycle_epoch();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Occupy the actor with a blocking job so the next job stays QUEUED.
+        let blocker = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .with(move |_| {
+                        entered_tx.send(()).ok();
+                        release_rx.recv().ok();
+                    })
+                    .await;
+            }
+        });
+        entered_rx
+            .recv()
+            .expect("the blocking job is running on the actor");
+
+        // Queue the member-bound op, then CANCEL its future mid-flight (the
+        // shutdown select! dropping the drainer/watcher future). Poll it on a
+        // task so it enters the lifecycle lock and queues its actor callback.
+        let (job_ran_tx, job_ran_rx) = mpsc::channel::<()>();
+        let (guard_held_tx, guard_held_rx) = mpsc::channel::<()>();
+        let op = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                with_member_engine_observed(
+                    &engine,
+                    epoch,
+                    move |_| {
+                        job_ran_tx.send(()).ok();
+                    },
+                    move || {
+                        guard_held_tx.send(()).ok();
+                    },
+                )
+                .await;
+            }
+        });
+        // The op holds the shared guard and its callback sits QUEUED behind
+        // the blocker. Now CANCEL the op's future (the shutdown select!
+        // dropping the drainer/watcher): any guard the FUTURE holds dies with
+        // it, while the queued callback's fate is the question under test.
+        guard_held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the op entered the lifecycle lock");
+        op.abort();
+        assert!(
+            op.await.unwrap_err().is_cancelled(),
+            "the op task was cancelled mid-flight"
+        );
+
+        // The cancelled future must NOT have released the guard: retirement's
+        // exclusive lock is still blocked behind the queued job's shared hold.
+        let retire_probe = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.lifecycle_exclusive().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !retire_probe.is_finished(),
+            "a cancelled op must not release the lifecycle guard before its queued job runs"
+        );
+        // The probe holds the write slot (write-preferring lock); keep it as
+        // the retirement under test.
+        let retire = retire_probe;
+
+        // Unblock the actor: the queued job runs under its guard, THEN
+        // retirement's exclusive lock is granted.
+        release_tx.send(()).expect("release the blocking job");
+        blocker.await.expect("blocker task");
+        job_ran_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued job still ran after its caller was cancelled");
+        let exclusive = tokio::time::timeout(Duration::from_secs(5), retire)
+            .await
+            .expect("retirement completes once the queued job ran")
+            .expect("retire task");
+        // The job ran BEFORE the exclusive was granted: the epoch only
+        // advances under the exclusive lock, which could not be taken while
+        // the job's guard lived.
+        assert_eq!(
+            engine.lifecycle_epoch(),
+            epoch + 1,
+            "retirement advanced the epoch only after the queued job finished"
+        );
+        drop(exclusive);
+    }
+
+    /// #1574 review: the orphan drainer holds the engine + a Batcher (→ Raft)
+    /// while the journal inside that engine owns the drainer's channel sender,
+    /// so `rx.recv()` never yields `None`. The orphan tasks must still exit on
+    /// every shutdown path — a direct `raft.shutdown()`, `retire()`, and a plain
+    /// drop of the partition — or they keep the Raft alive forever.
+    #[tokio::test]
+    async fn orphan_propose_tasks_exit_on_shutdown() {
+        async fn assert_exits(tasks: [tokio::task::JoinHandle<()>; 2], path: &str) {
+            for task in tasks {
+                tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                    .await
+                    .unwrap_or_else(|_| panic!("orphan task still alive after {path}"))
+                    .expect("orphan task exits cleanly");
+            }
+        }
+        let boot = || async {
+            RaftPartition::bootstrap_single(
+                0,
+                0,
+                "addr".into(),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            )
+            .await
+            .expect("boot")
+        };
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        part.raft.shutdown().await.expect("clean shutdown");
+        assert_exits(tasks, "raft.shutdown()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part.retire().await.expect("retire"));
+        assert_exits(tasks, "retire()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part);
+        assert_exits(tasks, "drop(RaftPartition)").await;
     }
 
     /// A fresh receiver is provably empty, and the emptiness guard fails closed
@@ -4040,6 +5541,8 @@ mod tests {
             captured: None,
             last_applied: None,
             last_membership: StoredMembership::default(),
+            test_writer_barrier: None,
+            test_publish_barrier: None,
         };
         let err = match builder.build_snapshot().await {
             Ok(_) => panic!("an incomplete capture must fail the snapshot build"),
@@ -4070,6 +5573,8 @@ mod tests {
             captured,
             last_applied: None,
             last_membership: StoredMembership::default(),
+            test_writer_barrier: None,
+            test_publish_barrier: None,
         };
         ok_builder
             .build_snapshot()
@@ -4421,24 +5926,12 @@ mod tests {
         engine: &DeepthiHandle,
     ) -> (u64, u64) {
         let setup = [
-            ReplicatedCommand {
-                command: wait_process_command(),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 2,
-            },
-            ReplicatedCommand {
-                command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
-                now: 3,
-            },
+            ReplicatedCommand::new(wait_process_command(), 1),
+            ReplicatedCommand::new(Command::create_instance("w"), 2),
+            ReplicatedCommand::new(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3),
             // Release the activation lock so the parked instance goes idle and is
             // cold-spillable (a locked job keeps its instance hot).
-            ReplicatedCommand {
-                command: Command::ExpireJobs { now: 64_000 },
-                now: 64_000,
-            },
+            ReplicatedCommand::new(Command::ExpireJobs { now: 64_000 }, 64_000),
         ];
         let mut job_key = None;
         for (i, cmd) in setup.into_iter().enumerate() {
@@ -4496,14 +5989,8 @@ mod tests {
         // A batch [deploy, complete_job]: the deploy succeeds, the completion hits
         // the unreadable row. The whole entry must abort closed at index 5.
         let batch = vec![
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 6,
-            },
+            ReplicatedCommand::new(deploy_command(), 5),
+            ReplicatedCommand::new(Command::complete_job(job_key), 6),
         ];
         let refused = apply_entry(&sm, 5, batch).await;
         assert!(refused.is_err(), "the impaired replica fails closed");
@@ -4532,14 +6019,8 @@ mod tests {
         // Entry 1: [CompleteJob(unknown key) -> deterministic JobNotFound,
         //           DeployProcess(valid) -> must still apply].
         let batch = vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 2,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 1),
+            ReplicatedCommand::new(deploy_command(), 2),
         ];
         let outcome = apply_entry(&sm, 1, batch)
             .await
@@ -4610,18 +6091,9 @@ mod tests {
     /// that hits the unreadable cold row.
     fn failing_entry(job_key: u64) -> Vec<ReplicatedCommand> {
         vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 6,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 7,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 5),
+            ReplicatedCommand::new(Command::create_instance("w"), 6),
+            ReplicatedCommand::new(Command::complete_job(job_key), 7),
         ]
     }
 
@@ -4893,7 +6365,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let before = {
             let engine = durable_engine(&journal_dir);
             let mut sm = new_sm(&engine);
@@ -4969,7 +6441,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let expected = {
             let engine = durable_engine(&dir.join("peer"));
@@ -5053,7 +6525,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
@@ -5143,7 +6615,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -5222,7 +6694,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -5322,7 +6794,7 @@ mod tests {
                 .build()
                 .expect("valid message-start process"),
         );
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let start = || Command::correlate_message("go", "");
         let journal_dir = dir.join("journal");
         // Both replicas apply entries 1..=3 (a deploy + two round-robin starts).
@@ -5393,18 +6865,12 @@ mod tests {
             apply_entry(
                 &sm,
                 1,
-                vec![ReplicatedCommand {
-                    command: wait_process_command(),
-                    now: 1,
-                }],
+                vec![ReplicatedCommand::new(wait_process_command(), 1)],
             )
             .await
             .expect("entry 1");
             let two_creates = (0..2)
-                .map(|i| ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 2 + i,
-                })
+                .map(|i| ReplicatedCommand::new(Command::create_instance("w"), 2 + i))
                 .collect();
             apply_entry(&sm, 2, two_creates).await.expect("entry 2");
             drop(sm);
@@ -5615,6 +7081,292 @@ mod tests {
 
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");
+        }
+    }
+
+    /// Waits until every member has applied up to the leader's (node 0's)
+    /// current `last_applied` — the applied-index barrier a test needs before
+    /// touching a FOLLOWER's state (`propose` only waits for the leader).
+    async fn wait_all_applied(parts: &[RaftPartition]) {
+        let target = parts[0]
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for (id, p) in parts.iter().enumerate() {
+            let raft = &p.raft;
+            let applied = wait_until(3_000, || {
+                raft.metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+                    >= target
+            })
+            .await;
+            assert!(applied, "node {id} did not apply up to index {target}");
+        }
+    }
+
+    /// #1447: an off-heap orphan discovered inside replicated state-machine
+    /// application (one replica lost the spill row, the others still have it)
+    /// is surfaced as a durable `VariablesLost` incident proposed by the Raft
+    /// LEADER with a replicated timestamp — every replica applies the identical
+    /// incident (same key, same `created_at`) and the journals stay identical.
+    #[tokio::test]
+    async fn orphan_detected_in_apply_is_leader_proposed_with_replicated_timestamp() {
+        use crate::raft_net::LocalCluster;
+
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+
+        // Three voters of partition 0, each with its OWN file-backed spill
+        // store (spill state is replica-local by construction).
+        let mut parts = Vec::new();
+        let mut engines = Vec::new();
+        let mut store_paths = Vec::new();
+        for id in 0u64..3 {
+            let store_dir = unique_log_dir(&format!("1447-spill-{id}"));
+            std::fs::create_dir_all(&store_dir).expect("store dir");
+            let store_path = store_dir.join("var-spill.sqlite");
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engine
+                .with({
+                    let store_path = store_path.clone();
+                    move |j| {
+                        let store = Arc::new(
+                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                                .expect("open spill store"),
+                        );
+                        // Budget 0: every spill check sheds, so the instance is
+                        // spilled after the forced scan below.
+                        j.set_spill(store, 0);
+                        j.set_replicated_apply(true);
+                    }
+                })
+                .await;
+            engines.push(engine.clone());
+            store_paths.push(store_path);
+            let p = RaftPartition::bootstrap_member(id, 0, engine, transport.clone(), None, false)
+                .await
+                .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
+            "node 0 wins the initial election"
+        );
+
+        // Deploy a service-task process and create one instance with a payload,
+        // replicated to every voter.
+        parts[0]
+            .propose(wait_process_command(), 1_000)
+            .await
+            .expect("deploy");
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("payload-0".to_string()),
+        );
+        let create_events = parts[0]
+            .propose(
+                Command::CreateInstance {
+                    process_id: "w".into(),
+                    variables: vars,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: None,
+                    version: None,
+                },
+                2_000,
+            )
+            .await
+            .expect("create");
+        let instance_key = create_events
+            .iter()
+            .find_map(|e| e.instance_key())
+            .expect("create minted an instance key");
+        // Applied-index barrier: `propose` returns once the LEADER applied, so
+        // wait for every follower to apply the create before touching its
+        // replica-local spill state (#1447 review).
+        wait_all_applied(&parts).await;
+
+        // Spill the instance's variables on EVERY replica (a purely local
+        // memory-reclamation op, so driving it per-replica is faithful), then
+        // drop the row on node 1 ONLY: its store is now definitively missing
+        // the payload the other two replicas hold.
+        for (id, engine) in engines.iter().enumerate() {
+            engine
+                .with(move |j| {
+                    j.force_spill_scan();
+                    assert!(
+                        j.engine().is_variables_spilled(instance_key),
+                        "replica {id} spilled the instance"
+                    );
+                })
+                .await;
+        }
+        {
+            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_paths[1]))
+                .expect("reopen node 1 store");
+            store.forget(&[instance_key]).expect("drop node 1's row");
+        }
+
+        // Replicated activation: node 1 discovers the orphan mid-apply and
+        // hands it to the leader-propose channel; the command itself must
+        // apply identically on every replica (no inline incident).
+        parts[0]
+            .propose(
+                Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                3_000,
+            )
+            .await
+            .expect("activate");
+        // Applied-index barrier: node 1 must have applied the activation
+        // before its observation is inspected (#1447 review).
+        wait_all_applied(&parts).await;
+
+        // Precondition: node 1 (the orphan replica) OBSERVED the loss during
+        // the replicated apply (its spill row is definitively absent).
+        let quarantined_on_node1 = engines[1].with(|j| j.quarantined_orphans()).await;
+        assert_eq!(
+            quarantined_on_node1,
+            vec![instance_key],
+            "node 1 observed the orphan during the replicated apply"
+        );
+
+        // The orphan was detected on a FOLLOWER and parked in its backlog
+        // (only the leader proposes). Fail the leader over to node 1: node 0
+        // steps down, node 1 wins the triggered election, its watcher flips
+        // the orphan-leadership flag, and the promotion drain hands the parked
+        // key to its own batcher — which proposes the quarantine through the
+        // log.
+        parts[0].raft.shutdown().await.expect("node 0 steps down");
+        parts[1]
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .expect("trigger node 1 election");
+        assert!(
+            wait_until(3_000, || parts[1].raft.metrics().borrow().current_leader
+                == Some(1))
+            .await,
+            "node 1 wins the triggered election"
+        );
+
+        // The leader's drainer re-proposes the orphan as a
+        // `QuarantineOffheapOrphan` carrying the leader's replicated `now`;
+        // every LIVE replica applies the identical incident (the downed former
+        // leader catches up from the new leader when it rejoins).
+        let mut incidents_per_replica = Vec::new();
+        let mut converged = false;
+        for _ in 0..300 {
+            incidents_per_replica.clear();
+            for engine in engines.iter().skip(1) {
+                let incidents = engine
+                    .with(move |j| {
+                        j.incidents()
+                            .into_iter()
+                            .filter(|i| i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost)
+                            .map(|i| {
+                                (
+                                    i.key,
+                                    i.instance_key,
+                                    i.created_at,
+                                    i.state,
+                                    i.reason.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                incidents_per_replica.push(incidents);
+            }
+            if incidents_per_replica.iter().all(|v| v.len() == 1) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "exactly one replicated VariablesLost incident on every replica \
+             (got {incidents_per_replica:?})"
+        );
+        let first = &incidents_per_replica[0][0];
+        assert_eq!(first.1, instance_key, "incident pinned to the orphan");
+        assert_eq!(
+            first.3,
+            nanobpmn_engine_core::IncidentState::Active,
+            "the replicated incident is active"
+        );
+        for (id, incidents) in incidents_per_replica.iter().enumerate() {
+            assert_eq!(
+                &incidents[0],
+                first,
+                "replica {} applied the identical incident (key + replicated timestamp)",
+                id + 1
+            );
+        }
+
+        // The incident journals are identical across the replicas that applied
+        // the proposal (the downed former leader replays the same entry from
+        // the new leader when it rejoins): the orphan replica minted nothing
+        // locally.
+        let mut journals = Vec::new();
+        for engine in engines.iter().skip(1) {
+            let events = engine
+                .with(|j| {
+                    j.state()
+                        .incidents
+                        .values()
+                        .map(|i| (i.key, i.instance_key, i.created_at))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            journals.push(events);
+        }
+        assert!(
+            journals.windows(2).all(|w| w[0] == w[1]),
+            "identical incident journals across replicas (got {journals:?})"
+        );
+        // The stamped quarantine carries no repair (#1574): it raises the
+        // incident and records the replicated tombstone identically on every
+        // live replica, and leaves each replica's off-heap reference alone.
+        let mut tombstones = Vec::new();
+        for engine in engines.iter().skip(1) {
+            tombstones.push(
+                engine
+                    .with(move |j| j.state().variables_lost_quarantined.clone())
+                    .await,
+            );
+        }
+        assert!(
+            tombstones.windows(2).all(|w| w[0] == w[1])
+                && tombstones[0].contains_key(&instance_key),
+            "identical replicated tombstones (got {tombstones:?})"
+        );
+
+        for (id, p) in parts.into_iter().enumerate() {
+            if id == 0 {
+                continue; // already shut down (the failover above)
+            }
+            p.raft.shutdown().await.expect("clean shutdown");
+        }
+        for path in &store_paths {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -6103,15 +7855,7 @@ mod tests {
         assert!(sm.begin_receiving_snapshot().await.is_err());
 
         // apply: refused, engine untouched.
-        let applied = apply_entry(
-            &sm,
-            1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
-        )
-        .await;
+        let applied = apply_entry(&sm, 1, vec![ReplicatedCommand::new(deploy_command(), 1)]).await;
         assert!(applied.is_err(), "a retired member must refuse an apply");
         let processes = dst.with(|j| j.state().processes.len()).await;
         assert_eq!(processes, 0, "a refused apply never reaches the engine");
@@ -6131,10 +7875,7 @@ mod tests {
         apply_entry(
             &successor,
             1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
+            vec![ReplicatedCommand::new(deploy_command(), 1)],
         )
         .await
         .expect("the successor applies");

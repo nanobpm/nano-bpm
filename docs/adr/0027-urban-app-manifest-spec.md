@@ -194,3 +194,6 @@ types). Run/Compile flow through the **existing supervisor** unchanged — the A
   console, like the read-model schema version, vs. an explicit `nano app upgrade`)?
 - **Manifest as MCP descriptor** — ADR 0022 §"Open questions" asks whether an App exposes itself as
   an MCP server; if so, is that a `surfaces.mcp` block here or a separate descriptor?
+  **Settled (2026-11-11, epic #1499):** an App is exposed via Camunda's MCP contract
+  (`/mcp/cluster`, `/mcp/processes`, tools marked with `io.camunda.tool:*` properties in the
+  BPMN); any Urban-specific manifest extras are additive over it.

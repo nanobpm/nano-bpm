@@ -48,8 +48,8 @@
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, ProcessBuilder,
-    SNAPSHOT_FORMAT_VERSION,
+    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState, Key,
+    ProcessBuilder, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus (owned by #1069), relative to
@@ -136,21 +136,96 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         let raw =
             std::fs::read_to_string(golden_path(&format!("event_corpus.v{version}.json"))).unwrap();
         let frames: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
-        let journal = frames
+        let journal: Vec<Event> = frames
             .into_iter()
-            .map(|frame| decode_event_json(&frame.to_string()).unwrap());
+            .map(|frame| decode_event_json(&frame.to_string()).unwrap())
+            .collect();
         let raw = std::fs::read_to_string(golden_path(&format!("engine_snapshot.v{version}.json")))
             .unwrap();
         let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
+        let terminal_keys: std::collections::VecDeque<_> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+                _ => None,
+            })
+            .collect();
+        // #1574 review (review 5899722557) stamps each terminal instance's own
+        // `terminated_epoch` with the epoch its terminal transition produced
+        // (the target-specific lifecycle-validity record). Derive it from the
+        // journal BEFORE the journal is consumed by replay: the Nth terminal
+        // event (1-based) sets its instance's `terminated_epoch = N`. Live
+        // instances keep `0`.
+        let mut terminal_epoch_by_instance: std::collections::HashMap<Key, u64> =
+            std::collections::HashMap::new();
+        {
+            let mut epoch = 0u64;
+            for event in &journal {
+                if let Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } = event
+                {
+                    epoch += 1;
+                    terminal_epoch_by_instance.insert(*instance_key, epoch);
+                }
+            }
+        }
         let replayed = Engine::replay_partition(expected.partition_id, journal);
         // Load the archived snapshot the way a host does (`from_snapshot`), so
         // its load-time normalizations apply — e.g. legacy element-keyed join
         // bookkeeping is keyed by flow-scope instance (#1580).
         let next_local = expected.next_local;
         let expected = Engine::from_snapshot(expected);
+
+        // Replay-compatibility is a NORMALIZED equality, not a byte-identical
+        // one: later builds legitimately derive some fields under semantics the
+        // archived snapshot predates. Each normalization below names the change
+        // whose replay-only divergence it absorbs; anything ELSE drifting still
+        // fails this assert, which is what keeps the #1065 class guarded.
+        let replayed_state = replayed.state().clone();
+        let mut expected_state = expected.state().clone();
+        if version < 3 {
+            // #1440 (landed at format v3) retains a job's first terminal
+            // instant/deadline; v1/v2 journals predate the event field that
+            // carries it, so replaying them yields `terminal_end: None` where a
+            // v3 live run would record a stamp. Normalize the pre-field
+            // snapshots to the replayable floor.
+            for job in expected_state.jobs.values_mut() {
+                job.terminal_end = None;
+            }
+        }
+        // #1551 clears `has_failed_with_retries_left` when a job goes terminal
+        // (a completed/canceled job is not retry-eligible). Archived snapshots
+        // recorded the pre-#1551 semantics — the flag surviving on a terminal
+        // job — and the v1/v2 journals do not carry the information to
+        // reconstruct the pre-clear value, so replay under current semantics
+        // converges on the cleared flag. Normalize the archived expectation to
+        // current terminal semantics.
+        for job in expected_state.jobs.values_mut() {
+            if matches!(job.state, JobState::Completed | JobState::Canceled) {
+                job.has_failed_with_retries_left = false;
+            }
+        }
+        // #1574 review adds the replicated `recently_terminated` ring, derived
+        // purely from terminal events. Archived snapshots predate it (they load
+        // it empty via `serde(default)`), so normalize it to what the archived
+        // journal's own terminal events derive — computed independently here
+        // from the journal, not copied from the replayed state. The same
+        // change adds the replicated `terminal_epoch` counter (one increment
+        // per terminal event), normalized the same way.
+        expected_state.terminal_epoch = terminal_keys.len() as u64;
+        expected_state.recently_terminated = terminal_keys;
+        // Normalize each terminal instance's `terminated_epoch` (derived above
+        // from the journal's own terminal events): archived snapshots predate
+        // the field and load it `0`, but replay under current semantics records
+        // it. Live instances (absent from the map) keep `0`.
+        for (key, instance) in expected_state.instances.iter_mut() {
+            if let Some(epoch) = terminal_epoch_by_instance.get(key) {
+                instance.terminated_epoch = *epoch;
+            }
+        }
         assert_eq!(
-            replayed.state(),
-            expected.state(),
+            &replayed_state, &expected_state,
             "archived format {version}"
         );
         assert_eq!(

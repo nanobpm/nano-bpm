@@ -283,7 +283,10 @@ ${body}
 // Official language logos (devicon originals) for the Polyglot section. Read from
 // website/logos/*.svg at build time and inlined, so the page stays zero-dependency
 // and renders offline (no external icon CDN). Rust's mark is monochrome and given
-// a light root fill in the source SVG so it reads on the dark band.
+// a light root fill in the source SVG so it reads on the dark band. Devicon has no
+// D mark, so d.svg is the official 2015 logo from dlang/dlang.org (BSL-1.0),
+// optimised with svgo and its gradient ids prefixed `dlang__` so they can't
+// collide with another inlined SVG on the page.
 function langChips() {
   const langs = [
     ["typescript", "TypeScript"],
@@ -293,6 +296,7 @@ function langChips() {
     ["csharp", "C#"],
     ["go", "Go"],
     ["php", "PHP"],
+    ["d", "D"],
   ];
   return langs
     .map(([id, label]) => {

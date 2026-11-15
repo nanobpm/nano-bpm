@@ -76,6 +76,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
                     suspended_at: None,
+                    terminated_epoch: 0,
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
@@ -267,7 +268,33 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // untouched (no record is created for an idempotent retry).
         Event::AgentHistoryDeduplicated { .. } => {}
 
+        // Off-heap orphan quarantine (#1574): record the replicated dedup
+        // tombstone only. Residency-independent, so every replica lands
+        // identically; no instance state is touched. The tombstone carries the
+        // loss-episode id (#1587) so a delayed duplicate of the same episode,
+        // applying after the incident was resolved and the tombstone lifted, is
+        // a deterministic no-op instead of a fresh incident.
+        Event::VariablesLostQuarantined {
+            instance_key,
+            incident_key,
+            episode,
+        } => {
+            state.variables_lost_quarantined.insert(
+                *instance_key,
+                crate::state::types::VariablesLostTombstone {
+                    incident_key: *incident_key,
+                    episode: *episode,
+                },
+            );
+        }
+
+        // A superseded orphan stamp (#1587 review) carries no state change —
+        // it only journals the replica-deterministic decision so the leader's
+        // journal re-enqueues the still-pending report. Nothing to apply.
+        Event::OrphanStampSuperseded { .. } => {}
+
         Event::ProcessInstanceCompleted { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
@@ -535,6 +562,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
             // gone the parked tokens are gone too, so `hasIncident` must clear.

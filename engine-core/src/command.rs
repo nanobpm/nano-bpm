@@ -38,6 +38,17 @@ pub struct JobActivationOptions {
 pub struct JobAttribution {
     #[cfg_attr(feature = "serde", serde(default))]
     pub worker: Option<String>,
+    /// The activation-lock deadline the job held on the proposing leader
+    /// (#1494) — soft (leader-local) or durable. A soft lock lives only in
+    /// the leader's RAM, so stamping it here is what lets a soft job's
+    /// terminal `JobCompleted.deadline` / `Job::terminal_end` agree on every
+    /// replica. `None` when unlocked (or for a stamp written before the field
+    /// existed; additive, so an older log entry decodes unchanged).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub deadline: Option<u64>,
 }
 
 /// Which deployed decision a [`Command::EvaluateDecision`] evaluates.
@@ -317,9 +328,8 @@ pub enum Command {
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
     /// no-retries incident before resolving that incident. Does not by itself
-    /// unblock the job — the incident must still be resolved. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// unblock the job — the incident must still be resolved. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobRetries {
         job_key: Key,
         #[cfg_attr(
@@ -328,11 +338,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         retries: i32,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Reset the activation lock of a currently-activated job to `now + timeout`.
     /// Signed durations may shorten it; zero or negative values make the lock
@@ -341,9 +346,8 @@ pub enum Command {
     /// legitimately holding a long-running job open past its original lock:
     /// without it the lock simply expires (`JobLockExpired`) and the job is
     /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
-    /// that is not currently locked returns `JobUpdateInvalid`. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// that is not currently locked returns `JobUpdateInvalid`. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobTimeout {
         job_key: Key,
         #[cfg_attr(
@@ -352,11 +356,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         timeout: i64,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Atomically validate and update job properties. An empty changeset still
     /// validates job state and a supplied lease token.
@@ -367,8 +366,6 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         timeout: Option<i64>,
         #[cfg_attr(feature = "serde", serde(default))]
-        operation_reference: Option<i64>,
-        #[cfg_attr(feature = "serde", serde(default))]
         lease_token: Option<String>,
     },
     /// Resolve an open incident by retrying the work that failed. A job-incident
@@ -376,11 +373,9 @@ pub enum Command {
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
     /// current variables; an uncaught-error incident re-creates the service-task
     /// job. If the retry fails again a fresh incident is raised. The resolved
-    /// record is retained for audit, tagged with `operation_reference` if given.
-    ResolveIncident {
-        incident_key: Key,
-        operation_reference: Option<i64>,
-    },
+    /// record is retained for audit, tagged with the command's generic
+    /// `operationReference` (#1556) if given.
+    ResolveIncident { incident_key: Key },
     /// Merge variables into a scope, typically to correct data before resolving
     /// an incident. `scope_key` may be a process instance key or an element
     /// instance key; it resolves to the owning instance's variable scope. When
@@ -435,6 +430,13 @@ pub enum Command {
         message_name: String,
         correlation_key: String,
         kind: MessageSubscriptionKind,
+        /// The source partition's stable delivery identity (#1497), carried from
+        /// the routing [`crate::Event::MessageSubscriptionOpening`]. `0` means
+        /// "no identity" (a legacy or hand-issued open): applied without dedup.
+        /// Non-zero is deduplicated against the recipient's routed-delivery
+        /// ledger and rejected when it matches a close tombstone.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Deliver a correlation back to the **instance** partition: advance the token
     /// parked on an `Opening` subscription (the counterpart of a
@@ -450,6 +452,14 @@ pub enum Command {
         element_id: String,
         kind: MessageSubscriptionKind,
         variables: HashMap<String, Value>,
+        /// The message partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::RemoteMessageCorrelation`]. `0`
+        /// means "no identity" (legacy): applied without dedup. Non-zero is
+        /// deduplicated against the recipient's routed-delivery ledger — the
+        /// guard that keeps a retried **non-interrupting** boundary correlation
+        /// (whose `Opening` record stays open) from spawning a second token.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
@@ -461,6 +471,15 @@ pub enum Command {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// The instance partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::MessageSubscriptionClosing`]. `0`
+        /// means "no identity" (legacy): applied without a tombstone. Non-zero
+        /// records a **close tombstone** in the recipient's routed-delivery
+        /// ledger even when no canonical record exists yet, so a delayed
+        /// `OpenMessageSubscription` that lands after this close is rejected
+        /// instead of resurrecting a subscription for a cancelled instance.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// Cancel a running process instance. Every token is discarded: pending jobs
     /// are cancelled, armed timers and open message subscriptions are cancelled,
@@ -562,6 +581,14 @@ pub enum Command {
         /// the instance's partition records the correlation.
         #[cfg_attr(feature = "serde", serde(default))]
         message_start: Option<crate::MessageStartCorrelation>,
+        /// The deploy partition's stable delivery identity (#1497), carried
+        /// from the routing [`crate::Event::StartInstanceDispatched`]. `0` means
+        /// "no identity" (legacy): applied without dedup. Non-zero is
+        /// deduplicated against the recipient's routed-delivery ledger — the
+        /// guard that keeps a retried dispatch from minting a SECOND process
+        /// instance after a lost acknowledgement.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// External "activate ad-hoc activities" command (#614 gap 3, Zeebe
     /// `AdHocSubProcessInstructionActivateProcessor` — REST
@@ -690,7 +717,118 @@ pub enum Command {
     /// leader retry / replay), and an unknown or terminal instance is a no-op too
     /// (the orphan may have been cancelled between the quarantine note and this
     /// command landing). Additive brand-new variant — old journals never carry it.
-    QuarantineOffheapOrphan { instance_key: Key },
+    ///
+    /// **Replicated form (#1447).** Under Raft the residency-dependent rules
+    /// above are NOT replica-independent: whether an instance is resident,
+    /// terminal, or already incidented differs per replica (cold tiering,
+    /// follower retirement), so the bare command could raise the incident on
+    /// one replica and no-op on another, diverging their journals and key
+    /// counters. The partition leader therefore proposes it with a
+    /// [`OrphanIncidentStamp`] (`stamp: Some`) — the orphan kind plus the
+    /// incident metadata it resolved from ITS state — and every replica applies
+    /// a stamped command identically: it unconditionally emits exactly one
+    /// `IncidentRaised` carrying the stamp's metadata, whatever its local
+    /// residency (deduped only by the replicated tombstone). It carries no
+    /// variable payload and triggers no replica-local row repair (#1574).
+    /// Additive `#[serde(default)]` field: a journal written before #1447
+    /// decodes as `stamp: None` (the local form).
+    QuarantineOffheapOrphan {
+        instance_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        stamp: Option<OrphanIncidentStamp>,
+    },
+    /// Raise a durable [`crate::Event::IncidentRaised`]
+    /// ([`crate::IncidentKind::VariablesLost`]) for a **cold** (wholly off-heap)
+    /// instance whose cold row the host's storage layer found definitively
+    /// absent (#1481). Unlike [`Command::QuarantineOffheapOrphan`] it does not
+    /// require the instance to be resident: a cold instance is absent from
+    /// engine state by construction, so the incident is recorded against the
+    /// bare `instance_key` (with an empty `element_id` — the instance's model is
+    /// lost with its row). This is the only durable record of the loss once the
+    /// covered journal prefix compacts away, so it must survive restart.
+    ///
+    /// If the instance is in fact resident, this behaves exactly like
+    /// [`Command::QuarantineOffheapOrphan`]. **Idempotent** — a no-op when an
+    /// active `VariablesLost` incident already names the instance. Additive
+    /// brand-new variant — old journals never carry it.
+    QuarantineColdOrphan { instance_key: Key },
+}
+
+/// Which off-heap tier lost an orphan's payload (#1447).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OrphanKind {
+    /// A resident instance whose spilled variable row is gone: it keeps its
+    /// surviving resident variables.
+    Resident,
+    /// A cold (wholly off-heap) instance whose cold row is gone: the whole
+    /// instance is unrecoverable.
+    Cold,
+}
+
+/// The leader-resolved incident metadata a replicated
+/// [`Command::QuarantineOffheapOrphan`] carries (#1447), so every replica emits
+/// a byte-identical `IncidentRaised` whatever its local residency. Built by
+/// [`crate::Engine::orphan_incident_stamp`] on the proposing leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OrphanIncidentStamp {
+    /// The tier that lost the payload.
+    pub kind: OrphanKind,
+    /// The incident's `element_id` (the process id when the leader had the
+    /// instance resident; empty for a cold instance whose model is lost).
+    pub element_id: String,
+    /// The incident's `reason`.
+    pub reason: String,
+    /// The leader's replicated terminal epoch
+    /// ([`crate::state::State::terminal_epoch`]) at stamp time (#1574 review).
+    /// The apply gate compares it against the applying replica's epoch and
+    /// terminal ring coverage, so a proposal committing after the ring wrapped
+    /// still decides identically on a resident and an evicted replica.
+    /// Additive: `0` (a stamp minted before this field existed) disables the
+    /// epoch check and keeps the pre-field behaviour (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub terminal_epoch: u64,
+    /// The target instance's own replicated terminal epoch
+    /// ([`crate::state::types::ProcessInstance::terminated_epoch`]) observed by
+    /// the leader at stamp time (#1574 review, review 5899722557), recovered
+    /// from the resident record OR the replicated terminal ring (so a leader
+    /// that already evicted its terminal shell still proves it). This is the
+    /// target-specific lifecycle-validity record the apply gate reads: the
+    /// bounded `recently_terminated` ring cannot distinguish "cold but LIVE"
+    /// from "terminated and evicted" once unrelated completions fill it, and the
+    /// global epoch distance counts EVERY terminal transition — so it misreads
+    /// an unrelated completion as the target's termination (suppressing a live
+    /// orphan). `> 0` means the leader observed the target already terminal at
+    /// stamp time — a stale proposal the gate no-ops, identically on every
+    /// replica. `0` = the target was live (or unprovable) at stamp time.
+    /// Additive: `0` for a stamp minted before this field existed (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub target_terminated_epoch: u64,
+    /// The replicated **loss-episode id** (#1587): the leader's replicated
+    /// allocator position at stamp time (the next key it would issue). Two
+    /// stamped copies of one detection episode carry the SAME episode id, so a
+    /// delayed duplicate applying after the episode's incident was resolved is
+    /// a deterministic no-op (it matches no live episode) instead of raising a
+    /// fresh incident — while a genuinely new loss after resolution stamps a
+    /// fresh, distinct episode id and is still reported. The id is a
+    /// *replicated* key (never wall-clock, never replica-local), so every
+    /// replica compares it identically. Unrelated key-minting work can advance
+    /// the allocator between stamping and commitment, so a position mismatch
+    /// at apply time is a SUPERSEDED stamp — re-stamped and re-proposed via
+    /// [`crate::Event::OrphanStampSuperseded`], never silently dropped (#1587
+    /// review). Additive: `0` for a stamp minted before this field existed,
+    /// which keeps the pre-#1587 (episode-blind) dedup behaviour.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub episode: u64,
+}
+
+#[cfg(feature = "serde")]
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -784,6 +922,22 @@ impl UserTaskChangeset {
 }
 
 impl Command {
+    /// The routed-delivery identity (#1497) this command carries, when it is
+    /// one of the four routed recipient commands with a non-zero
+    /// `delivery_key`. A deduplicated redelivery of such a command applies
+    /// eventlessly, so its acknowledgement must wait on a writer barrier for
+    /// the original delivery's write rather than resolve immediately.
+    pub fn routed_delivery_key(&self) -> Option<Key> {
+        let key = match self {
+            Command::OpenMessageSubscription { delivery_key, .. }
+            | Command::CorrelateMessageSubscription { delivery_key, .. }
+            | Command::CloseMessageSubscription { delivery_key, .. }
+            | Command::DispatchStartInstance { delivery_key, .. } => *delivery_key,
+            _ => return None,
+        };
+        (key != 0).then_some(key)
+    }
+
     /// A stable, allocation-free `&'static str` discriminant for this command,
     /// used as a metrics label so per-command actor cost (wall time and
     /// allocated bytes) can be attributed by kind. Kept in lockstep with the
@@ -831,6 +985,7 @@ impl Command {
             Command::UpdateAgentInstance { .. } => "update_agent_instance",
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
             Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
+            Command::QuarantineColdOrphan { .. } => "quarantine_cold_orphan",
         }
     }
 
@@ -926,6 +1081,12 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // The stamp's strings are leader-resolved metadata of unbounded
+            // length (#1574 review): count them so the batcher's byte budget
+            // sees the real proposal size.
+            Command::QuarantineOffheapOrphan {
+                stamp: Some(stamp), ..
+            } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
             _ => 0,
         };
         BASE + payload
@@ -1151,21 +1312,6 @@ impl Command {
             job_key,
             lease_token: None,
             retries,
-            operation_reference: None,
-        }
-    }
-
-    /// `UpdateJobRetries` tagged with a caller audit `operation_reference`.
-    pub fn update_job_retries_with_ref(
-        job_key: Key,
-        retries: i32,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobRetries {
-            job_key,
-            lease_token: None,
-            retries,
-            operation_reference,
         }
     }
 
@@ -1175,40 +1321,12 @@ impl Command {
             job_key,
             lease_token: None,
             timeout,
-            operation_reference: None,
         }
     }
 
-    /// `UpdateJobTimeout` tagged with a caller audit `operation_reference`.
-    pub fn update_job_timeout_with_ref(
-        job_key: Key,
-        timeout: i64,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobTimeout {
-            job_key,
-            lease_token: None,
-            timeout,
-            operation_reference,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` with no operation
-    /// reference.
+    /// Convenience constructor for a `ResolveIncident`.
     pub fn resolve_incident(incident_key: Key) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` tagged with an operation
-    /// reference for audit.
-    pub fn resolve_incident_with(incident_key: Key, operation_reference: i64) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: Some(operation_reference),
-        }
+        Command::ResolveIncident { incident_key }
     }
 
     /// Convenience constructor for a propagating (`local = false`) `SetVariables`.
@@ -1468,6 +1586,33 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    // #1574 review: a stamped orphan quarantine carries leader-resolved strings;
+    // `approx_bytes` must count them, not treat the command as fixed-size.
+    #[test]
+    fn approx_bytes_counts_the_orphan_quarantine_stamp() {
+        let bare = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: None,
+        }
+        .approx_bytes();
+        let stamped = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: Some(OrphanIncidentStamp {
+                kind: OrphanKind::Resident,
+                element_id: "e".repeat(10_000),
+                reason: "r".repeat(20_000),
+                terminal_epoch: 0,
+                target_terminated_epoch: 0,
+                episode: 0,
+            }),
+        }
+        .approx_bytes();
+        assert!(
+            stamped >= bare + 30_000,
+            "stamp strings must count: stamped={stamped} bare={bare}"
         );
     }
 

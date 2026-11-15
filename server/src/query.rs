@@ -618,6 +618,38 @@ pub fn match_element_instance_key_opt(
     }
 }
 
+/// Matches a `ProcessDefinitionIdFilterProperty` (bare string or advanced
+/// `$eq`/`$neq`/`$exists`/`$in`/`$notIn`/`$like`) against a possibly-absent
+/// process definition id. Passing `None` models a record without the id: value
+/// operators then exclude the row (honest, not silently ignored) while
+/// `$exists: false` still matches — the [`match_string_opt`] convention.
+pub fn match_process_definition_id(
+    filter: &Option<models::ProcessDefinitionIdFilterProperty>,
+    value: Option<&str>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::ProcessDefinitionIdFilterProperty::String(s)) => value == Some(s.as_str()),
+        Some(models::ProcessDefinitionIdFilterProperty::AdvancedProcessDefinitionIdFilter(a)) => {
+            Ops {
+                eq: a.dollar_eq.clone(),
+                neq: a.dollar_neq.clone(),
+                exists: a.dollar_exists,
+                in_: a
+                    .dollar_in
+                    .as_ref()
+                    .map(|v| v.iter().map(|id| id.0.clone()).collect()),
+                not_in: a
+                    .dollar_not_in
+                    .as_ref()
+                    .map(|v| v.iter().map(|id| id.0.clone()).collect()),
+                like: a.dollar_like.clone(),
+            }
+            .matches(value)
+        }
+    }
+}
+
 /// Matches an `AgentInstanceKeyFilterProperty` against a key's decimal string.
 pub fn match_agent_instance_key(
     filter: &Option<models::AgentInstanceKeyFilterProperty>,

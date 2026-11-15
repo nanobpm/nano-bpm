@@ -47,6 +47,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             message_name,
             correlation_key,
             kind,
+            ..
         } => {
             state.message_subscriptions.insert(
                 *subscription_key,
@@ -189,6 +190,26 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         // generator on replay, exactly like `MessagePublished`.
         Event::SignalBroadcast { .. } => {}
 
+        // The routed-delivery ledger record (#1497): fold the source-minted
+        // delivery into this partition's dedup / close-tombstone set, bounded
+        // by the ledger cap.
+        Event::RoutedDeliveryRecorded {
+            delivery_key,
+            subscription_key,
+            close_tombstone,
+            ..
+        } => {
+            record_routed_delivery(
+                state,
+                RoutedDelivery {
+                    delivery_key: *delivery_key,
+                    subscription_key: *subscription_key,
+                    close_tombstone: *close_tombstone,
+                },
+                ROUTED_DELIVERY_LEDGER_CAP,
+            );
+        }
+
         // The instance partition tearing down a cross-partition parked
         // placeholder: mark it cancelled locally exactly like
         // `MessageSubscriptionCanceled`. The host routes a
@@ -222,6 +243,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             process_id,
             message_name,
             start_element_id,
+            tool_name,
+            tool_properties,
         } => {
             // Keyed by message name: re-deploying a process with the same start
             // message replaces the older version's subscription.
@@ -232,6 +255,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     message_name: message_name.clone(),
                     start_element_id: start_element_id.clone(),
+                    tool_name: tool_name.clone(),
+                    tool_properties: tool_properties.clone(),
                 },
             );
         }

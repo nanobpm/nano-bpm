@@ -1311,6 +1311,19 @@ pub struct Element {
     /// on the unchanged hot path (ADR 0037 §6).
     #[cfg_attr(feature = "serde", serde(default))]
     pub task_listeners: Vec<TaskListener>,
+    /// The element's `zeebe:properties` extension properties
+    /// (`<zeebe:property name="…" value="…"/>`), keyed by property name. This is
+    /// the generic vendor-metadata channel Camunda uses to mark a process as an
+    /// MCP tool (`io.camunda.tool:name` / `:purpose` / `:input_N_*` on a message
+    /// start event, #1499) or an inbound connector (`inbound.type`), among
+    /// others. Non-executable metadata: the engine never dispatches on it, but
+    /// it travels with the deployed definition so read models and APIs can
+    /// project it (e.g. a message start subscription's `toolName` /
+    /// `toolProperties`). A `BTreeMap` so the serialized order is deterministic.
+    /// Empty (the default) for elements that declare no properties and for
+    /// definitions serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub properties: BTreeMap<String, String>,
 }
 
 impl Element {
@@ -1440,6 +1453,12 @@ pub struct AdHocTool {
     /// mappings apply on activation, output mappings on completion.
     #[cfg_attr(feature = "serde", serde(default))]
     pub io: IoMapping,
+    /// The tool's own `zeebe:properties` (empty if none). Retained on the
+    /// catalog for the same reason as `io`: the pruned tool element is gone
+    /// from the executable graph, so a re-emitter (processos edit/layout)
+    /// restores them from here instead of silently dropping them.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// The retained metadata + tool catalog of one `adHocSubProcess`.
@@ -1672,6 +1691,34 @@ pub struct ProcessDefinition {
     pub start_form_id: Option<String>,
 }
 
+/// The zeebe:property key carrying a process's MCP tool name (Camunda 8.10 MCP
+/// gateway, `gateways/gateway-mcp`, #1499). Camunda's
+/// `ExtensionPropertyConfiguration` lets an operator *reconfigure* which
+/// property key holds the tool name; Nano hard-codes the default key (the
+/// reconfiguration surface is not modelled).
+pub const TOOL_NAME_PROPERTY: &str = "io.camunda.tool:name";
+
+/// The property-key prefix marking a zeebe:property as MCP tool metadata
+/// (`io.camunda.tool:name`, `:purpose`, `:input_N_{name,type,description,
+/// required}`, `:when_to_use`, `:when_not_to_use`, `:results`).
+pub const TOOL_PROPERTY_PREFIX: &str = "io.camunda.tool:";
+
+/// The tool name declared in `properties` (the [`TOOL_NAME_PROPERTY`] value),
+/// or `None` when the property is absent.
+pub fn tool_name_of(properties: &BTreeMap<String, String>) -> Option<String> {
+    properties.get(TOOL_NAME_PROPERTY).cloned()
+}
+
+/// The subset of `properties` whose keys carry the [`TOOL_PROPERTY_PREFIX`]
+/// prefix — the full MCP tool marker set (name, purpose, inputs, usage hints).
+pub fn tool_properties_of(properties: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    properties
+        .iter()
+        .filter(|(k, _)| k.starts_with(TOOL_PROPERTY_PREFIX))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 impl ProcessDefinition {
     /// Validates every [`ElementKind::EventSubProcess`] structurally (no
     /// sequence flow in or out, `start_event` is a start event directly
@@ -1879,6 +1926,7 @@ fn splice_call_activities(
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
                     task_listeners: el.task_listeners.clone(),
+                    properties: el.properties.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -1907,6 +1955,7 @@ fn splice_call_activities(
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
                     task_listeners: el.task_listeners.clone(),
+                    properties: el.properties.clone(),
                 },
             );
         }
@@ -2051,6 +2100,11 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     names: Vec<(ElementId, String)>,
+    /// Recorded `(element id, zeebe:properties)` declarations, applied in
+    /// [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    properties: Vec<(ElementId, BTreeMap<String, String>)>,
 }
 
 impl ProcessBuilder {
@@ -2069,6 +2123,7 @@ impl ProcessBuilder {
             listeners: Vec::new(),
             task_listeners: Vec::new(),
             names: Vec::new(),
+            properties: Vec::new(),
         }
     }
 
@@ -2093,6 +2148,7 @@ impl ProcessBuilder {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            properties: BTreeMap::new(),
         });
         self
     }
@@ -2469,6 +2525,18 @@ impl ProcessBuilder {
     /// element-instance search API. Applied in [`build`](ProcessBuilder::build).
     pub fn with_name(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
         self.names.push((id.into(), name.into()));
+        self
+    }
+
+    /// Attaches `zeebe:properties` extension properties to a previously-added
+    /// element (see [`Element::properties`]). Applied in
+    /// [`build`](ProcessBuilder::build).
+    pub fn with_properties(
+        mut self,
+        id: impl Into<String>,
+        properties: BTreeMap<String, String>,
+    ) -> Self {
+        self.properties.push((id.into(), properties));
         self
     }
 
@@ -3050,6 +3118,13 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach `zeebe:properties` extension properties to their elements.
+        for (id, properties) in &self.properties {
+            match elements.get_mut(id) {
+                Some(element) => element.properties = properties.clone(),
+                None => return Err(BuildError::UnknownPropertiesElement(id.clone())),
+            }
+        }
         validate_event_subprocesses(&elements)?;
 
         // The process-level start event is a start event that is not contained in
@@ -3248,6 +3323,8 @@ pub enum BuildError {
     UnknownListenerElement(ElementId),
     /// A `with_name` referenced an element that does not exist.
     UnknownNameElement(ElementId),
+    /// A `with_properties` referenced an element that does not exist.
+    UnknownPropertiesElement(ElementId),
     /// An [`ElementKind::EventSubProcess`] violates a structural constraint:
     /// it has an incoming/outgoing sequence flow, its `start_event` is not a
     /// start event directly contained in it, or it carries a non-interrupting
@@ -3312,6 +3389,9 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownNameElement(id) => {
                 write!(f, "name declared on unknown element {id}")
+            }
+            BuildError::UnknownPropertiesElement(id) => {
+                write!(f, "properties declared on unknown element {id}")
             }
         }
     }

@@ -220,7 +220,6 @@ fn optional_lease_helper_covers_and_clears_every_job_mutation() {
             job_key: 1,
             retries: None,
             timeout: None,
-            operation_reference: None,
             lease_token: None,
         },
     ] {

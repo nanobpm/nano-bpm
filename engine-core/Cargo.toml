@@ -20,8 +20,10 @@ serde = { version = "1", optional = true, features = ["derive", "rc"] }
 # persistence/replay). It backs the canonical `form_id_of` helper so the server
 # and the wasm entry point derive a form's identity from one source of truth
 # rather than duplicating the parse rule. The default, feature-off build stays
-# dependency-free (std-only).
-serde_json = { version = "1", optional = true }
+# dependency-free (std-only). `raw_value` lets `decode_record_json` borrow the
+# envelope's `event` payload and hand it straight to `decode_event_json` without
+# materializing a full JSON DOM per journal line (#1556 review).
+serde_json = { version = "1", optional = true, features = ["raw_value"] }
 
 [dev-dependencies]
 # Used by the golden serde-drift guard test (`tests/golden_serde_drift.rs`,

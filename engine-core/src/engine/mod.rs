@@ -191,6 +191,20 @@ pub struct Engine {
     /// snapshot, so it never affects replay/snapshot determinism. Defaults to
     /// `false` — the strict single-node/RF=1 behaviour is unchanged.
     lenient_completion: bool,
+    /// The current command's proposer-stamped terminal deadline (#1494):
+    /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
+    /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
+    /// at the [`Engine::emit`] choke point. Per-command scratch: reset by every
+    /// `plan_command_at`, so a rejected command's stamp can never leak into a
+    /// later one. Never snapshotted.
+    terminal_deadline_stamp: Option<(Key, Option<u64>)>,
+    /// The current command's caller `operationReference` (#1556), set ONLY by
+    /// [`Engine::apply_command_records_at`] — the single seam that stamps it on
+    /// every [`Record`](crate::Record) the command produces — and read at the
+    /// [`Engine::emit`] choke point for the legacy per-event audit fields.
+    /// Per-command scratch: reset by every `plan_command_at`. Never
+    /// snapshotted.
+    operation_reference: Option<i64>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -610,6 +624,12 @@ enum Step {
 /// self / mutually-recursive callees that never terminate.
 const MAX_CALL_ACTIVITY_DEPTH: usize = 1000;
 
+/// `reason` of a resident off-heap orphan's `VariablesLost` incident (#1384).
+const RESIDENT_ORPHAN_REASON: &str = "variables lost: spill row missing";
+/// `reason` of a cold off-heap orphan's `VariablesLost` incident (#1481).
+const COLD_ORPHAN_REASON: &str = "variables lost: cold instance row missing from the spill \
+                                  store; the whole instance is unrecoverable";
+
 impl Engine {
     /// Creates an empty engine for the single-partition (id `0`) namespace.
     pub fn new() -> Self {
@@ -636,6 +656,8 @@ impl Engine {
             now: 0,
             start_dispatch_rr: 0,
             lenient_completion: false,
+            terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -781,10 +803,7 @@ impl Engine {
                 start_dispatch_rr = rr;
                 continue;
             }
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == partition_id {
-                next_local = next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(partition_id, &mut next_local);
             state::apply(&mut state, &event);
         }
         Self {
@@ -795,6 +814,8 @@ impl Engine {
             now: 0,
             start_dispatch_rr,
             lenient_completion: false,
+            terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
@@ -834,6 +855,19 @@ impl Engine {
             self.partition_id
         );
         state::compose_key(self.partition_id, self.next_local)
+    }
+
+    /// The key [`mint_key`](Self::mint_key) will issue next, WITHOUT advancing
+    /// the allocator. Pure read. Used by the orphan-quarantine leader to stamp
+    /// its proposal's loss-episode id (#1587): two stamped copies of one
+    /// detection episode agree, and a delayed duplicate of a resolved episode
+    /// is a no-op. The episode is the leader's allocator position AT STAMP
+    /// TIME — unrelated key-minting work can advance the allocator before the
+    /// proposal commits, so the apply gate treats a mismatch as a SUPERSEDED
+    /// stamp (re-stamp + re-propose via [`Event::OrphanStampSuperseded`]),
+    /// never as authority to drop a still-pending report (#1587 review).
+    fn peek_next_key(&self) -> Key {
+        state::compose_key(self.partition_id, self.next_local.saturating_add(1))
     }
 
     /// The root (top-level ancestor) process instance key for `instance_key`:
@@ -1469,10 +1503,7 @@ impl Engine {
             // and the replica forks. Keys minted by OTHER partitions never advance
             // this counter (partition guard), so the common in-memory fan-out to
             // non-owning partitions is unchanged.
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == self.partition_id {
-                self.next_local = self.next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(self.partition_id, &mut self.next_local);
             if matches!(
                 event,
                 Event::ProcessDeployed { .. }
@@ -1500,10 +1531,7 @@ impl Engine {
     /// [`install_deployment`](Self::install_deployment).
     pub fn install_deployment_if_newer(&mut self, events: &[Event]) {
         for event in events {
-            let max_key = event.max_key();
-            if state::partition_of(max_key) == self.partition_id {
-                self.next_local = self.next_local.max(state::local_of(max_key));
-            }
+            event.advance_allocator(self.partition_id, &mut self.next_local);
             if matches!(
                 event,
                 Event::ProcessDeployed { .. }
@@ -1613,6 +1641,10 @@ impl Engine {
                 message_start,
             );
         } else {
+            // Mint the stable delivery identity (#1497) on THIS (the source)
+            // partition: a host re-delivery carries it to the target, whose
+            // routed-delivery ledger dedups a re-delivery after a lost ack.
+            let delivery_key = self.mint_key();
             self.emit(
                 log,
                 Event::StartInstanceDispatched {
@@ -1623,6 +1655,7 @@ impl Engine {
                     business_id,
                     target_partition: target,
                     message_start,
+                    delivery_key,
                 },
             );
         }
@@ -1739,21 +1772,18 @@ impl Engine {
             // are wired. So scan all process-level (`parent.is_none()`) typed
             // starts, deterministically ordered by element id so key minting
             // and replay stay in lock-step.
-            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> =
-                process
-                    .elements
-                    .values()
-                    .filter(|e| e.parent.is_none())
-                    .filter(|e| {
-                        matches!(
-                            e.kind,
-                            ElementKind::MessageStartEvent { .. }
-                                | ElementKind::TimerStartEvent { .. }
-                        )
-                    })
-                    .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
-                    .collect();
-            typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut typed_starts: Vec<&crate::model::Element> = process
+                .elements
+                .values()
+                .filter(|e| e.parent.is_none())
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        ElementKind::MessageStartEvent { .. } | ElementKind::TimerStartEvent { .. }
+                    )
+                })
+                .collect();
+            typed_starts.sort_by(|a, b| a.id.cmp(&b.id));
             // Per Zeebe, a start-event message name / timer expression is
             // evaluated at deploy time against an empty context; a failure
             // rejects the deployment (Zeebe `ProcessTransformer` /
@@ -1762,11 +1792,25 @@ impl Engine {
             // fallback timer. Resolve all before anything is emitted.
             let empty = HashMap::new();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
-            for (start_element_id, start_kind, start_timer_def) in typed_starts {
+            for start in typed_starts {
+                let (start_element_id, start_kind, start_timer_def, start_properties) = (
+                    start.id.clone(),
+                    start.kind.clone(),
+                    start.timer.clone(),
+                    &start.properties,
+                );
                 let resolved = match start_kind {
                     ElementKind::MessageStartEvent { message_name } => self
                         .resolve_event_name(&empty, &message_name)
-                        .map(ResolvedStart::Message),
+                        .map(|message_name| ResolvedStart::Message {
+                            message_name,
+                            // The MCP tool markers declared on the start event
+                            // via `zeebe:properties` (Camunda 8.10, #1499) ride
+                            // the subscription so the read model / REST search
+                            // can project them without re-parsing the XML.
+                            tool_name: crate::model::tool_name_of(start_properties),
+                            tool_properties: crate::model::tool_properties_of(start_properties),
+                        }),
                     ElementKind::TimerStartEvent {
                         interval_millis,
                         repeating,
@@ -1787,6 +1831,26 @@ impl Engine {
                             element_id: start_element_id,
                             reason: failure.message,
                         })
+                    }
+                }
+            }
+            // Two message starts whose names differ textually (`go` vs
+            // `="go"`) can still resolve to the same name. The raw-name
+            // duplicate rule cannot see that, so reject resolved collisions
+            // here: otherwise the engine and the read model would each keep a
+            // different start for the one subscription (#1499, Zeebe rejects
+            // duplicate message start names).
+            let mut seen_message_names: HashSet<&str> = HashSet::new();
+            for (start_element_id, r) in &resolved_starts {
+                if let ResolvedStart::Message { message_name, .. } = r {
+                    if !seen_message_names.insert(message_name.as_str()) {
+                        return Err(EngineError::StartEventExpressionInvalid {
+                            process_id: process.id.clone(),
+                            element_id: start_element_id.clone(),
+                            reason: format!(
+                                "multiple message start events resolve to the same message name '{message_name}'"
+                            ),
+                        });
                     }
                 }
             }
@@ -1826,7 +1890,11 @@ impl Engine {
             );
             for (start_element_id, resolved) in resolved_starts {
                 match resolved {
-                    ResolvedStart::Message(message_name) => {
+                    ResolvedStart::Message {
+                        message_name,
+                        tool_name,
+                        tool_properties,
+                    } => {
                         self.emit(
                             log,
                             Event::MessageStartSubscriptionCreated {
@@ -1834,6 +1902,8 @@ impl Engine {
                                 process_id: process_id.clone(),
                                 message_name,
                                 start_element_id,
+                                tool_name,
+                                tool_properties,
                             },
                         );
                     }
@@ -2103,11 +2173,45 @@ impl Engine {
         command: Command,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let (mut log, queue) = self.plan_command_at(command, now)?;
-        self.run(&mut log, queue);
-        self.cascade_cancel_children(&mut log);
-        self.finish_command(&log);
-        Ok(log)
+        self.apply_command_events(command, now, None)
+    }
+
+    /// Applies a command carrying a caller `operationReference` (#1556) and
+    /// returns its output as [`Record`](crate::Record)s, each stamped with the
+    /// reference. This is THE single propagation seam — Zeebe stamps a
+    /// command's `operationReference` on every record it produces, generically
+    /// — so no command variant carries its own copy. The legacy per-event
+    /// audit fields (`JobRetriesUpdated`/`JobTimeoutUpdated`/`IncidentResolved`
+    /// `.operation_reference`) are derived from the same value at
+    /// [`emit`](Self::emit).
+    pub fn apply_command_records_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<crate::Record>, EngineError> {
+        let events = self.apply_command_events(command, now, operation_reference)?;
+        Ok(crate::Record::stamp_all(events, operation_reference))
+    }
+
+    fn apply_command_events(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<Event>, EngineError> {
+        // Armed BEFORE planning: the planner itself emits (e.g. the
+        // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
+        // a reference can never leak into a later command.
+        self.operation_reference = operation_reference;
+        let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
+            self.run(&mut log, queue);
+            self.cascade_cancel_children(&mut log);
+            self.finish_command(&log);
+            log
+        });
+        self.operation_reference = None;
+        result
     }
 
     /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
@@ -2152,6 +2256,26 @@ impl Engine {
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
         self.esp_start_payloads.clear();
+        // Per-command terminal-deadline stamp (#1494): set from THIS command
+        // only (or cleared), never inherited from a previous one.
+        self.terminal_deadline_stamp = match &command {
+            Command::CompleteJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::FailJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::ThrowJobError {
+                job_key,
+                attribution,
+                ..
+            } => attribution.as_ref().map(|a| (*job_key, a.deadline)),
+            _ => None,
+        };
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -3468,14 +3592,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 retries,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     Some(retries),
                     None,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3484,14 +3606,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 timeout,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     None,
                     Some(timeout),
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3499,7 +3619,6 @@ impl Engine {
                 job_key,
                 retries,
                 timeout,
-                operation_reference,
                 lease_token,
             } => {
                 self.update_job_properties(
@@ -3507,15 +3626,11 @@ impl Engine {
                     job_key,
                     retries,
                     timeout,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
 
-            Command::ResolveIncident {
-                incident_key,
-                operation_reference,
-            } => {
+            Command::ResolveIncident { incident_key } => {
                 let incident = self
                     .state
                     .incidents
@@ -3555,7 +3670,7 @@ impl Engine {
                         instance_key,
                         job_key,
                         resolved_at: self.now,
-                        operation_reference,
+                        operation_reference: None,
                     },
                 );
                 // Resolution retries the failed work rather than merely clearing
@@ -4288,7 +4403,11 @@ impl Engine {
                         // The instance lives on another partition: settle the
                         // canonical subscription here and hand the token-advance to
                         // the host, which routes a `CorrelateMessageSubscription`
-                        // continuation to `partition_of(instance_key)`.
+                        // continuation to `partition_of(instance_key)`. Mint the
+                        // stable delivery identity (#1497) on THIS (the message)
+                        // partition so the instance partition dedups a re-driven
+                        // continuation after a lost ack.
+                        let delivery_key = self.mint_key();
                         self.emit(
                             &mut log,
                             Event::RemoteMessageCorrelation {
@@ -4299,6 +4418,7 @@ impl Engine {
                                 element_id,
                                 kind,
                                 variables: variables.clone(),
+                                delivery_key,
                             },
                         );
                     }
@@ -4418,7 +4538,22 @@ impl Engine {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered open whose
+                // `delivery_key` this partition already recorded is acknowledged
+                // without being re-applied.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
+                // Close tombstone (#1497): a `CloseMessageSubscription` for this
+                // subscription that landed BEFORE its delayed open (the instance
+                // was cancelled while the open backed off) recorded the
+                // `subscription_key`; the late open must NOT resurrect a live
+                // subscription for the dead instance.
+                if self.state.routed_deliveries.is_tombstoned(subscription_key) {
+                    return Ok((log, queue));
+                }
                 // Idempotent: re-delivering an open for a subscription we already
                 // hold (at-least-once retry, or a duplicate) is a no-op.
                 if !self
@@ -4439,6 +4574,17 @@ impl Engine {
                         },
                     );
                 }
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::CorrelateMessageSubscription {
@@ -4449,7 +4595,18 @@ impl Engine {
                 element_id,
                 kind,
                 variables,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered
+                // continuation whose `delivery_key` this partition already
+                // recorded is acknowledged without being re-applied. This is the
+                // guard that keeps a retried **non-interrupting** boundary
+                // correlation — whose `Opening` record intentionally stays open,
+                // so the state check below alone would re-fire it — from
+                // spawning a second token after a lost ack.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 // Advance only while the local record is still `Opening` (a parked
                 // token). Once it settles to `Correlated`/`Canceled` — or the
                 // instance is gone — a redelivered continuation is safely ignored,
@@ -4501,6 +4658,17 @@ impl Engine {
                         &variables,
                     );
                 }
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::CloseMessageSubscription {
@@ -4508,7 +4676,14 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered close
+                // whose `delivery_key` is already recorded is acknowledged
+                // without being re-applied.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 // Disarm the canonical subscription because the instance partition
                 // tore down the waiting element. Idempotent: only an open
                 // subscription is cancelled.
@@ -4527,6 +4702,22 @@ impl Engine {
                             instance_key,
                             element_instance_key,
                             element_id,
+                        },
+                    );
+                }
+                // Close tombstone (#1497): record the delivery EVEN WHEN no
+                // canonical record existed (the close landed before its delayed
+                // open). The recorded key then rejects the late
+                // `OpenMessageSubscription` for the same `subscription_key`, so
+                // a cancelled instance's subscription is never resurrected.
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: Some(subscription_key),
+                            close_tombstone: true,
                         },
                     );
                 }
@@ -4905,11 +5096,14 @@ impl Engine {
                 }
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
-                //    active element instance whose own kind is a call activity or
-                //    event-based gateway (`unsupported_migration_reason`).
+                //    active element instance whose kind is listed in
+                //    `unsupported_migration_reason` (currently none).
                 //    Embedded sub-processes and boundary / intermediate catch
                 //    events are migrated (#1374): their flow scopes and
-                //    subscriptions are planned in `engine/migration.rs`.
+                //    subscriptions are planned in `engine/migration.rs`. Call
+                //    activities are migrated (#1553): the parent element
+                //    instance is remapped and its child instance keeps the
+                //    parent link untouched (Zeebe `MigrateCallActivityTest`).
                 #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
@@ -4993,6 +5187,19 @@ impl Engine {
                     });
                 }
 
+                // 4a. Event-based gateway races (#1554): validate where mapped
+                //     catch events land and collect unmapped race members to
+                //     withdraw (exempt from the step-5 mapping requirement).
+                let withdrawn = Self::check_migrated_event_gateway_races(
+                    instance_key,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &active_elements,
+                    |eik| self.scope_of(instance_key, eik),
+                )?;
+                active_elements.retain(|e| !withdrawn.contains(e));
+                active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
                 // 4b. Event sub-process triggers (#1555) rest on their host
                 //     *scope* (`0` for the process root), not on an active
                 //     element, so the per-element catch-event reconciliation
@@ -5295,7 +5502,11 @@ impl Engine {
                     &target_definition,
                     &mapped,
                 )?;
-                for event in plan.before {
+                let withdrawals: Vec<Event> = withdrawn
+                    .into_iter()
+                    .flat_map(|(eik, eid)| self.withdraw_catch_instance(instance_key, eik, eid))
+                    .collect();
+                for event in withdrawals.into_iter().chain(plan.before) {
                     self.emit(&mut log, event);
                 }
                 self.emit(
@@ -5307,7 +5518,7 @@ impl Engine {
                         element_mappings: mapping_instructions,
                         migrated_flow_scopes: plan.migrated_flow_scopes,
                         subscriptions: plan.subscriptions,
-                        child_instances: Vec::new(),
+                        child_instances: plan.child_instances,
                         join_scoped: true,
                     },
                 );
@@ -5338,9 +5549,21 @@ impl Engine {
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 
-                // Move instructions are not acted on yet: rejected explicitly —
-                // never silently ignored (#1374; `engine-modify-move` lands them).
-                Self::reject_unsupported_modification(instance_key, &move_instructions)?;
+                // Move instructions (Camunda 8.9, #1552) desugar into the
+                // activate/terminate pairs they abbreviate — one terminate of
+                // each moved source element instance plus one activation of the
+                // target per moved instance — so the existing all-or-nothing
+                // validation/apply covers them unchanged (Zeebe
+                // `ProcessInstanceModificationModifyProcessor` builds the same
+                // final instruction lists).
+                let mut activate_instructions = activate_instructions;
+                let mut terminate_instructions = terminate_instructions;
+                self.desugar_move_instructions(
+                    instance_key,
+                    &move_instructions,
+                    &mut activate_instructions,
+                    &mut terminate_instructions,
+                )?;
 
                 // Validate everything up front so the command is all-or-nothing,
                 // then apply (see `modify.rs`).
@@ -5360,7 +5583,15 @@ impl Engine {
                 tags,
                 business_id,
                 message_start,
+                delivery_key,
             } => {
+                // At-least-once ⇒ exactly-once (#1497): a re-delivered dispatch
+                // whose `delivery_key` this partition already recorded is
+                // acknowledged WITHOUT minting a second process instance — the
+                // lost-ack duplicate the re-drive would otherwise create.
+                if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    return Ok((log, queue));
+                }
                 check_business_id(business_id.as_deref())?;
                 // Routed from the deploy partition's StartInstanceDispatched: mint
                 // the start-triggered instance here, in this partition's namespace,
@@ -5375,6 +5606,17 @@ impl Engine {
                     business_id,
                     message_start,
                 );
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::RoutedDeliveryRecorded {
+                            delivery_key,
+                            recipient_partition: self.partition_id,
+                            subscription_key: None,
+                            close_tombstone: false,
+                        },
+                    );
+                }
             }
 
             Command::ActivateAdHocActivities {
@@ -5485,8 +5727,160 @@ impl Engine {
                 self.process_complete_agent_instance(&mut log, agent_instance_key)?;
             }
 
-            Command::QuarantineOffheapOrphan { instance_key } => {
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: None,
+            } => {
                 self.process_quarantine_offheap_orphan(&mut log, instance_key);
+            }
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: Some(stamp),
+            } => {
+                // Replicated form (#1447): no residency branch — that reads
+                // replica-local state. The leader decided the incident metadata. The idempotency
+                // guard, however, reads ONLY replicated state (the dedup
+                // tombstone every replica applies identically), so it is safe
+                // here and required: two committed stamped proposals for the same
+                // outstanding loss (a promoted member re-proposing its parked
+                // report before an inherited quarantine entry applies) must not
+                // mint a second incident (#1574 review).
+                //
+                // A duplicate (the guard already holds this loss episode) is a
+                // complete no-op.
+                //
+                // The guard reads ONLY the replicated tombstone, never the hot
+                // incident map: the latter is residency-dependent (a cold-tiered
+                // replica has drained it), so it would split replicas.
+                //
+                // Terminal gate (#1574 review, cancellation race): a report
+                // queued before a cancel/complete can commit after it and must
+                // not raise an incident on the finished instance. Decided from
+                // REPLICATED state only, so every replica agrees. The decision
+                // uses the TARGET's own replicated lifecycle validity, never the
+                // global epoch distance (review 5899722557): the global
+                // `terminal_epoch` counts EVERY terminal transition, so an
+                // unrelated instance completing between the stamp and the
+                // commitment would otherwise be misread as the target's
+                // termination and wrongly suppress a LIVE orphan report.
+                //
+                // The terminal gate must be REPLICA-UNIFORM: every replica
+                // applies the same committed command, so the decision must be a
+                // pure function of replicated state, never of replica-local
+                // residency. The rule is target-specific (review 5899722557):
+                // no-op iff the TARGET is provably terminal — its own
+                // replicated `terminated_epoch` is set (a resident terminal
+                // instance), or its key is in the replicated terminal ring, or
+                // the leader recovered its terminal epoch into the stamp. The
+                // global epoch DISTANCE is deliberately NOT used: it counts
+                // EVERY terminal transition, so an unrelated instance completing
+                // between the stamp and the commitment would be misread as the
+                // target's termination and wrongly suppress a LIVE orphan
+                // report (the review's finding). A live orphan (no terminal
+                // record anywhere) always raises, identically on every replica.
+                //
+                // The resident record's `terminated_epoch` is deliberately NOT
+                // consulted: whether a terminal instance is still resident is
+                // replica-local (eviction), so once the ring wraps past a
+                // stamp-before-cancel target it would split replicas (one
+                // no-ops, one raises and mints a key). Only replicated inputs —
+                // the stamp and the ring — decide; past the ring's reach every
+                // replica uniformly fails open (raises).
+                let target_terminated = stamp.target_terminated_epoch > 0
+                    || self.state.recently_terminated.contains(&instance_key);
+                if target_terminated {
+                    return Ok((log, queue));
+                }
+                // Episode gate (#1587). The stamp carries the replicated
+                // loss-episode id the leader resolved at stamp time. Decide
+                // from the replicated tombstone alone (never the residency-
+                // dependent hot incident map), so every replica agrees:
+                //
+                // - A live tombstone for this instance means the episode is
+                //   still open: a duplicate of it is a no-op. (A stamp whose
+                //   episode DIFFERS from the live tombstone's cannot be
+                //   produced by the leader — `orphan_incident_stamp` returns
+                //   `None` while a tombstone is live — so any such frame is a
+                //   legacy/episode-0 frame, handled below.)
+                // - NO live tombstone + a NONZERO episode means this proposal's
+                //   episode already ran its course: its incident was resolved
+                //   and the tombstone lifted, so this is a DELAYED DUPLICATE of
+                //   a resolved episode. It must be a deterministic no-op — it
+                //   must NOT raise a fresh incident (today's tombstone-less
+                //   behaviour re-reported it as a new episode). A genuinely new
+                //   loss after resolution stamps a FRESH, distinct episode id
+                //   (the leader mints it from its advanced allocator), so it
+                //   still applies and is reported.
+                //
+                // `episode == 0` is a legacy (pre-#1587) stamp: keep the
+                // episode-blind #1574 dedup (tombstone-presence only).
+                //
+                // STALE-STAMP SUPERSERVE (#1587 review): the gate compares the
+                // episode against the allocator's CURRENT position, which
+                // unrelated key-minting work can advance between the leader
+                // stamping the report and the proposal committing. A mismatch
+                // then means one of two things the gate cannot tell apart from
+                // replicated state alone: a delayed duplicate of a RESOLVED
+                // episode (the common case — no-op), or a FRESH report whose
+                // stamp went stale in flight (its loss is still outstanding
+                // and must still be reported). So a mismatch never silently
+                // clears the pending report: it emits
+                // [`Event::OrphanStampSuperseded`] — journaled, so the decision
+                // is replica-deterministic. The leader's journal observes that
+                // event, keeps the report in its backlog, and re-drains it
+                // through the gated backlog drain (leader-only, one in-flight
+                // proposal per key), which re-stamps it at the allocator's
+                // now-current position and re-proposes it. A delayed
+                // duplicate's report is already settled out of the backlog, so
+                // it is not re-proposed; a genuinely fresh report is never
+                // silently cleared.
+                let tombstone = self.state.variables_lost_quarantined.get(&instance_key);
+                match (tombstone, stamp.episode) {
+                    // An open episode: dedup any repeat of it.
+                    (Some(_), _) => return Ok((log, queue)),
+                    // A delayed duplicate of a resolved episode OR a fresh
+                    // report whose stamp went stale in flight: supersede it —
+                    // journal the decision so the leader's journal re-stamps
+                    // the still-pending report. Equality — the episode IS the next key — means a
+                    // FRESH proposal at the allocator's current position:
+                    // apply it.
+                    (None, episode) if episode > 0 => {
+                        if episode != self.peek_next_key() {
+                            self.emit(
+                                &mut log,
+                                Event::OrphanStampSuperseded {
+                                    instance_key,
+                                    episode,
+                                },
+                            );
+                            return Ok((log, queue));
+                        }
+                    }
+                    // Legacy episode-blind stamp with no live tombstone: apply.
+                    (None, _) => {}
+                }
+                let incident_key = self.emit_variables_lost(
+                    &mut log,
+                    instance_key,
+                    stamp.element_id,
+                    stamp.reason,
+                );
+                // Record the replicated dedup tombstone (with its episode id,
+                // #1587). Deliberately NO variable install and no off-heap row
+                // cleanup (#1574): the command must be replica-deterministic,
+                // and a leader-snapshotted payload is not (it can roll back an
+                // intervening SetVariables).
+                self.emit(
+                    &mut log,
+                    Event::VariablesLostQuarantined {
+                        instance_key,
+                        incident_key,
+                        episode: stamp.episode,
+                    },
+                );
+            }
+            Command::QuarantineColdOrphan { instance_key } => {
+                self.process_quarantine_cold_orphan(&mut log, instance_key);
             }
         }
 
@@ -7657,6 +8051,24 @@ impl Engine {
             return;
         }
         let element_id = instance.process_id.clone();
+        self.emit_variables_lost(
+            log,
+            instance_key,
+            element_id,
+            RESIDENT_ORPHAN_REASON.to_string(),
+        );
+    }
+
+    /// Emits the single instance-root `VariablesLost` incident every orphan
+    /// quarantine form shares (#1384/#1481/#1447): one canonical shape, so the
+    /// local and replicated forms cannot drift.
+    fn emit_variables_lost(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: String,
+        reason: String,
+    ) -> Key {
         let incident_key = self.mint_key();
         self.emit(
             log,
@@ -7667,10 +8079,117 @@ impl Engine {
                 element_id,
                 kind: state::IncidentKind::VariablesLost,
                 redrive: None,
-                reason: "variables lost: spill row missing".to_string(),
+                reason,
                 job_key: None,
                 created_at: self.now,
             },
+        );
+        incident_key
+    }
+
+    /// Whether an active `VariablesLost` incident already names `instance_key`
+    /// in this engine's state.
+    ///
+    /// The quarantine idempotency guard must be **replica-identical** (#1574
+    /// review), so it reads the replicated dedup tombstone
+    /// ([`State::variables_lost_quarantined`]) first: that set is recorded by the
+    /// quarantine's own event and is independent of instance residency and
+    /// terminal eviction, whereas the `VariablesLost` *incident record* leaves
+    /// hot state when its instance cold-spills and is dropped on eviction — a
+    /// guard reading only `incidents` would go blind on exactly the replica that
+    /// tiered and mint a duplicate incident there. The tombstone is the
+    /// authoritative answer; the incident scan below is the legacy fallback for
+    /// an incident journaled before the tombstone event existed (a pre-#1574
+    /// journal mid-replay) and for the resident fast path.
+    pub fn has_active_variables_lost(&self, instance_key: Key) -> bool {
+        if self
+            .state
+            .variables_lost_quarantined
+            .contains_key(&instance_key)
+        {
+            return true;
+        }
+        self.state.incidents.values().any(|i| {
+            i.instance_key == instance_key
+                && i.state == state::IncidentState::Active
+                && i.kind == state::IncidentKind::VariablesLost
+        })
+    }
+
+    /// Resolves, from THIS (proposing leader's) state, the stamp a replicated
+    /// [`Command::QuarantineOffheapOrphan`] carries (#1447) — every replica then
+    /// applies the identical incident. `None` means nothing should be proposed:
+    /// the leader already holds an active `VariablesLost` incident for the
+    /// instance, or holds it resident in a terminal state (the loss no longer
+    /// matters to any live work). Pure read.
+    pub fn orphan_incident_stamp(
+        &self,
+        instance_key: Key,
+        kind: crate::command::OrphanKind,
+    ) -> Option<crate::command::OrphanIncidentStamp> {
+        if self.has_active_variables_lost(instance_key) {
+            return None;
+        }
+        let element_id = match self.state.instances.get(&instance_key) {
+            Some(instance)
+                if !matches!(
+                    instance.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                ) =>
+            {
+                return None;
+            }
+            Some(instance) => instance.process_id.clone(),
+            None => String::new(),
+        };
+        let reason = match kind {
+            crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
+            crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
+        };
+        Some(crate::command::OrphanIncidentStamp {
+            kind,
+            element_id,
+            reason: reason.to_string(),
+            terminal_epoch: self.state.terminal_epoch,
+            // The target's own terminal epoch at stamp time, read from the
+            // resident record OR the replicated terminal ring (a leader that
+            // already evicted its terminal shell still proves the target's
+            // terminal epoch from the ring). `0` while the target is live (a
+            // resident terminal instance returns `None` above) or so old the
+            // ring has wrapped past it. The cold apply path reads it to detect
+            // the target terminating after the stamp.
+            target_terminated_epoch: self.state.terminated_epoch_of(instance_key).unwrap_or(0),
+            // The loss-episode id (#1587): the allocator's next key at stamp
+            // time. Two stamped copies of one episode agree, and a delayed
+            // duplicate of a resolved episode (whose tombstone lifted) is a
+            // deterministic no-op. The allocator can advance between this stamp
+            // and the proposal's commitment (unrelated key-minting work), so
+            // the apply gate treats a position mismatch as a SUPERSEDED stamp —
+            // re-stamped and re-proposed via `Event::OrphanStampSuperseded` —
+            // never as authority to drop a still-pending report (#1587 review).
+            episode: self.peek_next_key(),
+        })
+    }
+
+    /// Process a [`Command::QuarantineColdOrphan`] (#1481): record a durable
+    /// `VariablesLost` incident for a cold (non-resident) instance whose cold row
+    /// is definitively lost. A resident instance defers to
+    /// [`process_quarantine_offheap_orphan`](Self::process_quarantine_offheap_orphan).
+    /// Idempotent: an active `VariablesLost` incident already naming the
+    /// instance makes this a no-op.
+    fn process_quarantine_cold_orphan(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        if self.state.instances.contains_key(&instance_key) {
+            self.process_quarantine_offheap_orphan(log, instance_key);
+            return;
+        }
+        if self.has_active_variables_lost(instance_key) {
+            return;
+        }
+        self.emit_variables_lost(
+            log,
+            instance_key,
+            String::new(),
+            COLD_ORPHAN_REASON.to_string(),
         );
     }
 
@@ -13338,85 +13857,21 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
-        // An event-based gateway's deferred choice is a race between intermediate
-        // catch events only. `is_catch_event` gates both the winner (below) and
-        // each losing sibling: it keeps the completion hot path O(1) for the
-        // common (non-catch) completion, and — should a malformed model route a
-        // gateway into a non-catch node (e.g. a service task) — prevents this
-        // code from force-completing that node's element instance via
-        // `ElementCompleted` while leaving its job/user-task uncancelled (which
-        // would orphan work). Withdrawal only ever cancels timers/subscriptions
-        // resting on genuine catch siblings.
-        let is_catch_event = |element_id: &str| {
-            matches!(
-                def.elements.get(element_id).map(|e| &e.kind),
-                Some(
-                    ElementKind::TimerIntermediateCatchEvent { .. }
-                        | ElementKind::MessageIntermediateCatchEvent { .. }
-                        | ElementKind::SignalIntermediateCatchEvent { .. }
-                        | ElementKind::ConditionalIntermediateCatchEvent { .. }
-                )
-            )
-        };
-        if !is_catch_event(winner_element_id) {
+        // Cheap kind check first: a completing task, gateway, or start/end
+        // event is never a race winner, so it must not pay for the index.
+        if !is_intermediate_catch(def, winner_element_id) {
             return Vec::new();
         }
-        // A catch event downstream of an event-based gateway has exactly one
-        // incoming flow — from the gateway. If the winner has any *other*
-        // incoming path (a malformed graph where a non-gateway node also routes
-        // into it), we cannot be sure this token arrived via the gateway, so we
-        // conservatively withdraw nothing rather than risk cancelling an
-        // unrelated race in the same scope.
-        let incoming_count = def
-            .elements
-            .values()
-            .flat_map(|element| element.outgoing.iter())
-            .filter(|f| f.to == winner_element_id)
-            .count();
-        if incoming_count != 1 {
-            return Vec::new();
-        }
-        // Find the event-based gateway(s) that route into the winning catch
-        // event. In a well-formed model a catch event has exactly one incoming
-        // flow, so at most one gateway owns the race. If more than one gateway
-        // routes into the same catch event the owning race is ambiguous — we
-        // cannot tell which gateway's siblings to withdraw without risking the
-        // cancellation of an unrelated gateway's branch — so we conservatively
-        // do nothing.
-        let owners: Vec<&crate::model::Element> = def
-            .elements
-            .values()
-            .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
-            .filter(|element| element.outgoing.iter().any(|f| f.to == winner_element_id))
-            .collect();
-        let [owner] = owners.as_slice() else {
+        // One indexed pass over the definition, shared by the winner lookup
+        // and sibling discovery (O(V + E), not a full rescan per branch).
+        let race_index = event_gateway_race_index(def);
+        let Some(owner) = race_index.owner_of(winner_element_id) else {
             return Vec::new();
         };
-        // The owning gateway must itself have exactly one incoming flow. A
-        // gateway reachable via multiple incoming flows (e.g. fed by both arms of
-        // a parallel split) can be activated concurrently in the same scope,
-        // arming several live instances of each sibling element id at once. Since
-        // losers are matched by element id + scope, withdrawing here could cancel
-        // a sibling instance belonging to a *different* concurrent activation of
-        // the same gateway. When the owner's static in-degree is not exactly 1 we
-        // cannot isolate a single race, so we conservatively withdraw nothing.
-        let owner_incoming = def
-            .elements
-            .values()
-            .flat_map(|element| element.outgoing.iter())
-            .filter(|f| f.to == owner.id)
-            .count();
-        if owner_incoming != 1 {
-            return Vec::new();
-        }
-        // The sibling targets are the owning gateway's *other* outgoing catch
-        // events. Any non-catch target is skipped (see `is_catch_event` above).
-        let sibling_ids: Vec<&str> = owner
-            .outgoing
-            .iter()
-            .filter(|f| f.to != winner_element_id)
-            .map(|f| f.to.as_str())
-            .filter(|id| is_catch_event(id))
+        let sibling_ids: Vec<&str> = race_index
+            .members_of(owner)
+            .into_iter()
+            .filter(|id| *id != winner_element_id)
             .collect();
         if sibling_ids.is_empty() {
             return Vec::new();
@@ -13440,21 +13895,40 @@ impl Engine {
 
         let mut events = Vec::new();
         for (eik, eid) in losers {
-            events.extend(self.cancel_all_timers_on(eik));
-            events.extend(self.cancel_all_subscriptions_on(eik));
-            events.extend(self.cancel_all_signal_subscriptions_on(eik));
-            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: eik,
-                element_id: eid.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: eik,
-                element_id: eid,
-            });
+            events.extend(self.withdraw_catch_instance(instance_key, eik, eid));
         }
+        events
+    }
+
+    /// Withdraws one armed intermediate-catch element instance: cancels every
+    /// timer and (message/signal/conditional) subscription resting on it, then
+    /// completes it without taking an outgoing flow. The single implementation
+    /// shared by the event-based gateway's deferred choice (a losing sibling)
+    /// and migration (an unmapped race member, whose subscriptions Zeebe
+    /// deletes).
+    pub(crate) fn withdraw_catch_instance(
+        &self,
+        instance_key: Key,
+        eik: Key,
+        eid: String,
+    ) -> Vec<Event> {
+        // A catch parked on a start-listener job or an activation incident
+        // carries that work on its root: cancel/resolve it too (#1554).
+        let mut events = self.boundary_root_teardown_events(instance_key, eik);
+        events.extend(self.cancel_all_timers_on(eik));
+        events.extend(self.cancel_all_subscriptions_on(eik));
+        events.extend(self.cancel_all_signal_subscriptions_on(eik));
+        events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: eik,
+            element_id: eid,
+        });
         events
     }
     /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
@@ -15762,14 +16236,12 @@ impl Engine {
         // last lock deadline identically, and no site can drift to reading
         // replica-local state directly.
         //
-        // A terminal event carries a deadline ONLY for a DURABLE (leased)
-        // activation — one whose lock is journaled and therefore identical on
-        // every replica. A leader-local (soft) activation is unreplicated by
-        // design (ADR 0002): a follower never sees it, so a soft job's deadline
-        // is replica-local and a terminal event stamped from it would diverge
-        // across replicas. Soft jobs therefore record NO deadline. Making
-        // terminal metadata authoritative for soft jobs is the architectural
-        // follow-up tracked in #963 — do NOT stamp a soft deadline here.
+        // A terminal event carries a deadline ONLY from replicated inputs: a
+        // DURABLE (leased) activation, whose lock is journaled, or the
+        // proposer's stamp on the terminating command (#1494). A leader-local
+        // (soft) activation is unreplicated by design (ADR 0002), so an
+        // UNSTAMPED soft job records NO deadline — never read the replica-local
+        // soft lock here, or replicas diverge.
         let event = match event {
             Event::JobCompleted {
                 job_key,
@@ -15798,6 +16270,67 @@ impl Engine {
                 instance_key,
                 canceled_at,
                 deadline: self.job_terminal_deadline(job_key),
+            },
+            // The stable delivery identity (#1497) of a routable
+            // `MessageSubscriptionClosing` is minted HERE — the single
+            // `&mut self` event choke point — because the disarm sites
+            // (`disarm_subscription_event` and the `&self` teardown helpers
+            // above it) cannot mint. A `0` means "not yet minted"; a non-zero
+            // value (none today — the disarm path always emits `0`) is kept.
+            // Legacy per-event audit fields (#1556): derived from the
+            // command's single generic `operationReference`, never set by an
+            // emission site, so they cannot drift from the record envelope.
+            Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: _,
+            } => Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: self.operation_reference,
+            },
+            Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: _,
+            } => Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: self.operation_reference,
+            },
+            Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: _,
+            } => Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: self.operation_reference,
+            },
+            Event::MessageSubscriptionClosing {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                delivery_key: 0,
+            } => Event::MessageSubscriptionClosing {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                delivery_key: self.mint_key(),
             },
             other => other,
         };
@@ -15966,7 +16499,6 @@ impl Engine {
         job_key: Key,
         retries: Option<i32>,
         timeout: Option<i64>,
-        operation_reference: Option<i64>,
         lease_token: Option<&str>,
     ) -> Result<(), EngineError> {
         let job = self
@@ -15995,6 +16527,8 @@ impl Engine {
             });
         }
         let instance_key = job.instance_key;
+        // `operation_reference: None` here: `emit` derives it from the
+        // command's generic reference (#1556).
         if let Some(retries) = retries {
             self.emit(
                 log,
@@ -16002,7 +16536,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     retries,
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }
@@ -16013,7 +16547,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     deadline: self.now.saturating_add_signed(timeout),
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }
@@ -16324,7 +16858,13 @@ fn group_owned<V: OwnedByInstance>(
 
 /// A process start event's deploy-time-resolved trigger.
 enum ResolvedStart {
-    Message(String),
+    Message {
+        message_name: String,
+        /// The start event's `io.camunda.tool:name` zeebe:property (#1499).
+        tool_name: Option<String>,
+        /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+        tool_properties: std::collections::BTreeMap<String, String>,
+    },
     Timer {
         due_at: u64,
         interval_millis: u64,
@@ -16548,10 +17088,11 @@ pub enum EngineError {
         flow_index: usize,
     },
     /// A `MigrateInstance` targeted an instance that contains an active element
-    /// class this phase does not yet support migrating (boundary events, event
-    /// subprocesses, multi-instance bodies, call activities, event-based-gateway
-    /// catch events). Maps to HTTP 409. Zeebe itself rejects several of these as
-    /// "not supported yet"; reproducing the rejection is parity.
+    /// class this phase does not yet support migrating (event subprocesses,
+    /// multi-instance bodies, ad-hoc sub-processes, compensation runtime,
+    /// event-based-gateway catch events). Maps to HTTP 409. Zeebe itself
+    /// rejects several of these as "not supported yet"; reproducing the
+    /// rejection is parity.
     UnsupportedMigration {
         instance_key: Key,
         element_id: String,
@@ -16732,39 +17273,117 @@ pub enum EngineError {
     InstanceUnavailable { instance_key: Key },
 }
 
-impl Engine {
-    /// Rejects the [`Command::ModifyInstance`] instruction fields the engine
-    /// does not act on yet with
-    /// [`EngineError::ModificationInstructionNotYetSupported`], in a fixed
-    /// field order so the rejection is deterministic.
-    fn reject_unsupported_modification(
-        instance_key: Key,
-        move_instructions: &[crate::command::MoveInstruction],
-    ) -> Result<(), EngineError> {
-        let unsupported = |instruction| {
-            Err(EngineError::ModificationInstructionNotYetSupported {
-                instance_key,
-                instruction,
-            })
-        };
-        if !move_instructions.is_empty() {
-            return unsupported("move_instructions");
-        }
-        Ok(())
+/// Whether `element_id` is an intermediate catch event — the only element
+/// class that takes part in an event-based gateway's deferred choice.
+fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str) -> bool {
+    matches!(
+        def.elements.get(element_id).map(|e| &e.kind),
+        Some(
+            ElementKind::TimerIntermediateCatchEvent { .. }
+                | ElementKind::MessageIntermediateCatchEvent { .. }
+                | ElementKind::SignalIntermediateCatchEvent { .. }
+                | ElementKind::ConditionalIntermediateCatchEvent { .. }
+        )
+    )
+}
+
+/// One O(V + E) pass over a definition's flow graph indexing which catch
+/// events race in which event-based gateway's deferred choice, so a caller
+/// resolving many catches (runtime sibling withdrawal, migration) pays the
+/// scan once instead of per catch. Catches with no unambiguous owning gateway
+/// are simply absent from the map — the one definition of "race membership"
+/// shared by the runtime withdrawal of losing siblings and by migration
+/// (#1554), so the two can never disagree:
+///
+/// * `catch_id` must be an intermediate catch event (a malformed model routing a
+///   gateway into e.g. a service task must never have that node force-completed,
+///   which would orphan its job);
+/// * it must have exactly one incoming flow — otherwise its token may not have
+///   arrived via the gateway;
+/// * exactly one event-based gateway may route into it — otherwise the owning
+///   race is ambiguous;
+/// * that gateway must itself have exactly one incoming flow — otherwise several
+///   concurrent activations could arm several instances of each sibling in one
+///   scope, and siblings (matched by element id + scope) could not be isolated.
+pub(crate) struct EventGatewayRaceIndex<'a> {
+    owners: HashMap<&'a str, &'a crate::model::Element>,
+}
+
+impl<'a> EventGatewayRaceIndex<'a> {
+    /// The gateway `catch_id` races in, or `None` when it is not an
+    /// unambiguous race member.
+    pub(crate) fn owner_of(&self, catch_id: &str) -> Option<&'a crate::model::Element> {
+        self.owners.get(catch_id).copied()
     }
+
+    /// The catch events racing in `owner`'s deferred choice, in declaration
+    /// order (non-catch targets are never part of the race).
+    pub(crate) fn members_of(&self, owner: &crate::model::Element) -> Vec<&'a str> {
+        let mut members: Vec<&'a str> = Vec::new();
+        for flow in &owner.outgoing {
+            if let Some((id, _)) = self
+                .owners
+                .get_key_value(flow.to.as_str())
+                .filter(|(_, o)| o.id == owner.id)
+            {
+                if !members.contains(id) {
+                    members.push(id);
+                }
+            }
+        }
+        members
+    }
+}
+
+/// Indexes every catch element's owning event-based gateway in one traversal
+/// of the definition: incoming-flow counts first, then a single pass over the
+/// gateways' outgoing flows recording each catch's owner — O(V + E) total,
+/// where per-catch owner lookups would each rescan the whole graph (O(C ×
+/// (V + E)) on catch-heavy models).
+pub(crate) fn event_gateway_race_index(
+    def: &crate::model::ProcessDefinition,
+) -> EventGatewayRaceIndex<'_> {
+    let mut incoming: HashMap<&str, usize> = HashMap::with_capacity(def.elements.len());
+    for element in def.elements.values() {
+        for flow in &element.outgoing {
+            *incoming.entry(flow.to.as_str()).or_default() += 1;
+        }
+    }
+    let mut owners: HashMap<&str, &crate::model::Element> = HashMap::new();
+    for gateway in def.elements.values() {
+        if !matches!(gateway.kind, ElementKind::EventBasedGateway)
+            || incoming.get(gateway.id.as_str()).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
+        for flow in &gateway.outgoing {
+            let catch = flow.to.as_str();
+            if !is_intermediate_catch(def, catch) || incoming.get(catch).copied().unwrap_or(0) != 1
+            {
+                continue;
+            }
+            // incoming(catch) == 1 makes this gateway's flow the catch's only
+            // incoming flow, so no second gateway can claim it — a second
+            // claimant would itself be a second incoming flow. The ambiguity
+            // checks therefore reduce to the two incoming-count requirements.
+            let previous = owners.insert(catch, gateway);
+            debug_assert!(
+                previous.is_none(),
+                "catch {catch} claimed by two event-based gateways"
+            );
+        }
+    }
+    EventGatewayRaceIndex { owners }
 }
 
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
 /// "not supported yet" migration rejections. Returns `Some(reason)` when a
 /// migration touching an active element (or armed boundary runtime) of this kind
 /// must be rejected with [`EngineError::UnsupportedMigration`].
-fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'static str> {
-    use crate::model::ElementKind;
-    match kind {
-        ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
-        ElementKind::EventBasedGateway => Some("event-based gateways are not migratable yet"),
-        _ => None,
-    }
+fn unsupported_migration_reason(_kind: &crate::model::ElementKind) -> Option<&'static str> {
+    // Every element class Zeebe migrates is supported; extend here when a new
+    // non-migratable kind appears.
+    None
 }
 
 impl std::fmt::Display for EngineError {

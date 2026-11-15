@@ -815,6 +815,19 @@ pub struct ProcessInstance {
     #[cfg_attr(feature = "serde", serde(default))]
     pub process_definition_key: Key,
     pub state: ProcessInstanceState,
+    /// The replicated terminal epoch ([`State::terminal_epoch`]) at which this
+    /// instance reached a terminal state (`Completed` / `Terminated`), recorded
+    /// by [`State::note_terminated`] in the same apply arm that set `state`.
+    /// `0` while the instance is live (and for instances written before this
+    /// field existed, via `serde(default)`). This is the **target-specific**
+    /// replicated lifecycle-validity stamp the orphan-quarantine gate reads
+    /// (#1574 review, review 5899722557): unlike the global epoch distance, it
+    /// names THIS instance's terminal transition, so an unrelated instance
+    /// completing between a stamp and its commitment is never misread as the
+    /// target's termination. Replicated-only (derived in `apply_event`), so
+    /// every replica records the identical value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminated_epoch: u64,
     /// When this instance is currently `SUSPENDED`, the millisecond-since-epoch
     /// instant it most recently entered suspension (the `suspendedDate` surfaced
     /// on the REST result). `None` whenever the instance is not currently
@@ -1998,6 +2011,20 @@ pub struct MessageStartSubscription {
     pub message_name: String,
     /// The start event element a new instance begins at.
     pub start_element_id: ElementId,
+    /// The MCP tool name declared on the start event via the
+    /// `io.camunda.tool:name` zeebe:property (Camunda 8.10 MCP gateway, #1499),
+    /// when present. Additive: `None` for subscriptions serialized before this
+    /// field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_name: Option<String>,
+    /// The start event's `zeebe:properties` subset whose keys carry the
+    /// `io.camunda.tool:` prefix, retained so API surfaces (the
+    /// `/mcp/processes` tool list, the REST `toolProperties` field) can read
+    /// the tool description / input schema without re-parsing the BPMN XML.
+    /// Empty when the start event declares no tool properties and for
+    /// subscriptions serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_properties: std::collections::BTreeMap<String, String>,
 }
 
 /// A process-level **timer start event**: an armed timer that creates a new
@@ -2069,6 +2096,126 @@ pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
 /// `SETTLED_JOB_LEDGER_CAP * SETTLED_TOKENS_PER_JOB_CAP` entries. A replay of a
 /// dropped token on a still-live job remains fenced by [`Job::settled_tokens`].
 pub const SETTLED_TOKENS_PER_JOB_CAP: usize = 8;
+
+/// Upper bound on [`State::routed_deliveries`] (#1497). Beyond it the entries
+/// this partition **applied earliest** are dropped (FIFO in the recipient's own
+/// applied order — never by key value: keys sort by source partition first, so
+/// key-order eviction would let a fresh delivery from a low partition evict
+/// itself the moment it is recorded). A re-delivery that old degrades to the
+/// pre-#1497 answer (applied again), never to a lost first delivery — the same
+/// degrade-to-previous-behaviour rule as [`SETTLED_JOB_LEDGER_CAP`].
+pub const ROUTED_DELIVERY_LEDGER_CAP: usize = 65_536;
+
+/// One routed-delivery ledger entry (#1497): the source-minted `delivery_key`
+/// (the dedup key) plus, for a subscription follow-up, the `subscription_key`
+/// it concerned, and whether it is a **close tombstone** (a
+/// `CloseMessageSubscription`) that rejects a delayed `OpenMessageSubscription`
+/// for that subscription (which bears its own, different `delivery_key`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RoutedDelivery {
+    pub delivery_key: Key,
+    /// `Some` for a subscription open/close/correlate; `None` for a
+    /// start-instance dispatch.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub subscription_key: Option<Key>,
+    /// `true` only for a `CloseMessageSubscription` delivery.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub close_tombstone: bool,
+}
+
+/// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
+/// close-tombstone index, kept consistent by [`RoutedDeliveries::record`]
+/// (the only mutator). Derived solely from replicated
+/// [`crate::Event::RoutedDeliveryRecorded`] records applied in log order, so
+/// every replica — and every snapshot/replay — holds the identical ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        from = "std::collections::VecDeque<RoutedDelivery>",
+        into = "std::collections::VecDeque<RoutedDelivery>"
+    )
+)]
+pub struct RoutedDeliveries {
+    /// Entries in the order this partition APPLIED them (oldest first). The
+    /// eviction order and the serialized source of truth.
+    order: std::collections::VecDeque<RoutedDelivery>,
+    /// `delivery_key` membership index (derived from `order`).
+    keys: std::collections::HashSet<Key>,
+    /// `subscription_key -> delivery_key` of the live close tombstone (derived
+    /// from `order`): an O(1) lookup instead of a ledger scan per open.
+    tombstones: std::collections::HashMap<Key, Key>,
+}
+
+impl RoutedDeliveries {
+    /// Whether `delivery_key` was already applied (and is still retained).
+    pub fn contains(&self, delivery_key: Key) -> bool {
+        self.keys.contains(&delivery_key)
+    }
+    /// Whether a retained close tombstone exists for `subscription_key`.
+    pub fn is_tombstoned(&self, subscription_key: Key) -> bool {
+        self.tombstones.contains_key(&subscription_key)
+    }
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    /// Retained entries, oldest-applied first.
+    pub fn iter(&self) -> impl Iterator<Item = &RoutedDelivery> {
+        self.order.iter()
+    }
+    /// Record an applied delivery, evicting the earliest-APPLIED entries
+    /// beyond `cap`. A key already present is a no-op (never re-ordered).
+    pub fn record(&mut self, entry: RoutedDelivery, cap: usize) {
+        if !self.keys.insert(entry.delivery_key) {
+            return;
+        }
+        if entry.close_tombstone {
+            if let Some(sub) = entry.subscription_key {
+                self.tombstones.insert(sub, entry.delivery_key);
+            }
+        }
+        self.order.push_back(entry);
+        while self.order.len() > cap {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.keys.remove(&old.delivery_key);
+            if let Some(sub) = old.subscription_key {
+                if self.tombstones.get(&sub) == Some(&old.delivery_key) {
+                    self.tombstones.remove(&sub);
+                }
+            }
+        }
+    }
+}
+
+/// Serialized form is the applied-order list only; the indexes are rebuilt on
+/// load, so a snapshot can never carry an index that drifted from `order`.
+impl From<std::collections::VecDeque<RoutedDelivery>> for RoutedDeliveries {
+    fn from(order: std::collections::VecDeque<RoutedDelivery>) -> Self {
+        let mut l = Self::default();
+        for e in order {
+            l.record(e, usize::MAX);
+        }
+        l
+    }
+}
+
+impl From<RoutedDeliveries> for std::collections::VecDeque<RoutedDelivery> {
+    fn from(l: RoutedDeliveries) -> Self {
+        l.order
+    }
+}
+
+/// Record a routed delivery in `state`'s ledger (bounded by `cap`).
+pub fn record_routed_delivery(state: &mut State, entry: RoutedDelivery, cap: usize) {
+    state.routed_deliveries.record(entry, cap);
+}
 
 /// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.
 ///
@@ -2143,6 +2290,25 @@ pub struct State {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub settled_jobs: BTreeMap<Key, Vec<JobSettlement>>,
+    /// The **routed-delivery ledger** (#1497): the source-minted
+    /// `delivery_key` of every routed cross-partition follow-up this partition
+    /// applied (`OpenMessageSubscription` / `CorrelateMessageSubscription` /
+    /// `CloseMessageSubscription` / `DispatchStartInstance`). A re-delivered
+    /// command carrying an already-recorded key is acknowledged without being
+    /// re-applied (at-least-once transport ⇒ exactly-once effect); a
+    /// `CloseMessageSubscription` records its key even when no canonical
+    /// subscription exists yet, and its entry carries the `subscription_key`
+    /// so it doubles as the **close tombstone** that rejects a delayed open
+    /// landing after its close. Derived only from the replicated
+    /// [`crate::Event::RoutedDeliveryRecorded`], so every replica holds the
+    /// same ledger; bounded by [`ROUTED_DELIVERY_LEDGER_CAP`].
+    /// `serde(default)`: snapshots written before #1497 load with an empty
+    /// ledger.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "RoutedDeliveries::is_empty")
+    )]
+    pub routed_deliveries: RoutedDeliveries,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.
@@ -2266,6 +2432,167 @@ pub struct State {
     /// for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource_versions: HashMap<Key, DeployedResource>,
+    /// Instance key → the [`VariablesLostTombstone`] of its active loss
+    /// episode (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
+    /// tombstone** (#1574 review). The `VariablesLost` incident record itself
+    /// leaves hot state when its instance cold-spills
+    /// ([`crate::Engine::snapshot_instance`] drains `incidents` into the cold
+    /// row) and is dropped on terminal eviction, so a dedup guard that reads
+    /// only `incidents` goes blind on exactly the replica that tiered — a
+    /// duplicate committed quarantine then mints a second incident on that
+    /// replica while a resident replica skips it, diverging the journals. This
+    /// set is independent of instance residency and eviction, so the guard
+    /// stays identical on every replica. `serde(default)` so snapshots written
+    /// before it deserialize empty (such a snapshot predates the quarantine
+    /// event, so there is nothing to dedup yet). The value deserializer accepts
+    /// BOTH the legacy encoding (`"7": 9` — the bare incident key, pre-#1587)
+    /// and the current tombstone object, so a legacy snapshot holding an ACTIVE
+    /// quarantine still loads (as episode `0`, the episode-blind sentinel);
+    /// `serde(default)` alone does not convert an existing numeric value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables_lost_quarantined: BTreeMap<Key, VariablesLostTombstone>,
+    /// The most recent instance keys to reach a terminal state
+    /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
+    /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
+    /// **replicated** record — appended only by `apply_event`, so identical on
+    /// every replica and independent of host-driven terminal eviction (which is
+    /// replica-local in timing). It closes the orphan-quarantine cancellation
+    /// race: a stamped `QuarantineOffheapOrphan` queued before a cancel can
+    /// commit after it, when one replica still holds the terminal instance and
+    /// another has already evicted it; both must no-op identically.
+    /// `serde(default)`: older snapshots load empty.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub recently_terminated: std::collections::VecDeque<Key>,
+    /// Total terminal transitions ever applied (`ProcessInstanceCompleted` /
+    /// `ProcessInstanceTerminated`) — a **replicated** monotonic epoch
+    /// (#1574 review). The [`recently_terminated`](Self::recently_terminated)
+    /// ring is bounded, so once it wraps it can no longer answer "did this key
+    /// terminate after the leader stamped its orphan proposal?" for an evicted
+    /// instance. The epoch can: the leader stamps the value it saw, and the
+    /// apply gate compares the distance against the ring's coverage
+    /// (`terminal_epoch - stamp_epoch <= recently_terminated.len()` ⇒ every
+    /// transition since the stamp is still in the ring). Replicated-only, so
+    /// every replica computes the identical distance and decides identically.
+    /// `serde(default)`: older snapshots load `0` (they predate the quarantine
+    /// command, so no stamped proposal can be outstanding against them).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub terminal_epoch: u64,
+}
+
+/// Bound on [`State::recently_terminated`]. The window it must cover is one
+/// orphan proposal's round trip (enqueue → commit), so a few thousand terminal
+/// transitions is ample while keeping the snapshot cost tiny (8 bytes/key).
+pub const RECENTLY_TERMINATED_CAP: usize = 4_096;
+
+/// The replicated dedup tombstone one active off-heap-orphan loss episode
+/// leaves in [`State::variables_lost_quarantined`] (#1574, episode id #1587).
+/// Recorded by [`crate::Event::VariablesLostQuarantined`]; lifted when the
+/// episode's incident is resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct VariablesLostTombstone {
+    /// The `VariablesLost` incident the quarantine raised: resolving exactly
+    /// this incident lifts the tombstone, keyed on the replicated
+    /// `IncidentResolved.incident_key` so the lift does not depend on whether
+    /// the incident record is resident.
+    pub incident_key: Key,
+    /// The replicated loss-episode id the quarantine's stamp carried (#1587).
+    /// A delayed duplicate of the SAME episode applies after the incident was
+    /// resolved (and the tombstone lifted) and must be a no-op: with no live
+    /// tombstone its episode matches nothing, so the apply gate suppresses it
+    /// instead of raising a fresh incident. A genuinely new loss stamps a
+    /// fresh, distinct episode id and is still reported. `0` for a tombstone
+    /// written before this field existed (episode-blind, pre-#1587 behaviour).
+    /// The id is the leader's allocator position at stamp time — unrelated
+    /// key-minting work can advance the allocator before the proposal commits,
+    /// so a position mismatch at apply time supersedes the stamp (re-stamp +
+    /// re-propose via [`crate::Event::OrphanStampSuperseded`]) rather than
+    /// dropping the report (#1587 review).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub episode: u64,
+}
+
+/// Backward-compatible deserialization for [`VariablesLostTombstone`]: a
+/// snapshot written before #1587 encodes each map entry as the bare incident
+/// key (`"7": 9`), which cannot deserialize into the struct — and
+/// `serde(default)` does not convert an EXISTING numeric value, so without
+/// this a legacy snapshot holding an active quarantine fails to load through
+/// every direct `EngineSnapshot` reader, including Raft snapshot installation.
+/// Accept the legacy bare key (as `{ incident_key, episode: 0 }` — the
+/// episode-blind sentinel, matching the pre-#1587 behaviour that snapshot ran
+/// under) alongside the current object form.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// Current form: the tombstone object.
+            Current {
+                incident_key: Key,
+                #[serde(default)]
+                episode: u64,
+            },
+            /// Legacy (pre-#1587) form: the bare incident key.
+            Legacy(Key),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Current {
+                incident_key,
+                episode,
+            } => VariablesLostTombstone {
+                incident_key,
+                episode,
+            },
+            Repr::Legacy(incident_key) => VariablesLostTombstone {
+                incident_key,
+                episode: 0,
+            },
+        })
+    }
+}
+
+impl State {
+    /// Records `instance_key` as terminal in the bounded replicated ring and
+    /// advances the replicated terminal epoch. Also stamps the instance's own
+    /// [`ProcessInstance::terminated_epoch`] with the new epoch — the
+    /// target-specific lifecycle-validity record the orphan-quarantine gate
+    /// reads (#1574 review). The epoch is advanced FIRST so the instance records
+    /// the value its own terminal transition produced.
+    pub(crate) fn note_terminated(&mut self, instance_key: Key) {
+        if self.recently_terminated.len() >= RECENTLY_TERMINATED_CAP {
+            self.recently_terminated.pop_front();
+        }
+        self.recently_terminated.push_back(instance_key);
+        self.terminal_epoch += 1;
+        if let Some(instance) = self.instances.get_mut(&instance_key) {
+            instance.terminated_epoch = self.terminal_epoch;
+        }
+    }
+
+    /// The replicated terminal epoch at which `instance_key` reached a terminal
+    /// state, read from whichever replicated record still holds it: the resident
+    /// instance's own [`ProcessInstance::terminated_epoch`], or — for an
+    /// instance already evicted from hot state — its position in the bounded
+    /// [`recently_terminated`](Self::recently_terminated) ring (the oldest
+    /// retained entry is `terminal_epoch - len + 1`, so index `i` is epoch
+    /// `terminal_epoch - len + 1 + i`). `None` when no replicated record can
+    /// prove the instance terminated (live, or terminated so long ago the ring
+    /// has wrapped past it). Replicated-only, so every replica computes the
+    /// identical value for an instance it can still see.
+    pub(crate) fn terminated_epoch_of(&self, instance_key: Key) -> Option<u64> {
+        if let Some(instance) = self.instances.get(&instance_key) {
+            return (instance.terminated_epoch > 0).then_some(instance.terminated_epoch);
+        }
+        let len = self.recently_terminated.len() as u64;
+        self.recently_terminated
+            .iter()
+            .position(|k| *k == instance_key)
+            .map(|i| self.terminal_epoch - len + 1 + i as u64)
+    }
 }
 
 /// A deployed decision requirements graph together with the identity the engine
@@ -2655,6 +2982,38 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
     }
     for incident in incidents {
         state.incidents.insert(incident.key, incident);
+    }
+    reconcile_incident_index(state, key);
+}
+
+/// Folds the ACTIVE incident raised while `instance_key` was cold into that
+/// instance's `incidents` index (#1574 review). The only incident that can be
+/// raised against a non-resident instance is the off-heap-orphan
+/// `VariablesLost` quarantine, and it is always recorded in the replicated
+/// tombstone [`State::variables_lost_quarantined`] (instance → incident). That
+/// map is the O(1) instance-keyed lookup, so restore never scans the
+/// partition-wide incident map (which would make bulk snapshot loading
+/// quadratic). Restoring the stale cold row alone would leave the incident
+/// unindexed and a later termination would resolve it only on peers that held
+/// the instance resident — diverging the event log.
+fn reconcile_incident_index(state: &mut State, instance_key: Key) {
+    let Some(&tombstone) = state.variables_lost_quarantined.get(&instance_key) else {
+        return;
+    };
+    let incident_key = tombstone.incident_key;
+    let Some(incident) = state.incidents.get(&incident_key) else {
+        return;
+    };
+    if incident.instance_key != instance_key || incident.state != IncidentState::Active {
+        return;
+    }
+    let owed = incident.owed_activation();
+    if let Some(instance) = state.instances.get_mut(&instance_key) {
+        if instance.incidents.contains(&incident_key) {
+            return;
+        }
+        instance.incidents.push(incident_key);
+        instance.activating.extend(owed);
     }
 }
 

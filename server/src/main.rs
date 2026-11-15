@@ -16,6 +16,7 @@ mod console_api;
 // that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
+mod mcp;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
@@ -157,6 +158,13 @@ struct BatchOperationRecord {
     start_date_ms: u64,
     end_date_ms: Option<u64>,
     items: Vec<BatchOperationItemRecord>,
+    /// `item_key → position in items`, built once at create. `items` is
+    /// append-never, reorder-never after creation (search/counts only read it),
+    /// so the index stays valid for the record's lifetime and makes each
+    /// [`BatchOperationStore::record_item`] outcome update constant-time —
+    /// without it, recording N outcomes scans the vector per item (O(N²) under
+    /// the registry-wide mutex).
+    item_index: std::collections::HashMap<u64, usize>,
 }
 
 /// One item (target process instance) of a batch operation.
@@ -196,7 +204,7 @@ impl BatchOperationStore {
         }
         inner.seq += 1;
         let key = inner.seq;
-        let items = item_keys
+        let items: Vec<BatchOperationItemRecord> = item_keys
             .into_iter()
             .map(|item_key| BatchOperationItemRecord {
                 item_key,
@@ -205,6 +213,11 @@ impl BatchOperationStore {
                 processed_date_ms: None,
                 error_message: None,
             })
+            .collect();
+        let item_index = items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| (item.item_key, pos))
             .collect();
         inner.ops.insert(
             key,
@@ -215,6 +228,7 @@ impl BatchOperationStore {
                 start_date_ms: now,
                 end_date_ms: None,
                 items,
+                item_index,
             },
         );
         key
@@ -280,6 +294,77 @@ impl BatchOperationStore {
                 BatchLifecycleOutcome::Ok
             }
         }
+    }
+
+    /// Current lifecycle state of `key`, if registered. The batch executor
+    /// ([`ServerImpl::drive_process_instance_batch`]) polls this between items so
+    /// suspend/resume/cancel requests take effect mid-run.
+    fn state(&self, key: u64) -> Option<models::BatchOperationStateEnum> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ops
+            .get(&key)
+            .map(|rec| rec.state)
+    }
+
+    /// Records the outcome of processing one item of batch `key`: `Ok` marks
+    /// the item `COMPLETED`, `Err(message)` marks it `FAILED` with the message as
+    /// its `errorMessage`. Items already processed are left untouched (first
+    /// outcome wins). Unknown batch/item keys are ignored.
+    ///
+    /// The item is located through the record's `item_index` (built at create),
+    /// so each outcome update is O(1) — a per-item vector scan would make
+    /// recording N outcomes O(N²) while holding the registry-wide mutex.
+    fn record_item(&self, key: u64, item_key: u64, outcome: Result<(), String>) {
+        use models::BatchOperationItemStateEnum as I;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        let Some(&pos) = rec.item_index.get(&item_key) else {
+            return;
+        };
+        let item = &mut rec.items[pos];
+        if matches!(item.state, I::Active) {
+            item.processed_date_ms = Some(now_millis());
+            match outcome {
+                Ok(()) => item.state = I::Completed,
+                Err(message) => {
+                    item.state = I::Failed;
+                    item.error_message = Some(message);
+                }
+            }
+        }
+    }
+
+    /// Settles batch `key` into its terminal state once every item has been
+    /// processed (Zeebe batch semantics): `COMPLETED` when no item failed (incl.
+    /// an empty batch), `FAILED` when every item failed, else
+    /// `PARTIALLY_COMPLETED`. A batch that is already terminal (e.g. `CANCELED`
+    /// mid-run) is left as is.
+    fn finish(&self, key: u64) {
+        use models::{BatchOperationItemStateEnum as I, BatchOperationStateEnum as S};
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = inner.ops.get_mut(&key) else {
+            return;
+        };
+        if Self::is_terminal(&rec.state) || rec.items.iter().any(|i| matches!(i.state, I::Active)) {
+            return;
+        }
+        let failed = rec
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, I::Failed))
+            .count();
+        rec.state = if failed == 0 {
+            S::Completed
+        } else if failed == rec.items.len() {
+            S::Failed
+        } else {
+            S::PartiallyCompleted
+        };
+        rec.end_date_ms = Some(now_millis());
     }
 
     /// Whether `state` is a terminal (absorbing) batch-operation state: once a
@@ -1589,6 +1674,55 @@ mod converted_lock_poison_tests {
         );
     }
 
+    /// `record_item` locates the item through the record's `item_index` rather
+    /// than scanning the item vector: recording N outcomes must be O(N), not
+    /// O(N²) under the registry-wide mutex (#1551 review). Behavioural guard:
+    /// outcomes land on the right items, first outcome wins on a duplicate
+    /// delivery, and unknown batch/item keys are ignored.
+    #[test]
+    fn record_item_updates_items_in_constant_time_via_the_index() {
+        let store = BatchOperationStore::default();
+        let key = store.create(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![10, 20, 30],
+        );
+
+        store.record_item(key, 20, Err("no mapping for element".to_string()));
+        store.record_item(key, 10, Ok(()));
+        // A duplicate outcome for an already-processed item is ignored (first
+        // outcome wins).
+        store.record_item(key, 20, Ok(()));
+        // Unknown item / batch keys are ignored, not panics.
+        store.record_item(key, 999, Ok(()));
+        store.record_item(123_456_789, 10, Ok(()));
+
+        let rec = store.get(key).expect("record present");
+        let by_key = |item_key: u64| {
+            rec.items
+                .iter()
+                .find(|i| i.item_key == item_key)
+                .expect("item present")
+        };
+        assert!(matches!(
+            by_key(10).state,
+            models::BatchOperationItemStateEnum::Completed
+        ));
+        let failed = by_key(20);
+        assert!(matches!(
+            failed.state,
+            models::BatchOperationItemStateEnum::Failed
+        ));
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("no mapping for element"),
+            "the first (failed) outcome wins over the duplicate"
+        );
+        assert!(matches!(
+            by_key(30).state,
+            models::BatchOperationItemStateEnum::Active
+        ));
+    }
+
     /// Batch-store: a panic while holding `BatchOperationStore::inner` must not
     /// cascade into every later batch get/search/transition.
     #[test]
@@ -1768,6 +1902,82 @@ enum RoutedApply {
     /// The write path rejected or failed the command.
     Failed(u16, String),
 }
+
+/// Classified outcome of ONE delivery attempt of a routed cross-partition
+/// follow-up (#1582) — the decision [`ServerImpl::route_with_redrive`] retries on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteAttempt {
+    /// Applied by the target partition's writer.
+    Delivered,
+    /// Permanently rejected (a 4xx): retrying cannot help, so the re-drive stops.
+    Rejected(u16, String),
+    /// Not delivered for a reason a later attempt can overcome — no reachable
+    /// leader, link down / timeout, a 503 leader race, any 5xx. Retried.
+    Transient(String),
+}
+
+impl RouteAttempt {
+    /// Classifies a write-path status: 2xx delivered, 4xx permanent, anything
+    /// else (5xx, incl. the 503 leader race) transient.
+    fn from_status(status: u16, message: String) -> Self {
+        match status {
+            200..=299 => RouteAttempt::Delivered,
+            400..=499 => RouteAttempt::Rejected(status, message),
+            _ => RouteAttempt::Transient(format!("status {status}: {message}")),
+        }
+    }
+
+    /// Classifies a forwarded attempt's peer reply; every transport failure
+    /// (connect, link closed, per-attempt timeout) is transient.
+    fn from_peer(
+        result: Result<nano_server_raft::peer::PeerResult, nano_server_raft::peer::PeerError>,
+    ) -> Self {
+        match result {
+            Ok(reply) => {
+                let message = reply
+                    .body
+                    .as_ref()
+                    .map(|b| b.as_str().map_or_else(|| b.to_string(), str::to_owned))
+                    .unwrap_or_default();
+                Self::from_status(reply.status, message)
+            }
+            Err(e) => RouteAttempt::Transient(e.to_string()),
+        }
+    }
+}
+
+/// Bounded re-drive budget for routed cross-partition follow-ups (#1582):
+/// exponential backoff from `base` capped at `cap`, at most `max_attempts`
+/// deliveries — long enough to ride out a Raft leader election, bounded so a
+/// permanently unreachable partition cannot pin the pump forever.
+struct RouteRedrive {
+    max_attempts: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+}
+
+impl RouteRedrive {
+    /// The sleep before attempt number `attempt` (`attempt >= 1`).
+    fn backoff(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1u32 << attempt.saturating_sub(1).min(16);
+        self.base.saturating_mul(factor).min(self.cap)
+    }
+}
+
+const ROUTE_REDRIVE: RouteRedrive = RouteRedrive {
+    max_attempts: 16,
+    base: std::time::Duration::from_millis(50),
+    cap: std::time::Duration::from_secs(1),
+};
+
+/// How long ONE routing attempt observes a LOCAL Raft proposal before giving
+/// up and letting the re-drive retry (#1582). Detached from the write itself —
+/// the proposal still completes (or is answered by the batcher on a leadership
+/// change) on its own; this only bounds how long the routing pump (and through
+/// it the clock loop) waits on a leader that may have silently lost quorum.
+/// Sized with the write-forward fast deadline (2.5s) so one attempt rides out a
+/// healthy commit round-trip yet fails fast enough for the bounded re-drive.
+const ROUTE_ATTEMPT_OBSERVE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobMetricStatus {
@@ -2480,6 +2690,11 @@ pub struct ServerImpl {
     /// in flight so the two paths can't race into competing groups. See
     /// [`HandoffPending`].
     handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
+    /// Re-drive attempts (beyond the first) the cross-partition routing pump
+    /// made for transiently undelivered follow-ups (#1582). Observability for
+    /// the bounded re-drive; lets the RF=3 leader-change tests prove the retry
+    /// path was actually exercised.
+    route_redrives: Arc<AtomicU64>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -2540,17 +2755,22 @@ pub struct ServerImpl {
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
 /// entry and restores it on drop, so every exit path (success, error, or a
-/// dropped/cancelled request future) releases its slot exactly once.
-struct ProcessingGuard<'a>(&'a AtomicUsize);
+/// dropped/cancelled request future) releases its slot exactly once. Owned (it
+/// holds an `Arc` clone of the gauge) so the accounting can be TRANSFERRED into
+/// the detached create owner (#1582): a cancelled caller's dropped future must
+/// not release the slot while the create it submitted is still queued on the
+/// engine actor — otherwise the gauge undercounts in-flight creates and repeated
+/// cancelled requests bypass the concurrency rail.
+struct ProcessingGuard(Arc<AtomicUsize>);
 
-impl<'a> ProcessingGuard<'a> {
-    fn enter(gauge: &'a AtomicUsize) -> Self {
+impl ProcessingGuard {
+    fn enter(gauge: &Arc<AtomicUsize>) -> Self {
         gauge.fetch_add(1, Ordering::Relaxed);
-        ProcessingGuard(gauge)
+        ProcessingGuard(gauge.clone())
     }
 }
 
-impl Drop for ProcessingGuard<'_> {
+impl Drop for ProcessingGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -2561,19 +2781,42 @@ impl Drop for ProcessingGuard<'_> {
 /// dropped/cancelled request future) releases its bytes exactly once. Held across
 /// the same submit→apply window as [`ProcessingGuard`], so the gauge measures the
 /// payload bytes resident in the engine's creation mailbox rather than how long a
-/// client blocks for completion.
-struct ByteGuard<'a>(&'a AtomicU64, u64);
+/// client blocks for completion. Owned (an `Arc` clone of the gauge) for the same
+/// transfer-into-the-detached-owner reason as [`ProcessingGuard`] (#1582).
+struct ByteGuard(Arc<AtomicU64>, u64);
 
-impl<'a> ByteGuard<'a> {
-    fn enter(gauge: &'a AtomicU64, bytes: u64) -> Self {
+impl ByteGuard {
+    fn enter(gauge: &Arc<AtomicU64>, bytes: u64) -> Self {
         gauge.fetch_add(bytes, Ordering::Relaxed);
-        ByteGuard(gauge, bytes)
+        ByteGuard(gauge.clone(), bytes)
     }
 }
 
-impl Drop for ByteGuard<'_> {
+impl Drop for ByteGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
+
+/// The create-path admission accounting a detached create owner must keep
+/// charged until the engine actor has finished the create (#1582): one
+/// processing-concurrency slot plus the payload bytes. Entered on the caller
+/// (so the sheds see the charge from the moment the request arrives), then
+/// MOVED into [`ServerImpl::submit_create_detached`]'s task, which drops it only
+/// after the actor round-trip resolves — a cancelled caller can no longer
+/// release the charge early and let repeated cancelled requests slip past the
+/// `admission_shed` watermarks.
+struct CreateAccounting {
+    _processing: ProcessingGuard,
+    _bytes: ByteGuard,
+}
+
+impl CreateAccounting {
+    fn enter(server: &ServerImpl, payload_bytes: u64) -> Self {
+        CreateAccounting {
+            _processing: ProcessingGuard::enter(&server.processing),
+            _bytes: ByteGuard::enter(&server.pipeline_bytes, payload_bytes),
+        }
     }
 }
 
@@ -3064,6 +3307,7 @@ impl ServerImpl {
                 handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_redrives: Arc::new(AtomicU64::new(0)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -5789,9 +6033,11 @@ impl SpillConfig {
     /// Installs the configured spill tiers onto `journal`. Idempotent per
     /// journal; call once per engine actor at construction.
     fn apply(&self, journal: &mut Journal) {
-        // #1384: under Raft, command-path orphan quarantines run inside
-        // state-machine application and must not raise a non-deterministic
-        // incident — observe only.
+        // #1384/#1447: under Raft, command-path orphan quarantines run inside
+        // state-machine application and never raise a non-deterministic
+        // incident inline — they are handed to the leader-propose channel the
+        // replication layer wires (`set_orphan_sink`) so the leader re-proposes
+        // them with a replicated timestamp.
         journal.set_replicated_apply(raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
@@ -6123,6 +6369,33 @@ struct CreatedInstanceDirect {
     commit: Commit,
 }
 
+/// What a detached create owner needs from a successfully applied create: the
+/// cross-partition follow-ups to route and the commit that gates them (#1582).
+/// Implemented by every create-path outcome type so
+/// [`ServerImpl::submit_create_detached`] can own submission → durability →
+/// routing for all of them. The commit is CONSUMED (it is a single-use
+/// durability handle, not `Clone`), so the outcome is returned with the commit
+/// taken out — after the owner has waited on it, only the already-durable
+/// projection remains for the caller.
+trait CreateOutcome {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit);
+}
+
+impl CreateOutcome for CreatedInstanceDirect {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        (
+            std::mem::take(&mut self.routable),
+            std::mem::replace(&mut self.commit, Commit::ready()),
+        )
+    }
+}
+
+impl CreateOutcome for (String, CreatedInstanceDirect) {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        self.1.take_routing_parts()
+    }
+}
+
 /// The ONE place the non-Raft (single-node) instance-creation handlers may apply
 /// a `CreateInstance` command directly on the engine: apply `command` on the
 /// create actor's `journal` and project the common post-apply fields. Confining
@@ -6189,7 +6462,7 @@ fn apply_create_instance_direct(
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
-    async fn create_process_instance_impl(
+    pub(crate) async fn create_process_instance_impl(
         &self,
         body: &models::ProcessInstanceCreationInstruction,
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
@@ -6430,7 +6703,6 @@ impl ServerImpl {
         // → applied), not the later `awaitCompletion` wait, so the backpressure
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
 
         // Cluster-wide create placement (stage 1): round-robin across EVERY
         // partition in the cluster so a single gateway drives the whole cluster.
@@ -6504,84 +6776,83 @@ impl ServerImpl {
         // command completes (the closure moves them).
         let tags_for_response = tags_vec.clone();
         let business_id_for_response = business_id_str.clone();
-        let outcome: Result<CreateOk, Box<Resp>> = {
+        // The actor round-trip, commit wait, and commit-gated routing all run
+        // inside ONE detached owner task (#1582): the engine actor executes a
+        // queued command even after its reply receiver is dropped, so awaiting
+        // the actor inline left a window where a cancelled caller persisted an
+        // instance whose cross-partition follow-ups nobody routed. The detached
+        // task owns the outcome end to end; awaiting the receiver here only
+        // OBSERVES it.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    // Resolve the version selector to a concrete process id +
-                    // (key | version). A by-key request is matched across all
-                    // retained versions; an unknown key is a 400 (the create
-                    // endpoint has no 404 variant).
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, by_version) {
-                            Ok(t) => t,
-                            Err((code, detail)) => {
-                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
-                                    problem("Process not found", code, detail),
-                                )));
-                            }
-                        };
-
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags_vec,
-                            business_id_str,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
-                            Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Process not found",
-                                400,
-                                format!("No deployed process with id '{process_id}'."),
-                            )),
-                        )),
-                        Err(e) => Err(Box::new(
-                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                problem("Internal error", 500, e.to_string()),
-                            ),
-                        )),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582): it stays charged until the actor finishes the create,
+            // even if this caller is cancelled first.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                // Resolve the version selector to a concrete process id +
+                // (key | version). A by-key request is matched across all
+                // retained versions; an unknown key is a 400 (the create
+                // endpoint has no 404 variant).
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, by_version)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags_vec,
+                        business_id_str,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await
         };
 
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            match outcome {
-                Ok(fields) => fields,
-                Err(resp) => return Ok(*resp),
-            };
+        let (process_id, created) = match created {
+            Ok(fields) => fields,
+            Err((code, detail)) => {
+                return Ok(if code == 400 {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Process not found",
+                        code,
+                        detail,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        code,
+                        detail,
+                    ))
+                });
+            }
+        };
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
 
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // Block on durability before acknowledging: a returned 200 means the
-        // create is fsynced.
-        commit.wait().await;
-        // The instance may have parked on an off-partition message catch: route
-        // the subscription open to its canonical partition (no-op single-node).
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
-        // Starting an instance parks it on its first service task, so new jobs
-        // may now be activatable: wake any long-pollers.
+        // The detached owner blocked on durability AND drove the cross-partition
+        // routing pump before answering (#1582): a returned 200 means the create
+        // is fsynced and a publish issued now finds the subscription open (the
+        // create-then-publish ordering clients rely on); cancelling this handler
+        // at any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -7175,7 +7446,7 @@ impl ServerImpl {
             );
         }
         let (engine_meta, result) = self
-            .apply_job_command_direct_with(job_key, command, move |engine| {
+            .apply_job_command_direct_with(job_key, command, None, move |engine| {
                 // Capture the job's type/worker authoritatively from engine state
                 // *before* the completion drops the activation, so the
                 // job-statistics attribution is race-free (the read model is
@@ -7380,6 +7651,7 @@ impl ServerImpl {
                     Command::fail_job(job_key, retries, error_message),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -7585,6 +7857,7 @@ impl ServerImpl {
                     ),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -8209,15 +8482,17 @@ impl ServerImpl {
             job_key,
             retries,
             timeout,
-            operation_reference,
             lease_token,
         };
         let commit = if self.raft.is_empty() {
-            let result = self.apply_job_command_direct(job_key, command).await;
+            let result = self
+                .apply_job_command_direct_ref(job_key, command, operation_reference)
+                .await;
             Self::map_job_events(result)?.1
         } else {
             // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false).await?
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
+                .await?
         };
         commit.wait().await;
         self.signal_jobs_available();
@@ -8516,11 +8791,14 @@ impl ServerImpl {
             };
         }
 
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        match self.apply_partition_command(incident_key, command).await {
+        match self
+            .apply_partition_command_ref(
+                incident_key,
+                Command::resolve_incident(incident_key),
+                operation_reference,
+            )
+            .await
+        {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -8660,7 +8938,7 @@ impl ServerImpl {
         }
     }
 
-    async fn resolve_incident_impl(
+    pub(crate) async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
         body: &Option<models::IncidentResolutionRequest>,
@@ -8782,7 +9060,7 @@ impl ServerImpl {
         )
     }
 
-    async fn get_process_instance_impl(
+    pub(crate) async fn get_process_instance_impl(
         &self,
         path_params: &models::GetProcessInstancePathParams,
     ) -> Result<apis::process_instance::GetProcessInstanceResponse, ()> {
@@ -8855,7 +9133,7 @@ impl ServerImpl {
     /// on every node). Only the latest version per process id is retained, so an
     /// older version's key yields 404. A definition built programmatically (no
     /// source XML) is reported as 204.
-    async fn get_process_definition_xml_impl(
+    pub(crate) async fn get_process_definition_xml_impl(
         &self,
         path_params: &models::GetProcessDefinitionXmlPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionXmlResponse, ()> {
@@ -8902,7 +9180,7 @@ impl ServerImpl {
     /// RF>1 are reported as `follower`. `replication_factor` is the cluster's
     /// `effective_rf()`. A single-node cluster reports one broker leading every
     /// partition at RF=1.
-    async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
+    pub(crate) async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
         let version = env!("NANOBPM_VERSION").to_string();
@@ -9372,30 +9650,104 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
+    ///
+    /// **Uncancellable (#1582).** Every caller reaches this only AFTER the source
+    /// command committed, so the routing it performs is post-commit work that a
+    /// caller-side timeout / dropped request future must never abort — a lost
+    /// follow-up would otherwise be unrecoverable (the retried parent is deduped
+    /// to a no-op). The pump therefore runs as a detached task; awaiting it only
+    /// observes completion, and dropping the await leaves it running.
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
-        let num_partitions = self.engine.topology().num_partitions;
-        if num_partitions <= 1 {
+        if self.engine.topology().num_partitions <= 1 {
             return;
         }
+        let server = self.clone();
+        let pump = tokio::spawn(async move { server.drive_subscription_routing_now(events).await });
+        if let Err(e) = pump.await {
+            tracing::warn!("subscription routing pump task failed: {e}");
+        }
+    }
+
+    /// Routes follow-ups of a routed apply that committed AFTER its observer
+    /// gave up (#1582). A plain fn returning a boxed `dyn Send` future (not an
+    /// `async fn`) so the recursion pump → apply funnel → pump has a concrete
+    /// type and does not form an opaque-type cycle.
+    fn route_late_follow_ups(
+        &self,
+        events: Vec<Event>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let server = self.clone();
+        Box::pin(async move { server.drive_subscription_routing(events).await })
+    }
+
+    /// The routing pump body behind [`Self::drive_subscription_routing`]; only
+    /// ever run inside that detached task.
+    async fn drive_subscription_routing_now(&self, events: Vec<Event>) {
+        let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            match self.apply_routed_command(target, command).await {
-                RoutedApply::Applied(produced) => work.extend(produced),
-                RoutedApply::NotHere => {
-                    // The target partition is owned (led, under Raft) by a peer:
-                    // forward the source event so that node applies it (and
-                    // drives any further routing) through its own write path.
-                    self.forward_route_subscription(target, event).await;
-                }
-                RoutedApply::Failed(status, message) => {
-                    tracing::warn!(
-                        "subscription routing on partition {target} failed ({status}): {message}"
-                    );
-                }
+            work.extend(self.route_with_redrive(target, command, event).await);
+        }
+    }
+
+    /// Delivers one routed follow-up to partition `target` with a **bounded
+    /// re-drive** (#1582): each attempt re-resolves the writer — applying
+    /// locally when this node leads `target` (the produced follow-ups are
+    /// returned for the pump to continue), or forwarding the source `event` to
+    /// the current leader otherwise. A transient non-delivery (no reachable
+    /// leader, link down, timeout, a 503 leader race, any 5xx) is retried with
+    /// backoff per [`ROUTE_REDRIVE`]; a 4xx is a permanent rejection and stops.
+    /// Re-delivery is safe: routed deliveries carry stable source-minted keys the
+    /// recipient dedups on (#1568), so a retry of an attempt whose reply was lost
+    /// is a no-op.
+    async fn route_with_redrive(&self, target: u64, command: Command, event: Event) -> Vec<Event> {
+        let mut last = String::new();
+        // An unkeyed (zero / legacy) routed command has no dedup, so a retry
+        // after an ambiguous outcome could apply it twice: deliver it at most
+        // once (#1582).
+        let max_attempts = Self::redrive_attempts(&command);
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                self.route_redrives.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
             }
+            let outcome = match self.apply_routed_command(target, command.clone()).await {
+                RoutedApply::Applied(produced) => return produced,
+                RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
+                // Led by a peer (or a leadership gap): forward to the current
+                // writer, re-resolved on every attempt.
+                RoutedApply::NotHere => {
+                    self.forward_route_subscription(target, &event, attempt)
+                        .await
+                }
+            };
+            match outcome {
+                RouteAttempt::Delivered => return Vec::new(),
+                RouteAttempt::Rejected(status, message) => {
+                    tracing::warn!(
+                        "subscription routing on partition {target} rejected ({status}): {message}"
+                    );
+                    return Vec::new();
+                }
+                RouteAttempt::Transient(reason) => last = reason,
+            }
+        }
+        tracing::warn!(
+            "subscription routing on partition {target} not delivered after {max_attempts} attempts: {last}"
+        );
+        Vec::new()
+    }
+
+    /// How many delivery attempts the re-drive may make for `command`: the
+    /// bounded budget for keyed (deduped) commands, exactly one otherwise.
+    fn redrive_attempts(command: &Command) -> u32 {
+        if Self::routed_command_is_idempotent(command) {
+            ROUTE_REDRIVE.max_attempts
+        } else {
+            1
         }
     }
 
@@ -9414,6 +9766,7 @@ impl ServerImpl {
                 message_name,
                 correlation_key,
                 kind,
+                delivery_key,
             } => {
                 let target =
                     nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions);
@@ -9425,6 +9778,7 @@ impl ServerImpl {
                     message_name: message_name.clone(),
                     correlation_key: correlation_key.clone(),
                     kind: kind.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9436,6 +9790,7 @@ impl ServerImpl {
                 element_id,
                 kind,
                 variables,
+                delivery_key,
             } => {
                 let target = nanobpmn_engine_core::partition_of(*instance_key);
                 let command = Command::CorrelateMessageSubscription {
@@ -9446,6 +9801,7 @@ impl ServerImpl {
                     element_id: element_id.clone(),
                     kind: kind.clone(),
                     variables: variables.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9455,6 +9811,7 @@ impl ServerImpl {
                 element_instance_key,
                 element_id,
                 correlation_key,
+                delivery_key,
                 ..
             } => {
                 let target =
@@ -9464,6 +9821,7 @@ impl ServerImpl {
                     instance_key: *instance_key,
                     element_instance_key: *element_instance_key,
                     element_id: element_id.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((target, command))
             }
@@ -9475,6 +9833,7 @@ impl ServerImpl {
                 business_id,
                 target_partition,
                 message_start,
+                delivery_key,
             } => {
                 let command = Command::DispatchStartInstance {
                     process_id: process_id.clone(),
@@ -9483,6 +9842,7 @@ impl ServerImpl {
                     tags: tags.clone(),
                     business_id: business_id.clone(),
                     message_start: message_start.clone(),
+                    delivery_key: *delivery_key,
                 };
                 Some((*target_partition, command))
             }
@@ -9501,6 +9861,68 @@ impl ServerImpl {
             .and_then(|part| part.raft.metrics().borrow().current_leader)
             .and_then(|leader| u32::try_from(leader).ok())
             .unwrap_or_else(|| topology.owner_of(p))
+    }
+
+    /// The node a routed-forward `attempt` addresses for partition `p` (#1582).
+    /// When this node hosts a replica of `p` it knows the elected leader, so that
+    /// is used ([`Self::partition_write_node`]). A source hosting NO replica of
+    /// `p` has no leadership view and would otherwise only ever retry the static
+    /// owner — a dead or former leader after failover — so it rotates through
+    /// `p`'s replica set across attempts instead: a non-leader replica answers
+    /// `503` and the next attempt tries the next replica, reaching the
+    /// replacement leader within one pass of the set.
+    fn route_forward_candidate(&self, p: u64, attempt: u32) -> u32 {
+        if self.raft.is_empty() || self.raft.get(p).is_some() {
+            return self.partition_write_node(p);
+        }
+        let topology = self.engine.topology();
+        Self::rotate_replica(&topology.replicas_of(p), topology.node_id, attempt)
+            .unwrap_or_else(|| topology.owner_of(p))
+    }
+
+    /// Pure rotation behind [`Self::route_forward_candidate`]: the
+    /// `attempt`-th replica (mod the set), skipping `self_id`.
+    fn rotate_replica(replicas: &[u32], self_id: u32, attempt: u32) -> Option<u32> {
+        let others: Vec<u32> = replicas.iter().copied().filter(|n| *n != self_id).collect();
+        if others.is_empty() {
+            return None;
+        }
+        others.get(attempt as usize % others.len()).copied()
+    }
+
+    /// Whether a routed command dedups on a source-minted key, so a retry after
+    /// an unobserved commit is an exactly-once no-op (#1568). Only such
+    /// commands may have their proposal observation time out (#1582).
+    /// A zero key is the legacy "no dedup" sentinel the engine skips, so it
+    /// is NOT idempotent — the single source of truth is
+    /// [`Command::routed_delivery_key`].
+    fn routed_command_is_idempotent(command: &Command) -> bool {
+        command.routed_delivery_key().is_some()
+    }
+
+    /// Removes the routable follow-ups from a proposal result whose detached
+    /// proposer owns their routing (#1582), so the observer never re-routes them.
+    fn strip_routable(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> Result<crate::raft::ReplicatedItem, crate::raft::ProposeError> {
+        result.map(|mut item| {
+            item.events.retain(|e| !Self::is_routable_event(e));
+            item
+        })
+    }
+
+    /// Classifies a Raft proposal result into a [`RoutedApply`].
+    fn classify_proposal(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> RoutedApply {
+        match result {
+            Ok(item) => match item.error {
+                Some((status, message)) => RoutedApply::Failed(status, message),
+                None => RoutedApply::Applied(item.events),
+            },
+            Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
+            Err(other) => RoutedApply::Failed(500, other.to_string()),
+        }
     }
 
     /// THE single apply funnel for the cross-partition routing pump
@@ -9523,13 +9945,64 @@ impl ServerImpl {
             if part.raft.metrics().borrow().current_leader != Some(node_id) {
                 return RoutedApply::NotHere;
             }
-            return match part.propose_result(command, now_millis()).await {
-                Ok(item) => match item.error {
-                    Some((status, message)) => RoutedApply::Failed(status, message),
-                    None => RoutedApply::Applied(item.events),
-                },
-                Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
-                Err(other) => RoutedApply::Failed(500, other.to_string()),
+            // Bound OBSERVATION of the local proposal (#1582): a node that still
+            // reports itself leader but has lost quorum can keep `client_write`
+            // pending indefinitely, and the routing pump's callers include the
+            // clock loop — an unbounded await there blocks later timer and
+            // lease sweeps. The proposal is detached so the write itself keeps
+            // its apply result and completes independently; only this attempt's
+            // OBSERVATION times out. A timeout is transient (the re-drive
+            // retries), and the routed command carries a source-minted delivery
+            // key the apply dedups on (#1568), so a retry after the write in
+            // fact committed is an exactly-once no-op — timing out can never
+            // discard the follow-ups of a later-committed apply.
+            // An unkeyed publish (`CorrelateMessage`) has no dedup: a retry
+            // after a late commit would mint a second message key / start a
+            // duplicate instance, so its outcome must be observed, never
+            // timed out into a retryable non-delivery (#1582).
+            if !Self::routed_command_is_idempotent(&command) {
+                return Self::classify_proposal(part.propose_result(command, now_millis()).await);
+            }
+            // Exactly ONE routing owner for the produced follow-ups: the
+            // detached task ALWAYS routes them itself, whether or not the
+            // observer is still listening — a send that races the observer's
+            // timeout can otherwise be dropped unread with its follow-ups
+            // (#1582).
+            //
+            // The observer is answered FIRST (with the routable follow-ups
+            // stripped, so it never re-routes them), and ONLY THEN does this task
+            // drive the routing pump. Routing-before-answer would self-deadlock:
+            // a routed correlation can advance the instance to ANOTHER catch whose
+            // open routes BACK to this same partition/leader, and that re-entrant
+            // `apply_routed_command` cannot commit while this proposal's detached
+            // task is still parked awaiting the routing it is part of. Answering
+            // first frees the proposal, so the chained open commits and the pump
+            // completes (#1582). A routed follow-up is keyed and deduped (#1568),
+            // so a later publish re-driving it is an exactly-once no-op.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let result = part.propose_result(command, now_millis()).await;
+                let follow_ups = match &result {
+                    Ok(item) if item.error.is_none() => Self::routable_events(&item.events),
+                    _ => Vec::new(),
+                };
+                let _ = tx.send(Self::strip_routable(result));
+                if !follow_ups.is_empty() {
+                    server.route_late_follow_ups(follow_ups).await;
+                    server.signal_jobs_available();
+                }
+            });
+            return match tokio::time::timeout(ROUTE_ATTEMPT_OBSERVE, rx).await {
+                Ok(Ok(result)) => Self::classify_proposal(result),
+                Ok(Err(_)) => RoutedApply::Failed(500, "raft proposal task ended".into()),
+                Err(_) => RoutedApply::Failed(
+                    503,
+                    format!(
+                        "partition {target} local proposal not observed within {:?}",
+                        ROUTE_ATTEMPT_OBSERVE
+                    ),
+                ),
             };
         }
         let Some(handle) = self.engine.local_for_partition(target) else {
@@ -9543,7 +10016,11 @@ impl ServerImpl {
                 },
             )
             .await;
-        commit.wait().await;
+        // Only a durable apply counts as delivered: its follow-ups are routed
+        // onward with keys peers dedup on, so they must never outrun it (#1582).
+        if !commit.wait_durable().await {
+            return RoutedApply::Failed(503, format!("partition {target} write not durable"));
+        }
         match result {
             Ok(events) => RoutedApply::Applied(events.iter().cloned().collect()),
             Err(error) => {
@@ -9553,44 +10030,86 @@ impl ServerImpl {
         }
     }
 
-    /// Forwards a cross-partition subscription follow-up `event` to the peer that
-    /// owns `target_partition`, over the Falcon protocol. The owner applies it and
-    /// drives its own pump for any further follow-ups. Best-effort: a delivery
-    /// failure is logged and dropped (idempotent — the source command re-emits the
-    /// event on replay; at RF=1 a lost open just leaves the instance parked until
-    /// a retry/restart re-routes it).
-    async fn forward_route_subscription(&self, target_partition: u64, event: Event) {
-        let owner = self.partition_write_node(target_partition);
+    /// ONE forwarding attempt of a cross-partition subscription follow-up
+    /// `event` to the node currently writing `target_partition`, over the Falcon
+    /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
+    /// it and drives its own pump for any further follow-ups.
+    async fn forward_route_subscription(
+        &self,
+        target_partition: u64,
+        event: &Event,
+        attempt: u32,
+    ) -> RouteAttempt {
+        let owner = self.route_forward_candidate(target_partition, attempt);
         if owner == self.engine.topology().node_id {
             // No peer to hand it to: this node is the best-known writer but does
             // not lead the partition right now (a leadership gap). Never apply
-            // around the log; the source command re-emits the event on replay.
-            tracing::warn!(
-                "subscription routing: partition {target_partition} has no reachable leader; dropped"
-            );
-            return;
+            // around the log — wait for an election and re-resolve.
+            return RouteAttempt::Transient(format!(
+                "partition {target_partition} has no reachable leader"
+            ));
         }
-        match self.peers.link(owner).await {
-            Ok(link) => {
-                if let Err(e) = link.route_subscription(event).await {
-                    tracing::warn!(
-                        "subscription routing to node {owner} (partition {target_partition}) failed: {e}"
-                    );
+        // ONE absolute deadline covers link acquisition (dial lock + connect)
+        // AND the request, so a stalled dial can never stretch an attempt past
+        // the fast write-forward budget and stall the re-drive / clock loop.
+        // The link this attempt used, recorded so an OUTER-deadline expiry can
+        // evict exactly it: the outer timeout can cancel a stalled request
+        // before its own error branch runs, and a connected-but-stalled link
+        // left cached would be reused by every remaining attempt.
+        let mut used: Option<nano_server_raft::peer::PeerLink> = None;
+        let attempt = async {
+            let link = match self.peers.link(owner).await {
+                Ok(link) => link,
+                Err(e) => {
+                    return RouteAttempt::Transient(format!(
+                        "node {owner} (partition {target_partition}) unreachable: {e}"
+                    ));
                 }
+            };
+            used = Some(link.clone());
+            let result = link.route_subscription(event.clone()).await;
+            if result.is_err() {
+                // A dead/stalled link: drop it so the next attempt redials.
+                self.peers.drop_link_if_same(owner, &link).await;
             }
-            Err(e) => tracing::warn!(
-                "subscription routing: node {owner} (partition {target_partition}) unreachable: {e}"
-            ),
+            RouteAttempt::from_peer(result)
+        };
+        let outcome = tokio::time::timeout(write_forward_timeout(), attempt).await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                if let Some(link) = used.as_ref() {
+                    self.peers.drop_link_if_same(owner, link).await;
+                }
+                RouteAttempt::Transient(format!(
+                    "node {owner} (partition {target_partition}) forward attempt exceeded {:?}",
+                    write_forward_timeout()
+                ))
+            }
         }
     }
 
-    /// Peer-side handler for a forwarded subscription follow-up: the owning node
-    /// drives its own pump for `event` (it now owns the target partition, so the
-    /// apply is local), recursing into any further cross-node follow-ups. Wakes
-    /// pollers in case the correlation advanced a token onto a service task.
-    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) {
-        self.drive_subscription_routing(vec![event]).await;
-        self.signal_jobs_available();
+    /// Peer-side handler for a forwarded subscription follow-up: applies the
+    /// routed command on `event`'s target partition **once** (no re-forward — a
+    /// node that does not lead the target answers `503` and the source re-drives
+    /// against the re-resolved leader, #1582), then drives its own pump for any
+    /// follow-ups the apply produced. Returns the status the source classifies
+    /// (`200` delivered, `503` not the leader, otherwise the apply's status).
+    /// Wakes pollers in case the correlation advanced a token onto a service task.
+    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) -> (u16, String) {
+        let num_partitions = self.engine.topology().num_partitions;
+        let Some((target, command)) = Self::route_event(&event, num_partitions) else {
+            return (400, "event is not a routable subscription follow-up".into());
+        };
+        match self.apply_routed_command(target, command).await {
+            RoutedApply::Applied(produced) => {
+                self.drive_subscription_routing(produced).await;
+                self.signal_jobs_available();
+                (200, String::new())
+            }
+            RoutedApply::NotHere => (503, format!("not the leader of partition {target}; retry")),
+            RoutedApply::Failed(status, message) => (status, message),
+        }
     }
 
     /// Spawns cross-partition subscription routing for the follow-ups carried in
@@ -9625,6 +10144,169 @@ impl ServerImpl {
         tokio::spawn(async move {
             server.drive_subscription_routing(routable).await;
         });
+    }
+
+    /// Like [`Self::spawn_routing_if_needed`] but for a source write that is NOT
+    /// yet durable (the pipelined non-Raft stream path acks before fsync):
+    /// routing is gated on the source commit becoming durable (#1582). Routed
+    /// deliveries carry source-minted keys the peer durably dedups on, so
+    /// forwarding before the source persisted could let a peer record a close
+    /// identity the source then loses in a crash — after restart the key is
+    /// reused and the real delivery silently deduped away. Returns the commit the
+    /// caller awaits (same outcome as `commit`) plus the gated routing task,
+    /// which resolves to whether routing ran.
+    fn route_after_durable(
+        &self,
+        events: &[Event],
+        commit: Commit,
+    ) -> (Commit, Option<tokio::task::JoinHandle<bool>>) {
+        if self.engine.topology().num_partitions <= 1
+            || !Self::has_routable_subscription_events(events)
+        {
+            return (commit, None);
+        }
+        let routable = Self::routable_events(events);
+        let (caller, gate) = commit.tee();
+        let server = self.clone();
+        let task = tokio::spawn(async move {
+            if !gate.wait_durable().await {
+                tracing::warn!(
+                    "subscription routing withheld: the source write never became durable"
+                );
+                return false;
+            }
+            server.drive_subscription_routing(routable).await;
+            true
+        });
+        (caller, Some(task))
+    }
+
+    /// Cancellation-safe create submission (#1582): the create command's actor
+    /// round-trip, commit wait, and commit-gated routing all run inside ONE
+    /// detached owner task. The engine actor executes a queued command even
+    /// after its reply receiver is dropped, so awaiting the actor inline left a
+    /// window where a cancelled caller could persist an instance whose
+    /// cross-partition follow-ups nobody ever routed. Here the detached task
+    /// owns the outcome end to end: it submits `apply` at create priority,
+    /// gates routing on durability exactly as [`Self::route_after_durable`]
+    /// does (a write that never persists routes nothing), drives the routing
+    /// pump, and only then delivers the projected outcome over the returned
+    /// oneshot. The caller merely OBSERVES the outcome; cancelling that
+    /// observation strands nothing.
+    ///
+    /// The answer is sent only AFTER the routing pump has driven the
+    /// cross-partition subscription follow-ups: clients rely on the
+    /// create-then-publish ordering `main` has always given — a publish issued
+    /// the moment the create returns must find the subscription already open,
+    /// or the unmatched message is discarded and the instance stays parked
+    /// (#1582). The cost of that guarantee is bounded: a stalled subscription
+    /// target can delay the create response by at most the bounded re-drive
+    /// budget ([`ROUTE_REDRIVE`]: 16 attempts of exponential backoff capped at
+    /// 1s, plus the per-attempt forward deadline), never indefinitely. Routing
+    /// still completes when the caller has gone away: a dropped receiver
+    /// (caller cancelled) leaves this task running to completion, exactly as
+    /// [`Self::raft_create_core`] routes after Raft commit. The latency-optimal
+    /// alternative — answer at commit and gate publications on pending
+    /// subscription opens — is tracked as #1604.
+    ///
+    /// `accounting` is the admission charge (processing slot + payload bytes)
+    /// entered on the caller before submission; it is MOVED in here and held
+    /// until the actor round-trip resolves, so a cancelled caller cannot
+    /// release the charge while its create is still queued on the actor —
+    /// otherwise repeated cancelled requests would undercount the
+    /// `admission_shed` watermarks and bypass the memory limit (#1582).
+    ///
+    /// The pre-checks (shed gates, selector resolution) run on the caller
+    /// before submission, so a rejected create is never queued; a dead engine
+    /// actor answers the receiver with `None` (the closed mailbox drops the
+    /// job's reply sender), which the caller maps to a 500 instead of hanging.
+    /// A create whose write never became durable is answered as a 500 too:
+    /// acknowledging it would hand back an instance that disappears on restart.
+    fn submit_create_detached<F, T>(
+        &self,
+        accounting: CreateAccounting,
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
+        let engine = self.engine.for_create().clone();
+        self.submit_create_detached_on(accounting, engine, apply)
+    }
+
+    /// [`Self::submit_create_detached`] onto a caller-chosen create actor.
+    /// Production picks the actor via `for_create()` (round-robin); the
+    /// partition-pinned form exists so a test can park a barrier on the SAME
+    /// partition the create will land on, deterministically ordering the create
+    /// behind the barrier on that actor's queue.
+    fn submit_create_detached_on<F, T>(
+        &self,
+        accounting: CreateAccounting,
+        engine: DeepthiHandle,
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
+        let server = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut outcome = engine.with_low(apply).await;
+            // The actor has finished with the create (applied or rejected), so
+            // its payload is no longer resident in the creation mailbox: the
+            // admission charge is released here, not when the caller leaves.
+            drop(accounting);
+            if let Ok(created) = &mut outcome {
+                let (routable, commit) = created.take_routing_parts();
+                if !commit.wait_durable().await {
+                    // The write never persisted (writer gone unacked): route
+                    // nothing — the peer would durably record a delivery
+                    // identity the source then loses (#1582) — and do NOT
+                    // acknowledge the create: the instance would disappear on
+                    // restart, so the caller must see a retryable error.
+                    tracing::warn!(
+                        "create not acknowledged: the source write never became durable"
+                    );
+                    let _ = tx.send(Err((
+                        500,
+                        "the create was not persisted durably; retry".to_string(),
+                    )));
+                    return;
+                }
+                // Route the follow-ups FIRST, then answer: a publish issued the
+                // moment the create returns must find the subscription already
+                // open (the create-then-publish ordering clients rely on,
+                // #1582). The wait is bounded by the re-drive budget, and a
+                // dropped receiver (caller cancelled) is fine: routing already
+                // ran to completion inside this detached task.
+                server.drive_subscription_routing(routable).await;
+                server.signal_jobs_available();
+                let _ = tx.send(outcome);
+                return;
+            }
+            // A dropped receiver (caller cancelled) is fine; the apply already
+            // ran to completion inside this task.
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    /// Observes a [`Self::submit_create_detached`] outcome, mapping a dead
+    /// engine actor (the oneshot resolves to `Err`) to a 500 rather than
+    /// hanging or panicking. Cancelling this await leaves the detached owner
+    /// running.
+    async fn observe_create<T>(
+        rx: tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>,
+    ) -> Result<T, (u16, String)> {
+        match rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err((
+                500,
+                "engine actor died while applying the create".to_string(),
+            )),
+        }
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -9671,19 +10353,19 @@ impl ServerImpl {
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_retries_with_ref(job_key, retries, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_retries(job_key, retries), lease_token);
         if !self.raft.is_empty() {
             // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9723,19 +10405,19 @@ impl ServerImpl {
         timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_timeout(job_key, timeout), lease_token);
         if !self.raft.is_empty() {
             // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9760,11 +10442,10 @@ impl ServerImpl {
         incident_key: u64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        let _ = self.apply_partition_command(incident_key, command).await?;
+        let command = Command::resolve_incident(incident_key);
+        let _ = self
+            .apply_partition_command_ref(incident_key, command, operation_reference)
+            .await?;
         self.signal_jobs_available();
         Ok(())
     }
@@ -10625,78 +11306,68 @@ impl ServerImpl {
         }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
         // Under Raft, a forwarded create must be REPLICATED through this node's
         // Raft log, not applied directly to the local engine — otherwise the
         // instance would not survive this node's failure. Route it through the
         // shared Raft create core (durability is awaited inside the propose, so
         // the returned commit is already ready).
-        let outcome: Result<CreateOk, (u16, String)> = if !self.raft.is_empty() {
-            self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
-                .await
-                .map(
-                    |(
-                        process_id,
-                        version,
-                        definition_key,
-                        instance_key,
-                        sync_completed,
-                        routable,
-                    )| {
-                        (
-                            process_id,
-                            version,
-                            definition_key,
-                            instance_key,
-                            sync_completed,
-                            routable,
-                            Commit::ready(),
-                        )
-                    },
-                )
+        let (process_id, created) = if !self.raft.is_empty() {
+            let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+                self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
+                    .await?;
+            (
+                process_id,
+                CreatedInstanceDirect {
+                    instance_key,
+                    definition_key,
+                    version,
+                    sync_completed,
+                    routable,
+                    commit: Commit::ready(),
+                },
+            )
         } else {
+            // The actor round-trip, commit wait, and commit-gated routing run
+            // inside ONE detached owner task (#1582): a caller cancelled while
+            // the actor still has the command queued must not strand a
+            // persisted create without its cross-partition routing. Awaiting
+            // the receiver here only OBSERVES the outcome.
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags,
-                            business_id,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await?
         };
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            outcome?;
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
         // Count the forwarded create exactly once, here at the committing owner,
         // under the ORIGINAL client transport (`origin_protocol`) rather than a
         // hardcoded "rest". The forwarding node deliberately does NOT record a
@@ -10704,10 +11375,12 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // The non-Raft branch's detached owner awaited durability AND drove the
+        // cross-partition routing pump before answering (#1582); under Raft the
+        // proposal is durable at commit and `raft_create_core` routes before
+        // answering too. Either way the create is committed and its
+        // subscriptions routed by the time we answer, so a publish issued right
+        // after finds them open.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -11078,8 +11751,43 @@ impl ServerImpl {
                         problem("Conflict", 409, peer_detail(&r)),
                     );
                 }
-                // Transient (peer 5xx, timeout, closed): re-resolve leader & retry.
+                // The link closed (or was retired after an unrelated routing
+                // timeout) AFTER the create was sent: the peer may already have
+                // committed it. Without a business id a retry is not
+                // idempotent and could mint a duplicate instance, so surface
+                // the ambiguous outcome instead of re-driving (#1582).
+                Ok(r)
+                    if business_id.is_none()
+                        && nano_server_raft::peer::is_link_closed_result(&r) =>
+                {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        "the peer link closed before the forwarded create was acknowledged; its outcome is unknown, so it was not retried".into(),
+                    ));
+                }
+                // Transient peer 5xx (not link-closed, handled above): re-resolve
+                // the leader & retry.
                 Ok(r) => last_detail = peer_detail(&r),
+                // A transport error (timeout / closed) AFTER the create may have
+                // been sent is ambiguous — the peer may already have committed it.
+                // Without a business id a retry is not idempotent and could mint a
+                // duplicate instance, so surface the ambiguous outcome instead of
+                // re-driving (#1582). This mirrors the link-closed guard above and
+                // the REST path ([`forward_create_once`]), which already refuses to
+                // reroute a transport-errored create. A create WITH a business id
+                // dedups on retry, so it stays retryable.
+                Err(e) if business_id.is_none() => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem(
+                            "Peer error",
+                            500,
+                            format!(
+                                "the forwarded create's outcome is unknown ({e}); it was not retried, so no duplicate instance is minted"
+                            ),
+                        ),
+                    );
+                }
                 Err(e) => last_detail = e.to_string(),
             }
 
@@ -11224,7 +11932,7 @@ impl ServerImpl {
         }
     }
 
-    async fn get_incident_impl(
+    pub(crate) async fn get_incident_impl(
         &self,
         path_params: &models::GetIncidentPathParams,
     ) -> Result<apis::incident::GetIncidentResponse, ()> {
@@ -11288,7 +11996,7 @@ impl ServerImpl {
         }
     }
 
-    async fn search_incidents_impl(
+    pub(crate) async fn search_incidents_impl(
         &self,
         body: &Option<models::IncidentSearchQuery>,
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
@@ -11304,35 +12012,7 @@ impl ServerImpl {
             .iter()
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -11448,35 +12128,7 @@ impl ServerImpl {
             .filter(|inc| contained.contains(&inc.element_instance_key))
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -12565,7 +13217,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_process_instances_impl(
+    pub(crate) async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
@@ -12610,6 +13262,18 @@ impl ServerImpl {
             _ => std::collections::HashMap::new(),
         };
 
+        // Pre-index the instance's element-instance / job / incident child rows
+        // only when an inherited cross-entity filter is actually present (same
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
+        let cross_index = match filter {
+            Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
+                f,
+                &InstanceCrossEntityIndex::sources_for(f, &self.store),
+            ),
+            _ => InstanceCrossEntityIndex::default(),
+        };
+
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
             .filter(|inst| match filter {
@@ -12637,6 +13301,23 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+                        // `suspendedDate`: read straight from the read-model's
+                        // `suspended_date_ms` (the single source of truth for
+                        // suspension) — a datetime while suspended, absent otherwise.
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Nano is single-tenant: every instance's `tenantId` is the
+                        // `<default>` constant, so honour the filter against it.
+                        && query::match_string(&f.tenant_id, "<default>")
+                        // `processDefinitionName` / `processDefinitionVersionTag` are
+                        // never projected (always null in `process_instance_result`),
+                        // so match against an absent value: equality / `$like` /
+                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
+                        // matches.
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
                         // Call-activity hierarchy filters (C8 parity, issue
                         // #977): a bare parent key enumerates the direct children
                         // of that instance; `$exists:false` selects top-level
@@ -12654,10 +13335,35 @@ impl ServerImpl {
                                 .map(|k| k.to_string())
                                 .as_deref(),
                         )
+                        // The read model does not project the definition's
+                        // display name or version tag onto the instance row, so
+                        // those filters match against an absent value — value
+                        // operators exclude (honest, never silently widening)
+                        // while `$exists: false` still matches (the `endDate`
+                        // convention above).
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.process_definition_version_tag, None)
+                        // `suspendedDate` is the nullable column the read model
+                        // maintains (the single source of truth for suspension).
+                        && query::match_date_time_ms(
+                            &f.suspended_date,
+                            inst.suspended_date_ms.map(|ms| ms as i64),
+                        )
+                        // Camunda's `tags` filter is a conjunction: an instance
+                        // must carry every listed tag.
+                        && f.tags.as_ref().is_none_or(|tags| {
+                            tags.iter().all(|t| inst.tags.contains(&t.0))
+                        })
                         && match_instance_variables(
                             &f.variables,
                             variables_index.get(&inst.key),
                         )
+                        && match_instance_tags(&f.tags, &inst.tags)
+                        // Inherited element / job / incident / batch-operation
+                        // filters (C8 parity): existential predicates over the
+                        // instance's child rows, evaluated against the
+                        // pre-indexed cross-entity index.
+                        && match_instance_cross_entity_filters(f, inst.key, &cross_index)
                 }
             })
             .collect();
@@ -12701,48 +13407,83 @@ impl ServerImpl {
 
     /// Searches open message subscriptions (Zeebe `searchMessageSubscriptions`).
     ///
-    /// Backed by the `message_subscriptions` read-model table, which retains only
-    /// *open*, instance-scoped subscriptions (a running element instance parked on
-    /// a message catch), dropped on correlate/cancel/terminate. Every retained row
-    /// therefore surfaces with `state = CREATED` and `type = PROCESS_EVENT`;
-    /// settled subscriptions and message-*start* (`START_EVENT`) subscriptions are
-    /// not materialised and so are not returned. Process-definition attributes are
-    /// resolved by joining each subscription's instance to `process_instances`.
+    /// Backed by two read-model tables:
+    /// * `message_subscriptions` retains only *open*, instance-scoped
+    ///   subscriptions (a running element instance parked on a message catch),
+    ///   dropped on correlate/cancel/terminate. Every retained row surfaces with
+    ///   `state = CREATED` and `type = PROCESS_EVENT`; settled subscriptions are
+    ///   not materialised and so are not returned. Process-definition attributes
+    ///   are resolved by joining each subscription's instance to
+    ///   `process_instances`.
+    /// * `message_start_subscriptions` (#1499) retains the definition-scoped
+    ///   message *start event* subscriptions, one per deployed start message.
+    ///   These surface with `type = START_EVENT`, a null `processInstanceKey` /
+    ///   `elementInstanceKey` / `correlationKey` (they are not bound to an
+    ///   instance), and the MCP tool metadata (`toolName` / `toolProperties`)
+    ///   the start event declared via `zeebe:properties` (`io.camunda.tool:*`).
     async fn search_message_subscriptions_impl(
         &self,
         body: &Option<models::MessageSubscriptionSearchQuery>,
     ) -> Result<apis::message_subscription::SearchMessageSubscriptionsResponse, ()> {
         use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
 
-        // Every open read-model subscription is a created, process-event catch.
         let state_str = models::MessageSubscriptionStateEnum::Created.to_string();
-        let type_str = models::MessageSubscriptionTypeEnum::ProcessEvent.to_string();
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let subs = self.store.message_subscriptions();
+        let start_subs = self.store.message_start_subscriptions();
 
-        // Resolve process-definition attributes by joining to the owning instance.
+        // Resolve process-definition attributes by joining to the owning instance
+        // (PROCESS_EVENT rows) or directly to the deployed definition
+        // (START_EVENT rows).
         let instances = self.store.process_instances();
         let by_instance: std::collections::HashMap<u64, &readstore::ProcessInstanceRow> =
             instances.iter().map(|inst| (inst.key, inst)).collect();
+        let definitions = self.store.process_definitions();
+        let by_definition_key: std::collections::HashMap<u64, &readstore::ProcessDefinitionRow> =
+            definitions.iter().map(|d| (d.key, d)).collect();
 
         struct MsgSubEntry {
             subscription_key: u64,
             process_definition_id: String,
             process_definition_key: Option<String>,
-            process_instance_key: u64,
+            /// `Some` for instance-scoped (`PROCESS_EVENT`) subscriptions; `None`
+            /// for definition-scoped (`START_EVENT`) ones.
+            process_instance_key: Option<u64>,
             element_id: String,
-            element_instance_key: u64,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT`.
+            element_instance_key: Option<u64>,
             last_updated_ms: u64,
             message_name: String,
-            correlation_key: String,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT` (a start
+            /// subscription correlates by message name only).
+            correlation_key: Option<String>,
             process_definition_version: Option<i32>,
             /// The owning instance's business id (joined, like the definition
             /// attributes): the single source for both filter and result.
+            /// `None` for `START_EVENT` rows (not bound to an instance).
             business_id: Option<String>,
+            /// The MCP tool name from the start event's `io.camunda.tool:name`
+            /// zeebe:property (#1499). `None` when the property is absent and on
+            /// `PROCESS_EVENT` rows.
+            tool_name: Option<String>,
+            /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+            /// Empty when none and on `PROCESS_EVENT` rows.
+            tool_properties: std::collections::HashMap<String, String>,
+            /// The Zeebe `messageSubscriptionType` of this row.
+            is_start_event: bool,
         }
+        // The Zeebe `messageSubscriptionType` string of a row: the single
+        // source for the filter and the sort.
+        let type_str = |e: &MsgSubEntry| {
+            if e.is_start_event {
+                models::MessageSubscriptionTypeEnum::StartEvent.to_string()
+            } else {
+                models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
+            }
+        };
 
-        let entries: Vec<MsgSubEntry> = subs
+        let mut entries: Vec<MsgSubEntry> = subs
             .into_iter()
             .filter_map(|sub| {
                 // Skip subscriptions whose owning instance is not yet projected
@@ -12757,20 +13498,51 @@ impl ServerImpl {
                     subscription_key: sub.subscription_key,
                     process_definition_id: inst.process_definition_id.clone(),
                     process_definition_key: Some(inst.process_definition_key.clone()),
-                    process_instance_key: sub.instance_key,
+                    process_instance_key: Some(sub.instance_key),
                     element_id: sub.element_id,
-                    element_instance_key: sub.element_instance_key,
+                    element_instance_key: Some(sub.element_instance_key),
                     last_updated_ms: sub.created_at_ms,
                     message_name: sub.message_name,
-                    correlation_key: sub.correlation_key,
+                    correlation_key: Some(sub.correlation_key),
                     process_definition_version: Some(inst.version),
                     business_id: sub.business_id,
+                    tool_name: None,
+                    tool_properties: std::collections::HashMap::new(),
+                    is_start_event: false,
                 })
             })
             .collect();
 
-        // All Zeebe `MessageSubscriptionFilter` fields are honoured. Fields Nano
-        // does not yet project (`processDefinitionName`, `toolName`,
+        // Definition-scoped message start event subscriptions (#1499). The
+        // subscription key is the read model's canonical derived key
+        // (`message_start_subscription_key`), unique per start event even when
+        // one definition declares several message starts.
+        entries.extend(start_subs.into_iter().filter_map(|sub| {
+            let def = by_definition_key.get(&sub.process_definition_key)?;
+            Some(MsgSubEntry {
+                subscription_key: sub.subscription_key,
+                process_definition_id: def.process_id.clone(),
+                process_definition_key: Some(sub.process_definition_key.to_string()),
+                process_instance_key: None,
+                element_id: sub.start_element_id,
+                element_instance_key: None,
+                last_updated_ms: sub.created_at_ms,
+                message_name: sub.message_name,
+                correlation_key: None,
+                process_definition_version: Some(def.version),
+                business_id: None,
+                tool_name: sub.tool_name,
+                tool_properties: serde_json::from_str(&sub.tool_properties).unwrap_or_default(),
+                is_start_event: true,
+            })
+        }));
+
+        // All Zeebe `MessageSubscriptionFilter` fields are honoured. `toolName`
+        // is projected for START_EVENT rows (the start event's
+        // `io.camunda.tool:name` zeebe:property, #1499) and absent elsewhere, so
+        // an equality/`$like` filter matches only tool-marked start
+        // subscriptions while `$exists: false` matches every row without a tool
+        // name. Fields Nano does not yet project (`processDefinitionName`,
         // `inboundConnectorType`) are matched against an absent value, so an
         // equality/`$like` filter on them correctly yields no rows (rather than
         // being silently ignored) while `$exists: false` still matches.
@@ -12779,6 +13551,7 @@ impl ServerImpl {
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
+                    let type_str = type_str(e);
                     query::match_message_subscription_key(
                         &f.message_subscription_key,
                         &e.subscription_key.to_string(),
@@ -12786,17 +13559,17 @@ impl ServerImpl {
                         &f.process_definition_key,
                         e.process_definition_key.as_deref().unwrap_or(""),
                     ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
-                        && query::match_process_instance_key(
+                        && query::match_process_instance_key_opt(
                             &f.process_instance_key,
-                            &e.process_instance_key.to_string(),
+                            e.process_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
-                        && query::match_element_instance_key(
+                        && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            &e.element_instance_key.to_string(),
+                            e.element_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.message_name, &e.message_name)
-                        && query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_string_opt(&f.correlation_key, e.correlation_key.as_deref())
                         && query::match_message_subscription_state(
                             &f.message_subscription_state,
                             &state_str,
@@ -12815,7 +13588,7 @@ impl ServerImpl {
                             Some(e.last_updated_ms as i64),
                         )
                         && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.tool_name, None)
+                        && query::match_string_opt(&f.tool_name, e.tool_name.as_deref())
                         && query::match_string_opt(&f.inbound_connector_type, None)
                         && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
@@ -12840,13 +13613,21 @@ impl ServerImpl {
                 "processDefinitionVersion" => {
                     query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
                 }
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
+                "processInstanceKey" => {
+                    query::SortVal::Num(e.process_instance_key.unwrap_or(0) as i64)
+                }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => {
+                    query::SortVal::Num(e.element_instance_key.unwrap_or(0) as i64)
+                }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
+                "correlationKey" => {
+                    query::SortVal::Str(e.correlation_key.clone().unwrap_or_default())
+                }
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
+                "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
+                "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -12878,26 +13659,42 @@ impl ServerImpl {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-                        e.process_instance_key.to_string(),
-                    )),
+                    process_instance_key: match e.process_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ProcessInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     root_process_instance_key: types::Nullable::Null,
                     element_id: e.element_id,
-                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-                        e.element_instance_key.to_string(),
-                    )),
+                    element_instance_key: match e.element_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ElementInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     message_subscription_state: models::MessageSubscriptionStateEnum::Created,
                     last_updated_date: last_updated,
                     message_name: e.message_name,
-                    correlation_key: types::Nullable::Present(e.correlation_key),
-                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    tool_properties: std::collections::HashMap::new(),
+                    correlation_key: match e.correlation_key {
+                        Some(k) => types::Nullable::Present(k),
+                        None => types::Nullable::Null,
+                    },
+                    message_subscription_type: if e.is_start_event {
+                        models::MessageSubscriptionTypeEnum::StartEvent
+                    } else {
+                        models::MessageSubscriptionTypeEnum::ProcessEvent
+                    },
+                    tool_properties: e.tool_properties,
                     process_definition_name: types::Nullable::Null,
                     process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    tool_name: types::Nullable::Null,
+                    tool_name: match e.tool_name {
+                        Some(name) => types::Nullable::Present(name),
+                        None => types::Nullable::Null,
+                    },
                     inbound_connector_type: types::Nullable::Null,
                     tenant_id: "<default>".to_string(),
                 }
@@ -13807,17 +14604,34 @@ impl ServerImpl {
         key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.apply_partition_command_ref(key, command, None).await
+    }
+
+    /// [`apply_partition_command`](Self::apply_partition_command) carrying the
+    /// caller's `operationReference` (#1556): the ONE by-key funnel through
+    /// which a REST request's reference reaches the engine seam, under Raft or
+    /// direct.
+    async fn apply_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         if !self.raft.is_empty() {
             // `propose_partition_command` already awaits the durable barrier and
             // drives routing / job-sojourn / ad-hoc side effects on the replicated
             // events, so callers must NOT repeat them. `false`: this generic funnel
             // must not record the stream-completion diagnostic (#1306).
-            return self.propose_partition_command(key, command, false).await;
+            return self
+                .propose_partition_command_ref(key, command, false, operation_reference)
+                .await;
         }
         let (events, commit) = self
             .engine
             .by_key(key)
-            .with(move |journal| journal.apply_command_at(command, now_millis()))
+            .with(move |journal| {
+                journal.apply_command_ref_at(command, now_millis(), operation_reference)
+            })
             .await
             .map_err(|error| crate::raft::engine_error_status(&error))?;
         // Mirror the Raft path: wait for durability, then route any
@@ -13854,7 +14668,19 @@ impl ServerImpl {
         job_key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
-        self.apply_job_command_direct_with(job_key, command, |_| ())
+        self.apply_job_command_direct_ref(job_key, command, None)
+            .await
+    }
+
+    /// [`apply_job_command_direct`](Self::apply_job_command_direct) carrying
+    /// the caller's `operationReference` (#1556).
+    async fn apply_job_command_direct_ref(
+        &self,
+        job_key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        self.apply_job_command_direct_with(job_key, command, operation_reference, |_| ())
             .await
             .1
     }
@@ -13870,6 +14696,7 @@ impl ServerImpl {
         &self,
         job_key: Key,
         command: Command,
+        operation_reference: Option<i64>,
         pre_apply: impl FnOnce(&mut Journal) -> M + Send + 'static,
     ) -> (
         M,
@@ -13882,7 +14709,10 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |journal| {
                 let meta = pre_apply(journal);
-                (meta, journal.apply_command_at(command, now_millis()))
+                (
+                    meta,
+                    journal.apply_command_ref_at(command, now_millis(), operation_reference),
+                )
             })
             .await
     }
@@ -14083,7 +14913,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_user_tasks_impl(
+    pub(crate) async fn search_user_tasks_impl(
         &self,
         body: &Option<models::UserTaskSearchQuery>,
     ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
@@ -14132,7 +14962,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn assign_user_task_impl(
+    pub(crate) async fn assign_user_task_impl(
         &self,
         path_params: &models::AssignUserTaskPathParams,
         body: &models::UserTaskAssignmentRequest,
@@ -14230,7 +15060,7 @@ impl ServerImpl {
         }
     }
 
-    async fn complete_user_task_impl(
+    pub(crate) async fn complete_user_task_impl(
         &self,
         path_params: &models::CompleteUserTaskPathParams,
         body: &Option<models::UserTaskCompletionRequest>,
@@ -14334,7 +15164,7 @@ impl ServerImpl {
     }
 
     /// Returns a single user task from the read model by key.
-    async fn get_user_task_impl(
+    pub(crate) async fn get_user_task_impl(
         &self,
         path_params: &models::GetUserTaskPathParams,
     ) -> Result<apis::user_task::GetUserTaskResponse, ()> {
@@ -14565,7 +15395,7 @@ impl ServerImpl {
     }
 
     /// Clears a user task's assignee.
-    async fn unassign_user_task_impl(
+    pub(crate) async fn unassign_user_task_impl(
         &self,
         path_params: &models::UnassignUserTaskPathParams,
     ) -> Result<apis::user_task::UnassignUserTaskResponse, ()> {
@@ -14781,7 +15611,7 @@ impl ServerImpl {
     /// `scopeKey` of the scope that holds it — the process instance for root-scope
     /// variables, or a sub-process / multi-instance body / child element instance
     /// for a nested scope (Part C hierarchical scoping).
-    async fn search_variables_impl(
+    pub(crate) async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,
         body: &Option<models::VariableSearchQuery>,
@@ -14849,7 +15679,7 @@ impl ServerImpl {
 
     /// Returns a single variable by its (read-model assigned) key, with its full
     /// untruncated value.
-    async fn get_variable_impl(
+    pub(crate) async fn get_variable_impl(
         &self,
         path_params: &models::GetVariablePathParams,
     ) -> Result<apis::variable::GetVariableResponse, ()> {
@@ -14914,7 +15744,7 @@ impl ServerImpl {
     /// process id is retained and searchable (Camunda/Zeebe parity); the
     /// `isLatestVersion` filter narrows to the highest version per id via the
     /// `is_latest` discriminator computed by the read store.
-    async fn search_process_definitions_impl(
+    pub(crate) async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
     ) -> Result<apis::process_definition::SearchProcessDefinitionsResponse, ()> {
@@ -15004,7 +15834,7 @@ impl ServerImpl {
     /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
     /// the latest — since every version is retained and independently
     /// addressable by key. A malformed or unknown key yields 404.
-    async fn get_process_definition_impl(
+    pub(crate) async fn get_process_definition_impl(
         &self,
         path_params: &models::GetProcessDefinitionPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
@@ -15390,7 +16220,7 @@ impl ServerImpl {
     /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     #[cfg(test)]
-    async fn deploy_resources_locally(
+    pub(crate) async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
@@ -18191,10 +19021,19 @@ impl ServerImpl {
             // Recover the COMPLETE locally owned set, then select `p`: a replay
             // migration rewrites the shared combined snapshot and prunes the
             // cold archive, so recovering only `[p]` would drop the sibling
-            // partitions' state and history (#1473).
+            // partitions' state and history (#1473). The pending-spill discard
+            // is scoped to `p` ALONE (#1575 review): only `p`'s engine is being
+            // replaced, so only its not-yet-checkpointed spill rows are stale —
+            // a healthy sibling's pending rows are its LIVE spilled payloads
+            // (the only copy rehydration reads) and must survive the repair.
             let owned = self.engine.topology().local_partitions();
-            let recovery =
-                seglog::recover_multi(&dir, &owned, num_partitions, varstore.as_deref())?;
+            let recovery = seglog::recover_multi_scoped(
+                &dir,
+                &owned,
+                num_partitions,
+                varstore.as_deref(),
+                &[p],
+            )?;
             let mut engines = recovery.engines;
             // Seed from the DURABLY recovered deployment owner (#1473).
             let seed = owned
@@ -19544,6 +20383,16 @@ impl ServerImpl {
         let Some(handle) = self.engine_handle_for(p) else {
             return (false, Vec::new());
         };
+        // Drain any off-heap orphans parked while this replica was a follower
+        // (#1447): each is re-proposed as a leader-stamped
+        // `QuarantineOffheapOrphan`, so a loss detected before promotion (or
+        // before the orphan sink was wired) still becomes a durable, replicated
+        // `VariablesLost` incident.
+        handle
+            .with(|journal| {
+                journal.drain_orphan_backlog();
+            })
+            .await;
         // One read on the leader: variable/cold spill + what (if anything) is due
         // now. Only the leader runs this gate; followers never propose, so safe.
         let (timers_due, jobs_due) = handle
@@ -19557,7 +20406,11 @@ impl ServerImpl {
                 journal.maybe_var_spill_pressure();
                 journal.maybe_cold_spill();
                 let state = journal.engine().state();
-                let timers_due = state.timers.values().any(|t| t.due_at <= now);
+                // Hot ∪ cold (#1483): a cold-spilled instance's armed timer is
+                // invisible in `state.timers`, and `TriggerTimers` is the only
+                // path that rehydrates it — gating on hot timers alone never
+                // proposes the command, so those timers never fire.
+                let timers_due = journal.has_due_timers(now);
                 // Only `Activated` jobs hold a lease deadline, and `ExpireJobs`
                 // reclaims exactly that set (it iterates `activated_jobs`). Gate on
                 // the same index rather than scanning every job: this pre-check runs
@@ -19710,55 +20563,47 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
-        #[allow(clippy::type_complexity)]
-        let outcome: Result<
-            (nanobpmn_engine_core::Key, bool, Vec<Event>, Commit),
-            (u16, String),
-        > = {
+        // The actor round-trip, commit wait, and commit-gated routing run
+        // inside ONE detached owner task (#1582): a stream connection cancelled
+        // while the actor still has the create queued must not strand a
+        // persisted instance without its cross-partition routing. Awaiting the
+        // receiver here only OBSERVES the outcome.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            Vec::new(),
-                            None,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        // The stream create reports only the key + completion; the
-                        // projected definition key/version are unused here.
-                        Ok(created) => Ok((
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
+                    other => (500, other.to_string()),
                 })
-                .await
+            });
+            Self::observe_create(rx).await?
         };
-        let (instance_key, sync_completed, routable, commit) = outcome?;
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // The stream create reports only the key + completion; the projected
+        // definition key/version are unused here.
+        let instance_key = created.instance_key;
+        let sync_completed = created.sync_completed;
+        // The detached owner already awaited durability and drove the
+        // cross-partition routing pump before answering (#1582), so a publish
+        // issued now finds the subscription open.
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -20010,11 +20855,11 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                routable,
+                // Routing ran inside `raft_create_core`'s detached task BEFORE
+                // the answer (#1582 cancellation safety + create-then-publish
+                // ordering); the events are only reported.
+                _routable,
             )) => {
-                if !routable.is_empty() {
-                    self.drive_subscription_routing(routable).await;
-                }
                 self.signal_jobs_available();
                 // Local commit on a partition THIS node leads: count the stream
                 // create once, here. The forward branches below deliberately do
@@ -20161,7 +21006,7 @@ impl ServerImpl {
                 business_id.clone(),
             )
             .await;
-        let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+        let (process_id, version, definition_key, instance_key, sync_completed, _routable) =
             match core {
                 Ok(fields) => fields,
                 // Stale leadership / leads-nothing-now: forward to the current
@@ -20200,9 +21045,9 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // Routing ran inside `raft_create_core`'s detached task BEFORE the
+        // answer (#1582 cancellation safety + create-then-publish ordering);
+        // nothing further to route here.
         self.signal_jobs_available();
 
         let (variables_out, process_completed) = if await_completion {
@@ -20283,38 +21128,100 @@ impl ServerImpl {
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
-        let response = part
-            .propose_result(
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    tags,
-                    business_id,
-                    sel_key,
-                    sel_ver,
-                ),
-                now_millis(),
-            )
-            .await
-            .map_err(|e| match e {
-                // Leadership race on the batched write is retryable, not 500. #1306.
-                crate::raft::ProposeError::Leader => {
-                    (503, format!("partition {p} leader unavailable; retry"))
+        // The propose + post-commit routing run DETACHED (#1582): a caller
+        // cancelled while awaiting the Raft commit must not strand a committed
+        // create without its cross-partition routing — the Raft batcher keeps
+        // running past the cancellation, and the detached task still observes
+        // the proposal outcome and routes. The result is handed back over a
+        // oneshot only AFTER the routing re-drive has driven the
+        // cross-partition subscription follow-ups: clients rely on the
+        // create-then-publish ordering `main` has always given — a publish
+        // issued the moment the create returns must find the subscription
+        // already open, or the unmatched message is discarded and the instance
+        // stays parked (#1582). The cost is bounded: a stalled subscription
+        // target can delay the create response by at most the bounded re-drive
+        // budget ([`ROUTE_REDRIVE`]), never indefinitely. Awaiting the receiver
+        // only OBSERVES the outcome; dropping it leaves the work running. The
+        // latency-optimal alternative — answer at commit and gate publications
+        // on pending subscription opens — is tracked as #1604.
+        let server = self.clone();
+        let process_id_for_propose = process_id.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let proposed = part
+                .propose_result(
+                    Command::create_instance_versioned(
+                        process_id_for_propose,
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    now_millis(),
+                )
+                .await
+                .map_err(|e| match e {
+                    // Leadership race on the batched write is retryable, not 500. #1306.
+                    crate::raft::ProposeError::Leader => {
+                        (503, format!("partition {p} leader unavailable; retry"))
+                    }
+                    other => (500, other.to_string()),
+                })
+                .and_then(|response| {
+                    if let Some((status, message)) = response.error {
+                        return Err((status, message));
+                    }
+                    let events = response.events;
+                    let instance_key = events
+                        .iter()
+                        .find_map(Event::instance_key)
+                        .ok_or((500, "raft create produced no instance key".to_string()))?;
+                    let sync_completed = events.iter().any(|e| {
+                        matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                    });
+                    let routable: Vec<Event> = events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    Ok((instance_key, sync_completed, routable))
+                });
+            match proposed {
+                Ok((instance_key, sync_completed, routable)) => {
+                    // Route the follow-ups FIRST, then answer: a publish issued
+                    // the moment the create returns must find the subscription
+                    // already open (the create-then-publish ordering clients
+                    // rely on, #1582). The wait is bounded by the re-drive
+                    // budget, and a dropped receiver (caller cancelled) is fine:
+                    // routing already ran to completion inside this task.
+                    if !routable.is_empty() {
+                        server.drive_subscription_routing(routable.clone()).await;
+                    }
+                    server.signal_jobs_available();
+                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
                 }
-                other => (500, other.to_string()),
-            })?;
-        if let Some((status, message)) = response.error {
-            return Err((status, message));
-        }
-        let events = response.events;
-
-        let instance_key = events
-            .iter()
-            .find_map(Event::instance_key)
-            .ok_or((500, "raft create produced no instance key".to_string()))?;
-        let sync_completed = events.iter().any(|e| {
-            matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                Err(err) => {
+                    let _ = result_tx.send(Err(err));
+                }
+            }
         });
+        // Observe the detached proposal; a dropped sender (task panicked) is a
+        // 500, never a hang.
+        let (instance_key, sync_completed, routable) = match result_rx.await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err((500, "raft create task ended without a result".to_string()));
+            }
+        };
         // Project the deployed key + version of the version the instance was
         // pinned to (not the latest), so by-id and by-key creates agree.
         let pid_for_read = process_id.clone();
@@ -20329,18 +21236,6 @@ impl ServerImpl {
                     .unwrap_or((pid_for_read, 1))
             })
             .await;
-        let routable: Vec<Event> = events
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::MessageSubscriptionOpening { .. }
-                        | Event::RemoteMessageCorrelation { .. }
-                        | Event::MessageSubscriptionClosing { .. }
-                        | Event::StartInstanceDispatched { .. }
-                )
-            })
-            .collect();
         Ok((
             process_id,
             version,
@@ -20421,15 +21316,24 @@ impl ServerImpl {
     /// diagnostic and is `true` ONLY for the stream `CompleteJob` path — the REST
     /// complete/fail/throw callers pass `false` so a failed REST mutation never
     /// inflates the stream-completion counters (see [`propose_partition_command`]). #1306.
+    ///
+    /// Carries the caller's `operationReference` (#1556) on the replicated
+    /// command envelope.
     async fn propose_job_for_stream(
         &self,
         job_key: u64,
         command: Command,
         record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<Commit, (u16, String)> {
-        self.propose_partition_command(job_key, command, record_stream_outcome)
-            .await
-            .map(|(_, commit)| commit)
+        self.propose_partition_command_ref(
+            job_key,
+            command,
+            record_stream_outcome,
+            operation_reference,
+        )
+        .await
+        .map(|(_, commit)| commit)
     }
 
     /// `record_stream_outcome` gates the `stream_complete_outcome_total`
@@ -20444,6 +21348,20 @@ impl ServerImpl {
         key: Key,
         command: Command,
         record_stream_outcome: bool,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.propose_partition_command_ref(key, command, record_stream_outcome, None)
+            .await
+    }
+
+    /// [`propose_partition_command`](Self::propose_partition_command) carrying
+    /// the caller's `operationReference` (#1556) on the replicated command
+    /// envelope, so every record the command produces is stamped with it.
+    async fn propose_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
@@ -20467,7 +21385,7 @@ impl ServerImpl {
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
-            .propose_result(command, now_millis())
+            .propose_result_ref(command, now_millis(), operation_reference)
             .await
             .map_err(|e| {
                 if record_stream_outcome {
@@ -20573,12 +21491,26 @@ impl ServerImpl {
             return self.propose_partition_command(job_key, command, true).await;
         }
         let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self.gate_stream_routing(result);
         if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
             self.record_adhoc_events(events);
         }
         Self::map_job_events(result)
+    }
+
+    /// Routes the cross-partition follow-ups of a pipelined (ack-before-fsync)
+    /// non-Raft stream job command only once its source write is durable
+    /// (#1582), handing back the commit the pipelined caller still awaits. See
+    /// [`Self::route_after_durable`].
+    fn gate_stream_routing(
+        &self,
+        result: Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        result.map(|(events, commit)| {
+            let (commit, _routing) = self.route_after_durable(&events, commit);
+            (events, commit)
+        })
     }
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
@@ -20626,10 +21558,7 @@ impl ServerImpl {
                 ),
             )
             .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
-        }
-        Self::map_job_events(result)
+        Self::map_job_events(self.gate_stream_routing(result))
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -20671,10 +21600,7 @@ impl ServerImpl {
                 ),
             )
             .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
-        }
-        Self::map_job_events(result)
+        Self::map_job_events(self.gate_stream_routing(result))
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -21496,11 +22422,59 @@ impl ServerImpl {
     /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
     /// threading a per-call `state` policy) keeps the override in one place so a
     /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
+    ///
+    /// The `variables` filter is honoured exactly as
+    /// `search_process_instances_impl` honours it: matched against the
+    /// instance's process-scoped (root) variables via [`match_instance_variables`],
+    /// over a per-call index built only when a variable filter is present (the
+    /// common no-variable-filter path pays nothing for the extra scan). Dropping
+    /// it here would silently *broaden* the batch — a migration filtered to
+    /// `batch = "alpha"` would also migrate every other eligible instance.
     fn batch_matched_process_instances(
         &self,
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
+        // Pre-index root-scope variables by instance only when the filter
+        // actually constrains on them, restricted to the variable names the
+        // filter references (same construction as `search_process_instances_impl`).
+        let variables_index: std::collections::HashMap<
+            u64,
+            std::collections::HashMap<String, String>,
+        > = match &filter.variables {
+            Some(entries) if !entries.is_empty() => {
+                let requested: std::collections::HashSet<&str> =
+                    entries.iter().map(|entry| entry.name.as_str()).collect();
+                let mut idx: std::collections::HashMap<
+                    u64,
+                    std::collections::HashMap<String, String>,
+                > = std::collections::HashMap::new();
+                for v in self.store.variables() {
+                    // Root-scope (process-instance) variables only: a variable
+                    // held under a nested scope has `scope_key != instance_key`
+                    // and is not a process-instance-level variable.
+                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+                        idx.entry(v.instance_key)
+                            .or_default()
+                            .insert(v.name, v.value);
+                    }
+                }
+                idx
+            }
+            _ => std::collections::HashMap::new(),
+        };
+        // Pre-index the instance's element-instance / job / incident child rows
+        // only when an inherited cross-entity filter is actually present (same
+        // lazy construction as `variables_index`), loading only the child-row
+        // sources the supplied predicates read.
+        let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
+            InstanceCrossEntityIndex::new(
+                filter,
+                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
+            )
+        } else {
+            InstanceCrossEntityIndex::default()
+        };
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
@@ -21550,9 +22524,38 @@ impl ServerImpl {
                     )
                     && query::match_date_time_ms(&filter.end_date, None)
                     && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
+                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
+                    // single source of truth. A batch is ACTIVE-only, so a matched
+                    // instance is never suspended and the value is always absent —
+                    // `$exists: true` / value operators then correctly exclude
+                    // every candidate (fail closed) instead of silently broadening.
+                    && query::match_date_time_ms(
+                        &filter.suspended_date,
+                        inst.suspended_date_ms.map(|ms| ms as i64),
+                    )
+                    // Nano is single-tenant: every instance's `tenantId` is the
+                    // `<default>` constant, so honour the filter against it.
+                    && query::match_string(&filter.tenant_id, "<default>")
+                    // `processDefinitionName` / `processDefinitionVersionTag` are
+                    // never projected (always null in `process_instance_result`), so
+                    // match against an absent value: equality / `$like` / `$in` /
+                    // `$exists: true` correctly exclude, `$exists: false` matches.
+                    && query::match_string_opt(&filter.process_definition_name, None)
+                    && query::match_string_opt(&filter.process_definition_version_tag, None)
                     // Call-activity hierarchy filters (C8 parity, issue #977),
                     // gated per the per-operation contract above.
                     && hierarchy_matches
+                    && match_instance_variables(
+                        &filter.variables,
+                        variables_index.get(&inst.key),
+                    )
+                    && match_instance_tags(&filter.tags, &inst.tags)
+                    // Inherited element / job / incident / batch-operation
+                    // filters (C8 parity): existential predicates over the
+                    // instance's child rows, evaluated against the pre-indexed
+                    // cross-entity index so a nonmatching instance is excluded
+                    // from the batch instead of silently broadening it.
+                    && match_instance_cross_entity_filters(filter, inst.key, &cross_index)
             })
             .map(|inst| inst.key)
             .collect();
@@ -21575,6 +22578,219 @@ impl ServerImpl {
         let items =
             self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
         let key = self.batch_operations.create(op_type, items);
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// The shared batch-operation seam: mints a trackable batch of `op_type`
+    /// over `items` and drives it to a terminal state in the background, applying
+    /// `apply` to each item and recording a per-item `COMPLETED` / `FAILED`
+    /// outcome. Between items the executor honours the batch lifecycle — it
+    /// waits while the batch is `SUSPENDED` and stops when it is `CANCELED`
+    /// (remaining items stay unprocessed). Every executing process-instance batch
+    /// (migration, and the modification slice #1552) goes through here, so there
+    /// is exactly one batch-execution implementation.
+    fn drive_process_instance_batch<F, Fut>(
+        &self,
+        op_type: models::BatchOperationTypeEnum,
+        items: Vec<u64>,
+        apply: F,
+    ) -> u64
+    where
+        F: Fn(ServerImpl, u64) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let key = self.batch_operations.create(op_type, items.clone());
+        let server = self.clone();
+        tokio::spawn(async move {
+            for item in items {
+                loop {
+                    match server.batch_operations.state(key) {
+                        Some(models::BatchOperationStateEnum::Suspended) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Some(models::BatchOperationStateEnum::Active) => break,
+                        // Canceled (or otherwise terminal / gone): stop driving.
+                        _ => return,
+                    }
+                }
+                let outcome = apply(server.clone(), item).await;
+                server.batch_operations.record_item(key, item, outcome);
+            }
+            server.batch_operations.finish(key);
+        });
+        key
+    }
+
+    /// `POST /v2/process-instances/migration` — mint a
+    /// `MIGRATE_PROCESS_INSTANCE` batch operation over every ACTIVE process
+    /// instance matched by the request filter and migrate each one with the
+    /// request's `migrationPlan` (via the same [`Self::migrate_instance_core`]
+    /// as the single-instance endpoint). Ineligible instances are recorded as
+    /// `FAILED` items carrying the engine's rejection reason.
+    ///
+    /// The filter schema (spec/process-instances.yaml) deprecates
+    /// `batchOperationId` in favour of `batchOperationKey` and requires a 400
+    /// when BOTH are supplied; that contract is enforced up front, before any
+    /// batch is minted.
+    async fn migrate_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceMigrationBatchOperationRequest,
+    ) -> Result<apis::process_instance::MigrateProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        // The filter schema (spec/process-instances.yaml) deprecates
+        // `batchOperationId` in favour of `batchOperationKey` and requires a
+        // 400 when BOTH are supplied. Enforce that here, before any batch is
+        // minted — the matcher's fail-closed absent-value matching of the two
+        // unprojected fields is not a substitute for the contract validation.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(problem(
+                "INVALID_ARGUMENT",
+                400,
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            )));
+        }
+        let target = match crate::falcon::parse_migration_target_key(
+            &body.migration_plan.target_process_definition_key.0,
+        ) {
+            Ok(k) => k,
+            Err((_status, detail)) => {
+                return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                    problem("INVALID_ARGUMENT", 400, detail),
+                ));
+            }
+        };
+        let mappings: Vec<(String, String)> = body
+            .migration_plan
+            .mapping_instructions
+            .iter()
+            .map(|m| (m.source_element_id.clone(), m.target_element_id.clone()))
+            .collect();
+        let op_type = models::BatchOperationTypeEnum::MigrateProcessInstance;
+        // Migration honours the supplied filters; `state` is overridden to
+        // ACTIVE by the matcher (only ACTIVE instances can be migrated).
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
+            let mappings = mappings.clone();
+            async move {
+                match server
+                    .migrate_instance_core(instance, target, mappings)
+                    .await
+                {
+                    MigrateInstanceOutcome::Migrated => Ok(()),
+                    MigrateInstanceOutcome::BadRequest(d)
+                    | MigrateInstanceOutcome::NotFound(d)
+                    | MigrateInstanceOutcome::Conflict(d)
+                    | MigrateInstanceOutcome::Unavailable(d)
+                    | MigrateInstanceOutcome::Internal(d) => Err(d),
+                }
+            }
+        });
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// `POST /v2/process-instances/modification` — mint a
+    /// `MODIFY_PROCESS_INSTANCE` batch operation over every ACTIVE process
+    /// instance matched by the request filter and apply the request's
+    /// `moveInstructions` to each one (Zeebe
+    /// `ModifyProcessInstanceBatchOperationExecutor` parity), via the same
+    /// [`Self::modify_instance_core`] as the single-instance endpoint.
+    /// Ineligible instances are recorded as `FAILED` items carrying the
+    /// engine's rejection reason.
+    ///
+    /// Batch modification supports `moveInstructions` only (spec:
+    /// `ProcessInstanceModificationBatchOperationRequest`); each batch move
+    /// instruction carries a source/target element id pair, which maps onto
+    /// the engine's [`nanobpmn_engine_core::MoveInstruction`] with the
+    /// inferred ancestor scope — Zeebe maps the batch shape onto
+    /// `setInferAncestorScopeFromSourceHierarchy(true)`
+    /// (`ProcessInstanceMapper.mapProcessInstanceModificationMoveBatchInstruction`).
+    ///
+    /// Up-front 400s (no batch minted), matching Zeebe's
+    /// `validateModifyProcessInstanceBatchOperationRequest`: an empty
+    /// `moveInstructions`, a blank source/target element id, and the filter
+    /// contract violation of supplying BOTH the deprecated
+    /// `batchOperationId` and `batchOperationKey`.
+    async fn modify_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceModificationBatchOperationRequest,
+    ) -> Result<apis::process_instance::ModifyProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let bad_request = |detail: String| {
+            Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                problem("INVALID_ARGUMENT", 400, detail),
+            ))
+        };
+        // The filter schema (spec/process-instances.yaml) deprecates
+        // `batchOperationId` in favour of `batchOperationKey` and requires a
+        // 400 when BOTH are supplied — the same contract the migration
+        // endpoint enforces.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return bad_request(
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            );
+        }
+        // Zeebe `ERROR_MESSAGE_EMPTY_ATTRIBUTE.formatted("moveInstructions")`.
+        if body.move_instructions.is_empty() {
+            return bad_request("No moveInstructions provided.".to_string());
+        }
+        // Zeebe `validateMoveBatchInstructions`: every instruction needs a
+        // non-blank source and target element id.
+        if body
+            .move_instructions
+            .iter()
+            .any(|m| m.source_element_id.trim().is_empty())
+        {
+            return bad_request("No sourceElementId provided.".to_string());
+        }
+        if body
+            .move_instructions
+            .iter()
+            .any(|m| m.target_element_id.trim().is_empty())
+        {
+            return bad_request("No targetElementId provided.".to_string());
+        }
+        let move_instructions: Vec<nanobpmn_engine_core::MoveInstruction> = body
+            .move_instructions
+            .iter()
+            .map(|m| nanobpmn_engine_core::MoveInstruction {
+                source: nanobpmn_engine_core::MoveSource::ById(m.source_element_id.clone()),
+                target_element_id: m.target_element_id.clone(),
+                ancestor_scope: nanobpmn_engine_core::AncestorScopeInstruction::Inferred,
+                variable_instructions: Vec::new(),
+            })
+            .collect();
+        let op_type = models::BatchOperationTypeEnum::ModifyProcessInstance;
+        // Modification honours the supplied filters; `state` is overridden to
+        // ACTIVE by the matcher (only ACTIVE instances can be modified).
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
+            let move_instructions = move_instructions.clone();
+            async move {
+                match server
+                    .modify_instance_core(
+                        instance,
+                        falcon::ModifyInstanceInstructions {
+                            move_instructions,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    ModifyInstanceOutcome::Modified => Ok(()),
+                    ModifyInstanceOutcome::BadRequest(d)
+                    | ModifyInstanceOutcome::NotFound(d)
+                    | ModifyInstanceOutcome::Conflict(d)
+                    | ModifyInstanceOutcome::Unavailable(d)
+                    | ModifyInstanceOutcome::Internal(d) => Err(d),
+                }
+            }
+        });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -22384,6 +23600,283 @@ fn decision_instance_get_result(
     }
 }
 
+/// Per-instance cross-entity index backing the inherited element / job /
+/// incident filters on a process-instance query (`elementId`,
+/// `elementInstanceState`, `hasElementInstanceIncident`, `errorMessage`,
+/// `hasRetriesLeft`). These are **existential** predicates over an instance's
+/// child rows (element instances, jobs, incidents), not columns on
+/// [`readstore::ProcessInstanceRow`], so they are pre-indexed by
+/// `instance_key` once per query — only when at least one such filter is
+/// actually present, so the common path pays nothing for the extra scans.
+///
+/// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
+/// (element instances, jobs, incidents) is scanned only when a filter that
+/// reads it is supplied, mirroring the `variables_index` construction in
+/// `search_process_instances_impl`.
+#[derive(Default)]
+struct InstanceCrossEntityIndex {
+    /// `instance_key → its element instances` (for the element predicates).
+    /// The whole row is kept per element — not a per-field map — so the
+    /// `elementId` / `elementInstanceState` / `hasElementInstanceIncident`
+    /// predicates stay correlated: they must hold of the **same** element
+    /// instance, not of three independent rows (a COMPLETED `review` plus an
+    /// ACTIVE `approve` must not satisfy `elementId: "review",
+    /// elementInstanceState: "ACTIVE"`).
+    elements: std::collections::HashMap<u64, Vec<IndexedElement>>,
+    /// `instance_key → worker/incident error messages` (for `errorMessage`):
+    /// the last `errorMessage` of each failed/errored job plus each incident's
+    /// reason — the two places a process-level error message is projected.
+    error_messages: std::collections::HashMap<u64, Vec<String>>,
+    /// `instance_key → true when any job has failed with retries left` (for
+    /// `hasRetriesLeft`).
+    has_retries_left: std::collections::HashMap<u64, bool>,
+}
+
+/// One element instance as carried by [`InstanceCrossEntityIndex::elements`].
+struct IndexedElement {
+    element_id: String,
+    /// The element-instance state wire spelling (`ACTIVE` / `COMPLETED` /
+    /// `TERMINATED`).
+    state: String,
+    has_incident: bool,
+}
+
+/// The child-row sources an [`InstanceCrossEntityIndex`] is built from. Each
+/// field is loaded by the caller **only when a supplied filter reads it** (see
+/// [`InstanceCrossEntityIndex::needs_elements`] / `needs_jobs` /
+/// `needs_incidents`), so an `elementId`-only query never materializes the job
+/// or incident tables. `None` sources are treated as empty; construction
+/// asserts the filter only reads sources that were loaded.
+#[derive(Default)]
+struct CrossEntitySources {
+    element_instances: Option<Vec<readstore::ElementInstanceRow>>,
+    jobs: Option<Vec<readstore::JobRow>>,
+    incidents: Option<Vec<readstore::IncidentRow>>,
+}
+
+impl InstanceCrossEntityIndex {
+    /// Builds the index, populating only the maps the supplied `filter`
+    /// actually constrains on and reading only the sources in `sources`.
+    #[allow(
+        clippy::expect_used,
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+    )]
+    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
+        let mut idx = InstanceCrossEntityIndex::default();
+        if Self::needs_elements(filter) {
+            let rows = sources
+                .element_instances
+                .as_deref()
+                .expect("element predicates require the element-instance source");
+            for e in rows {
+                idx.elements
+                    .entry(e.instance_key)
+                    .or_default()
+                    .push(IndexedElement {
+                        element_id: e.element_id.clone(),
+                        state: element_instance_state_enum(e.state).to_string(),
+                        has_incident: e.has_incident,
+                    });
+            }
+        }
+        if filter.error_message.is_some() {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("errorMessage requires the job source")
+            {
+                if let Some(msg) = &j.error_message {
+                    idx.error_messages
+                        .entry(j.instance_key)
+                        .or_default()
+                        .push(msg.clone());
+                }
+            }
+            for i in sources
+                .incidents
+                .as_deref()
+                .expect("errorMessage requires the incident source")
+            {
+                idx.error_messages
+                    .entry(i.instance_key)
+                    .or_default()
+                    .push(i.reason.clone());
+            }
+        }
+        if filter.has_retries_left.is_some() {
+            for j in sources
+                .jobs
+                .as_deref()
+                .expect("hasRetriesLeft requires the job source")
+            {
+                if j.has_failed_with_retries_left {
+                    idx.has_retries_left.insert(j.instance_key, true);
+                }
+            }
+        }
+        idx
+    }
+
+    /// Whether any element predicate (`elementId` / `elementInstanceState` /
+    /// `hasElementInstanceIncident`) is present, so the caller loads the
+    /// element-instance source only then.
+    fn needs_elements(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.element_id.is_some()
+            || filter.element_instance_state.is_some()
+            || filter.has_element_instance_incident.is_some()
+    }
+
+    /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
+    /// is present.
+    fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some() || filter.has_retries_left.is_some()
+    }
+
+    /// Whether any incident-reading predicate (`errorMessage`) is present.
+    fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
+        filter.error_message.is_some()
+    }
+
+    /// Whether any cross-entity filter is present (so the caller can skip
+    /// building the index entirely when none is).
+    fn is_needed(filter: &models::ProcessInstanceFilter) -> bool {
+        Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
+    }
+
+    /// Loads exactly the child-row sources `filter` reads: the element-instance
+    /// table only when an element predicate is present, jobs only for
+    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
+    /// so an `elementId`-only query never scans the job or incident tables.
+    /// Shared by the search and batch-selection paths so both honour the same
+    /// lazy-source contract.
+    fn sources_for(
+        filter: &models::ProcessInstanceFilter,
+        store: &readstore::ReadModel,
+    ) -> CrossEntitySources {
+        CrossEntitySources {
+            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
+            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
+            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+        }
+    }
+}
+
+/// Evaluates the inherited element / job / incident / batch-operation filters
+/// on a process-instance query against instance `instance_key`, using the
+/// pre-indexed `index`. Each is an **existential** predicate over the
+/// instance's child rows:
+///
+/// - `elementId` / `elementInstanceState` / `hasElementInstanceIncident` — the
+///   instance has **one** element instance satisfying all supplied element
+///   predicates at once (they are correlated: a COMPLETED `review` plus an
+///   ACTIVE `approve` must not satisfy `elementId: "review",
+///   elementInstanceState: "ACTIVE"`). `hasElementInstanceIncident: false`
+///   inverts the whole existential: it selects instances with **no** element
+///   satisfying the supplied id/state predicates that carries an incident.
+/// - `errorMessage` — it has a failed/errored job or incident whose message
+///   matches.
+/// - `hasRetriesLeft` — it has a job that failed with retries left (`false`
+///   selects instances with no such job).
+///
+/// `incidentErrorHashCode` and `batchOperationId` / `batchOperationKey` are
+/// declared on the filter schema but Nano does not project a per-instance value
+/// for them (no incident error-hash column; batch membership lives in the
+/// separate `BatchOperationStore`, not the read model), so they are matched
+/// against an **absent** value: equality / `$in` / `$exists: true` correctly
+/// exclude (fail closed — the field is honoured, not silently broadening a
+/// mutating batch) while `$exists: false` still matches. This mirrors the
+/// `endDate` / `processDefinitionName` convention.
+fn match_instance_cross_entity_filters(
+    filter: &models::ProcessInstanceFilter,
+    instance_key: u64,
+    index: &InstanceCrossEntityIndex,
+) -> bool {
+    // The element predicates are evaluated together, existentially over the
+    // instance's element rows, so an id/state/incident combination must hold of
+    // the SAME element instance. An instance with no element instances matches
+    // an `elementId` filter only against an absent value (so `$exists: false`
+    // still matches) and never matches a state or `hasElementInstanceIncident:
+    // true` predicate.
+    let element_matches = {
+        let has_element_predicates = filter.element_id.is_some()
+            || filter.element_instance_state.is_some()
+            || filter.has_element_instance_incident.is_some();
+        if !has_element_predicates {
+            true
+        } else {
+            let elements = index.elements.get(&instance_key);
+            let row_matches = |e: &IndexedElement| {
+                let id_ok = match &filter.element_id {
+                    None => true,
+                    Some(f) => query::match_string_property(f, Some(e.element_id.as_str())),
+                };
+                let state_ok = match &filter.element_instance_state {
+                    None => true,
+                    Some(f) => {
+                        query::match_element_instance_state(&Some(f.clone()), e.state.as_str())
+                    }
+                };
+                id_ok && state_ok
+            };
+            match filter.has_element_instance_incident {
+                None => match elements {
+                    Some(rows) => rows.iter().any(row_matches),
+                    // No element rows: `elementId` still matches against an
+                    // absent value (the `$exists: false` case); a state
+                    // predicate can never be satisfied.
+                    None => {
+                        let id_ok = match &filter.element_id {
+                            None => true,
+                            Some(f) => query::match_string_property(f, None),
+                        };
+                        id_ok && filter.element_instance_state.is_none()
+                    }
+                },
+                // `true`: some element satisfying the id/state predicates
+                // carries an incident. `false`: none does (the inverted
+                // existential — an instance with no element instances has no
+                // incidented element, so it matches).
+                Some(want) => {
+                    let any_incidented = elements
+                        .map(|rows| rows.iter().any(|e| row_matches(e) && e.has_incident))
+                        .unwrap_or(false);
+                    any_incidented == want
+                }
+            }
+        }
+    };
+    // `errorMessage`: existential over the instance's job/incident messages.
+    let error_message_matches = match &filter.error_message {
+        None => true,
+        Some(f) => match index.error_messages.get(&instance_key) {
+            Some(msgs) => msgs
+                .iter()
+                .any(|m| query::match_string_property(f, Some(m.as_str()))),
+            None => query::match_string_property(f, None),
+        },
+    };
+    // `hasRetriesLeft`: `true` requires a job that failed with retries left.
+    let retries_matches = match filter.has_retries_left {
+        None => true,
+        Some(want) => {
+            index
+                .has_retries_left
+                .get(&instance_key)
+                .copied()
+                .unwrap_or(false)
+                == want
+        }
+    };
+    element_matches
+        && error_message_matches
+        && retries_matches
+        // Not projected per-instance → matched against an absent value (fail
+        // closed; see the doc comment).
+        && query::match_integer(&filter.incident_error_hash_code, None)
+        && query::match_string_opt(&filter.batch_operation_id, None)
+        && query::match_string_opt(&filter.batch_operation_key, None)
+}
+
 /// Evaluates a process-instance `variables` filter against an instance's
 /// process-scoped (root) variables, provided as a `name → serialized-JSON value`
 /// map (absent when the instance has no root variables). Each
@@ -22403,6 +23896,22 @@ fn match_instance_variables(
             let value = vars.and_then(|m| m.get(&entry.name)).map(String::as_str);
             query::match_string_property(&entry.value, value)
         }),
+    }
+}
+
+/// Matches the `tags` filter against an instance's carried tags. Every
+/// requested tag must be present on the instance (AND semantics — a tag set
+/// constrains to instances carrying the whole set, Camunda-style). An empty
+/// filter set matches everything; an instance with no tags matches only an
+/// absent/empty filter, never a non-empty one (so the field is honoured, not
+/// silently ignored — the class that let a `tags: ["canary"]` migration select
+/// untagged instances, #1551 review).
+fn match_instance_tags(filter: &Option<Vec<models::Tag>>, instance_tags: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(tags) => tags
+            .iter()
+            .all(|want| instance_tags.iter().any(|have| have == &want.0)),
     }
 }
 
@@ -22644,13 +24153,65 @@ fn match_element_instance_fields(
         })
 }
 
+/// The incident filter predicate, shared by `searchIncidents` and the
+/// element-instance-scoped incident search so the two cannot drift. Every
+/// declared `IncidentFilter` field is matched: the process-definition identity
+/// is denormalized onto the row at projection time (no cross-entity lookup),
+/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
+/// against an absent value — value operators exclude the row (honest, never
+/// silently widening the search) while `$exists: false` still matches.
+fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
+    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
+        && query::match_element_instance_key(
+            &f.element_instance_key,
+            &inc.element_instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inc.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
+        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
+        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
+        && query::match_incident_error_type(
+            &f.error_type,
+            &incident_error_type_enum(inc.kind).to_string(),
+        )
+        && query::match_string(&f.element_id, &inc.element_id)
+        && query::match_string(&f.error_message, &inc.reason)
+        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
+        && query::match_string_opt(&f.tenant_id, None)
+}
+
 /// The user-task filter predicate over one AND-group of fields, shared by the
 /// top-level filter and each `$or` clause so the two cannot drift.
+///
+/// Every advertised field is matched against what the row actually projects.
+/// Fields Nano never projects onto a user task — `name` (the result's `name`
+/// is always null), `completionDate` (always null), `tags` (always empty), and
+/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
+/// absent value: value operators exclude the row (honest, never silently
+/// widening the search) while `$exists: false` still matches. The variable
+/// filters (`processInstanceVariables` / `localVariables`) are NOT evaluated
+/// here — they need a variable-store join this predicate cannot see, so the
+/// MCP adapter rejects them instead of letting them widen results silently.
 fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
+    // The task's due/follow-up dates are stored as RFC 3339 strings; project
+    // them to epoch millis for the date-time filter algebra. An unparseable or
+    // absent stored date is an absent value (value operators exclude it).
+    let parse_ms = |d: &Option<String>| {
+        d.as_deref()
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .map(|dt| dt.timestamp_millis())
+    };
     f.user_task_key
         .as_ref()
         .is_none_or(|k| k.0 == task.key.to_string())
+        && f.element_instance_key
+            .as_ref()
+            .is_none_or(|k| k.0 == task.element_instance_key.to_string())
         && query::match_process_instance_key(
             &f.process_instance_key,
             &task.instance_key.to_string(),
@@ -22659,9 +24220,40 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
             &f.process_definition_key,
             &task.process_definition_key,
         )
+        && query::match_process_definition_id(
+            &f.process_definition_id,
+            Some(&task.process_definition_id),
+        )
         && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
         && query::match_string(&f.assignee, &assignee)
         && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+        && query::match_string_opt(&f.business_id, task.business_id.as_deref())
+        && query::match_integer(&f.priority, Some(i64::from(task.priority)))
+        && f.candidate_group.as_ref().is_none_or(|g| match g {
+            models::StringFilterProperty::String(s) => task.candidate_groups.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_groups
+                .iter()
+                .any(|cg| query::match_string_property(g, Some(cg))),
+        })
+        && f.candidate_user.as_ref().is_none_or(|u| match u {
+            models::StringFilterProperty::String(s) => task.candidate_users.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_users
+                .iter()
+                .any(|cu| query::match_string_property(u, Some(cu))),
+        })
+        && query::match_date_time_ms(&f.creation_date, Some(task.created_at_ms as i64))
+        && query::match_date_time_ms(&f.due_date, parse_ms(&task.due_date))
+        && query::match_date_time_ms(&f.follow_up_date, parse_ms(&task.follow_up_date))
+        // Never projected: completion date (result is always null).
+        && query::match_date_time_ms(&f.completion_date, None)
+        // Never projected: task name (result is always null).
+        && query::match_string_opt(&f.name, None)
+        // Never projected: task tags (result is always empty), so any listed
+        // tag excludes the row.
+        && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
+        && query::match_string_opt(&f.tenant_id, None)
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -24700,12 +26292,16 @@ fn modify_instructions_from_rest(
             }
         };
         // Spec: the default (absent) ancestor scope resembles a `direct`
-        // instruction with key `-1`, i.e. the engine's inferred default.
+        // instruction with key `-1`, i.e. the default find-or-create flow
+        // scope resolution (`Direct(0)`) — NOT source-hierarchy inference,
+        // which is reserved for an explicit `inferred` instruction (it would
+        // silently pick the source's scope where the default rejects an
+        // ambiguous target scope).
         let ancestor_scope = match &m.ancestor_scope_instruction {
-            None => AncestorScopeInstruction::Inferred,
+            None => AncestorScopeInstruction::Direct(0),
             Some(models::AncestorScopeInstruction::DirectAncestorKeyInstruction(d)) => {
                 if d.ancestor_element_instance_key.0 == "-1" {
-                    AncestorScopeInstruction::Inferred
+                    AncestorScopeInstruction::Direct(0)
                 } else {
                     AncestorScopeInstruction::Direct(parse_modification_key(
                         "ancestorElementInstanceKey",
@@ -27030,30 +28626,19 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    let mut pos = shard.exported_position();
-                    if pos > events.len() {
-                        // The store is ahead of the log (truncated/corrupt journal):
-                        // rebuild from scratch.
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
-                        )]
-                        shard.reset().expect("reset read store");
-                        pos = 0;
-                    }
-                    if pos < events.len() {
-                        let refs: Vec<&Event> = events[pos..].iter().collect();
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
-                        )]
-                        shard
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    // Open the journal (rebuilding the engine from the full log)
+                    // BEFORE the read-model catch-up, so a store migrated from an
+                    // older schema backfills its pending projections from the
+                    // recovered engine state first — the same rule the segmented
+                    // path applies in `catch_up_shard`.
                     let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to open journal {}: {e}", journal_path.display())
                     });
+                    if let Err(e) =
+                        seglog::catch_up_shard_legacy(&shard, &events, journal.engine_state())
+                    {
+                        panic!("failed to catch up the read model from the legacy journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 }
@@ -27131,7 +28716,7 @@ async fn main() {
                     let mut per_partition: Vec<Vec<Event>> =
                         (0..partitions).map(|_| Vec::new()).collect();
                     for event in events {
-                        let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
+                        let p = event.owning_partition() as usize;
                         per_partition[p.min(partitions - 1)].push(event);
                     }
 
@@ -27256,7 +28841,7 @@ async fn main() {
                             }
                             continue;
                         }
-                        let p = nanobpmn_engine_core::partition_of(event.max_key());
+                        let p = event.owning_partition();
                         if let Some(bucket) = per_owned.get_mut(&p) {
                             bucket.push(event);
                         }
@@ -27931,6 +29516,14 @@ async fn main() {
         });
     }
 
+    // MCP gateway (Camunda parity, issue #1499): a stateless streamable-HTTP
+    // MCP server at `/mcp/cluster` (slice 2; `/mcp/processes` lands in slice 3
+    // on the same seam). On by default; `NANOBPM_MCP_ENABLED=false/0/off/no`
+    // opts out. The mount is a single call so sibling slices extend it without
+    // touching dispatch.
+    // Built before `server` is moved into the REST router below.
+    let mcp_server = server.clone();
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route(
@@ -28107,6 +29700,20 @@ async fn main() {
     // secret. Merge it here so `/cluster` is reachable alongside `/falcon`.
     if let Some(cluster_router) = public_cluster_router {
         app = app.merge(cluster_router);
+    }
+
+    // MCP gateway (issue #1499 slice 2). On by default (operator decision,
+    // epic #1499); mounted unless `NANOBPM_MCP_ENABLED` is explicitly falsy
+    // (`false`/`0`/`off`/`no`). The endpoints sit behind the same auth check
+    // as the REST API: `mcp::mcp_router` layers every `/mcp/*` route in
+    // `mcp_auth`, which applies the shared `ApiAuthBasic` credential
+    // extraction the generated `/v2` handlers use (see server/src/mcp/mod.rs).
+    if mcp::mcp_enabled() {
+        app = app.merge(mcp::mcp_router(mcp_server));
+        tracing::info!(
+            "MCP gateway enabled: {}",
+            mcp::mcp_endpoint_paths().join(", ")
+        );
     }
 
     if debug_rest_enabled() {
@@ -28995,6 +30602,9 @@ async fn main() {
         println!("  API reference  {base}/swagger");
         println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);
         println!("  Metrics        {base}/metrics");
+        for line in mcp::mcp_banner_lines(&base, mcp::mcp_enabled()) {
+            println!("{line}");
+        }
         println!();
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -34061,9 +35671,13 @@ mod clustered_startup_tests {
             "lastUpdatedDate after 2100 excludes"
         );
 
-        // Fields Nano does not project (processDefinitionName / toolName /
+        // Fields Nano does not project (processDefinitionName /
         // inboundConnectorType) are treated as absent: an equality filter yields
         // no rows (not silently ignored) while `$exists: false` matches.
+        // (`toolName` is no longer in this list — it is projected for
+        // START_EVENT subscriptions, #1499; this process deploys no message
+        // start event, so its PROCESS_EVENT row still carries no tool name and
+        // behaves like an absent field here.)
         for field_setter in [
             |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
                 f.process_definition_name = Some(v)
@@ -34100,6 +35714,415 @@ mod clustered_startup_tests {
                 "$exists:false matches an unprojected field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_message_start_subscriptions_have_unique_keys_and_sort_by_tool_name() {
+        // #1499: a definition with several message start events yields one
+        // START_EVENT row per start event, each with its own
+        // `messageSubscriptionKey` (cursor pagination must not loop), and the
+        // advertised `toolName` sort orders by tool name, not by key.
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let multi = ProcessBuilder::new("multi")
+            .message_start_event("s1", "m1")
+            .message_start_event("s2", "m2")
+            .end_event("e")
+            .connect("s1", "e")
+            .connect("s2", "e")
+            .build()
+            .expect("valid two-start process");
+        let tool = |id: &str, name: &str| {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("io.camunda.tool:name".to_string(), name.to_string());
+            ProcessBuilder::new(id)
+                .message_start_event("s", format!("{id}-msg"))
+                .end_event("e")
+                .connect("s", "e")
+                .with_properties("s", props)
+                .build()
+                .expect("valid tool process")
+        };
+        let mut names = std::collections::HashMap::new();
+        for id in ["multi", "zeta-proc", "alpha-proc"] {
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+        }
+        // `zeta` deploys before `alpha`, so key order differs from name order.
+        server
+            .deploy_resources_locally(
+                vec![
+                    multi,
+                    tool("zeta-proc", "zeta"),
+                    tool("alpha-proc", "alpha"),
+                ],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let search = |q: models::MessageSubscriptionSearchQuery| {
+            let server = &server;
+            async move {
+                let Resp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .expect("search returns")
+                else {
+                    panic!("expected a 200 result");
+                };
+                r
+            }
+        };
+        let all = || models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        };
+        for _ in 0..200 {
+            if search(all()).await.items.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(search(all()).await.items.len(), 4);
+
+        // Page the two `multi` start subscriptions one at a time.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..4 {
+            let r = search(models::MessageSubscriptionSearchQuery {
+                page: Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(1),
+                    },
+                )),
+                sort: None,
+                filter: Some(models::MessageSubscriptionFilter {
+                    process_definition_id: Some(models::StringFilterProperty::String(
+                        "multi".to_string(),
+                    )),
+                    ..models::MessageSubscriptionFilter::new()
+                }),
+            })
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(|i| i.message_name.clone()));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Sort by toolName ascending: alpha before zeta despite key order.
+        let r = search(models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: Some(vec![models::MessageSubscriptionSearchQuerySortRequest {
+                field: "toolName".to_string(),
+                order: Some(models::SortOrderEnum::Asc),
+            }]),
+            filter: None,
+        })
+        .await;
+        let tools: Vec<String> = r
+            .items
+            .into_iter()
+            .filter_map(|i| match i.tool_name {
+                types::Nullable::Present(t) => Some(t),
+                types::Nullable::Null => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_message_subscriptions_projects_tool_name_on_start_events() {
+        // MCP gateway parity (#1499): a process whose message start event
+        // carries `zeebe:properties` tool markers deploys a definition-scoped
+        // START_EVENT subscription whose `toolName` / `toolProperties` are
+        // projected from `io.camunda.tool:*`, and the `toolName` filter honours
+        // the Zeebe semantics (equality / `$like` on an absent value match no
+        // rows; `$exists: false` matches rows with no tool name; `$exists: true`
+        // matches rows that have one).
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+
+        // A tool-marked message start process (the vendored Camunda e2e
+        // fixture), a plain message start process (no tool markers), and an
+        // instance-scoped catch process (a PROCESS_EVENT row once running).
+        let tool_xml =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let tool = parse_bpmn(tool_xml).expect("tool fixture parses");
+        let plain = ProcessBuilder::new("plain-start")
+            .message_start_event("s", "plain-message")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid plain message-start process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("mcpProcessWithInputs".to_string(), "mcp.bpmn".to_string());
+        names.insert("plain-start".to_string(), "plain.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        let mut defs = tool;
+        defs.push(plain);
+        defs.push(waiter);
+        server
+            .deploy_resources_locally(
+                defs,
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Start an instance of the waiter so a PROCESS_EVENT row exists too.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until all three rows are projected (two START_EVENT + one
+        // PROCESS_EVENT).
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .expect("search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.len() == 3 {
+                items = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            items.len(),
+            3,
+            "two START_EVENT rows plus one PROCESS_EVENT row are projected"
+        );
+
+        // The tool-marked START_EVENT row carries the full tool metadata.
+        let tool_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "mcpProcessWithInputs")
+            .expect("the tool process's start subscription is projected");
+        assert_eq!(
+            tool_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(tool_row.element_id, "StartEvent_1");
+        assert_eq!(tool_row.message_name, "mcp-process-with-inputs");
+        assert_eq!(
+            tool_row.tool_name,
+            types::Nullable::Present("mcp-process-with-inputs".to_string())
+        );
+        assert_eq!(
+            tool_row.tool_properties.get("io.camunda.tool:input_1_name"),
+            Some(&"firstName".to_string())
+        );
+        assert_eq!(tool_row.tool_properties.len(), 9);
+        // A definition-scoped subscription is not bound to an instance.
+        assert_eq!(tool_row.process_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.element_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.correlation_key, types::Nullable::Null);
+        assert_eq!(
+            tool_row.message_subscription_state,
+            models::MessageSubscriptionStateEnum::Created
+        );
+        assert_eq!(
+            tool_row.process_definition_version,
+            types::Nullable::Present(1)
+        );
+
+        // The plain message start row is a START_EVENT with no tool metadata.
+        let plain_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "plain-start")
+            .expect("the plain process's start subscription is projected");
+        assert_eq!(
+            plain_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(plain_row.tool_name, types::Nullable::Null);
+        assert!(plain_row.tool_properties.is_empty());
+
+        // The instance-scoped catch row is a PROCESS_EVENT with no tool metadata.
+        let catch_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "waiter")
+            .expect("the waiter's catch subscription is projected");
+        assert_eq!(
+            catch_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::ProcessEvent
+        );
+        assert_eq!(catch_row.tool_name, types::Nullable::Null);
+        assert!(matches!(
+            catch_row.process_instance_key,
+            types::Nullable::Present(_)
+        ));
+
+        // Helper: run one filter and return the matched processDefinitionIds.
+        async fn matched_ids(
+            server: &ServerImpl,
+            filter: models::MessageSubscriptionFilter,
+        ) -> Vec<String> {
+            let resp = server
+                .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                }))
+                .await
+                .expect("filtered search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            let mut ids: Vec<String> = result
+                .items
+                .into_iter()
+                .map(|i| i.process_definition_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+        let tool_filter = |v: models::StringFilterProperty| models::MessageSubscriptionFilter {
+            tool_name: Some(v),
+            ..models::MessageSubscriptionFilter::new()
+        };
+
+        // toolName equality matches only the tool-marked START_EVENT row.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String(
+                    "mcp-process-with-inputs".to_string()
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // Equality on a value no row carries matches nothing.
+        assert!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String("nope".to_string()))
+            )
+            .await
+            .is_empty(),
+            "equality on an absent tool name matches no rows"
+        );
+        // `$like` behaves like equality w.r.t. absent values.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_like: Some("mcp-process-*".to_string()),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: true` matches only the row that has a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(true),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: false` matches every row without a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["plain-start".to_string(), "waiter".to_string()]
+        );
+
+        // messageSubscriptionType filters select each side.
+        let type_filter =
+            |t: models::MessageSubscriptionTypeEnum| models::MessageSubscriptionFilter {
+                message_subscription_type: Some(
+                    models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(t),
+                ),
+                ..models::MessageSubscriptionFilter::new()
+            };
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::StartEvent)
+            )
+            .await,
+            vec![
+                "mcpProcessWithInputs".to_string(),
+                "plain-start".to_string()
+            ]
+        );
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::ProcessEvent)
+            )
+            .await,
+            vec!["waiter".to_string()]
+        );
+
+        // Correlating the tool message starts a new instance of the tool
+        // process (the subscription mints instances; the START_EVENT row stays).
+        let correlate = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
+                name: "mcp-process-with-inputs".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .expect("correlate returns");
+        assert!(
+            matches!(
+                correlate,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ),
+            "the tool message starts an instance"
+        );
     }
 
     #[tokio::test]
@@ -35027,6 +37050,514 @@ mod clustered_startup_tests {
         ));
     }
 
+    /// #1551: `POST /v2/process-instances/migration` mints a trackable
+    /// `MIGRATE_PROCESS_INSTANCE` batch over every matched ACTIVE instance,
+    /// migrates the eligible ones with the request's plan, and records a FAILED
+    /// item (with the rejection reason) for each ineligible one, settling the
+    /// batch as `PARTIALLY_COMPLETED`.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_migrates_and_records_failures() {
+        use apis::batch_operation::{
+            GetBatchOperationResponse as GetResp, SearchBatchOperationItemsResponse as ItemsResp,
+        };
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+        let build = |id: &str, task: &str, job: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .service_task(task, job)
+                .end_event("e")
+                .connect("s", task)
+                .connect(task, "e")
+                .build()
+                .expect("valid definition")
+        };
+        let mut target_key = 0u64;
+        for (id, task, job) in [
+            ("order-v1", "work", "src-work"),
+            ("audit-v1", "audit", "audit-work"),
+            ("order-v2", "fulfil", "tgt-work"),
+        ] {
+            let mut names = std::collections::HashMap::new();
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+            let (deploy, _) = server
+                .deploy_resources_locally(
+                    vec![build(id, task, job)],
+                    &names,
+                    Vec::new(),
+                    &std::collections::HashMap::new(),
+                    "<default>",
+                )
+                .await
+                .expect("deploy");
+            if id == "order-v2" {
+                target_key = deploy
+                    .deployments
+                    .iter()
+                    .find_map(|d| match &d.process_definition {
+                        types::Nullable::Present(p) => Some(p.process_definition_key.0.clone()),
+                        _ => None,
+                    })
+                    .expect("target definition")
+                    .parse()
+                    .expect("numeric key");
+            }
+        }
+
+        // Two eligible order-v1 instances, one ineligible audit-v1 instance
+        // (its active `audit` element has no mapping instruction).
+        let mut eligible = Vec::new();
+        let mut ineligible = 0u64;
+        for id in ["order-v1", "order-v1", "audit-v1"] {
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .await
+                .expect("create instance");
+            if id == "audit-v1" {
+                ineligible = key;
+            } else {
+                eligible.push(key);
+            }
+        }
+        let all: Vec<u64> = eligible.iter().copied().chain([ineligible]).collect();
+        let mut projected = false;
+        for _ in 0..200 {
+            let matched = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                BatchHierarchyPolicy::HonourFilters,
+            );
+            if all.iter().all(|k| matched.contains(k)) {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "all instances project as ACTIVE");
+
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey(target_key.to_string()),
+                vec![models::MigrateProcessInstanceMappingInstruction::new(
+                    "work".to_string(),
+                    "fulfil".to_string(),
+                )],
+            ),
+        );
+        let created = match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("response")
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200 created, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::MigrateProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // Poll the batch until it settles.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let mut got = None;
+        for _ in 0..500 {
+            let r = match server.get_batch_operation_impl(&path).await.unwrap() {
+                GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                other => panic!("expected 200 get, got {other:?}"),
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                got = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the batch settles");
+        assert_eq!(
+            got.state,
+            models::BatchOperationStateEnum::PartiallyCompleted
+        );
+        assert_eq!(got.operations_total_count, 3);
+        assert_eq!(got.operations_completed_count, 2);
+        assert_eq!(got.operations_failed_count, 1);
+        assert!(got.end_date.is_present());
+
+        // Eligible instances were actually migrated onto order-v2. A terminal
+        // batch state does not guarantee the migration events have reached the
+        // read model (the in-memory journal queues them for the exporter
+        // without awaiting projection), so poll for the re-home with a bounded
+        // timeout — as the adjacent single-instance migration test does —
+        // rather than asserting against a possibly-stale row.
+        let mut rehomed = false;
+        for _ in 0..200 {
+            if eligible.iter().all(|key| {
+                server
+                    .store
+                    .process_instance(*key)
+                    .is_some_and(|rec| rec.process_definition_id == "order-v2")
+            }) {
+                rehomed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            rehomed,
+            "eligible instances project onto order-v2 after the batch settles"
+        );
+
+        // The ineligible item is FAILED with an error message.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r.items,
+            other => panic!("expected 200 items, got {other:?}"),
+        };
+        let failed = items
+            .iter()
+            .find(|i| i.batch_operation_key == batch_key && i.item_key == ineligible.to_string())
+            .expect("ineligible item recorded");
+        assert_eq!(failed.state, "FAILED");
+        assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
+    }
+
+    /// #1551: a malformed `targetProcessDefinitionKey` is rejected up front with
+    /// `400`, and no batch is minted.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_bad_target_key() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("not-a-key".to_string()),
+                Vec::new(),
+            ),
+        );
+        assert!(matches!(
+            server
+                .migrate_process_instances_batch_operation_impl(&req)
+                .await
+                .unwrap(),
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+        ));
+        assert!(server.batch_operations.all().is_empty());
+    }
+
+    /// #1551 review (Copilot): the filter schema (spec/process-instances.yaml)
+    /// deprecates `batchOperationId` in favour of `batchOperationKey` and
+    /// requires a `400` when BOTH are supplied. The migration endpoint must
+    /// enforce that up front — minting no batch — rather than fail-closed
+    /// matching the two unprojected fields into an empty (but registered)
+    /// batch.
+    #[tokio::test]
+    async fn migrate_process_instances_batch_operation_rejects_id_and_key_together() {
+        use apis::process_instance::MigrateProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let filter = models::ProcessInstanceFilter {
+            batch_operation_id: Some(s("2251799813685249")),
+            batch_operation_key: Some(s("2251799813685249")),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let req = models::ProcessInstanceMigrationBatchOperationRequest::new(
+            filter,
+            models::ProcessInstanceMigrationBatchOperationPlan::new(
+                models::ProcessDefinitionKey("1".to_string()),
+                Vec::new(),
+            ),
+        );
+        match server
+            .migrate_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for id+key together, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
+    /// #1552: `POST /v2/process-instances/modification` mints a trackable
+    /// `MODIFY_PROCESS_INSTANCE` batch over every matched ACTIVE instance and
+    /// applies the request's `moveInstructions` to each one (Zeebe
+    /// `ModifyProcessInstanceBatchOperationExecutor` parity): the matched
+    /// instances' tokens move from the source to the target element, an
+    /// instance whose active element is not the source is recorded FAILED with
+    /// the engine's reason, and the batch settles `PARTIALLY_COMPLETED`.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_moves_tokens_and_records_failures() {
+        use apis::batch_operation::{
+            GetBatchOperationResponse as GetResp, SearchBatchOperationItemsResponse as ItemsResp,
+        };
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+        // `move-me`: s → a(work-a) → b(work-b) → e. `other`: s → c(work-c) →
+        // b(work-b) → e (no `a` element, so a move from `a` matches nothing
+        // there — Zeebe records it as a per-item failure).
+        let build = |id: &str, task: &str, job: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .service_task(task, job)
+                .service_task("b", "work-b")
+                .end_event("e")
+                .connect("s", task)
+                .connect(task, "b")
+                .connect("b", "e")
+                .build()
+                .expect("valid definition")
+        };
+        for (id, task, job) in [("move-me", "a", "work-a"), ("other", "c", "work-c")] {
+            let mut names = std::collections::HashMap::new();
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+            server
+                .deploy_resources_locally(
+                    vec![build(id, task, job)],
+                    &names,
+                    Vec::new(),
+                    &std::collections::HashMap::new(),
+                    "<default>",
+                )
+                .await
+                .expect("deploy");
+        }
+
+        // Two eligible move-me instances (parked on `a`), one other instance
+        // (parked on `c`; the move from `a` matches nothing there — Zeebe
+        // records it as a per-item failure).
+        let mut eligible = Vec::new();
+        let mut ineligible = 0u64;
+        for id in ["move-me", "move-me", "other"] {
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .await
+                .expect("create instance");
+            if id == "other" {
+                ineligible = key;
+            } else {
+                eligible.push(key);
+            }
+        }
+        let all: Vec<u64> = eligible.iter().copied().chain([ineligible]).collect();
+        let mut projected = false;
+        for _ in 0..200 {
+            let matched = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                BatchHierarchyPolicy::HonourFilters,
+            );
+            if all.iter().all(|k| matched.contains(k)) {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "all instances project as ACTIVE");
+
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            vec![
+                models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                    "a".to_string(),
+                    "b".to_string(),
+                ),
+            ],
+        );
+        let created = match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("response")
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200 created, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::ModifyProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // Poll the batch until it settles.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let mut got = None;
+        for _ in 0..500 {
+            let r = match server.get_batch_operation_impl(&path).await.unwrap() {
+                GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                other => panic!("expected 200 get, got {other:?}"),
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                got = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the batch settles");
+        assert_eq!(
+            got.state,
+            models::BatchOperationStateEnum::PartiallyCompleted
+        );
+        assert_eq!(got.operations_total_count, 3);
+        assert_eq!(got.operations_completed_count, 2);
+        assert_eq!(got.operations_failed_count, 1);
+
+        // The eligible instances' tokens actually moved from `a` to `b`. A
+        // terminal batch state does not guarantee the modification events have
+        // reached the read model, so poll for the move with a bounded timeout
+        // (as the batch-migration test does).
+        let mut moved = false;
+        for _ in 0..200 {
+            if eligible.iter().all(|key| {
+                let elements = server.store.element_instances();
+                let active = |element_id: &str| {
+                    elements.iter().any(|e| {
+                        e.instance_key == *key
+                            && e.element_id == element_id
+                            && e.state == crate::readstore::ElementInstanceState::Active
+                    })
+                };
+                !active("a") && active("b")
+            }) {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            moved,
+            "eligible instances project the moved token (a terminated, b active)"
+        );
+
+        // The ineligible item is FAILED with an error message.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r.items,
+            other => panic!("expected 200 items, got {other:?}"),
+        };
+        let failed = items
+            .iter()
+            .find(|i| i.batch_operation_key == batch_key && i.item_key == ineligible.to_string())
+            .expect("ineligible item recorded");
+        assert_eq!(failed.state, "FAILED");
+        assert!(matches!(&failed.error_message, types::Nullable::Present(m) if !m.is_empty()));
+    }
+
+    /// #1552: an empty `moveInstructions` array is rejected up front with `400`
+    /// (Zeebe `ERROR_MESSAGE_EMPTY_ATTRIBUTE.formatted("moveInstructions")`),
+    /// and no batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_empty_move_instructions() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+            Vec::new(),
+        );
+        match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for empty moveInstructions, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
+    /// #1552: a move instruction with a blank source or target element id is
+    /// rejected up front with `400` (Zeebe `validateMoveBatchInstructions`),
+    /// and no batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_blank_element_ids() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        for (source, target) in [("", "b"), ("a", "")] {
+            let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+                models::ProcessInstanceFilter::new(),
+                vec![
+                    models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                        source.to_string(),
+                        target.to_string(),
+                    ),
+                ],
+            );
+            match server
+                .modify_process_instances_batch_operation_impl(&req)
+                .await
+                .unwrap()
+            {
+                Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                    assert_eq!(p.status, 400);
+                }
+                other => {
+                    panic!("expected 400 for ({source:?} -> {target:?}), got {other:?}")
+                }
+            }
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
+    /// #1552: the filter schema (spec/process-instances.yaml) deprecates
+    /// `batchOperationId` in favour of `batchOperationKey` and requires a `400`
+    /// when BOTH are supplied — the modification endpoint enforces the same
+    /// contract as the migration endpoint, before any batch is minted.
+    #[tokio::test]
+    async fn modify_process_instances_batch_operation_rejects_id_and_key_together() {
+        use apis::process_instance::ModifyProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let filter = models::ProcessInstanceFilter {
+            batch_operation_id: Some(s("2251799813685249")),
+            batch_operation_key: Some(s("2251799813685249")),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let req = models::ProcessInstanceModificationBatchOperationRequest::new(
+            filter,
+            vec![
+                models::ProcessInstanceModificationMoveBatchOperationInstruction::new(
+                    "a".to_string(),
+                    "b".to_string(),
+                ),
+            ],
+        );
+        match server
+            .modify_process_instances_batch_operation_impl(&req)
+            .await
+            .unwrap()
+        {
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(p) => {
+                assert_eq!(p.status, 400);
+            }
+            other => panic!("expected 400 for id+key together, got {other:?}"),
+        }
+        assert!(
+            server.batch_operations.all().is_empty(),
+            "no batch operation is registered for a rejected request"
+        );
+    }
+
     /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
     /// core the v2 REST API shares — end to end: a service-task instance waiting
     /// on a job is migrated onto a second definition, the read model re-homes
@@ -35304,9 +37835,53 @@ mod clustered_startup_tests {
         assert!(ok, "b active, a terminated, x=42 on the root scope");
     }
 
-    /// 400: an unknown element id and an engine 'not yet supported' instruction
-    /// (a move instruction) are INVALID_ARGUMENT carrying the
-    /// engine's message; a malformed element-instance key is 400 too.
+    /// #1552: a `moveInstructions` request on the single-instance endpoint
+    /// moves the token — the full REST → engine move path (the instruction was
+    /// previously rejected `not yet supported`).
+    #[tokio::test]
+    async fn modify_instance_moves_a_token_via_rest() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let (instance_key, _) = modify_fixture(&server).await;
+
+        let resp = modify_via_rest(
+            &server,
+            &instance_key.to_string(),
+            serde_json::json!({
+                "moveInstructions": [{
+                    "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                    "targetElementId": "b"
+                }]
+            }),
+        )
+        .await;
+        assert!(
+            matches!(resp, Resp::Status204_TheProcessInstanceIsModified),
+            "unexpected response: {resp:?}"
+        );
+
+        let mut moved = false;
+        for _ in 0..200 {
+            let rows = server.store.element_instances();
+            let active = |element_id: &str| {
+                rows.iter().any(|e| {
+                    e.instance_key == instance_key
+                        && e.element_id == element_id
+                        && e.state == crate::readstore::ElementInstanceState::Active
+                })
+            };
+            if !active("a") && active("b") {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(moved, "the token moved from a to b");
+    }
+
+    /// 400: an unknown element id (activate target or move target) is
+    /// INVALID_ARGUMENT carrying the engine's message; a malformed
+    /// element-instance key is 400 too.
     #[tokio::test]
     async fn modify_instance_invalid_instruction_is_400() {
         use apis::process_instance::ModifyProcessInstanceResponse as Resp;
@@ -35325,28 +37900,24 @@ mod clustered_startup_tests {
             "unknown element: {resp:?}"
         );
 
+        // Move instructions are acted on (#1552): a move to an UNKNOWN target
+        // element is a 400 (the engine's ElementNotFound), never silently
+        // ignored.
         let resp = modify_via_rest(
             &server,
             &key,
             serde_json::json!({
                 "moveInstructions": [{
                     "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
-                    "targetElementId": "b"
+                    "targetElementId": "nope"
                 }]
             }),
         )
         .await;
-        let expected = nanobpmn_engine_core::EngineError::ModificationInstructionNotYetSupported {
-            instance_key,
-            instruction: "move_instructions",
-        }
-        .to_string();
-        match &resp {
-            Resp::Status400_TheProvidedDataIsNotValid(p) => {
-                assert_eq!(p.detail, expected);
-            }
-            other => panic!("move instructions must be 400 not-yet-supported: {other:?}"),
-        }
+        assert!(
+            matches!(&resp, Resp::Status400_TheProvidedDataIsNotValid(p) if p.status == 400),
+            "unknown move target: {resp:?}"
+        );
 
         let resp = modify_via_rest(
             &server,
@@ -35407,6 +37978,48 @@ mod clustered_startup_tests {
     /// (root-scope aliases — absent/empty `scopeId` or the process id — stay
     /// in `variable_instructions` for the engine to resolve), terminate by id,
     /// and move instructions.
+    /// An omitted ancestor scope and an explicit `direct`/`-1` are the
+    /// spec's default find-or-create resolution (`Direct(0)`); only an
+    /// explicit `inferred` instruction maps to source-hierarchy inference.
+    #[test]
+    fn modify_move_default_ancestor_scope_is_direct_not_inferred() {
+        use nanobpmn_engine_core::AncestorScopeInstruction;
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(serde_json::json!({
+                "moveInstructions": [
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                        "targetElementId": "b"
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "c" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "direct", "ancestorElementInstanceKey": "-1" }
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "d" },
+                        "targetElementId": "b",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "inferred" }
+                    }
+                ]
+            }))
+            .expect("well-formed body");
+        let i = modify_instructions_from_rest(&body).expect("maps");
+        let scopes: Vec<_> = i
+            .move_instructions
+            .iter()
+            .map(|m| m.ancestor_scope.clone())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Direct(0),
+                AncestorScopeInstruction::Inferred,
+            ]
+        );
+    }
+
     #[test]
     fn modify_instructions_map_full_request_shape() {
         use nanobpmn_engine_core::{AncestorScopeInstruction, MoveSource};
@@ -39506,11 +42119,9 @@ mod clustered_startup_tests {
                 tally.created += 1;
             }
         }
-        // Fire the timers while their instances are still hot. (The Raft tick's
-        // pre-check only sees HOT timers, so a timer whose instance is cold on
-        // the leader is never proposed — a liveness defect tracked in #1483;
-        // it cannot cause replica divergence because nothing is
-        // proposed.)
+        // Fire the timers while their instances are still hot. (The cold-on-
+        // the-leader tick path is exercised separately by
+        // `raft_tick_fires_timers_of_cold_spilled_instances` — #1483.)
         let far_future = now_millis() + 600_000;
         parity_tick(nodes, far_future).await;
         // Create/tick acks are leader-durable: they do NOT wait for the
@@ -39716,6 +42327,44 @@ mod clustered_startup_tests {
         assert!(
             active < tally.created,
             "the parity comparison covers completed instances too"
+        );
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #1483 guard: the Raft tick pre-check must see a timer whose instance is
+    /// COLD on the leader. Spilling before the tick used to leave the hot-only
+    /// gate blind, so `TriggerTimers` was never proposed and the timer never
+    /// fired (`do-timed` jobs never created). Now the hot ∪ cold probe proposes
+    /// the tick, which rehydrates the instance and fires the timer on every
+    /// replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raft_tick_fires_timers_of_cold_spilled_instances() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        for node in nodes {
+            node.create_for_stream(Some("timed".into()), None, Default::default())
+                .await
+                .expect("timed create acks");
+        }
+        // Spill BEFORE the tick: every timed instance is cold on every replica,
+        // so the leader's pre-check sees no hot timer at all.
+        let spill = parity_force_spill(nodes).await;
+        assert!(
+            spill.cold >= 3,
+            "every timed instance spilled (cold={}, var={})",
+            spill.cold,
+            spill.var
+        );
+        let far_future = now_millis() + 600_000;
+        parity_tick(nodes, far_future).await;
+        parity_barrier(nodes).await;
+        let mut timed_completed = 0;
+        for node in nodes {
+            timed_completed += parity_activate_complete(node, "do-timed", 3).await;
+        }
+        assert_eq!(
+            timed_completed, 3,
+            "the tick fired the cold-spilled timers, so every do-timed job completes"
         );
         parity_shutdown(nodes, handles).await;
     }
@@ -40799,6 +43448,188 @@ mod clustered_startup_tests {
         );
 
         for node in survivors {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// #1582: bounded re-drive of a routed forward across an RF=3 leader change.
+    /// Deterministic fixture: the FIRST forward of the routed subscription open
+    /// is forced to fail with a test barrier — the source's peer view of the
+    /// subscription partition's owner (node 1) is fault-injected unreachable for
+    /// exactly the first attempt, then healed — so the re-drive path is
+    /// exercised by construction, not by racing an election. Node 1 is then
+    /// stopped (a real leader change), and the re-drive must re-resolve the new
+    /// leader and deliver, with exactly-once effects: one instance, exactly one
+    /// armed subscription on every surviving replica, one completion — and no
+    /// resurrection of the subscription after the correlation closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn routed_forward_is_redriven_across_a_leader_change() {
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("start")
+            .message_intermediate_catch_event("catch", "go", "orderId")
+            .end_event("end")
+            .connect("start", "catch")
+            .connect("catch", "end")
+            .build()
+            .expect("valid waiter process");
+        let (node0, node1, node2, handles) =
+            boot_rf3_intake_cluster_with(false, false, None, None, vec![waiter]).await;
+        let sub_partition = 1u64;
+        let order_id = (0..)
+            .map(|i| format!("redrive-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == sub_partition)
+            .expect("some key hashes to partition 1");
+
+        // Force the FIRST forward to fail deterministically: from node 0's peer
+        // view, node 1 (partition 1's current leader) is unreachable. `fail_node`
+        // drops the cached link and fails the dial, so attempt 0 is a transient
+        // transport failure regardless of election timing. `PeerSet` is `Clone`
+        // over shared state, so healing through this handle lifts the barrier.
+        let node0_peers = node0.peers.clone();
+        node0_peers.fail_node(1).await;
+
+        let create = {
+            let node = node0.clone();
+            let order = order_id.clone();
+            tokio::spawn(async move {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("orderId".to_string(), Value::Str(order));
+                node.create_for_stream(Some("waiter".into()), None, vars)
+                    .await
+            })
+        };
+        // Wait until the re-drive has actually retried once — proof the first
+        // forward failed — then heal the link so the NEXT attempt can deliver.
+        let mut retried = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0.route_redrives.load(Ordering::Relaxed) > 0 {
+                retried = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            retried,
+            "the first forward must fail under the injected partition, forcing a re-drive"
+        );
+        // Now stop node 1 for real (the leader change) and heal the source's
+        // peer view so the re-drive re-resolves and reaches the NEW leader.
+        for p in 0..3u64 {
+            if let Some(part) = node1.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[1].abort();
+        node0_peers.heal_node(1).await;
+
+        let (instance_key, _) = create
+            .await
+            .expect("create task")
+            .expect("create commits on partition 0 (quorum node0+node2)");
+        assert_ne!(partition_of(instance_key), sub_partition);
+
+        let sub_count = |node: &ServerImpl| {
+            let node = node.clone();
+            async move {
+                let Some(handle) = node.engine_handle_for(sub_partition) else {
+                    return 0usize;
+                };
+                handle
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .filter(|s| {
+                                s.instance_key == instance_key
+                                    && s.state
+                                        == nanobpmn_engine_core::MessageSubscriptionState::Open
+                            })
+                            .count()
+                    })
+                    .await
+            }
+        };
+        let mut delivered = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if sub_count(&node0).await == 1 && sub_count(&node2).await == 1 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            delivered,
+            "the re-drive must deliver the routed open to the new partition-1 leader"
+        );
+        // The re-drive was already proven above (the test waited for the first
+        // retry before healing the barrier), so no second timing-dependent
+        // assertion on `route_redrives` is needed here.
+        let instances = node0
+            .engine_handle_for(partition_of(instance_key))
+            .expect("instance partition")
+            .with(|j| j.state().instances.len())
+            .await;
+        assert_eq!(instances, 1, "exactly one instance");
+
+        let taps = [
+            tap_replica_events(&node0, partition_of(instance_key)).await,
+            tap_replica_events(&node2, partition_of(instance_key)).await,
+        ];
+        let (message_key, _) = node0
+            .correlate_message_cluster("go".into(), order_id.clone(), None, None)
+            .await
+            .expect("publish succeeds");
+        assert!(message_key.is_some());
+        let mut completions = [0usize, 0usize];
+        for _ in 0..250 {
+            for (n, tap) in completions.iter_mut().zip(&taps) {
+                while let Ok(batch) = tap.try_recv() {
+                    *n += batch
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key))
+                        .count();
+                }
+            }
+            if completions.iter().all(|n| *n >= 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completions,
+            [1, 1],
+            "exactly one completion per surviving replica"
+        );
+
+        // No resurrection: the correlated subscription is no longer open and
+        // stays so (a late re-delivery of the open is deduped), and a second
+        // publish correlates nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            sub_count(&node0).await,
+            0,
+            "no resurrected subscription (node0)"
+        );
+        assert_eq!(
+            sub_count(&node2).await,
+            0,
+            "no resurrected subscription (node2)"
+        );
+        let (_, correlated) = node0
+            .correlate_message_cluster("go".into(), order_id, None, None)
+            .await
+            .expect("second publish succeeds");
+        assert_eq!(correlated, None, "nothing left to correlate");
+
+        for node in [&node0, &node2] {
             for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
@@ -45255,6 +48086,710 @@ mod subscription_placement_tests {
         );
     }
 
+    /// #1582 (crash window): the pipelined non-Raft stream path acks before
+    /// fsync, so its cross-partition routing must wait for the SOURCE write to
+    /// become durable. A source that never persists (writer gone unacked — the
+    /// crash case) must route nothing, otherwise a peer durably records a close
+    /// identity the source then loses and a reused delivery key is silently
+    /// deduped. Once durable, the same follow-up routes.
+    #[tokio::test]
+    async fn pipelined_routing_is_gated_on_source_durability() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("gate-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, _) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            let sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if sub != nanobpmn_engine_core::partition_of(key) {
+                chosen = Some((sub, key));
+                break;
+            }
+        }
+        let (sub_partition, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let armed = || {
+            let handle = server
+                .engine_handle_for(sub_partition)
+                .expect("subscription partition is local");
+            async move {
+                handle
+                    .with(move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.instance_key == instance_key
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    })
+                    .await
+            }
+        };
+        // `create_for_stream` answers at source durability, before its detached
+        // routing task opens the subscription: wait (bounded) for it to arm.
+        let mut is_armed = false;
+        for _ in 0..200 {
+            if armed().await {
+                is_armed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(is_armed, "the routed subscription is armed");
+
+        let (events, commit) = server
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+            .expect("cancel succeeds");
+        commit.wait().await;
+
+        // The source write never becomes durable: nothing may be routed.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        drop(tx);
+        let routed = routing.expect("cancel emits a routable close").await;
+        assert!(!routed.expect("gate task"), "no routing before durability");
+        assert!(
+            !caller.wait_durable().await,
+            "the caller sees the same outcome"
+        );
+        assert!(
+            armed().await,
+            "the close was withheld from the peer partition"
+        );
+
+        // The same follow-up routes once the source is durable.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        tx.send(()).expect("gate listening");
+        assert!(routing.expect("routable").await.expect("gate task"));
+        assert!(caller.wait_durable().await);
+        assert!(
+            !armed().await,
+            "the durable close disarmed the subscription"
+        );
+    }
+
+    /// #1582 (cancellation window): the create's actor round-trip, commit wait,
+    /// and post-commit routing all run inside ONE detached owner task
+    /// ([`ServerImpl::submit_create_detached`]), so a caller that is cancelled
+    /// (drops its observation) at ANY point — even while the command is still
+    /// queued on the engine actor, whose dropped reply receiver does NOT stop
+    /// the queued apply — cannot strand a persisted create without its routing.
+    /// Model the cancelled caller by dropping the observation receiver before
+    /// the create is submitted: the instance must still be created and its
+    /// cross-partition subscription still routed open.
+    #[tokio::test]
+    async fn create_routing_survives_cancellation_before_submission() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        // Find a correlation key whose canonical subscription partition differs
+        // from the partition the create will land on, so the opening follow-up
+        // is genuinely routable.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("orphan-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
+                break;
+            }
+        }
+        let order = chosen.expect("a cross-partition correlation key exists");
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        // The caller is CANCELLED immediately: it never observes the outcome.
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        drop(rx);
+
+        // The detached owner still applied the create, awaited durability, and
+        // routed the subscription open to its canonical partition.
+        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let handle = server
+            .engine_handle_for(sub_partition)
+            .expect("subscription partition is local");
+        let mut armed = false;
+        for _ in 0..100 {
+            let found = handle
+                .with({
+                    let order = order.clone();
+                    move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.correlation_key == order
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    }
+                })
+                .await;
+            if found {
+                armed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            armed,
+            "the detached owner routed the subscription open after the caller was cancelled"
+        );
+    }
+
+    /// #1582: a detached create whose apply FAILS still answers its observer
+    /// with the error (nothing was written, so nothing routes) — the detached
+    /// owner must not swallow rejections.
+    #[tokio::test]
+    async fn detached_create_reports_apply_errors() {
+        let server = single_node_multi_partition();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("not-deployed".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("an unknown process id is rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "the apply error reaches the observer");
+        assert!(
+            err.1.contains("not-deployed"),
+            "the error names the missing process: {}",
+            err.1
+        );
+    }
+
+    /// #1582: a create whose write never becomes durable (the writer went away
+    /// without acking) must NOT be acknowledged — the instance would disappear
+    /// on restart. The detached owner answers a retryable 500 and routes
+    /// nothing. Model the dead writer by forcing the create's commit to
+    /// [`Commit::failed`].
+    #[tokio::test]
+    async fn detached_create_reports_durable_failure() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            // Simulate the writer dying before it could persist the create.
+            created.commit = Commit::failed();
+            Ok(created)
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("a create that never persisted must not be acknowledged"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "a non-durable create is a retryable 500");
+        assert!(
+            err.1.contains("not persisted durably"),
+            "the error says the write was not durable: {}",
+            err.1
+        );
+    }
+
+    /// #1582: the admission accounting (processing slot + payload bytes) is
+    /// TRANSFERRED into the detached create owner and released only when the
+    /// actor finishes — a caller that is cancelled (drops its observation)
+    /// while the create is still queued must NOT release the charge early, or
+    /// repeated cancelled requests would undercount the watermarks.
+    ///
+    /// Deterministic: a FIFO barrier job at the same (Low/create) priority is
+    /// queued ahead of the create and parked on a oneshot, so the create is
+    /// guaranteed to still be QUEUED on the engine actor when the caller is
+    /// cancelled. The charge must stay entered across the cancellation and only
+    /// drain once the barrier is released and the actor finishes the create —
+    /// an implementation that released accounting on cancellation would fail
+    /// the "still charged while queued" assertion.
+    #[tokio::test]
+    async fn cancelled_create_holds_admission_charge_until_actor_finishes() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let payload_bytes = 128u64;
+        let processing_before = server.processing.load(Ordering::Relaxed);
+        let bytes_before = server.pipeline_bytes.load(Ordering::Relaxed);
+
+        // Park the create-priority queue on ONE chosen partition: a barrier job
+        // at Low priority runs FIRST (FIFO within a priority) and blocks until
+        // released, so the create queued behind it stays pending on the actor.
+        // `for_create()` round-robins across partitions, so the create is
+        // submitted through the partition-pinned `submit_create_detached_on`
+        // onto the SAME actor the barrier parks — otherwise the two could land
+        // on different partitions and the barrier would not order the create.
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let barrier_engine = create_engine.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            barrier_engine
+                .with_low(move |_journal| {
+                    // Signal the barrier holds the actor, then park until released.
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx
+            .await
+            .expect("the barrier job is running on the actor");
+
+        let accounting = CreateAccounting::enter(&server, payload_bytes);
+        // The charge is visible from the moment the request arrives.
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes
+        );
+        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        // Cancel the caller while its create is still QUEUED behind the barrier.
+        drop(rx);
+
+        // Give the detached owner every chance to (wrongly) release the charge
+        // on cancellation: while the barrier holds the actor the create cannot
+        // finish, so the charge MUST remain entered.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1,
+            "the processing slot stays charged while the cancelled create is still queued"
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes,
+            "the payload bytes stay charged while the cancelled create is still queued"
+        );
+
+        // Release the barrier: the create now runs to completion and the
+        // detached owner releases the charge once the actor finishes.
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier job completes");
+        let mut released = false;
+        for _ in 0..100 {
+            if server.processing.load(Ordering::Relaxed) == processing_before
+                && server.pipeline_bytes.load(Ordering::Relaxed) == bytes_before
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the detached owner released the admission charge after the actor finished"
+        );
+    }
+
+    /// #1582: the non-Raft detached create owner drives the cross-partition
+    /// routing pump BEFORE answering its observer, so a client that publishes a
+    /// message the moment the create returns finds the subscription already
+    /// open — the create-then-publish ordering `main` has always given. An
+    /// answer-before-routing implementation lets that immediate publish
+    /// overtake the subscription open; the unmatched message is discarded and
+    /// the instance stays parked.
+    ///
+    /// Deterministic: the create's `Commit` is replaced by a
+    /// [`Commit::from_ack`] the test holds open, so the owner provably parks in
+    /// `wait_durable()` (with routing not yet started) until the gate opens.
+    /// After the gate opens the observer must resolve only because routing
+    /// already ran: the publish right after the answer MUST correlate, with no
+    /// wait for the subscription to arm.
+    #[tokio::test]
+    async fn detached_create_publish_right_after_answer_correlates() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        // A correlation key whose canonical subscription partition differs from
+        // the create's partition, so the opening follow-up is genuinely routed.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("stall-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
+                break;
+            }
+        }
+        let order = chosen.expect("a cross-partition correlation key exists");
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+
+        // The durability gate the test holds open: the create's commit is
+        // replaced by this ack, so the owner blocks in `wait_durable()` until
+        // the test releases it — the stand-in for a slow routing target.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            created.commit = Commit::from_ack(ack_rx);
+            Ok(created)
+        });
+
+        // While the durability gate is shut the observer must be UNANSWERED —
+        // the reply is gated on durability, and routing has not even started.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut rx = rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "no answer before the create is durable"
+        );
+
+        // Open the gate: the write is now durable. The owner drives the routing
+        // pump FIRST and answers only once the cross-partition subscription is
+        // open, so the observer resolves with routing already complete.
+        ack_tx.send(()).expect("the durability gate is held");
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered once routing has run")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(created.instance_key > 0, "a real instance key");
+
+        // The guarantee the ordering buys: a publish issued the MOMENT the
+        // create returns correlates — the subscription is already open on its
+        // canonical partition, so the message is not discarded as unmatched.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".to_string(),
+                order.clone(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("the publish applies");
+        assert_eq!(
+            correlated,
+            Some(created.instance_key),
+            "a publish right after the create answer correlates to the new instance"
+        );
+    }
+
+    /// #1582: a source with no replica of the target rotates its forwards
+    /// through the target's replica set (never pinned to the static owner,
+    /// which may be a dead former leader), skipping itself.
+    #[test]
+    fn forward_candidate_rotates_through_the_replica_set() {
+        let picks: Vec<u32> = (0..6)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 0, a))
+            .collect();
+        assert_eq!(picks, vec![1, 2, 3, 1, 2, 3]);
+        // Self is skipped (a replica host normally uses its leader view, but
+        // the rotation itself must never address this node).
+        let picks: Vec<u32> = (0..4)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 2, a))
+            .collect();
+        assert_eq!(picks, vec![1, 3, 1, 3]);
+        assert_eq!(ServerImpl::rotate_replica(&[2], 2, 0), None);
+    }
+
+    /// #1582: only keyed (deduped) routed commands may have their proposal
+    /// observation time out; an unkeyed publish must not, or a late commit
+    /// plus a republish would create duplicate message-start instances.
+    #[test]
+    fn only_keyed_routed_commands_are_observation_bounded() {
+        let publish = Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: Default::default(),
+            business_id: None,
+        };
+        assert!(!ServerImpl::routed_command_is_idempotent(&publish));
+        let num_partitions = 4;
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: Default::default(),
+        };
+        let (_, routed) =
+            ServerImpl::route_event(&opening, num_partitions).expect("opening is routable");
+        // A zero (legacy) delivery key is the engine's no-dedup sentinel.
+        assert!(!ServerImpl::routed_command_is_idempotent(&routed));
+        assert_eq!(ServerImpl::redrive_attempts(&routed), 1);
+        assert_eq!(ServerImpl::redrive_attempts(&publish), 1);
+        let keyed_opening = match opening {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                ..
+            } => Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key: 7,
+            },
+            other => other,
+        };
+        let (_, keyed) =
+            ServerImpl::route_event(&keyed_opening, num_partitions).expect("opening is routable");
+        assert!(ServerImpl::routed_command_is_idempotent(&keyed));
+        assert_eq!(
+            ServerImpl::redrive_attempts(&keyed),
+            ROUTE_REDRIVE.max_attempts
+        );
+    }
+
+    /// #1582: the observer of a detached proposal never sees routable
+    /// follow-ups — the proposer task alone routes them, so a result that
+    /// races the observer's timeout cannot drop them nor route them twice.
+    #[test]
+    fn observed_proposal_result_excludes_routable_follow_ups() {
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: 9,
+        };
+        let other = Event::DecisionInstanceDeleted {
+            instance_key: 2,
+            decision_evaluation_key: 4,
+        };
+        assert!(ServerImpl::is_routable_event(&opening));
+        let item = crate::raft::ReplicatedItem {
+            events: vec![opening, other.clone()],
+            error: None,
+        };
+        let stripped = ServerImpl::strip_routable(Ok(item)).expect("ok preserved");
+        assert_eq!(stripped.events, vec![other]);
+    }
+
+    /// #1582: transient non-delivery (5xx, the 503 leader race, transport
+    /// failures) is retried; a 4xx is permanent; the backoff is bounded.
+    #[test]
+    fn route_attempt_classification_and_backoff_are_bounded() {
+        use nano_server_raft::peer::{PeerError, PeerResult};
+        assert_eq!(
+            RouteAttempt::from_status(200, String::new()),
+            RouteAttempt::Delivered
+        );
+        assert!(matches!(
+            RouteAttempt::from_status(404, "x".into()),
+            RouteAttempt::Rejected(404, _)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(503, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(500, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        for e in [
+            PeerError::Closed,
+            PeerError::Timeout,
+            PeerError::Connect("refused".into()),
+        ] {
+            assert!(matches!(
+                RouteAttempt::from_peer(Err(e)),
+                RouteAttempt::Transient(_)
+            ));
+        }
+        let reply = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert_eq!(
+            RouteAttempt::from_peer(Ok(reply)),
+            RouteAttempt::Rejected(409, "conflict".into())
+        );
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(1),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(2),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(ROUTE_REDRIVE.backoff(40), ROUTE_REDRIVE.cap);
+        let total: std::time::Duration = (1..ROUTE_REDRIVE.max_attempts)
+            .map(|a| ROUTE_REDRIVE.backoff(a))
+            .sum();
+        assert!(
+            total >= std::time::Duration::from_secs(5),
+            "rides out an election: {total:?}"
+        );
+        assert!(
+            total <= std::time::Duration::from_secs(30),
+            "bounded: {total:?}"
+        );
+    }
+
+    /// #1582: a forwarded create whose transport outcome is AMBIGUOUS — the peer
+    /// link closed, or the request timed out, after the create may have been sent
+    /// — must NOT be retried when the create carries no business id, because the
+    /// peer may already have committed it and a blind retry mints a duplicate
+    /// instance. The bounded forward loop (`forward_create_bounded`) surfaces such
+    /// an outcome as a retryable-via-client 500 instead of re-driving, mirroring
+    /// the REST path (`forward_create_once`), which already maps any transport
+    /// `Err` to a non-rerouted 502. A create WITH a business id dedups on retry,
+    /// so only the unkeyed case is guarded.
+    ///
+    /// This pins the *classification* the guard relies on: a link-closed reply is
+    /// distinguishable from a timeout, and BOTH are ambiguous for an unkeyed
+    /// create (unlike a deterministic 400/409 rejection, which is safe to surface
+    /// directly, or a clean 200, which is a committed success).
+    #[test]
+    fn unkeyed_create_ambiguous_outcomes_are_not_retried() {
+        use nano_server_raft::peer::{PeerResult, is_link_closed_result};
+        // The two ambiguous outcomes the guard must catch for an unkeyed create:
+        // a synthetic link-closed reply (status 502 + LINK_CLOSED_BODY) ...
+        let link_closed = PeerResult {
+            status: 502,
+            body: Some(serde_json::Value::String(
+                nano_server_raft::peer::LINK_CLOSED_BODY.into(),
+            )),
+        };
+        assert!(is_link_closed_result(&link_closed));
+        // ... and a transport timeout, which surfaces as `Err(PeerError::Timeout)`
+        // (distinct from a link-closed `Ok` reply) and is matched by the
+        // `Err(e) if business_id.is_none()` guard arm.
+        // A deterministic rejection is NOT ambiguous and must keep surfacing
+        // directly (the 400/409 short-circuit arms precede the guard).
+        let conflict = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert!(!is_link_closed_result(&conflict));
+        // A clean success is likewise unambiguous.
+        let ok = PeerResult {
+            status: 200,
+            body: None,
+        };
+        assert!(!is_link_closed_result(&ok) && is_ok_status(ok.status));
+    }
+
     /// start -> serviceTask "work" with an interrupting message boundary keyed on
     /// `orderId` -> end. The boundary subscription opens when the task activates;
     /// when its canonical home is another partition, the publish must interrupt
@@ -46727,6 +50262,125 @@ mod batch_operation_tests {
     }
 
     #[tokio::test]
+    async fn executor_honours_suspend_resume_and_cancel_between_items() {
+        // #1551 review (execution-level coverage): the batch executor
+        // (`drive_process_instance_batch`) must honour the lifecycle *between*
+        // items — suspension blocks the next item, resumption continues
+        // processing, and cancellation leaves the remaining items unprocessed
+        // without the final `finish` overwriting CANCELED. The store-level state
+        // machine is covered above; this drives the real executor loop with a
+        // gated per-item closure so the behaviour is pinned deterministically.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = ServerImpl::default();
+        // A gate the executor must wait on before applying each item, so the
+        // test controls exactly when item N is processed.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let apply_gate = gate.clone();
+        let apply_started = started.clone();
+        let key = server.drive_process_instance_batch(
+            models::BatchOperationTypeEnum::MigrateProcessInstance,
+            vec![1, 2, 3],
+            move |_server, _item| {
+                let gate = apply_gate.clone();
+                let started = apply_started.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    // Park until the test releases this item.
+                    gate.notified().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // Poll the store until `want` items have been *started* (bounded).
+        let wait_started = |want: usize| {
+            let started = started.clone();
+            async move {
+                for _ in 0..200 {
+                    if started.load(Ordering::SeqCst) >= want {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("timed out waiting for {want} item(s) to start");
+            }
+        };
+        let state = |k: u64| server.batch_operations.state(k);
+
+        // --- Suspend before the first item: nothing may start. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        // Give the executor ample opportunity to (incorrectly) start item 1.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "a suspended batch must not start any item"
+        );
+
+        // --- Resume: item 1 starts; release it and let it complete. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Active);
+        wait_started(1).await;
+        gate.notify_one();
+        // Wait for item 1 to be recorded COMPLETED and item 2 to start.
+        wait_started(2).await;
+
+        // --- Suspend again: item 2 is parked on the gate; even after releasing
+        // the gate the executor must not start item 3 while suspended. ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Suspended);
+        gate.notify_one(); // release item 2
+        // Item 2 completes, then the executor parks on the suspended state.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a re-suspended batch must not start item 3"
+        );
+
+        // --- Cancel while suspended: item 3 never starts, and the terminal
+        // CANCELED state is not overwritten by finish(). ---
+        server
+            .batch_operations
+            .transition(key, models::BatchOperationStateEnum::Canceled);
+        // The executor is parked in its suspend-poll; the next poll observes the
+        // terminal CANCELED state and returns (the `_ => return` arm), so the
+        // loop exits without driving item 3 or reaching finish(). Give it time
+        // to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "a canceled batch must not start the remaining item"
+        );
+        assert_eq!(
+            state(key),
+            Some(models::BatchOperationStateEnum::Canceled),
+            "finish() must not overwrite the terminal CANCELED state"
+        );
+
+        // The two processed items are COMPLETED; the unprocessed item stays
+        // ACTIVE (never driven to a terminal item state).
+        let rec = server.batch_operations.get(key).expect("batch present");
+        let item_state = |k: u64| rec.items.iter().find(|i| i.item_key == k).map(|i| i.state);
+        use models::BatchOperationItemStateEnum as I;
+        assert!(matches!(item_state(1), Some(I::Completed)));
+        assert!(matches!(item_state(2), Some(I::Completed)));
+        assert!(
+            matches!(item_state(3), Some(I::Active)),
+            "the unprocessed item stays ACTIVE, never completed/failed"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_and_unknown_keys_map_to_400_and_404() {
         use apis::batch_operation::GetBatchOperationResponse as GetResp;
         use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
@@ -46992,6 +50646,282 @@ mod search_process_instances_variable_filter_tests {
 }
 
 #[cfg(test)]
+mod search_process_instances_tags_filter_tests {
+    //! Regression coverage for the `tags` filter on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler
+    //! previously parsed `filter.tags` off the wire and discarded it, returning
+    //! the full unfiltered set — the same silent-broadening failure mode the
+    //! batch matcher had. These drive the actual handler against a populated
+    //! read model so the predicate can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created_with_tags(instance_key: u64, tags: &[&str]) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn tag_filter(tags: &[&str]) -> models::ProcessInstanceFilter {
+        models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        }
+    }
+
+    fn keys(result: &models::ProcessInstanceSearchQueryResult) -> Vec<String> {
+        let mut ks: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    fn seed(server: &ServerImpl) {
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tag_filter_isolates_matching_instances() {
+        let server = ServerImpl::default();
+        seed(&server);
+
+        // Baseline: no filter returns every seeded instance.
+        let all = run(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 4, "baseline should see all instances");
+
+        // The tag filter narrows to exactly the instances carrying `canary` —
+        // not the full set (the pre-fix bug returned all 4).
+        let matched = run(&server, tag_filter(&["canary"])).await;
+        assert_eq!(matched.page.total_items, 2);
+        assert_eq!(keys(&matched), vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multiple_tags_are_anded() {
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["canary", "blue"])).await;
+        assert_eq!(matched.page.total_items, 1);
+        assert_eq!(keys(&matched), vec!["2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn absent_tag_fails_honestly() {
+        // A tag no instance carries must exclude everything rather than being
+        // silently ignored.
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, tag_filter(&["ghost"])).await;
+        assert_eq!(matched.page.total_items, 0);
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_tenant_suspended_unprojected_filter_tests {
+    //! Regression coverage for the `tenantId` / `suspendedDate` /
+    //! `processDefinitionName` / `processDefinitionVersionTag` filters on
+    //! `POST /v2/process-instances/search` (#1551 review): the handler previously
+    //! parsed all four off the wire and discarded them, returning the full
+    //! unfiltered set — the same silent-broadening failure mode the batch matcher
+    //! had. These drive the actual handler against a populated read model so the
+    //! predicates can't silently regress.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created(instance_key: u64) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn string_filter(s: &str) -> models::StringFilterProperty {
+        models::StringFilterProperty::String(s.to_string())
+    }
+
+    fn exists_string(exists: bool) -> models::StringFilterProperty {
+        models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedStringFilter::new()
+        })
+    }
+
+    fn exists_date(exists: bool) -> models::DateTimeFilterProperty {
+        models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+            dollar_exists: Some(exists),
+            ..models::AdvancedDateTimeFilter::new()
+        })
+    }
+
+    #[tokio::test]
+    async fn tenant_id_is_honoured_against_the_default_tenant() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // Nano is single-tenant: the `<default>` tenant matches every instance,
+        // any other tenant matches none (not silently ignored).
+        let default = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("<default>")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(default.page.total_items, 2, "the <default> tenant matches");
+
+        let other = run(
+            &server,
+            models::ProcessInstanceFilter {
+                tenant_id: Some(string_filter("acme")),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            other.page.total_items, 0,
+            "a non-default tenantId excludes everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_date_filter_selects_only_suspended_instances() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+        // Suspend instance 2.
+        shard
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 2,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // `$exists: true` selects exactly the suspended instance (its
+        // `suspended_date_ms` is set); the ACTIVE instance is excluded.
+        let suspended = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(true)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "2");
+
+        // `$exists: false` selects the non-suspended instance.
+        let active = run(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(exists_date(false)),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(active.page.total_items, 1);
+        assert_eq!(active.items[0].process_instance_key.0, "1");
+    }
+
+    #[tokio::test]
+    async fn unprojected_name_and_version_tag_fail_honestly() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are never
+        // projected (always null), so an equality / `$exists: true` filter
+        // excludes every row while `$exists: false` matches.
+        for field_setter in [
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_name = Some(v)
+            },
+            |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                f.process_definition_version_tag = Some(v)
+            },
+        ] {
+            let mut eq = models::ProcessInstanceFilter::new();
+            field_setter(&mut eq, string_filter("x"));
+            assert_eq!(
+                run(&server, eq).await.page.total_items,
+                0,
+                "equality on an unprojected field is not silently ignored"
+            );
+
+            let mut absent = models::ProcessInstanceFilter::new();
+            field_setter(&mut absent, exists_string(false));
+            assert_eq!(
+                run(&server, absent).await.page.total_items,
+                2,
+                "$exists:false on an unprojected field matches"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod search_process_instances_suspend_resume_tests {
     //! Camunda-parity coverage for `suspendedDate` (issue #1147): every
     //! `/process-instances/search` result item ALWAYS carries a `suspendedDate`
@@ -47164,6 +51094,444 @@ mod search_process_instances_suspend_resume_tests {
             ),
             "an unparseable key is a 400 on resumption"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_filter_honesty_tests {
+    //! Regression coverage for the "silently ignored filter" defect class
+    //! (PR #1586 review): a filter field the API advertises but the predicate
+    //! never evaluates *widens* the caller's restriction while looking like a
+    //! match — the worst failure mode for a search API. Every field the
+    //! incident / process-instance / user-task predicates declare must either
+    //! narrow the result set or honestly exclude (matching against an absent
+    //! value, so `$exists: false` still works). These tests seed the read model
+    //! directly and drive the real `*_impl` handlers.
+
+    use nanobpmn_engine_core::{Event, IncidentKind};
+
+    use super::*;
+
+    /// Seed two process instances on *different* process definitions (so a
+    /// processDefinitionId filter can tell them apart), each with tags and a
+    /// business id.
+    fn seed_instances(server: &ServerImpl) {
+        let created = |key: u64, process_id: &str, tags: &[&str], business_id: Option<&str>| {
+            Event::ProcessInstanceCreated {
+                instance_key: key,
+                process_id: process_id.to_string(),
+                variables: std::collections::HashMap::new(),
+                created_at: 1_700_000_000_000,
+                tags: tags.iter().map(|t| (*t).to_string()).collect(),
+                business_id: business_id.map(str::to_string),
+                process_definition_key: 0,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            }
+        };
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1, "order-process", &["blue"], Some("order-7")),
+                &created(2, "returns-process", &["red"], Some("return-3")),
+            ])
+            .unwrap();
+    }
+
+    async fn search_instances(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_instance_search_honours_tags_suspended_date_and_definition_metadata() {
+        let server = ServerImpl::default();
+        seed_instances(&server);
+        // Suspend instance 1 at a known instant so suspendedDate can select it.
+        server.store.shards()[0]
+            .1
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 1,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // Baseline: both instances.
+        let all = search_instances(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both instances");
+
+        // `tags` narrows to the instance carrying every listed tag.
+        let tagged = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(tagged.page.total_items, 1);
+        assert_eq!(tagged.items[0].process_instance_key.0, "1");
+        let no_tag = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("no-such-tag".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_tag.page.total_items, 0,
+            "a tag nothing carries must match nothing — not widen to all rows"
+        );
+
+        // `suspendedDate` narrows to the instance suspended in the range.
+        let suspended = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "1");
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are not
+        // projected onto the instance row: a value filter honestly matches
+        // nothing (never widens), while `$exists: false` matches both.
+        let by_name = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::String(
+                    "Order Process".to_string(),
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+        let name_absent = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            name_absent.page.total_items, 2,
+            "$exists: false on an unprojected field matches every row"
+        );
+    }
+
+    /// Seed one incident per process instance (different definitions).
+    fn seed_incidents(server: &ServerImpl) {
+        seed_instances(server);
+        let raised = |key: u64, instance: u64, reason: &str, at: u64| Event::IncidentRaised {
+            incident_key: key,
+            instance_key: instance,
+            element_instance_key: 100 + instance,
+            element_id: "task".to_string(),
+            kind: IncidentKind::JobNoRetries,
+            reason: reason.to_string(),
+            job_key: Some(200 + instance),
+            created_at: at,
+            redrive: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &raised(11, 1, "order failed", 1_700_000_100_000),
+                &raised(22, 2, "return failed", 1_700_000_200_000),
+            ])
+            .unwrap();
+    }
+
+    async fn search_incidents(
+        server: &ServerImpl,
+        filter: models::IncidentFilter,
+    ) -> models::IncidentSearchQueryResult {
+        let body = Some(models::IncidentSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_incidents_impl(&body).await {
+            Ok(apis::incident::SearchIncidentsResponse::Status200_TheIncidentSearchResult(r)) => r,
+            other => panic!("expected a 200 incident search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_search_honours_process_definition_id_and_creation_time() {
+        let server = ServerImpl::default();
+        seed_incidents(&server);
+
+        let all = search_incidents(&server, models::IncidentFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both incidents");
+
+        // `processDefinitionId` narrows to the incident of that definition's
+        // instance — the field the PR #1586 review caught being ignored.
+        let narrowed = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "order-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(narrowed.page.total_items, 1);
+        assert_eq!(narrowed.items[0].incident_key.0, "11");
+        let widened = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "no-such-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            widened.page.total_items, 0,
+            "a non-matching processDefinitionId must exclude, not widen"
+        );
+
+        // `creationTime` narrows by the incident's creation timestamp.
+        let recent = search_incidents(
+            &server,
+            models::IncidentFilter {
+                creation_time: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_150_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(recent.page.total_items, 1);
+        assert_eq!(recent.items[0].incident_key.0, "22");
+    }
+
+    /// Seed one user task per instance with distinct business ids, priorities
+    /// and candidate assignments.
+    fn seed_user_tasks(server: &ServerImpl) {
+        seed_instances(server);
+        let task = |key: u64,
+                    instance: u64,
+                    assignee: Option<&str>,
+                    groups: &[&str],
+                    priority: i32,
+                    due: Option<&str>| Event::UserTaskCreated {
+            user_task_key: key,
+            instance_key: instance,
+            element_instance_key: 300 + instance,
+            element_id: "review".to_string(),
+            created_at: 1_700_000_300_000 + key,
+            assignee: assignee.map(str::to_string),
+            candidate_groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            candidate_users: Vec::new(),
+            due_date: due.map(str::to_string),
+            follow_up_date: None,
+            priority,
+            form_key: None,
+            external_form_reference: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &task(
+                    31,
+                    1,
+                    Some("alice"),
+                    &["ops"],
+                    50,
+                    Some("2024-01-01T00:00:00Z"),
+                ),
+                &task(32, 2, None, &["finance"], 80, None),
+            ])
+            .unwrap();
+    }
+
+    async fn search_tasks(
+        server: &ServerImpl,
+        filter: models::UserTaskFilter,
+    ) -> models::UserTaskSearchQueryResult {
+        let body = Some(models::UserTaskSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_user_tasks_impl(&body).await {
+            Ok(apis::user_task::SearchUserTasksResponse::Status200_TheUserTaskSearchResult(r)) => r,
+            other => panic!("expected a 200 user-task search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_task_search_honours_the_advertised_filters() {
+        let server = ServerImpl::default();
+        seed_user_tasks(&server);
+
+        let all = search_tasks(&server, models::UserTaskFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both tasks");
+
+        // `businessId` narrows to the task of the instance carrying it — the
+        // exact case the PR #1586 review cited.
+        let by_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String("order-7".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_business.page.total_items, 1);
+        assert_eq!(by_business.items[0].user_task_key.0, "31");
+        let no_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String(
+                    "no-such-order".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_business.page.total_items, 0,
+            "a non-matching businessId must exclude, not widen"
+        );
+
+        // `priority` narrows numerically.
+        let by_priority = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                priority: Some(models::IntegerFilterProperty::I32(80)),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_priority.page.total_items, 1);
+        assert_eq!(by_priority.items[0].user_task_key.0, "32");
+
+        // `processDefinitionId` narrows to the task of that definition.
+        let by_pd = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                process_definition_id: Some(models::ProcessDefinitionIdFilterProperty::String(
+                    "returns-process".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_pd.page.total_items, 1);
+        assert_eq!(by_pd.items[0].user_task_key.0, "32");
+
+        // `elementInstanceKey` narrows to the task with that element instance.
+        let by_eik = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                element_instance_key: Some(models::ElementInstanceKey("302".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_eik.page.total_items, 1);
+        assert_eq!(by_eik.items[0].user_task_key.0, "32");
+
+        // `candidateGroup` narrows to the tasks listing the group.
+        let by_group = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                candidate_group: Some(models::StringFilterProperty::String("ops".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_group.page.total_items, 1);
+        assert_eq!(by_group.items[0].user_task_key.0, "31");
+
+        // `dueDate` narrows by the parsed stored date; the task without a due
+        // date is excluded by a range operator (honest absent-value semantics).
+        let by_due = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                due_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_lte: Some(
+                            chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                                .unwrap()
+                                .to_utc(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_due.page.total_items, 1);
+        assert_eq!(by_due.items[0].user_task_key.0, "31");
+
+        // `name` is never projected (the result's name is always null): a
+        // value filter honestly matches nothing instead of widening.
+        let by_name = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                name: Some(models::StringFilterProperty::String("Review".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+
+        // `tags` is always empty on Nano tasks: any listed tag excludes.
+        let by_tags = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_tags.page.total_items, 0);
     }
 }
 
@@ -49490,6 +53858,538 @@ mod call_activity_hierarchy_read_model_tests {
         }
     }
 
+    #[tokio::test]
+    async fn batch_matcher_honours_the_variables_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.variables`
+        // against each instance's process-scoped (root) variables with the same
+        // algebra as `search_process_instances_impl` — dropping it silently
+        // *broadens* the batch (a migration filtered to `batch = "alpha"` would
+        // also migrate every other eligible instance). Seeds the read model
+        // directly (same pattern as the search-side variable-filter tests) and
+        // drives the matcher both batch operations consume, so the join cannot
+        // silently regress for cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::{Event, Value};
+        let created_with_vars =
+            |instance_key: u64, vars: &[(&str, Value)]| Event::ProcessInstanceCreated {
+                instance_key,
+                process_id: "p".to_string(),
+                variables: vars
+                    .iter()
+                    .map(|(n, v)| ((*n).to_string(), v.clone()))
+                    .collect(),
+                created_at: 0,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: 0,
+                version: 0,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_vars(1, &[("batch", Value::Str("alpha".into()))]),
+                &created_with_vars(2, &[("batch", Value::Str("beta".into()))]),
+                &created_with_vars(3, &[("batch", Value::Str("alpha".into()))]),
+                // Carries no `batch` variable at all.
+                &created_with_vars(4, &[("other", Value::Str("alpha".into()))]),
+            ])
+            .unwrap();
+
+        let var_filter = |name: &str, json_value: &str| models::ProcessInstanceFilter {
+            variables: Some(vec![models::VariableValueFilterProperty {
+                name: name.to_string(),
+                value: models::StringFilterProperty::String(json_value.to_string()),
+            }]),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        // Baseline: no variable filter selects every ACTIVE instance.
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // The variable filter narrows to exactly the instances whose
+            // root-scope `batch` equals the JSON-encoded string "alpha" — not
+            // the full set (the pre-fix matcher ignored `variables` and
+            // returned all 4).
+            let matched = server.batch_matched_process_instances(
+                &var_filter("batch", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                matched,
+                vec![1, 3],
+                "batch matcher honours the variables filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A filter on a variable no instance carries excludes everything
+            // (matched against an absent value) rather than being ignored.
+            let none = server.batch_matched_process_instances(
+                &var_filter("ghost", "\"alpha\""),
+                honour_hierarchy,
+            );
+            assert!(
+                none.is_empty(),
+                "an absent variable name fails honestly (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_tags_filter() {
+        // #1551 review: the batch matcher must evaluate `filter.tags` against
+        // each instance's carried tags — dropping it silently *broadens* the
+        // batch (a migration filtered to `tags = ["canary"]` would also migrate
+        // every untagged ACTIVE instance). Seeds the read model directly (same
+        // pattern as the variable-filter test above) and drives the matcher both
+        // batch operations consume, so the predicate cannot silently regress for
+        // cancellation / incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_tags(1, &["canary"]),
+                &created_with_tags(2, &["canary", "blue"]),
+                &created_with_tags(3, &["beta"]),
+                // Carries no tags at all.
+                &created_with_tags(4, &[]),
+            ])
+            .unwrap();
+
+        let tag_filter = |tags: &[&str]| models::ProcessInstanceFilter {
+            tags: Some(tags.iter().map(|t| models::Tag((*t).to_string())).collect()),
+            ..models::ProcessInstanceFilter::new()
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no tag filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2, 3, 4], "baseline selects all instances");
+
+            // A single tag narrows to exactly the instances carrying it — not
+            // the full set (the pre-fix matcher ignored `tags` and returned all
+            // 4).
+            let matched =
+                server.batch_matched_process_instances(&tag_filter(&["canary"]), honour_hierarchy);
+            assert_eq!(
+                matched,
+                vec![1, 2],
+                "batch matcher honours the tags filter (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // Multiple tags are ANDed: only the instance carrying the whole set
+            // matches.
+            let all_tags = server.batch_matched_process_instances(
+                &tag_filter(&["canary", "blue"]),
+                honour_hierarchy,
+            );
+            assert_eq!(
+                all_tags,
+                vec![2],
+                "multiple tags are ANDed (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // A tag no instance carries excludes everything (matched against an
+            // absent tag) rather than being ignored.
+            let none =
+                server.batch_matched_process_instances(&tag_filter(&["ghost"]), honour_hierarchy);
+            assert!(
+                none.is_empty(),
+                "an absent tag fails honestly (honour_hierarchy={honour_hierarchy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_inherited_cross_entity_filters() {
+        // #1551 review: the inherited element / job / incident / batch-operation
+        // filters (`elementId`, `elementInstanceState`,
+        // `hasElementInstanceIncident`, `errorMessage`, `hasRetriesLeft`,
+        // `incidentErrorHashCode`, `batchOperationId`/`Key`) must constrain the
+        // batch: an otherwise-migratable ACTIVE instance without a `review`
+        // element must NOT be selected by `elementId: "review"`.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1),
+                &created(2),
+                &created(3),
+                &activated(1, 11, "review"),
+                &activated(2, 21, "approve"),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            assert_eq!(
+                server
+                    .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), policy),
+                vec![1, 2, 3],
+                "baseline selects all instances"
+            );
+            // elementId narrows to the instance carrying that element; the
+            // nonmatching (otherwise migratable) instances are excluded.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1],
+                "elementId is honoured ({policy:?})"
+            );
+            // No incidents / failed jobs seeded: `true` excludes all, `false`
+            // matches all.
+            for want in [true, false] {
+                let expect: Vec<u64> = if want { vec![] } else { vec![1, 2, 3] };
+                assert_eq!(
+                    server.batch_matched_process_instances(
+                        &models::ProcessInstanceFilter {
+                            has_element_instance_incident: Some(want),
+                            ..models::ProcessInstanceFilter::new()
+                        },
+                        policy
+                    ),
+                    expect,
+                    "hasElementInstanceIncident={want} ({policy:?})"
+                );
+                assert_eq!(
+                    server.batch_matched_process_instances(
+                        &models::ProcessInstanceFilter {
+                            has_retries_left: Some(want),
+                            ..models::ProcessInstanceFilter::new()
+                        },
+                        policy
+                    ),
+                    expect,
+                    "hasRetriesLeft={want} ({policy:?})"
+                );
+            }
+            // Unprojected / absent values fail closed on equality.
+            for f in [
+                models::ProcessInstanceFilter {
+                    error_message: Some(s("boom")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                models::ProcessInstanceFilter {
+                    batch_operation_id: Some(s("x")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                models::ProcessInstanceFilter {
+                    batch_operation_key: Some(s("x")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+            ] {
+                assert!(
+                    server
+                        .batch_matched_process_instances(&f, policy)
+                        .is_empty(),
+                    "absent-value filter fails closed ({policy:?})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_correlates_element_predicates_on_one_row() {
+        // #1551 review (Copilot): the element predicates must hold of the SAME
+        // element instance. An instance whose COMPLETED `review` and ACTIVE
+        // `approve` are different rows must NOT satisfy
+        // `elementId: "review", elementInstanceState: "ACTIVE"` — the pre-fix
+        // matcher evaluated each predicate against an independent per-field
+        // list, so it selected the instance (and would have migrated it) even
+        // though no ACTIVE `review` exists.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let completed =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+            };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                // Instance 1: `review` COMPLETED (historical), `approve` ACTIVE —
+                // the split-rows trap.
+                &created(1),
+                &activated(1, 11, "review"),
+                &completed(1, 11, "review"),
+                &activated(1, 12, "approve"),
+                // Instance 2: `review` genuinely ACTIVE — the positive control.
+                &created(2),
+                &activated(2, 21, "review"),
+                // Instance 3: `review` COMPLETED only — historical, not active.
+                &created(3),
+                &activated(3, 31, "review"),
+                &completed(3, 31, "review"),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let active_state = || {
+            models::ElementInstanceStateFilterProperty::ElementInstanceStateEnum(
+                models::ElementInstanceStateEnum::Active,
+            )
+        };
+
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // The correlated predicate selects ONLY instance 2: instance 1's
+            // ACTIVE element is `approve` (its `review` is COMPLETED) and
+            // instance 3's `review` is historical.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![2],
+                "elementId + elementInstanceState correlate on one row ({policy:?})"
+            );
+            // State alone still behaves existentially: instances 1 and 2 both
+            // carry an ACTIVE element.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_instance_state: Some(active_state()),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2],
+                "elementInstanceState alone is existential ({policy:?})"
+            );
+            // Id alone matches historical rows too: instances 1, 2 and 3 all
+            // carried a `review` element at some point.
+            assert_eq!(
+                server.batch_matched_process_instances(
+                    &models::ProcessInstanceFilter {
+                        element_id: Some(s("review")),
+                        ..models::ProcessInstanceFilter::new()
+                    },
+                    policy
+                ),
+                vec![1, 2, 3],
+                "elementId alone matches historical rows ({policy:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_tenant_suspended_and_unprojected_filters() {
+        // #1551 review: the batch matcher must evaluate `tenantId`,
+        // `suspendedDate`, `processDefinitionName` and
+        // `processDefinitionVersionTag` rather than silently dropping them — a
+        // dropped constraint *broadens* a mutating batch to instances the caller
+        // asked to exclude (e.g. `suspendedDate: { $exists: true }` must not
+        // select ACTIVE instances, whose suspension timestamp is null). Seeds the
+        // read model directly and drives the matcher both batch operations
+        // consume, so the predicates cannot silently regress for cancellation /
+        // incident-resolution / migration.
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard.export(&[&created(1), &created(2)]).unwrap();
+
+        let string_filter = |s: &str| models::StringFilterProperty::String(s.to_string());
+        let exists_string = |exists: bool| {
+            models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedStringFilter::new()
+            })
+        };
+        let exists_date = |exists: bool| {
+            models::DateTimeFilterProperty::AdvancedDateTimeFilter(models::AdvancedDateTimeFilter {
+                dollar_exists: Some(exists),
+                ..models::AdvancedDateTimeFilter::new()
+            })
+        };
+
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            // Baseline: no filter selects every ACTIVE instance.
+            let all = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter::new(),
+                honour_hierarchy,
+            );
+            assert_eq!(all, vec![1, 2], "baseline selects all instances");
+
+            // `suspendedDate: { $exists: true }` matches nothing: a batch is
+            // ACTIVE-only, so no candidate carries a suspension timestamp (the
+            // finding's exact example).
+            let suspended_exists = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(true)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                suspended_exists.is_empty(),
+                "suspendedDate $exists:true excludes ACTIVE instances (honour_hierarchy={honour_hierarchy:?})"
+            );
+            // `$exists: false` matches every (non-suspended) candidate.
+            let not_suspended = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    suspended_date: Some(exists_date(false)),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                not_suspended,
+                vec![1, 2],
+                "suspendedDate $exists:false matches all (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `tenantId` is honoured against Nano's single `<default>` tenant: the
+            // default matches, any other tenant excludes.
+            let default_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("<default>")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert_eq!(
+                default_tenant,
+                vec![1, 2],
+                "tenantId <default> matches (honour_hierarchy={honour_hierarchy:?})"
+            );
+            let other_tenant = server.batch_matched_process_instances(
+                &models::ProcessInstanceFilter {
+                    tenant_id: Some(string_filter("acme")),
+                    ..models::ProcessInstanceFilter::new()
+                },
+                honour_hierarchy,
+            );
+            assert!(
+                other_tenant.is_empty(),
+                "a non-default tenantId excludes everything (honour_hierarchy={honour_hierarchy:?})"
+            );
+
+            // `processDefinitionName` / `processDefinitionVersionTag` are never
+            // projected (always null), so an equality / `$exists: true` filter
+            // excludes every candidate while `$exists: false` matches.
+            for field_setter in [
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_name = Some(v)
+                },
+                |f: &mut models::ProcessInstanceFilter, v: models::StringFilterProperty| {
+                    f.process_definition_version_tag = Some(v)
+                },
+            ] {
+                let mut eq = models::ProcessInstanceFilter::new();
+                field_setter(&mut eq, string_filter("x"));
+                let matched = server.batch_matched_process_instances(&eq, honour_hierarchy);
+                assert!(
+                    matched.is_empty(),
+                    "equality on an unprojected field is not silently ignored (honour_hierarchy={honour_hierarchy:?})"
+                );
+
+                let mut absent = models::ProcessInstanceFilter::new();
+                field_setter(&mut absent, exists_string(false));
+                let matched = server.batch_matched_process_instances(&absent, honour_hierarchy);
+                assert_eq!(
+                    matched,
+                    vec![1, 2],
+                    "$exists:false on an unprojected field matches (honour_hierarchy={honour_hierarchy:?})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ms_to_datetime_clamps_out_of_range_stamps_to_the_epoch() {
         // An in-range stamp round-trips.
@@ -49622,7 +54522,7 @@ mod no_direct_engine_apply_guard {
     /// it was written for.
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
-        "ServerImpl::apply_partition_command",
+        "ServerImpl::apply_partition_command_ref",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -49713,7 +54613,9 @@ mod no_direct_engine_apply_guard {
     /// runs first and `apply_command` only matches when not already part of an
     /// `apply_command_at` token.
     fn is_direct_apply_call(line: &str) -> bool {
-        contains_call_token(line, "apply_command_at") || contains_call_token(line, "apply_command")
+        contains_call_token(line, "apply_command_at")
+            || contains_call_token(line, "apply_command_ref_at")
+            || contains_call_token(line, "apply_command")
     }
 
     /// True when `line` contains a call to `token` used as either
@@ -49941,3 +54843,37 @@ mod publish_fanout_retry_tests {
         assert!(!retry(1, false, false, 8, 8), "bounded");
     }
 }
+
+/// Sort fields the shared REST sorters project (keep in lockstep with the
+/// `sort_items` match arms in the `search_*_impl` handlers; every other field
+/// falls back to entity-key order). The MCP adapter rejects anything outside
+/// these lists instead of silently mis-ordering.
+pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
+    "incidentKey",
+    "creationTime",
+    "state",
+    "errorType",
+    "processInstanceKey",
+    "elementId",
+];
+pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
+    "processInstanceKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "state",
+    "businessId",
+];
+pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
+    "userTaskKey",
+    "processInstanceKey",
+    "elementId",
+    "state",
+    "creationDate",
+    "businessId",
+];
+pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
+    "processDefinitionKey",
+    "processDefinitionId",
+    "name",
+    "version",
+];

@@ -1,9 +1,9 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { InstanceTrace, TraceElement } from "./gen";
 import { SectionLabel } from "./ui";
 import { IncidentReason } from "./IncidentReason";
-import { fmtClock, fmtDuration } from "./traceTime.ts";
+import { fmtClock, fmtDuration, headlineDuration } from "./traceTime.ts";
 
 // Re-exported so existing importers of `../components/TraceTimeline` keep
 // working; the implementations live in the JSX-free `traceTime.ts` so they are
@@ -21,12 +21,28 @@ export interface TraceTimeFmt {
   clock: (n: number) => string;
   /** Axis origin label (e.g. "0 ms" or "step 0"). */
   origin: string;
+  /**
+   * "Now" in the trace's clock domain, used for the elapsed time of an
+   * unfinished job. Production traces pass `Date.now`; the simulation passes
+   * its current event-sequence index — its timestamps are logical steps, so a
+   * wall-clock `Date.now()` would headline ~1.8 trillion "steps". When
+   * omitted the timeline falls back to `Date.now()` and ticks it (below).
+   */
+  now?: (trace: InstanceTrace) => number;
+  /**
+   * When true (and `now` is omitted), a shared 1 s clock tick re-renders the
+   * rows while any job is still running, so its elapsed label advances even
+   * when no new trace events arrive. Ignored for logical-clock traces (their
+   * `now` only moves with the simulation's own events).
+   */
+  tickWhenRunning?: boolean;
 }
 
 export const msFmt: TraceTimeFmt = {
   duration: fmtDuration,
   clock: fmtClock,
   origin: "0 ms",
+  tickWhenRunning: true,
 };
 
 /// The shared trace timeline: one lane per element instance with its lifetime
@@ -59,12 +75,41 @@ export function TraceTimeline({
 
   const pct = (t: number) => ((t - t0) / span) * 100;
 
+  // "Now" in the trace's own clock domain. A logical-clock trace (the
+  // simulation) supplies `fmt.now`; a wall-clock trace defaults to Date.now()
+  // and — while the trace is still active and a job is still running — a
+  // single shared 1 s tick so the elapsed labels advance even when no new
+  // trace events arrive (the trace queries refresh on read-model change
+  // notifications, not a timer). An ended trace's rows are frozen, so no tick.
+  const anyRunning =
+    trace.endedAt == null &&
+    trace.elements.some(
+      (el) =>
+        el.job != null && el.job.completedAt == null && el.exitedAt == null,
+    );
+  const ticking = fmt.now == null && fmt.tickWhenRunning === true && anyRunning;
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!ticking) return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [ticking]);
+  void tick;
+  const now = fmt.now ? fmt.now(trace) : Date.now();
+
   return (
     <div>
       <Legend />
       <div className="mt-4 space-y-1.5">
         {trace.elements.map((el) => (
-          <ElementRow key={el.elementInstanceKey} el={el} pct={pct} fmt={fmt} />
+          <ElementRow
+            key={el.elementInstanceKey}
+            el={el}
+            pct={pct}
+            fmt={fmt}
+            now={now}
+            traceEndedAt={trace.endedAt}
+          />
         ))}
       </div>
       <div className="mt-2 flex justify-between border-t border-edge pt-1 font-mono text-[10px] text-fg-faint">
@@ -118,16 +163,21 @@ function ElementRow({
   el,
   pct,
   fmt,
+  now,
+  traceEndedAt,
 }: {
   el: TraceElement;
   pct: (t: number) => number;
   fmt: TraceTimeFmt;
+  now: number;
+  traceEndedAt: number | null;
 }) {
   const job = el.job;
   const start = el.enteredAt;
   const end =
     el.exitedAt ?? Math.max(el.enteredAt, job?.completedAt ?? el.enteredAt);
 
+  const headline = headlineDuration(el, now, fmt.duration, traceEndedAt);
   const left = pct(start);
   const width = Math.max(pct(end) - left, 0.6);
 
@@ -144,16 +194,15 @@ function ElementRow({
         <div
           className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-edge-strong"
           style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${el.elementId} · ${fmt.duration(el.durationMs)}`}
+          title={`${el.elementId} · ${headline.title}`}
         />
         {job && <JobBars job={job} pct={pct} fmt={fmt} />}
       </div>
-      <div className="w-28 shrink-0 text-right font-mono text-[11px] text-fg-faint">
-        {job
-          ? job.queueMs != null
-            ? `${fmt.duration(job.queueMs)} q`
-            : fmt.duration(job.waitMs)
-          : fmt.duration(el.durationMs)}
+      <div
+        className="w-28 shrink-0 text-right font-mono text-[11px] text-fg-faint"
+        title={headline.title}
+      >
+        {headline.label}
       </div>
     </div>
   );

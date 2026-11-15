@@ -12,6 +12,14 @@ use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
 
+/// `skip_serializing_if` predicate for an optional-by-zero [`Key`] field: a
+/// zero key is the legacy/absent sentinel (additive fields default to it), so
+/// it is omitted from the serialized frame.
+#[cfg(feature = "serde")]
+fn is_zero_key(k: &Key) -> bool {
+    *k == 0
+}
+
 /// One activation instruction of a [`crate::command::Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
 /// scope. Mirrors Zeebe's `ProcessInstanceModificationActivateInstruction`:
@@ -823,13 +831,54 @@ pub enum Event {
         outcome: crate::state::JobSettlementOutcome,
         lease_token: String,
     },
+    /// A **routed cross-partition delivery was applied** (#1497): the recipient
+    /// partition records the source-minted `delivery_key` of a routed follow-up
+    /// (`OpenMessageSubscription` / `CorrelateMessageSubscription` /
+    /// `CloseMessageSubscription` / `DispatchStartInstance`) it applied, so a
+    /// re-delivery of the same `delivery_key` — a host re-delivery
+    /// after a lost acknowledgement — is acknowledged WITHOUT being re-applied
+    /// (at-least-once transport ⇒ exactly-once effect, Zeebe's command
+    /// distribution dedup).
+    ///
+    /// For a `CloseMessageSubscription` the record doubles as the **close
+    /// tombstone**: it additionally carries the `subscription_key` it closed,
+    /// so a delayed `OpenMessageSubscription` for that subscription — which
+    /// bears its OWN, different `delivery_key` — that lands after its close is
+    /// rejected instead of resurrecting a subscription for a cancelled
+    /// instance. (`None` for the non-subscription `DispatchStartInstance`.)
+    /// Replicated through the partition's log, so every replica holds the same
+    /// ledger; bounded by [`crate::state::ROUTED_DELIVERY_LEDGER_CAP`].
+    /// Additive variant: a journal written before #1497 never contains it.
+    RoutedDeliveryRecorded {
+        /// The source partition's minted delivery identity (see the routed
+        /// source events' `delivery_key`).
+        delivery_key: Key,
+        /// The RECIPIENT partition that applied (and owns) this ledger record.
+        /// `delivery_key` is minted on the SOURCE partition, so a key-derived
+        /// split (`partition_of(max_key())`, the legacy shared-journal
+        /// recovery) would file it under the sender; recovery routes the record
+        /// by this field instead (see [`Event::owning_partition`]).
+        #[cfg_attr(feature = "serde", serde(default))]
+        recipient_partition: u64,
+        /// The subscription this delivery concerned, recorded so a close
+        /// tombstones it against a late open. `None` for a start-instance
+        /// dispatch (no subscription).
+        #[cfg_attr(feature = "serde", serde(default))]
+        subscription_key: Option<Key>,
+        /// `true` for a `CloseMessageSubscription` delivery: the record is the
+        /// close tombstone for `subscription_key`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        close_tombstone: bool,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
         job_key: Key,
         instance_key: Key,
         retries: i32,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -842,7 +891,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         deadline: u64,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -1181,6 +1232,14 @@ pub enum Event {
     /// advance the token. Only emitted when `num_partitions > 1` and the key
     /// hashes off-partition — a single-partition host never produces it, so its
     /// log is byte-identical to before.
+    ///
+    /// `delivery_key` is the **stable delivery identity** (#1497) the host's
+    /// bounded re-drive carries to the message partition: minted on this (the
+    /// source) partition when the event is emitted, it lets the recipient
+    /// deduplicate a re-delivered `OpenMessageSubscription` after a lost
+    /// acknowledgement (at-least-once ⇒ exactly-once). `0` on a record written
+    /// before #1497, which the recipient treats as "no identity" (no dedup —
+    /// the legacy best-effort path).
     MessageSubscriptionOpening {
         subscription_key: Key,
         instance_key: Key,
@@ -1189,6 +1248,8 @@ pub enum Event {
         message_name: String,
         correlation_key: String,
         kind: MessageSubscriptionKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A published message correlated to an open subscription. For an
     /// intermediate catch event its token is released along the event's outgoing
@@ -1210,6 +1271,14 @@ pub enum Event {
     /// the message's variables) so the host can route a
     /// [`crate::Command::CorrelateMessageSubscription`] to the instance partition,
     /// where the token actually advances. Only produced when `num_partitions > 1`.
+    ///
+    /// `delivery_key` is the stable delivery identity (#1497) a host re-delivery
+    /// carries with the continuation: minted on this (the message) partition, it
+    /// lets the instance partition deduplicate a re-delivered
+    /// `CorrelateMessageSubscription` after a lost acknowledgement — the guard
+    /// that keeps a retried **non-interrupting** boundary correlation (whose
+    /// `Opening` record intentionally stays open) from spawning a second token.
+    /// `0` on a pre-#1497 record: no dedup (the legacy path).
     RemoteMessageCorrelation {
         subscription_key: Key,
         message_key: Key,
@@ -1218,6 +1287,8 @@ pub enum Event {
         element_id: ElementId,
         kind: MessageSubscriptionKind,
         variables: HashMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A published message correlated to a process-level **message start
     /// event** and created instance `instance_key` (#1300; Zeebe records this as
@@ -1601,6 +1672,14 @@ pub enum Event {
     /// [`Event::MessageSubscriptionOpening`]: only emitted when the canonical
     /// subscription lives off-partition, so a single-partition log never
     /// produces it and stays byte-identical.
+    ///
+    /// `delivery_key` is the stable delivery identity (#1497) a host re-delivery
+    /// carries with the routed close: minted on this (the instance) partition,
+    /// it lets the message partition record a **close tombstone** so an
+    /// `OpenMessageSubscription` that arrives *after* its close (an instance
+    /// cancelled while the open was still backing off) is rejected instead of
+    /// resurrecting a live subscription for the dead instance. `0` on a
+    /// pre-#1497 record: no tombstone (the legacy path).
     MessageSubscriptionClosing {
         subscription_key: Key,
         instance_key: Key,
@@ -1608,6 +1687,8 @@ pub enum Event {
         element_id: ElementId,
         message_name: String,
         correlation_key: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
@@ -1618,6 +1699,20 @@ pub enum Event {
         process_id: String,
         message_name: String,
         start_element_id: ElementId,
+        /// The MCP tool name declared on the start event via the
+        /// `io.camunda.tool:name` zeebe:property (Camunda 8.10 MCP gateway,
+        /// #1499), when present. Additive: `None` for events serialized before
+        /// this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        tool_name: Option<String>,
+        /// The start event's `zeebe:properties` subset whose keys carry the
+        /// `io.camunda.tool:` prefix (`:purpose`, `:input_N_*`, …), projected so
+        /// the `/mcp/processes` server and the REST `toolProperties` field can
+        /// assemble the tool description/input schema without re-parsing the
+        /// BPMN XML. Empty when the start event declares no tool properties and
+        /// for events serialized before this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        tool_properties: std::collections::BTreeMap<String, String>,
     },
     /// A process-level timer start event was armed at deploy time, first due at
     /// `due_at`. When it fires a new instance of `process_id` is created.
@@ -1660,6 +1755,14 @@ pub enum Event {
         /// correlation once it mints the instance. `None` for timer starts.
         #[cfg_attr(feature = "serde", serde(default))]
         message_start: Option<MessageStartCorrelation>,
+        /// The stable delivery identity (#1497) a host re-delivery carries with
+        /// the routed `DispatchStartInstance`: minted on this (the deploy)
+        /// partition, it lets the target partition deduplicate a re-delivered
+        /// dispatch after a lost acknowledgement — the guard that keeps a retry
+        /// from minting a SECOND process instance. `0` on a pre-#1497 record:
+        /// no dedup (the legacy path).
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
 
     /// An engine-native AgentInstance was created (Camunda `AgentInstanceIntent.CREATED`,
@@ -1753,6 +1856,53 @@ pub enum Event {
         /// duplicate resolves to.
         original_agent_history_key: Key,
     },
+
+    /// An instance's off-heap variable payload was quarantined as lost (#1574).
+    /// Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
+    /// alongside its `IncidentRaised`, its reducer records the instance in
+    /// [`crate::state::State::variables_lost_quarantined`], the replicated
+    /// dedup tombstone the quarantine idempotency guard reads (lifted when
+    /// `incident_key` is resolved). It carries **no** variable payload
+    /// and mutates no instance state: the payload-carrying repair was dropped
+    /// because a leader-snapshotted payload is not safe under Raft ordering
+    /// (it can roll back an intervening `SetVariables`). Deterministic
+    /// apply-time repair is the #1447 follow-up.
+    VariablesLostQuarantined {
+        instance_key: Key,
+        /// The `VariablesLost` incident this quarantine raised: the loss
+        /// episode. Resolving exactly this incident lifts the tombstone, keyed
+        /// on the replicated `IncidentResolved.incident_key` so the lift does
+        /// not depend on whether the incident record is resident.
+        incident_key: Key,
+        /// The replicated loss-episode id the quarantine's stamp carried
+        /// (#1587), recorded into the tombstone so a delayed duplicate of the
+        /// SAME episode (applying after the incident was resolved and the
+        /// tombstone lifted) is a deterministic no-op instead of a fresh
+        /// incident. `0` for a frame written before this field existed
+        /// (episode-blind, pre-#1587 behaviour). Additive: `serde(default)`.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
+        episode: Key,
+    },
+
+    /// A stamped orphan-quarantine proposal could not apply because its
+    /// loss-episode id no longer matches the incident key a fresh proposal
+    /// would mint (#1587 review): unrelated key-minting work advanced the
+    /// replicated allocator between the leader stamping the report and the
+    /// proposal committing. The report itself is still pending in the leader's
+    /// journal backlog, so this event is the **replicated** signal every
+    /// replica (and the leader's journal, which watches applied events)
+    /// observes identically: the leader re-stamps the still-pending report at
+    /// its now-current allocator position and re-proposes it, instead of
+    /// silently clearing the pending report without raising `VariablesLost`.
+    /// Carries no state change — the reducers ignore it; it exists so the
+    /// supersede decision is journaled and replica-deterministic. Additive
+    /// variant: no snapshot-format bump.
+    OrphanStampSuperseded {
+        instance_key: Key,
+        /// The superseded loss-episode id (the stamp's `episode`), recorded so
+        /// the journal can correlate the reissue with the report it parked.
+        episode: Key,
+    },
 }
 
 impl Event {
@@ -1845,6 +1995,8 @@ impl Event {
             | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
+            | Event::VariablesLostQuarantined { instance_key, .. }
+            | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no
@@ -1878,6 +2030,7 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
+            | Event::RoutedDeliveryRecorded { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }
@@ -1939,6 +2092,60 @@ impl Event {
     /// engine and stamped onto events, so the log is an exact record of them —
     /// including transient ones like completed element-instance keys that no
     /// longer appear in final state.)
+    /// The source-minted routed-delivery identity (#1497) this event carries,
+    /// if it is one of the four routable source events
+    /// (`MessageSubscriptionOpening` / `RemoteMessageCorrelation` /
+    /// `MessageSubscriptionClosing` / `StartInstanceDispatched`) with a non-zero
+    /// key. These keys are minted by THIS partition's allocator, so recovery
+    /// must advance past them ([`Event::advance_allocator`]) or a restarted
+    /// node re-issues an already-delivered identity and the recipient drops a
+    /// genuinely new delivery as a duplicate.
+    pub fn source_delivery_key(&self) -> Option<Key> {
+        let k = match self {
+            Event::MessageSubscriptionOpening { delivery_key, .. }
+            | Event::RemoteMessageCorrelation { delivery_key, .. }
+            | Event::MessageSubscriptionClosing { delivery_key, .. }
+            | Event::StartInstanceDispatched { delivery_key, .. } => *delivery_key,
+            _ => return None,
+        };
+        (k != 0).then_some(k)
+    }
+
+    /// Advance a partition's local key allocator (`next_local`) past every key
+    /// this event proves `partition_id` already minted — the single canonical
+    /// replay/recovery fold (#1497). Considers [`Event::max_key`] and,
+    /// independently, [`Event::source_delivery_key`]: the latter is checked on
+    /// its own because a routed event can also carry a higher FOREIGN key (e.g.
+    /// a `RemoteMessageCorrelation` naming an instance on a higher partition),
+    /// which would otherwise mask the local delivery key behind the
+    /// `partition_of(max) == partition_id` guard.
+    pub fn advance_allocator(&self, partition_id: u64, next_local: &mut u64) {
+        for k in [Some(self.max_key()), self.source_delivery_key()]
+            .into_iter()
+            .flatten()
+        {
+            if crate::state::partition_of(k) == partition_id {
+                *next_local = (*next_local).max(crate::state::local_of(k));
+            }
+        }
+    }
+
+    /// The partition that owns this event when a shared (untagged) journal is
+    /// split per partition on recovery. Normally the partition encoded in
+    /// [`Event::max_key`]; a [`Event::RoutedDeliveryRecorded`] record instead
+    /// belongs to its `recipient_partition`, because its only key was minted on
+    /// the SOURCE partition (#1497). Every key-derived split must go through
+    /// this, never `partition_of(max_key())` directly.
+    pub fn owning_partition(&self) -> u64 {
+        match self {
+            Event::RoutedDeliveryRecorded {
+                recipient_partition,
+                ..
+            } => *recipient_partition,
+            _ => crate::state::partition_of(self.max_key()),
+        }
+    }
+
     pub fn max_key(&self) -> Key {
         let mut m = self.instance_key().unwrap_or(0);
         match self {
@@ -2057,6 +2264,13 @@ impl Event {
                 ..
             } => {
                 m = m.max(*job_key).max(crate::lease::issued_key(lease_token));
+            }
+            // The recorded key was minted on the SOURCE partition; folding it
+            // in is harmless because the allocator fold is partition-scoped
+            // (`partition_of(k) == partition_id`), so a foreign key never
+            // advances this partition's counter.
+            Event::RoutedDeliveryRecorded { delivery_key, .. } => {
+                m = m.max(*delivery_key);
             }
             Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }
@@ -2426,6 +2640,264 @@ pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
             }
         }
     }
+}
+
+/// One journaled record: an [`Event`] plus the per-record metadata Zeebe
+/// carries on every record (#1556). Today that is the caller's
+/// `operationReference` — the correlation id a client attaches to a command,
+/// propagated **generically** to every record the command produces (Zeebe
+/// parity). [`Event`] itself stays untouched: the reference lives once, on this
+/// envelope, stamped at the engine's single command seam
+/// ([`Engine::apply_command_records_at`](crate::Engine::apply_command_records_at)),
+/// so no per-variant copy can drift.
+///
+/// **Wire form** (`serde` feature): a record WITH a reference serializes as the
+/// envelope `{"event":{…},"operation_reference":N}`; a record WITHOUT one
+/// serializes as the bare legacy [`Event`] (`{"VariantName":{…}}`). Every
+/// pre-#1556 journal line is therefore already a valid record, and
+/// [`decode_record_json`] reads both shapes — no `SNAPSHOT_FORMAT_VERSION`
+/// bump. The `event` key cannot collide with an event tag (variants are
+/// PascalCase).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The domain event.
+    pub event: Event,
+    /// The `operationReference` of the command that produced this record.
+    pub operation_reference: Option<i64>,
+}
+
+impl Record {
+    /// A record with no operation reference (the bare-event wire form).
+    pub fn bare(event: Event) -> Self {
+        Self {
+            event,
+            operation_reference: None,
+        }
+    }
+
+    /// Stamps `operation_reference` onto every event of one command's output —
+    /// the single, generic propagation seam (#1556).
+    pub fn stamp_all(events: Vec<Event>, operation_reference: Option<i64>) -> Vec<Self> {
+        events
+            .into_iter()
+            .map(|event| Self {
+                event,
+                operation_reference,
+            })
+            .collect()
+    }
+}
+
+impl From<Event> for Record {
+    fn from(event: Event) -> Self {
+        Self::bare(event)
+    }
+}
+
+/// Borrowed serialization view of a [`Record`] — the ONE implementation of the
+/// record wire form, shared by `Record`'s `Serialize` and
+/// [`encode_record_json`] (which journals without cloning the event).
+#[cfg(feature = "serde")]
+struct RecordView<'a> {
+    event: &'a Event,
+    operation_reference: Option<i64>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for RecordView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.operation_reference {
+            None => self.event.serialize(serializer),
+            Some(reference) => {
+                let mut s = serializer.serialize_struct("Record", 2)?;
+                s.serialize_field("event", self.event)?;
+                s.serialize_field("operation_reference", &reference)?;
+                s.end()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Record {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RecordView {
+            event: &self.event,
+            operation_reference: self.operation_reference,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Encodes one journal line for `event` produced by a command carrying
+/// `operation_reference` — the writer-side twin of [`decode_record_json`]
+/// (#1556). Without a reference this is exactly the legacy bare-`Event` line.
+#[cfg(feature = "serde")]
+pub fn encode_record_json(
+    event: &Event,
+    operation_reference: Option<i64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RecordView {
+        event,
+        operation_reference,
+    })
+}
+
+/// Decodes one journal line into a [`Record`] — the replay-boundary reader for
+/// the #1556 envelope. Accepts both the envelope and the legacy bare-[`Event`]
+/// form (which decodes with `operation_reference: None`). The envelope is
+/// recognised by the PARSED top-level `event` member, never by property order,
+/// so a producer that reorders keys (`{"operation_reference":N,"event":…}`)
+/// still decodes. The inner event is decoded through [`decode_event_json`], so
+/// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
+/// rejection — never a silent drop.
+///
+/// Two disciplines keep this safe AND cheap on the hot recovery path:
+///
+/// * **Decode the event FIRST, validate the envelope metadata SECOND.** An
+///   envelope whose `event` names a variant this build does not know must
+///   surface the typed [`EventDecodeError::UnknownVariant`] even when the
+///   surrounding metadata is also invalid (a bad `operation_reference` type or
+///   an unrecognised extra field). Validating metadata first would return
+///   [`EventDecodeError::Malformed`], which the journal reader
+///   (`read_segment_with`) tolerates as a torn tail and DROPS — silently
+///   discarding a real cross-version frame (#1065 class). Decoding the event
+///   first guarantees the fail-closed `UnknownVariant` wins.
+/// * **No double parse of the event payload.** The envelope probe borrows the
+///   `event` member as a [`serde_json::value::RawValue`] and hands it straight
+///   to [`decode_event_json`] — the payload is parsed exactly once, never
+///   materialized into a [`serde_json::Value`] DOM and re-serialized. Bare
+///   events (unreferenced commands) skip the probe's payload capture entirely.
+#[cfg(feature = "serde")]
+pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
+    // A borrowed probe over the raw line: the `event`/`operation_reference`
+    // members are captured by reference as a `RawValue` (no DOM, no copy of the
+    // payload). Any OTHER top-level key is collected into `extra` so an
+    // unrecognised envelope field can be rejected AFTER the event is decoded.
+    // `extra` is a `Value` map only because serde's `flatten` cannot deserialize
+    // into a borrowed `RawValue`; it stays empty for every well-formed record,
+    // so the hot path never builds a DOM.
+    #[derive(serde::Deserialize)]
+    struct Probe<'a> {
+        #[serde(borrow)]
+        event: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        operation_reference: Option<&'a serde_json::value::RawValue>,
+        #[serde(flatten)]
+        extra: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let probe: Probe<'_> = match serde_json::from_str(line) {
+        Ok(probe) => probe,
+        // Not an object the probe recognises. Either a legacy bare event (whose
+        // top-level key is a PascalCase variant tag, collected into `extra` —
+        // but then `event` is absent and we fall through below) or genuinely
+        // malformed JSON. The bare-event decode classifies both precisely.
+        // Probe failures (e.g. duplicate `operation_reference`/`event` keys,
+        // which the derived probe rejects) must never mask the inner event's
+        // typed `UnknownVariant`: this cold path re-parses as a DOM (duplicate
+        // keys are accepted there) and decodes any `event` member FIRST.
+        // Only genuinely unparseable JSON (a torn tail) stays `Malformed`.
+        Err(e) => {
+            let malformed = || EventDecodeError::Malformed {
+                detail: e.to_string(),
+            };
+            // Walk EVERY top-level member (duplicates included — a DOM would
+            // keep only the last) so each `event` occurrence is classified.
+            return match top_level_members(line) {
+                None => Err(malformed()),
+                Some(members) => {
+                    // Scan ALL `event` occurrences before failing: a malformed
+                    // sibling must never short-circuit past an unknown one, so
+                    // any `UnknownVariant` wins regardless of key order.
+                    let mut saw_event = false;
+                    for (key, raw) in &members {
+                        if key == "event" {
+                            saw_event = true;
+                            if let Err(err @ EventDecodeError::UnknownVariant { .. }) =
+                                decode_event_json(raw.get())
+                            {
+                                return Err(err);
+                            }
+                        }
+                    }
+                    if saw_event {
+                        Err(malformed())
+                    } else {
+                        decode_event_json(line).map(Record::bare)
+                    }
+                }
+            };
+        }
+    };
+
+    let event_raw = match probe.event {
+        Some(raw) => raw,
+        // No `event` member: a legacy bare event (variant tags are PascalCase,
+        // never the lowercase `event` key). Decode it directly.
+        None => return decode_event_json(line).map(Record::bare),
+    };
+
+    // Decode the inner event FIRST (straight from the borrowed raw payload, no
+    // re-serialization) so an unknown variant is the typed fail-closed
+    // rejection even when the envelope metadata below is also invalid.
+    let event = decode_event_json(event_raw.get())?;
+
+    // Only now validate the envelope metadata. An unrecognised field or a bad
+    // `operation_reference` is `Malformed` — but the event is already known to
+    // be decodable, so this can never mask an `UnknownVariant`.
+    if let Some(extra) = probe.extra.keys().next() {
+        return Err(EventDecodeError::Malformed {
+            detail: format!("unknown record envelope field `{extra}`"),
+        });
+    }
+    let operation_reference = match probe.operation_reference {
+        None => None,
+        // `RawValue::get` returns the exact source slice, so an explicit null
+        // may carry whitespace (`" null"`); trim before comparing.
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => Some(serde_json::from_str::<i64>(raw.get()).map_err(|e| {
+            EventDecodeError::Malformed {
+                detail: format!("operation_reference: {e}"),
+            }
+        })?),
+    };
+    Ok(Record {
+        event,
+        operation_reference,
+    })
+}
+
+/// Every top-level `(key, raw value)` member of a JSON object IN SOURCE ORDER,
+/// duplicates preserved (unlike a `Value` map, which keeps only the last).
+/// `None` if `line` is not a parseable JSON object.
+#[cfg(feature = "serde")]
+fn top_level_members(line: &str) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
+    struct Members(Vec<(String, Box<serde_json::value::RawValue>)>);
+    impl<'de> serde::Deserialize<'de> for Members {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Members;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Members, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(entry) = map.next_entry()? {
+                        out.push(entry);
+                    }
+                    Ok(Members(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Members>(line).ok().map(|m| m.0)
 }
 
 /// Extract the offending variant name from serde's

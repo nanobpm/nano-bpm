@@ -28,6 +28,7 @@
   {
     "StartInstanceDispatched": {
       "business_id": "b",
+      "delivery_key": 25,
       "message_start": {
         "correlation_key": "c",
         "message_key": 20,
@@ -39,6 +40,14 @@
       "tags": [],
       "target_partition": 1,
       "variables": {}
+    }
+  },
+  {
+    "RoutedDeliveryRecorded": {
+      "close_tombstone": true,
+      "delivery_key": 25,
+      "recipient_partition": 2,
+      "subscription_key": 6
     }
   },
   {
@@ -207,6 +216,19 @@
       "job_key": 23,
       "lease_token": "nano-lease:0000000000000019",
       "outcome": "failed"
+    }
+  },
+  {
+    "VariablesLostQuarantined": {
+      "episode": 26,
+      "incident_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "OrphanStampSuperseded": {
+      "episode": 26,
+      "instance_key": 27
     }
   }
 ]

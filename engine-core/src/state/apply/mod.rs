@@ -51,6 +51,8 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::AgentHistoryCommitted { .. }
         | Event::AgentHistoryDiscarded { .. }
         | Event::AgentHistoryDeduplicated { .. }
+        | Event::VariablesLostQuarantined { .. }
+        | Event::OrphanStampSuperseded { .. }
         | Event::ProcessInstanceCompleted { .. }
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessInstanceSuspended { .. }
@@ -127,9 +129,8 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::SignalBroadcast { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::RemoteMessageCorrelation { .. }
-        | Event::MessageStartSubscriptionCreated { .. } => {
-            subscription::apply_subscription(state, event)
-        }
+        | Event::MessageStartSubscriptionCreated { .. }
+        | Event::RoutedDeliveryRecorded { .. } => subscription::apply_subscription(state, event),
         // A history-only record (#1300): the instance it names was already
         // created by the preceding `ProcessInstanceCreated`.
         Event::MessageStartEventCorrelated { .. } => {}

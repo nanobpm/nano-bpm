@@ -15,6 +15,9 @@ members = ["crates/*"]
 
 [dependencies]
 nanobpm-gateway-rest = { path = "../generated" }
+# Run the generated models' validation rules on MCP tool arguments, which
+# bypass the generated REST router (the only other place they run).
+validator = "0.20"
 # Generated console API layer (models + axum router + per-tag Api traits) from
 # spec-console/console-api.yaml. Only needed with the `console` feature.
 nanobpm-console-api = { path = "../generated-console", optional = true }
@@ -81,6 +84,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # flat observability config at startup — no hot-path involvement.
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
+# Random correlation keys for MCP process-tool calls (Camunda parity, #1499).
+uuid = { version = "1", features = ["v4"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the

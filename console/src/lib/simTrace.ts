@@ -38,6 +38,7 @@ export function foldSimTrace(
   const path: string[] = [];
 
   let startedAt = 0;
+  let lastSeq = 0;
   let endedAt: number | null = null;
   let outcome: TraceOutcome = "active";
 
@@ -63,6 +64,7 @@ export function foldSimTrace(
   for (const e of events) {
     if (s(e.instance_key) !== instanceKey) continue;
     const at = e.seq;
+    lastSeq = Math.max(lastSeq, at);
     switch (e.type) {
       case "ProcessInstanceCreated":
         startedAt = at;
@@ -165,7 +167,7 @@ export function foldSimTrace(
     }
   }
 
-  return {
+  const trace: InstanceTrace = {
     instanceKey,
     processId,
     version: null,
@@ -179,12 +181,31 @@ export function foldSimTrace(
     incidents,
     path,
   };
+  LAST_STEP.set(trace, Math.max(lastSeq, startedAt));
+  return trace;
 }
 
+/// The latest folded event sequence per simulation trace. Every event (even
+/// one that moves no element/job endpoint, e.g. `JobFailed`) advances the
+/// simulation clock, so it is recorded at fold time rather than reconstructed
+/// from endpoints.
+const LAST_STEP = new WeakMap<InstanceTrace, number>();
+
 /// Step formatter for the simulation timeline: logical steps, not milliseconds.
+/// `now` is the trace's current step (its last event's sequence index), so an
+/// unfinished simulated job headlines elapsed STEPS — never the browser's
+/// wall-clock `Date.now()` (which in this domain would read as ~1.8 trillion
+/// "steps"). No wall-clock tick: the simulation clock only moves when a new
+/// event folds in, which already re-renders.
 export const stepFmt = {
   duration: (n: number | null): string =>
     n == null ? "—" : `${n} step${n === 1 ? "" : "s"}`,
   clock: (n: number): string => `#${n}`,
   origin: "step 0",
+  now: (trace: InstanceTrace): number => trace.endedAt ?? lastStep(trace),
 };
+
+/// The current simulation step: the latest folded event's sequence index.
+function lastStep(trace: InstanceTrace): number {
+  return LAST_STEP.get(trace) ?? trace.startedAt;
+}

@@ -23,7 +23,7 @@
 
 use super::flow_scope::{element_flow_scope_chain, FlowScopeResolution};
 use super::*;
-use crate::command::{ActivateElementInstruction, VariableInstruction};
+use crate::command::{ActivateElementInstruction, MoveInstruction, VariableInstruction};
 
 /// One validated activation: where it lands and which variables go where.
 struct PlannedActivation {
@@ -144,6 +144,247 @@ impl Engine {
 }
 
 impl Engine {
+    /// Desugars the move instructions of a `ModifyInstance` (Camunda 8.9
+    /// `moveInstructions`) into the activate/terminate instructions they
+    /// abbreviate, mirroring Zeebe's
+    /// `ProcessInstanceModificationModifyProcessor` (`mapIdInstructions` +
+    /// `mapMoveInstructionsByInstanceKey`): each moved source element instance
+    /// is terminated and one fresh instance of the target element is activated
+    /// per moved instance, with the move's variable instructions riding the
+    /// activation.
+    ///
+    /// The desugared instructions are APPENDED to the caller's explicit
+    /// instructions (Zeebe builds the final lists the same way), so the
+    /// existing all-or-nothing validation in [`Self::plan_modification`]
+    /// covers moves unchanged.
+    ///
+    /// The ancestor scope of each spawned activation is resolved per moved
+    /// source instance (Zeebe `determineAncestorScopeKey`):
+    ///
+    /// * `SourceParent` — the source instance's direct flow-scope instance;
+    /// * `Direct(k)` — the explicit ancestor key (`None` = Zeebe's `-1`, the
+    ///   default find-or-create resolution);
+    /// * `Inferred` — walk the source instance's ancestry for an instance
+    ///   whose element is one of the target's flow scopes and use it; none →
+    ///   the default resolution (`findProperAncestorScopeKeyForTarget`).
+    ///
+    /// Rejections (all [`EngineError::ModificationInstructionInvalid`], the
+    /// 400-class): an empty source id or target id, a duplicated source
+    /// element id (Zeebe `ERROR_MESSAGE_MOVE_*`), a by-key source instance
+    /// that does not exist or belongs to another process instance, and a
+    /// by-id source whose element id is unknown to the definition.
+    ///
+    /// For a multi-instance source only the BODY instances move
+    /// (`shouldMoveAllMultiInstanceElementsByIds`): each body is terminated
+    /// (its children go with it) and activates one fresh target instance.
+    pub(super) fn desugar_move_instructions(
+        &self,
+        instance_key: Key,
+        move_instructions: &[MoveInstruction],
+        activate_instructions: &mut Vec<ActivateElementInstruction>,
+        terminate_instructions: &mut Vec<Key>,
+    ) -> Result<(), EngineError> {
+        use crate::command::{AncestorScopeInstruction as Anc, MoveSource};
+
+        let instance = self
+            .state
+            .instances
+            .get(&instance_key)
+            .ok_or(EngineError::InstanceNotFound { instance_key })?;
+        let process_id = instance.process_id.clone();
+        let def = self
+            .process_of_instance(instance_key)
+            .ok_or(EngineError::InstanceNotFound { instance_key })?;
+        let invalid_move = |reason: String| {
+            Err(EngineError::ModificationInstructionInvalid {
+                instance_key,
+                process_id: process_id.clone(),
+                reason,
+            })
+        };
+
+        // Zeebe `validateHasMoveInstructions` / `validateMoveBatchInstructions`:
+        // every instruction needs a non-empty source and target.
+        for m in move_instructions {
+            let source_missing = match &m.source {
+                MoveSource::ById(id) => id.is_empty(),
+                // A by-key source is defined by its key; `0` is no key.
+                MoveSource::ByKey(k) => *k == 0,
+            };
+            if source_missing || m.target_element_id.is_empty() {
+                return invalid_move(format!(
+                    "Expected to modify instance of process '{process_id}' but it contains one \
+                     or more move instructions with either or both the source or target element \
+                     id missing"
+                ));
+            }
+        }
+
+        // Every move target must exist in the definition — validated up front
+        // so a move whose source has no active instances (and therefore spawns
+        // no activation) still rejects an unknown target instead of silently
+        // applying the rest of the modification.
+        for m in move_instructions {
+            if def.element(&m.target_element_id).is_none() {
+                return invalid_move(format!(
+                    "Expected to modify instance of process '{process_id}' but it contains one \
+                     or more move instructions with a target element id that could not be found \
+                     in the process: '{}'",
+                    m.target_element_id
+                ));
+            }
+        }
+
+        // Zeebe `validateNoDuplicatedMoveInstructions`: no two by-id moves may
+        // share a source element id.
+        let mut seen_source_ids: Vec<&str> = Vec::new();
+        for m in move_instructions {
+            if let MoveSource::ById(id) = &m.source {
+                if seen_source_ids.contains(&id.as_str()) {
+                    return invalid_move(format!(
+                        "Expected to modify instance of process '{process_id}' but it contains \
+                         multiple move instructions with identical source element ids: '{id}'"
+                    ));
+                }
+                seen_source_ids.push(id);
+            }
+        }
+
+        // The ancestor scope for the activation one moved source instance
+        // spawns (Zeebe `determineAncestorScopeKey`). `0` — the process root,
+        // Zeebe's `-1` — means the default find-or-create resolution and is
+        // carried as `None` (the activation instruction's "no ancestor
+        // selection").
+        let ancestor_for = |m: &MoveInstruction, source_parent: Key| -> Option<Key> {
+            match &m.ancestor_scope {
+                // A root-level source's parent is the process root (`0`).
+                // That is an EXPLICIT selection, not "no selection": carry it
+                // as the instance key, which the flow-scope resolver treats as
+                // the root (it then creates the target's whole scope chain
+                // beneath it rather than reusing/inferring an active scope).
+                Anc::SourceParent => Some(if source_parent == 0 {
+                    instance_key
+                } else {
+                    source_parent
+                }),
+                Anc::Direct(k) => Some(*k).filter(|k| *k != 0),
+                Anc::Inferred => self.infer_ancestor_scope(
+                    def,
+                    instance_key,
+                    source_parent,
+                    &m.target_element_id,
+                ),
+            }
+        };
+        let mut spawn_activation = |m: &MoveInstruction, ancestor: Option<Key>| {
+            activate_instructions.push(ActivateElementInstruction {
+                element_id: m.target_element_id.clone(),
+                variables: HashMap::new(),
+                ancestor_element_instance_key: ancestor,
+                variable_instructions: m.variable_instructions.clone(),
+            });
+        };
+
+        // By-key moves first (Zeebe `mapMoveInstructionsByInstanceKey`): the
+        // source instance must exist and belong to this process instance.
+        for m in move_instructions {
+            let MoveSource::ByKey(source_key) = &m.source else {
+                continue;
+            };
+            if !instance.active.contains_key(source_key) {
+                return invalid_move(format!(
+                    "Expected to modify instance of process '{process_id}' but it contains one \
+                     or more move instructions with a source element instance that could not be \
+                     found: '{source_key}'"
+                ));
+            }
+            let source_parent = self.scope_of(instance_key, *source_key);
+            spawn_activation(m, ancestor_for(m, source_parent));
+            terminate_instructions.push(*source_key);
+        }
+
+        // By-id moves (Zeebe `mapIdInstructions`): every active instance of the
+        // source element id moves. A multi-instance source moves only its BODY
+        // instances (the children go with the terminated body); a body is not
+        // itself moved by an id instruction naming its element when enumerated
+        // as a child of another body — the structural body check keeps exactly
+        // the bodies.
+        for m in move_instructions {
+            let MoveSource::ById(source_id) = &m.source else {
+                continue;
+            };
+            if def.element(source_id).is_none() {
+                return invalid_move(format!(
+                    "Expected to modify instance of process '{process_id}' but it contains one \
+                     or more move instructions with a source element id that could not be found \
+                     in the process: '{source_id}'"
+                ));
+            }
+            let mut sources: Vec<Key> = instance
+                .active
+                .iter()
+                .filter(|(_, id)| id.as_str() == source_id)
+                .map(|(k, _)| *k)
+                // A parked join (#1244) never activated: it is no source
+                // instance to move (and is not terminable by key).
+                .filter(|k| !self.is_parked_join(instance_key, *k))
+                .collect();
+            sources.sort_unstable();
+            if self.multi_instance_of(instance_key, source_id).is_some() {
+                sources.retain(|k| self.is_multi_instance_body_structural(instance_key, *k));
+            }
+            for source_key in sources {
+                let source_parent = self.scope_of(instance_key, source_key);
+                spawn_activation(m, ancestor_for(m, source_parent));
+                terminate_instructions.push(source_key);
+            }
+        }
+        Ok(())
+    }
+
+    /// The inferred ancestor scope instance for a move target (Zeebe
+    /// `findProperAncestorScopeKeyForTarget`): walk the source instance's
+    /// ancestry — starting at its direct flow scope — for an instance whose
+    /// element is one of the target's flow scopes, and use it. The process
+    /// root is itself a flow scope of every element, so when the walk reaches
+    /// the root without an intermediate match the root is the selection
+    /// (`Some(instance_key)`, as for `SourceParent`): the target's missing
+    /// scope chain is created beneath it rather than reusing an unrelated
+    /// active scope. A root-level target → `None`: the default resolution
+    /// lands it at the root.
+    fn infer_ancestor_scope(
+        &self,
+        def: &crate::model::ProcessDefinition,
+        instance_key: Key,
+        source_parent: Key,
+        target_element_id: &str,
+    ) -> Option<Key> {
+        let chain = element_flow_scope_chain(def, target_element_id);
+        // Root-level target: the default find-or-create resolution lands it at
+        // the process root (Zeebe's `-1`).
+        if chain.is_empty() {
+            return None;
+        }
+        let mut current = Some(source_parent);
+        while let Some(key) = current {
+            if key == 0 {
+                return Some(instance_key);
+            }
+            let matches = self
+                .element_id_of_instance(instance_key, key)
+                .is_some_and(|id| chain.contains(&id));
+            if matches {
+                return Some(key);
+            }
+            current = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.scopes.get(&key).copied());
+        }
+        Some(instance_key)
+    }
+
     /// Validates a `ModifyInstance` against the current state without emitting
     /// anything (Zeebe validation order: activate targets, ancestors, variable
     /// scopes, terminate targets, then flow-scope/termination conflicts).

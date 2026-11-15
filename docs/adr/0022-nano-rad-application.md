@@ -364,6 +364,16 @@ on-ramp binary first — but growth to a hosted cluster is a one-line change whe
   audit trail of tool activations to match Operate, or a reduced one?
 - **MCP surface**: does an Urban App only *consume* MCP tool servers, or also *expose* its own
   processes/tasks as an MCP server (making the App itself an agent tool for other systems)?
+  **Settled (2026-11-11, epic #1499): yes — Nano exposes Camunda's MCP gateway contract
+  (`/mcp/cluster`, `/mcp/processes`); any Urban-specific extras are additive over it.**
+  **Auth (settled 2026-11-13, epic #1499 integration review): the MCP endpoints sit behind the
+  *same* auth check as `/v2` — every `/mcp/*` route is layered in the shared `ApiAuthBasic`
+  credential extraction the generated REST handlers apply (`server/src/mcp/mod.rs` `mcp_auth`),
+  so a secured REST deployment secures MCP identically and the two surfaces can never drift onto
+  different checks. Today that impl accepts any credentials (the REST API runs unsecured), so
+  MCP behaves exactly like `/v2`; a route-enumeration guard test
+  (`every_mcp_route_sits_behind_auth`) pins the invariant that no mounted `/mcp` route can
+  bypass the layer.**
 - **SQLite vs the engine journal**: two files, or does App data ride the engine's varstore? Keep
   them separate for a clean DB-manager story, or unify for one durability model?
 - **Trigger packs vs first-party set**: which sources are core (cron/webhook/file) vs pack-only

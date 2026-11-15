@@ -1018,6 +1018,9 @@ fn redelivered_message_continuation_starts_one_non_interrupting_run() {
                 element_id: element_id.clone(),
                 kind: kind.clone(),
                 variables: HashMap::new(),
+                // `0` = no routed-delivery identity (#1497), so the dedup under
+                // test is the ESP subscription's own message-key dedup.
+                delivery_key: 0,
             })
             .unwrap()
     };
