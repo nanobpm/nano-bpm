@@ -947,13 +947,14 @@ impl Engine {
             // mapped target id is in this set is the mapped common ancestor —
             // the search must not climb past it. An ancestor id absent from
             // the source model contributes nothing (its source counterpart
-            // does not exist, so no live scope can map to it).
-            let mut chain: HashSet<ElementId> = HashSet::new();
-            let mut cur = Some(parent.clone());
-            while let Some(id) = cur {
-                chain.insert(id.clone());
-                cur = target.element(&id).and_then(|el| el.parent.clone());
-            }
+            // does not exist, so no live scope can map to it). Read off the
+            // one canonical, cycle-safe chain walk (#1374): a malformed
+            // cyclic `parent` chain (e.g. `contained_in("sub", "sub")`, which
+            // deployment preflight does not reject) must not hang migration
+            // (#1379 review).
+            let chain: HashSet<ElementId> = std::iter::once(parent.clone())
+                .chain(flow_scope::element_flow_scope_chain(target, &parent))
+                .collect();
             let within = |a: Key, root: Key| -> bool {
                 let mut c = a;
                 loop {

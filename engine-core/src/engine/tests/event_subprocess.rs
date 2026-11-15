@@ -3142,3 +3142,75 @@ fn migration_bounds_destination_search_to_the_mapped_common_ancestor_instance() 
         "host 1's subB carries the timer; host 0's consumed timer suppresses nothing"
     );
 }
+
+#[test]
+fn migration_cyclic_containment_in_unused_target_scope_does_not_hang() {
+    // #1379 review r4579688057: `ProcessBuilder::contained_in("sub", "sub")`
+    // and deployment preflight do not reject cyclic containment, so an armed
+    // event sub-process moved under an unused target sub-process whose parent
+    // chain CYCLES passed the active-element checks, then the destination
+    // search's model-ancestor walk looped forever. The walk must be the
+    // cycle-safe `flow_scope::element_flow_scope_chain`: the migration
+    // completes, and with no live `sub` instance the consumed source trigger
+    // resolves to no destination (nothing re-arms).
+    let model = |esp_parent: Option<&str>| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .sub_process("sub", "sub_s")
+            .start_event("sub_s")
+            .service_task("sub_w", "sw")
+            .end_event("sub_e")
+            .connect("sub_s", "sub_w")
+            .connect("sub_w", "sub_e")
+            .contained_in("sub_s", "sub")
+            .contained_in("sub_w", "sub")
+            .contained_in("sub_e", "sub")
+            .event_sub_process("esp", "esp_start", trig_of(T::Timer), false)
+            .start_event("esp_start")
+            .service_task("esp_w", "ew")
+            .end_event("esp_e")
+            .connect("esp_start", "esp_w")
+            .connect("esp_w", "esp_e")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_w", "esp")
+            .contained_in("esp_e", "esp");
+        b = match esp_parent {
+            Some(p) => b.contained_in("esp", p),
+            None => b,
+        };
+        b.build().unwrap()
+    };
+    let mut engine = Engine::new();
+    // Source: the timer ESP lives in the process-level scope; park in `work`.
+    let inst = start(&mut engine, model(None));
+    // Consume the armed timer.
+    let key = engine
+        .state
+        .timers
+        .values()
+        .find(|t| t.instance_key == inst && t.state == crate::state::TimerState::Created)
+        .map(|t| t.key)
+        .expect("esp timer armed");
+    engine.state.timers.get_mut(&key).expect("timer").state = crate::state::TimerState::Triggered;
+    // Target: the ESP moves under `sub`, whose containment is CYCLIC
+    // (`sub` inside `sub`). `sub` is never entered, so no live scope maps to
+    // it. This must terminate (not hang) and re-arm nothing.
+    let mut target = model(Some("sub"));
+    target.elements.get_mut("sub").expect("sub exists").parent = Some("sub".into());
+    let target_key = deploy_for_migration(&mut engine, target);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("work".into(), "work".into())],
+        ))
+        .unwrap();
+    assert!(
+        armed_timer_hosts(&engine, inst).is_empty(),
+        "cyclic unused target scope: consumed timer re-arms nothing"
+    );
+}
