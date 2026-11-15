@@ -26,7 +26,7 @@
 //! `searchVariables`) are the cluster server's own [`Tool`]s, shared via
 //! [`shared_cluster_tools`] — not copies.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use nanobpm_gateway_rest::models;
 // The tool-metadata property prefix (single source: engine-core).
@@ -38,6 +38,7 @@ use super::{
     DynamicTools, ToolServer, response_status_body, tool_error_from_problem, tool_error_result,
 };
 use crate::ServerImpl;
+use crate::readstore::ProcessDefinitionRow;
 
 /// The mount path of the processes server.
 pub(crate) const PROCESSES_PATH: &str = "/mcp/processes";
@@ -80,11 +81,22 @@ pub(crate) fn processes_tool_servers() -> Vec<ToolServer> {
 }
 
 /// One resolved process tool.
+#[cfg_attr(
+    not(feature = "console"),
+    allow(
+        dead_code,
+        reason = "the console catalog is served by console builds only"
+    )
+)]
 struct ProcessTool {
     /// `<toolName>_<subscriptionKey>`.
     name: String,
     tool_name: String,
     message_name: String,
+    process_definition_key: u64,
+    process_definition_id: String,
+    process_definition_version: i32,
+    process_name: Option<String>,
     properties: BTreeMap<String, String>,
 }
 
@@ -93,19 +105,19 @@ struct ProcessTool {
 /// subscription of a superseded version is closed in Zeebe, so its tool is
 /// gone even when the newer version no longer declares the message start).
 fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
-    let latest: HashSet<u64> = server
+    let latest: HashMap<u64, ProcessDefinitionRow> = server
         .store
         .process_definitions()
         .into_iter()
         .filter(|d| d.is_latest)
-        .map(|d| d.key)
+        .map(|d| (d.key, d))
         .collect();
     let mut tools: Vec<ProcessTool> = server
         .store
         .message_start_subscriptions()
         .into_iter()
-        .filter(|s| latest.contains(&s.process_definition_key))
         .filter_map(|s| {
+            let def = latest.get(&s.process_definition_key)?;
             let tool_name = s.tool_name.filter(|n| !n.is_empty())?;
             let properties = serde_json::from_str::<BTreeMap<String, String>>(&s.tool_properties)
                 .unwrap_or_default();
@@ -113,6 +125,10 @@ fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
                 name: format!("{tool_name}{TOOL_NAME_DELIMITER}{}", s.subscription_key),
                 tool_name,
                 message_name: s.message_name,
+                process_definition_key: s.process_definition_key,
+                process_definition_id: s.process_id,
+                process_definition_version: def.version,
+                process_name: def.name.clone(),
                 properties,
             })
         })
@@ -279,6 +295,49 @@ fn descriptor(tool: &ProcessTool) -> Value {
     })
 }
 
+/// The console's read-only view of the processes exposed as MCP tools
+/// (`GET /console/api/mcp/processes`, issue #1612 — parity with Camunda's
+/// admin "MCP processes" page). Derived from the SAME [`open_tools`] +
+/// [`descriptor`] the `/mcp/processes` server lists, so the console can never
+/// drift from what an agent is actually offered; it only adds the owning
+/// process definition and the `NANOBPM_MCP_ENABLED` state. Served even when
+/// MCP is disabled (with `enabled: false`) so an operator can see what would
+/// be exposed.
+#[cfg_attr(
+    not(feature = "console"),
+    allow(
+        dead_code,
+        reason = "the console catalog is served by console builds only"
+    )
+)]
+pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
+    let tools: Vec<Value> = open_tools(server)
+        .iter()
+        .map(|t| {
+            let mut v = descriptor(t);
+            v["toolName"] = json!(t.tool_name);
+            v["messageName"] = json!(t.message_name);
+            v["subscriptionKey"] = json!(
+                t.name
+                    .rsplit_once(TOOL_NAME_DELIMITER)
+                    .map_or("", |(_, k)| k)
+            );
+            v["processDefinitionKey"] = json!(t.process_definition_key.to_string());
+            v["processDefinitionId"] = json!(t.process_definition_id);
+            v["processDefinitionVersion"] = json!(t.process_definition_version);
+            v["processName"] = json!(t.process_name);
+            v
+        })
+        .collect();
+    json!({
+        "enabled": enabled,
+        "envVar": super::MCP_ENABLED_ENV,
+        "path": PROCESSES_PATH,
+        "staticTools": PROCESSES_STATIC_TOOLS,
+        "tools": tools,
+    })
+}
+
 /// `tools/list` provider: the current dynamic tools.
 fn list_tools(server: &ServerImpl) -> Vec<Value> {
     open_tools(server).iter().map(descriptor).collect()
@@ -357,6 +416,8 @@ async fn call_tool(server: &ServerImpl, name: String, args: Value) -> Value {
     reason = "non-production target (unit tests)"
 )]
 mod tests {
+    use std::collections::HashSet;
+
     use nanobpmn_engine_core::bpmn::parse_bpmn;
 
     use super::*;
@@ -465,6 +526,48 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(&names[1..], &PROCESSES_STATIC_TOOLS);
+    }
+
+    /// Issue #1612: the console catalog is the `tools/list` descriptor plus
+    /// definition metadata — never a re-derivation that can drift.
+    #[tokio::test]
+    async fn console_catalog_mirrors_tools_list_with_definition_metadata() {
+        let server = ServerImpl::default();
+        let empty = console_catalog(&server, false);
+        assert_eq!(empty["enabled"], json!(false));
+        assert_eq!(empty["tools"], json!([]));
+        assert_eq!(empty["path"], json!(PROCESSES_PATH));
+        assert_eq!(empty["envVar"], json!("NANOBPM_MCP_ENABLED"));
+        assert_eq!(empty["staticTools"], json!(PROCESSES_STATIC_TOOLS));
+
+        deploy_xml(&server, FIXTURE).await;
+        let listed = wait_tools(&server, |t| t.len() == 1).await;
+        let catalog = console_catalog(&server, true);
+        assert_eq!(catalog["enabled"], json!(true));
+        let entries = catalog["tools"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        for field in [
+            "name",
+            "title",
+            "description",
+            "inputSchema",
+            "outputSchema",
+        ] {
+            assert_eq!(entry[field], listed[0][field], "{field} drifted");
+        }
+        assert_eq!(entry["toolName"], json!("mcp-process-with-inputs"));
+        assert_eq!(entry["messageName"], json!("mcp-process-with-inputs"));
+        assert_eq!(entry["subscriptionKey"], json!(sub_key(&listed[0])));
+        assert_eq!(entry["processDefinitionId"], json!("mcpProcessWithInputs"));
+        assert_eq!(entry["processDefinitionVersion"], json!(1));
+        assert!(
+            entry["processDefinitionKey"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .is_ok()
+        );
     }
 
     #[test]
