@@ -389,11 +389,13 @@ fn migration_remaps_both_parallel_join_maps_together() {
 
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "the join is half-open on the source id before migration"
     );
     assert_eq!(
-        instance.join_flows_taken("join"),
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
         1,
         "one branch has arrived at the join before migration"
     );
@@ -413,16 +415,24 @@ fn migration_remaps_both_parallel_join_maps_together() {
 
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_flow_arrivals.contains_key("join2")
-            && !instance.join_flow_arrivals.contains_key("join"),
+        instance
+            .join_flow_arrivals
+            .contains_key(&crate::state::JoinKey::root("join2"))
+            && !instance
+                .join_flow_arrivals
+                .contains_key(&crate::state::JoinKey::root("join")),
         "join_flow_arrivals re-keyed onto the target join id"
     );
     assert!(
-        instance.join_instances.contains_key("join2")
-            && !instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join2"))
+            && !instance
+                .join_instances
+                .contains_key(&crate::state::JoinKey::root("join")),
         "join_instances re-keyed onto the target join id (kept in sync with the counts)"
     );
-    let arrivals = &instance.join_flow_arrivals["join2"];
+    let arrivals = &instance.join_flow_arrivals[&crate::state::JoinKey::root("join2")];
     assert_eq!(
         arrivals.count(&IncomingFlow {
             from: "a2".to_string(),
@@ -502,7 +512,9 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "precondition: the join is open before migration"
     );
 
@@ -537,7 +549,9 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     let instance = engine.instance(inst).unwrap();
     assert_eq!(instance.process_id, "source", "instance not migrated");
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "the open join is left intact on the source id"
     );
 }
@@ -685,7 +699,9 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "precondition: the inclusive join is open before migration"
     );
 
@@ -707,7 +723,9 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
     let instance = engine.instance(inst).unwrap();
     assert_eq!(instance.process_id, "target", "instance migrated");
     assert!(
-        instance.join_instances.contains_key("join2"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join2")),
         "the open inclusive join is re-pointed at the target id"
     );
 
@@ -765,7 +783,9 @@ fn migration_rejects_inclusive_join_with_unidentified_arrival_and_different_arit
         .unwrap();
     let instance = engine.instance(inst).unwrap();
     assert_eq!(
-        instance.join_counts.get("join"),
+        instance
+            .join_counts
+            .get(&crate::state::JoinKey::root("join")),
         Some(&1),
         "precondition: the join holds one unidentified arrival"
     );

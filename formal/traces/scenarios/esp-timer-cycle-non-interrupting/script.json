@@ -1,0 +1,24 @@
+{
+  "description": "A non-interrupting unbounded timer-cycle (R/PT1M) event sub-process fires on each cycle and re-arms, alongside the service task; completing the task closes the timer.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-timer-cycle-non-interrupting",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

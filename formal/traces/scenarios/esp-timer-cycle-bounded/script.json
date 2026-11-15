@@ -1,0 +1,24 @@
+{
+  "description": "A non-interrupting bounded timer-cycle (R2/PT1M) event sub-process fires exactly twice (Zeebe stops re-arming after the 2nd repetition).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-timer-cycle-bounded",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

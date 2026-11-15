@@ -454,6 +454,19 @@ pub enum Event {
     /// dropped and its tree entry removed. Emitted as the owning element instance
     /// completes or is terminated.
     VariableScopeDestroyed { instance_key: Key, scope_key: Key },
+    /// A correlated message / signal payload is held for an event
+    /// sub-process whose start event carries output mappings (#1555, Zeebe
+    /// parity): Zeebe creates such a payload LOCAL to the start event
+    /// instance, so it is parked against the event sub-process container
+    /// instance `scope_key` until that container's start event activates
+    /// (possibly in a later command, e.g. after a container `start`
+    /// execution listener completes). Journaled so the hold survives replay;
+    /// dropped with the container's scope (`VariableScopeDestroyed`).
+    EventSubProcessPayloadHeld {
+        instance_key: Key,
+        scope_key: Key,
+        variables: HashMap<String, Value>,
+    },
 
     /// An element instance entered `ACTIVATING`. It registers the element
     /// instance as a live token (so a token parked in `ACTIVATING` on an
@@ -550,6 +563,12 @@ pub enum Event {
     ParallelJoinTokenArrived {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
         #[cfg_attr(feature = "serde", serde(default))]
         flow: Option<IncomingFlow>,
     },
@@ -559,6 +578,12 @@ pub enum Event {
     ParallelJoinReset {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
     /// A join fired: a parallel join because every incoming flow has been taken,
     /// an inclusive join because every incoming flow has been taken or no active
@@ -569,6 +594,12 @@ pub enum Event {
     ParallelJoinFired {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
 
     /// A job was created for a service task; the token now rests until the job
@@ -1088,6 +1119,11 @@ pub enum Event {
         /// call-activity element instance (#1374). Additive; empty when none.
         #[cfg_attr(feature = "serde", serde(default))]
         child_instances: Vec<MigratedChildInstance>,
+        /// Whether the join bookkeeping was migrated per flow-scope instance
+        /// (#1580). Additive; a legacy record decodes `false` and replays the
+        /// pre-#1580 element-wide merge (one slot per target join element).
+        #[cfg_attr(feature = "serde", serde(default))]
+        join_scoped: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification
@@ -1894,6 +1930,7 @@ impl Event {
             | Event::ScopedVariablesUpdated { instance_key, .. }
             | Event::VariableScopeCreated { instance_key, .. }
             | Event::VariableScopeDestroyed { instance_key, .. }
+            | Event::EventSubProcessPayloadHeld { instance_key, .. }
             | Event::ElementActivating { instance_key, .. }
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }

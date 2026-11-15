@@ -115,6 +115,11 @@ def registry : List KindSpec :=
         , { key := "repeating", required := true, ty := .bool } ] }
   , { keyword := "subProcess"
     , attrs := [ { key := "startEvent", required := true, ty := .id } ] }
+  , { keyword := "eventSubProcess"
+    , attrs :=
+        [ { key := "startEvent", required := true, ty := .id }
+        , { key := "trigger", required := true, ty := .str }
+        , { key := "interrupting", required := true, ty := .bool } ] }
   , { keyword := "escalationThrowEvent"
     , attrs := [ { key := "escalationCode", required := false, ty := .str } ] }
   , { keyword := "escalationBoundaryEvent"

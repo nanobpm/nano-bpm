@@ -136,18 +136,18 @@ pub use feel::FeelError;
 pub use model::{
     tool_name_of, tool_properties_of, AdHocActivateElement, AdHocImplementationType,
     AdHocJobResult, AdHocSubProcessDef, AdHocTool, AdHocToolKind, BindingType, BuildError,
-    Condition, Element, ElementId, ElementKind, ExecutionListener, IncomingFlow, IoMapping,
-    LinkedResource, ListenerEventType, Mapping, MultiInstance, ProcessBuilder, ProcessDefinition,
-    SequenceFlow, TaskListener, TaskListenerEventType, TaskListenerJobResult, TimerDef,
-    TimerDefKind, UserTaskCorrections, UserTaskProps, Value, TOOL_NAME_PROPERTY,
-    TOOL_PROPERTY_PREFIX,
+    Condition, Element, ElementId, ElementKind, EventSubProcessTrigger, ExecutionListener,
+    IncomingFlow, IoMapping, LinkedResource, ListenerEventType, Mapping, MultiInstance,
+    ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener, TaskListenerEventType,
+    TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
+    TOOL_NAME_PROPERTY, TOOL_PROPERTY_PREFIX,
 };
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
     subscription_partition, ConditionalSubscription, DeployedProcess, Incident, IncidentKind,
     IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
-    JobSettlementOutcome, JobState, JobTerminalEnd, Key, MessageStartSubscription,
+    JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
     ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
     UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES,

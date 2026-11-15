@@ -354,6 +354,7 @@ mod tests {
             adhoc_instances: HashMap::new(),
             scope_parents: HashMap::new(),
             scope_variables: HashMap::new(),
+            esp_held_payloads: HashMap::new(),
             compensable: Default::default(),
             compensation_waits: HashMap::new(),
             agent_instances: HashMap::new(),
@@ -457,6 +458,7 @@ mod tests {
             correlation_key: "A".into(),
             state: MessageSubscriptionState::Open,
             kind: MessageSubscriptionKind::IntermediateCatch,
+            correlated_message_keys: Default::default(),
         });
         snap.timers.push(Timer {
             key: 320,
