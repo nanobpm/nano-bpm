@@ -2,7 +2,10 @@
 // Guards the built-in "MCP start event" component (#1611): schema validity,
 // exact Camunda bindings, optional typed-input groups that emit nothing when
 // empty, the dropdown type list vs. the server's JSON_SCHEMA_TYPES, and the
-// shared BPMN fixture the server deploys under `/mcp/processes`.
+// shared BPMN fixture the server deploys under `/mcp/processes`. `emitted()`
+// models the persistence rule only; the authoritative check that the REAL
+// modeler serializes exactly this (and the fixture) is the Playwright guard
+// `e2e/modeler-mcp-start-event.spec.ts`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
