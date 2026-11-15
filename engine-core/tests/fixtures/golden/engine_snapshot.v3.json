@@ -4832,6 +4832,7 @@
         "instance_key": 99,
         "key": 103,
         "kind": "IntermediateCatch",
+        "repetitions": null,
         "state": "Created"
       }
     },

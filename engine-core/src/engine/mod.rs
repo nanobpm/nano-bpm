@@ -31,7 +31,7 @@ mod migration;
 mod modify;
 mod resolve;
 pub use debug::{BreakCondition, DebugSession};
-use resolve::{JobProps, ResolvedUserTask};
+use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
 /// Whether the fixpoint loop should keep draining after a processed step, or pause
 /// and hand control back to a debugger. See [`StepDriver`].
@@ -1816,10 +1816,11 @@ impl Engine {
                         repeating,
                     } => self
                         .resolve_timer(&empty, start_timer_def.as_ref(), self.now, interval_millis)
-                        .map(|(due_at, interval_millis)| ResolvedStart::Timer {
-                            due_at,
-                            interval_millis,
+                        .map(|t| ResolvedStart::Timer {
+                            due_at: t.due_at,
+                            interval_millis: t.interval_millis,
                             repeating,
+                            repetitions: if repeating { t.repetitions } else { None },
                         }),
                     _ => continue,
                 };
@@ -1911,6 +1912,7 @@ impl Engine {
                         due_at,
                         interval_millis,
                         repeating,
+                        repetitions,
                     } => {
                         let timer_key = self.mint_key();
                         self.emit(
@@ -1923,6 +1925,7 @@ impl Engine {
                                 due_at,
                                 interval_millis,
                                 repeating,
+                                repetitions,
                             },
                         );
                     }
@@ -3073,6 +3076,7 @@ impl Engine {
                     let element_id = timer.element_id.clone();
                     let due_at = timer.due_at;
                     let kind = timer.kind.clone();
+                    let repetitions = timer.repetitions;
 
                     self.emit(
                         &mut log,
@@ -3134,6 +3138,9 @@ impl Engine {
                                 ..
                             }) = self.element_kind(instance_key, &boundary_element_id)
                             {
+                                // A bounded `Rn/…` cycle stops after its n-th
+                                // fire (Zeebe parity, #1596).
+                                if let Some(next_repetitions) = rearm_repetitions(repetitions) {
                                 let next_timer_key = self.mint_key();
                                 // Re-evaluate a FEEL cycle against current vars so
                                 // the next interval reflects any updated variable;
@@ -3148,17 +3155,18 @@ impl Engine {
                                     due_at,
                                     duration_millis,
                                 ) {
-                                    Ok((next_due_at, _)) => self.emit(
+                                    Ok(next) => self.emit(
                                         &mut log,
                                         Event::TimerCreated {
                                             timer_key: next_timer_key,
                                             instance_key,
                                             element_instance_key,
                                             element_id: element_id.clone(),
-                                            due_at: next_due_at,
+                                            due_at: next.due_at,
                                             kind: state::TimerKind::NonInterruptingBoundary {
                                                 boundary_element_id,
                                             },
+                                            repetitions: next_repetitions,
                                         },
                                     ),
                                     // The cycle no longer evaluates (a variable it
@@ -3176,6 +3184,7 @@ impl Engine {
                                         self.emit(&mut log, incident);
                                     }
                                 }
+                                }
                             }
                         }
                         // Event sub-process timer: `element_instance_key` is the
@@ -3192,6 +3201,7 @@ impl Engine {
                                     &element_id,
                                     &esp_element_id,
                                     due_at,
+                                    repetitions,
                                 ) {
                                     Ok(Some(event)) => self.emit(&mut log, event),
                                     Ok(None) => {}
@@ -3242,7 +3252,11 @@ impl Engine {
                         Some(d) => d,
                         None => continue,
                     };
-                    let next_due_at = if timer.repeating {
+                    // A bounded `Rn/…` start cycle stops re-arming after its
+                    // n-th fire (#1596).
+                    let next_due_at = if timer.repeating
+                        && rearm_repetitions(timer.repetitions).is_some()
+                    {
                         Some(due_at.saturating_add(timer.interval_millis))
                     } else {
                         None
@@ -16869,6 +16883,8 @@ enum ResolvedStart {
         due_at: u64,
         interval_millis: u64,
         repeating: bool,
+        /// A bounded `Rn/…` cycle's fire count (#1596).
+        repetitions: Option<u32>,
     },
 }
 

@@ -1160,6 +1160,15 @@ pub enum Event {
         element_id: ElementId,
         due_at: u64,
         kind: TimerKind,
+        /// Remaining fires of a bounded cycle (`Rn/…`) INCLUDING this one;
+        /// the timer is not re-armed after the fire that consumes the last
+        /// (#1596). `None` for an unbounded cycle, a one-shot, and records
+        /// serialized before this field existed.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        repetitions: Option<u32>,
     },
     /// A due timer fired. For an intermediate catch event its token is released
     /// along the event's outgoing flow; for an interrupting boundary timer the
@@ -1724,6 +1733,15 @@ pub enum Event {
         due_at: u64,
         interval_millis: u64,
         repeating: bool,
+        /// Remaining fires of a bounded cycle (`Rn/…`) INCLUDING this one;
+        /// the timer is not re-armed after the fire that consumes the last
+        /// (#1596). `None` for an unbounded cycle, a one-shot, and records
+        /// serialized before this field existed.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        repetitions: Option<u32>,
     },
     /// A process-level timer start event fired (a `ProcessInstanceCreated` and
     /// the new instance's flow events follow). `next_due_at` is `Some` for a

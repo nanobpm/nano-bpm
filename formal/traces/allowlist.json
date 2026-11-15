@@ -213,23 +213,6 @@
           "intent": "ELEMENT_COMPLETED"
         }
       ]
-    },
-    {
-      "scenario": "esp-timer-cycle-bounded",
-      "issue": "#1596",
-      "reason": "timeCycle repetition count ignored: after the 2nd fire of R2/PT1M nano re-arms a third TIMER CREATED (then CANCELED when the scope completes); Zeebe stops re-arming. Narrowed with ignoreRecords to TIMER CREATED/CANCELED records targeting `esp_start`; every lifecycle record (both EVENT_SUB_PROCESS runs) must equal Zeebe.",
-      "ignoreRecords": [
-        {
-          "valueType": "TIMER",
-          "intent": "CREATED",
-          "targetElementId": "esp_start"
-        },
-        {
-          "valueType": "TIMER",
-          "intent": "CANCELED",
-          "targetElementId": "esp_start"
-        }
-      ]
     }
   ]
 }

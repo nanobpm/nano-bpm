@@ -1806,6 +1806,10 @@ pub struct Timer {
     pub state: TimerState,
     /// What the timer guards, and so what firing it does.
     pub kind: TimerKind,
+    /// Remaining fires of a bounded cycle (`Rn/…`) including the next one
+    /// (#1596); `None` when unbounded or not a cycle.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub repetitions: Option<u32>,
 }
 
 /// Lifecycle state of a message subscription.
@@ -2047,6 +2051,10 @@ pub struct StartTimer {
     pub interval_millis: u64,
     /// Whether the timer re-arms after firing (a cycle) or fires once.
     pub repeating: bool,
+    /// Remaining fires of a bounded cycle (`Rn/…`) including the next one
+    /// (#1596); `None` when unbounded or not a cycle.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub repetitions: Option<u32>,
 }
 
 /// A deployed process definition together with the identity the engine assigned

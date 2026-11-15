@@ -743,9 +743,10 @@ impl Engine {
     /// ([`crate::model::TimerDef`]) when one is declared on the element, and
     /// using the statically-parsed `fallback_millis` only when none is.
     ///
-    /// Returns `(due_at, interval_millis)` where `due_at` is an absolute epoch
-    /// time in the engine's millisecond clock and `interval_millis` is the delay
-    /// used to re-arm a repeating (cycle) timer (0 for an absolute date). `vars`
+    /// Returns a [`ResolvedTimer`]: `due_at` is an absolute epoch time in the
+    /// engine's millisecond clock, `interval_millis` is the delay used to re-arm
+    /// a repeating (cycle) timer (0 for an absolute date), and `repetitions` is
+    /// a bounded cycle's `Rn` fire count (#1596). `vars`
     /// is the scoped view the timer's element sees (empty for a process-level
     /// start timer evaluated at deploy against an empty context). A declared
     /// expression that fails to evaluate, or whose result is not a valid
@@ -758,9 +759,18 @@ impl Engine {
         def: Option<&crate::model::TimerDef>,
         base_now: u64,
         fallback_millis: u64,
-    ) -> Result<(u64, u64), expression::Failure> {
+    ) -> Result<ResolvedTimer, expression::Failure> {
+        let resolved = |due_at, interval_millis, repetitions| ResolvedTimer {
+            due_at,
+            interval_millis,
+            repetitions,
+        };
         let Some(def) = def else {
-            return Ok((base_now.saturating_add(fallback_millis), fallback_millis));
+            return Ok(resolved(
+                base_now.saturating_add(fallback_millis),
+                fallback_millis,
+                None,
+            ));
         };
         match def.kind {
             crate::model::TimerDefKind::Duration => {
@@ -770,16 +780,20 @@ impl Engine {
                     "duration",
                     crate::temporal::parse_duration_millis,
                 )?;
-                Ok((base_now.saturating_add(ms), ms))
+                Ok(resolved(base_now.saturating_add(ms), ms, None))
             }
             crate::model::TimerDefKind::Cycle => {
-                let ms = expression::evaluate_timer(
+                let cycle = expression::evaluate_timer(
                     &def.expr,
                     vars,
                     "cycle",
-                    crate::temporal::parse_cycle_millis,
+                    crate::temporal::parse_cycle,
                 )?;
-                Ok((base_now.saturating_add(ms), ms))
+                Ok(resolved(
+                    base_now.saturating_add(cycle.interval_millis),
+                    cycle.interval_millis,
+                    cycle.repetitions,
+                ))
             }
             crate::model::TimerDefKind::Date => {
                 let dt = expression::evaluate_timer(
@@ -788,7 +802,11 @@ impl Engine {
                     "date-time",
                     crate::feel::temporal::DateTime::parse,
                 )?;
-                Ok(((dt.epoch_nanos() / 1_000_000).max(0) as u64, 0))
+                Ok(resolved(
+                    (dt.epoch_nanos() / 1_000_000).max(0) as u64,
+                    0,
+                    None,
+                ))
             }
         }
     }
@@ -1096,4 +1114,25 @@ pub(crate) fn conditional_write_checks() -> u64 {
 #[cfg(test)]
 pub(crate) fn note_conditional_write_check() {
     CONDITIONAL_WRITE_CHECKS.with(|c| c.set(c.get() + 1));
+}
+
+/// A timer resolved at creation time (see [`Engine::resolve_timer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedTimer {
+    pub(crate) due_at: u64,
+    pub(crate) interval_millis: u64,
+    /// The `n` of a bounded `Rn/…` cycle; `None` when unbounded / not a cycle.
+    pub(crate) repetitions: Option<u32>,
+}
+
+/// The remaining-fire count a cycle timer re-arms with after a fire that had
+/// `remaining` fires left (including itself), or `None` when that fire was the
+/// last and the cycle must NOT re-arm (Zeebe stops an `R2/…` cycle after two
+/// fires, #1596). An unbounded cycle (`None`) always re-arms unbounded.
+pub(crate) fn rearm_repetitions(remaining: Option<u32>) -> Option<Option<u32>> {
+    match remaining {
+        None => Some(None),
+        Some(n) if n > 1 => Some(Some(n - 1)),
+        Some(_) => None,
+    }
 }
