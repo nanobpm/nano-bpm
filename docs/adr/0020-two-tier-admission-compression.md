@@ -176,9 +176,10 @@ only `B`, whereas fan-in would over-throttle healthy `A`.
   (batch pre-creation, workers deployed later, a worker outage) cannot meet any
   latency budget however slowly instances arrive, so an on-by-default Tier-2 shed
   legitimate intake and never recovered — and Camunda 8 does not reject on this
-  pattern, making the opt-out default a C8-compatibility gap as well. Tier-1
-  (engine-saturation) and the memory-safety rails still shed real overload in
-  every mode; only the per-definition latency-SLA shed is opt-in.
+  pattern, making the opt-out default a C8-compatibility gap as well. The
+  exporter memory-safety rails still shed real overload in every mode, and Tier-1
+  (engine-saturation) sheds on raft-log fsync latency only in latency SLA mode
+  (that input is disabled in admission mode); only the per-definition latency-SLA shed is opt-in.
 
 Two behaviours are **correct by design**, not bugs:
 - a definition whose instances drain healthily is **never** throttled (the entire

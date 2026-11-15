@@ -284,9 +284,10 @@ This matters for C8 parity: a **backlog with no workers draining** (a batch
 pre-create, workers deployed after the process starts receiving instances, a
 worker outage) is a legitimate pattern Camunda 8 accepts, and it cannot meet any
 latency budget however slowly instances arrive — so an on-by-default Tier-2
-rejected it and never recovered (issue #1532). The engine-saturation guard
-(Tier-1) and the memory-safety rails still shed genuine overload in every mode;
-only the per-definition latency-SLA shed is opt-in, pending ADR-0021's
+rejected it and never recovered (issue #1532). The exporter memory-safety
+rails still shed genuine overload in every mode, and the Tier-1 engine-saturation
+guard sheds on its raft-log fsync-latency input only in latency SLA mode (that
+input is disabled in admission mode); only the per-definition latency-SLA shed is opt-in, pending ADR-0021's
 latency-causal shed predicate.
 
 ### Durability tiers
