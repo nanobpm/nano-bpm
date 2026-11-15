@@ -5276,6 +5276,15 @@ impl Engine {
                         tgt,
                     )?;
                 }
+                // 5a'. Event sub-processes of a live scope may not merge onto
+                //      one target event sub-process (#1379).
+                Self::check_migrated_event_subprocesses(
+                    instance_key,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &active_elements,
+                )?;
 
                 // 5b. An already-*open* parallel-gateway join (a token has
                 //     arrived on some but not all of its incoming flows) carries

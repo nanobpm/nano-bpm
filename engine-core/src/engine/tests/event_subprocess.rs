@@ -1962,3 +1962,147 @@ fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_end
         }
     }
 }
+
+#[test]
+fn migration_arms_a_subscription_trigger_replacing_an_error_or_escalation_one() {
+    // #1379 review r4578935957: error / escalation event sub-processes have
+    // no armed subscription, so they must not suppress arming a same-id target
+    // event sub-process that now carries a subscription trigger.
+    let sources = [
+        Trig::Error {
+            error_code: Some("E".into()),
+        },
+        Trig::Escalation {
+            escalation_code: Some("X".into()),
+        },
+    ];
+    for embedded in [false, true] {
+        for src in &sources {
+            for t in ALL {
+                let mut engine = Engine::new();
+                let inst = start(&mut engine, esp_model(src.clone(), true, embedded));
+                assert_eq!(armed(&engine, inst), 0);
+                let target_key =
+                    deploy_for_migration(&mut engine, esp_model(trig_of(t), false, embedded));
+                migrate(&mut engine, inst, target_key, embedded);
+                assert_eq!(
+                    armed(&engine, inst),
+                    1,
+                    "{src:?}->{t:?}/{embedded}: target trigger armed"
+                );
+                let fired = fire(&mut engine, inst, t, 5_000);
+                assert!(esp_activated(&fired), "{src:?}->{t:?}/{embedded}: fires");
+            }
+        }
+    }
+}
+
+/// `s -> work("w") -> e` plus two non-interrupting signal event sub-processes
+/// `a` and `b` (or only `a` when `!with_b`).
+fn two_esp_model(with_b: bool) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "w")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e");
+    let ids: &[&str] = if with_b { &["a", "b"] } else { &["a"] };
+    for id in ids {
+        let (st, wk, en) = (format!("{id}_s"), format!("{id}_w"), format!("{id}_e"));
+        b = b
+            .event_sub_process(*id, st.clone(), sig(), false)
+            .start_event(st.clone())
+            .service_task(wk.clone(), *id)
+            .end_event(en.clone())
+            .connect(st.clone(), wk.clone())
+            .connect(wk.clone(), en.clone())
+            .contained_in(st, *id)
+            .contained_in(wk, *id)
+            .contained_in(en, *id);
+    }
+    b.build().unwrap()
+}
+
+#[test]
+fn migration_rejects_merging_event_subprocesses_onto_one_target() {
+    // #1379 review r4578935984: mapping `b -> a` while `a` is implicitly
+    // retained would leave two live triggers for target `a`.
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, two_esp_model(true));
+    assert_eq!(armed(&engine, inst), 2);
+    let target_key = deploy_for_migration(&mut engine, two_esp_model(false));
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("work".into(), "work".into()), ("b".into(), "a".into())],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::MigrationCatchEventsMerged { target_catch_event_id, source_catch_event_ids, .. }
+            if target_catch_event_id == "a" && source_catch_event_ids == &vec!["a".to_string(), "b".to_string()]),
+        "{err:?}"
+    );
+    assert_eq!(
+        armed(&engine, inst),
+        2,
+        "rejected migration changes nothing"
+    );
+}
+
+#[test]
+fn migration_does_not_arm_root_triggers_while_the_start_listener_is_pending() {
+    // #1379 review r4578935998: the root arms its event sub-processes when the
+    // process start event's body runs. Migrating while that start event waits
+    // on a start listener must not arm them early (completing the listener
+    // would arm them again).
+    use crate::model::{ExecutionListener, ListenerEventType};
+    let listener = || {
+        vec![ExecutionListener {
+            event_type: ListenerEventType::Start,
+            job_type: "gate".into(),
+            retries: None,
+        }]
+    };
+    let base = |with_esp: bool| {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("work", "w")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .with_listeners("s", listener(), vec![]);
+        if with_esp {
+            b = b
+                .event_sub_process("esp", "esp_start", sig(), false)
+                .start_event("esp_start")
+                .service_task("esp_work", "esp")
+                .end_event("esp_end")
+                .connect("esp_start", "esp_work")
+                .connect("esp_work", "esp_end")
+                .contained_in("esp_start", "esp")
+                .contained_in("esp_work", "esp")
+                .contained_in("esp_end", "esp");
+        }
+        b.build().unwrap()
+    };
+    let (src, tgt) = (base(false), base(true));
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, src);
+    assert_eq!(job_count(&mut engine, "gate"), 1);
+    let target_key = deploy_for_migration(&mut engine, tgt);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("s".into(), "s".into())],
+        ))
+        .unwrap();
+    assert_eq!(
+        armed(&engine, inst),
+        0,
+        "not armed before the start body runs"
+    );
+    complete_one(&mut engine, "gate");
+    assert_eq!(armed(&engine, inst), 1, "armed exactly once");
+}

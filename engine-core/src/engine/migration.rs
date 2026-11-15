@@ -125,6 +125,62 @@ fn timer_fingerprint(element: &Element) -> Option<TriggerFingerprint> {
 }
 
 impl Engine {
+    /// No two event sub-processes of one live scope may migrate onto the same
+    /// target event sub-process (#1379 review; Zeebe
+    /// `requireNoDuplicateTargetsInCatchEventMappings` parity). A source event
+    /// sub-process's counterpart is its mapping target, or itself when
+    /// unmapped (implicit retention by id) — so `b -> a` collides with an
+    /// unmapped `a` that the target still contains. Merging would leave two
+    /// live triggers for one target event sub-process (its handler would run
+    /// twice per trigger).
+    pub(crate) fn check_migrated_event_subprocesses(
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &HashMap<String, String>,
+        active: &[(Key, String)],
+    ) -> Result<(), EngineError> {
+        use super::event_subprocess::ArmableEsp;
+        let mut scopes: Vec<(Option<&str>, Option<&str>)> = vec![(None, None)];
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (_, source_id) in active {
+            let owns = source
+                .element(source_id)
+                .is_some_and(|e| e.kind.owns_token_scope());
+            if owns && seen.insert(source_id.as_str()) {
+                if let Some(t) = mapped.get(source_id) {
+                    scopes.push((Some(source_id.as_str()), Some(t.as_str())));
+                }
+            }
+        }
+        for (source_scope, target_scope) in scopes {
+            let target_ids: Vec<String> = ArmableEsp::in_scope(target, target_scope)
+                .into_iter()
+                .map(|e| e.esp_id)
+                .collect();
+            let mut by_target: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for esp in ArmableEsp::in_scope(source, source_scope) {
+                let tgt = mapped
+                    .get(&esp.esp_id)
+                    .cloned()
+                    .unwrap_or_else(|| esp.esp_id.clone());
+                if target_ids.contains(&tgt) {
+                    by_target.entry(tgt).or_default().push(esp.esp_id);
+                }
+            }
+            if let Some((tgt, mut sources)) = by_target.into_iter().find(|(_, s)| s.len() > 1) {
+                sources.sort();
+                return Err(EngineError::MigrationCatchEventsMerged {
+                    instance_key,
+                    element_id: source_scope.map_or_else(|| source.id.clone(), str::to_string),
+                    target_catch_event_id: tgt,
+                    source_catch_event_ids: sources,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Zeebe catch-event preconditions for one active element `source_id`
     /// mapped onto `target_id`: every mapped boundary of the source must target
     /// a boundary attached to `target_id` (stay attached), and no two may
@@ -840,8 +896,18 @@ impl Engine {
         for (scope_eik, source_scope, target_scope) in scopes {
             let source_esps = ArmableEsp::in_scope(source, source_scope.as_deref());
             let target_esps = ArmableEsp::in_scope(target, target_scope.as_deref());
-            let covered: HashSet<ElementId> =
-                source_esps.iter().map(|e| counterpart(&e.esp_id)).collect();
+            // Target event sub-processes a source counterpart accounts for:
+            // its armed trigger (if any) is retained or re-created above, and
+            // one with NO armed trigger (a fired one-shot timer) must not be
+            // re-armed. Error / escalation triggers are never subscriptions —
+            // they have nothing to retain or re-create — so they cover
+            // nothing: a target that turns one into a subscription trigger is
+            // newly armed below (#1379 review).
+            let covered: HashSet<ElementId> = source_esps
+                .iter()
+                .filter(|e| e.trigger.is_subscription())
+                .map(|e| counterpart(&e.esp_id))
+                .collect();
             let mut to_arm: Vec<ElementId> = Vec::new();
             // Target event sub-processes re-armed in place of a deleted source
             // trigger (vs newly created ones), by start-event id.
@@ -898,7 +964,10 @@ impl Engine {
                     })
                 ) && self.scope_of(instance_key, *eik) == scope_eik
             });
-            if !interrupted && !not_armable.contains(&scope_eik) {
+            if !interrupted
+                && !not_armable.contains(&scope_eik)
+                && !self.root_pending(instance_key, scope_eik, source, active, not_armable)
+            {
                 for g in &target_esps {
                     if !covered.contains(&g.esp_id) && !to_arm.contains(&g.esp_id) {
                         to_arm.push(g.esp_id.clone());
@@ -945,6 +1014,44 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Whether scope `scope_eik` is the process root and its arming is still
+    /// pending: the root arms its event sub-processes in the process start
+    /// event's activation body, so while that start event waits on a start
+    /// execution listener (or an activation-redriving incident) the root is
+    /// not steady — arming now would be repeated when the start event's body
+    /// runs (#1379 review).
+    fn root_pending(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+        source: &ProcessDefinition,
+        active: &[(Key, ElementId)],
+        not_armable: &HashSet<Key>,
+    ) -> bool {
+        scope_eik == 0
+            && active.iter().any(|(eik, id)| {
+                not_armable.contains(eik)
+                    && self.scope_of(instance_key, *eik) == 0
+                    && source.element(id).is_some_and(|e| e.kind.is_start_event())
+                    && !self.state.jobs.values().any(|j| {
+                        j.element_instance_key == *eik
+                            && matches!(
+                                j.kind,
+                                state::JobKind::ExecutionListener {
+                                    event_type: crate::model::ListenerEventType::End,
+                                    ..
+                                }
+                            )
+                            && matches!(
+                                j.state,
+                                state::JobState::Created
+                                    | state::JobState::Activated
+                                    | state::JobState::Failed
+                            )
+                    })
+            })
     }
 
     /// The `hosts` NOT in their steady active phase (computed in one pass), i.e. a
