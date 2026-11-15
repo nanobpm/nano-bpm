@@ -57,6 +57,7 @@ inductive Kind where
   | messageStartEvent
   | timerStartEvent
   | subProcess
+  | eventSubProcess
   | escalationThrowEvent
   | escalationBoundaryEvent
   | intermediateThrowEvent
@@ -80,7 +81,8 @@ def Kind.all : List Kind :=
   , .userTask, .exclusiveGateway, .parallelGateway, .inclusiveGateway
   , .eventBasedGateway, .errorBoundaryEvent, .timerIntermediateCatchEvent
   , .timerBoundaryEvent, .messageIntermediateCatchEvent, .messageBoundaryEvent
-  , .messageStartEvent, .timerStartEvent, .subProcess, .escalationThrowEvent
+  , .messageStartEvent, .timerStartEvent, .subProcess, .eventSubProcess
+  , .escalationThrowEvent
   , .escalationBoundaryEvent, .intermediateThrowEvent, .linkIntermediateThrowEvent
   , .linkIntermediateCatchEvent, .task, .scriptTask, .callActivity
   , .signalIntermediateCatchEvent, .signalBoundaryEvent
@@ -107,6 +109,7 @@ def Kind.keyword : Kind → String
   | .messageStartEvent => "messageStartEvent"
   | .timerStartEvent => "timerStartEvent"
   | .subProcess => "subProcess"
+  | .eventSubProcess => "eventSubProcess"
   | .escalationThrowEvent => "escalationThrowEvent"
   | .escalationBoundaryEvent => "escalationBoundaryEvent"
   | .intermediateThrowEvent => "intermediateThrowEvent"
@@ -175,6 +178,10 @@ def Kind.schema : Kind → List AttrDecl
       , { key := "repeating", required := true, ty := .bool } ]
   | .subProcess =>
       [ { key := "startEvent", required := true, ty := .id } ]
+  | .eventSubProcess =>
+      [ { key := "startEvent", required := true, ty := .id }
+      , { key := "trigger", required := true, ty := .str }
+      , { key := "interrupting", required := true, ty := .bool } ]
   | .escalationThrowEvent =>
       [ { key := "escalationCode", required := false, ty := .str } ]
   | .escalationBoundaryEvent =>

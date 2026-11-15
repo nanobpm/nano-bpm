@@ -66,6 +66,11 @@ impl Engine {
                 instance.activating.extend(element_keys);
             }
         }
+        // A legacy (pre-#1580) snapshot keyed join bookkeeping by element id
+        // alone; key it by its flow-scope instance.
+        for instance in snapshot.state.instances.values_mut() {
+            instance.resolve_legacy_join_scopes();
+        }
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,
@@ -81,6 +86,7 @@ impl Engine {
             forgotten_vars: std::collections::HashSet::new(),
             retired_tombstones: std::collections::HashSet::new(),
             torn_down_scopes: std::collections::HashSet::new(),
+            esp_start_payloads: std::collections::HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
             raft_applied: snapshot.raft_applied,
         }

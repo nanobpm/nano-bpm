@@ -1,0 +1,32 @@
+{
+  "description": "A non-interrupting message event sub-process runs twice alongside the service task; the process completes once the task completes.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-message-non-interrupting",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "order-1",
+      "variables": {
+        "reason": "customer"
+      }
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "order-1",
+      "variables": {
+        "reason": "customer"
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

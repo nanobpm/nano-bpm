@@ -292,6 +292,32 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   inner scope (like the error boundary) before routing out the boundary, while a
   **non-interrupting** one spawns a parallel token and leaves the inner scope
   running.
+- An **event sub-process** (`<subProcess triggeredByEvent="true">`, #1555) is a
+  container like an embedded sub-process but **never entered by token flow**:
+  while its enclosing scope (the process, or an embedded sub-process) is active,
+  its single typed start event's trigger is armed, and the event's occurrence
+  activates the sub-process. The parser models it as
+  `ElementKind::EventSubProcess` carrying its start event's trigger — message,
+  timer, signal, error, escalation or conditional — and its `isInterrupting`
+  flag (default `true`; an error start is always interrupting). At runtime
+  the message / timer / signal / conditional start triggers of every event
+  sub-process directly contained in a scope **arm when that scope activates**
+  and **disarm when it completes or is terminated**. An **interrupting**
+  trigger terminates the scope's other active children and disarms its other
+  event sub-process triggers, then runs the event sub-process; the scope
+  completes when it does. A **non-interrupting** trigger runs the event
+  sub-process concurrently and **repeatedly** (message / signal stay armed, a
+  timer cycle re-arms — the `Rn` repetition count is not yet honoured, #1596);
+  the scope waits for running ones before completing. **Error** (job error by
+  code, or catch-all without a code — always interrupting) and **escalation**
+  (by code or catch-all, interrupting or non-interrupting) start events catch
+  throws from within the scope, resolved outward scope by scope with Zeebe's
+  precedence: an exact code beats a catch-all, and an event sub-process beats
+  a boundary event of equal match; an uncaught error raises an
+  `UNHANDLED_ERROR` incident. Event payload variables (message / signal /
+  error) propagate from the host scope. Error *end* events do not throw yet
+  (#1592). `ProcessDefinition::event_subprocesses_in_scope` enumerates the
+  event sub-processes directly contained in a scope.
 - A **call activity** invokes another deployed process as a distinct **child
   process instance** of its `calledElement` / `zeebe:calledElement processId`
   (Zeebe/C8 parity), linked back to the caller via `parentProcessInstanceKey` /

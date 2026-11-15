@@ -432,6 +432,28 @@ impl Engine {
                 )));
             }
 
+            // An event sub-process is only ever entered through its trigger;
+            // the runtime does not drive one yet (its drained scope would never
+            // complete, stranding the instance). Fail closed for the container
+            // and every descendant until runtime support lands.
+            //
+            // The walk over the element and its ancestors is cycle-bounded:
+            // `element_flow_scope_chain` caps the chain at the element count and
+            // breaks on a repeated id, so a malformed cyclic `parent` chain
+            // (accepted by the builder when no event sub-process exists) cannot
+            // hang the modification before the bounded scope resolver runs.
+            let chain = element_flow_scope_chain(def, &a.element_id);
+            if std::iter::once(element)
+                .chain(chain.iter().filter_map(|id| def.element(id)))
+                .any(|el| matches!(el.kind, crate::model::ElementKind::EventSubProcess { .. }))
+            {
+                return Err(not_activatable(format!(
+                    "The activation of elements inside an event sub-process '{}' \
+                     is not supported",
+                    element.id
+                )));
+            }
+
             // Zeebe's `-1` (and an absent key) = no ancestor selection.
             let ancestor = a.ancestor_element_instance_key;
             if let Some(body) =
@@ -469,7 +491,6 @@ impl Engine {
                 )));
             }
 
-            let chain = element_flow_scope_chain(def, &a.element_id);
             let mut global = Vec::new();
             if !a.variables.is_empty() {
                 global.push(a.variables.clone());
@@ -491,7 +512,7 @@ impl Engine {
                                 "variable instructions with a scope element id that could not \
                                  be found: '{id}'"
                             ),
-                        ))
+                        ));
                     }
                     Some(id) if id == a.element_id || chain.iter().any(|s| s == id) => {
                         scoped.push((id.to_string(), variables.clone()));
@@ -504,7 +525,7 @@ impl Engine {
                              the activating element's flow scope. These variables should be set \
                              before or after the modification."
                                 .to_string(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -616,84 +637,11 @@ impl Engine {
             }
         }
 
-        // Join bookkeeping (waiting instance + arrivals) is keyed by element id
-        // per process instance, not per flow-scope instance. Activating a join
-        // whose waiting instance lives in a DIFFERENT flow-scope instance would
-        // take over that instance's arrivals and variables: fail closed.
-        for planned in &activations {
-            if self.join_kind(instance_key, &planned.element_id).is_none() {
-                continue;
-            }
-            let Some(waiting) = self.join_eik(instance_key, &planned.element_id) else {
-                continue;
-            };
-            if terminations.iter().any(|&t| {
-                t == waiting || self.is_ancestor_element_instance(instance_key, t, waiting)
-            }) {
-                continue;
-            }
-            let waiting_scope = self.scope_of(instance_key, waiting);
-            if !planned.resolution.to_create.is_empty()
-                || waiting_scope != planned.resolution.existing
-            {
-                return Err(invalid(
-                    instance_key,
-                    &process_id,
-                    format!(
-                        "an activate instruction for join element '{}' in a flow scope other \
-                         than that of its waiting instance '{waiting}' (flow scope \
-                         '{waiting_scope}')",
-                        planned.element_id
-                    ),
-                ));
-            }
-        }
-
-        // The same id-keyed bookkeeping also forces every activation of one
-        // join element in a single command to land in ONE flow-scope instance:
-        // with no join waiting, two activations under different scope instances
-        // would still share the join's arrivals and could combine tokens from
-        // unrelated scopes into a firing. Zeebe activates both (its joins are
-        // per-scope); this engine keys joins per process instance, so it fails
-        // closed instead. Activations sharing the to-be-created scope instance
-        // (same existing parent, same innermost created scope — the applier
-        // reuses one created instance for both) land together and are fine.
-        let planned_joins: Vec<&PlannedActivation> = activations
-            .iter()
-            .filter(|p| self.join_kind(instance_key, &p.element_id).is_some())
-            .collect();
-        for (i, a) in planned_joins.iter().enumerate() {
-            for b in &planned_joins[i + 1..] {
-                // Distinct joins keep separately keyed bookkeeping: no collision.
-                if a.element_id != b.element_id {
-                    continue;
-                }
-                let (ra, rb) = (&a.resolution, &b.resolution);
-                // Guaranteed same landing scope only when both create the same
-                // innermost scope under the same parent (the applier shares
-                // that one created instance), or both reuse the same existing
-                // instance and create nothing. Everything else can land the
-                // two activations in different scope instances.
-                let shared_created = ra.existing == rb.existing
-                    && !ra.to_create.is_empty()
-                    && ra.to_create.last() == rb.to_create.last();
-                let same_existing = ra.existing == rb.existing
-                    && ra.to_create.is_empty()
-                    && rb.to_create.is_empty();
-                if !(shared_created || same_existing) {
-                    return Err(invalid(
-                        instance_key,
-                        &process_id,
-                        format!(
-                            "multiple activate instructions for join element '{}' in different \
-                             flow scopes of one modification: join arrivals are kept per \
-                             process instance, so the activations would share one join",
-                            a.element_id
-                        ),
-                    ));
-                }
-            }
-        }
+        // Join bookkeeping is keyed per flow-scope instance (#1580), as in
+        // Zeebe: a join activated under one scope instance takes over only that
+        // instance's waiting join, and two activations of one join under
+        // different scope instances keep independent arrivals. No cross-scope
+        // guard is needed.
 
         // Scopes an activation creates arm their boundary events (Zeebe
         // `ElementActivationBehavior.activateFlowScope` → `subscribeToEvents`);
@@ -734,7 +682,8 @@ impl Engine {
                     planned.resolution.existing,
                     planned.resolution.to_create[..=depth].to_vec(),
                 );
-                let checked = if created.insert(path.clone()) {
+                let first = created.insert(path.clone());
+                let checked = if first {
                     self.check_boundary_arming(instance_key, scope_id, &host_vars)
                 } else {
                     Ok(())
@@ -751,6 +700,17 @@ impl Engine {
                         host_vars.extend(variables.clone());
                     }
                 }
+                // The created scope's event sub-processes (#1555) live INSIDE
+                // the scope, so — unlike its boundaries — they see its staged
+                // locals (application arms them from the scope's own view). A
+                // failing trigger expression rejects the command here.
+                let checked = checked.and_then(|()| {
+                    if first {
+                        self.check_event_subprocess_arming(instance_key, Some(scope_id), &host_vars)
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(failure) = checked {
                     return Err(invalid(
                         instance_key,
@@ -843,6 +803,30 @@ impl Engine {
                 // fail here. Never drop a failure silently: should it happen
                 // anyway, surface it as an incident on the created scope.
                 match self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    Ok(armed) => {
+                        for event in armed {
+                            self.emit(log, event);
+                        }
+                    }
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            key,
+                            scope_id.clone(),
+                            failure,
+                            None,
+                        );
+                        self.emit(log, event);
+                    }
+                }
+                // The created scope's event sub-processes (#1555) arm here too —
+                // this path bypasses the activation body where arming otherwise
+                // lives. Validated by `plan_modification`
+                // (`check_event_subprocess_arming`) against the scope's own view
+                // (its locals layered over the parent chain), so a failure is
+                // likewise surfaced as an incident on the scope.
+                let esp_vars = self.variables_for_element(instance_key, key);
+                match self.arm_event_subprocesses(instance_key, key, Some(&scope_id), &esp_vars) {
                     Ok(armed) => {
                         for event in armed {
                             self.emit(log, event);
@@ -1140,7 +1124,7 @@ impl Engine {
         if self.step_targets_dead_scope(&step) {
             return;
         }
-        let eik = match self.join_eik(instance_key, &element_id) {
+        let eik = match self.join_eik(instance_key, scope, &element_id) {
             Some(eik) => eik,
             None => {
                 let mut events = Vec::new();

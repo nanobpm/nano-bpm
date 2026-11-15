@@ -1,5 +1,16 @@
 [
   {
+    "EventSubProcessPayloadHeld": {
+      "instance_key": 30,
+      "scope_key": 31,
+      "variables": {
+        "x": {
+          "Int": 1
+        }
+      }
+    }
+  },
+  {
     "RaftEntryApplied": {
       "index": 41,
       "raft_state": "{\"opaque\":true}",
@@ -150,6 +161,7 @@
         ]
       ],
       "instance_key": 1,
+      "join_scoped": true,
       "migrated_flow_scopes": [
         {
           "element_instance_key": 8,

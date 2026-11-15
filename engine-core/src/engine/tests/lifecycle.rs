@@ -2296,10 +2296,13 @@ fn parallel_join_keeps_surplus_token_waiting_like_zeebe() {
         "the surplus token keeps the instance alive, as in Zeebe"
     );
     let instance = engine.instance(instance_key).unwrap();
-    assert_eq!(instance.join_flows_taken("join"), 1);
+    assert_eq!(
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
+        1
+    );
     let open = instance
         .join_instances
-        .get("join")
+        .get(&crate::state::JoinKey::root("join"))
         .copied()
         .expect("the join is re-opened to hold the surplus token");
     assert_eq!(
@@ -2436,11 +2439,13 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(key).unwrap();
     assert_eq!(
-        instance.join_flows_taken("join"),
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
         1,
         "the join is half-open before the terminate"
     );
-    assert!(instance.join_instances.contains_key("join"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 
     // The sibling terminate fires when `trigger` completes, ending the instance.
     complete_one(&mut engine, "trigger-job");
@@ -6754,10 +6759,12 @@ fn inclusive_join_strands_a_surplus_that_arrives_first_like_zeebe() {
     );
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1
     );
-    assert!(instance.join_instances.contains_key("join"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]
@@ -6828,8 +6835,13 @@ fn inclusive_join_is_not_reevaluated_when_a_competing_path_diverges_like_zeebe()
         ordinal: 0,
     };
     let instance = engine.instance(instance_key).unwrap();
-    assert_eq!(instance.join_flow_arrivals["join"].count(&a_to_join), 1);
-    assert!(instance.join_instances.contains_key("join"));
+    assert_eq!(
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&a_to_join),
+        1
+    );
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]
@@ -6894,10 +6906,12 @@ fn inclusive_join_records_the_flow_each_token_arrived_over() {
     complete_one(&mut engine, "jy");
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         2
     );
-    assert!(!instance.join_counts.contains_key("join"));
+    assert!(!instance
+        .join_counts
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 /// Count the `join -> e` routings in `events`.
@@ -6941,7 +6955,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     let incident_key = incidents[0].key;
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1,
         "the incident parks after the consumption"
     );
@@ -6964,7 +6978,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     );
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1
     );
 }
@@ -7010,8 +7024,12 @@ fn inclusive_join_late_arrival_while_an_incident_is_pending_activates_again_like
         2,
         "both accepted join instances wait on their incidents"
     );
-    assert!(!instance.join_instances.contains_key("join"));
-    assert!(!instance.join_flow_arrivals.contains_key("join"));
+    assert!(!instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
+    assert!(!instance
+        .join_flow_arrivals
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]

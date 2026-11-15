@@ -20,13 +20,13 @@
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed + call-activity input mapping not local (#1536)",
-      "nanoTrace": "56e771be5fcfe3f8"
+      "nanoTrace": "274d14533053d674"
     },
     {
       "scenario": "g-2",
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "a77d18eb16f54817"
+      "nanoTrace": "05a6c2c2fd2f98c1"
     },
     {
       "scenario": "g-3",
@@ -38,13 +38,13 @@
       "scenario": "g-4",
       "issue": "#1533",
       "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "21ffb97c5076468a"
+      "nanoTrace": "4b977466001b96c0"
     },
     {
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "1a65ba1bf2a1f72f"
+      "nanoTrace": "b6246a9d01d8ccb0"
     },
     {
       "scenario": "g-6",
@@ -62,7 +62,7 @@
       "scenario": "g-9",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "377355ba7d6482e7"
+      "nanoTrace": "d517e6bf427fc8c7"
     },
     {
       "scenario": "g-10",
@@ -92,7 +92,7 @@
       "scenario": "g-14",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "78b0ec40385478f7"
+      "nanoTrace": "915aff81a749e715"
     },
     {
       "scenario": "g-15",
@@ -116,7 +116,7 @@
       "scenario": "g-18",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "c078f0e0d25fb6d4"
+      "nanoTrace": "b73282d8a918c858"
     },
     {
       "scenario": "g-20",
@@ -140,13 +140,13 @@
       "scenario": "g-25",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "34a630974d83f5d5"
+      "nanoTrace": "6cd6d594b57ba19a"
     },
     {
       "scenario": "g-26",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local",
-      "nanoTrace": "71fe7175028838fa"
+      "nanoTrace": "1a5781de4dd2b8e3"
     },
     {
       "scenario": "g-28",
@@ -158,7 +158,78 @@
       "scenario": "g-30",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "b770fc0f46de7b03"
+      "nanoTrace": "2ff4050efbdca69d"
+    },
+    {
+      "scenario": "esp-message-interrupting",
+      "issue": "#1535",
+      "reason": "interrupting message event sub-process: the interrupted service task `work` is torn down as ELEMENT_COMPLETING/COMPLETED instead of Zeebe's TERMINATING/TERMINATED (same teardown defect as interrupting boundaries, #1535). Narrowed with ignoreRecords to `work`'s lifecycle records only (it has no other lifecycle in the interrupting step); every other record — EVENT_SUB_PROCESS lifecycle, subscription/timer, variables, process completion — must equal Zeebe.",
+      "ignoreRecords": [
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_TERMINATING"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_TERMINATED"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_COMPLETING"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_COMPLETED"
+        }
+      ]
+    },
+    {
+      "scenario": "esp-timer-interrupting",
+      "issue": "#1535",
+      "reason": "interrupting timer event sub-process: the interrupted service task `work` is torn down as ELEMENT_COMPLETING/COMPLETED instead of Zeebe's TERMINATING/TERMINATED (same teardown defect as interrupting boundaries, #1535). Narrowed with ignoreRecords to `work`'s lifecycle records only (it has no other lifecycle in the interrupting step); every other record — EVENT_SUB_PROCESS lifecycle, subscription/timer, variables, process completion — must equal Zeebe.",
+      "ignoreRecords": [
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_TERMINATING"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_TERMINATED"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_COMPLETING"
+        },
+        {
+          "valueType": "PROCESS_INSTANCE",
+          "elementId": "work",
+          "intent": "ELEMENT_COMPLETED"
+        }
+      ]
+    },
+    {
+      "scenario": "esp-timer-cycle-bounded",
+      "issue": "#1596",
+      "reason": "timeCycle repetition count ignored: after the 2nd fire of R2/PT1M nano re-arms a third TIMER CREATED (then CANCELED when the scope completes); Zeebe stops re-arming. Narrowed with ignoreRecords to TIMER CREATED/CANCELED records targeting `esp_start`; every lifecycle record (both EVENT_SUB_PROCESS runs) must equal Zeebe.",
+      "ignoreRecords": [
+        {
+          "valueType": "TIMER",
+          "intent": "CREATED",
+          "targetElementId": "esp_start"
+        },
+        {
+          "valueType": "TIMER",
+          "intent": "CANCELED",
+          "targetElementId": "esp_start"
+        }
+      ]
     }
   ]
 }

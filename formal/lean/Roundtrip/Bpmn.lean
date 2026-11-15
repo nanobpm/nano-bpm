@@ -23,7 +23,9 @@ This module models that projection as `toBpmn : Kind → BpmnShape` and its
 inverse `fromBpmn : BpmnShape → Option Kind`, and proves the inverse *is* a left
 inverse on the supported set (`fromBpmn_toBpmn`). That theorem is the crux of the
 round-trip: it certifies that the `(localName, eventDefinition)` pair BPMN uses
-is a faithful (injective) re-encoding of the IR keyword, so no element kind
+(plus the `triggeredByEvent` attribute, which alone tells an event sub-process
+from an embedded one — both are `<subProcess>`) is a faithful (injective)
+re-encoding of the IR keyword, so no element kind
 collapses into another when it crosses to BPMN and back.
 -/
 
@@ -73,76 +75,83 @@ structure BpmnShape where
   tag : BpmnTag
   /-- The disambiguating child event definition (`none` if absent). -/
   eventDef : EventDef
+  /-- The `triggeredByEvent` attribute. BPMN has no `<eventSubProcess>` tag: an
+  event sub-process is a `<subProcess triggeredByEvent="true">`
+  (`processos/src/bpmn_model.rs`), so this flag — not the tag — is the
+  discriminator between an embedded and an event sub-process. `false` for
+  every other element. -/
+  triggeredByEvent : Bool
   deriving DecidableEq, Repr, Inhabited
 
 /-- Project a kind to its BPMN structural identity — mirror of the element
 emission in `bpmn_model.rs`. -/
 def toBpmn : Kind → BpmnShape
-  | .startEvent => ⟨.startEvent, .none⟩
-  | .endEvent => ⟨.endEvent, .none⟩
-  | .terminateEndEvent => ⟨.endEvent, .terminate⟩
-  | .serviceTask => ⟨.serviceTask, .none⟩
-  | .businessRuleTask => ⟨.businessRuleTask, .none⟩
-  | .userTask => ⟨.userTask, .none⟩
-  | .exclusiveGateway => ⟨.exclusiveGateway, .none⟩
-  | .parallelGateway => ⟨.parallelGateway, .none⟩
-  | .inclusiveGateway => ⟨.inclusiveGateway, .none⟩
-  | .eventBasedGateway => ⟨.eventBasedGateway, .none⟩
-  | .errorBoundaryEvent => ⟨.boundaryEvent, .error⟩
-  | .timerIntermediateCatchEvent => ⟨.intermediateCatchEvent, .timer⟩
-  | .timerBoundaryEvent => ⟨.boundaryEvent, .timer⟩
-  | .messageIntermediateCatchEvent => ⟨.intermediateCatchEvent, .message⟩
-  | .messageBoundaryEvent => ⟨.boundaryEvent, .message⟩
-  | .messageStartEvent => ⟨.startEvent, .message⟩
-  | .timerStartEvent => ⟨.startEvent, .timer⟩
-  | .subProcess => ⟨.subProcess, .none⟩
-  | .escalationThrowEvent => ⟨.intermediateThrowEvent, .escalation⟩
-  | .escalationBoundaryEvent => ⟨.boundaryEvent, .escalation⟩
-  | .intermediateThrowEvent => ⟨.intermediateThrowEvent, .none⟩
-  | .linkIntermediateThrowEvent => ⟨.intermediateThrowEvent, .link⟩
-  | .linkIntermediateCatchEvent => ⟨.intermediateCatchEvent, .link⟩
-  | .task => ⟨.task, .none⟩
-  | .scriptTask => ⟨.scriptTask, .none⟩
-  | .callActivity => ⟨.callActivity, .none⟩
-  | .signalIntermediateCatchEvent => ⟨.intermediateCatchEvent, .signal⟩
-  | .signalBoundaryEvent => ⟨.boundaryEvent, .signal⟩
-  | .conditionalIntermediateCatchEvent => ⟨.intermediateCatchEvent, .conditional⟩
-  | .conditionalBoundaryEvent => ⟨.boundaryEvent, .conditional⟩
-  | .compensationBoundaryEvent => ⟨.boundaryEvent, .compensate⟩
-  | .compensationThrowEvent => ⟨.intermediateThrowEvent, .compensate⟩
+  | .startEvent => ⟨.startEvent, .none, false⟩
+  | .endEvent => ⟨.endEvent, .none, false⟩
+  | .terminateEndEvent => ⟨.endEvent, .terminate, false⟩
+  | .serviceTask => ⟨.serviceTask, .none, false⟩
+  | .businessRuleTask => ⟨.businessRuleTask, .none, false⟩
+  | .userTask => ⟨.userTask, .none, false⟩
+  | .exclusiveGateway => ⟨.exclusiveGateway, .none, false⟩
+  | .parallelGateway => ⟨.parallelGateway, .none, false⟩
+  | .inclusiveGateway => ⟨.inclusiveGateway, .none, false⟩
+  | .eventBasedGateway => ⟨.eventBasedGateway, .none, false⟩
+  | .errorBoundaryEvent => ⟨.boundaryEvent, .error, false⟩
+  | .timerIntermediateCatchEvent => ⟨.intermediateCatchEvent, .timer, false⟩
+  | .timerBoundaryEvent => ⟨.boundaryEvent, .timer, false⟩
+  | .messageIntermediateCatchEvent => ⟨.intermediateCatchEvent, .message, false⟩
+  | .messageBoundaryEvent => ⟨.boundaryEvent, .message, false⟩
+  | .messageStartEvent => ⟨.startEvent, .message, false⟩
+  | .timerStartEvent => ⟨.startEvent, .timer, false⟩
+  | .subProcess => ⟨.subProcess, .none, false⟩
+  | .eventSubProcess => ⟨.subProcess, .none, true⟩
+  | .escalationThrowEvent => ⟨.intermediateThrowEvent, .escalation, false⟩
+  | .escalationBoundaryEvent => ⟨.boundaryEvent, .escalation, false⟩
+  | .intermediateThrowEvent => ⟨.intermediateThrowEvent, .none, false⟩
+  | .linkIntermediateThrowEvent => ⟨.intermediateThrowEvent, .link, false⟩
+  | .linkIntermediateCatchEvent => ⟨.intermediateCatchEvent, .link, false⟩
+  | .task => ⟨.task, .none, false⟩
+  | .scriptTask => ⟨.scriptTask, .none, false⟩
+  | .callActivity => ⟨.callActivity, .none, false⟩
+  | .signalIntermediateCatchEvent => ⟨.intermediateCatchEvent, .signal, false⟩
+  | .signalBoundaryEvent => ⟨.boundaryEvent, .signal, false⟩
+  | .conditionalIntermediateCatchEvent => ⟨.intermediateCatchEvent, .conditional, false⟩
+  | .conditionalBoundaryEvent => ⟨.boundaryEvent, .conditional, false⟩
+  | .compensationBoundaryEvent => ⟨.boundaryEvent, .compensate, false⟩
+  | .compensationThrowEvent => ⟨.intermediateThrowEvent, .compensate, false⟩
 
 /-- Recover the kind from a BPMN structural identity. Total: a `(tag,
 eventDef)` pair outside the supported projection maps to `none` (an unsupported
 or malformed BPMN element). -/
 def fromBpmn : BpmnShape → Option Kind
-  | ⟨.startEvent, .none⟩ => some .startEvent
-  | ⟨.startEvent, .message⟩ => some .messageStartEvent
-  | ⟨.startEvent, .timer⟩ => some .timerStartEvent
-  | ⟨.endEvent, .none⟩ => some .endEvent
-  | ⟨.endEvent, .terminate⟩ => some .terminateEndEvent
-  | ⟨.serviceTask, .none⟩ => some .serviceTask
-  | ⟨.businessRuleTask, .none⟩ => some .businessRuleTask
-  | ⟨.userTask, .none⟩ => some .userTask
-  | ⟨.exclusiveGateway, .none⟩ => some .exclusiveGateway
-  | ⟨.parallelGateway, .none⟩ => some .parallelGateway
-  | ⟨.inclusiveGateway, .none⟩ => some .inclusiveGateway
-  | ⟨.eventBasedGateway, .none⟩ => some .eventBasedGateway
-  | ⟨.boundaryEvent, .error⟩ => some .errorBoundaryEvent
-  | ⟨.boundaryEvent, .timer⟩ => some .timerBoundaryEvent
-  | ⟨.boundaryEvent, .message⟩ => some .messageBoundaryEvent
-  | ⟨.boundaryEvent, .escalation⟩ => some .escalationBoundaryEvent
-  | ⟨.boundaryEvent, .signal⟩ => some .signalBoundaryEvent
-  | ⟨.boundaryEvent, .conditional⟩ => some .conditionalBoundaryEvent
-  | ⟨.boundaryEvent, .compensate⟩ => some .compensationBoundaryEvent
-  | ⟨.intermediateCatchEvent, .timer⟩ => some .timerIntermediateCatchEvent
-  | ⟨.intermediateCatchEvent, .message⟩ => some .messageIntermediateCatchEvent
-  | ⟨.intermediateCatchEvent, .link⟩ => some .linkIntermediateCatchEvent
-  | ⟨.intermediateCatchEvent, .signal⟩ => some .signalIntermediateCatchEvent
-  | ⟨.intermediateCatchEvent, .conditional⟩ => some .conditionalIntermediateCatchEvent
-  | ⟨.intermediateThrowEvent, .none⟩ => some .intermediateThrowEvent
-  | ⟨.intermediateThrowEvent, .escalation⟩ => some .escalationThrowEvent
-  | ⟨.intermediateThrowEvent, .link⟩ => some .linkIntermediateThrowEvent
-  | ⟨.intermediateThrowEvent, .compensate⟩ => some .compensationThrowEvent
+  | ⟨.startEvent, .none, false⟩ => some .startEvent
+  | ⟨.startEvent, .message, false⟩ => some .messageStartEvent
+  | ⟨.startEvent, .timer, false⟩ => some .timerStartEvent
+  | ⟨.endEvent, .none, false⟩ => some .endEvent
+  | ⟨.endEvent, .terminate, false⟩ => some .terminateEndEvent
+  | ⟨.serviceTask, .none, false⟩ => some .serviceTask
+  | ⟨.businessRuleTask, .none, false⟩ => some .businessRuleTask
+  | ⟨.userTask, .none, false⟩ => some .userTask
+  | ⟨.exclusiveGateway, .none, false⟩ => some .exclusiveGateway
+  | ⟨.parallelGateway, .none, false⟩ => some .parallelGateway
+  | ⟨.inclusiveGateway, .none, false⟩ => some .inclusiveGateway
+  | ⟨.eventBasedGateway, .none, false⟩ => some .eventBasedGateway
+  | ⟨.boundaryEvent, .error, false⟩ => some .errorBoundaryEvent
+  | ⟨.boundaryEvent, .timer, false⟩ => some .timerBoundaryEvent
+  | ⟨.boundaryEvent, .message, false⟩ => some .messageBoundaryEvent
+  | ⟨.boundaryEvent, .escalation, false⟩ => some .escalationBoundaryEvent
+  | ⟨.boundaryEvent, .signal, false⟩ => some .signalBoundaryEvent
+  | ⟨.boundaryEvent, .conditional, false⟩ => some .conditionalBoundaryEvent
+  | ⟨.boundaryEvent, .compensate, false⟩ => some .compensationBoundaryEvent
+  | ⟨.intermediateCatchEvent, .timer, false⟩ => some .timerIntermediateCatchEvent
+  | ⟨.intermediateCatchEvent, .message, false⟩ => some .messageIntermediateCatchEvent
+  | ⟨.intermediateCatchEvent, .link, false⟩ => some .linkIntermediateCatchEvent
+  | ⟨.intermediateCatchEvent, .signal, false⟩ => some .signalIntermediateCatchEvent
+  | ⟨.intermediateCatchEvent, .conditional, false⟩ => some .conditionalIntermediateCatchEvent
+  | ⟨.intermediateThrowEvent, .none, false⟩ => some .intermediateThrowEvent
+  | ⟨.intermediateThrowEvent, .escalation, false⟩ => some .escalationThrowEvent
+  | ⟨.intermediateThrowEvent, .link, false⟩ => some .linkIntermediateThrowEvent
+  | ⟨.intermediateThrowEvent, .compensate, false⟩ => some .compensationThrowEvent
   -- Terminal (`<endEvent>`) flavour of the escalation/compensation throws. The
   -- Rust parser (`bpmn.rs`) maps `<endEvent><escalationEventDefinition>` and
   -- `<endEvent><compensateEventDefinition>` to the very same
@@ -154,12 +163,13 @@ def fromBpmn : BpmnShape → Option Kind
   -- element-kind projection. So BPMN → IR must accept BOTH shapes for these two
   -- kinds; `toBpmn` picks the intermediate shape as the single canonical one
   -- (the terminal flavour is reconstructed from the absent outgoing flow).
-  | ⟨.endEvent, .escalation⟩ => some .escalationThrowEvent
-  | ⟨.endEvent, .compensate⟩ => some .compensationThrowEvent
-  | ⟨.subProcess, .none⟩ => some .subProcess
-  | ⟨.task, .none⟩ => some .task
-  | ⟨.scriptTask, .none⟩ => some .scriptTask
-  | ⟨.callActivity, .none⟩ => some .callActivity
+  | ⟨.endEvent, .escalation, false⟩ => some .escalationThrowEvent
+  | ⟨.endEvent, .compensate, false⟩ => some .compensationThrowEvent
+  | ⟨.subProcess, .none, false⟩ => some .subProcess
+  | ⟨.subProcess, .none, true⟩ => some .eventSubProcess
+  | ⟨.task, .none, false⟩ => some .task
+  | ⟨.scriptTask, .none, false⟩ => some .scriptTask
+  | ⟨.callActivity, .none, false⟩ => some .callActivity
   | _ => none
 
 /-- **`fromBpmn` is a left inverse of `toBpmn` on the supported set.** The BPMN
