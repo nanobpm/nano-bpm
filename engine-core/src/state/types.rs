@@ -1667,6 +1667,31 @@ impl IoMappingRedrive {
             IoMappingRedrive::ActivationPending | IoMappingRedrive::ActivationBodyPending
         )
     }
+
+    /// Whether resolving this redrive re-runs the element's **activation body**
+    /// (the step that, for a process-level start event, arms the root's event
+    /// sub-process triggers — `Engine::try_activation_body`). Migration's
+    /// root-steadiness guard keys on this: only an activation-phase redrive
+    /// (or a pending start-listener job) means the start event's body will run
+    /// again, so arming now would be repeated. A completion-phase redrive
+    /// (`Completion`, `TerminateEndCompletion`, an `End`-listener chain, the
+    /// MI/call-activity completions) resumes completion instead — the start
+    /// event's body already ran, so the root IS steady and may be armed
+    /// (#1379 review).
+    pub(crate) fn redrives_activation(&self) -> bool {
+        match self {
+            IoMappingRedrive::Activation
+            | IoMappingRedrive::ActivationPending
+            | IoMappingRedrive::ActivationBody
+            | IoMappingRedrive::ActivationBodyPending => true,
+            // A `start`-listener chain restarts the activation (`RetryActivation`);
+            // an `end` chain resumes completion.
+            IoMappingRedrive::ExecutionListenerJob { event_type, .. } => {
+                *event_type == crate::model::ListenerEventType::Start
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as

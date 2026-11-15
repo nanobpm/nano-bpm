@@ -561,6 +561,15 @@ pub enum EventSubProcessTrigger {
     },
 }
 
+impl EventSubProcessTrigger {
+    /// Whether arming this trigger opens a subscription (timer, message,
+    /// signal, conditional). Error and escalation triggers are not
+    /// subscriptions: throw-resolution catches them.
+    pub fn is_subscription(&self) -> bool {
+        !matches!(self, Self::Error { .. } | Self::Escalation { .. })
+    }
+}
+
 /// The kind of a BPMN flow node.
 ///
 /// The set is intentionally small. New element types plug in here and gain
