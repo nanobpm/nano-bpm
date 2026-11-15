@@ -3975,13 +3975,27 @@ impl Engine {
                     // `RerunActivationBody` is reserved for correlation-key (ACTIVATING)
                     // failures, which surface as `ExpressionEvaluation`.
                     // Uncaught business error: re-create a job for the still-active
-                    // service task so a worker can attempt it again.
+                    // service task so a worker can attempt it again. An error END
+                    // event (#1592) owns no job — its throw runs at completion — so
+                    // resolving re-drives `Complete`, re-running the catch walk
+                    // against the (possibly migrated) model.
                     state::IncidentKind::UnhandledError => {
-                        queue.push_back(Step::CreateJob {
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                        });
+                        if matches!(
+                            self.element_kind(instance_key, &element_id),
+                            Some(ElementKind::ErrorEndEvent { .. })
+                        ) {
+                            queue.push_back(Step::Complete {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else {
+                            queue.push_back(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        }
                     }
                     // A `zeebe:ioMapping` failure (input or output, any element
                     // type) or a job-type extraction failure (#1390, Zeebe
@@ -13109,6 +13123,24 @@ impl Engine {
             );
         }
 
+        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
+        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
+        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
+        // Mirrors the deferred `finalize_completion` handoff for the end-listener
+        // path.
+        if let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.throw_error_from_end_event(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                error_code,
+                events,
+            );
+        }
+
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -13517,6 +13549,21 @@ impl Engine {
                 events,
             );
         }
+        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
+        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
+        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
+        if let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.throw_error_from_end_event(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                error_code,
+                events,
+            );
+        }
         // #901: compensation registration (explicit boundary subscription, or
         // a sub-process's scope subscription, and nothing at all for undo work
         // inside a pending handler) has one canonical home.
@@ -13730,6 +13777,159 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
+                });
+            }
+        }
+        (events, followups)
+    }
+
+    /// Throws the BPMN error of a just-completed
+    /// [`ErrorEndEvent`](ElementKind::ErrorEndEvent) (#1592). `events` already
+    /// carries the end event's own `ElementCompleted` — the throwing token is
+    /// consumed by the throw either way, exactly like a worker `ThrowJobError`
+    /// consumes its job. The catch is resolved by
+    /// [`find_error_catch`](Self::find_error_catch) from the throwing element
+    /// instance outward (Zeebe `CatchEventAnalyzer` parity):
+    ///
+    /// * **caught by an error event sub-process** — always interrupting: the
+    ///   host scope's other work is torn down and the event sub-process runs in
+    ///   it (queued as a step, after this completion is applied);
+    /// * **caught by an error boundary** — always interrupting: the caught
+    ///   activity (an enclosing sub-process — the walk starts at the throwing
+    ///   end event, and an end event carries no boundaries of its own) has its
+    ///   inner scope torn down and completes, and the boundary activates in the
+    ///   caught activity's enclosing scope;
+    /// * **uncaught** — an `UNHANDLED_ERROR` incident is raised on the end
+    ///   event's element instance, matching the unhandled job-error lifecycle:
+    ///   the token parks there (its `ElementCompleted` is withheld) and the
+    ///   incident's resolution re-drives the completion.
+    fn throw_error_from_end_event(
+        &mut self,
+        instance_key: Key,
+        throw_eik: Key,
+        throw_element_id: String,
+        scope: Key,
+        error_code: String,
+        mut events: Vec<Event>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // `scope` (the throw's enclosing scope) is unused: the catch walk starts
+        // at the throwing element INSTANCE (`throw_eik`) and derives every level
+        // from it — an end event owns no inner scope, so its own level offers no
+        // catch candidates and the walk proceeds straight to its ancestors.
+        let _ = scope;
+        let mut followups = Vec::new();
+        match self.find_error_catch(instance_key, &throw_element_id, throw_eik, &error_code) {
+            // Caught by an error event sub-process (#1555): always interrupting.
+            // The interrupt runs as a queued step, after this throw's completion
+            // is applied, so the teardown sees exactly the scope's other work
+            // (mirrors the escalation-throw handoff).
+            Some(boundary::ThrowCatch::EventSubProcess {
+                scope_eik, esp_id, ..
+            }) => {
+                followups.push(Step::TriggerEventSubProcess {
+                    instance_key,
+                    scope: scope_eik,
+                    esp_element_id: esp_id,
+                });
+            }
+            // Caught by an error boundary: interrupt the catching activity (an
+            // enclosing sub-process) and run the boundary's error-handling path.
+            Some(boundary::ThrowCatch::Boundary {
+                boundary_id,
+                caught_eik,
+                caught_element_id,
+                ..
+            }) => {
+                // Capture the catching activity's scope before completing it
+                // (completion clears its scope entry); the boundary event runs in
+                // that same scope.
+                let boundary_scope = self.scope_of(instance_key, caught_eik);
+                // The caught activity is never the throwing end event itself (an
+                // end event carries no boundaries), so its inner scope — the
+                // throw included — is always torn down here. The throw's own
+                // lifecycle records are filtered out: its `ElementCompleted` is
+                // already in `events` (and it already rests in COMPLETING, so a
+                // duplicate `ElementCompleting` is dropped — one per element
+                // instance, as in Zeebe).
+                for event in self.scope_teardown_events(instance_key, caught_eik) {
+                    if matches!(
+                        &event,
+                        Event::ElementCompleting { element_instance_key: eik, .. }
+                        | Event::ElementCompleted { element_instance_key: eik, .. }
+                            if *eik == throw_eik
+                    ) {
+                        continue;
+                    }
+                    events.push(event);
+                }
+                // The teardown sweeps only the caught activity's DESCENDANTS; its
+                // own root record (a parked incident, an MI-body / ad-hoc active
+                // child set, a still-live job) is cleared exactly as the
+                // interrupting boundary paths do (#1173, #1508).
+                for event in self.boundary_root_teardown_events(instance_key, caught_eik) {
+                    events.push(event);
+                }
+                self.torn_down_scopes.insert(caught_eik);
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: caught_eik,
+                    element_id: caught_element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: caught_eik,
+                    element_id: caught_element_id,
+                });
+                // Interrupting the activity also disarms any sibling boundary
+                // timers and message/signal/conditional subscriptions on it.
+                for event in self.cancel_boundary_timers_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: boundary_id,
+                    scope: boundary_scope,
+                    via: None,
+                });
+            }
+            // Unhandled: raise an `UNHANDLED_ERROR` incident on the end event's
+            // element instance. Its `ElementCompleted` is NOT journaled: the
+            // applier would drop the token and the post-drain sweep would
+            // complete the instance outright, stranding the incident on a
+            // finished instance — whereas the unhandled job-error lifecycle this
+            // mirrors keeps the token parked (a job error consumes the JOB, never
+            // the token) so resolving the incident re-drives the completion and
+            // the throw re-resolves against the (possibly fixed) model. The
+            // caller prepended `ElementCompleted` unconditionally; remove it.
+            None => {
+                events.retain(|e| {
+                    !matches!(
+                        e,
+                        Event::ElementCompleted { element_instance_key, .. }
+                            if *element_instance_key == throw_eik
+                    )
+                });
+                let reason = format!("unhandled BPMN error '{error_code}'");
+                let incident_key = self.mint_key();
+                events.push(Event::IncidentRaised {
+                    incident_key,
+                    instance_key,
+                    element_instance_key: throw_eik,
+                    element_id: throw_element_id,
+                    kind: state::IncidentKind::UnhandledError,
+                    redrive: None,
+                    reason,
+                    job_key: None,
+                    created_at: self.now,
                 });
             }
         }

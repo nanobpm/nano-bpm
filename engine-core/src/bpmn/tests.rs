@@ -940,6 +940,109 @@ fn should_parse_an_escalation_end_event() {
 }
 
 #[test]
+fn should_parse_an_error_end_event() {
+    // An error end event (#1592): an `endEvent` carrying an
+    // `errorEventDefinition` builds as an `ErrorEndEvent` whose code is
+    // resolved from the referenced `<error>`.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" name="Declined" errorCode="CARD_DECLINED" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: "CARD_DECLINED".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_error_end_event_without_a_ref_as_an_unnamed_throw() {
+    // An `errorEventDefinition` with no `errorRef` throws an unnamed error
+    // (empty code), matched by catch-alls only.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: String::new(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_an_outgoing_flow() {
+    // An error `<endEvent>` is remapped to an `ErrorEndEvent`, so the
+    // model-level `end_events_have_no_outgoing` rule cannot see it — the
+    // end-event outgoing-flow guard in `build` covers every flavour (#1592,
+    // mirroring the #1173 escalation guard).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="after" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ErrEnd" targetRef="after" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_a_competing_definition() {
+    // An end event carrying BOTH an error and a terminate definition has no
+    // combined-semantics element in the supported subset: refuse the ambiguous
+    // model at deploy rather than pick one arm (#1173's multi-definition guard,
+    // now covering the error flavour).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
 fn should_reject_an_escalation_end_event_with_an_outgoing_flow() {
     // Regression (#1173): an escalation `<endEvent>` is remapped to an
     // `EscalationThrowEvent`, so the model-level `end_events_have_no_outgoing`

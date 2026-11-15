@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-eventSubProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-errorEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-eventSubProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -28,6 +28,12 @@ attr-line-endEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | a
 elem-terminateEndEvent  ::= indent "terminateEndEvent" sp id (sp string)? (sp attrs-terminateEndEvent)? nl
 attrs-terminateEndEvent   ::= "{" nl (indent2 attr-line-terminateEndEvent nl)+ indent "}"
 attr-line-terminateEndEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
+
+# errorEndEvent — Error end event. Throws `errorCode` on completion, caught exactly like a job-thrown error (error boundary / error event sub-process, exact code beats catch-all); an uncaught error raises an UNHANDLED_ERROR incident.
+elem-errorEndEvent  ::= indent "errorEndEvent" sp id (sp string)? (sp attrs-errorEndEvent)? nl
+attrs-errorEndEvent   ::= "{" nl (indent2 attr-line-errorEndEvent nl)+ indent "}"
+attr-line-errorEndEvent  ::= attr-errorEndEvent-errorCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
+attr-errorEndEvent-errorCode  ::= "errorCode" sp attr-str   # The BPMN error code thrown (empty throws an unnamed error, matched by catch-alls only).
 
 # serviceTask — Job-based task. Creates a job of `jobType` and rests until completion. Optional agent metadata does not change the job-worker lifecycle.
 elem-serviceTask  ::= indent "serviceTask" sp id (sp string)? (sp attrs-serviceTask)? nl

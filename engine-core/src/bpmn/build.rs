@@ -210,6 +210,14 @@ pub(super) struct NodeAcc {
     /// / [`LinkIntermediateCatchEvent`](crate::model::ElementKind::LinkIntermediateCatchEvent)
     /// at build. `None` on nodes without a `linkEventDefinition`.
     pub(super) link_name: Option<String>,
+    /// True when this `endEvent` carries an `errorEventDefinition`, making it an
+    /// [`ErrorEndEvent`](crate::model::ElementKind::ErrorEndEvent). Its thrown
+    /// error code is resolved from `error_ref` at build.
+    pub(super) is_error_throw: bool,
+    /// The `errorRef` on this error end event, resolved to an `errorCode` at
+    /// build. `None` when the definition carries no `errorRef` (an unnamed
+    /// throw, matched by catch-alls only).
+    pub(super) error_ref: Option<String>,
     /// True when this `endEvent` carries a `terminateEventDefinition`, making it
     /// a [`TerminateEndEvent`](crate::model::ElementKind::TerminateEndEvent)
     /// rather than a plain none end event.
@@ -476,6 +484,8 @@ impl ProcessAcc {
             escalation_throw_dup: false,
             escalation_ref: None,
             link_name: None,
+            is_error_throw: false,
+            error_ref: None,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
             agent_type: None,
@@ -1443,15 +1453,6 @@ impl ProcessAcc {
             .iter()
             .filter_map(|n| n.parent.clone().map(|p| (n.id.clone(), p)))
             .collect();
-        // Node ids carrying a non-boundary `errorEventDefinition` (an error
-        // throw / end). Recorded separately from the node flags (in
-        // `error_refs_extra`), so surfaced here as a set for the competing
-        // event-definition guard below (#1173).
-        let error_def_node_ids: std::collections::HashSet<String> = self
-            .error_refs_extra
-            .iter()
-            .map(|(node_id, _)| node_id.clone())
-            .collect();
         // Validate every event sub-process (`subProcess triggeredByEvent="true"`)
         // BEFORE the node-consumption loop below (#1555): Zeebe's
         // `EventSubProcessValidator` requires exactly one start event, that start
@@ -1538,7 +1539,7 @@ impl ProcessAcc {
                     + node.is_compensation_throw as u32
                     + node.is_terminate as u32
                     + node.link_name.is_some() as u32
-                    + error_def_node_ids.contains(&node.id) as u32
+                    + node.is_error_throw as u32
                     // A job-worker message event is rebuilt as a job task below,
                     // which would silently drop any competing definition.
                     + job_worker as u32;
@@ -1689,6 +1690,17 @@ impl ProcessAcc {
                             .and_then(|r| escalations.get(r).cloned())
                             .unwrap_or_default();
                         builder.escalation_throw_event(node.id, code)
+                    } else if node.is_error_throw {
+                        // An error end event (#1592): resolve its `errorRef` to
+                        // the declared error code (no ref = an unnamed throw,
+                        // matched by catch-alls only). A dangling ref was already
+                        // rejected by the reference-integrity validator (#851).
+                        let code = node
+                            .error_ref
+                            .as_ref()
+                            .and_then(|r| errors.get(r).cloned())
+                            .unwrap_or_default();
+                        builder.error_end_event(node.id, code)
                     } else if node.is_compensation_throw {
                         builder.compensation_throw_event(node.id)
                     } else if node.is_terminate {

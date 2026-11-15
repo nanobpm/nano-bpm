@@ -606,11 +606,26 @@ pub(crate) fn parse_with_captures(
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
                                     // An `errorRef` on a non-boundary error event
-                                    // (an error end / throw event). Recorded so the
-                                    // reference-integrity validator (#851) can
-                                    // resolve it against declared `<error>`s.
+                                    // (an error end / throw event). A non-empty
+                                    // ref is recorded so the reference-integrity
+                                    // validator (#851) can resolve it against
+                                    // declared `<error>`s (mirroring the
+                                    // escalation arm: an absent ref is not a
+                                    // reference and needs no validation).
                                     let node_id = acc.nodes[idx].id.clone();
-                                    acc.error_refs_extra.push((node_id, error_ref));
+                                    if !error_ref.is_empty() {
+                                        acc.error_refs_extra.push((node_id, error_ref.clone()));
+                                    }
+                                    // Only an end event carrier is an error *throw*
+                                    // (#1592); any other placement (an error
+                                    // intermediate throw/catch — not modelled)
+                                    // stays recorded above for #851 but builds no
+                                    // element behaviour.
+                                    if matches!(acc.nodes[idx].kind, NodeKind::End) {
+                                        acc.nodes[idx].is_error_throw = true;
+                                        acc.nodes[idx].error_ref =
+                                            (!error_ref.is_empty()).then_some(error_ref);
+                                    }
                                 }
                             }
                             // `escalationEventDefinition escalationRef="…"` on an

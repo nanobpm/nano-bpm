@@ -146,6 +146,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::TerminateEndEvent => "terminateEndEvent",
+        ElementKind::ErrorEndEvent { .. } => "errorEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -259,6 +260,11 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         } => {
             attrs.push(format!("attachedTo {attached_to}"));
             attrs.push(format!("errorCode {}", quote(error_code)));
+        }
+        ElementKind::ErrorEndEvent { error_code } => {
+            if !error_code.is_empty() {
+                attrs.push(format!("errorCode {}", quote(error_code)));
+            }
         }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
             attrs.push(format!("duration {duration_millis}ms"));
@@ -1412,6 +1418,9 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "errorBoundaryEvent" => ElementKind::ErrorBoundaryEvent {
             attached_to: attrs.require("attachedTo", id)?,
             error_code: attrs.require("errorCode", id)?,
+        },
+        "errorEndEvent" => ElementKind::ErrorEndEvent {
+            error_code: attrs.take("errorCode").unwrap_or_default(),
         },
         "timerIntermediateCatchEvent" => {
             let d = attrs.require("duration", id)?;
