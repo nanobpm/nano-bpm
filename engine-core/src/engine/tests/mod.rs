@@ -34,6 +34,7 @@ mod multi_instance;
 mod retry_phases;
 mod scoped_conditions;
 mod terminal_timing;
+mod timer_cycle_bounds;
 mod timers_catch;
 mod user_task;
 

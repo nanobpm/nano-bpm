@@ -550,6 +550,26 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             for incident in state.incidents.values_mut() {
                 if incident.instance_key == *instance_key {
                     remap_id(&mut incident.element_id);
+                    // A pending cycle re-arm retry names its boundary / ESP
+                    // trigger inside the redrive descriptor (#1596 review):
+                    // re-point it with the same mapping so resolving the
+                    // incident after migration looks up the renamed element.
+                    if let Some(crate::state::IoMappingRedrive::TimerCycleRearm { kind, .. }) =
+                        &mut incident.redrive
+                    {
+                        match kind {
+                            TimerKind::InterruptingBoundary {
+                                boundary_element_id,
+                            }
+                            | TimerKind::NonInterruptingBoundary {
+                                boundary_element_id,
+                            } => remap_id(boundary_element_id),
+                            TimerKind::EventSubProcess { esp_element_id, .. } => {
+                                remap_id(esp_element_id)
+                            }
+                            TimerKind::IntermediateCatch => {}
+                        }
+                    }
                 }
             }
             // The scope tree (`scopes` / `scope_parents` / `scope_variables`)

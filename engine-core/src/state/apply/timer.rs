@@ -12,6 +12,7 @@ pub(super) fn apply_timer(state: &mut State, event: &Event) {
             element_id,
             due_at,
             kind,
+            repetitions,
         } => {
             state.timers.insert(
                 *timer_key,
@@ -23,6 +24,7 @@ pub(super) fn apply_timer(state: &mut State, event: &Event) {
                     due_at: *due_at,
                     state: TimerState::Created,
                     kind: kind.clone(),
+                    repetitions: *repetitions,
                 },
             );
         }
@@ -47,6 +49,7 @@ pub(super) fn apply_timer(state: &mut State, event: &Event) {
             due_at,
             interval_millis,
             repeating,
+            repetitions,
         } => {
             state.start_timers.insert(
                 *timer_key,
@@ -58,6 +61,7 @@ pub(super) fn apply_timer(state: &mut State, event: &Event) {
                     due_at: Some(*due_at),
                     interval_millis: *interval_millis,
                     repeating: *repeating,
+                    repetitions: *repetitions,
                 },
             );
         }
@@ -70,6 +74,8 @@ pub(super) fn apply_timer(state: &mut State, event: &Event) {
                 // A cycle re-arms (next_due_at is Some); a one-shot is retained
                 // with due_at = None so a later tick never re-fires it.
                 start_timer.due_at = *next_due_at;
+                // A bounded cycle consumes one of its remaining fires (#1596).
+                start_timer.repetitions = start_timer.repetitions.map(|n| n.saturating_sub(1));
             }
         }
         _ => unreachable!(),

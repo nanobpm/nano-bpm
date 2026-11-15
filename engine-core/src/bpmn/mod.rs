@@ -323,8 +323,9 @@ pub(crate) fn parse_iso8601_duration(raw: &str) -> Option<u64> {
 
 /// Parses an ISO-8601 repeating interval (a BPMN `timeCycle`, e.g. `R/PT1H` or
 /// `R5/PT1H`) into the interval in milliseconds. Thin wrapper over the canonical
-/// [`crate::temporal`] leaf. The `Rn` repetition-count prefix is accepted but
-/// ignored (the engine repeats unboundedly). A bare duration without the
+/// [`crate::temporal`] leaf. The `Rn` repetition count is not part of the
+/// interval: the parser retains the literal as the element's `TimerDef`, and
+/// the engine bounds the cycle to `n` fires at runtime (#1596). A bare duration without the
 /// `R[n]/` prefix is also accepted. Returns `None` if the interval portion is
 /// not a recognisable duration.
 pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
