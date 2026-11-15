@@ -1485,16 +1485,12 @@ fn assert_loop_kind_change_rejected(source_sequential: bool, target_sequential: 
             pairs(&[("sub", "sub2"), ("a", "b")]),
         ))
         .unwrap_err();
-    // Today an active MI source is rejected wholesale before the loop-kind
-    // guard runs; once MI migration lands, the guard must take over. Either
-    // way a parallel <-> sequential change must never be accepted.
+    // A parallel <-> sequential change is never accepted (Zeebe
+    // `requireSameMultiInstanceLoopCharacteristics`).
     assert!(
         matches!(
             err,
-            EngineError::UnsupportedMigration { ref element_id, .. } if element_id == "a"
-        ) || matches!(
-            err,
-            EngineError::MigrationMultiInstanceMismatch { ref source_element_id, ref target_element_id, .. }
+            EngineError::MigrationLoopCharacteristicsChanged { ref source_element_id, ref target_element_id, .. }
                 if source_element_id == "a" && target_element_id == "b"
         ),
         "{err:?}"

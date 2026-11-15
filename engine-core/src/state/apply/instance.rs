@@ -418,6 +418,40 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .instances
                 .get(instance_key)
                 .map(|i| i.process_id.clone());
+            // Multi-instance bodies and ad-hoc containers (#1630) adopt the
+            // target element's loop / `zeebe:adHoc` wiring, as Zeebe reads it
+            // from the target definition after migration. The evaluated input
+            // collection, spawned children and collected outputs are runtime
+            // state and are kept. Resolved before borrowing the instance.
+            let target_def = state
+                .process_by_key(*target_process_definition_key)
+                .map(|d| d.definition.clone());
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                for mi in instance.multi_instances.values_mut() {
+                    remap_id(&mut mi.element_id);
+                    if let Some(spec) = target_def
+                        .as_ref()
+                        .and_then(|d| d.element(&mi.element_id))
+                        .and_then(|e| e.multi_instance.as_ref())
+                    {
+                        mi.input_element = spec.input_element.clone();
+                        mi.output_collection = spec.output_collection.clone();
+                        mi.output_element = spec.output_element.clone();
+                        mi.completion_condition = spec.completion_condition.clone();
+                        mi.cancel_remaining_instances = spec.cancel_remaining_instances;
+                    }
+                }
+                for adhoc in instance.adhoc_instances.values_mut() {
+                    remap_id(&mut adhoc.element_id);
+                    if let Some(spec) = target_def
+                        .as_ref()
+                        .and_then(|d| d.adhoc.iter().find(|a| a.container_id == adhoc.element_id))
+                    {
+                        adhoc.output_collection = spec.output_collection.clone();
+                        adhoc.output_element = spec.output_element.clone();
+                    }
+                }
+            }
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.process_id = target_process_id.clone();
                 // Re-pin the instance to the target definition's version so

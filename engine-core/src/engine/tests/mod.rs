@@ -27,6 +27,7 @@ mod lifecycle;
 mod listeners;
 mod migration;
 mod migration_event_gateway;
+mod migration_mi_adhoc;
 mod migration_scopes;
 mod modify_moves;
 mod modify_scopes;

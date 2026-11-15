@@ -469,6 +469,7 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::InstanceNotActive { .. }
         | E::MigrationFlowScopeChanged { .. }
         | E::MigrationMultiInstanceMismatch { .. }
+        | E::MigrationLoopCharacteristicsChanged { .. }
         | E::MigrationCatchEventDetached { .. }
         | E::MigrationCatchEventsMerged { .. }
         // A target catch event whose subscription expression fails to evaluate
@@ -4186,6 +4187,16 @@ mod tests {
             ),
             (
                 E::MigrationMultiInstanceMismatch {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    source_element_type: "MULTI_INSTANCE_BODY".into(),
+                    target_element_id: "b".into(),
+                    target_element_type: "SERVICE_TASK".into(),
+                },
+                409,
+            ),
+            (
+                E::MigrationLoopCharacteristicsChanged {
                     instance_key: 1,
                     source_element_id: "a".into(),
                     target_element_id: "b".into(),

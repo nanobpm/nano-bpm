@@ -5104,20 +5104,19 @@ impl Engine {
                             element_id: src.clone(),
                         });
                     }
-                    let src_el = source_def.definition.element(src).ok_or_else(|| {
-                        EngineError::MappingSourceElementNotFound {
+                    let src_el = migration::migration_node(&source_def.definition, src)
+                        .ok_or_else(|| EngineError::MappingSourceElementNotFound {
                             instance_key,
                             element_id: src.clone(),
-                        }
-                    })?;
-                    let tgt_el = target.definition.element(tgt).ok_or_else(|| {
-                        EngineError::MappingTargetElementNotFound {
-                            target_process_definition_key,
-                            element_id: tgt.clone(),
-                        }
-                    })?;
-                    if std::mem::discriminant(&src_el.kind) != std::mem::discriminant(&tgt_el.kind)
-                    {
+                        })?;
+                    let tgt_el =
+                        migration::migration_node(&target.definition, tgt).ok_or_else(|| {
+                            EngineError::MappingTargetElementNotFound {
+                                target_process_definition_key,
+                                element_id: tgt.clone(),
+                            }
+                        })?;
+                    if !src_el.same_type_as(&source_def.definition, &tgt_el, &target.definition) {
                         return Err(EngineError::MappedElementTypeChanged {
                             instance_key,
                             source_element_id: src.clone(),
@@ -5126,6 +5125,23 @@ impl Engine {
                     }
                     mapped.insert(src.clone(), tgt.clone());
                 }
+                // 3a. Ad-hoc sub-process inner instances (#1630): each activated
+                //     tool runs beneath a `<container>#innerInstance` element
+                //     instance that has no definition element of its own, so
+                //     it cannot be named in a mapping instruction (an explicit
+                //     one fails the source-element lookup above, Zeebe parity).
+                //     Like Zeebe, derive its mapping from the container's.
+                let mut mapping_instructions = mapping_instructions;
+                let mut inner_mappings: Vec<(String, String)> = mapping_instructions
+                    .iter()
+                    .filter(|(src, _)| migration::is_adhoc_container(&source_def.definition, src))
+                    .map(|(src, tgt)| (adhoc_inner_instance_id(src), adhoc_inner_instance_id(tgt)))
+                    .collect();
+                inner_mappings.sort();
+                for (src, tgt) in &inner_mappings {
+                    mapped.insert(src.clone(), tgt.clone());
+                }
+                mapping_instructions.extend(inner_mappings);
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
                 //    active element instance whose kind is listed in
@@ -5162,34 +5178,6 @@ impl Engine {
                             });
                         }
                     }
-                }
-
-                //    An active multi-instance body or ad-hoc sub-process
-                //    container: their per-element bookkeeping lives in
-                //    `ProcessInstance.multi_instances` / `adhoc_instances`,
-                //    which the applier (`state::apply`) does not remap, so
-                //    migrating one would leave that bookkeeping pointing at
-                //    the source element id and desync engine runtime.
-                let mut unremappable: Vec<String> = instance
-                    .multi_instances
-                    .values()
-                    .map(|mi| mi.element_id.clone())
-                    .chain(
-                        instance
-                            .adhoc_instances
-                            .values()
-                            .map(|adhoc| adhoc.element_id.clone()),
-                    )
-                    .collect();
-                unremappable.sort();
-                if let Some(element_id) = unremappable.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "multi-instance and ad-hoc sub-process activities are not \
-                                 migratable yet"
-                            .to_string(),
-                    });
                 }
 
                 //    Compensation runtime (`compensable` / `compensation_waits`)
@@ -5273,23 +5261,51 @@ impl Engine {
                         .definition
                         .element(tgt)
                         .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
-                    if source_mi != target_mi {
-                        return Err(EngineError::MigrationMultiInstanceMismatch {
-                            instance_key,
-                            source_element_id: eid.clone(),
-                            target_element_id: tgt.clone(),
-                        });
+                    match (source_mi, target_mi) {
+                        (Some(s), Some(t)) if s != t => {
+                            return Err(EngineError::MigrationLoopCharacteristicsChanged {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                target_element_id: tgt.clone(),
+                            });
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            // Zeebe reports the element-instance types: an MI
+                            // body is `MULTI_INSTANCE_BODY`, a plain activity
+                            // its own BPMN type.
+                            let type_of = |def: &ProcessDefinition, id: &str, mi: bool| {
+                                if mi {
+                                    "MULTI_INSTANCE_BODY".to_string()
+                                } else {
+                                    def.element(id)
+                                        .map(|e| e.kind.type_name().to_string())
+                                        .unwrap_or_default()
+                                }
+                            };
+                            return Err(EngineError::MigrationMultiInstanceMismatch {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                source_element_type: type_of(
+                                    &source_def.definition,
+                                    eid,
+                                    source_mi.is_some(),
+                                ),
+                                target_element_id: tgt.clone(),
+                                target_element_type: type_of(
+                                    &target.definition,
+                                    tgt,
+                                    target_mi.is_some(),
+                                ),
+                            });
+                        }
+                        _ => {}
                     }
                     let expected =
-                        match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
-                            .first()
-                        {
-                            Some(scope) => mapped.get(scope).cloned(),
+                        match migration::migration_flow_scope(&source_def.definition, eid) {
+                            Some(scope) => mapped.get(&scope).cloned(),
                             None => Some(target_process_id.clone()),
                         };
-                    let actual = flow_scope::element_flow_scope_chain(&target.definition, tgt)
-                        .first()
-                        .cloned()
+                    let actual = migration::migration_flow_scope(&target.definition, tgt)
                         .unwrap_or_else(|| target_process_id.clone());
                     if expected.as_deref() != Some(actual.as_str()) {
                         return Err(EngineError::MigrationFlowScopeChanged {
@@ -17584,9 +17600,21 @@ pub enum EngineError {
         target_flow_scope_id: Option<String>,
     },
     /// A migration mapped a multi-instance element onto a non-multi-instance
-    /// one or vice versa, or a parallel multi-instance element onto a
-    /// sequential one or vice versa. HTTP 409.
+    /// one or vice versa: the element-instance types differ
+    /// (`MULTI_INSTANCE_BODY` vs. the plain activity type). HTTP 409. Zeebe
+    /// `requireSameElementType` (`ERROR_ELEMENT_TYPE_CHANGED`, INVALID_STATE).
     MigrationMultiInstanceMismatch {
+        instance_key: Key,
+        source_element_id: String,
+        source_element_type: String,
+        target_element_id: String,
+        target_element_type: String,
+    },
+    /// A migration mapped a parallel multi-instance element onto a sequential
+    /// one or vice versa. HTTP 409. Zeebe
+    /// `requireSameMultiInstanceLoopCharacteristics`
+    /// (`ERROR_UPDATED_LOOP_CHARACTERISTICS`, INVALID_STATE).
+    MigrationLoopCharacteristicsChanged {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
@@ -17848,9 +17876,13 @@ impl std::fmt::Display for EngineError {
                 source_flow_scope_id.as_deref().unwrap_or("<process>"),
                 target_flow_scope_id.as_deref().unwrap_or("<process>")
             ),
-            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
+            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, source_element_type, target_element_id, target_element_type } => write!(
                 f,
-                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' and type '{source_element_type}' is mapped to an element with id '{target_element_id}' and different type '{target_element_type}'. Elements must be mapped to elements of the same type."
+            ),
+            EngineError::MigrationLoopCharacteristicsChanged { instance_key, source_element_id, target_element_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' has a different loop characteristics than the target element with id '{target_element_id}'. Both elements must have either sequential or parallel loop characteristics."
             ),
             EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
                 f,
@@ -18335,6 +18367,7 @@ impl EngineError {
             | EngineError::ElementNotActivatable { .. }
             | EngineError::MigrationFlowScopeChanged { .. }
             | EngineError::MigrationMultiInstanceMismatch { .. }
+            | EngineError::MigrationLoopCharacteristicsChanged { .. }
             | EngineError::MigrationCatchEventDetached { .. }
             | EngineError::MigrationCatchEventsMerged { .. }
             | EngineError::MigrationCatchEventSubscriptionFailed { .. }
