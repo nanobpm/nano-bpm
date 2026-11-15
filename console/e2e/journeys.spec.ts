@@ -63,6 +63,7 @@ const REACHABLE = new Set([
   "/explorer",
   "/traces",
   "/workers",
+  "/mcp",
 ]);
 
 function isReachable(route: string | undefined): boolean {

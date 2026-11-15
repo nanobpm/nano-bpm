@@ -29523,6 +29523,10 @@ async fn main() {
     // touching dispatch.
     // Built before `server` is moved into the REST router below.
     let mcp_server = server.clone();
+    // The console's read-only MCP processes view (issue #1612) reads the same
+    // tool catalog the `/mcp/processes` server lists.
+    #[cfg(feature = "console")]
+    let mcp_catalog_server = server.clone();
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
@@ -29664,6 +29668,26 @@ async fn main() {
             // thresholds are computed once (never in TypeScript). A GET
             // observability read, served in observe (read-only) mode too, gated by
             // the console feature + `console_enabled()` like the other reads.
+            // Processes exposed as MCP tools (issue #1612): the console view of
+            // what `/mcp/processes` offers an AI agent. Built by the MCP module
+            // from the same resolver/descriptor `tools/list` uses (never
+            // re-derived in TypeScript), plus the `NANOBPM_MCP_ENABLED` state.
+            // A GET observability read, served in observe mode too.
+            {
+                let srv = mcp_catalog_server.clone();
+                console = console.route(
+                    "/console/api/mcp/processes",
+                    axum::routing::get(move || {
+                        let srv = srv.clone();
+                        async move {
+                            axum::Json(mcp::processes_tools::console_catalog(
+                                &srv,
+                                mcp::mcp_enabled(),
+                            ))
+                        }
+                    }),
+                );
+            }
             console = console.route(
                 "/console/api/provisioning",
                 axum::routing::get(|| async { axum::Json(crate::provisioning::latest()) }),

@@ -74,6 +74,7 @@ const Extensions = __STUDIO__
 // it outside <Routes>) so this import stays tree-shakeable with the profile.
 // Operator surface — always present in both profiles.
 const Workers = lazyImport(() => import("./views/Workers"));
+const McpProcesses = lazyImport(() => import("./views/McpProcesses"));
 const Metrics = lazyImport(() => import("./views/Metrics"));
 const Traces = lazyImport(() => import("./views/Traces"));
 const Explorer = lazyImport(() => import("./views/Explorer"));
@@ -140,6 +141,12 @@ const icons = {
       <rect x="4" y="4" width="16" height="16" rx="2" />
       <rect x="9" y="9" width="6" height="6" />
       <path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" />
+    </Icon>
+  ),
+  mcp: (
+    <Icon>
+      <path d="M8 3v4M16 3v4M6 7h12v4a6 6 0 0 1-12 0z" />
+      <path d="M12 17v4" />
     </Icon>
   ),
   docs: (
@@ -263,6 +270,7 @@ const navItems: {
   { to: "/explorer", label: "Explorer", icon: icons.explorer },
   { to: "/traces", label: "Traces", icon: icons.traces },
   { to: "/workers", label: "Workers", icon: icons.workers },
+  { to: "/mcp", label: "MCP", icon: icons.mcp },
 ].filter((i) => IS_STUDIO || !i.studio);
 
 // Where "home" lands: the maker starts in Studio; the operator ("observe"
@@ -1181,6 +1189,7 @@ export default function App() {
                 <Route path="/explorer" element={<ExplorerRoute />} />
                 <Route path="/traces" element={<Traces />} />
                 <Route path="/workers" element={<Workers />} />
+                <Route path="/mcp" element={<McpProcesses />} />
                 <Route
                   path="*"
                   element={<Navigate to={HOME_ROUTE} replace />}
