@@ -219,6 +219,10 @@ pub(super) struct NodeAcc {
     /// event-definition guard (#1173) independently of `is_error_throw`, which
     /// is only set on an end-event carrier.
     pub(super) has_error_def: bool,
+    /// True when a SECOND non-boundary `errorEventDefinition` was seen on this
+    /// node. `error_ref` is last-wins, so `build` rejects the ambiguous
+    /// multi-definition throw (the error analogue of `escalation_throw_dup`).
+    pub(super) error_def_dup: bool,
     /// The `errorRef` on this error end event, resolved to an `errorCode` at
     /// build. `None` when the definition carries no `errorRef` (an unnamed
     /// throw, matched by catch-alls only).
@@ -491,6 +495,7 @@ impl ProcessAcc {
             link_name: None,
             is_error_throw: false,
             has_error_def: false,
+            error_def_dup: false,
             error_ref: None,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
@@ -1554,7 +1559,7 @@ impl ProcessAcc {
                 // SAME throw/end — a last-wins overwrite of `escalation_ref` that
                 // would silently drop the first (#1173), the throw/end analogue of
                 // the boundary `escalation_dup` guard.
-                if defs > 1 || node.escalation_throw_dup {
+                if defs > 1 || node.escalation_throw_dup || node.error_def_dup {
                     return Err(match node.kind {
                         // The `endEvent` flavour has a reason-bearing error; an
                         // `intermediateThrowEvent` reuses the throw-side
@@ -1567,6 +1572,14 @@ impl ProcessAcc {
                                          escalationEventDefinition; a multi-definition \
                                          escalation end event is not supported (declare \
                                          exactly one)"
+                                .to_string(),
+                        },
+                        NodeKind::End if node.error_def_dup => ParseError::InvalidEndEvent {
+                            process_id: self.id.clone(),
+                            element_id: node.id.clone(),
+                            reason: "end event declares more than one \
+                                     errorEventDefinition; a multi-definition error end \
+                                     event is not supported (declare exactly one)"
                                 .to_string(),
                         },
                         NodeKind::End => ParseError::InvalidEndEvent {

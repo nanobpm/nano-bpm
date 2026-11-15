@@ -624,6 +624,13 @@ pub(crate) fn parse_with_captures(
                                     // Presence is tracked for EVERY carrier so the
                                     // competing-definition guard (#1173) still sees an
                                     // error definition on an intermediate throw.
+                                    // A SECOND definition is a last-wins overwrite
+                                    // of `error_ref`; flag it so `build` rejects
+                                    // the ambiguous throw (mirrors
+                                    // `escalation_throw_dup`).
+                                    if acc.nodes[idx].has_error_def {
+                                        acc.nodes[idx].error_def_dup = true;
+                                    }
                                     acc.nodes[idx].has_error_def = true;
                                     if matches!(acc.nodes[idx].kind, NodeKind::End) {
                                         acc.nodes[idx].is_error_throw = true;

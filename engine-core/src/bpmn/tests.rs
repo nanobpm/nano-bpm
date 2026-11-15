@@ -1523,6 +1523,45 @@ fn should_reject_a_duplicate_escalation_definition_on_a_throw() {
 }
 
 #[test]
+fn should_reject_a_duplicate_error_definition_on_an_end_event() {
+    // Regression (#1592 review): a SECOND `errorEventDefinition` on one end
+    // event silently overwrote `error_ref` (last-wins) while the presence flag
+    // stayed a single boolean, so the competing-definition guard accepted it.
+    // Covers named/named and named/unnamed pairs, both orders.
+    for (first, second) in [
+        (r#"errorRef="ErrA""#, r#"errorRef="ErrB""#),
+        (r#"errorRef="ErrA""#, ""),
+        ("", r#"errorRef="ErrA""#),
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="ErrA" name="A" errorCode="A" />
+  <bpmn:error id="ErrB" name="B" errorCode="B" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition {first} />
+      <bpmn:errorEventDefinition {second} />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        let err =
+            parse_bpmn(&xml).expect_err("two error definitions on one end event are rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, reason, .. }
+                    if element_id == "Bad" && reason.contains("more than one errorEventDefinition")
+            ),
+            "expected InvalidEndEvent for ({first}, {second}), got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn should_capture_the_element_name_attribute() {
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
