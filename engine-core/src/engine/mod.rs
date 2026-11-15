@@ -7272,17 +7272,30 @@ impl Engine {
                 kind,
                 previous_due_at,
                 remaining,
-            } => (
-                self.cycle_rearm_events(
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    kind,
-                    previous_due_at,
-                    remaining,
-                ),
-                Vec::new(),
-            ),
+            } => {
+                // A re-arm incident can outlive its instance: resolving it after
+                // the instance completed must not mint a timer (or raise another
+                // incident) on the completed instance (#1596 review).
+                if self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.state == ProcessInstanceState::Completed)
+                {
+                    return (Vec::new(), Vec::new());
+                }
+                (
+                    self.cycle_rearm_events(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind,
+                        previous_due_at,
+                        remaining,
+                    ),
+                    Vec::new(),
+                )
+            }
             Step::RetryMiChildCompletion {
                 instance_key,
                 element_id,

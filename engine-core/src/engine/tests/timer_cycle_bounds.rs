@@ -290,3 +290,221 @@ fn event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
     );
     assert_rearm_incident_resumes_remaining_count(def, "esp-feel");
 }
+
+// ---------------------------------------------------------------------------
+// #1596 review: a re-arm incident can outlive its instance. Resolving it after
+// the instance completed must not mint a timer (or raise another incident) on
+// the completed instance.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_subprocess_cycle_rearm_incident_resolution_after_completion_is_noop() {
+    let def = parse(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="esp-complete" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="end" />
+    <bpmn:subProcess id="esp" triggeredByEvent="true">
+      <bpmn:startEvent id="esp_start" isInterrupting="false">
+        <bpmn:timerEventDefinition><bpmn:timeCycle>=cyc</bpmn:timeCycle></bpmn:timerEventDefinition>
+      </bpmn:startEvent>
+      <bpmn:endEvent id="esp_end" />
+      <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+    </bpmn:subProcess>
+  </bpmn:process>
+</bpmn:definitions>"#,
+    );
+    let cycle = Value::Str("R3/PT5S".into());
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                "esp-complete",
+                HashMap::from([("cyc".to_string(), cycle.clone())]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(armed(&engine), vec![6_000]);
+    engine.trigger_timers(6_000); // fire 1 of 3
+    assert_eq!(armed(&engine), vec![11_000]);
+
+    // Break the cycle variable so the second fire's re-arm raises an incident.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+        ))
+        .unwrap();
+    engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
+    assert!(armed(&engine).is_empty());
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1);
+    let incident_key = incidents[0].key;
+
+    // Complete the instance while the incident is still open.
+    complete_one(&mut engine, "work");
+    assert!(engine.is_completed(instance_key));
+
+    // Repair the variable and resolve the incident: the retry must be skipped —
+    // no new timer, no new incident, and the incident record is closed.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), cycle)]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command_at(Command::resolve_incident(incident_key), 13_000)
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::TimerCreated { .. })),
+        "no timer is minted on a completed instance: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. })),
+        "no fresh incident is raised on a completed instance: {events:?}"
+    );
+    assert!(armed(&engine).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #1596 review: migrating to renamed host and boundary elements must re-point
+// the boundary id inside a pending `TimerCycleRearm` redrive, or resolving the
+// incident after migration looks up the old boundary id and silently drops the
+// remaining fires.
+// ---------------------------------------------------------------------------
+
+fn boundary_process_named(process_id: &str, task: &str, boundary: &str) -> ProcessDefinition {
+    parse(&format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="{process_id}" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="{task}">
+      <bpmn:extensionElements><zeebe:taskDefinition type="payment" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="{boundary}" attachedToRef="{task}" cancelActivity="false">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>=cyc</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="ticked" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="{task}" />
+    <bpmn:sequenceFlow id="f2" sourceRef="{task}" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="{boundary}" targetRef="ticked" />
+  </bpmn:process>
+</bpmn:definitions>"#
+    ))
+}
+
+#[test]
+fn migration_remaps_pending_cycle_rearm_boundary_id() {
+    let cycle = Value::Str("R3/PT5S".into());
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        boundary_process_named("source", "charge", "tick"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        boundary_process_named("target", "charge2", "tick2"),
+    );
+
+    let created = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                "source",
+                HashMap::from([("cyc".to_string(), cycle.clone())]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(armed(&engine), vec![6_000]);
+    engine.trigger_timers(6_000); // fire 1 of 3
+    assert_eq!(armed(&engine), vec![11_000]);
+
+    // Break the cycle variable so the second fire's re-arm raises an incident.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+        ))
+        .unwrap();
+    engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
+    assert!(armed(&engine).is_empty());
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1);
+    let incident_key = incidents[0].key;
+    assert!(matches!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::TimerCycleRearm {
+            kind: state::TimerKind::NonInterruptingBoundary { ref boundary_element_id },
+            ..
+        }) if boundary_element_id == "tick"
+    ));
+
+    // Migrate to a definition that renames both the host task and the boundary.
+    engine
+        .apply_command(Command::migrate_instance(
+            instance_key,
+            target_key,
+            vec![
+                ("charge".to_string(), "charge2".to_string()),
+                ("tick".to_string(), "tick2".to_string()),
+            ],
+        ))
+        .unwrap();
+    let incident = engine.incident(incident_key).unwrap();
+    assert!(
+        matches!(
+            incident.redrive,
+            Some(state::IoMappingRedrive::TimerCycleRearm {
+                kind: state::TimerKind::NonInterruptingBoundary { ref boundary_element_id },
+                ..
+            }) if boundary_element_id == "tick2"
+        ),
+        "migration re-points the pending re-arm's boundary id"
+    );
+
+    // Repair the variable and resolve: the retry re-arms against the renamed
+    // boundary and the bounded cycle fires exactly once more.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("cyc".to_string(), cycle)]),
+        ))
+        .unwrap();
+    engine
+        .apply_command_at(Command::resolve_incident(incident_key), 13_000)
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        armed(&engine),
+        vec![16_000],
+        "the retry re-arms the renamed boundary from the fired timer's due time"
+    );
+    let fired = engine.trigger_timers(16_000); // fire 3 of 3 — the last
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::TimerTriggered { .. })));
+    assert!(
+        armed(&engine).is_empty(),
+        "R3 fires exactly three times — migration must not lose the remaining count"
+    );
+}
