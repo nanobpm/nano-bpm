@@ -332,3 +332,86 @@ fn error_end_event_inside_a_multi_instance_child_is_caught_on_the_body() {
     complete_one(&mut engine, "handle");
     assert!(engine.is_completed(inst));
 }
+
+/// Resolving an uncaught error end event's incident must re-run ONLY the catch
+/// walk: the end event already applied its output mappings and drained its end
+/// listeners before parking, so neither may be repeated (#1592 review).
+fn assert_retry_reruns_only_the_throw(resolved: &[Event]) {
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::IncidentRaised { kind, .. } if *kind == crate::state::IncidentKind::UnhandledError
+        )),
+        "the retried throw is still uncaught, so a fresh incident is raised"
+    );
+    for e in resolved {
+        assert!(
+            !matches!(
+                e,
+                Event::ElementCompleting { .. }
+                    | Event::ExecutionListenerJobCreated { .. }
+                    | Event::VariablesUpdated { .. }
+            ),
+            "resolution must not repeat outputs/listeners/lifecycle: {e:?}"
+        );
+    }
+}
+
+fn uncaught_err_end_with_output() -> ProcessBuilder {
+    ProcessBuilder::new("p")
+        .start_event("s")
+        .error_end_event("err_end", "E1")
+        .with_io(
+            "err_end",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=1".to_string(),
+                    target: "out".to_string(),
+                }],
+            },
+        )
+        .connect("s", "err_end")
+}
+
+#[test]
+fn resolving_an_uncaught_error_end_incident_does_not_rerun_output_mappings() {
+    let mut engine = Engine::new();
+    let (inst, _) = start(&mut engine, uncaught_err_end_with_output().build().unwrap());
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1);
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incidents[0].key))
+        .unwrap();
+    assert_retry_reruns_only_the_throw(&resolved);
+    assert!(!engine.is_completed(inst));
+}
+
+#[test]
+fn resolving_a_deferred_uncaught_error_end_incident_does_not_refire_end_listeners() {
+    let def = uncaught_err_end_with_output()
+        .with_listeners(
+            "err_end",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "err-audit")],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let (inst, _) = start(&mut engine, def);
+    complete_one(&mut engine, "err-audit");
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "uncaught after the listener drains");
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incidents[0].key))
+        .unwrap();
+    assert_retry_reruns_only_the_throw(&resolved);
+    assert!(
+        engine
+            .pending_jobs()
+            .iter()
+            .all(|j| j.job_type != "err-audit"),
+        "the end listener is not re-armed"
+    );
+    assert!(!engine.is_completed(inst));
+}

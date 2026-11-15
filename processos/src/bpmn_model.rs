@@ -1934,24 +1934,28 @@ fn millis_to_iso8601(ms: u64) -> String {
 }
 
 /// Collect the definitions-level `<bpmn:error>` declarations a model needs: one per distinct
-/// error code carried by an error boundary event or thrown by an error end event (#1592).
-/// Returns a code → synthesized-error-id map.
-fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
-    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+/// error code carried by an error boundary event, thrown by an error end event (#1592), or caught
+/// by an error event sub-process. Returns a code → synthesized-error-id map.
+///
+/// `id_fragment` is not injective (`A.B` and `A/B` both normalize to `A_B`), so ids are minted via
+/// [`alloc_unique_id`] in sorted code order against `reserved` — the same scheme as
+/// [`collect_escalations`] — so two distinct codes can never share one `<bpmn:error id>` (which
+/// would reparse both refs onto the last declaration's code and misroute the throw).
+fn collect_error_ids(
+    def: &ProcessDefinition,
+    reserved: &HashSet<String>,
+) -> BTreeMap<String, String> {
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
         match &el.kind {
             ElementKind::ErrorBoundaryEvent { error_code, .. } => {
-                codes
-                    .entry(error_code.clone())
-                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+                codes.insert(error_code.clone());
             }
             // An error end event with a code needs a definitions-level
             // `<bpmn:error>` for its `errorRef` (an unnamed throw — empty code —
             // carries no ref and needs no declaration).
             ElementKind::ErrorEndEvent { error_code } if !error_code.is_empty() => {
-                codes
-                    .entry(error_code.clone())
-                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+                codes.insert(error_code.clone());
             }
             // An event sub-process error trigger with a code needs a
             // definitions-level `<bpmn:error>` for its start event's `errorRef`.
@@ -1962,14 +1966,18 @@ fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
                     },
                 ..
             } => {
-                codes
-                    .entry(error_code.clone())
-                    .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+                codes.insert(error_code.clone());
             }
             _ => {}
         }
     }
-    codes
+    let mut used: HashSet<String> = reserved.clone();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for code in codes {
+        let id = alloc_unique_id(format!("Error_{}", id_fragment(&code)), &mut used);
+        out.insert(code, id);
+    }
+    out
 }
 
 /// A definitions-level `<bpmn:message>` declaration needed by a message start/catch/boundary.
@@ -3499,7 +3507,7 @@ fn serialize_definition(
     if let Some(d) = preserve {
         reserved_ids.extend(d.di_ids.iter().cloned());
     }
-    let errors = collect_error_ids(def);
+    let errors = collect_error_ids(def, &reserved_ids);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
     let escalations = collect_escalations(def, &reserved_ids);
@@ -6189,6 +6197,55 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn collect_error_ids_assigns_distinct_ids_to_colliding_codes() {
+        // `A.B` and `A/B` both normalize to `Error_A_B`; each code must still get
+        // its own `<bpmn:error>` id, or both throws reparse onto one code (#1592).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("CollideErr")
+            .start_event("Start")
+            .parallel_gateway("Split")
+            .error_end_event("Throw1", "A.B")
+            .error_end_event("Throw2", "A/B")
+            .connect("Start", "Split")
+            .connect("Split", "Throw1")
+            .connect("Split", "Throw2")
+            .build()
+            .unwrap();
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_eq!(errors.len(), 2, "both codes get a declaration");
+        let ids: std::collections::HashSet<&String> = errors.values().collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "colliding codes need distinct ids: {errors:?}"
+        );
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for (id, code) in [("Throw1", "A.B"), ("Throw2", "A/B")] {
+            match &reparsed[0].elements[id].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(error_code, code),
+                other => panic!("{id}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collect_error_ids_reserves_model_ids() {
+        // A model element literally named `Error_OOPS` must not be shadowed.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("ReserveErr")
+            .start_event("Error_OOPS")
+            .error_end_event("Throw", "OOPS")
+            .connect("Error_OOPS", "Throw")
+            .build()
+            .unwrap();
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_ne!(errors["OOPS"], "Error_OOPS");
+        let xml = definition_to_xml(&def);
+        parse_bpmn(&xml).expect("serialized model re-parses");
     }
 
     #[test]

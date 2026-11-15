@@ -214,6 +214,11 @@ pub(super) struct NodeAcc {
     /// [`ErrorEndEvent`](crate::model::ElementKind::ErrorEndEvent). Its thrown
     /// error code is resolved from `error_ref` at build.
     pub(super) is_error_throw: bool,
+    /// True when this node carries a non-boundary `errorEventDefinition` in ANY
+    /// placement (end or intermediate throw). Counted by the competing
+    /// event-definition guard (#1173) independently of `is_error_throw`, which
+    /// is only set on an end-event carrier.
+    pub(super) has_error_def: bool,
     /// The `errorRef` on this error end event, resolved to an `errorCode` at
     /// build. `None` when the definition carries no `errorRef` (an unnamed
     /// throw, matched by catch-alls only).
@@ -485,6 +490,7 @@ impl ProcessAcc {
             escalation_ref: None,
             link_name: None,
             is_error_throw: false,
+            has_error_def: false,
             error_ref: None,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
@@ -1539,7 +1545,7 @@ impl ProcessAcc {
                     + node.is_compensation_throw as u32
                     + node.is_terminate as u32
                     + node.link_name.is_some() as u32
-                    + node.is_error_throw as u32
+                    + node.has_error_def as u32
                     // A job-worker message event is rebuilt as a job task below,
                     // which would silently drop any competing definition.
                     + job_worker as u32;

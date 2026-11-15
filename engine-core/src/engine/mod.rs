@@ -355,6 +355,16 @@ enum Step {
         /// [`Engine::take_flow`], never by hand.
         via: Option<IncomingFlow>,
     },
+    /// Re-run ONLY the catch walk of an [`ErrorEndEvent`](ElementKind::ErrorEndEvent)
+    /// parked by an `UNHANDLED_ERROR` incident (#1592). The element already
+    /// rests in COMPLETING with its output mappings applied and its end
+    /// listeners finished, so resolving the incident must not re-drive
+    /// `Complete` (which would re-apply outputs and re-fire listeners).
+    RetryErrorEndThrow {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
     /// Run an already-activated element through `COMPLETING -> COMPLETED` and take
     /// its outgoing sequence flows.
     Complete {
@@ -3977,14 +3987,15 @@ impl Engine {
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again. An error END
                     // event (#1592) owns no job — its throw runs at completion — so
-                    // resolving re-drives `Complete`, re-running the catch walk
-                    // against the (possibly migrated) model.
+                    // resolving re-runs ONLY the catch walk (`RetryErrorEndThrow`)
+                    // against the (possibly migrated) model: its outputs and end
+                    // listeners already ran before the incident was raised.
                     state::IncidentKind::UnhandledError => {
                         if matches!(
                             self.element_kind(instance_key, &element_id),
                             Some(ElementKind::ErrorEndEvent { .. })
                         ) {
-                            queue.push_back(Step::Complete {
+                            queue.push_back(Step::RetryErrorEndThrow {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
@@ -6858,6 +6869,11 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::RetryErrorEndThrow {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::CompleteAdHocCallActivityTool {
                 instance_key,
                 element_instance_key,
@@ -7126,6 +7142,11 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.complete(instance_key, element_instance_key, element_id),
+            Step::RetryErrorEndThrow {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => self.retry_error_end_throw(instance_key, element_instance_key, element_id),
             Step::CompleteAdHocCallActivityTool {
                 instance_key,
                 element_instance_key,
@@ -13781,6 +13802,41 @@ impl Engine {
             }
         }
         (events, followups)
+    }
+
+    /// Resolves an `UNHANDLED_ERROR` incident on an error end event by re-running
+    /// only its catch walk (see [`Step::RetryErrorEndThrow`]).
+    fn retry_error_end_throw(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // The model may have been migrated while the incident was open; an
+        // element that is no longer an error end has nothing to re-throw, so
+        // re-drive its plain completion rather than strand the token.
+        let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        else {
+            return self.complete(instance_key, element_instance_key, element_id);
+        };
+        let scope = self.scope_of(instance_key, element_instance_key);
+        // Same shape `complete` / `finalize_completion` hand to the throw: the
+        // element's `ElementCompleted` (withheld again if still uncaught). No
+        // output mapping or end-listener step is re-run.
+        let events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        self.throw_error_from_end_event(
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+            error_code,
+            events,
+        )
     }
 
     /// Throws the BPMN error of a just-completed

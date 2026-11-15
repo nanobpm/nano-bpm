@@ -621,6 +621,10 @@ pub(crate) fn parse_with_captures(
                                     // intermediate throw/catch — not modelled)
                                     // stays recorded above for #851 but builds no
                                     // element behaviour.
+                                    // Presence is tracked for EVERY carrier so the
+                                    // competing-definition guard (#1173) still sees an
+                                    // error definition on an intermediate throw.
+                                    acc.nodes[idx].has_error_def = true;
                                     if matches!(acc.nodes[idx].kind, NodeKind::End) {
                                         acc.nodes[idx].is_error_throw = true;
                                         acc.nodes[idx].error_ref =

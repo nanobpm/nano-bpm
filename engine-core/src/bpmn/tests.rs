@@ -1374,6 +1374,40 @@ fn should_reject_an_end_event_with_escalation_and_terminate_definitions() {
 }
 
 #[test]
+fn should_reject_an_intermediate_throw_with_error_and_escalation_definitions() {
+    // Regression (#1592 review): an error definition on an
+    // `intermediateThrowEvent` (with or without an errorRef) must still count
+    // as a competing definition — otherwise the node deploys as a bare
+    // escalation throw and the error definition is silently discarded.
+    for error_def in [
+        r#"<bpmn:errorEventDefinition errorRef="Err" />"#,
+        r#"<bpmn:errorEventDefinition />"#,
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:error id="Err" name="Boom" errorCode="BOOM" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Bad">
+      {error_def}
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Bad" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        assert!(
+            parse_bpmn(&xml).is_err(),
+            "{error_def}: an error+escalation intermediate throw must be rejected"
+        );
+    }
+}
+
+#[test]
 fn should_reject_an_intermediate_throw_with_competing_definitions() {
     // Regression (#1173): the throw form of the same class — an
     // `intermediateThrowEvent` carrying BOTH an escalation and a compensation
