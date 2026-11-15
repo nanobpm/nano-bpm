@@ -745,6 +745,81 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("quarantine instance E"),
     );
 
+    // Event sub-process held-payload witness (#1555): a non-interrupting
+    // message event sub-process whose start event carries an output mapping and
+    // whose CONTAINER has a `start` execution listener. The correlated payload is
+    // parked (`EventSubProcessPayloadHeld`) until the listener job completes —
+    // which it never does here — so both the journal frame and the snapshot's
+    // held-payload state are pinned by the goldens. The host waits on a TIMER
+    // (not a job) so the instance owns exactly one job (the listener's): the
+    // set-valued `jobs_by_instance` must stay single-element for the canonical
+    // JSON to be deterministic (see `canonical_json`).
+    let esp_xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+         <bpmn:message id="Msg" name="esp-msg">
+           <bpmn:extensionElements><zeebe:subscription correlationKey="=orderId" /></bpmn:extensionElements>
+         </bpmn:message>
+         <bpmn:process id="esp-held" isExecutable="true">
+           <bpmn:startEvent id="s" />
+           <bpmn:intermediateCatchEvent id="work">
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+           </bpmn:intermediateCatchEvent>
+           <bpmn:endEvent id="e" />
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+           <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+           <bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:extensionElements>
+               <zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="esp-gate" />
+               </zeebe:executionListeners>
+             </bpmn:extensionElements>
+             <bpmn:startEvent id="esp_start" isInterrupting="false">
+               <bpmn:extensionElements>
+                 <zeebe:ioMapping><zeebe:output source="=payload" target="mapped" /></zeebe:ioMapping>
+               </bpmn:extensionElements>
+               <bpmn:messageEventDefinition messageRef="Msg" />
+             </bpmn:startEvent>
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+           </bpmn:subProcess>
+         </bpmn:process>
+       </bpmn:definitions>"#;
+    let esp_def = nanobpmn_engine_core::bpmn::parse_bpmn(esp_xml)
+        .expect("parse esp-held")
+        .remove(0);
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(esp_def), T0 + 24)
+            .expect("deploy esp-held"),
+    );
+    let mut esp_vars = HashMap::new();
+    esp_vars.insert("orderId".to_string(), Value::Int(7));
+    journal.extend(
+        engine
+            .apply_command_at(Command::create_instance_with("esp-held", esp_vars), T0 + 25)
+            .expect("create esp-held instance"),
+    );
+    let mut payload = HashMap::new();
+    payload.insert("payload".to_string(), Value::Int(42));
+    let correlated = engine
+        .apply_command_at(
+            Command::CorrelateMessage {
+                message_name: "esp-msg".into(),
+                correlation_key: "7".into(),
+                variables: payload,
+                business_id: None,
+            },
+            T0 + 26,
+        )
+        .expect("correlate esp-msg");
+    assert!(
+        correlated
+            .iter()
+            .any(|e| matches!(e, Event::EventSubProcessPayloadHeld { .. })),
+        "the esp-held scenario must journal a held payload: {correlated:?}"
+    );
+    journal.extend(correlated);
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }
@@ -761,6 +836,13 @@ fn build_event_witnesses() -> Vec<Event> {
         scope_id: Some("sub".to_string()),
     };
     vec![
+        // The #1555 event sub-process held payload (a correlated payload
+        // parked until the container's start event activates).
+        Event::EventSubProcessPayloadHeld {
+            instance_key: 30,
+            scope_key: 31,
+            variables: vars.clone(),
+        },
         // The #1405 Raft applied-entry record: the last record of a committed
         // entry's atomic journal frame. The executed corpus never applies
         // through Raft, so the frame is pinned here.

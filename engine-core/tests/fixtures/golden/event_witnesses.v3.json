@@ -1,5 +1,16 @@
 [
   {
+    "EventSubProcessPayloadHeld": {
+      "instance_key": 30,
+      "scope_key": 31,
+      "variables": {
+        "x": {
+          "Int": 1
+        }
+      }
+    }
+  },
+  {
     "RaftEntryApplied": {
       "index": 41,
       "raft_state": "{\"opaque\":true}",

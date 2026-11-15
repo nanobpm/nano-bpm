@@ -4619,7 +4619,7 @@ fn project_engine_state(
                 params![
                     sub.key as i64,
                     sub.instance_key as i64,
-                    sub.element_instance_key as i64,
+                    wait_host_key(sub.instance_key, sub.element_instance_key) as i64,
                     sub.element_id,
                     sub.message_name,
                     sub.correlation_key,
@@ -4829,6 +4829,22 @@ fn is_non_interrupting_timer(kind: &nanobpmn_engine_core::TimerKind) -> bool {
     )
 }
 
+/// The element-instance key a wait projects under. The engine parks a
+/// process-level event sub-process start (#1555) on the engine-only host key
+/// `0` — the process scope itself — but the process scope's element instance
+/// IS the process instance, so the read model reports the process-instance key
+/// there (Zeebe parity; filters by that key must match). Every wait insert —
+/// open message / timer / signal / conditional rows, the seed path, and the
+/// correlation history — routes through this one normalisation (review
+/// r4578375368), so no projection path can leak the `0`.
+fn wait_host_key(instance_key: Key, element_instance_key: Key) -> Key {
+    if element_instance_key == 0 {
+        instance_key
+    } else {
+        element_instance_key
+    }
+}
+
 /// Whether a message subscription is an instance wait state the read model
 /// tracks. Every engine message subscription belongs to a running instance;
 /// the only one resting on element instance `0` is a process-level event
@@ -4866,7 +4882,7 @@ fn insert_event_wait(
             wait_key as i64,
             wait_type.as_str(),
             instance_key as i64,
-            element_instance_key as i64,
+            wait_host_key(instance_key, element_instance_key) as i64,
             element_id,
             detail,
             due_at_ms.map(|d| d as i64),
@@ -5376,7 +5392,7 @@ fn project_event(
                     params![
                         *subscription_key as i64,
                         *instance_key as i64,
-                        *element_instance_key as i64,
+                        wait_host_key(*instance_key, *element_instance_key) as i64,
                         element_id,
                         message_name,
                         correlation_key,
@@ -5470,7 +5486,7 @@ fn project_event(
                             *message_key as i64,
                             *subscription_key as i64,
                             *instance_key as i64,
-                            *element_instance_key as i64,
+                            wait_host_key(*instance_key, *element_instance_key) as i64,
                             element_id,
                             message_name,
                             correlation_key,
@@ -14098,6 +14114,65 @@ mod element_instance_tests {
             3,
             "every correlation recorded in history"
         );
+        // Review r4578375368: the engine-only host key `0` must not leak. A
+        // root ESP wait rests on the process scope, whose element instance is
+        // the process instance itself — so both the open wait and every history
+        // row carry the process-instance key (filters by it then match).
+        assert!(
+            store
+                .message_subscriptions()
+                .iter()
+                .all(|s| s.element_instance_key == INST)
+        );
+        assert!(
+            store
+                .correlated_message_subscriptions()
+                .iter()
+                .all(|c| c.element_instance_key == INST)
+        );
+    }
+
+    #[test]
+    fn root_event_subprocess_timer_and_signal_waits_use_the_process_instance_key() {
+        // Review r4578375368 (the class): every wait projected from an event
+        // resting on the process scope (element instance `0`) — timer, signal,
+        // conditional — reports the process-instance key, not `0`.
+        use nanobpmn_engine_core::{MessageSubscriptionKind, TimerKind};
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let ni = MessageSubscriptionKind::EventSubProcess {
+            esp_element_id: "esp".to_string(),
+            interrupting: false,
+        };
+        store
+            .export(&[
+                &Event::TimerCreated {
+                    timer_key: 6001,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".to_string(),
+                    due_at: 5_000,
+                    kind: TimerKind::EventSubProcess {
+                        esp_element_id: "esp".to_string(),
+                        interrupting: false,
+                    },
+                },
+                &Event::SignalSubscriptionCreated {
+                    subscription_key: 6002,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".to_string(),
+                    signal_name: "go".to_string(),
+                    kind: ni,
+                },
+            ])
+            .unwrap();
+        let waits = store.event_waits();
+        assert_eq!(waits.len(), 2);
+        assert!(
+            waits.iter().all(|w| w.element_instance_key == INST),
+            "root ESP waits carry the process-instance key"
+        );
     }
 
     #[test]
@@ -14173,6 +14248,17 @@ mod element_instance_tests {
         store.seed_from_engine_state(&state).unwrap();
         let subs = store.message_subscriptions();
         assert_eq!(subs.len(), 1, "root ESP message wait reseeded");
+        assert_eq!(
+            subs[0].element_instance_key, INST,
+            "reseeded root ESP wait carries the process-instance key, not 0"
+        );
+        assert!(
+            store
+                .event_waits()
+                .iter()
+                .all(|w| w.element_instance_key == INST),
+            "reseeded root ESP timer/signal/conditional waits carry the process-instance key"
+        );
         assert_eq!(
             store.event_waits().len(),
             3,

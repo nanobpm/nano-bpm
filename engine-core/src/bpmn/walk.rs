@@ -587,7 +587,16 @@ pub(crate) fn parse_with_captures(
                                     // catch-all) for build to resolve against the
                                     // declared `<error>`s. A process-level error
                                     // start is invalid, but the ESP build check
-                                    // rejects it naming the construct.
+                                    // rejects it naming the construct. A nonempty
+                                    // ref is ALSO captured for the reference-
+                                    // integrity validator (#851), mirroring the
+                                    // escalation arm: `resolve_esp_trigger` only
+                                    // sees starts inside an event sub-process, so a
+                                    // dangling ref anywhere else must not bypass it.
+                                    if !error_ref.is_empty() {
+                                        acc.error_refs_extra
+                                            .push((acc.nodes[idx].id.clone(), error_ref.clone()));
+                                    }
                                     acc.nodes[idx].esp_error_ref = Some(if error_ref.is_empty() {
                                         None
                                     } else {

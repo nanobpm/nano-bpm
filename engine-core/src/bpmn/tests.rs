@@ -6452,3 +6452,44 @@ fn should_not_attach_nested_data_object_properties_to_the_enclosing_subprocess()
     assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
     assert!(!sub.properties.contains_key("extra"));
 }
+
+#[test]
+fn should_reject_a_dangling_error_ref_on_a_start_event_outside_an_event_subprocess() {
+    // given: error start events whose `errorRef` dangles, placed where
+    // `resolve_esp_trigger` never looks — the process level and an ordinary
+    // embedded sub-process. The reference-integrity validator (#851) must still
+    // see the ref; it must not be silently lowered to a plain start (#1555).
+    let process_level = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s"><errorEventDefinition errorRef="missing" /></startEvent>
+              <endEvent id="e" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </process>
+          </definitions>"#;
+    let in_subprocess = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s" />
+              <subProcess id="sub">
+                <startEvent id="ss"><errorEventDefinition errorRef="missing" /></startEvent>
+                <endEvent id="se" />
+                <sequenceFlow id="sf" sourceRef="ss" targetRef="se" />
+              </subProcess>
+              <endEvent id="e" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <sequenceFlow id="f1" sourceRef="sub" targetRef="e" />
+            </process>
+          </definitions>"#;
+
+    for xml in [process_level, in_subprocess] {
+        // when
+        let err = parse_bpmn(xml).unwrap_err();
+
+        // then
+        assert!(
+            format!("{err:?}").contains("missing"),
+            "expected a dangling-errorRef rejection, got {err:?}"
+        );
+    }
+}

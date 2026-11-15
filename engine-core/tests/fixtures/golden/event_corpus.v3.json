@@ -3984,5 +3984,332 @@
       "reason": "variables lost: spill row missing",
       "redrive": null
     }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 97
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 97,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "esp": {
+            "end_listeners": [],
+            "id": "esp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EventSubProcess": {
+                "interrupting": false,
+                "start_event": "esp_start",
+                "trigger": {
+                  "Message": {
+                    "correlation_key": "orderId",
+                    "message_name": "esp-msg"
+                  }
+                }
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [
+              {
+                "event_type": "Start",
+                "job_type": "esp-gate",
+                "retries": null
+              }
+            ],
+            "task_listeners": [],
+            "timer": null
+          },
+          "esp_end": {
+            "end_listeners": [],
+            "id": "esp_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "esp",
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "esp_start": {
+            "end_listeners": [],
+            "id": "esp_start",
+            "io": {
+              "inputs": [],
+              "outputs": [
+                {
+                  "source": "=payload",
+                  "target": "mapped"
+                }
+              ]
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "esp_end"
+              }
+            ],
+            "parent": "esp",
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "work"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "work": {
+            "end_listeners": [],
+            "id": "work",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "TimerIntermediateCatchEvent": {
+                "duration_millis": 3600000
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "esp-held",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"\n                      xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\">\n         <bpmn:message id=\"Msg\" name=\"esp-msg\">\n           <bpmn:extensionElements><zeebe:subscription correlationKey=\"=orderId\" /></bpmn:extensionElements>\n         </bpmn:message>\n         <bpmn:process id=\"esp-held\" isExecutable=\"true\">\n           <bpmn:startEvent id=\"s\" />\n           <bpmn:intermediateCatchEvent id=\"work\">\n             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>\n           </bpmn:intermediateCatchEvent>\n           <bpmn:endEvent id=\"e\" />\n           <bpmn:sequenceFlow id=\"f1\" sourceRef=\"s\" targetRef=\"work\" />\n           <bpmn:sequenceFlow id=\"f2\" sourceRef=\"work\" targetRef=\"e\" />\n           <bpmn:subProcess id=\"esp\" triggeredByEvent=\"true\">\n             <bpmn:extensionElements>\n               <zeebe:executionListeners>\n                 <zeebe:executionListener eventType=\"start\" type=\"esp-gate\" />\n               </zeebe:executionListeners>\n             </bpmn:extensionElements>\n             <bpmn:startEvent id=\"esp_start\" isInterrupting=\"false\">\n               <bpmn:extensionElements>\n                 <zeebe:ioMapping><zeebe:output source=\"=payload\" target=\"mapped\" /></zeebe:ioMapping>\n               </bpmn:extensionElements>\n               <bpmn:messageEventDefinition messageRef=\"Msg\" />\n             </bpmn:startEvent>\n             <bpmn:endEvent id=\"esp_end\" />\n             <bpmn:sequenceFlow id=\"ef1\" sourceRef=\"esp_start\" targetRef=\"esp_end\" />\n           </bpmn:subProcess>\n         </bpmn:process>\n       </bpmn:definitions>"
+      },
+      "process_definition_key": 98,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000025,
+      "instance_key": 99,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 98,
+      "process_id": "esp-held",
+      "tags": [],
+      "variables": {
+        "orderId": {
+          "Int": 7
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 100,
+      "instance_key": 99,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 100,
+      "instance_key": 99,
+      "scope": 0
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "7",
+      "element_id": "esp_start",
+      "element_instance_key": 0,
+      "instance_key": 99,
+      "kind": {
+        "EventSubProcess": {
+          "esp_element_id": "esp",
+          "interrupting": false
+        }
+      },
+      "message_name": "esp-msg",
+      "subscription_key": 101
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 100,
+      "instance_key": 99
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 100,
+      "instance_key": 99
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 99,
+      "to": "work"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "work",
+      "element_instance_key": 102,
+      "instance_key": 99,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "work",
+      "element_instance_key": 102,
+      "instance_key": 99,
+      "scope": 0
+    }
+  },
+  {
+    "TimerCreated": {
+      "due_at": 1700003600025,
+      "element_id": "work",
+      "element_instance_key": 102,
+      "instance_key": 99,
+      "kind": "IntermediateCatch",
+      "timer_key": 103
+    }
+  },
+  {
+    "MessagePublished": {
+      "correlation_key": "7",
+      "message_key": 104,
+      "message_name": "esp-msg"
+    }
+  },
+  {
+    "MessageCorrelated": {
+      "element_id": "esp_start",
+      "element_instance_key": 0,
+      "instance_key": 99,
+      "message_key": 104,
+      "subscription_key": 101
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "esp",
+      "element_instance_key": 105,
+      "instance_key": 99,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 99,
+      "parent_scope_key": 0,
+      "scope_key": 105
+    }
+  },
+  {
+    "EventSubProcessPayloadHeld": {
+      "instance_key": 99,
+      "scope_key": 105,
+      "variables": {
+        "payload": {
+          "Int": 42
+        }
+      }
+    }
+  },
+  {
+    "ExecutionListenerJobCreated": {
+      "created_at": 1700000000026,
+      "element_id": "esp",
+      "element_instance_key": 105,
+      "event_type": "Start",
+      "instance_key": 99,
+      "job_key": 106,
+      "job_type": "esp-gate",
+      "listener_index": 0,
+      "retries": 3,
+      "scope": 0
+    }
   }
 ]
