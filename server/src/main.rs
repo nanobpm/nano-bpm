@@ -28029,6 +28029,11 @@ mod snapshot_health_tick_tests {
         .await;
         let tiny_budget = snapshot_health::HealthThresholds {
             uncompacted_bytes_max: 1,
+            // This tick samples the REAL host volume, so a disk floor would
+            // make the exact-causes assertion below depend on the machine's
+            // free space (`disk_low` on a >90%-full dev disk). The disk guard
+            // has its own synthetic-input tests; isolate this one from it.
+            disk_free_min_percent: 0.0,
             ..thresholds()
         };
         let r = h.report(Instant::now(), &tiny_budget);
