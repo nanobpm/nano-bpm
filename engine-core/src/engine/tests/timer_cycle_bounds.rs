@@ -291,6 +291,42 @@ fn event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
     assert_rearm_incident_resumes_remaining_count(def, "esp-feel");
 }
 
+/// #1583: an event sub-process hosted by an EMBEDDED sub-process — the re-arm
+/// incident's redrive must re-arm the timer in the sub-process scope (the host
+/// element instance), never retry the ESP's activation.
+#[test]
+fn embedded_event_subprocess_cycle_rearm_incident_resumes_remaining_count() {
+    let def = parse(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="esp-embedded" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="host">
+      <bpmn:startEvent id="host_start" />
+      <bpmn:serviceTask id="work">
+        <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="host_end" />
+      <bpmn:sequenceFlow id="hf1" sourceRef="host_start" targetRef="work" />
+      <bpmn:sequenceFlow id="hf2" sourceRef="work" targetRef="host_end" />
+      <bpmn:subProcess id="esp" triggeredByEvent="true">
+        <bpmn:startEvent id="esp_start" isInterrupting="false">
+          <bpmn:timerEventDefinition><bpmn:timeCycle>=cyc</bpmn:timeCycle></bpmn:timerEventDefinition>
+        </bpmn:startEvent>
+        <bpmn:endEvent id="esp_end" />
+        <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+      </bpmn:subProcess>
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="host" />
+    <bpmn:sequenceFlow id="f2" sourceRef="host" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#,
+    );
+    assert_rearm_incident_resumes_remaining_count(def, "esp-embedded");
+}
+
 // ---------------------------------------------------------------------------
 // #1596 review: a re-arm incident can outlive its instance. Resolving it after
 // the instance completed must not mint a timer (or raise another incident) on
