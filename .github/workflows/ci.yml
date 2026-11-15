@@ -451,6 +451,13 @@ jobs:
         # it reuses the package built above instead of rebuilding it.
         run: npm install && npm test
         working-directory: engine-wasm/tests/agent-instance-e2e
+      - name: Event sub-process e2e (lean + read-model TestEngine)
+        # #1616: the reproducible form of the #1597 hand-run wasm probe. A
+        # non-interrupting timer ESP runs alongside `work`; an interrupting
+        # message ESP terminates the siblings and completes the instance via
+        # its own end event. Reuses the package built above.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/event-subprocess-e2e
       - name: Test-Studio record loop (embedded-engine isolation example)
         # Worked example + guard (nanobpm/nano-bpm example): drives a
         # Test-Studio-style recording session entirely through the freshly built
