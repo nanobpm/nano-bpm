@@ -139,7 +139,7 @@ elem-eventSubProcess  ::= indent "eventSubProcess" sp id (sp string)? (sp attrs-
 attrs-eventSubProcess   ::= "{" nl (indent2 attr-line-eventSubProcess nl)+ indent "}"
 attr-line-eventSubProcess  ::= attr-eventSubProcess-startEvent | attr-eventSubProcess-trigger | attr-eventSubProcess-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-eventSubProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the event sub-process's inner (typed) start event.
-attr-eventSubProcess-trigger  ::= "trigger" sp attr-str   # The start event's trigger, e.g. `message "name"`, `timer duration "PT5M"`, `signal "name"`, `error "CODE"` / `error` (catch-all), `escalation "CODE"` / `escalation`, `conditional "=expr"`.
+attr-eventSubProcess-trigger  ::= "trigger" sp attr-str   # The start event's trigger, e.g. `message "name" correlationKey "=orderId"`, `timer duration "PT5M"`, `signal "name"`, `error "CODE"` / `error` (catch-all), `escalation "CODE"` / `escalation`, `conditional "=expr"`.
 attr-eventSubProcess-interrupting  ::= "interrupting" sp attr-bool   # `true` terminates the scope's other work on trigger (the default); `false` runs the event sub-process concurrently. Always `true` for an error trigger.
 
 # escalationThrowEvent — Escalation throw (intermediate throw or end event). Raises `escalationCode` up the enclosing scopes; non-critical, so the token always continues / drains (an uncaught escalation is ignored).

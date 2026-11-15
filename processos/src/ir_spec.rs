@@ -371,7 +371,7 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
                 key: "trigger",
                 required: true,
                 ty: AttrType::Str,
-                doc: "The start event's trigger, e.g. `message \"name\"`, `timer duration \"PT5M\"`, \
+                doc: "The start event's trigger, e.g. `message \"name\" correlationKey \"=orderId\"`, `timer duration \"PT5M\"`, \
                       `signal \"name\"`, `error \"CODE\"` / `error` (catch-all), \
                       `escalation \"CODE\"` / `escalation`, `conditional \"=expr\"`.",
             },
