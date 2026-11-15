@@ -5233,23 +5233,9 @@ impl Engine {
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
                 // 4b. Event sub-process triggers (#1555) rest on their host
-                //     *scope* (`0` for the process root), not on an active
-                //     element, so the per-element catch-event reconciliation
-                //     below never sees them: a migration that removed an event
-                //     sub-process or changed its trigger would silently keep the
-                //     stale timer / subscription armed. Reject explicitly until
-                //     scope-owned trigger reconciliation lands (#1379) — never
-                //     drop or keep them silently.
-                if let Some(element_id) = self.armed_event_subprocess_ids(instance_key).first() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id: element_id.clone(),
-                        reason: "instances with armed event sub-process triggers are not \
-                                 migratable yet (scope-owned trigger reconciliation is \
-                                 tracked in #1379)"
-                            .to_string(),
-                    });
-                }
+                //     *scope*, not on an active element: they are reconciled
+                //     per scope against the target by `plan_migration`
+                //     (`plan_event_subprocess_migration`, #1379).
 
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
@@ -5322,6 +5308,15 @@ impl Engine {
                         tgt,
                     )?;
                 }
+                // 5a'. Event sub-processes of a live scope may not merge onto
+                //      one target event sub-process (#1379).
+                Self::check_migrated_event_subprocesses(
+                    instance_key,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &active_elements,
+                )?;
 
                 // 5b. An already-*open* parallel-gateway join (a token has
                 //     arrived on some but not all of its incoming flows) carries
