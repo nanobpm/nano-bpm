@@ -465,7 +465,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     // (element instance, element, source handler); duplicates
                     // (boundaries sharing a handler) are consumed one each.
                     let mut plan: HashMap<
-                        (Key, &str, &str),
+                        (Key, &str, &str, &str),
                         std::collections::VecDeque<&crate::event::MigratedCompensationSubscription>,
                     > = HashMap::new();
                     for c in compensation_subscriptions {
@@ -473,6 +473,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                             c.source_element_instance_key,
                             c.source_element_id.as_str(),
                             c.source_handler.as_str(),
+                            c.source_boundary_id.as_str(),
                         ))
                         .or_default()
                         .push_back(c);
@@ -484,6 +485,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                                 c.element_instance_key,
                                 c.element_id.as_str(),
                                 c.handler.as_str(),
+                                c.boundary_id.as_str(),
                             ))
                             .and_then(|q| q.pop_front());
                         if let Some(m) = m {
@@ -491,6 +493,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                             c.element_id = m.target_element_id.clone();
                             if !c.scope_subscription {
                                 c.handler = m.target_handler.clone();
+                                c.boundary_id = m.target_boundary_id.clone();
                             }
                             migrated.push(c);
                         }

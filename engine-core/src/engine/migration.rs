@@ -1581,14 +1581,25 @@ pub(crate) fn plan_compensation_migration(
             .or_insert(0);
         let index = *occ;
         *occ += 1;
-        let Some(source_boundary) = compensation_boundaries_of(source_def, &sub.element_id)
-            .into_iter()
-            .filter(|b| {
-                matches!(&b.kind, ElementKind::CompensationBoundaryEvent { handler, .. }
-                    if *handler == sub.handler)
-            })
-            .nth(index)
-        else {
+        // A subscription that recorded its boundary (#1635) resolves it by
+        // identity — stable across successive migrations; an older record
+        // falls back to boundary-id occurrence order among same-handler
+        // boundaries.
+        let source_boundaries = compensation_boundaries_of(source_def, &sub.element_id);
+        let source_boundary = if sub.boundary_id.is_empty() {
+            source_boundaries
+                .into_iter()
+                .filter(|b| {
+                    matches!(&b.kind, ElementKind::CompensationBoundaryEvent { handler, .. }
+                        if *handler == sub.handler)
+                })
+                .nth(index)
+        } else {
+            source_boundaries
+                .into_iter()
+                .find(|b| b.id == sub.boundary_id)
+        };
+        let Some(source_boundary) = source_boundary else {
             continue;
         };
         let Some(target_boundary) = mapped
@@ -1608,14 +1619,31 @@ pub(crate) fn plan_compensation_migration(
             source_element_id: sub.element_id.clone(),
             source_element_instance_key: sub.element_instance_key,
             source_handler: sub.handler.clone(),
+            source_boundary_id: sub.boundary_id.clone(),
             target_element_id: target_activity.clone(),
             target_handler: target_handler.clone(),
+            target_boundary_id: target_boundary.id.clone(),
         });
         let source_chain = super::flow_scope::element_flow_scope_chain(source_def, &sub.element_id);
         let target_chain = super::flow_scope::element_flow_scope_chain(target_def, target_activity);
         for level in 0..source_chain.len().max(target_chain.len()) {
             match (source_chain.get(level), target_chain.get(level)) {
                 (Some(s), Some(t)) => {
+                    // A derived scope mapping must agree with an explicit
+                    // mapping instruction for that scope and with every
+                    // earlier derivation: otherwise a scope subscription (whose
+                    // numeric scope key is preserved) would run its nested
+                    // handlers under the wrong target scope.
+                    let conflicts = mapped.get(s).is_some_and(|m| m != t)
+                        || scope_map.get(s).is_some_and(|prev| prev != t);
+                    if conflicts {
+                        return Err(EngineError::MigrationCompensationFlowScopeChanged {
+                            instance_key,
+                            process_id: source_process_id.to_string(),
+                            source_flow_scope_id: s.clone(),
+                            target_flow_scope_id: t.clone(),
+                        });
+                    }
                     scope_map.insert(s.clone(), t.clone());
                 }
                 (s, t) => {
@@ -1641,8 +1669,10 @@ pub(crate) fn plan_compensation_migration(
                 source_element_id: sub.element_id.clone(),
                 source_element_instance_key: sub.element_instance_key,
                 source_handler: sub.handler.clone(),
+                source_boundary_id: String::new(),
                 target_element_id: target.clone(),
                 target_handler: sub.handler.clone(),
+                target_boundary_id: String::new(),
             });
         }
     }

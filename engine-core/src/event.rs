@@ -211,8 +211,17 @@ pub struct MigratedCompensationSubscription {
     /// subscription), identifying which boundary's subscription this is.
     #[cfg_attr(feature = "serde", serde(default))]
     pub source_handler: ElementId,
+    /// The migrated subscription's source compensation boundary (empty for a
+    /// scope subscription, or a pre-#1635 subscription recorded without one).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_boundary_id: ElementId,
     pub target_element_id: ElementId,
     pub target_handler: ElementId,
+    /// The mapped target compensation boundary the subscription now belongs
+    /// to (empty for a scope subscription), persisted so successive
+    /// migrations and throws keep the boundary identity.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub target_boundary_id: ElementId,
 }
 
 /// The message that triggered a **message start event** (#1300), carried on a
@@ -1490,6 +1499,13 @@ pub enum Event {
         scope: Key,
         #[cfg_attr(feature = "serde", serde(default))]
         scope_subscription: bool,
+        /// The compensation boundary event this subscription was recorded for
+        /// (#1635), so a throw and a later migration resolve the subscription's
+        /// boundary by identity rather than by occurrence order. Empty for a
+        /// scope subscription. Additive: `serde(default)` decodes older records
+        /// as empty, and resolution falls back to boundary-id occurrence order.
+        #[cfg_attr(feature = "serde", serde(default))]
+        boundary_id: ElementId,
     },
     /// A compensation throw event fired: it consumed the compensable
     /// subscriptions in its `scope` and triggered their handlers. `handlers`

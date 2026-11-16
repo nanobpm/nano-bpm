@@ -224,6 +224,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             handler,
             scope,
             scope_subscription,
+            boundary_id,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.compensable.push(CompensationSubscription {
@@ -232,6 +233,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     handler: handler.clone(),
                     scope: *scope,
                     scope_subscription: *scope_subscription,
+                    boundary_id: boundary_id.clone(),
                 });
             }
         }

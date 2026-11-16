@@ -678,3 +678,197 @@ fn explicit_subprocess_subscription_follows_its_own_boundary() {
     assert!(compensable(&engine, inst).contains(&("A".to_string(), "undoA2".to_string())));
     assert_replays(&log, &engine, inst);
 }
+
+/// #1635 review: the boundary identity is persisted, so a SUCCESSIVE
+/// migration of the shared-handler survivor (`b2`) still resolves it as `b2`
+/// (not as occurrence 0 = `b1`), and a throw journals `b2`'s lifecycle.
+#[test]
+fn successive_migrations_keep_the_subscriptions_boundary_identity() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, two_boundaries("p", "u", "u", "B"));
+    let second = deploy(&mut engine, &mut log, two_boundaries("p2", "v", "v", "D"));
+    let third = deploy(&mut engine, &mut log, two_boundaries("p3", "w", "w", "F"));
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    let boundaries = |engine: &Engine| -> Vec<String> {
+        engine
+            .instance(inst)
+            .unwrap()
+            .compensable
+            .iter()
+            .map(|c| c.boundary_id.clone())
+            .collect()
+    };
+    assert_eq!(
+        boundaries(&engine),
+        vec!["b1".to_string(), "b2".to_string()]
+    );
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        second,
+        &[("A", "A"), ("B", "D"), ("b2", "b2")],
+    );
+    assert_eq!(boundaries(&engine), vec!["b2".to_string()]);
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        third,
+        &[("A", "A"), ("D", "F"), ("b2", "b2")],
+    );
+    assert_eq!(compensable(&engine, inst), pairs(&[("A", "w")]));
+    assert_eq!(boundaries(&engine), vec!["b2".to_string()]);
+    assert_replays(&log, &engine, inst);
+
+    // The throw journals the lifecycle of the subscription's OWN boundary.
+    let job = engine.activate_jobs("next", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(job)).unwrap();
+    let activated: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementActivated { element_id, .. }
+                if element_id == "b1" || element_id == "b2" =>
+            {
+                Some(element_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(activated, vec!["b2"]);
+}
+
+/// `(task, compensation boundary, handler)`.
+type CompTask<'a> = (&'a str, &'a str, &'a str);
+
+/// `s -> {sub}[...tasks each with its comp boundary...] -> {next} -> throw -> e`
+/// followed by an extra (empty) sub-process `{other}` before `{next}` when
+/// given. Tasks run in sequence inside `{sub}`.
+fn subs_with_tasks(process: &str, subs: &[(&str, &[CompTask])], next: &str) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new(process).start_event("s");
+    let mut prev = "s".to_string();
+    for &(sub, tasks) in subs {
+        let ss = format!("{sub}_s");
+        let se = format!("{sub}_e");
+        b = b
+            .sub_process(sub, &ss)
+            .start_event(&ss)
+            .contained_in(&ss, sub)
+            .end_event(&se)
+            .contained_in(&se, sub)
+            .connect(&prev, sub);
+        let mut inner = ss.clone();
+        for &(task, boundary, handler) in tasks {
+            b = b
+                .service_task(task, task)
+                .contained_in(task, sub)
+                .compensation_boundary_event(boundary, task, handler)
+                .contained_in(boundary, sub)
+                .service_task(handler, handler)
+                .contained_in(handler, sub)
+                .connect(&inner, task);
+            inner = task.to_string();
+        }
+        b = b.connect(&inner, &se);
+        prev = sub.to_string();
+    }
+    b.service_task(next, "next")
+        .compensation_throw_event("throw")
+        .end_event("e")
+        .connect(&prev, next)
+        .connect(next, "throw")
+        .connect("throw", "e")
+        .build()
+        .unwrap()
+}
+
+/// #1635 review: a completed sub-process explicitly mapped to `T` cannot be
+/// re-derived onto `U` by a nested subscription's boundary mapping.
+#[test]
+fn rejects_a_derived_scope_that_conflicts_with_an_explicit_mapping() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        subs_with_tasks("p", &[("S", &[("A", "ab", "undoA")])], "B"),
+    );
+    let target = deploy(
+        &mut engine,
+        &mut log,
+        subs_with_tasks("p2", &[("T", &[]), ("U", &[("C", "cb", "undoC")])], "D"),
+    );
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    let before = engine.instance(inst).unwrap().clone();
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target,
+            pairs(&[("S", "T"), ("B", "D"), ("ab", "cb")]),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::MigrationCompensationFlowScopeChanged {
+            instance_key: inst,
+            process_id: "p".into(),
+            source_flow_scope_id: "S".into(),
+            target_flow_scope_id: "U".into(),
+        }
+    );
+    assert_eq!(engine.instance(inst).unwrap(), &before);
+}
+
+/// #1635 review: two nested subscriptions cannot derive two different
+/// targets for the same completed sub-process scope.
+#[test]
+fn rejects_two_subscriptions_deriving_different_targets_for_one_scope() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        subs_with_tasks(
+            "p",
+            &[("S", &[("A1", "a1b", "undoA1"), ("A2", "a2b", "undoA2")])],
+            "B",
+        ),
+    );
+    let target = deploy(
+        &mut engine,
+        &mut log,
+        subs_with_tasks(
+            "p2",
+            &[
+                ("T1", &[("C1", "c1b", "undoC1")]),
+                ("T2", &[("C2", "c2b", "undoC2")]),
+            ],
+            "D",
+        ),
+    );
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A1");
+    complete(&mut engine, &mut log, "A2");
+    let before = engine.instance(inst).unwrap().clone();
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target,
+            pairs(&[("B", "D"), ("a1b", "c1b"), ("a2b", "c2b")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::MigrationCompensationFlowScopeChanged {
+                ref source_flow_scope_id,
+                ..
+            } if source_flow_scope_id == "S"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(engine.instance(inst).unwrap(), &before);
+}
