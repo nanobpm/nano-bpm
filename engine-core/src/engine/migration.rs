@@ -1615,6 +1615,24 @@ pub(crate) fn plan_compensation_migration(
         else {
             continue;
         };
+        // The completed activity follows its mapped boundary, so it gets the
+        // same catch-event preconditions as an active element (#1635): an
+        // explicit activity mapping must agree with the boundary's
+        // attachment, and no two source boundaries may merge onto one target
+        // boundary (that would run its handler twice). Validated against
+        // DEFINITION boundary ids, so repeated occurrences of one source
+        // boundary (multi-instance bodies, loops) stay allowed.
+        let activity_target = mapped
+            .get(&sub.element_id)
+            .map_or(target_activity.as_str(), String::as_str);
+        Engine::check_migrated_catch_events(
+            instance_key,
+            source_def,
+            target_def,
+            mapped,
+            &sub.element_id,
+            activity_target,
+        )?;
         out.push(crate::event::MigratedCompensationSubscription {
             source_element_id: sub.element_id.clone(),
             source_element_instance_key: sub.element_instance_key,

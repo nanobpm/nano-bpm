@@ -872,3 +872,64 @@ fn rejects_two_subscriptions_deriving_different_targets_for_one_scope() {
     );
     assert_eq!(engine.instance(inst).unwrap(), &before);
 }
+
+/// #1635 review: a completed activity's compensation boundaries get the same
+/// no-merge validation as an active element's catch events — two source
+/// boundaries mapped onto one target boundary would double-run its handler.
+#[test]
+fn rejects_two_completed_boundaries_merged_onto_one_target_boundary() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, two_boundaries("p", "u1", "u2", "B"));
+    let target = deploy(&mut engine, &mut log, two_boundaries("p2", "v1", "v2", "D"));
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target,
+            pairs(&[("A", "A"), ("B", "D"), ("b1", "b1"), ("b2", "b1")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::MigrationCatchEventsMerged { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        compensable(&engine, inst),
+        pairs(&[("A", "u1"), ("A", "u2")])
+    );
+}
+
+/// #1635 review: an explicit activity mapping must agree with the activity its
+/// mapped compensation boundary is attached to (stay attached).
+#[test]
+fn rejects_a_completed_activity_mapping_its_boundary_detaches_from() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        root_level("p", "A", "boundary1", "undoA", "B", "throw"),
+    );
+    let target = deploy(
+        &mut engine,
+        &mut log,
+        root_level("p2", "C", "boundary2", "undoC", "D", "throw"),
+    );
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target,
+            // A -> D, but boundary2 is attached to C.
+            pairs(&[("A", "D"), ("B", "D"), ("boundary1", "boundary2")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::MigrationCatchEventDetached { .. }),
+        "{err:?}"
+    );
+    assert_eq!(compensable(&engine, inst), pairs(&[("A", "undoA")]));
+}
