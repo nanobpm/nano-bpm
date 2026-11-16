@@ -115,7 +115,18 @@ impl MigrationNode<'_> {
             (
                 MigrationNode::AdHocTool { tool: s, .. },
                 MigrationNode::AdHocTool { tool: t, .. },
-            ) => std::mem::discriminant(&s.kind) == std::mem::discriminant(&t.kind),
+            ) => {
+                std::mem::discriminant(&s.kind) == std::mem::discriminant(&t.kind)
+                    // A nested ad-hoc container catalogues as a `ServiceTask`
+                    // tool, so the discriminant alone cannot tell it from a
+                    // plain service-task tool. Apply the same container-status
+                    // check as the element branch: a container tool must map to
+                    // a container tool, or its derived `#innerInstance` and
+                    // ad-hoc bookkeeping would attach to a target with no
+                    // container definition (and the reverse would invent one).
+                    && is_adhoc_container(source_def, &s.element_id)
+                        == is_adhoc_container(target_def, &t.element_id)
+            }
             _ => false,
         }
     }
@@ -787,6 +798,20 @@ impl Engine {
                         target_element_id: target_id.clone(),
                     });
                 }
+            }
+            // A multi-instance CHILD shares its body's element id, but a
+            // boundary on a multi-instance activity is armed on the BODY alone
+            // (`run_mi_body_activation`): it interrupts / spawns beside the
+            // whole loop, never one child. Reconciling boundaries against a
+            // child would arm a newly-added target boundary once per active
+            // child (duplicating a non-interrupting side path, or interrupting
+            // one child instead of the loop). Skip boundary reconciliation for
+            // a child — its other migration work above (flow scope, kept
+            // call-activity child) still runs.
+            if self.multi_instance_of(instance_key, &source_id).is_some()
+                && !self.is_multi_instance_body_structural(instance_key, eik)
+            {
+                continue;
             }
             let scope = self.scope_of(instance_key, eik);
             // Boundaries evaluate against the enclosing scope (as at activation);

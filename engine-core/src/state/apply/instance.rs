@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::event::Event;
 use crate::model::ElementId;
 use crate::state::types::*;
+use crate::Value;
 
 /// Reads the process id of `instance_key` **iff** it is currently non-terminal,
 /// so the caller can decrement the per-definition in-flight counter exactly once
@@ -441,7 +442,15 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         mi.cancel_remaining_instances = spec.cancel_remaining_instances;
                     }
                 }
-                for adhoc in instance.adhoc_instances.values_mut() {
+                // Refresh each ad-hoc container's advertised tool catalog
+                // (`adHocSubProcessElements`) from the TARGET definition (#1630
+                // review): the tools may have been renamed, and the next agent
+                // turn reads this engine-owned variable to choose tools — a stale
+                // source id would be rejected by the target catalog. Collected
+                // here and applied below (the loop borrows `adhoc_instances`
+                // mutably, so `scope_variables` cannot be touched inside it).
+                let mut catalog_refresh: Vec<(Key, Value)> = Vec::new();
+                for (container_key, adhoc) in instance.adhoc_instances.iter_mut() {
                     remap_id(&mut adhoc.element_id);
                     if let Some(spec) = target_def
                         .as_ref()
@@ -449,6 +458,15 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     {
                         adhoc.output_collection = spec.output_collection.clone();
                         adhoc.output_element = spec.output_element.clone();
+                        catalog_refresh.push((
+                            *container_key,
+                            Value::List(crate::engine::Engine::advertised_adhoc_catalog(spec)),
+                        ));
+                    }
+                }
+                for (container_key, catalog) in catalog_refresh {
+                    if let Some(scope) = instance.scope_variables.get_mut(&container_key) {
+                        scope.insert("adHocSubProcessElements".to_string(), catalog);
                     }
                 }
             }
@@ -584,6 +602,22 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             for incident in state.incidents.values_mut() {
                 if incident.instance_key == *instance_key {
                     remap_id(&mut incident.element_id);
+                    // A pending ad-hoc tool retry names the tool inside its
+                    // redrive descriptor (#1630 review): re-point it with the
+                    // same mapping so resolving the incident after a tool rename
+                    // re-activates the renamed tool instead of falling through
+                    // on the unknown source id.
+                    match &mut incident.redrive {
+                        Some(crate::state::IoMappingRedrive::AdHocToolActivation {
+                            element_id,
+                            ..
+                        })
+                        | Some(crate::state::IoMappingRedrive::AdHocToolJobType {
+                            element_id,
+                            ..
+                        }) => remap_id(element_id),
+                        _ => {}
+                    }
                     // A pending cycle re-arm retry names its boundary / ESP
                     // trigger inside the redrive descriptor (#1596 review):
                     // re-point it with the same mapping so resolving the

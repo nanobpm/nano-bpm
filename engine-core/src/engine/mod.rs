@@ -10910,7 +10910,7 @@ impl Engine {
     /// container activation (`run_activation_body`) and the nested-container tool
     /// activation (`activate_adhoc_tool`, #631) so both stand up an identical
     /// catalog.
-    fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
+    pub(crate) fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
         def.tools
             .iter()
             .filter(|t| !matches!(t.kind, crate::model::AdHocToolKind::Other))
@@ -11853,13 +11853,22 @@ impl Engine {
         // binding directly (it is seeded/appended local to the container scope) —
         // no need to merge the whole visible variable chain.
         //
-        // On a type mismatch, DEFER the tool's completion for full Zeebe parity
-        // (retry-on-resolve): park an EXTRACT_VALUE_ERROR incident on the TOOL
-        // child and return WITHOUT emitting any completion event. The child stays
-        // in the container's `active` set with its local scope intact, so
-        // resolving the incident re-drives `Step::Complete` for this child (see
-        // `ResolveIncident` → `ExpressionEvaluation`) and re-attempts the append
-        // once the target has been corrected — nothing is discarded.
+        // A MISSING binding is guarded too: a migration that renamed the
+        // container's `outputCollection` re-points `AdHocState.output_collection`
+        // at the target name while the accumulated list stays under its source
+        // name, so the target binding is absent until repaired. Appending anyway
+        // would silently discard the tool's output and let the container publish
+        // an empty list — so an absent binding is treated exactly like a
+        // wrong-typed one (#1630 review).
+        //
+        // On a type mismatch or a missing binding, DEFER the tool's completion
+        // for full Zeebe parity (retry-on-resolve): park an EXTRACT_VALUE_ERROR
+        // incident on the TOOL child and return WITHOUT emitting any completion
+        // event. The child stays in the container's `active` set with its local
+        // scope intact, so resolving the incident re-drives `Step::Complete` for
+        // this child (see `ResolveIncident` → `ExpressionEvaluation`) and
+        // re-attempts the append once the target has been corrected — nothing is
+        // discarded.
         if output.is_some() {
             if let Some(name) = &output_collection {
                 let current = self
@@ -11869,12 +11878,24 @@ impl Engine {
                     .and_then(|i| i.scope_variables.get(&container_key))
                     .and_then(|m| m.get(name))
                     .cloned();
-                if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
+                let unappendable = match &current {
+                    // Absent binding (e.g. a renamed collection not yet repaired).
+                    None => true,
+                    // Present but not an array.
+                    Some(v) => !matches!(v, Value::List(_)),
+                };
+                if unappendable {
                     let incident_key = self.mint_key();
-                    let reason = format!(
-                        "the output collection '{name}' of ad-hoc sub-process \
-                         '{container_element_id}' has the wrong type: expected an array"
-                    );
+                    let reason = match &current {
+                        None => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' is not defined: expected an array"
+                        ),
+                        Some(_) => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' has the wrong type: expected an array"
+                        ),
+                    };
                     // Preserve the tool's single-pass output projection on the
                     // redrive when it is a call-activity tool (#1176): the projection
                     // was already evaluated once by `complete_adhoc_call_activity_tool`
