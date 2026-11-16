@@ -5235,6 +5235,60 @@ impl Engine {
                     }
                 }
 
+                // 5b. A parked ad-hoc tool retry (#1630 review): an
+                //     activation / job-type incident names a PENDING tool
+                //     that has no active element instance yet, so step 5
+                //     cannot see it. Resolving the incident re-activates
+                //     that tool under the target, so it must be mapped like
+                //     an active element and stay in its mapped container.
+                let mut pending_tools: Vec<String> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| i.instance_key == instance_key)
+                    .filter_map(|i| match &i.redrive {
+                        Some(crate::state::IoMappingRedrive::AdHocToolActivation {
+                            element_id,
+                            ..
+                        })
+                        | Some(crate::state::IoMappingRedrive::AdHocToolJobType {
+                            element_id,
+                            ..
+                        }) => Some(element_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                pending_tools.sort();
+                pending_tools.dedup();
+                for tool in &pending_tools {
+                    let Some(tgt_tool) = mapped.get(tool) else {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: tool.clone(),
+                        });
+                    };
+                    let container_of = |def: &ProcessDefinition, id: &str| {
+                        def.adhoc
+                            .iter()
+                            .find(|ad| ad.tools.iter().any(|t| t.element_id == id))
+                            .map(|ad| ad.container_id.clone())
+                    };
+                    let source_container = container_of(&source_def.definition, tool);
+                    let expected = source_container
+                        .as_ref()
+                        .and_then(|c| mapped.get(c).cloned())
+                        .or(source_container);
+                    let actual = container_of(&target.definition, tgt_tool);
+                    if expected != actual {
+                        return Err(EngineError::MigrationFlowScopeChanged {
+                            instance_key,
+                            element_id: tool.clone(),
+                            source_flow_scope_id: expected,
+                            target_flow_scope_id: actual,
+                        });
+                    }
+                }
+
                 // 5a. Zeebe `requireUnchangedFlowScope`: the target element's
                 //     flow scope must be the mapped target of the source
                 //     element's flow scope (the process itself for a
@@ -5565,6 +5619,48 @@ impl Engine {
                         join_scoped: true,
                     },
                 );
+                // Refresh each ad-hoc container's advertised tool catalog
+                // (`adHocSubProcessElements`) from the TARGET definition
+                // (#1630 review): the tools may have been renamed, and the
+                // next agent turn reads this engine-owned variable. Emitted as
+                // a scoped variable update (not mutated in the applier) so
+                // read-model projections observe the refreshed value too.
+                let mut catalog_refresh: Vec<(Key, Value)> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|inst| {
+                        inst.adhoc_instances
+                            .iter()
+                            .filter_map(|(container_key, adhoc)| {
+                                target_definition
+                                    .adhoc
+                                    .iter()
+                                    .find(|a| a.container_id == adhoc.element_id)
+                                    .map(|spec| {
+                                        (
+                                            *container_key,
+                                            Value::List(Self::advertised_adhoc_catalog(spec)),
+                                        )
+                                    })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                catalog_refresh.sort_by_key(|(k, _)| *k);
+                for (scope_key, catalog) in catalog_refresh {
+                    self.emit(
+                        &mut log,
+                        Event::ScopedVariablesUpdated {
+                            instance_key,
+                            scope_key,
+                            variables: HashMap::from([(
+                                "adHocSubProcessElements".to_string(),
+                                catalog,
+                            )]),
+                        },
+                    );
+                }
                 for event in plan.after {
                     self.emit(&mut log, event);
                 }

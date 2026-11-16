@@ -990,6 +990,15 @@ impl Engine {
             if !owns {
                 continue;
             }
+            // A multi-instance embedded sub-process's structural BODY shares
+            // its element id with its children, but event sub-process triggers
+            // are armed on each CHILD scope only. Hosting triggers on the body
+            // would arm an extra trigger per migrated loop (#1630 review).
+            if self.multi_instance_of(instance_key, source_id).is_some()
+                && self.is_multi_instance_body_structural(instance_key, *eik)
+            {
+                continue;
+            }
             if let Some(target_id) = mapped.get(source_id) {
                 scopes.push((*eik, Some(source_id.clone()), Some(target_id.clone())));
             }

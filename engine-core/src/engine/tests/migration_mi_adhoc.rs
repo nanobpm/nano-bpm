@@ -1105,7 +1105,7 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
         ),
     );
 
-    run(
+    let migrated = run(
         &mut engine,
         &mut log,
         Command::migrate_instance(
@@ -1117,6 +1117,16 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
                 ("toolB", "toolB2"),
             ]),
         ),
+    );
+    // The refresh is journalled as a scoped variable update (so read-model
+    // projections see it), not applied silently inside the migration applier.
+    assert!(
+        migrated.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { scope_key, variables, .. }
+                if *scope_key == container && variables.contains_key("adHocSubProcessElements")
+        )),
+        "catalog refresh emitted as ScopedVariablesUpdated"
     );
 
     assert_eq!(
@@ -1184,4 +1194,160 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
     assert_eq!(tool_jobs.len(), 1, "the advertised target tool activates");
     assert_eq!(tool_jobs[0].element_id, "toolB2");
     assert_replays(&log, &engine, inst);
+}
+
+/// A parallel multi-instance embedded sub-process `sp` (three children, each
+/// parked on a service task), optionally hosting a non-interrupting timer
+/// event sub-process `esp`.
+fn mi_sub_process_with_esp(process: &str, with_esp: bool) -> ProcessDefinition {
+    let esp = if with_esp {
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:startEvent id="esp_start" isInterrupting="false">
+               <bpmn:timerEventDefinition><bpmn:timeDuration>PT60S</bpmn:timeDuration></bpmn:timerEventDefinition>
+             </bpmn:startEvent>
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+           </bpmn:subProcess>"#
+    } else {
+        ""
+    };
+    let xml = format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+          <bpmn:process id="{process}">
+            <bpmn:startEvent id="s" />
+            <bpmn:subProcess id="sp">
+              <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+                <bpmn:extensionElements>
+                  <zeebe:loopCharacteristics inputCollection="=[1,2,3]" inputElement="item" />
+                </bpmn:extensionElements>
+              </bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:startEvent id="is" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="ie" />
+              <bpmn:sequenceFlow id="i1" sourceRef="is" targetRef="t" />
+              <bpmn:sequenceFlow id="i2" sourceRef="t" targetRef="ie" />
+              {esp}
+            </bpmn:subProcess>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sp" />
+            <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="e" />
+          </bpmn:process>
+        </bpmn:definitions>"#
+    );
+    crate::bpmn::parse_bpmn(&xml).unwrap().remove(0)
+}
+
+fn armed_timer_hosts(engine: &Engine, inst: Key) -> Vec<Key> {
+    let mut hosts: Vec<Key> = engine
+        .state()
+        .timers
+        .values()
+        .filter(|t| t.instance_key == inst && t.state == state::TimerState::Created)
+        .map(|t| t.element_instance_key)
+        .collect();
+    hosts.sort_unstable();
+    hosts
+}
+
+#[test]
+fn migration_arms_a_newly_added_event_sub_process_on_mi_children_only() {
+    // Reference: a fresh target instance arms one ESP trigger per child scope.
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, mi_sub_process_with_esp("src", false));
+    let target_key = deploy(&mut engine, &mut log, mi_sub_process_with_esp("tgt", true));
+    let fresh = run(&mut engine, &mut log, Command::create_instance("tgt"));
+    let fresh_inst = fresh.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        armed_timer_hosts(&engine, fresh_inst).len(),
+        3,
+        "a fresh instance arms one ESP trigger per child"
+    );
+
+    let created = run(&mut engine, &mut log, Command::create_instance("src"));
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let body_key = *engine
+        .instance(inst)
+        .unwrap()
+        .multi_instances
+        .keys()
+        .next()
+        .unwrap();
+    run(
+        &mut engine,
+        &mut log,
+        Command::migrate_instance(inst, target_key, pairs(&[("sp", "sp"), ("t", "t")])),
+    );
+    let hosts = armed_timer_hosts(&engine, inst);
+    assert_eq!(hosts.len(), 3, "one trigger per running child: {hosts:?}");
+    assert!(
+        !hosts.contains(&body_key),
+        "no trigger on the structural body {body_key}: {hosts:?}"
+    );
+    assert_replays(&log, &engine, inst);
+}
+
+/// Parks an ad-hoc tool retry incident (built by `fixture`), then attempts a
+/// CONTAINER-ONLY migration onto a target whose tool was renamed: the pending
+/// tool has no active element instance, but resolving the incident would
+/// re-activate it, so the migration must be rejected.
+fn container_only_migration_with_pending_tool(
+    fixture: fn(&str, &str, &str) -> ProcessDefinition,
+) -> EngineError {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, fixture("src", "agent", "toolA"));
+    let target_key = deploy(&mut engine, &mut log, fixture("tgt", "agent2", "toolA2"));
+    let created = run(
+        &mut engine,
+        &mut log,
+        Command::create_instance_with("src", vars(&[("base", Value::Str("oops".into()))])),
+    );
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ),
+    );
+    assert_eq!(
+        engine.incidents().len(),
+        1,
+        "a tool retry incident is parked"
+    );
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("agent", "agent2")]),
+        ))
+        .unwrap_err()
+}
+
+#[test]
+fn migration_rejects_container_only_mapping_with_pending_tool_activation() {
+    let err = container_only_migration_with_pending_tool(adhoc_tool_with_failing_input);
+    assert!(
+        matches!(err, EngineError::UnmappedActiveElement { ref element_id, .. } if element_id == "toolA"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn migration_rejects_container_only_mapping_with_pending_tool_job_type() {
+    let err = container_only_migration_with_pending_tool(adhoc_tool_with_failing_job_type);
+    assert!(
+        matches!(err, EngineError::UnmappedActiveElement { ref element_id, .. } if element_id == "toolA"),
+        "{err:?}"
+    );
 }
