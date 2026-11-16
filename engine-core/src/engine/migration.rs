@@ -84,6 +84,95 @@ pub(crate) struct MigrationPlan {
 }
 
 /// `Some(interrupting)` when `kind` is a boundary event.
+/// A node a migration mapping instruction may name (#1630): a definition
+/// element, or an ad-hoc sub-process tool — tools are pruned from the
+/// executable graph into the container's catalog, yet run as element instances
+/// carrying their own id, so they must be mappable like any other activity.
+pub(crate) enum MigrationNode<'a> {
+    Element(&'a Element),
+    AdHocTool {
+        container_id: &'a str,
+        tool: &'a crate::model::AdHocTool,
+    },
+}
+
+impl MigrationNode<'_> {
+    /// Same BPMN type on both sides (discriminant only — a service task may map
+    /// to one with a different job type, Zeebe parity). An ad-hoc container
+    /// must stay an ad-hoc container: its inner instances are derived from it.
+    pub(crate) fn same_type_as(
+        &self,
+        source_def: &ProcessDefinition,
+        other: &MigrationNode<'_>,
+        target_def: &ProcessDefinition,
+    ) -> bool {
+        match (self, other) {
+            (MigrationNode::Element(s), MigrationNode::Element(t)) => {
+                std::mem::discriminant(&s.kind) == std::mem::discriminant(&t.kind)
+                    && is_adhoc_container(source_def, &s.id)
+                        == is_adhoc_container(target_def, &t.id)
+            }
+            (
+                MigrationNode::AdHocTool { tool: s, .. },
+                MigrationNode::AdHocTool { tool: t, .. },
+            ) => {
+                std::mem::discriminant(&s.kind) == std::mem::discriminant(&t.kind)
+                    // A nested ad-hoc container catalogues as a `ServiceTask`
+                    // tool, so the discriminant alone cannot tell it from a
+                    // plain service-task tool. Apply the same container-status
+                    // check as the element branch: a container tool must map to
+                    // a container tool, or its derived `#innerInstance` and
+                    // ad-hoc bookkeeping would attach to a target with no
+                    // container definition (and the reverse would invent one).
+                    && is_adhoc_container(source_def, &s.element_id)
+                        == is_adhoc_container(target_def, &t.element_id)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Resolve a mapping-instruction element id against `def` (see [`MigrationNode`]).
+pub(crate) fn migration_node<'a>(
+    def: &'a ProcessDefinition,
+    id: &str,
+) -> Option<MigrationNode<'a>> {
+    if let Some(element) = def.element(id) {
+        return Some(MigrationNode::Element(element));
+    }
+    def.adhoc.iter().find_map(|ad| {
+        ad.tools
+            .iter()
+            .find(|t| t.element_id == id)
+            .map(|tool| MigrationNode::AdHocTool {
+                container_id: ad.container_id.as_str(),
+                tool,
+            })
+    })
+}
+
+/// Whether `id` is an ad-hoc sub-process container of `def`.
+pub(crate) fn is_adhoc_container(def: &ProcessDefinition, id: &str) -> bool {
+    def.adhoc.iter().any(|ad| ad.container_id == id)
+}
+
+/// The direct flow scope of a migrated active element id (`None` = the
+/// process): an ad-hoc tool and a container's `#innerInstance` both sit in
+/// their container (#1630); any other element in its enclosing sub-process.
+pub(crate) fn migration_flow_scope(def: &ProcessDefinition, id: &str) -> Option<ElementId> {
+    if let Some(container) = id.strip_suffix(ADHOC_INNER_INSTANCE_ID_POSTFIX) {
+        if is_adhoc_container(def, container) {
+            return Some(container.to_string());
+        }
+    }
+    match migration_node(def, id) {
+        Some(MigrationNode::AdHocTool { container_id, .. }) => Some(container_id.to_string()),
+        _ => super::flow_scope::element_flow_scope_chain(def, id)
+            .into_iter()
+            .next(),
+    }
+}
+
 fn boundary_interrupting(kind: &ElementKind) -> Option<bool> {
     match kind {
         ElementKind::TimerBoundaryEvent { interrupting, .. }
@@ -710,6 +799,20 @@ impl Engine {
                     });
                 }
             }
+            // A multi-instance CHILD shares its body's element id, but a
+            // boundary on a multi-instance activity is armed on the BODY alone
+            // (`run_mi_body_activation`): it interrupts / spawns beside the
+            // whole loop, never one child. Reconciling boundaries against a
+            // child would arm a newly-added target boundary once per active
+            // child (duplicating a non-interrupting side path, or interrupting
+            // one child instead of the loop). Skip boundary reconciliation for
+            // a child — its other migration work above (flow scope, kept
+            // call-activity child) still runs.
+            if self.multi_instance_of(instance_key, &source_id).is_some()
+                && !self.is_multi_instance_body_structural(instance_key, eik)
+            {
+                continue;
+            }
             let scope = self.scope_of(instance_key, eik);
             // Boundaries evaluate against the enclosing scope (as at activation);
             // an intermediate catch evaluates against its own element-instance
@@ -885,6 +988,15 @@ impl Engine {
                 .element(source_id)
                 .is_some_and(|e| e.kind.owns_token_scope());
             if !owns {
+                continue;
+            }
+            // A multi-instance embedded sub-process's structural BODY shares
+            // its element id with its children, but event sub-process triggers
+            // are armed on each CHILD scope only. Hosting triggers on the body
+            // would arm an extra trigger per migrated loop (#1630 review).
+            if self.multi_instance_of(instance_key, source_id).is_some()
+                && self.is_multi_instance_body_structural(instance_key, *eik)
+            {
                 continue;
             }
             if let Some(target_id) = mapped.get(source_id) {

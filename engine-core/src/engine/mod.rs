@@ -3925,6 +3925,18 @@ impl Engine {
                                 element_id: tool_element_id.clone(),
                                 variables,
                             });
+                        } else if let Some(state::IoMappingRedrive::AdHocContainerCompletion {
+                            cancel,
+                        }) = redrive
+                        {
+                            // A container completion deferred on a missing
+                            // `outputCollection` binding (#1630 review): retry
+                            // the container completion itself.
+                            queue.push_back(Step::CompleteAdHoc {
+                                instance_key,
+                                container_key: element_instance_key,
+                                cancel,
+                            });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
                         }) = &redrive
@@ -4243,6 +4255,15 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                 })),
+                            // Deferred container completion (#1630 review);
+                            // surfaces as `ExpressionEvaluation`, handled above.
+                            Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }) => {
+                                Some(Step::CompleteAdHoc {
+                                    instance_key,
+                                    container_key: element_instance_key,
+                                    cancel,
+                                })
+                            }
                             // Ad-hoc tool job-type failure (#1390): re-activate the
                             // tool with its preserved seed, overlaid with the
                             // operator's post-incident scope corrections (see
@@ -5104,20 +5125,19 @@ impl Engine {
                             element_id: src.clone(),
                         });
                     }
-                    let src_el = source_def.definition.element(src).ok_or_else(|| {
-                        EngineError::MappingSourceElementNotFound {
+                    let src_el = migration::migration_node(&source_def.definition, src)
+                        .ok_or_else(|| EngineError::MappingSourceElementNotFound {
                             instance_key,
                             element_id: src.clone(),
-                        }
-                    })?;
-                    let tgt_el = target.definition.element(tgt).ok_or_else(|| {
-                        EngineError::MappingTargetElementNotFound {
-                            target_process_definition_key,
-                            element_id: tgt.clone(),
-                        }
-                    })?;
-                    if std::mem::discriminant(&src_el.kind) != std::mem::discriminant(&tgt_el.kind)
-                    {
+                        })?;
+                    let tgt_el =
+                        migration::migration_node(&target.definition, tgt).ok_or_else(|| {
+                            EngineError::MappingTargetElementNotFound {
+                                target_process_definition_key,
+                                element_id: tgt.clone(),
+                            }
+                        })?;
+                    if !src_el.same_type_as(&source_def.definition, &tgt_el, &target.definition) {
                         return Err(EngineError::MappedElementTypeChanged {
                             instance_key,
                             source_element_id: src.clone(),
@@ -5126,6 +5146,23 @@ impl Engine {
                     }
                     mapped.insert(src.clone(), tgt.clone());
                 }
+                // 3a. Ad-hoc sub-process inner instances (#1630): each activated
+                //     tool runs beneath a `<container>#innerInstance` element
+                //     instance that has no definition element of its own, so
+                //     it cannot be named in a mapping instruction (an explicit
+                //     one fails the source-element lookup above, Zeebe parity).
+                //     Like Zeebe, derive its mapping from the container's.
+                let mut mapping_instructions = mapping_instructions;
+                let mut inner_mappings: Vec<(String, String)> = mapping_instructions
+                    .iter()
+                    .filter(|(src, _)| migration::is_adhoc_container(&source_def.definition, src))
+                    .map(|(src, tgt)| (adhoc_inner_instance_id(src), adhoc_inner_instance_id(tgt)))
+                    .collect();
+                inner_mappings.sort();
+                for (src, tgt) in &inner_mappings {
+                    mapped.insert(src.clone(), tgt.clone());
+                }
+                mapping_instructions.extend(inner_mappings);
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
                 //    active element instance whose kind is listed in
@@ -5162,34 +5199,6 @@ impl Engine {
                             });
                         }
                     }
-                }
-
-                //    An active multi-instance body or ad-hoc sub-process
-                //    container: their per-element bookkeeping lives in
-                //    `ProcessInstance.multi_instances` / `adhoc_instances`,
-                //    which the applier (`state::apply`) does not remap, so
-                //    migrating one would leave that bookkeeping pointing at
-                //    the source element id and desync engine runtime.
-                let mut unremappable: Vec<String> = instance
-                    .multi_instances
-                    .values()
-                    .map(|mi| mi.element_id.clone())
-                    .chain(
-                        instance
-                            .adhoc_instances
-                            .values()
-                            .map(|adhoc| adhoc.element_id.clone()),
-                    )
-                    .collect();
-                unremappable.sort();
-                if let Some(element_id) = unremappable.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "multi-instance and ad-hoc sub-process activities are not \
-                                 migratable yet"
-                            .to_string(),
-                    });
                 }
 
                 //    Compensation runtime (`compensable` / `compensation_waits`)
@@ -5247,6 +5256,63 @@ impl Engine {
                     }
                 }
 
+                // 5b. A parked ad-hoc tool retry (#1630 review): an
+                //     activation / job-type incident names a PENDING tool
+                //     that has no active element instance yet, so step 5
+                //     cannot see it. Resolving the incident re-activates
+                //     that tool under the target, so it must be mapped like
+                //     an active element and stay in its mapped container.
+                let mut pending_tools: Vec<String> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key
+                            && i.state == crate::state::IncidentState::Active
+                    })
+                    .filter_map(|i| match &i.redrive {
+                        Some(crate::state::IoMappingRedrive::AdHocToolActivation {
+                            element_id,
+                            ..
+                        })
+                        | Some(crate::state::IoMappingRedrive::AdHocToolJobType {
+                            element_id,
+                            ..
+                        }) => Some(element_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                pending_tools.sort();
+                pending_tools.dedup();
+                for tool in &pending_tools {
+                    let Some(tgt_tool) = mapped.get(tool) else {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: tool.clone(),
+                        });
+                    };
+                    let container_of = |def: &ProcessDefinition, id: &str| {
+                        def.adhoc
+                            .iter()
+                            .find(|ad| ad.tools.iter().any(|t| t.element_id == id))
+                            .map(|ad| ad.container_id.clone())
+                    };
+                    let source_container = container_of(&source_def.definition, tool);
+                    let expected = source_container
+                        .as_ref()
+                        .and_then(|c| mapped.get(c).cloned())
+                        .or(source_container);
+                    let actual = container_of(&target.definition, tgt_tool);
+                    if expected != actual {
+                        return Err(EngineError::MigrationFlowScopeChanged {
+                            instance_key,
+                            element_id: tool.clone(),
+                            source_flow_scope_id: expected,
+                            target_flow_scope_id: actual,
+                        });
+                    }
+                }
+
                 // 5a. Zeebe `requireUnchangedFlowScope`: the target element's
                 //     flow scope must be the mapped target of the source
                 //     element's flow scope (the process itself for a
@@ -5273,23 +5339,51 @@ impl Engine {
                         .definition
                         .element(tgt)
                         .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
-                    if source_mi != target_mi {
-                        return Err(EngineError::MigrationMultiInstanceMismatch {
-                            instance_key,
-                            source_element_id: eid.clone(),
-                            target_element_id: tgt.clone(),
-                        });
+                    match (source_mi, target_mi) {
+                        (Some(s), Some(t)) if s != t => {
+                            return Err(EngineError::MigrationLoopCharacteristicsChanged {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                target_element_id: tgt.clone(),
+                            });
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            // Zeebe reports the element-instance types: an MI
+                            // body is `MULTI_INSTANCE_BODY`, a plain activity
+                            // its own BPMN type.
+                            let type_of = |def: &ProcessDefinition, id: &str, mi: bool| {
+                                if mi {
+                                    "MULTI_INSTANCE_BODY".to_string()
+                                } else {
+                                    def.element(id)
+                                        .map(|e| e.kind.type_name().to_string())
+                                        .unwrap_or_default()
+                                }
+                            };
+                            return Err(EngineError::MigrationMultiInstanceMismatch {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                source_element_type: type_of(
+                                    &source_def.definition,
+                                    eid,
+                                    source_mi.is_some(),
+                                ),
+                                target_element_id: tgt.clone(),
+                                target_element_type: type_of(
+                                    &target.definition,
+                                    tgt,
+                                    target_mi.is_some(),
+                                ),
+                            });
+                        }
+                        _ => {}
                     }
                     let expected =
-                        match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
-                            .first()
-                        {
-                            Some(scope) => mapped.get(scope).cloned(),
+                        match migration::migration_flow_scope(&source_def.definition, eid) {
+                            Some(scope) => mapped.get(&scope).cloned(),
                             None => Some(target_process_id.clone()),
                         };
-                    let actual = flow_scope::element_flow_scope_chain(&target.definition, tgt)
-                        .first()
-                        .cloned()
+                    let actual = migration::migration_flow_scope(&target.definition, tgt)
                         .unwrap_or_else(|| target_process_id.clone());
                     if expected.as_deref() != Some(actual.as_str()) {
                         return Err(EngineError::MigrationFlowScopeChanged {
@@ -5549,6 +5643,48 @@ impl Engine {
                         join_scoped: true,
                     },
                 );
+                // Refresh each ad-hoc container's advertised tool catalog
+                // (`adHocSubProcessElements`) from the TARGET definition
+                // (#1630 review): the tools may have been renamed, and the
+                // next agent turn reads this engine-owned variable. Emitted as
+                // a scoped variable update (not mutated in the applier) so
+                // read-model projections observe the refreshed value too.
+                let mut catalog_refresh: Vec<(Key, Value)> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|inst| {
+                        inst.adhoc_instances
+                            .iter()
+                            .filter_map(|(container_key, adhoc)| {
+                                target_definition
+                                    .adhoc
+                                    .iter()
+                                    .find(|a| a.container_id == adhoc.element_id)
+                                    .map(|spec| {
+                                        (
+                                            *container_key,
+                                            Value::List(Self::advertised_adhoc_catalog(spec)),
+                                        )
+                                    })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                catalog_refresh.sort_by_key(|(k, _)| *k);
+                for (scope_key, catalog) in catalog_refresh {
+                    self.emit(
+                        &mut log,
+                        Event::ScopedVariablesUpdated {
+                            instance_key,
+                            scope_key,
+                            variables: HashMap::from([(
+                                "adHocSubProcessElements".to_string(),
+                                catalog,
+                            )]),
+                        },
+                    );
+                }
                 for event in plan.after {
                     self.emit(&mut log, event);
                 }
@@ -10894,7 +11030,7 @@ impl Engine {
     /// container activation (`run_activation_body`) and the nested-container tool
     /// activation (`activate_adhoc_tool`, #631) so both stand up an identical
     /// catalog.
-    fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
+    pub(crate) fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
         def.tools
             .iter()
             .filter(|t| !matches!(t.kind, crate::model::AdHocToolKind::Other))
@@ -11837,13 +11973,22 @@ impl Engine {
         // binding directly (it is seeded/appended local to the container scope) —
         // no need to merge the whole visible variable chain.
         //
-        // On a type mismatch, DEFER the tool's completion for full Zeebe parity
-        // (retry-on-resolve): park an EXTRACT_VALUE_ERROR incident on the TOOL
-        // child and return WITHOUT emitting any completion event. The child stays
-        // in the container's `active` set with its local scope intact, so
-        // resolving the incident re-drives `Step::Complete` for this child (see
-        // `ResolveIncident` → `ExpressionEvaluation`) and re-attempts the append
-        // once the target has been corrected — nothing is discarded.
+        // A MISSING binding is guarded too: a migration that renamed the
+        // container's `outputCollection` re-points `AdHocState.output_collection`
+        // at the target name while the accumulated list stays under its source
+        // name, so the target binding is absent until repaired. Appending anyway
+        // would silently discard the tool's output and let the container publish
+        // an empty list — so an absent binding is treated exactly like a
+        // wrong-typed one (#1630 review).
+        //
+        // On a type mismatch or a missing binding, DEFER the tool's completion
+        // for full Zeebe parity (retry-on-resolve): park an EXTRACT_VALUE_ERROR
+        // incident on the TOOL child and return WITHOUT emitting any completion
+        // event. The child stays in the container's `active` set with its local
+        // scope intact, so resolving the incident re-drives `Step::Complete` for
+        // this child (see `ResolveIncident` → `ExpressionEvaluation`) and
+        // re-attempts the append once the target has been corrected — nothing is
+        // discarded.
         if output.is_some() {
             if let Some(name) = &output_collection {
                 let current = self
@@ -11853,12 +11998,24 @@ impl Engine {
                     .and_then(|i| i.scope_variables.get(&container_key))
                     .and_then(|m| m.get(name))
                     .cloned();
-                if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
+                let unappendable = match &current {
+                    // Absent binding (e.g. a renamed collection not yet repaired).
+                    None => true,
+                    // Present but not an array.
+                    Some(v) => !matches!(v, Value::List(_)),
+                };
+                if unappendable {
                     let incident_key = self.mint_key();
-                    let reason = format!(
-                        "the output collection '{name}' of ad-hoc sub-process \
-                         '{container_element_id}' has the wrong type: expected an array"
-                    );
+                    let reason = match &current {
+                        None => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' is not defined: expected an array"
+                        ),
+                        Some(_) => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' has the wrong type: expected an array"
+                        ),
+                    };
                     // Preserve the tool's single-pass output projection on the
                     // redrive when it is a call-activity tool (#1176): the projection
                     // was already evaluated once by `complete_adhoc_call_activity_tool`
@@ -12537,6 +12694,43 @@ impl Engine {
         // still proceeds — it is the sanctioned way out of a parked container.
         if !cancel && self.adhoc_container_blocked_by_incident(instance_key, container_key) {
             return (Vec::new(), Vec::new());
+        }
+
+        // A MISSING `outputCollection` binding (a migration renamed the
+        // collection while the accumulated list stays under its source name,
+        // #1630 review) must not complete: substituting `[]` would silently
+        // discard every collected output. Defer — before any teardown or
+        // propagation — with a recoverable incident on the container whose
+        // resolution re-drives this completion (same `cancel` flag) once the
+        // operator has repaired the binding. Mirrors the per-tool append guard
+        // in `complete_adhoc_tool`.
+        if let Some(name) = &output_collection {
+            let bound = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.scope_variables.get(&container_key))
+                .is_some_and(|m| m.contains_key(name));
+            if !bound {
+                let incident_key = self.mint_key();
+                return (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key: container_key,
+                        element_id: element_id.clone(),
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }),
+                        reason: format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{element_id}' is not defined: expected an array"
+                        ),
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                );
+            }
         }
 
         // A JOB_WORKER ad-hoc container that is a MULTI-INSTANCE child (its token
@@ -17584,9 +17778,21 @@ pub enum EngineError {
         target_flow_scope_id: Option<String>,
     },
     /// A migration mapped a multi-instance element onto a non-multi-instance
-    /// one or vice versa, or a parallel multi-instance element onto a
-    /// sequential one or vice versa. HTTP 409.
+    /// one or vice versa: the element-instance types differ
+    /// (`MULTI_INSTANCE_BODY` vs. the plain activity type). HTTP 409. Zeebe
+    /// `requireSameElementType` (`ERROR_ELEMENT_TYPE_CHANGED`, INVALID_STATE).
     MigrationMultiInstanceMismatch {
+        instance_key: Key,
+        source_element_id: String,
+        source_element_type: String,
+        target_element_id: String,
+        target_element_type: String,
+    },
+    /// A migration mapped a parallel multi-instance element onto a sequential
+    /// one or vice versa. HTTP 409. Zeebe
+    /// `requireSameMultiInstanceLoopCharacteristics`
+    /// (`ERROR_UPDATED_LOOP_CHARACTERISTICS`, INVALID_STATE).
+    MigrationLoopCharacteristicsChanged {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
@@ -17848,9 +18054,13 @@ impl std::fmt::Display for EngineError {
                 source_flow_scope_id.as_deref().unwrap_or("<process>"),
                 target_flow_scope_id.as_deref().unwrap_or("<process>")
             ),
-            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
+            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, source_element_type, target_element_id, target_element_type } => write!(
                 f,
-                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' and type '{source_element_type}' is mapped to an element with id '{target_element_id}' and different type '{target_element_type}'. Elements must be mapped to elements of the same type."
+            ),
+            EngineError::MigrationLoopCharacteristicsChanged { instance_key, source_element_id, target_element_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' has a different loop characteristics than the target element with id '{target_element_id}'. Both elements must have either sequential or parallel loop characteristics."
             ),
             EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
                 f,
@@ -18335,6 +18545,7 @@ impl EngineError {
             | EngineError::ElementNotActivatable { .. }
             | EngineError::MigrationFlowScopeChanged { .. }
             | EngineError::MigrationMultiInstanceMismatch { .. }
+            | EngineError::MigrationLoopCharacteristicsChanged { .. }
             | EngineError::MigrationCatchEventDetached { .. }
             | EngineError::MigrationCatchEventsMerged { .. }
             | EngineError::MigrationCatchEventSubscriptionFailed { .. }

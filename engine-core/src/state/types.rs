@@ -1511,6 +1511,13 @@ pub enum IoMappingRedrive {
     AdHocToolOutputCollection {
         precomputed_output: HashMap<String, Value>,
     },
+    /// An ad-hoc container's completion was deferred because its
+    /// `outputCollection` binding is missing from the container scope (a
+    /// migration renamed the collection, #1630 review). The incident sits on
+    /// the CONTAINER; resolution re-drives the container completion
+    /// (engine `Step::CompleteAdHoc`) with the same `cancel` flag, once the
+    /// operator has repaired the binding. Additive brand-new variant.
+    AdHocContainerCompletion { cancel: bool },
     /// A job-worker element's job properties (`zeebe:taskDefinition` type /
     /// retries) failed to evaluate when its job was to be created (#1390, Zeebe
     /// `BpmnJobBehavior.evaluateJobExpressions` -> `EXTRACT_VALUE_ERROR`). The
