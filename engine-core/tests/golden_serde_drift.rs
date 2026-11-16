@@ -1012,6 +1012,8 @@ fn build_event_witnesses() -> Vec<Event> {
             join_scoped: true,
             compensation_subscriptions: vec![MigratedCompensationSubscription {
                 source_element_id: "a".to_string(),
+                source_element_instance_key: 20,
+                source_handler: "undoA".to_string(),
                 target_element_id: "c".to_string(),
                 target_handler: "undoC".to_string(),
             }],

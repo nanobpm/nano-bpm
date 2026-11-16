@@ -180,14 +180,11 @@ fn compensation_subscription_migrates_and_its_target_handler_runs() {
             _ => None,
         })
         .expect("a ProcessInstanceMigrated fact is emitted");
-    assert_eq!(
-        migrated,
-        vec![crate::event::MigratedCompensationSubscription {
-            source_element_id: "A".into(),
-            target_element_id: "C".into(),
-            target_handler: "undoC".into(),
-        }]
-    );
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(migrated[0].source_element_id, "A");
+    assert_eq!(migrated[0].source_handler, "undoA");
+    assert_eq!(migrated[0].target_element_id, "C");
+    assert_eq!(migrated[0].target_handler, "undoC");
     log.extend(events);
     assert_eq!(compensable(&engine, inst), pairs(&[("C", "undoC")]));
     assert_replays(&log, &engine, inst);
@@ -465,4 +462,219 @@ fn rejects_a_compensation_boundary_whose_flow_scope_gets_shallower() {
             target_flow_scope_id: "p2".into(),
         }
     );
+}
+
+/// `s -> A(comp boundaries b1 -> {h1}, b2 -> {h2}) -> B -> throw -> e`.
+fn two_boundaries(process: &str, h1: &str, h2: &str, b: &str) -> ProcessDefinition {
+    let mut builder = ProcessBuilder::new(process)
+        .start_event("s")
+        .service_task("A", "A")
+        .compensation_boundary_event("b1", "A", h1)
+        .compensation_boundary_event("b2", "A", h2)
+        .service_task(h1, h1);
+    if h2 != h1 {
+        builder = builder.service_task(h2, h2);
+    }
+    builder
+        .service_task(b, "next")
+        .compensation_throw_event("throw")
+        .end_event("e")
+        .connect("s", "A")
+        .connect("A", b)
+        .connect(b, "throw")
+        .connect("throw", "e")
+        .build()
+        .unwrap()
+}
+
+fn migrate(engine: &mut Engine, log: &mut Vec<Event>, inst: Key, target: Key, m: &[(&str, &str)]) {
+    log.extend(
+        engine
+            .apply_command(Command::migrate_instance(inst, target, pairs(m)))
+            .unwrap(),
+    );
+}
+
+/// #1635 review: with two compensation boundaries on one task, mapping only
+/// one keeps only ITS subscription (no double compensation).
+#[test]
+fn mapping_one_of_two_boundaries_migrates_only_its_subscription() {
+    for mapped in ["b1", "b2"] {
+        let mut engine = Engine::new();
+        let mut log = Vec::new();
+        deploy(&mut engine, &mut log, two_boundaries("p", "u1", "u2", "B"));
+        let target = deploy(&mut engine, &mut log, two_boundaries("p2", "v1", "v2", "D"));
+        let inst = start(&mut engine, &mut log, "p");
+        complete(&mut engine, &mut log, "A");
+        assert_eq!(
+            compensable(&engine, inst),
+            pairs(&[("A", "u1"), ("A", "u2")])
+        );
+        migrate(
+            &mut engine,
+            &mut log,
+            inst,
+            target,
+            &[("A", "A"), ("B", "D"), (mapped, mapped)],
+        );
+        let expected = if mapped == "b1" { "v1" } else { "v2" };
+        assert_eq!(compensable(&engine, inst), pairs(&[("A", expected)]));
+        assert_replays(&log, &engine, inst);
+    }
+}
+
+/// #1635 review: crossed mappings take the MAPPED boundary's handler.
+#[test]
+fn crossed_boundary_mappings_take_each_mapped_boundarys_handler() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, two_boundaries("p", "u1", "u2", "B"));
+    let target = deploy(&mut engine, &mut log, two_boundaries("p2", "v1", "v2", "D"));
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        target,
+        &[("A", "A"), ("B", "D"), ("b1", "b2"), ("b2", "b1")],
+    );
+    let subs: Vec<String> = engine
+        .instance(inst)
+        .unwrap()
+        .compensable
+        .iter()
+        .map(|c| c.handler.clone())
+        .collect();
+    assert_eq!(subs, vec!["v2".to_string(), "v1".to_string()]);
+    assert_replays(&log, &engine, inst);
+}
+
+/// #1635 review: two boundaries sharing one handler; mapping one keeps one.
+#[test]
+fn shared_handler_boundaries_migrate_one_subscription_per_mapped_boundary() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(&mut engine, &mut log, two_boundaries("p", "u", "u", "B"));
+    let target = deploy(&mut engine, &mut log, two_boundaries("p2", "v", "v", "D"));
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    assert_eq!(compensable(&engine, inst), pairs(&[("A", "u"), ("A", "u")]));
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        target,
+        &[("A", "A"), ("B", "D"), ("b2", "b2")],
+    );
+    assert_eq!(compensable(&engine, inst), pairs(&[("A", "v")]));
+    assert_replays(&log, &engine, inst);
+}
+
+/// `s -> {sub}(comp boundary {sb} -> {sh})[ss -> A(comp boundary ab -> {ah}) -> se]
+/// -> {next} -> throw -> e`.
+fn compensable_subprocess(
+    process: &str,
+    sub: &str,
+    sb: &str,
+    sh: &str,
+    ah: &str,
+    next: &str,
+) -> ProcessDefinition {
+    ProcessBuilder::new(process)
+        .start_event("s")
+        .sub_process(sub, "ss")
+        .start_event("ss")
+        .contained_in("ss", sub)
+        .service_task("A", "A")
+        .contained_in("A", sub)
+        .compensation_boundary_event("ab", "A", ah)
+        .contained_in("ab", sub)
+        .service_task(ah, ah)
+        .contained_in(ah, sub)
+        .end_event("se")
+        .contained_in("se", sub)
+        .compensation_boundary_event(sb, sub, sh)
+        .service_task(sh, sh)
+        .service_task(next, "next")
+        .compensation_throw_event("throw")
+        .end_event("e")
+        .connect("ss", "A")
+        .connect("A", "se")
+        .connect("s", sub)
+        .connect(sub, next)
+        .connect(next, "throw")
+        .connect("throw", "e")
+        .build()
+        .unwrap()
+}
+
+fn explicit_sub_handlers(engine: &Engine, inst: Key) -> Vec<(String, String)> {
+    compensable(engine, inst)
+        .into_iter()
+        .filter(|(_, h)| h == "subUndo" || h == "subUndo2")
+        .collect()
+}
+
+/// #1635 review: an explicit sub-process compensation subscription follows
+/// its OWN boundary mapping, independent of nested boundaries.
+#[test]
+fn explicit_subprocess_subscription_follows_its_own_boundary() {
+    // Own boundary mapped, nested one not: the explicit subscription survives.
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        compensable_subprocess("p", "sub1", "sb1", "subUndo", "undoA", "B"),
+    );
+    let target = deploy(
+        &mut engine,
+        &mut log,
+        compensable_subprocess("p2", "sub2", "sb2", "subUndo2", "undoA2", "D"),
+    );
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    assert_eq!(
+        explicit_sub_handlers(&engine, inst),
+        pairs(&[("sub1", "subUndo")])
+    );
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        target,
+        &[("sub1", "sub2"), ("B", "D"), ("sb1", "sb2")],
+    );
+    assert_eq!(
+        explicit_sub_handlers(&engine, inst),
+        pairs(&[("sub2", "subUndo2")])
+    );
+    assert_replays(&log, &engine, inst);
+
+    // Nested boundary mapped, own boundary not: the explicit one is deleted.
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        compensable_subprocess("p", "sub1", "sb1", "subUndo", "undoA", "B"),
+    );
+    let target = deploy(
+        &mut engine,
+        &mut log,
+        compensable_subprocess("p2", "sub2", "sb2", "subUndo2", "undoA2", "D"),
+    );
+    let inst = start(&mut engine, &mut log, "p");
+    complete(&mut engine, &mut log, "A");
+    migrate(
+        &mut engine,
+        &mut log,
+        inst,
+        target,
+        &[("sub1", "sub2"), ("B", "D"), ("ab", "ab")],
+    );
+    assert!(explicit_sub_handlers(&engine, inst).is_empty());
+    assert!(compensable(&engine, inst).contains(&("A".to_string(), "undoA2".to_string())));
+    assert_replays(&log, &engine, inst);
 }

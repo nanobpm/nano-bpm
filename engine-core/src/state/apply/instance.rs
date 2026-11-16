@@ -461,19 +461,38 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // throws at their mapped throw / handler elements. A legacy
                 // record never carried compensation state (it was rejected).
                 if *compensation_migrated {
-                    let plan: HashMap<&str, &crate::event::MigratedCompensationSubscription> =
-                        compensation_subscriptions
-                            .iter()
-                            .map(|c| (c.source_element_id.as_str(), c))
-                            .collect();
-                    let mut migrated: Vec<_> = instance.compensable.iter().cloned().collect();
-                    migrated.retain(|c| plan.contains_key(c.element_id.as_str()));
-                    for c in &mut migrated {
-                        if let Some(m) = plan.get(c.element_id.as_str()) {
+                    // One plan entry per subscription occurrence, keyed by
+                    // (element instance, element, source handler); duplicates
+                    // (boundaries sharing a handler) are consumed one each.
+                    let mut plan: HashMap<
+                        (Key, &str, &str),
+                        std::collections::VecDeque<&crate::event::MigratedCompensationSubscription>,
+                    > = HashMap::new();
+                    for c in compensation_subscriptions {
+                        plan.entry((
+                            c.source_element_instance_key,
+                            c.source_element_id.as_str(),
+                            c.source_handler.as_str(),
+                        ))
+                        .or_default()
+                        .push_back(c);
+                    }
+                    let mut migrated = Vec::new();
+                    for c in instance.compensable.iter() {
+                        let m = plan
+                            .get_mut(&(
+                                c.element_instance_key,
+                                c.element_id.as_str(),
+                                c.handler.as_str(),
+                            ))
+                            .and_then(|q| q.pop_front());
+                        if let Some(m) = m {
+                            let mut c = c.clone();
                             c.element_id = m.target_element_id.clone();
                             if !c.scope_subscription {
                                 c.handler = m.target_handler.clone();
                             }
+                            migrated.push(c);
                         }
                     }
                     instance.compensable = migrated.into();

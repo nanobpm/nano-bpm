@@ -202,6 +202,15 @@ pub struct MigratedChildInstance {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MigratedCompensationSubscription {
     pub source_element_id: ElementId,
+    /// The migrated subscription's element instance key, so each plan entry
+    /// names one subscription occurrence (a task with several compensation
+    /// boundaries holds one subscription per boundary).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_element_instance_key: Key,
+    /// The migrated subscription's source handler (empty for a scope
+    /// subscription), identifying which boundary's subscription this is.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_handler: ElementId,
     pub target_element_id: ElementId,
     pub target_handler: ElementId,
 }

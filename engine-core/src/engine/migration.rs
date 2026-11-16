@@ -1565,31 +1565,58 @@ pub(crate) fn plan_compensation_migration(
     mapped: &HashMap<String, String>,
     compensable: &[state::CompensationSubscription],
 ) -> Result<Vec<crate::event::MigratedCompensationSubscription>, EngineError> {
-    let mut element_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
+    // Boundary subscriptions are planned per boundary occurrence: every
+    // compensation boundary of an activity records its own subscription (its
+    // own handler), so each follows only its OWN boundary's mapping and takes
+    // that mapped boundary's handler. Duplicate `(instance, handler)` pairs
+    // (several boundaries sharing one handler) pair up with those boundaries
+    // in boundary-id order. Explicit sub-process subscriptions are boundary
+    // subscriptions too.
+    let mut scope_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut occurrence: HashMap<(Key, &str), usize> = HashMap::new();
     for sub in compensable.iter().filter(|c| !c.scope_subscription) {
-        // Zeebe starts from tasks only (bottom-up); sub-processes are reached
-        // through the flow-scope walk.
-        if matches!(
-            source_def.element(&sub.element_id).map(|e| &e.kind),
-            Some(ElementKind::SubProcess { .. }) | None
-        ) {
-            continue;
-        }
-        let Some(target_activity) = compensation_boundaries_of(source_def, &sub.element_id)
+        let occ = occurrence
+            .entry((sub.element_instance_key, sub.handler.as_str()))
+            .or_insert(0);
+        let index = *occ;
+        *occ += 1;
+        let Some(source_boundary) = compensation_boundaries_of(source_def, &sub.element_id)
             .into_iter()
-            .find_map(|b| mapped.get(&b.id))
-            .and_then(|tb| target_def.element(tb))
-            .and_then(|tb| tb.kind.attached_to())
+            .filter(|b| {
+                matches!(&b.kind, ElementKind::CompensationBoundaryEvent { handler, .. }
+                    if *handler == sub.handler)
+            })
+            .nth(index)
         else {
             continue;
         };
-        element_map.insert(sub.element_id.clone(), target_activity.to_string());
+        let Some(target_boundary) = mapped
+            .get(&source_boundary.id)
+            .and_then(|tb| target_def.element(tb))
+        else {
+            continue;
+        };
+        let ElementKind::CompensationBoundaryEvent {
+            attached_to: target_activity,
+            handler: target_handler,
+        } = &target_boundary.kind
+        else {
+            continue;
+        };
+        out.push(crate::event::MigratedCompensationSubscription {
+            source_element_id: sub.element_id.clone(),
+            source_element_instance_key: sub.element_instance_key,
+            source_handler: sub.handler.clone(),
+            target_element_id: target_activity.clone(),
+            target_handler: target_handler.clone(),
+        });
         let source_chain = super::flow_scope::element_flow_scope_chain(source_def, &sub.element_id);
         let target_chain = super::flow_scope::element_flow_scope_chain(target_def, target_activity);
         for level in 0..source_chain.len().max(target_chain.len()) {
             match (source_chain.get(level), target_chain.get(level)) {
                 (Some(s), Some(t)) => {
-                    element_map.insert(s.clone(), t.clone());
+                    scope_map.insert(s.clone(), t.clone());
                 }
                 (s, t) => {
                     return Err(EngineError::MigrationCompensationFlowScopeChanged {
@@ -1606,26 +1633,18 @@ pub(crate) fn plan_compensation_migration(
             }
         }
     }
-    let mut out: BTreeMap<ElementId, crate::event::MigratedCompensationSubscription> =
-        BTreeMap::new();
-    for sub in compensable {
-        let Some(target) = element_map.get(&sub.element_id) else {
-            continue;
-        };
-        let target_handler = compensation_boundaries_of(target_def, target)
-            .into_iter()
-            .find_map(|b| match &b.kind {
-                ElementKind::CompensationBoundaryEvent { handler, .. } => Some(handler.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| sub.handler.clone());
-        out.entry(sub.element_id.clone()).or_insert_with(|| {
-            crate::event::MigratedCompensationSubscription {
+    // Handlerless scope subscriptions (#901) follow the flow scope of a
+    // migrated nested subscription.
+    for sub in compensable.iter().filter(|c| c.scope_subscription) {
+        if let Some(target) = scope_map.get(&sub.element_id) {
+            out.push(crate::event::MigratedCompensationSubscription {
                 source_element_id: sub.element_id.clone(),
+                source_element_instance_key: sub.element_instance_key,
+                source_handler: sub.handler.clone(),
                 target_element_id: target.clone(),
-                target_handler,
-            }
-        });
+                target_handler: sub.handler.clone(),
+            });
+        }
     }
-    Ok(out.into_values().collect())
+    Ok(out)
 }

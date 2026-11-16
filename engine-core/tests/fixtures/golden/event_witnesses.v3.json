@@ -158,6 +158,8 @@
       "compensation_subscriptions": [
         {
           "source_element_id": "a",
+          "source_element_instance_key": 20,
+          "source_handler": "undoA",
           "target_element_id": "c",
           "target_handler": "undoC"
         }
