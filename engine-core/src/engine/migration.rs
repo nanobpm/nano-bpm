@@ -1575,6 +1575,11 @@ pub(crate) fn plan_compensation_migration(
     let mut scope_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
     let mut out = Vec::new();
     let mut occurrence: HashMap<(Key, &str), usize> = HashMap::new();
+    // Loops / multi-instance bodies accumulate many subscriptions per
+    // activity: scan the model once per source activity and validate each
+    // (source activity, target activity) pair once.
+    let mut boundaries_by_activity: HashMap<&str, Vec<&Element>> = HashMap::new();
+    let mut validated: HashSet<(&str, String)> = HashSet::new();
     for sub in compensable.iter().filter(|c| !c.scope_subscription) {
         let occ = occurrence
             .entry((sub.element_instance_key, sub.handler.as_str()))
@@ -1585,10 +1590,13 @@ pub(crate) fn plan_compensation_migration(
         // identity — stable across successive migrations; an older record
         // falls back to boundary-id occurrence order among same-handler
         // boundaries.
-        let source_boundaries = compensation_boundaries_of(source_def, &sub.element_id);
+        let source_boundaries = boundaries_by_activity
+            .entry(sub.element_id.as_str())
+            .or_insert_with(|| compensation_boundaries_of(source_def, &sub.element_id));
         let source_boundary = if sub.boundary_id.is_empty() {
             source_boundaries
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|b| {
                     matches!(&b.kind, ElementKind::CompensationBoundaryEvent { handler, .. }
                         if *handler == sub.handler)
@@ -1596,7 +1604,8 @@ pub(crate) fn plan_compensation_migration(
                 .nth(index)
         } else {
             source_boundaries
-                .into_iter()
+                .iter()
+                .copied()
                 .find(|b| b.id == sub.boundary_id)
         };
         let Some(source_boundary) = source_boundary else {
@@ -1625,14 +1634,16 @@ pub(crate) fn plan_compensation_migration(
         let activity_target = mapped
             .get(&sub.element_id)
             .map_or(target_activity.as_str(), String::as_str);
-        Engine::check_migrated_catch_events(
-            instance_key,
-            source_def,
-            target_def,
-            mapped,
-            &sub.element_id,
-            activity_target,
-        )?;
+        if validated.insert((sub.element_id.as_str(), activity_target.to_string())) {
+            Engine::check_migrated_catch_events(
+                instance_key,
+                source_def,
+                target_def,
+                mapped,
+                &sub.element_id,
+                activity_target,
+            )?;
+        }
         out.push(crate::event::MigratedCompensationSubscription {
             source_element_id: sub.element_id.clone(),
             source_element_instance_key: sub.element_instance_key,
