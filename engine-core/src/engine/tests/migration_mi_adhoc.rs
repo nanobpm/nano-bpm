@@ -1351,3 +1351,179 @@ fn migration_rejects_container_only_mapping_with_pending_tool_job_type() {
         "{err:?}"
     );
 }
+
+#[test]
+fn migration_ignores_resolved_tool_retry_incidents() {
+    // A RESOLVED tool job-type incident keeps its record (and redrive) for
+    // history; once the retried tool has finished it names no pending work, so
+    // a container-only migration onto a target without that tool must succeed
+    // (#1630 review).
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        adhoc_tool_with_failing_job_type("src", "agent", "toolA"),
+    );
+    let target_key = deploy(
+        &mut engine,
+        &mut log,
+        adhoc_tool_with_failing_job_type("tgt", "agent2", "toolA2"),
+    );
+    let created = run(&mut engine, &mut log, Command::create_instance("src"));
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ),
+    );
+    let incident = engine.active_incidents()[0].key;
+    run(
+        &mut engine,
+        &mut log,
+        Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ),
+    );
+    run(&mut engine, &mut log, Command::resolve_incident(incident));
+    let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool.len(), 1);
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with(tool[0].key, HashMap::new()),
+    );
+    assert!(engine.active_incidents().is_empty());
+    run(
+        &mut engine,
+        &mut log,
+        Command::migrate_instance(inst, target_key, pairs(&[("agent", "agent2")])),
+    );
+    assert_replays(&log, &engine, inst);
+}
+
+#[test]
+fn container_completion_after_collection_rename_raises_a_recoverable_incident() {
+    // Migration renames `outputCollection` BETWEEN agent turns (all tools
+    // drained); the next agent turn signals completion without activating a
+    // tool. Completing must not substitute `[]` for the missing target binding
+    // and discard the collected outputs: it parks a recoverable incident on the
+    // container, and resolving after repair completes with the outputs (#1630
+    // review).
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    deploy(
+        &mut engine,
+        &mut log,
+        adhoc_collecting("src", "agent", "toolA", "results"),
+    );
+    let target_key = deploy(
+        &mut engine,
+        &mut log,
+        adhoc_collecting("tgt", "agent2", "toolA2", "results2"),
+    );
+    let created = run(&mut engine, &mut log, Command::create_instance("src"));
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    let container = agent[0].element_instance_key;
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ),
+    );
+    let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with(
+            tool[0].key,
+            HashMap::from([("result".to_string(), Value::Str("A".to_string()))]),
+        ),
+    );
+    run(
+        &mut engine,
+        &mut log,
+        Command::migrate_instance(inst, target_key, pairs(&[("agent", "agent2")])),
+    );
+    let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    assert_eq!(agent.len(), 1, "the next agent turn is pending");
+    run(
+        &mut engine,
+        &mut log,
+        Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ),
+    );
+    let incident = engine
+        .active_incidents()
+        .into_iter()
+        .find(|i| i.instance_key == inst)
+        .map(|i| (i.key, i.element_instance_key))
+        .unwrap_or_else(|| panic!("a recoverable incident is raised: {:?}", engine.incidents()));
+    assert_eq!(incident.1, container);
+    assert!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .contains_key(&container),
+        "the container is not torn down"
+    );
+    assert_replays(&log, &engine, inst);
+
+    let source = engine
+        .instance(inst)
+        .unwrap()
+        .scope_variables
+        .get(&container)
+        .and_then(|m| m.get("results"))
+        .cloned()
+        .unwrap();
+    run(
+        &mut engine,
+        &mut log,
+        Command::set_variables_scoped(
+            container,
+            HashMap::from([("results2".to_string(), source)]),
+            true,
+        ),
+    );
+    let ev = run(&mut engine, &mut log, Command::resolve_incident(incident.0));
+    assert!(engine.active_incidents().is_empty());
+    let propagated = ev.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results2").cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        propagated,
+        Some(Value::List(vec![Value::Str("A".to_string())])),
+        "the collected outputs propagate on resolution: {ev:?}"
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })),
+        "the instance completes"
+    );
+    assert_replays(&log, &engine, inst);
+}

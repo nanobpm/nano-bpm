@@ -3925,6 +3925,18 @@ impl Engine {
                                 element_id: tool_element_id.clone(),
                                 variables,
                             });
+                        } else if let Some(state::IoMappingRedrive::AdHocContainerCompletion {
+                            cancel,
+                        }) = redrive
+                        {
+                            // A container completion deferred on a missing
+                            // `outputCollection` binding (#1630 review): retry
+                            // the container completion itself.
+                            queue.push_back(Step::CompleteAdHoc {
+                                instance_key,
+                                container_key: element_instance_key,
+                                cancel,
+                            });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
                         }) = &redrive
@@ -4243,6 +4255,15 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                 })),
+                            // Deferred container completion (#1630 review);
+                            // surfaces as `ExpressionEvaluation`, handled above.
+                            Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }) => {
+                                Some(Step::CompleteAdHoc {
+                                    instance_key,
+                                    container_key: element_instance_key,
+                                    cancel,
+                                })
+                            }
                             // Ad-hoc tool job-type failure (#1390): re-activate the
                             // tool with its preserved seed, overlaid with the
                             // operator's post-incident scope corrections (see
@@ -5245,7 +5266,10 @@ impl Engine {
                     .state
                     .incidents
                     .values()
-                    .filter(|i| i.instance_key == instance_key)
+                    .filter(|i| {
+                        i.instance_key == instance_key
+                            && i.state == crate::state::IncidentState::Active
+                    })
                     .filter_map(|i| match &i.redrive {
                         Some(crate::state::IoMappingRedrive::AdHocToolActivation {
                             element_id,
@@ -12670,6 +12694,43 @@ impl Engine {
         // still proceeds — it is the sanctioned way out of a parked container.
         if !cancel && self.adhoc_container_blocked_by_incident(instance_key, container_key) {
             return (Vec::new(), Vec::new());
+        }
+
+        // A MISSING `outputCollection` binding (a migration renamed the
+        // collection while the accumulated list stays under its source name,
+        // #1630 review) must not complete: substituting `[]` would silently
+        // discard every collected output. Defer — before any teardown or
+        // propagation — with a recoverable incident on the container whose
+        // resolution re-drives this completion (same `cancel` flag) once the
+        // operator has repaired the binding. Mirrors the per-tool append guard
+        // in `complete_adhoc_tool`.
+        if let Some(name) = &output_collection {
+            let bound = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.scope_variables.get(&container_key))
+                .is_some_and(|m| m.contains_key(name));
+            if !bound {
+                let incident_key = self.mint_key();
+                return (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key: container_key,
+                        element_id: element_id.clone(),
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }),
+                        reason: format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{element_id}' is not defined: expected an array"
+                        ),
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                );
+            }
         }
 
         // A JOB_WORKER ad-hoc container that is a MULTI-INSTANCE child (its token
