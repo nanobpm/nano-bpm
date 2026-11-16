@@ -154,6 +154,18 @@
           "target_element_id": "call2"
         }
       ],
+      "compensation_migrated": true,
+      "compensation_subscriptions": [
+        {
+          "source_boundary_id": "bA",
+          "source_element_id": "a",
+          "source_element_instance_key": 20,
+          "source_handler": "undoA",
+          "target_boundary_id": "bC",
+          "target_element_id": "c",
+          "target_handler": "undoC"
+        }
+      ],
       "element_mappings": [
         [
           "sub",

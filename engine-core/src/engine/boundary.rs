@@ -186,10 +186,14 @@ impl Engine {
                         .cloned()
                         .unwrap_or_default()
                 });
-                let boundary = wired
-                    .iter()
-                    .position(|(_, h)| h == &target.handler)
-                    .map(|i| wired.remove(i).0);
+                // A subscription that recorded its boundary (#1635) consumes
+                // exactly that one; older records fall back to occurrence order.
+                let boundary = if target.boundary_id.is_empty() {
+                    wired.iter().position(|(_, h)| h == &target.handler)
+                } else {
+                    wired.iter().position(|(b, _)| b == &target.boundary_id)
+                }
+                .map(|i| wired.remove(i).0);
                 if let Some(boundary) = boundary {
                     boundaries.push((boundary, self.mint_key()));
                 }
@@ -228,16 +232,19 @@ impl Engine {
             return Vec::new();
         }
         let explicit: Vec<Event> = self
-            .compensation_handlers_for(instance_key, element_id)
+            .compensation_boundaries_for(instance_key, element_id)
             .into_iter()
-            .map(|handler| Event::CompensationSubscriptionCreated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-                handler,
-                scope,
-                scope_subscription: false,
-            })
+            .map(
+                |(boundary_id, handler)| Event::CompensationSubscriptionCreated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    handler,
+                    scope,
+                    scope_subscription: false,
+                    boundary_id,
+                },
+            )
             .collect();
         if !explicit.is_empty() {
             return explicit;
@@ -292,6 +299,7 @@ impl Engine {
                 handler: String::new(),
                 scope,
                 scope_subscription: true,
+                boundary_id: String::new(),
             })
         } else {
             None

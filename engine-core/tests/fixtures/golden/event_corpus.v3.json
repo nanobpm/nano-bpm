@@ -1750,6 +1750,7 @@
   },
   {
     "CompensationSubscriptionCreated": {
+      "boundary_id": "book-comp",
       "element_id": "book",
       "element_instance_key": 37,
       "handler": "cancel",
@@ -2255,6 +2256,7 @@
   },
   {
     "CompensationSubscriptionCreated": {
+      "boundary_id": "book-comp",
       "element_id": "book",
       "element_instance_key": 48,
       "handler": "cancel",
@@ -2316,6 +2318,7 @@
   },
   {
     "CompensationSubscriptionCreated": {
+      "boundary_id": "",
       "element_id": "sub",
       "element_instance_key": 46,
       "handler": "",
@@ -2814,6 +2817,7 @@
   },
   {
     "CompensationSubscriptionCreated": {
+      "boundary_id": "book-comp",
       "element_id": "book",
       "element_instance_key": 60,
       "handler": "cancel",
@@ -2875,6 +2879,7 @@
   },
   {
     "CompensationSubscriptionCreated": {
+      "boundary_id": "",
       "element_id": "sub",
       "element_instance_key": 58,
       "handler": "",
@@ -3947,6 +3952,8 @@
   {
     "ProcessInstanceMigrated": {
       "child_instances": [],
+      "compensation_migrated": true,
+      "compensation_subscriptions": [],
       "element_mappings": [
         [
           "charge",

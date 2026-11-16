@@ -193,6 +193,37 @@ pub struct MigratedChildInstance {
     pub target_element_id: ElementId,
 }
 
+/// A completed compensable activity's compensation subscription re-pointed by
+/// a migration (#1631, Zeebe `CompensationSubscriptionIntent.MIGRATED`): every
+/// subscription recorded for `source_element_id` now names
+/// `target_element_id` and runs `target_handler` when compensation is thrown.
+/// Scope subscriptions (#901, completed sub-processes) carry an empty handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedCompensationSubscription {
+    pub source_element_id: ElementId,
+    /// The migrated subscription's element instance key, so each plan entry
+    /// names one subscription occurrence (a task with several compensation
+    /// boundaries holds one subscription per boundary).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_element_instance_key: Key,
+    /// The migrated subscription's source handler (empty for a scope
+    /// subscription), identifying which boundary's subscription this is.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_handler: ElementId,
+    /// The migrated subscription's source compensation boundary (empty for a
+    /// scope subscription, or a pre-#1635 subscription recorded without one).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_boundary_id: ElementId,
+    pub target_element_id: ElementId,
+    pub target_handler: ElementId,
+    /// The mapped target compensation boundary the subscription now belongs
+    /// to (empty for a scope subscription), persisted so successive
+    /// migrations and throws keep the boundary identity.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub target_boundary_id: ElementId,
+}
+
 /// The message that triggered a **message start event** (#1300), carried on a
 /// cross-partition [`Event::StartInstanceDispatched`] /
 /// [`crate::Command::DispatchStartInstance`] so the partition that mints the
@@ -1124,6 +1155,18 @@ pub enum Event {
         /// pre-#1580 element-wide merge (one slot per target join element).
         #[cfg_attr(feature = "serde", serde(default))]
         join_scoped: bool,
+        /// The compensation subscriptions re-pointed by this migration
+        /// (#1631). Only applied when `compensation_migrated` is set: such a
+        /// migration also deletes every subscription NOT listed (its
+        /// compensation boundary was left unmapped, Zeebe parity) and remaps
+        /// in-flight compensation waits. Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_subscriptions: Vec<MigratedCompensationSubscription>,
+        /// Whether this migration carries the compensation plan (#1631).
+        /// Additive; a legacy record decodes `false` (pre-#1631 migrations
+        /// rejected every instance holding compensation state).
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_migrated: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification
@@ -1456,6 +1499,13 @@ pub enum Event {
         scope: Key,
         #[cfg_attr(feature = "serde", serde(default))]
         scope_subscription: bool,
+        /// The compensation boundary event this subscription was recorded for
+        /// (#1635), so a throw and a later migration resolve the subscription's
+        /// boundary by identity rather than by occurrence order. Empty for a
+        /// scope subscription. Additive: `serde(default)` decodes older records
+        /// as empty, and resolution falls back to boundary-id occurrence order.
+        #[cfg_attr(feature = "serde", serde(default))]
+        boundary_id: ElementId,
     },
     /// A compensation throw event fired: it consumed the compensable
     /// subscriptions in its `scope` and triggered their handlers. `handlers`

@@ -12467,6 +12467,8 @@ mod element_instance_tests {
                 subscriptions: vec![],
                 child_instances: vec![],
                 join_scoped: true,
+                compensation_subscriptions: vec![],
+                compensation_migrated: true,
             }])
             .unwrap();
 
@@ -12566,6 +12568,8 @@ mod element_instance_tests {
                 subscriptions: vec![],
                 child_instances: vec![],
                 join_scoped: true,
+                compensation_subscriptions: vec![],
+                compensation_migrated: true,
             }])
             .unwrap();
 

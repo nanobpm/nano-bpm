@@ -1495,3 +1495,215 @@ impl Engine {
         blocked
     }
 }
+
+/// The BPMN event type of a boundary event kind (Zeebe `BpmnEventType`), or
+/// `None` for a non-boundary kind.
+fn boundary_event_type(kind: &ElementKind) -> Option<&'static str> {
+    Some(match kind {
+        ElementKind::ErrorBoundaryEvent { .. } => "ERROR",
+        ElementKind::TimerBoundaryEvent { .. } => "TIMER",
+        ElementKind::MessageBoundaryEvent { .. } => "MESSAGE",
+        ElementKind::SignalBoundaryEvent { .. } => "SIGNAL",
+        ElementKind::ConditionalBoundaryEvent { .. } => "CONDITIONAL",
+        ElementKind::EscalationBoundaryEvent { .. } => "ESCALATION",
+        ElementKind::CompensationBoundaryEvent { .. } => "COMPENSATION",
+        _ => return None,
+    })
+}
+
+/// The target boundary's event type when a compensation boundary event is
+/// mapped onto a boundary event of a different type (#1631, Zeebe
+/// `ERROR_BOUNDARY_HAS_WRONG_EVENT_TYPE`); `None` otherwise.
+pub(crate) fn compensation_boundary_type_change(
+    source: &MigrationNode<'_>,
+    target: &MigrationNode<'_>,
+) -> Option<&'static str> {
+    match (source, target) {
+        (MigrationNode::Element(s), MigrationNode::Element(t))
+            if matches!(s.kind, ElementKind::CompensationBoundaryEvent { .. }) =>
+        {
+            boundary_event_type(&t.kind).filter(|ty| *ty != "COMPENSATION")
+        }
+        _ => None,
+    }
+}
+
+/// The compensation boundary events attached to `activity_id` (sorted by id).
+fn compensation_boundaries_of<'a>(
+    def: &'a ProcessDefinition,
+    activity_id: &str,
+) -> Vec<&'a Element> {
+    let mut boundaries: Vec<&Element> = def
+        .elements
+        .values()
+        .filter(|e| {
+            matches!(&e.kind, ElementKind::CompensationBoundaryEvent { attached_to, .. }
+                if attached_to == activity_id)
+        })
+        .collect();
+    boundaries.sort_by(|a, b| a.id.cmp(&b.id));
+    boundaries
+}
+
+/// Plans the migration of an instance's compensation subscriptions (#1631,
+/// Zeebe `ProcessInstanceMigrationCatchEventBehavior#handleCompensationCatchEvents`).
+///
+/// For every completed compensable task whose compensation boundary event is
+/// mapped, the task maps onto the activity the target boundary is attached to,
+/// and each enclosing flow scope maps level by level onto the target's (so the
+/// #901 scope subscriptions of completed sub-processes follow). A level where
+/// one side reaches the process root before the other is rejected
+/// ([`EngineError::MigrationCompensationFlowScopeChanged`]). Subscriptions not
+/// covered by the derived mapping are deleted by the applier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_compensation_migration(
+    instance_key: Key,
+    source_process_id: &str,
+    target_process_id: &str,
+    source_def: &ProcessDefinition,
+    target_def: &ProcessDefinition,
+    mapped: &HashMap<String, String>,
+    compensable: &[state::CompensationSubscription],
+) -> Result<Vec<crate::event::MigratedCompensationSubscription>, EngineError> {
+    // Boundary subscriptions are planned per boundary occurrence: every
+    // compensation boundary of an activity records its own subscription (its
+    // own handler), so each follows only its OWN boundary's mapping and takes
+    // that mapped boundary's handler. Duplicate `(instance, handler)` pairs
+    // (several boundaries sharing one handler) pair up with those boundaries
+    // in boundary-id order. Explicit sub-process subscriptions are boundary
+    // subscriptions too.
+    let mut scope_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut occurrence: HashMap<(Key, &str), usize> = HashMap::new();
+    // Loops / multi-instance bodies accumulate many subscriptions per
+    // activity: scan the model once per source activity and validate each
+    // (source activity, target activity) pair once.
+    let mut boundaries_by_activity: HashMap<&str, Vec<&Element>> = HashMap::new();
+    let mut validated: HashSet<(&str, String)> = HashSet::new();
+    for sub in compensable.iter().filter(|c| !c.scope_subscription) {
+        let occ = occurrence
+            .entry((sub.element_instance_key, sub.handler.as_str()))
+            .or_insert(0);
+        let index = *occ;
+        *occ += 1;
+        // A subscription that recorded its boundary (#1635) resolves it by
+        // identity — stable across successive migrations; an older record
+        // falls back to boundary-id occurrence order among same-handler
+        // boundaries.
+        let source_boundaries = boundaries_by_activity
+            .entry(sub.element_id.as_str())
+            .or_insert_with(|| compensation_boundaries_of(source_def, &sub.element_id));
+        let source_boundary = if sub.boundary_id.is_empty() {
+            source_boundaries
+                .iter()
+                .copied()
+                .filter(|b| {
+                    matches!(&b.kind, ElementKind::CompensationBoundaryEvent { handler, .. }
+                        if *handler == sub.handler)
+                })
+                .nth(index)
+        } else {
+            source_boundaries
+                .iter()
+                .copied()
+                .find(|b| b.id == sub.boundary_id)
+        };
+        let Some(source_boundary) = source_boundary else {
+            continue;
+        };
+        let Some(target_boundary) = mapped
+            .get(&source_boundary.id)
+            .and_then(|tb| target_def.element(tb))
+        else {
+            continue;
+        };
+        let ElementKind::CompensationBoundaryEvent {
+            attached_to: target_activity,
+            handler: target_handler,
+        } = &target_boundary.kind
+        else {
+            continue;
+        };
+        // The completed activity follows its mapped boundary, so it gets the
+        // same catch-event preconditions as an active element (#1635): an
+        // explicit activity mapping must agree with the boundary's
+        // attachment, and no two source boundaries may merge onto one target
+        // boundary (that would run its handler twice). Validated against
+        // DEFINITION boundary ids, so repeated occurrences of one source
+        // boundary (multi-instance bodies, loops) stay allowed.
+        let activity_target = mapped
+            .get(&sub.element_id)
+            .map_or(target_activity.as_str(), String::as_str);
+        if validated.insert((sub.element_id.as_str(), activity_target.to_string())) {
+            Engine::check_migrated_catch_events(
+                instance_key,
+                source_def,
+                target_def,
+                mapped,
+                &sub.element_id,
+                activity_target,
+            )?;
+        }
+        out.push(crate::event::MigratedCompensationSubscription {
+            source_element_id: sub.element_id.clone(),
+            source_element_instance_key: sub.element_instance_key,
+            source_handler: sub.handler.clone(),
+            source_boundary_id: sub.boundary_id.clone(),
+            target_element_id: target_activity.clone(),
+            target_handler: target_handler.clone(),
+            target_boundary_id: target_boundary.id.clone(),
+        });
+        let source_chain = super::flow_scope::element_flow_scope_chain(source_def, &sub.element_id);
+        let target_chain = super::flow_scope::element_flow_scope_chain(target_def, target_activity);
+        for level in 0..source_chain.len().max(target_chain.len()) {
+            match (source_chain.get(level), target_chain.get(level)) {
+                (Some(s), Some(t)) => {
+                    // A derived scope mapping must agree with an explicit
+                    // mapping instruction for that scope and with every
+                    // earlier derivation: otherwise a scope subscription (whose
+                    // numeric scope key is preserved) would run its nested
+                    // handlers under the wrong target scope.
+                    let conflicts = mapped.get(s).is_some_and(|m| m != t)
+                        || scope_map.get(s).is_some_and(|prev| prev != t);
+                    if conflicts {
+                        return Err(EngineError::MigrationCompensationFlowScopeChanged {
+                            instance_key,
+                            process_id: source_process_id.to_string(),
+                            source_flow_scope_id: s.clone(),
+                            target_flow_scope_id: t.clone(),
+                        });
+                    }
+                    scope_map.insert(s.clone(), t.clone());
+                }
+                (s, t) => {
+                    return Err(EngineError::MigrationCompensationFlowScopeChanged {
+                        instance_key,
+                        process_id: source_process_id.to_string(),
+                        source_flow_scope_id: s
+                            .cloned()
+                            .unwrap_or_else(|| source_process_id.to_string()),
+                        target_flow_scope_id: t
+                            .cloned()
+                            .unwrap_or_else(|| target_process_id.to_string()),
+                    })
+                }
+            }
+        }
+    }
+    // Handlerless scope subscriptions (#901) follow the flow scope of a
+    // migrated nested subscription.
+    for sub in compensable.iter().filter(|c| c.scope_subscription) {
+        if let Some(target) = scope_map.get(&sub.element_id) {
+            out.push(crate::event::MigratedCompensationSubscription {
+                source_element_id: sub.element_id.clone(),
+                source_element_instance_key: sub.element_instance_key,
+                source_handler: sub.handler.clone(),
+                source_boundary_id: String::new(),
+                target_element_id: target.clone(),
+                target_handler: sub.handler.clone(),
+                target_boundary_id: String::new(),
+            });
+        }
+    }
+    Ok(out)
+}

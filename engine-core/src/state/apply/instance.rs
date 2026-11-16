@@ -385,6 +385,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             target_process_definition_key,
             element_mappings,
             join_scoped,
+            compensation_subscriptions,
+            compensation_migrated,
             ..
         } => {
             let remap: HashMap<&str, &str> = element_mappings
@@ -453,6 +455,58 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 }
             }
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                // Compensation (#1631): re-point every subscription the
+                // migration planned, delete the rest (their compensation
+                // boundary was unmapped, Zeebe parity), and re-point in-flight
+                // throws at their mapped throw / handler elements. A legacy
+                // record never carried compensation state (it was rejected).
+                if *compensation_migrated {
+                    // One plan entry per subscription occurrence, keyed by
+                    // (element instance, element, source handler, source boundary id);
+                    // duplicates
+                    // (boundaries sharing a handler) are consumed one each.
+                    let mut plan: HashMap<
+                        (Key, &str, &str, &str),
+                        std::collections::VecDeque<&crate::event::MigratedCompensationSubscription>,
+                    > = HashMap::new();
+                    for c in compensation_subscriptions {
+                        plan.entry((
+                            c.source_element_instance_key,
+                            c.source_element_id.as_str(),
+                            c.source_handler.as_str(),
+                            c.source_boundary_id.as_str(),
+                        ))
+                        .or_default()
+                        .push_back(c);
+                    }
+                    let mut migrated = Vec::new();
+                    for c in instance.compensable.iter() {
+                        let m = plan
+                            .get_mut(&(
+                                c.element_instance_key,
+                                c.element_id.as_str(),
+                                c.handler.as_str(),
+                                c.boundary_id.as_str(),
+                            ))
+                            .and_then(|q| q.pop_front());
+                        if let Some(m) = m {
+                            let mut c = c.clone();
+                            c.element_id = m.target_element_id.clone();
+                            if !c.scope_subscription {
+                                c.handler = m.target_handler.clone();
+                                c.boundary_id = m.target_boundary_id.clone();
+                            }
+                            migrated.push(c);
+                        }
+                    }
+                    instance.compensable = migrated.into();
+                    for wait in instance.compensation_waits.values_mut() {
+                        remap_id(&mut wait.throw_element_id);
+                        for handler in &mut wait.pending_handlers {
+                            remap_id(handler);
+                        }
+                    }
+                }
                 instance.process_id = target_process_id.clone();
                 // Re-pin the instance to the target definition's version so
                 // `definition_for` resolves execution against the migrated-to

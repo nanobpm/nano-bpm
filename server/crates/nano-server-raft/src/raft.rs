@@ -446,7 +446,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::TargetProcessDefinitionNotFound { .. } => (404, e.to_string()),
         E::DuplicateMappingSourceElement { .. }
         | E::MappingSourceElementNotFound { .. }
-        | E::MappingTargetElementNotFound { .. } => (400, e.to_string()),
+        | E::MappingTargetElementNotFound { .. }
+        // Zeebe INVALID_ARGUMENT (#1631).
+        | E::MigrationCompensationBoundaryTypeChanged { .. } => (400, e.to_string()),
         E::UnmappedActiveElement { .. }
         | E::MappedElementTypeChanged { .. }
         | E::MigratedParallelJoinArityChanged { .. }
@@ -472,6 +474,8 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::MigrationLoopCharacteristicsChanged { .. }
         | E::MigrationCatchEventDetached { .. }
         | E::MigrationCatchEventsMerged { .. }
+        // Zeebe INVALID_STATE (#1631).
+        | E::MigrationCompensationFlowScopeChanged { .. }
         // A target catch event whose subscription expression fails to evaluate
         // (Zeebe `ProcessInstanceMigrationCatchEventBehaviour`, INVALID_STATE).
         | E::MigrationCatchEventSubscriptionFailed { .. } => (409, e.to_string()),
@@ -4219,6 +4223,25 @@ mod tests {
                     element_id: "a".into(),
                     target_catch_event_id: "t2".into(),
                     source_catch_event_ids: vec!["t1".into(), "t1b".into()],
+                },
+                409,
+            ),
+            (
+                E::MigrationCompensationBoundaryTypeChanged {
+                    instance_key: 1,
+                    process_id: "p".into(),
+                    source_boundary_id: "b1".into(),
+                    target_boundary_id: "b2".into(),
+                    target_event_type: "TIMER",
+                },
+                400,
+            ),
+            (
+                E::MigrationCompensationFlowScopeChanged {
+                    instance_key: 1,
+                    process_id: "p".into(),
+                    source_flow_scope_id: "p".into(),
+                    target_flow_scope_id: "sub".into(),
                 },
                 409,
             ),

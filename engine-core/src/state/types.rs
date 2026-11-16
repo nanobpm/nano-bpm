@@ -1136,6 +1136,7 @@ mod compensation_subscriptions_tests {
             handler: "h".to_string(),
             scope,
             scope_subscription: false,
+            boundary_id: String::new(),
         }
     }
 
@@ -1219,6 +1220,11 @@ pub struct CompensationSubscription {
     /// snapshots as `false` — every pre-#901 subscription was a boundary one.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_subscription: bool,
+    /// The compensation boundary event this subscription belongs to (#1635);
+    /// empty for a scope subscription or a pre-#1635 snapshot (resolution
+    /// then falls back to boundary-id occurrence order).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub boundary_id: ElementId,
 }
 
 /// A compensation throw event's outstanding wait: the handler activities it

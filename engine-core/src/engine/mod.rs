@@ -5137,6 +5137,19 @@ impl Engine {
                                 element_id: tgt.clone(),
                             }
                         })?;
+                    // A compensation boundary mapped onto a boundary of another
+                    // event type gets Zeebe's dedicated rejection (#1631).
+                    if let Some(target_event_type) =
+                        migration::compensation_boundary_type_change(&src_el, &tgt_el)
+                    {
+                        return Err(EngineError::MigrationCompensationBoundaryTypeChanged {
+                            instance_key,
+                            process_id: source_process_id.clone(),
+                            source_boundary_id: src.clone(),
+                            target_boundary_id: tgt.clone(),
+                            target_event_type,
+                        });
+                    }
                     if !src_el.same_type_as(&source_def.definition, &tgt_el, &target.definition) {
                         return Err(EngineError::MappedElementTypeChanged {
                             instance_key,
@@ -5201,34 +5214,23 @@ impl Engine {
                     }
                 }
 
-                //    Compensation runtime (`compensable` / `compensation_waits`)
-                //    is keyed by source element ids (activity, handler, throw)
-                //    the applier does not remap: a migrated in-flight throw
-                //    would never be released by its renamed handler. Fail
-                //    closed until supported.
-                let mut compensation_refs: Vec<String> = instance
-                    .compensable
-                    .iter()
-                    .map(|c| c.element_id.clone())
-                    .chain(
-                        instance
-                            .compensation_waits
-                            .values()
-                            .map(|w| w.throw_element_id.clone()),
-                    )
-                    .collect();
-                compensation_refs.sort();
-                if let Some(element_id) = compensation_refs.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "instances with compensation subscriptions or an \
-                                 in-flight compensation are not migratable yet"
-                            .to_string(),
-                    });
-                }
+                // 4a. Compensation subscriptions (#1631, Zeebe
+                //     `ProcessInstanceMigrationCatchEventBehavior`): a completed
+                //     compensable activity whose compensation boundary is mapped
+                //     follows it (with its flow-scope chain) to the target; an
+                //     unmapped one is deleted. In-flight waits are keyed by
+                //     active elements, which the general mapping re-points.
+                let compensation_subscriptions = migration::plan_compensation_migration(
+                    instance_key,
+                    &source_process_id,
+                    &target_process_id,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &instance.compensable,
+                )?;
 
-                // 4a. Event-based gateway races (#1554): validate where mapped
+                // 4b. Event-based gateway races (#1554): validate where mapped
                 //     catch events land and collect unmapped race members to
                 //     withdraw (exempt from the step-5 mapping requirement).
                 let withdrawn = Self::check_migrated_event_gateway_races(
@@ -5241,7 +5243,7 @@ impl Engine {
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
-                // 4b. Event sub-process triggers (#1555) rest on their host
+                // 4c. Event sub-process triggers (#1555) rest on their host
                 //     *scope*, not on an active element: they are reconciled
                 //     per scope against the target by `plan_migration`
                 //     (`plan_event_subprocess_migration`, #1379).
@@ -5641,6 +5643,8 @@ impl Engine {
                         subscriptions: plan.subscriptions,
                         child_instances: plan.child_instances,
                         join_scoped: true,
+                        compensation_subscriptions,
+                        compensation_migrated: true,
                     },
                 );
                 // Refresh each ad-hoc container's advertised tool catalog
@@ -17702,9 +17706,8 @@ pub enum EngineError {
         flow_index: usize,
     },
     /// A `MigrateInstance` targeted an instance that contains an active element
-    /// class this phase does not yet support migrating (event subprocesses,
-    /// multi-instance bodies, ad-hoc sub-processes, compensation runtime,
-    /// event-based-gateway catch events). Maps to HTTP 409. Zeebe itself
+    /// class this phase does not yet support migrating (currently none is
+    /// listed in `unsupported_migration_reason`). Maps to HTTP 409. Zeebe itself
     /// rejects several of these as "not supported yet"; reproducing the
     /// rejection is parity.
     UnsupportedMigration {
@@ -17816,6 +17819,32 @@ pub enum EngineError {
         element_id: String,
         target_catch_event_id: String,
         source_catch_event_ids: Vec<String>,
+    },
+    /// A migration mapped a compensation boundary event onto a target boundary
+    /// event of a different event type (#1631). HTTP 400. Zeebe
+    /// `ERROR_BOUNDARY_HAS_WRONG_EVENT_TYPE` (INVALID_ARGUMENT).
+    MigrationCompensationBoundaryTypeChanged {
+        instance_key: Key,
+        /// The source process id (Zeebe names it in the message).
+        process_id: String,
+        source_boundary_id: String,
+        target_boundary_id: String,
+        /// The target boundary's event type, e.g. `TIMER`.
+        target_event_type: &'static str,
+    },
+    /// A migrated compensation subscription's compensable activity would sit
+    /// at a different flow-scope depth in the target (#1631). HTTP 409. Zeebe
+    /// `ERROR_COMPENSATION_SUBSCRIPTION_FLOW_SCOPE_CHANGED` (INVALID_STATE).
+    MigrationCompensationFlowScopeChanged {
+        instance_key: Key,
+        /// The source process id (Zeebe names it in the message).
+        process_id: String,
+        /// The source-side flow scope at the level that diverged (the process
+        /// id when the source reached the root first).
+        source_flow_scope_id: String,
+        /// The target-side flow scope at that level (the target process id
+        /// when the target reached the root first).
+        target_flow_scope_id: String,
     },
     /// A target catch event the migrated element must subscribe to has an
     /// expression (message / signal name, correlation key, timer) that fails
@@ -18069,6 +18098,14 @@ impl std::fmt::Display for EngineError {
             EngineError::MigrationCatchEventSubscriptionFailed { instance_key, element_id, target_element_id, reason } => write!(
                 f,
                 "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to element with id '{target_element_id}' that must be subscribed to a catch event. {reason}"
+            ),
+            EngineError::MigrationCompensationBoundaryTypeChanged { process_id, source_boundary_id, target_boundary_id, target_event_type, .. } => write!(
+                f,
+                "Expected to migrate process instance with id '{process_id}' but compensation boundary event '{source_boundary_id}' is mapped to a target boundary event '{target_boundary_id}' that has event type '{target_event_type}' different than compensation boundary event type."
+            ),
+            EngineError::MigrationCompensationFlowScopeChanged { process_id, source_flow_scope_id, target_flow_scope_id, .. } => write!(
+                f,
+                "Expected to migrate process instance with id '{process_id}' but the flow scope of compensation boundary event is changed. Flow scope '{source_flow_scope_id}' is not in the same level as '{target_flow_scope_id}'. The flow scope of a compensation boundary event cannot be changed during migration yet."
             ),
             EngineError::MigrationCatchEventsMerged { instance_key, element_id, target_catch_event_id, source_catch_event_ids } => write!(
                 f,
@@ -18548,6 +18585,8 @@ impl EngineError {
             | EngineError::MigrationLoopCharacteristicsChanged { .. }
             | EngineError::MigrationCatchEventDetached { .. }
             | EngineError::MigrationCatchEventsMerged { .. }
+            | EngineError::MigrationCompensationBoundaryTypeChanged { .. }
+            | EngineError::MigrationCompensationFlowScopeChanged { .. }
             | EngineError::MigrationCatchEventSubscriptionFailed { .. }
             | EngineError::AgentInstanceNotFound { .. }
             | EngineError::AgentInstanceElementInstanceInactive { .. }

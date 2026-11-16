@@ -26,6 +26,7 @@ mod join_scopes;
 mod lifecycle;
 mod listeners;
 mod migration;
+mod migration_compensation;
 mod migration_event_gateway;
 mod migration_mi_adhoc;
 mod migration_scopes;
