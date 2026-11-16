@@ -3942,6 +3942,50 @@ pub fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) ->
 /// unaffected). `type_name()` hard-codes both to `INTERMEDIATE_THROW_EVENT`; a
 /// terminal (no-outgoing-flow) throw is an end event, so classify it as
 /// `END_EVENT` here (#917, #1173). Every other kind passes through unchanged.
+/// Every `(element_id, element_type, element_name)` row a deployed definition
+/// contributes to `definition_elements` — the single derivation shared by the
+/// deploy projection and the snapshot rebuild. Besides `def.elements` it
+/// covers the ad-hoc catalog tools (pruned from the executable graph) and each
+/// container's synthetic `<container>#innerInstance`, so a migration whose
+/// derived mapping targets either resolves its metadata (#1630 review).
+fn definition_element_rows(
+    def: &nanobpmn_engine_core::ProcessDefinition,
+) -> Vec<(String, String, Option<String>)> {
+    let mut rows: Vec<(String, String, Option<String>)> = def
+        .elements
+        .iter()
+        .map(|(id, el)| {
+            (
+                id.clone(),
+                element_type_name(el).to_string(),
+                el.name.clone(),
+            )
+        })
+        .collect();
+    for ad in &def.adhoc {
+        rows.push((
+            nanobpmn_engine_core::adhoc_inner_instance_id(&ad.container_id),
+            "AD_HOC_SUB_PROCESS_INNER_INSTANCE".to_string(),
+            None,
+        ));
+        for tool in &ad.tools {
+            if def.elements.contains_key(&tool.element_id) {
+                continue;
+            }
+            let ty = match tool.kind {
+                nanobpmn_engine_core::AdHocToolKind::ServiceTask { .. } => "SERVICE_TASK",
+                nanobpmn_engine_core::AdHocToolKind::UserTask(_) => "USER_TASK",
+                nanobpmn_engine_core::AdHocToolKind::CallActivity { .. } => "CALL_ACTIVITY",
+                nanobpmn_engine_core::AdHocToolKind::SubProcess { .. } => "SUB_PROCESS",
+                nanobpmn_engine_core::AdHocToolKind::Other => "UNKNOWN",
+            };
+            let name = (!tool.name.is_empty()).then(|| tool.name.clone());
+            rows.push((tool.element_id.clone(), ty.to_string(), name));
+        }
+    }
+    rows
+}
+
 fn element_type_name(element: &nanobpmn_engine_core::Element) -> &'static str {
     match element.kind {
         nanobpmn_engine_core::ElementKind::CompensationThrowEvent
@@ -4191,18 +4235,13 @@ fn project_engine_state(
                 def.start_form_id.as_ref()
             ],
         )?;
-        for (element_id, element) in &def.elements {
+        for (element_id, element_type, element_name) in definition_element_rows(def) {
             tx.cexecute(
                 "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(process_definition_key, element_id) DO UPDATE SET \
                  element_type = excluded.element_type, element_name = excluded.element_name",
-                params![
-                    deployed.key as i64,
-                    element_id,
-                    element_type_name(element),
-                    element.name.as_ref(),
-                ],
+                params![deployed.key as i64, element_id, element_type, element_name],
             )?;
         }
     }
@@ -5030,7 +5069,7 @@ fn project_event(
             // id): the per-element lifecycle events carry only an element id, so
             // the element-instance read model resolves `type`/`elementName` here,
             // from the deployed model (the single source of truth).
-            for (element_id, element) in &process.elements {
+            for (element_id, element_type, element_name) in definition_element_rows(process) {
                 tx.cexecute(
                     "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
                      VALUES (?1, ?2, ?3, ?4) \
@@ -5039,8 +5078,8 @@ fn project_event(
                     params![
                         *process_definition_key as i64,
                         element_id,
-                        element_type_name(element),
-                        element.name.as_ref(),
+                        element_type,
+                        element_name
                     ],
                 )?;
             }
@@ -16596,5 +16635,133 @@ mod job_position_gate_tests {
         assert_eq!(r.state, JobState::Activated);
         assert_eq!(r.worker.as_deref(), Some("w2"));
         assert_eq!(r.deadline_ms, Some(20_000));
+    }
+}
+
+#[cfg(test)]
+mod adhoc_migration_export_tests {
+    use std::collections::HashMap;
+
+    use nanobpmn_engine_core::{
+        AdHocActivateElement, AdHocJobResult, Command, Engine, Event, ProcessDefinition,
+        bpmn::parse_bpmn,
+    };
+
+    use super::ReadStore;
+
+    fn adhoc(process: &str, container: &str, tool_a: &str, tool_b: &str) -> ProcessDefinition {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+          <bpmn:process id="{process}">
+            <bpmn:startEvent id="s" />
+            <bpmn:adHocSubProcess id="{container}">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="agent-worker" />
+                <zeebe:adHoc outputCollection="results" outputElement="=result" />
+              </bpmn:extensionElements>
+              <bpmn:serviceTask id="{tool_a}" name="Tool A">
+                <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="{tool_b}">
+                <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+            </bpmn:adHocSubProcess>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="{container}" />
+            <bpmn:sequenceFlow id="f2" sourceRef="{container}" targetRef="e" />
+          </bpmn:process>
+        </bpmn:definitions>"#
+        );
+        parse_bpmn(&xml).unwrap().remove(0)
+    }
+
+    fn deployed_key(events: &[Event]) -> u64 {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed {
+                    process_definition_key,
+                    ..
+                } => Some(*process_definition_key),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The complete journal of a mid-flight ad-hoc migration (renamed
+    /// container + tools, an active tool and its synthetic inner instance)
+    /// exports through `ReadStore` (#1630 review): every derived mapping
+    /// target resolves its `definition_elements` metadata, and the projected
+    /// `adHocSubProcessElements` variable advertises the TARGET tool ids.
+    #[test]
+    fn adhoc_migration_journal_exports_and_projects_refreshed_catalog() {
+        let mut engine = Engine::new();
+        let mut log: Vec<Event> = Vec::new();
+        let ev = engine
+            .apply_command(Command::DeployProcess(adhoc(
+                "src", "agent", "toolA", "toolB",
+            )))
+            .unwrap();
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::DeployProcess(adhoc(
+                "tgt", "agent2", "toolA2", "toolB2",
+            )))
+            .unwrap();
+        let target_key = deployed_key(&ev);
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::create_instance("src"))
+            .unwrap();
+        let inst = ev.iter().find_map(|e| e.instance_key()).unwrap();
+        log.extend(ev);
+        let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+        let ev = engine
+            .apply_command(Command::complete_job_with_result(
+                agent[0].key,
+                HashMap::new(),
+                AdHocJobResult {
+                    activate_elements: vec![AdHocActivateElement {
+                        element_id: "toolA".to_string(),
+                        variables: HashMap::new(),
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![
+                    ("agent".to_string(), "agent2".to_string()),
+                    ("toolA".to_string(), "toolA2".to_string()),
+                    ("toolB".to_string(), "toolB2".to_string()),
+                ],
+            ))
+            .unwrap();
+        log.extend(ev);
+
+        let store = ReadStore::open(None).unwrap();
+        let refs: Vec<&Event> = log.iter().collect();
+        store.export(&refs).unwrap();
+
+        let catalog = store
+            .instance_variables(inst)
+            .into_iter()
+            .find(|v| v.name == "adHocSubProcessElements")
+            .expect("catalog variable projected");
+        assert!(
+            catalog.value.contains("toolA2") && catalog.value.contains("toolB2"),
+            "projected catalog advertises target ids: {}",
+            catalog.value
+        );
+        assert!(
+            !catalog.value.contains("\"toolA\""),
+            "no stale source id: {}",
+            catalog.value
+        );
     }
 }

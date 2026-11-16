@@ -1076,11 +1076,10 @@ fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
 }
 
 #[test]
-fn migration_rejects_active_multi_instance_body() {
-    // An active parallel multi-instance body keeps per-element bookkeeping in
-    // `ProcessInstance.multi_instances` that this phase does not remap, so
-    // migration is rejected as "not supported yet" (Zeebe parity), matching the
-    // boundary-event rejection above.
+fn migration_accepts_active_multi_instance_body() {
+    // An active parallel multi-instance body is migratable (#1630, Zeebe
+    // `MigrateParallelMultiInstanceBodyTest`): its `multi_instances`
+    // bookkeeping is re-pointed onto the target element.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(multi_instance_service_process(
@@ -1118,18 +1117,19 @@ fn migration_rejects_active_multi_instance_body() {
             Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
         )]),
     );
-    let err = engine
+    engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
             vec![("each".to_string(), "each".to_string())],
         ))
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        EngineError::UnsupportedMigration { element_id, reason, .. }
-            if element_id == "each" && reason.contains("multi-instance")
-    ));
+        .unwrap();
+    let live = engine.instance(inst).unwrap();
+    assert_eq!(live.process_id, "mi-target");
+    assert!(live
+        .multi_instances
+        .values()
+        .all(|mi| mi.element_id == "each"));
 }
 
 #[test]
