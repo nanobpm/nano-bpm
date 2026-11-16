@@ -102,7 +102,11 @@ fn start(engine: &mut Engine, log: &mut Vec<Event>, process: &str) -> Key {
 }
 
 fn complete(engine: &mut Engine, log: &mut Vec<Event>, job_type: &str) {
-    let job = engine.activate_jobs(job_type, "w", 1, 60_000, 0)[0].key;
+    let job = engine
+        .activate_jobs(job_type, "w", 1, 60_000, 0)
+        .first()
+        .unwrap_or_else(|| panic!("expected an activatable job of type {job_type}"))
+        .key;
     log.extend(engine.apply_command(Command::complete_job(job)).unwrap());
 }
 
@@ -724,7 +728,11 @@ fn successive_migrations_keep_the_subscriptions_boundary_identity() {
     assert_replays(&log, &engine, inst);
 
     // The throw journals the lifecycle of the subscription's OWN boundary.
-    let job = engine.activate_jobs("next", "w", 1, 60_000, 0)[0].key;
+    let job = engine
+        .activate_jobs("next", "w", 1, 60_000, 0)
+        .first()
+        .expect("expected an activatable job of type next")
+        .key;
     let events = engine.apply_command(Command::complete_job(job)).unwrap();
     let activated: Vec<&str> = events
         .iter()

@@ -462,7 +462,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // record never carried compensation state (it was rejected).
                 if *compensation_migrated {
                     // One plan entry per subscription occurrence, keyed by
-                    // (element instance, element, source handler); duplicates
+                    // (element instance, element, source handler, source boundary id);
+                    // duplicates
                     // (boundaries sharing a handler) are consumed one each.
                     let mut plan: HashMap<
                         (Key, &str, &str, &str),

@@ -5214,7 +5214,7 @@ impl Engine {
                     }
                 }
 
-                // 4b. Compensation subscriptions (#1631, Zeebe
+                // 4a. Compensation subscriptions (#1631, Zeebe
                 //     `ProcessInstanceMigrationCatchEventBehavior`): a completed
                 //     compensable activity whose compensation boundary is mapped
                 //     follows it (with its flow-scope chain) to the target; an
@@ -5230,7 +5230,7 @@ impl Engine {
                     &instance.compensable,
                 )?;
 
-                // 4a. Event-based gateway races (#1554): validate where mapped
+                // 4b. Event-based gateway races (#1554): validate where mapped
                 //     catch events land and collect unmapped race members to
                 //     withdraw (exempt from the step-5 mapping requirement).
                 let withdrawn = Self::check_migrated_event_gateway_races(
@@ -5243,7 +5243,7 @@ impl Engine {
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
-                // 4b. Event sub-process triggers (#1555) rest on their host
+                // 4c. Event sub-process triggers (#1555) rest on their host
                 //     *scope*, not on an active element: they are reconciled
                 //     per scope against the target by `plan_migration`
                 //     (`plan_event_subprocess_migration`, #1379).
