@@ -193,6 +193,19 @@ pub struct MigratedChildInstance {
     pub target_element_id: ElementId,
 }
 
+/// A completed compensable activity's compensation subscription re-pointed by
+/// a migration (#1631, Zeebe `CompensationSubscriptionIntent.MIGRATED`): every
+/// subscription recorded for `source_element_id` now names
+/// `target_element_id` and runs `target_handler` when compensation is thrown.
+/// Scope subscriptions (#901, completed sub-processes) carry an empty handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedCompensationSubscription {
+    pub source_element_id: ElementId,
+    pub target_element_id: ElementId,
+    pub target_handler: ElementId,
+}
+
 /// The message that triggered a **message start event** (#1300), carried on a
 /// cross-partition [`Event::StartInstanceDispatched`] /
 /// [`crate::Command::DispatchStartInstance`] so the partition that mints the
@@ -1124,6 +1137,18 @@ pub enum Event {
         /// pre-#1580 element-wide merge (one slot per target join element).
         #[cfg_attr(feature = "serde", serde(default))]
         join_scoped: bool,
+        /// The compensation subscriptions re-pointed by this migration
+        /// (#1631). Only applied when `compensation_migrated` is set: such a
+        /// migration also deletes every subscription NOT listed (its
+        /// compensation boundary was left unmapped, Zeebe parity) and remaps
+        /// in-flight compensation waits. Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_subscriptions: Vec<MigratedCompensationSubscription>,
+        /// Whether this migration carries the compensation plan (#1631).
+        /// Additive; a legacy record decodes `false` (pre-#1631 migrations
+        /// rejected every instance holding compensation state).
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_migrated: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification

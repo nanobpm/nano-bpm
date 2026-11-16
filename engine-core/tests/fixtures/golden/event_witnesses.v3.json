@@ -154,6 +154,14 @@
           "target_element_id": "call2"
         }
       ],
+      "compensation_migrated": true,
+      "compensation_subscriptions": [
+        {
+          "source_element_id": "a",
+          "target_element_id": "c",
+          "target_handler": "undoC"
+        }
+      ],
       "element_mappings": [
         [
           "sub",

@@ -64,10 +64,10 @@ use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance,
-    MigratedSubscription, MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder,
-    ProcessDefinition, SubscriptionMigrationAction, Value, VariableInstruction,
-    SNAPSHOT_FORMAT_VERSION,
+    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance,
+    MigratedCompensationSubscription, MigratedElementInstance, MigratedSubscription,
+    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
+    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -1010,6 +1010,12 @@ fn build_event_witnesses() -> Vec<Event> {
                 target_element_id: "call2".to_string(),
             }],
             join_scoped: true,
+            compensation_subscriptions: vec![MigratedCompensationSubscription {
+                source_element_id: "a".to_string(),
+                target_element_id: "c".to_string(),
+                target_handler: "undoC".to_string(),
+            }],
+            compensation_migrated: true,
         },
         // The #1181 settlement-ledger frame (additive variant, no version bump).
         Event::JobSettlementRecorded {
@@ -1140,6 +1146,8 @@ fn pre_1374_migrated_record_decodes_with_defaults() {
             subscriptions: vec![],
             child_instances: vec![],
             join_scoped: false,
+            compensation_subscriptions: vec![],
+            compensation_migrated: false,
         }
     );
 }

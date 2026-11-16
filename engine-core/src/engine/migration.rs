@@ -1495,3 +1495,137 @@ impl Engine {
         blocked
     }
 }
+
+/// The BPMN event type of a boundary event kind (Zeebe `BpmnEventType`), or
+/// `None` for a non-boundary kind.
+fn boundary_event_type(kind: &ElementKind) -> Option<&'static str> {
+    Some(match kind {
+        ElementKind::ErrorBoundaryEvent { .. } => "ERROR",
+        ElementKind::TimerBoundaryEvent { .. } => "TIMER",
+        ElementKind::MessageBoundaryEvent { .. } => "MESSAGE",
+        ElementKind::SignalBoundaryEvent { .. } => "SIGNAL",
+        ElementKind::ConditionalBoundaryEvent { .. } => "CONDITIONAL",
+        ElementKind::EscalationBoundaryEvent { .. } => "ESCALATION",
+        ElementKind::CompensationBoundaryEvent { .. } => "COMPENSATION",
+        _ => return None,
+    })
+}
+
+/// The target boundary's event type when a compensation boundary event is
+/// mapped onto a boundary event of a different type (#1631, Zeebe
+/// `ERROR_BOUNDARY_HAS_WRONG_EVENT_TYPE`); `None` otherwise.
+pub(crate) fn compensation_boundary_type_change(
+    source: &MigrationNode<'_>,
+    target: &MigrationNode<'_>,
+) -> Option<&'static str> {
+    match (source, target) {
+        (MigrationNode::Element(s), MigrationNode::Element(t))
+            if matches!(s.kind, ElementKind::CompensationBoundaryEvent { .. }) =>
+        {
+            boundary_event_type(&t.kind).filter(|ty| *ty != "COMPENSATION")
+        }
+        _ => None,
+    }
+}
+
+/// The compensation boundary events attached to `activity_id` (sorted by id).
+fn compensation_boundaries_of<'a>(
+    def: &'a ProcessDefinition,
+    activity_id: &str,
+) -> Vec<&'a Element> {
+    let mut boundaries: Vec<&Element> = def
+        .elements
+        .values()
+        .filter(|e| {
+            matches!(&e.kind, ElementKind::CompensationBoundaryEvent { attached_to, .. }
+                if attached_to == activity_id)
+        })
+        .collect();
+    boundaries.sort_by(|a, b| a.id.cmp(&b.id));
+    boundaries
+}
+
+/// Plans the migration of an instance's compensation subscriptions (#1631,
+/// Zeebe `ProcessInstanceMigrationCatchEventBehavior#handleCompensationCatchEvents`).
+///
+/// For every completed compensable task whose compensation boundary event is
+/// mapped, the task maps onto the activity the target boundary is attached to,
+/// and each enclosing flow scope maps level by level onto the target's (so the
+/// #901 scope subscriptions of completed sub-processes follow). A level where
+/// one side reaches the process root before the other is rejected
+/// ([`EngineError::MigrationCompensationFlowScopeChanged`]). Subscriptions not
+/// covered by the derived mapping are deleted by the applier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_compensation_migration(
+    instance_key: Key,
+    source_process_id: &str,
+    target_process_id: &str,
+    source_def: &ProcessDefinition,
+    target_def: &ProcessDefinition,
+    mapped: &HashMap<String, String>,
+    compensable: &[state::CompensationSubscription],
+) -> Result<Vec<crate::event::MigratedCompensationSubscription>, EngineError> {
+    let mut element_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
+    for sub in compensable.iter().filter(|c| !c.scope_subscription) {
+        // Zeebe starts from tasks only (bottom-up); sub-processes are reached
+        // through the flow-scope walk.
+        if matches!(
+            source_def.element(&sub.element_id).map(|e| &e.kind),
+            Some(ElementKind::SubProcess { .. }) | None
+        ) {
+            continue;
+        }
+        let Some(target_activity) = compensation_boundaries_of(source_def, &sub.element_id)
+            .into_iter()
+            .find_map(|b| mapped.get(&b.id))
+            .and_then(|tb| target_def.element(tb))
+            .and_then(|tb| tb.kind.attached_to())
+        else {
+            continue;
+        };
+        element_map.insert(sub.element_id.clone(), target_activity.to_string());
+        let source_chain = super::flow_scope::element_flow_scope_chain(source_def, &sub.element_id);
+        let target_chain = super::flow_scope::element_flow_scope_chain(target_def, target_activity);
+        for level in 0..source_chain.len().max(target_chain.len()) {
+            match (source_chain.get(level), target_chain.get(level)) {
+                (Some(s), Some(t)) => {
+                    element_map.insert(s.clone(), t.clone());
+                }
+                (s, t) => {
+                    return Err(EngineError::MigrationCompensationFlowScopeChanged {
+                        instance_key,
+                        process_id: source_process_id.to_string(),
+                        source_flow_scope_id: s
+                            .cloned()
+                            .unwrap_or_else(|| source_process_id.to_string()),
+                        target_flow_scope_id: t
+                            .cloned()
+                            .unwrap_or_else(|| target_process_id.to_string()),
+                    })
+                }
+            }
+        }
+    }
+    let mut out: BTreeMap<ElementId, crate::event::MigratedCompensationSubscription> =
+        BTreeMap::new();
+    for sub in compensable {
+        let Some(target) = element_map.get(&sub.element_id) else {
+            continue;
+        };
+        let target_handler = compensation_boundaries_of(target_def, target)
+            .into_iter()
+            .find_map(|b| match &b.kind {
+                ElementKind::CompensationBoundaryEvent { handler, .. } => Some(handler.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| sub.handler.clone());
+        out.entry(sub.element_id.clone()).or_insert_with(|| {
+            crate::event::MigratedCompensationSubscription {
+                source_element_id: sub.element_id.clone(),
+                target_element_id: target.clone(),
+                target_handler,
+            }
+        });
+    }
+    Ok(out.into_values().collect())
+}

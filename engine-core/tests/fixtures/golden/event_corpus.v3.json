@@ -3947,6 +3947,8 @@
   {
     "ProcessInstanceMigrated": {
       "child_instances": [],
+      "compensation_migrated": true,
+      "compensation_subscriptions": [],
       "element_mappings": [
         [
           "charge",

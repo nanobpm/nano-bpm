@@ -459,6 +459,8 @@ mod legacy_element_wide {
                     subscriptions: vec![],
                     child_instances: vec![],
                     join_scoped,
+                    compensation_subscriptions: vec![],
+                    compensation_migrated: false,
                 },
             );
             let i = instance(&state);

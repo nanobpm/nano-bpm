@@ -129,8 +129,9 @@ pub use event::Record;
 #[cfg(feature = "serde")]
 pub use event::{decode_record_json, encode_record_json};
 pub use event::{
-    MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
-    MigratedSubscriptionTrigger, SubscriptionMigrationAction,
+    MessageStartCorrelation, MigratedChildInstance, MigratedCompensationSubscription,
+    MigratedElementInstance, MigratedSubscription, MigratedSubscriptionTrigger,
+    SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
 pub use model::{
