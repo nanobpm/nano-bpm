@@ -271,6 +271,25 @@ It is switchable at runtime, cluster-wide. [ADR 0021](adr/0021-process-sla-as-a-
 tracks unifying this with `zeebe:priorityDefinition` job priority into a declared
 per-process SLA.
 
+### Per-definition admission (Tier-2) is observe-only by default
+
+ADR-0020's Tier-2 compressor can shed `createProcessInstance` for a *specific*
+process definition whose in-flight backlog outgrows its end-to-end latency budget
+(`503 RESOURCE_EXHAUSTED`, per process definition). **It is observe-only by
+default** (`NANOBPMN_TIER2` unset): the per-definition pressure is always computed
+and exported as `nanobpm_tier2_pressure{proc}`, but no create is rejected unless
+the operator opts in with `NANOBPMN_TIER2=on`.
+
+This matters for C8 parity: a **backlog with no workers draining** (a batch
+pre-create, workers deployed after the process starts receiving instances, a
+worker outage) is a legitimate pattern Camunda 8 accepts, and it cannot meet any
+latency budget however slowly instances arrive — so an on-by-default Tier-2
+rejected it and never recovered (issue #1532). The exporter memory-safety
+rails still shed genuine overload in every mode, and the Tier-1 engine-saturation
+guard sheds on its raft-log fsync-latency input only in latency SLA mode (that
+input is disabled in admission mode); only the per-definition latency-SLA shed is opt-in, pending ADR-0021's
+latency-causal shed predicate.
+
 ### Durability tiers
 
 Two orthogonal, explicit durability choices ([ADR 0003](adr/0003-write-path-durability-tiers.md)):

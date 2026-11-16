@@ -82,7 +82,7 @@ use nanobpmn_engine_core::{
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
     ProcGovConfig, ProcessGovernors, SharedSlaMode, SlaMode, Tier1Config,
-    parse_backpressure_setting, parse_sla_mode,
+    parse_backpressure_setting, parse_sla_mode, parse_tier2_enabled,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -2424,7 +2424,8 @@ pub struct ServerImpl {
     /// congested job type. Stepped each ~1 Hz monitor tick from the cross-partition
     /// `backlog_by_process` snapshot; consulted per `createProcessInstance`.
     /// Actuates only in [`SlaMode::Latency`]. Always present (the signals stay
-    /// populated for monitoring); `NANOBPMN_TIER2` (default on) gates actuation.
+    /// populated for monitoring); `NANOBPMN_TIER2` (default **observe-only**, per
+    /// ADR-0021's latency-causal blocker and issue #1532) gates actuation.
     procgov: Arc<ProcessGovernors>,
     /// Whether Tier-2 per-definition admission actuates (else it observes only).
     tier2_enabled: bool,
@@ -3038,16 +3039,11 @@ impl ServerImpl {
         };
         // ADR-0020 Tier-2: per-process-definition admission compressors. Always
         // built (the per-definition backlog/pressure signals are a monitoring
-        // surface in both SLA modes); NANOBPMN_TIER2 (default on) gates whether it
+        // surface in both SLA modes); NANOBPMN_TIER2 (default **observe-only**,
+        // per ADR-0021's latency-causal blocker and issue #1532) gates whether it
         // actuates admission — and it only actuates in latency mode regardless.
         let procgov = Arc::new(ProcessGovernors::new(ProcGovConfig::from_env()));
-        let tier2_enabled = !matches!(
-            std::env::var("NANOBPMN_TIER2")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("0" | "off" | "false" | "no" | "disabled")
-        );
+        let tier2_enabled = parse_tier2_enabled(std::env::var("NANOBPMN_TIER2").ok().as_deref());
         tracing::info!(
             "ADR-0020 Tier-2 per-definition admission: {} (config {:?})",
             if tier2_enabled { "on" } else { "observe-only" },

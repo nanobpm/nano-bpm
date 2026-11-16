@@ -35,8 +35,8 @@ task (`common-job` for FAST, `slow-job` for SLOW).
 
 ## Run (GCP loadbox)
 
-Requires `NANOBPMN_SLA_MODE=latency` and `NANOBPMN_TIER2=1` (default on) on the
-gateway.
+Requires `NANOBPMN_SLA_MODE=latency` and `NANOBPMN_TIER2=on` (opt-in; the default
+is observe-only, see issue #1532) on the gateway.
 
 ```bash
 GW=http://10.128.0.19:8080 \
