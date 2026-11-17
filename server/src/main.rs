@@ -25727,7 +25727,9 @@ fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
         "type" => query::SortVal::Str(job.job_type.clone()),
         "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
         "retries" => query::SortVal::Num(job.retries as i128),
-        "worker" => query::opt_str_sort_val(job.worker.as_deref()),
+        // Sort the projected response value: `job_search_result` returns `""`
+        // for both `None` and a legacy `Some("")`, so they must tie here too.
+        "worker" => query::SortVal::Str(job_worker(job)),
         "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
         "processDefinitionKey" => query::key_sort_val(&job.process_definition_key),
         "errorCode" => query::opt_str_sort_val(job.error_code.as_deref()),
@@ -25751,6 +25753,12 @@ fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
         "tenantId" => query::SortVal::Str("<default>".to_string()),
         _ => query::SortVal::Num(job.key as i128),
     }
+}
+
+/// The `worker` value REST returns for a job: absent and legacy-empty both
+/// project as `""`. Single source for the response and the sort projection.
+fn job_worker(job: &readstore::JobRow) -> String {
+    job.worker.clone().unwrap_or_default()
 }
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
@@ -25817,7 +25825,7 @@ fn job_search_result(
         state: job_state_enum(job.state),
         tenant_id: "<default>".to_string(),
         r_type: job.job_type.clone(),
-        worker: job.worker.clone().unwrap_or_default(),
+        worker: job_worker(job),
         creation_time,
         last_update_time,
         priority: 0,
@@ -47909,6 +47917,29 @@ mod clustered_startup_tests {
                 last_event_identity_ms: 0,
                 last_event_position: 0,
             }
+        }
+
+        // Worker sorts on the projected response value: `None` and a legacy
+        // `Some("")` both return `""`, so they tie and the key tiebreak orders them.
+        let mut no_worker = job_row_with_def_key(300, "1");
+        no_worker.worker = None;
+        let mut empty_worker = job_row_with_def_key(301, "1");
+        empty_worker.worker = Some(String::new());
+        for descending in [false, true] {
+            let mut rows: Vec<&readstore::JobRow> = vec![&empty_worker, &no_worker];
+            query::sort_items(
+                &mut rows,
+                &[query::SortKey {
+                    field: "worker".to_string(),
+                    descending,
+                }],
+                |job, field| job_sort_val(job, field),
+                |job| job.key,
+            );
+            assert_eq!(
+                rows.iter().map(|j| j.key).collect::<Vec<_>>(),
+                vec![300, 301]
+            );
         }
 
         let two = job_row_with_def_key(100, "2");
