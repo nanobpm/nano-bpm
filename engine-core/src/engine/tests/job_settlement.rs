@@ -264,10 +264,11 @@ fn lease_less_settlements_record_nothing() {
         .iter()
         .any(|e| matches!(e, Event::JobSettlementRecorded { .. })));
     assert!(engine.state().settled_jobs.is_empty());
-    // Without a key there is nothing to dedupe against: still 409-class.
+    // Without a key there is nothing to dedupe against: the completed job is
+    // consumed, so the re-completion is NOT_FOUND (Zeebe parity, #1401).
     assert_eq!(
         engine.apply_command(Command::complete_job(job_key)),
-        Err(EngineError::JobNotActive { job_key })
+        Err(EngineError::JobNotFound { job_key })
     );
 }
 
