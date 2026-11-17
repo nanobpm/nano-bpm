@@ -1364,11 +1364,11 @@ fn an_all_duplicate_bundle_reversions_together_when_its_deployment_bindings_woul
     assert_eq!(created_form_key(&created), Some(form_key));
     assert!(engine.active_incidents().is_empty());
 
-    // Resubmitting the original XML parses to the original `deployment`
-    // binding again, so it re-triggers the forced re-version (another version)
-    // rather than ever comparing equal to the rebound record — the rewrite
-    // cannot wedge the idempotency skip into reusing an unsatisfying
-    // deployment.
+    // Once re-versioned together, the process and its form share a deployment,
+    // so the membership gate is satisfied and a further unchanged resubmission
+    // is the idempotent no-op Zeebe specifies — no churn, no incident, and the
+    // verbatim XML is preserved (a rewrite-based retry would instead have
+    // rebound the record to `latest` and re-versioned forever).
     let resubmitted = engine
         .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
             processes: vec![process()],
@@ -1377,10 +1377,11 @@ fn an_all_duplicate_bundle_reversions_together_when_its_deployment_bindings_woul
         }))
         .unwrap();
     assert!(
-        resubmitted
-            .iter()
-            .any(|e| matches!(e, Event::ProcessDeployed { version: 3, .. })),
-        "the original XML re-versions again rather than reusing: {resubmitted:?}"
+        resubmitted.iter().all(|e| !matches!(
+            e,
+            Event::ProcessDeployed { .. } | Event::FormDeployed { .. }
+        )),
+        "a satisfied membership makes the resubmission an idempotent no-op: {resubmitted:?}"
     );
     let created = engine.apply_command(Command::create_instance("p")).unwrap();
     assert!(created_form_key(&created).is_some());
@@ -1462,5 +1463,133 @@ fn an_all_duplicate_bundle_reversions_together_when_a_deployment_bound_linked_re
             "[{{\"resourceKey\":\"{resource_key}\",\"resourceType\":\"GenericScript\",\"linkName\":\"policy\"}}]"
         )),
         "the re-versioned shared deployment resolves the linked resource"
+    );
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_a_single_quoted_binding_without_recursing() {
+    // #1193 review (round 5): the forced re-version must be computed from the
+    // duplicate/membership checks directly, NEVER by rewriting the submitted
+    // XML and recursing. A `bindingType='deployment'` attribute (single quotes)
+    // does not match a `bindingType="deployment"` needle, so a rewrite-based
+    // retry never breaks byte-equality and recurses until the host stack is
+    // exhausted. This must instead terminate in one pass and re-version.
+    let process = || form_binding_process(r#"bindingType='deployment'"#);
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "a single-quoted binding still re-versions (no rewrite, no recursion): {together:?}"
+    );
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(created_form_key(&created).is_some());
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_a_programmatic_definition_with_empty_xml() {
+    // #1193 review (round 5): a programmatically built definition carries no
+    // verbatim XML (`xml` is empty), so there is nothing for a rewrite-based
+    // retry to mutate — it never breaks byte-equality and recurses forever.
+    // The direct `force` computation re-versions it in one pass.
+    let process = || {
+        ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                crate::model::UserTaskProps {
+                    form_id: Some("review-form".to_string()),
+                    form_binding_type: crate::model::BindingType::Deployment,
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .unwrap()
+    };
+    assert!(
+        process().xml.is_empty(),
+        "a builder-made process has no XML"
+    );
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "an empty-XML definition still re-versions (no rewrite, no recursion): {together:?}"
+    );
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(created_form_key(&created).is_some());
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn a_forced_redeploy_preserves_the_submitted_xml_verbatim() {
+    // #1193 review (round 5): the persisted model record must stay the
+    // SUBMITTED XML. A rewrite-based retry stored `bindingType="latest"` while
+    // execution kept `deployment`, so exporting and redeploying the definition
+    // changed its binding semantics. The direct `force` path never touches the
+    // XML, so the retained record is byte-for-byte what was submitted.
+    let process = || form_binding_process(r#"bindingType="deployment""#);
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+
+    engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    let persisted = &engine.state().processes["p"].definition.xml;
+    assert!(
+        persisted.contains(r#"bindingType="deployment""#),
+        "the retained XML keeps the submitted deployment binding: {persisted}"
+    );
+    assert!(
+        !persisted.contains(r#"bindingType="latest""#),
+        "the retained XML is never rebound to latest: {persisted}"
     );
 }
