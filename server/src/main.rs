@@ -14951,12 +14951,14 @@ impl ServerImpl {
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
                 "creationDate" => query::SortVal::Num(task.created_at_ms as i128),
                 "businessId" => query::opt_str_sort_val(task.business_id.as_deref()),
-                "priority" => query::SortVal::Num(i128::from(task.priority)),
+                // Sort on the value `user_task_result` returns (clamped to
+                // 0..=100) so rows reporting equal priorities tie.
+                "priority" => query::SortVal::Num(i128::from(user_task_priority(task.priority))),
                 // Sort on the instant, not the stored string, so differing
                 // offsets/precision still order chronologically.
-                "dueDate" => query::opt_num_sort_val(rfc3339_ms(task.due_date.as_deref())),
+                "dueDate" => query::opt_num_sort_val(rfc3339_ns(task.due_date.as_deref())),
                 "followUpDate" => {
-                    query::opt_num_sort_val(rfc3339_ms(task.follow_up_date.as_deref()))
+                    query::opt_num_sort_val(rfc3339_ns(task.follow_up_date.as_deref()))
                 }
                 // Constant in Nano: `user_task_result` always projects `name` and
                 // `completionDate` as null, so every row ties and the task-key
@@ -25660,37 +25662,63 @@ fn job_kind_enums(
     }
 }
 
-/// Maps a [`JobRow`] field name to its sort key for `/v2/jobs/search`. Numeric
-/// keys (including `processDefinitionKey`, a numeric key stored as its decimal
-/// string) sort as [`query::SortVal::Num`] so `"2"` precedes `"10"` instead of
-/// lexicographically; timing fields project their millisecond columns with a
-/// missing value sorting as `0` (#1344). Unknown fields fall back to the stable
-/// `job.key` tiebreak. Extracted from the handler so the ordering contract is
-/// unit-testable without a full deploy (the search harness can only mint
-/// same-length definition keys, which hide the numeric-vs-lexicographic bug).
-/// Epoch millis of an optional RFC 3339 timestamp string (`None` when absent
-/// or unparseable) — the sort projection for string-stored dates.
-fn rfc3339_ms(s: Option<&str>) -> Option<i64> {
+/// Epoch nanoseconds of an optional RFC 3339 timestamp string (`None` when
+/// absent or unparseable) — the sort projection for string-stored dates. Full
+/// precision (not millis) so sub-millisecond instants the REST surface
+/// returns verbatim still order correctly; `i128` cannot overflow.
+fn rfc3339_ns(s: Option<&str>) -> Option<i128> {
     s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.timestamp_millis())
+        .map(|d| i128::from(d.timestamp()) * 1_000_000_000 + i128::from(d.timestamp_subsec_nanos()))
+}
+
+/// The user-task priority as exposed by REST (clamped to `0..=100`): the single
+/// source for both the response projection and the sort projection.
+fn user_task_priority(stored: i32) -> u8 {
+    stored.clamp(0, 100) as u8
 }
 
 #[cfg(test)]
 mod sort_projection_tests {
-    use super::rfc3339_ms;
+    use super::{rfc3339_ns, user_task_priority};
 
     #[test]
-    fn rfc3339_ms_orders_by_instant_not_string() {
+    fn priority_sort_projection_matches_the_returned_clamped_value() {
+        // Stored 100 and 101 both return priority 100, so they must tie in
+        // the sort (letting the secondary sort / key tiebreak decide).
+        assert_eq!(user_task_priority(100), user_task_priority(101));
+        assert_eq!(user_task_priority(i32::MAX), 100);
+        assert_eq!(user_task_priority(-5), 0);
+        assert_eq!(user_task_priority(42), 42);
+    }
+
+    #[test]
+    fn rfc3339_ns_orders_by_instant_not_string() {
         // Lexicographically "…T10:00:00+02:00" > "…T09:00:00Z", but it is the
         // earlier instant; sorting must follow the instant (#1298).
-        let a = rfc3339_ms(Some("2026-01-01T10:00:00+02:00"));
-        let b = rfc3339_ms(Some("2026-01-01T09:00:00Z"));
+        let a = rfc3339_ns(Some("2026-01-01T10:00:00+02:00"));
+        let b = rfc3339_ns(Some("2026-01-01T09:00:00Z"));
         assert!(a < b);
-        assert_eq!(rfc3339_ms(None), None);
-        assert_eq!(rfc3339_ms(Some("garbage")), None);
+        assert_eq!(rfc3339_ns(None), None);
+        assert_eq!(rfc3339_ns(Some("garbage")), None);
+    }
+
+    #[test]
+    fn rfc3339_ns_keeps_sub_millisecond_precision() {
+        let early = rfc3339_ns(Some("2026-01-01T00:00:00.000100Z"));
+        let late = rfc3339_ns(Some("2026-01-01T00:00:00.000900Z"));
+        assert!(early < late, "same-millisecond instants must not tie");
+        // Pre-epoch instants stay ordered too.
+        assert!(
+            rfc3339_ns(Some("1969-12-31T23:59:59.5Z")) < rfc3339_ns(Some("1970-01-01T00:00:00Z"))
+        );
     }
 }
 
+/// Sort projection for job search: string-encoded definition keys sort
+/// numerically (so `"2"` precedes `"10"`), optional fields sort as
+/// [`query::SortVal::Null`] (before every present value), and unknown fields
+/// fall back to the stable `job.key` tiebreak (#1344). Extracted from the
+/// handler so the ordering contract is unit-testable without a full deploy.
 fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
     match field {
         "processInstanceKey" => query::SortVal::Num(job.instance_key as i128),
@@ -25704,8 +25732,8 @@ fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
         "processDefinitionKey" => query::key_sort_val(&job.process_definition_key),
         "errorCode" => query::opt_str_sort_val(job.error_code.as_deref()),
         "errorMessage" => query::opt_str_sort_val(job.error_message.as_deref()),
-        // Camunda-parity timing sort fields (#1344). Missing values sort as 0
-        // (epoch), so jobs lacking a timestamp group first ascending.
+        // Camunda-parity timing sort fields (#1344). Missing values sort as
+        // `SortVal::Null`, before every present timestamp ascending.
         "creationTime" => query::SortVal::Num(job.created_at_ms as i128),
         "lastUpdateTime" => query::opt_num_sort_val(job.last_update_ms.map(|v| v as i128)),
         "endTime" => query::opt_num_sort_val(job.end_ms.map(|v| v as i128)),
@@ -25865,7 +25893,7 @@ fn user_task_result(
         },
         process_definition_version: task.process_definition_version,
         custom_headers: std::collections::HashMap::new(),
-        priority: task.priority.clamp(0, 100) as u8,
+        priority: user_task_priority(task.priority),
         user_task_key: models::UserTaskKey(task.key.to_string()),
         element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
         process_name: types::Nullable::Null,
@@ -55930,6 +55958,11 @@ pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
     "errorType",
     "processInstanceKey",
     "elementId",
+    "elementInstanceKey",
+    "jobKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "tenantId",
 ];
 pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
     "processInstanceKey",
@@ -55937,6 +55970,16 @@ pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
     "processDefinitionKey",
     "state",
     "businessId",
+    "startDate",
+    "suspendedDate",
+    "hasIncident",
+    "parentProcessInstanceKey",
+    "parentElementInstanceKey",
+    "processDefinitionVersion",
+    "endDate",
+    "processDefinitionName",
+    "processDefinitionVersionTag",
+    "tenantId",
 ];
 pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
     "userTaskKey",
@@ -55945,10 +55988,18 @@ pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
     "state",
     "creationDate",
     "businessId",
+    "priority",
+    "dueDate",
+    "followUpDate",
+    "name",
+    "completionDate",
 ];
 pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "processDefinitionKey",
     "processDefinitionId",
     "name",
     "version",
+    "resourceName",
+    "versionTag",
+    "tenantId",
 ];
