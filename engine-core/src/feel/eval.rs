@@ -1,7 +1,8 @@
 //! The FEEL evaluator: walks an [`ast::Node`] tree producing a [`FeelVal`].
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use super::ast::{BinOp, CallArgs, Node, Quantifier, RangeNode};
@@ -17,8 +18,10 @@ pub struct Ctx<'a> {
     scopes: Vec<BTreeMap<String, FeelVal>>,
     /// The trusted secret names surfaced so far, when provenance is tracked
     /// (`None` = not tracked, the zero-cost default for every caller but the
-    /// expression-evaluation endpoint). See [`SecretProvenance`].
-    provenance: Option<SecretProvenance>,
+    /// expression-evaluation endpoint). Shared (`Rc<RefCell>`) so a function
+    /// call or builtin callback evaluating in a fresh `Ctx` still surfaces its
+    /// reads into the same tracker. See [`SecretProvenance`].
+    provenance: Option<Rc<RefCell<SecretProvenance>>>,
 }
 
 /// Evaluation-time secret-provenance tracker (#1296). Unlike a syntactic scan
@@ -52,23 +55,59 @@ impl SecretProvenance {
         self.trusted_roots.insert(name.into());
     }
 
-    /// Records every `camunda.secrets.<name>` reference text reachable in `v`.
-    fn record_value(&mut self, v: &FeelVal) {
-        match v {
-            FeelVal::Str(s) => {
-                if let Some(name) = super::secret_reference_name(s) {
-                    self.referenced.insert(name.to_string());
-                }
-            }
-            FeelVal::List(items) => items.iter().for_each(|i| self.record_value(i)),
-            FeelVal::Context(entries) => entries.values().for_each(|i| self.record_value(i)),
-            _ => {}
-        }
-    }
-
     /// Records a literal `camunda.secrets.<name>` path surfacing.
     fn record_literal(&mut self, name: &str) {
         self.literal.insert(name.to_string());
+    }
+
+    /// Surfaces the trusted secret names a *selected* value carries into
+    /// `referenced`. Called only when a [`FeelVal::SecretRef`] is the value a
+    /// member/index/filter access actually selects — never for the unselected
+    /// siblings of a structured trusted value (#1296).
+    fn surface(&mut self, names: &HashSet<String>) {
+        self.referenced.extend(names.iter().cloned());
+    }
+}
+
+/// Computes the `camunda.secrets.<name>` reference names reachable in `v`
+/// (without recording them). Used to taint a trusted root's value at the point
+/// it is read, so the provenance travels with the individual value.
+fn secret_names_in(v: &FeelVal) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_secret_names(v, &mut out);
+    out
+}
+
+fn collect_secret_names(v: &FeelVal, out: &mut HashSet<String>) {
+    match v {
+        FeelVal::Str(s) => {
+            if let Some(name) = super::secret_reference_name(s) {
+                out.insert(name.to_string());
+            }
+        }
+        FeelVal::List(items) => items.iter().for_each(|i| collect_secret_names(i, out)),
+        FeelVal::Context(entries) => entries.values().for_each(|i| collect_secret_names(i, out)),
+        FeelVal::SecretRef { value, names } => {
+            out.extend(names.iter().cloned());
+            collect_secret_names(value, out);
+        }
+        _ => {}
+    }
+}
+
+/// Records the trusted secret names `v` carries into the shared tracker, then
+/// returns `v` unchanged. A no-op for any untainted value (#1296).
+fn surface_selection(v: FeelVal, ctx: &Ctx) -> FeelVal {
+    ctx.surface(&v);
+    v
+}
+
+fn surface_names(v: &FeelVal, p: &mut SecretProvenance) {
+    match v {
+        FeelVal::SecretRef { names, .. } => p.surface(names),
+        FeelVal::List(items) => items.iter().for_each(|i| surface_names(i, p)),
+        FeelVal::Context(entries) => entries.values().for_each(|i| surface_names(i, p)),
+        _ => {}
     }
 }
 
@@ -84,13 +123,35 @@ impl<'a> Ctx<'a> {
     /// Attaches a provenance tracker, returning the context so the caller can
     /// `let mut ctx = Ctx::new(base).with_provenance(prov);`.
     pub fn with_provenance(mut self, provenance: SecretProvenance) -> Ctx<'a> {
-        self.provenance = Some(provenance);
+        self.provenance = Some(Rc::new(RefCell::new(provenance)));
         self
     }
 
     /// Consumes the context, returning the tracker (after evaluation).
     pub fn into_provenance(self) -> Option<SecretProvenance> {
-        self.provenance
+        self.provenance.and_then(|rc| {
+            // The tracker is shared with any in-flight function-call contexts;
+            // by the time the caller consumes the top-level context, evaluation
+            // has finished, so this is the sole owner.
+            Rc::try_unwrap(rc).ok().map(RefCell::into_inner)
+        })
+    }
+
+    /// Surfaces the trusted provenance of the expression's *final* result: when
+    /// the whole expression evaluates to a tainted value (a bare trusted
+    /// cluster variable), that value is what the caller substitutes, so its
+    /// secret names are reported (#1296).
+    pub fn surface_result(&self, v: &FeelVal) {
+        self.surface(v);
+    }
+
+    /// Surfaces the trusted secret names `v` carries into the shared tracker
+    /// (recursing into a tainted list/context). A no-op when provenance is not
+    /// tracked or `v` is untainted (#1296).
+    fn surface(&self, v: &FeelVal) {
+        if let Some(p) = self.provenance.as_ref() {
+            surface_names(v, &mut p.borrow_mut());
+        }
     }
 
     /// `true` when `name` resolves to a base-context variable (not shadowed by
@@ -148,22 +209,27 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
             .ok_or_else(|| FeelError(format!("invalid temporal literal @\"{s}\""))),
         Node::Var(name) => {
             // #1296: a base-context variable the host marked trusted (a
-            // `SECRET_REFERENCE` cluster variable) contributes the secret
-            // references its value carries — but ONLY when it actually resolves
+            // `SECRET_REFERENCE` cluster variable) carries the secret
+            // references its value holds — but ONLY when it actually resolves
             // to the base context (not shadowed by a local/body binding) and is
-            // genuinely read here. This is evaluation-driven, so a skipped
-            // branch or a shadowed name never surfaces a reference.
-            if ctx
+            // genuinely read here. Rather than recording every reachable
+            // reference at the root (which would report unselected siblings),
+            // the value is *tainted*: wrapped with the names it carries, so a
+            // later member/index/filter selection surfaces only what it
+            // actually selects. This is evaluation-driven, so a skipped branch
+            // or a shadowed name never surfaces a reference.
+            let is_trusted_root = ctx
                 .provenance
                 .as_ref()
-                .is_some_and(|p| p.trusted_roots.contains(name.as_str()))
-                && ctx.resolves_to_base(name)
-            {
+                .is_some_and(|p| p.borrow().trusted_roots.contains(name.as_str()))
+                && ctx.resolves_to_base(name);
+            if is_trusted_root {
                 let v = ctx.lookup(name).unwrap_or(FeelVal::Null);
-                if let Some(p) = ctx.provenance.as_mut() {
-                    p.record_value(&v);
-                }
-                return Ok(v);
+                let names = secret_names_in(&v);
+                return Ok(FeelVal::SecretRef {
+                    value: Box::new(v),
+                    names: Rc::new(names),
+                });
             }
             Ok(ctx.lookup(name).unwrap_or_else(|| {
                 if name == "camunda" {
@@ -192,12 +258,19 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
             // the sentinel marker's member is taken. Record it as a literal
             // (trusted) reference — but only on the actual evaluation path, so
             // a skipped branch or shadowed `camunda` binding never contributes.
+            // `member` also records the sentinel within a recursive list
+            // projection (`[camunda.secrets].NAME`), so scalar and list access
+            // paths report the same trusted reference.
             if matches!(v, FeelVal::Function(Func::Builtin("camunda.secrets"))) {
-                if let Some(p) = ctx.provenance.as_mut() {
-                    p.record_literal(name);
+                if let Some(p) = ctx.provenance.as_ref() {
+                    p.borrow_mut().record_literal(name);
                 }
             }
-            Ok(member(&v, name))
+            let selected = member(&v, name, ctx);
+            // A member access on a trusted value surfaces only that member's
+            // subtree (path-scoped): `cfg.token` surfaces `cfg.token`'s names,
+            // never the unselected siblings such as `cfg.safe`'s (#1296).
+            Ok(surface_selection(selected, ctx))
         }
         Node::Index(obj, idx) => eval_index(obj, idx, ctx),
         Node::Neg(inner) => {
@@ -374,6 +447,12 @@ fn eval_index(obj: &Node, idx: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelErro
     };
     // An index expression that resolves to a number in the current scope selects
     // a 1-based element (negative counts from the end).
+    //
+    // #1296: this outer-scope probe only *selects* an element — it must not
+    // surface provenance for the elements it merely passes over, and a
+    // non-numeric result (a boolean filter) discards the probe entirely before
+    // the per-item re-evaluation below. Only the element a numeric index
+    // actually selects surfaces its trusted provenance.
     if let Ok(n) = eval_node(idx, ctx) {
         if let Some(f) = n.as_f64() {
             let len = list.len() as i64;
@@ -388,10 +467,15 @@ fn eval_index(obj: &Node, idx: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelErro
             if resolved < 0 || resolved >= len {
                 return Ok(FeelVal::Null);
             }
-            return Ok(list[resolved as usize].clone());
+            let selected = list[resolved as usize].clone();
+            return Ok(surface_selection(selected, ctx));
         }
     }
-    // Otherwise it is a boolean filter evaluated per element.
+    // Otherwise it is a boolean filter evaluated per element. The probe above
+    // already ran `idx` once in the outer scope and was discarded (it returned
+    // no number); the per-item evaluation below is the authoritative read, with
+    // the item's own bindings in scope — so a body-provided filter value, not a
+    // shadowed trusted root, drives the selection.
     let mut out = Vec::new();
     for item in list {
         let mut frame = BTreeMap::new();
@@ -458,47 +542,68 @@ fn eval_call(callee: &Node, args: &CallArgs, ctx: &mut Ctx) -> Result<FeelVal, F
             .collect::<Result<Vec<_>, _>>()?,
     };
 
-    apply(&func, positional, ctx.base)
+    apply(&func, positional, ctx)
 }
 
 /// Invokes a function value with already-evaluated positional arguments.
-pub fn apply(
-    func: &Func,
-    args: Vec<FeelVal>,
-    base: &HashMap<String, Value>,
-) -> Result<FeelVal, FeelError> {
+///
+/// The caller's `ctx` threads the shared secret-provenance tracker into the
+/// function body (and any builtin callback), so a reference surfaced by an
+/// *executed* function body is reported — while an un-called function body,
+/// which never reaches `apply`, still contributes nothing (#1296).
+pub fn apply(func: &Func, args: Vec<FeelVal>, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
+    // A function argument crosses a boundary: its provenance was surfaced when
+    // the value was *selected*, so strip the (transparent-to-operators) wrapper
+    // here so a builtin pattern-matching on the concrete variant (e.g.
+    // `want_list`) sees the underlying value, not a `SecretRef` (#1296).
+    let args: Vec<FeelVal> = args.into_iter().map(FeelVal::strip_provenance).collect();
     match func {
-        Func::Builtin(name) => builtins::call(name, args, base),
+        Func::Builtin(name) => builtins::call(name, args, ctx),
         Func::Lambda {
             params,
             body,
             closure,
         } => {
-            let mut ctx = Ctx::new(base);
-            ctx.push((**closure).clone());
+            let mut body_ctx = Ctx::new(ctx.base);
+            body_ctx.provenance = ctx.provenance.clone();
+            body_ctx.push((**closure).clone());
             let mut frame = BTreeMap::new();
             for (i, p) in params.iter().enumerate() {
                 frame.insert(p.clone(), args.get(i).cloned().unwrap_or(FeelVal::Null));
             }
-            ctx.push(frame);
-            eval_node(body, &mut ctx)
+            body_ctx.push(frame);
+            eval_node(body, &mut body_ctx)
         }
     }
 }
 
 // --- Member access ----------------------------------------------------------
 
-fn member(v: &FeelVal, name: &str) -> FeelVal {
+fn member(v: &FeelVal, name: &str, ctx: &Ctx) -> FeelVal {
     match v {
         FeelVal::Context(entries) => entries.get(name).cloned().unwrap_or(FeelVal::Null),
         // #1296: `camunda.secrets.<name>` — the sentinel builtin marker the
         // `camunda` variable's `secrets` member carries — evaluates to its own
-        // reference text (never resolved here; see the `Node::Var` arm).
+        // reference text (never resolved here; see the `Node::Var` arm). This
+        // arm fires both for a direct access and for each element of a list
+        // projection (`[camunda.secrets].NAME`), so the literal reference is
+        // recorded here — the recursive-projection path the `Node::Member` arm
+        // cannot see.
         FeelVal::Function(Func::Builtin("camunda.secrets")) => {
+            if let Some(p) = ctx.provenance.as_ref() {
+                p.borrow_mut().record_literal(name);
+            }
             FeelVal::Str(format!("camunda.secrets.{name}"))
         }
         // Projection: `list.field` maps the access over each element.
-        FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name)).collect()),
+        FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name, ctx)).collect()),
+        // A tainted value narrows the access to the member's own subtree, so a
+        // selection surfaces only that member's names — never the unselected
+        // siblings (#1296).
+        FeelVal::SecretRef { value, names } => {
+            let selected = member(value, name, ctx);
+            super::value::taint_with(selected, names)
+        }
         FeelVal::Date(d) => date_member(d, name),
         FeelVal::DateTime(dt) => datetime_member(dt, name),
         FeelVal::Time(t) => time_member(t, name),
@@ -643,6 +748,12 @@ fn eval_binary(op: BinOp, lhs: &Node, rhs: &Node, ctx: &mut Ctx) -> Result<FeelV
 
     let l = eval_node(lhs, ctx)?;
     let r = eval_node(rhs, ctx)?;
+    // #1296: a trusted value *consumed* by an operator is a genuine read of the
+    // reference (e.g. a comparator `k = "x"` in a `sort` callback), so its
+    // provenance surfaces here — the operator's boolean/number result is not
+    // itself a reference, but the trusted value was used to produce it.
+    ctx.surface(&l);
+    ctx.surface(&r);
     // An operator applied to ill-typed operands is a *suppressed failure* in
     // feel-scala (the FEEL engine Zeebe embeds): the result is `null`, never an
     // evaluation error (#1392). Each operator therefore yields `Option`, and

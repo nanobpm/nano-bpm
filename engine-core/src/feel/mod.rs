@@ -91,6 +91,7 @@ fn feel_kind(v: &value::FeelVal) -> &'static str {
         value::FeelVal::YmDur(_) => "PERIOD",
         value::FeelVal::DtDur(_) => "DURATION",
         value::FeelVal::Range(_) | value::FeelVal::Function(_) => "UNKNOWN",
+        value::FeelVal::SecretRef { value, .. } => feel_kind(value),
     }
 }
 
@@ -566,6 +567,10 @@ pub fn eval_with_provenance(
     }
     let mut eval_ctx = eval::Ctx::new(ctx).with_provenance(provenance);
     let value = eval::eval_node_pub(&node, &mut eval_ctx)?;
+    // The expression's result is what the caller substitutes: surface the
+    // trusted provenance of a bare tainted result (e.g. the expression is just
+    // a trusted cluster variable), which no member/index selection surfaced.
+    eval_ctx.surface_result(&value);
     let provenance = eval_ctx.into_provenance().unwrap_or_default();
     let mut referenced_secrets: Vec<String> = provenance
         .referenced
@@ -843,6 +848,128 @@ mod tests {
         assert_eq!(prov("cfg.token", &c, &["cfg"]), vec!["NESTED"]);
         // An un-called function body never surfaces its reference.
         assert!(prov("function() camunda.secrets.SKIPPED", &ctx(&[]), &[]).is_empty());
+    }
+
+    /// #1296 review: provenance must follow the *selected* value, not the root
+    /// read — and must survive the function-call / list-projection paths.
+    #[test]
+    fn eval_with_provenance_is_selection_scoped() {
+        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+            eval_with_provenance(
+                e,
+                c,
+                trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .referenced_secrets
+        };
+
+        // Finding: a root read must not record UNSELECTED descendants. `cfg`
+        // carries a reference under `token`, but `[cfg.safe, body_ref]` selects
+        // only `cfg.safe` (a number) and the untrusted `body_ref` — so the
+        // result reference came only from the request body and TOKEN is NOT
+        // reported.
+        let c = ctx(&[
+            (
+                "cfg",
+                Value::Map(
+                    [
+                        ("safe".to_string(), Value::Int(1)),
+                        (
+                            "token".to_string(),
+                            Value::Str("camunda.secrets.TOKEN".into()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+            ("body_ref", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert!(
+            prov("[cfg.safe, body_ref]", &c, &["cfg"]).is_empty(),
+            "an unselected trusted sibling must not be reported"
+        );
+        // …but selecting the member that carries the reference DOES surface it.
+        assert_eq!(prov("cfg.token", &c, &["cfg"]), vec!["TOKEN"]);
+
+        // Finding: a discarded index *probe* must not leak provenance. `flag`
+        // is a trusted reference, but as a filter predicate it is re-evaluated
+        // per item against the item's own (body-provided) `flag`, so the
+        // trusted root is never read for the selection and TOKEN is not
+        // reported.
+        let c = ctx(&[
+            ("flag", Value::Str("camunda.secrets.TOKEN".into())),
+            (
+                "rows",
+                Value::List(vec![Value::Map(
+                    [
+                        ("flag".to_string(), Value::Bool(true)),
+                        (
+                            "value".to_string(),
+                            Value::Str("camunda.secrets.TOKEN".into()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )]),
+            ),
+        ]);
+        assert!(
+            prov("rows[flag].value", &c, &["flag"]).is_empty(),
+            "a discarded index probe must not surface the trusted root"
+        );
+        // A genuine numeric index surfaces only the selected element's names.
+        let c = ctx(&[(
+            "arr",
+            Value::List(vec![
+                Value::Str("camunda.secrets.FIRST".into()),
+                Value::Str("plain".into()),
+            ]),
+        )]);
+        assert_eq!(prov("arr[1]", &c, &["arr"]), vec!["FIRST"]);
+        assert!(
+            prov("arr[2]", &c, &["arr"]).is_empty(),
+            "selecting a non-reference element reports nothing"
+        );
+
+        // Finding: a literal reference reached through a LIST projection is
+        // recorded just like the scalar path.
+        assert_eq!(
+            prov("[camunda.secrets].TOKEN", &ctx(&[]), &[]),
+            vec!["TOKEN"]
+        );
+
+        // Finding: an EXECUTED function body surfaces its reference (a literal
+        // path, or a trusted cluster variable read) — while an un-called body
+        // still does not.
+        assert_eq!(
+            prov("(function() camunda.secrets.TOKEN)()", &ctx(&[]), &[]),
+            vec!["TOKEN"]
+        );
+        let c = ctx(&[("token_ref", Value::Str("camunda.secrets.TOKEN".into()))]);
+        assert_eq!(
+            prov("(function() token_ref)()", &c, &["token_ref"]),
+            vec!["TOKEN"]
+        );
+        assert!(prov("function() camunda.secrets.SKIPPED", &ctx(&[]), &[]).is_empty());
+
+        // A trusted value *consumed* by an operator (here the comparator of a
+        // `sort` callback) is a genuine read: its provenance surfaces even
+        // though the comparison's boolean result is not itself a reference.
+        let c = ctx(&[("k", Value::Str("camunda.secrets.KEY".into()))]);
+        assert_eq!(
+            prov("sort([2, 1], function(a, b) k = \"x\")", &c, &["k"]),
+            vec!["KEY"]
+        );
+        // A trusted value passed THROUGH a builtin is not re-reported (it was
+        // not selected), but the builtin must still see the underlying value —
+        // `count` on a trusted list returns its length, not an error.
+        let c = ctx(&[(
+            "arr",
+            Value::List(vec![Value::Str("camunda.secrets.S".into())]),
+        )]);
+        assert!(prov("count(arr)", &c, &["arr"]).is_empty());
     }
 
     #[test]
@@ -1365,4 +1492,3 @@ mod tests {
         )
     }
 }
-
