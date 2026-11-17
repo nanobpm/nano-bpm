@@ -2379,7 +2379,10 @@ fn should_parse_deployment_binding_on_a_user_task_form() {
         panic!("expected a user task");
     };
     assert_eq!(props.form_id.as_deref(), Some("review-form"));
-    assert_eq!(props.form_binding_type, crate::model::BindingType::Deployment);
+    assert_eq!(
+        props.form_binding_type,
+        crate::model::BindingType::Deployment
+    );
     assert_eq!(props.form_version_tag, None);
 }
 
@@ -2414,7 +2417,10 @@ fn should_parse_version_tag_binding_on_a_user_task_form() {
         panic!("expected a user task");
     };
     assert_eq!(props.form_id.as_deref(), Some("review-form"));
-    assert_eq!(props.form_binding_type, crate::model::BindingType::VersionTag);
+    assert_eq!(
+        props.form_binding_type,
+        crate::model::BindingType::VersionTag
+    );
     assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
 }
 
@@ -2557,7 +2563,10 @@ fn should_parse_a_binding_without_a_form_id() {
         panic!("expected a user task");
     };
     assert_eq!(props.form_id, None);
-    assert_eq!(props.form_binding_type, crate::model::BindingType::Deployment);
+    assert_eq!(
+        props.form_binding_type,
+        crate::model::BindingType::Deployment
+    );
 }
 
 #[test]

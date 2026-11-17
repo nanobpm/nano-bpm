@@ -889,7 +889,10 @@ fn deployment_binding_pins_the_form_version_deployed_with_the_process() {
     // after a newer form version is deployed — where `latest` would rebind.
     let mut engine = Engine::new();
     let shared = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v1"),
+        )]))
         .unwrap();
     let shared_deployment = shared
         .iter()
@@ -911,10 +914,16 @@ fn deployment_binding_pins_the_form_version_deployed_with_the_process() {
     // A newer form version deployed AFTERWARDS (its own deployment) must NOT
     // steal the binding.
     let later = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v2"),
+        )]))
         .unwrap();
     let form_key_v2 = form_key_of(&later, "review-form");
-    assert_ne!(form_key_v1, form_key_v2, "a changed redeploy mints a new key");
+    assert_ne!(
+        form_key_v1, form_key_v2,
+        "a changed redeploy mints a new key"
+    );
     assert_eq!(engine.state().forms["review-form"].key, form_key_v2);
 
     let created = engine.apply_command(Command::create_instance("p")).unwrap();
@@ -1022,11 +1031,17 @@ fn deployment_binding_miss_raises_a_resolvable_incident_and_creates_no_task() {
 fn version_tag_binding_resolves_the_tagged_form_version() {
     let mut engine = Engine::new();
     let v1 = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v1"),
+        )]))
         .unwrap();
     let key_v1 = form_key_of(&v1, "review-form");
     let v2 = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v2"),
+        )]))
         .unwrap();
     let key_v2 = form_key_of(&v2, "review-form");
     engine
@@ -1047,7 +1062,10 @@ fn version_tag_binding_miss_raises_a_resolvable_incident() {
     let mut engine = Engine::new();
     // The form exists, but no version carries the declared tag.
     engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v1"),
+        )]))
         .unwrap();
     engine
         .apply_command(Command::DeployProcess(form_binding_process(
@@ -1073,7 +1091,10 @@ fn version_tag_binding_miss_raises_a_resolvable_incident() {
 
     // Deploy the tagged version, then resolve: the activation re-drive binds it.
     let tagged = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v9"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v9"),
+        )]))
         .unwrap();
     let key_v9 = form_key_of(&tagged, "review-form");
     let resolved = engine
@@ -1097,7 +1118,10 @@ fn omitted_binding_type_still_resolves_the_latest_form_at_creation() {
         .apply_command(Command::DeployProcess(form_binding_process("")))
         .unwrap();
     let v2 = engine
-        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v2"),
+        )]))
         .unwrap();
     let key_v2 = form_key_of(&v2, "review-form");
 

@@ -104,10 +104,10 @@ pub use agent::{
     AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
-#[cfg(feature = "serde")]
-pub use command::{form_id_of, form_version_tag_of};
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
+#[cfg(feature = "serde")]
+pub use command::{form_id_of, form_version_tag_of};
 pub use command::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
     GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
