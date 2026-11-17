@@ -1796,3 +1796,100 @@ fn an_all_duplicate_bundle_reversions_when_the_co_deployed_resource_is_stale() {
         "the submitted v2 resource is re-versioned into the shared deployment: {together:?}"
     );
 }
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_external_form_reference_makes_a_deployment_binding_moot_for_membership() {
+    // #1193 review (round 6): a programmatic/IR user task can carry BOTH
+    // `form_id` (deployment binding) AND `external_form_reference`. The runtime
+    // lets the external reference win (it resolves no deployed version), so the
+    // `form_id` is moot — the membership scan must NOT require it to resolve.
+    // With the (unused) form absent, an id-based scan would force a new version
+    // on EVERY identical redeployment; the correct behavior is idempotent reuse.
+    use crate::model::UserTaskProps;
+    let process = || {
+        ProcessBuilder::new("ext-form")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("absent-form".to_string()),
+                    form_binding_type: crate::model::BindingType::Deployment,
+                    external_form_reference: Some("external:form".to_string()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .unwrap()
+    };
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+
+    // An identical redeployment is a no-op: the external reference makes the
+    // deployment binding moot, so membership does not force a re-version.
+    let redeploy = engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    assert!(
+        !redeploy
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+        "an external form reference makes the deployment binding moot — no re-version: {redeploy:?}"
+    );
+    assert_eq!(engine.state().processes["ext-form"].version, 1);
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_external_form_reference_on_an_adhoc_tool_makes_its_binding_moot_for_membership() {
+    // #1193 review (round 6): the same precedence through the ad-hoc tool
+    // catalog (`process.adhoc[*].tools`). A pruned ad-hoc user-task tool carrying
+    // both a deployment-bound `form_id` AND an external reference must not force
+    // a re-version on identical redeploy — the external reference wins.
+    use crate::model::{AdHocTool, AdHocToolKind, UserTaskProps};
+    let process = || {
+        let mut def = ProcessBuilder::new("ahp-ext")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .unwrap();
+        def.adhoc.push(crate::model::AdHocSubProcessDef {
+            container_id: "Host".to_string(),
+            tools: vec![AdHocTool {
+                element_id: "Tool".to_string(),
+                name: String::new(),
+                kind: AdHocToolKind::UserTask(UserTaskProps {
+                    form_id: Some("absent-form".to_string()),
+                    form_binding_type: crate::model::BindingType::Deployment,
+                    external_form_reference: Some("external:form".to_string()),
+                    ..Default::default()
+                }),
+                io: Default::default(),
+                properties: Default::default(),
+            }],
+            ..Default::default()
+        });
+        def
+    };
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+
+    let redeploy = engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    assert!(
+        !redeploy
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+        "an ad-hoc tool's external form reference makes its binding moot — no re-version: {redeploy:?}"
+    );
+    assert_eq!(engine.state().processes["ahp-ext"].version, 1);
+}

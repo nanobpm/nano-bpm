@@ -1685,3 +1685,87 @@ fn decompose_for_streaming_groups_owned_entities_per_instance_over_a_backlog() {
         assert_eq!(snap.timers[0].instance_key, snap.instance.key);
     }
 }
+
+#[test]
+fn reversioning_a_timer_start_process_retires_the_superseded_timer() {
+    // #1193 review (round 6): forcing an unchanged timer-start process through
+    // `deploy` (here via a mixed bundle whose form changed) re-arms its start
+    // timer, but the prior version's timer must be RETIRED — otherwise both stay
+    // live in `state.start_timers` and each tick starts duplicate instances.
+    // A timer-start process whose user task binds a form with `deployment`:
+    // changing only the form forces the process to re-version alongside it.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="tp">
+          <bpmn:startEvent id="t">
+            <bpmn:timerEventDefinition>
+              <bpmn:timeDuration>PT5S</bpmn:timeDuration>
+            </bpmn:timerEventDefinition>
+          </bpmn:startEvent>
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:formDefinition formId="review-form" bindingType="deployment" />
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="t" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let process = || crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let form = |schema: &str| crate::command::FormResource {
+        id: "review-form".to_string(),
+        resource_name: "review-form.form".to_string(),
+        schema: schema.to_string(),
+        version_tag: None,
+    };
+    let mut engine = Engine::new();
+    // Deploy the timer-start process + form v1 together: one start timer armed.
+    engine
+        .apply_command_at(
+            Command::DeployBundle(crate::command::DeploymentBundle {
+                processes: vec![process()],
+                forms: vec![form(r#"{"v":1}"#)],
+                ..Default::default()
+            }),
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(engine.state().start_timers.len(), 1);
+
+    // Change ONLY the form in the same bundle: the deployment binding's content
+    // mismatch forces the unchanged process to re-version. The superseded v1
+    // start timer must be retired, leaving exactly one armed timer (v2's).
+    let redeploy = engine
+        .apply_command_at(
+            Command::DeployBundle(crate::command::DeploymentBundle {
+                processes: vec![process()],
+                forms: vec![form(r#"{"v":2}"#)],
+                ..Default::default()
+            }),
+            2_000,
+        )
+        .unwrap();
+    assert!(
+        redeploy
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "the changed form forces the process to re-version: {redeploy:?}"
+    );
+    assert_eq!(
+        engine.state().start_timers.len(),
+        1,
+        "the superseded version's start timer is retired, not duplicated: {:?}",
+        engine.state().start_timers
+    );
+
+    // And the surviving timer fires exactly one instance per tick (no duplicate).
+    engine.trigger_timers(8_000);
+    assert_eq!(
+        engine.state().instances.len(),
+        1,
+        "one armed start timer starts one instance, not two"
+    );
+}

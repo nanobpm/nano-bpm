@@ -46,6 +46,19 @@ pub(super) fn apply_process(state: &mut State, event: &Event) {
                 .unwrap_or(true);
             if is_latest {
                 state.processes.insert(process.id.clone(), deployed);
+                // Retire the superseded version's start timers. Start timers are
+                // keyed by a fresh `timer_key` per deploy, so re-versioning would
+                // otherwise leave the prior version's timers armed alongside the
+                // new ones — both fire on a tick and start duplicate instances
+                // (#1193). The timers belonging to *this* deployment are armed by
+                // the `ProcessStartTimerArmed` events that follow, so here we drop
+                // every start timer for this process id that is not part of the
+                // new definition. (Message-start subscriptions avoid this by being
+                // keyed on the message name, which re-deploying replaces.)
+                state.start_timers.retain(|_, timer| {
+                    timer.process_id != process.id
+                        || timer.process_definition_key == *process_definition_key
+                });
             }
         }
         _ => unreachable!(),

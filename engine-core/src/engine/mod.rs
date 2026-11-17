@@ -1828,7 +1828,11 @@ impl Engine {
             for adhoc in &process.adhoc {
                 for tool in &adhoc.tools {
                     if let crate::model::AdHocToolKind::UserTask(props) = &tool.kind {
-                        if props.form_binding_type == crate::model::BindingType::Deployment {
+                        // As above, an external form reference makes the binding
+                        // moot — it resolves no deployed version (#1193 review).
+                        if props.form_binding_type == crate::model::BindingType::Deployment
+                            && props.external_form_reference.is_none()
+                        {
                             if let Some(form_id) = props.form_id.as_deref() {
                                 bound_form_ids.push(form_id);
                             }
@@ -1894,8 +1898,12 @@ impl Engine {
         bound_resource_ids: &mut Vec<&'a str>,
     ) {
         match kind {
+            // An external form reference wins over `form_id` at runtime and
+            // resolves no deployed version (the binding is moot, #1193 review),
+            // so only a task WITHOUT one constrains bundle membership.
             ElementKind::UserTask(props)
-                if props.form_binding_type == crate::model::BindingType::Deployment =>
+                if props.form_binding_type == crate::model::BindingType::Deployment
+                    && props.external_form_reference.is_none() =>
             {
                 if let Some(form_id) = props.form_id.as_deref() {
                     bound_form_ids.push(form_id);
