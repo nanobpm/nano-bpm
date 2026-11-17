@@ -9221,6 +9221,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1600: a clustered peer's durable deployment copy keeps the deploying
+    /// request's reference on every persisted deployment envelope; the
+    /// unreferenced wrapper stays unreferenced (control).
+    #[test]
+    fn install_deployment_durable_ref_persists_reference_on_every_record() {
+        let src = temp_dir_1556("deploy-src");
+        let deployed = {
+            let (mut j, _) = Journal::open_segmented(&src).unwrap();
+            let (events, c) = j
+                .apply_command_ref_at(Command::DeployProcess(demo()), 1, None)
+                .unwrap();
+            c.blocking_wait();
+            events
+        };
+        let _ = std::fs::remove_dir_all(&src);
+        let expected: Vec<Event> = deployed
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .cloned()
+            .collect();
+        assert!(!expected.is_empty());
+
+        for (tag, reference) in [("deploy-ref", Some(77)), ("deploy-noref", None)] {
+            let dir = temp_dir_1556(tag);
+            {
+                let (mut j, _) = Journal::open_segmented(&dir).unwrap();
+                let c = match reference {
+                    Some(_) => j.install_deployment_durable_ref(&deployed, reference),
+                    None => j.install_deployment_durable(&deployed),
+                };
+                c.blocking_wait();
+                let records = segment_records_1556(&dir);
+                assert_eq!(records.len(), expected.len());
+                assert_run_refs(&records, 0, &expected, reference);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// Tagged (shared multi-partition writer, `<partition>\t<json>` lines)
     /// variant of the above.
     #[test]
