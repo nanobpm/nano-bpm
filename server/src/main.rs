@@ -421,13 +421,18 @@ const CLUSTER_VARIABLE_MAX_METADATA_BYTES: usize = 100 * (256 + 8192);
 
 /// One stored cluster variable. `value` is the engine [`Value`] (source of truth
 /// for both the FEEL overlay and the REST projection); `id` gives search a stable
-/// pagination cursor.
+/// pagination cursor. `kind` is the Camunda 8.10 `ClusterVariableKindEnum`:
+/// `JSON` (default) or `SECRET_REFERENCE` (#1296) — a SECRET_REFERENCE value is
+/// ordinary JSON that may carry `camunda.secrets.<name>` reference text, stored
+/// and returned verbatim; Nano never resolves it server-side (resolution happens
+/// at job activation, host-side).
 #[derive(Clone)]
 struct StoredClusterVariable {
     id: u64,
     name: String,
     tenant_id: Option<String>,
     value: Value,
+    kind: models::ClusterVariableKindEnum,
     metadata: ClusterVariableMetadata,
 }
 
@@ -463,12 +468,14 @@ impl ClusterVariableStore {
     /// when one already exists for `(tenant, name)` — the caller maps that to
     /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
     /// is race-free: a concurrent DELETE cannot make the caller's response
-    /// construction observe a missing record.
+    /// construction observe a missing record. `kind` defaults to `JSON` when the
+    /// request omits it (Camunda 8.10: "Defaults to JSON if not specified").
     fn create(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
+        kind: Option<models::ClusterVariableKindEnum>,
         metadata: ClusterVariableMetadata,
     ) -> Option<StoredClusterVariable> {
         let key = (tenant.map(str::to_string), name.to_string());
@@ -484,6 +491,7 @@ impl ClusterVariableStore {
                 name: name.to_string(),
                 tenant_id: tenant.map(str::to_string),
                 value,
+                kind: kind.unwrap_or(models::ClusterVariableKindEnum::Json),
                 metadata,
             };
             e.by_key.insert(key, stored.clone());
@@ -613,10 +621,13 @@ fn cluster_variable_search_result(
 }
 
 /// A stored variable's kind: the single source for the results' `kind` and the
-/// search `kind` filter. Always `JSON` — [`reject_unsupported_cluster_variable_kind`]
-/// refuses anything else at create time.
-fn cluster_variable_kind(_v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
-    models::ClusterVariableKindEnum::Json
+/// search `kind` filter. Camunda 8.10 `ClusterVariableKindEnum`: `JSON` (the
+/// default) or `SECRET_REFERENCE` (#1296) — a SECRET_REFERENCE value is ordinary
+/// JSON that may carry `camunda.secrets.<name>` reference text. It is stored and
+/// returned verbatim (never resolved server-side), so a GET/search response can
+/// never contain a secret value.
+fn cluster_variable_kind(v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
+    v.kind
 }
 
 /// Validates a create/update metadata bag against the serialized-size cap
@@ -641,24 +652,12 @@ fn cluster_variable_metadata(
     Ok(metadata)
 }
 
-/// Nano stores cluster variables as plain JSON values only (Camunda 8.10
-/// `kind: JSON`). It has
-/// no secret stores, so a `SECRET_REFERENCE` variable is rejected rather than
-/// silently stored as JSON — which would hand the reference string to FEEL as a
-/// literal value.
-fn reject_unsupported_cluster_variable_kind(
-    kind: Option<&models::ClusterVariableKindEnum>,
-) -> Option<models::ProblemDetail> {
-    match kind {
-        None | Some(models::ClusterVariableKindEnum::Json) => None,
-        Some(other) => Some(problem(
-            "Unsupported cluster variable kind",
-            400,
-            format!("Cluster variable kind '{other}' is not supported by Nano; only JSON is."),
-        )),
-    }
-}
-
+// Nano accepts both Camunda 8.10 cluster-variable kinds (#1296). A
+// `SECRET_REFERENCE` variable's value is ordinary JSON that may carry
+// `camunda.secrets.<name>` reference text; it is stored and returned verbatim
+// and never resolved server-side — resolution happens at job activation,
+// host-side (upstream: the value "contain[s] camunda.secrets.X references that
+// are resolved at job activation time", `ClusterVariableKindEnum`).
 impl ServerImpl {
     /// POST /v2/cluster-variables/global — create a global-scoped cluster
     /// variable. 200 with the created resource, or 409 when one already exists.
@@ -667,9 +666,6 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateGlobalClusterVariableResponse as Resp;
-        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
-        }
         let metadata = match cluster_variable_metadata(&body.metadata) {
             Ok(m) => m,
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
@@ -677,7 +673,7 @@ impl ServerImpl {
         let value = json_to_value(&body.value.0);
         if let Some(stored) = self
             .cluster_variables
-            .create(None, &body.name, value, metadata)
+            .create(None, &body.name, value, body.kind, metadata)
         {
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
@@ -705,9 +701,6 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
-        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
-        }
         let metadata = match cluster_variable_metadata(&body.metadata) {
             Ok(m) => m,
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
@@ -716,7 +709,7 @@ impl ServerImpl {
         let value = json_to_value(&body.value.0);
         if let Some(stored) =
             self.cluster_variables
-                .create(Some(tenant), &body.name, value, metadata)
+                .create(Some(tenant), &body.name, value, body.kind, metadata)
         {
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
@@ -983,6 +976,7 @@ mod cluster_variable_tests {
                 None,
                 "region",
                 val(json!("EMEA")),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_some()
@@ -993,6 +987,7 @@ mod cluster_variable_tests {
                 None,
                 "region",
                 val(json!("APAC")),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_none()
@@ -1019,6 +1014,7 @@ mod cluster_variable_tests {
                 Some("acme"),
                 "region",
                 val(json!("EMEA")),
+                None,
                 ClusterVariableMetadata::new(),
             )
             .expect("create of a fresh (scope, name) returns the stored snapshot");
@@ -1038,6 +1034,7 @@ mod cluster_variable_tests {
                 None,
                 "flag",
                 val(json!(false)),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_some()
@@ -1063,6 +1060,7 @@ mod cluster_variable_tests {
                 None,
                 "region",
                 val(json!("global")),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_some()
@@ -1072,6 +1070,7 @@ mod cluster_variable_tests {
                 Some("acme"),
                 "region",
                 val(json!("acme")),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_some()
@@ -1098,8 +1097,14 @@ mod cluster_variable_tests {
                 .is_none()
         );
         assert!(
-            s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
-                .is_some()
+            s.create(
+                None,
+                "ghost",
+                val(json!(1)),
+                None,
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
         );
         assert!(
             s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
@@ -1120,6 +1125,7 @@ mod cluster_variable_tests {
                 None,
                 "nope",
                 val(json!(true)),
+                None,
                 ClusterVariableMetadata::new()
             )
             .is_some()
@@ -1132,8 +1138,14 @@ mod cluster_variable_tests {
     fn empty_object_value_round_trips() {
         let s = store();
         assert!(
-            s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new())
-                .is_some()
+            s.create(
+                None,
+                "cfg",
+                val(json!({})),
+                None,
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
         );
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
@@ -1149,12 +1161,14 @@ mod cluster_variable_tests {
             None,
             "region",
             val(json!("EMEA")),
+            None,
             ClusterVariableMetadata::new(),
         );
         s.create(
             Some(DEFAULT_TENANT),
             "tier",
             val(json!(2)),
+            None,
             ClusterVariableMetadata::new(),
         );
         {
@@ -1172,11 +1186,18 @@ mod cluster_variable_tests {
     #[test]
     fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(None, "g", val(json!("x")), ClusterVariableMetadata::new());
+        s.create(
+            None,
+            "g",
+            val(json!("x")),
+            None,
+            ClusterVariableMetadata::new(),
+        );
         s.create(
             Some("acme"),
             "t",
             val(json!("y")),
+            None,
             ClusterVariableMetadata::new(),
         );
         let g = cluster_variable_result(&s.get(None, "g").unwrap());
@@ -1196,6 +1217,7 @@ mod cluster_variable_tests {
             None,
             "big",
             val(json!(long)),
+            None,
             ClusterVariableMetadata::new(),
         );
         let stored = s.get(None, "big").unwrap();
@@ -1372,6 +1394,127 @@ mod cluster_variable_tests {
         );
     }
 
+    /// #1296: a `kind: SECRET_REFERENCE` create is ACCEPTED (Camunda 8.10
+    /// `ClusterVariableKindEnum`), its value stored verbatim — the
+    /// `camunda.secrets.<name>` reference text round-trips through create, get
+    /// and search untouched (Nano never resolves it server-side), and the
+    /// stored `kind` is projected on every result.
+    #[tokio::test]
+    async fn secret_reference_kind_round_trips_verbatim() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::CreateTenantClusterVariableResponse as CreateTenant;
+        use apis::cluster_variable::GetGlobalClusterVariableResponse as Get;
+        let server = ServerImpl::default();
+        let mut req = create_req("api_token", None);
+        req.value = types::Object(json!("camunda.secrets.API_TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        let Create::Status200_ClusterVariableCreated(created) = server
+            .create_global_cluster_variable_impl(&req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a SECRET_REFERENCE create");
+        };
+        assert_eq!(
+            created.kind,
+            models::ClusterVariableKindEnum::SecretReference
+        );
+        assert_eq!(
+            created.value, "\"camunda.secrets.API_TOKEN\"",
+            "the reference text is stored and returned verbatim, never resolved"
+        );
+        let path = models::GetGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let Get::Status200_ClusterVariableFound(got) = server
+            .get_global_cluster_variable_impl(&path)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(got.kind, models::ClusterVariableKindEnum::SecretReference);
+        assert_eq!(got.value, "\"camunda.secrets.API_TOKEN\"");
+
+        // Tenant-scoped create accepts the kind too.
+        let tenant_path = models::CreateTenantClusterVariablePathParams {
+            tenant_id: "acme".to_string(),
+        };
+        let CreateTenant::Status200_ClusterVariableCreated(created) = server
+            .create_tenant_cluster_variable_impl(&tenant_path, &req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a tenant-scoped SECRET_REFERENCE create");
+        };
+        assert_eq!(
+            created.kind,
+            models::ClusterVariableKindEnum::SecretReference
+        );
+
+        // The runtime FEEL overlay carries the reference text through
+        // unchanged — nothing resolved is ever handed to the engine.
+        let snap = server.cluster_variables.runtime.read().unwrap();
+        assert_eq!(
+            snap.global.get("api_token"),
+            Some(&val(json!("camunda.secrets.API_TOKEN"))),
+            "the engine overlay sees the reference text verbatim"
+        );
+    }
+
+    /// #1296: the `kind` search filter distinguishes the two kinds once
+    /// SECRET_REFERENCE variables exist (previously every variable was JSON, so
+    /// the SECRET_REFERENCE filter trivially matched nothing).
+    #[tokio::test]
+    async fn search_kind_filter_distinguishes_secret_references() {
+        let server = ServerImpl::default();
+        server.cluster_variables.create(
+            None,
+            "plain",
+            val(json!(1)),
+            None,
+            ClusterVariableMetadata::new(),
+        );
+        let mut req = create_req("token", None);
+        req.value = types::Object(json!("camunda.secrets.TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&req)
+                .await
+                .unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        let kind =
+            |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
+                kind: Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(k)),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::Json)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(names(&r), vec!["plain"]);
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::SecretReference)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(names(&r), vec!["token"]);
+        assert_eq!(
+            r.items[0].value, "\"camunda.secrets.TOKEN\"",
+            "search returns the reference text verbatim"
+        );
+    }
+
     #[tokio::test]
     async fn search_filters_by_kind_and_metadata() {
         let server = ServerImpl::default();
@@ -1379,17 +1522,23 @@ mod cluster_variable_tests {
             None,
             "a",
             val(json!(1)),
+            None,
             meta(json!({"owner": "team-a", "ttl": 30})),
         );
         server.cluster_variables.create(
             None,
             "b",
             val(json!(2)),
+            None,
             meta(json!({"owner": "team-b", "ttl": "30"})),
         );
-        server
-            .cluster_variables
-            .create(None, "c", val(json!(3)), ClusterVariableMetadata::new());
+        server.cluster_variables.create(
+            None,
+            "c",
+            val(json!(3)),
+            None,
+            ClusterVariableMetadata::new(),
+        );
 
         let kind =
             |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
@@ -1461,18 +1610,21 @@ mod cluster_variable_tests {
             None,
             "region",
             val(json!("global")),
+            None,
             ClusterVariableMetadata::new(),
         );
         server.cluster_variables.create(
             Some("acme"),
             "region",
             val(json!("acme")),
+            None,
             ClusterVariableMetadata::new(),
         );
         server.cluster_variables.create(
             Some("beta"),
             "tier",
             val(json!(2)),
+            None,
             ClusterVariableMetadata::new(),
         );
 
@@ -1527,12 +1679,14 @@ mod cluster_variable_tests {
             None,
             "big",
             val(json!(long)),
+            None,
             ClusterVariableMetadata::new(),
         );
         server.cluster_variables.create(
             None,
             "small",
             val(json!("x")),
+            None,
             ClusterVariableMetadata::new(),
         );
 
@@ -1582,9 +1736,13 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server
-                .cluster_variables
-                .create(None, n, val(json!(n)), ClusterVariableMetadata::new());
+            server.cluster_variables.create(
+                None,
+                n,
+                val(json!(n)),
+                None,
+                ClusterVariableMetadata::new(),
+            );
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -3397,9 +3555,9 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         seed_versions(&state.process_versions, &state.processes, |d| d.key)
             .into_values()
             .map(|deployed| Event::ProcessDeployed {
-                // The deployment key is not used by the applier (definitions are
-                // keyed by processDefinitionKey); 0 is a harmless placeholder.
-                deployment_key: 0,
+                // The deployment key anchors `deployment`-bound form/resource
+                // resolution (#1193), so it must replicate faithfully.
+                deployment_key: deployed.deployment_key,
                 process_definition_key: deployed.key,
                 version: deployed.version,
                 process: deployed.definition.clone(),
@@ -3447,29 +3605,35 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         }
     }
     // Re-emit each deployed form version so a freshly seeded replica can serve
-    // it via GetFormByKey. Forms are independent (no sub-resources).
+    // it via GetFormByKey. Forms are independent (no sub-resources). The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // user-task form resolution (#1193), so they replicate faithfully.
     for form in seed_versions(&state.form_versions, &state.forms, |f| f.key).into_values() {
         events.push(Event::FormDeployed {
-            deployment_key: 0,
+            deployment_key: form.deployment_key,
             form_key: form.key,
             version: form.version,
             form_id: form.form_id.clone(),
             resource_name: form.resource_name.clone(),
             schema: form.schema.clone(),
+            version_tag: form.version_tag.clone(),
         });
     }
     // Re-emit each deployed generic-resource version so a freshly seeded
-    // replica can serve it via GetResourceByKey / searchResources.
+    // replica can serve it via GetResourceByKey / searchResources. The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // linked-resource resolution (#1193), so they replicate faithfully.
     for resource in
         seed_versions(&state.resource_versions, &state.resources, |r| r.key).into_values()
     {
         events.push(Event::GenericResourceDeployed {
-            deployment_key: 0,
+            deployment_key: resource.deployment_key,
             resource_key: resource.key,
             version: resource.version,
             resource_id: resource.resource_id.clone(),
             resource_name: resource.resource_name.clone(),
             content: resource.content.clone(),
+            version_tag: resource.version_tag.clone(),
         });
     }
     events
@@ -3542,6 +3706,9 @@ fn parse_deploy_resources(
                     id,
                     resource_name: resource_name.clone(),
                     schema: xml.clone(),
+                    // The form-js document's optional `versionTag` is matched by
+                    // a `versionTag`-bound user-task form (#1193).
+                    version_tag: nanobpmn_engine_core::form_version_tag_of(xml),
                 }),
                 None => {
                     return Err((
@@ -3595,6 +3762,10 @@ fn parse_deploy_resources(
             resource_id: resource_name.clone(),
             resource_name: resource_name.clone(),
             content: xml.clone(),
+            // The HTTP deploy envelope carries no per-resource `versionTag`
+            // metadata yet, so a generic resource deploys untagged (#1193
+            // wires the engine-side tag storage a future API field populates).
+            version_tag: None,
         });
     }
     Ok(ParsedDeploy {
@@ -6490,26 +6661,11 @@ impl ServerImpl {
         // and a ~40% tighter p90 tail vs suppressing it, at no cost (GCP 3-node
         // fresh-journal A/B; see PERFORMANCE.md 2026-07-10 / ADR 0013 Addendum). So
         // `admission` relaxes only the proactive backlog governor, not this guard.
-        if let Some(limit) = self.backpressure.current_limit() {
-            let processing = self.processing.load(Ordering::Relaxed);
-            if self.backpressure.should_shed(processing) {
-                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
-                    "RESOURCE_EXHAUSTED",
-                    503,
-                    format!(
-                        "Backpressure: {processing} creates in flight at or above the \
-                         configured limit of {limit}. Retry after a backoff."
-                    ),
-                )));
-            }
-        }
-
-        // Active-backlog admission control: independently of the concurrency gate
-        // above, shed once the standing backlog of active instances reaches the
-        // configured limit, so end-to-end latency and memory stay bounded under
-        // sustained overload instead of the create queue growing unboundedly. Off
-        // by default; a shed create is never journaled, so durability is untouched.
-        if let Some(message) = self.admission_shed() {
+        //
+        // Then the active-backlog admission control (`admission_shed`). Both
+        // rails live in [`Self::create_admission_shed`], the single create
+        // admission policy every instance-creating endpoint shares.
+        if let Some(message) = self.create_admission_shed() {
             return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                 "RESOURCE_EXHAUSTED",
                 503,
@@ -14557,11 +14713,29 @@ impl ServerImpl {
             let Some(handle) = self.engine.try_for_create() else {
                 return Err((500, "this node hosts no engine partition".to_string()));
             };
+            // Creation intake (e.g. conditional-start evaluation, #932) yields
+            // to the drain path on the engine mailbox, mirroring the Raft
+            // batcher's lane choice from the same predicate.
+            let priority = if crate::raft::is_creation_intake(&command) {
+                crate::deepthi::Priority::Low
+            } else {
+                crate::deepthi::Priority::High
+            };
             let (events, commit) = handle
-                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .with_priority(priority, move |journal| {
+                    journal.apply_command_at(command, now_millis())
+                })
                 .await
                 .map_err(|error| crate::raft::engine_error_status(&error))?;
-            commit.wait().await;
+            // `wait()` also resolves when the journal writer dies unacked;
+            // only a durable write may be acknowledged (or have its
+            // follow-ups routed), else the result vanishes on restart (#932).
+            if !commit.wait_durable().await {
+                return Err((
+                    500,
+                    "the write was not persisted durably; retry".to_string(),
+                ));
+            }
             return Ok(events);
         }
         let led: Vec<u64> = self
@@ -16322,37 +16496,21 @@ impl ServerImpl {
             self.engine
                 .deploy_partition()
                 .with(move |engine| {
+                    // One mixed deployment = ONE command = ONE deployment key
+                    // shared by every co-deployed resource, so
+                    // `bindingType: deployment` forms / linked resources resolve
+                    // (#1193). Never split it into per-kind commands.
                     let (events, commit) = engine
-                        .apply_command(Command::DeployResources(processes))
+                        .apply_command(Command::DeployBundle(
+                            nanobpmn_engine_core::DeploymentBundle {
+                                processes,
+                                decisions,
+                                forms,
+                                resources: generic_resources,
+                            },
+                        ))
                         .map_err(|e| e.to_string())?;
-                    // Deploy any DMN decisions in the same durable batch. Their events
-                    // are appended so the whole deployment broadcasts/replicates as one.
-                    let mut all_events = (*events).clone();
-                    let mut commit = commit;
-                    if !decisions.is_empty() {
-                        let (dec_events, dec_commit) = engine
-                            .apply_command(Command::DeployDecisionRequirements(decisions))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*dec_events).iter().cloned());
-                        commit = dec_commit;
-                    }
-                    // Deploy any forms in the same durable batch so the whole
-                    // deployment broadcasts/replicates as one.
-                    if !forms.is_empty() {
-                        let (form_events, form_commit) = engine
-                            .apply_command(Command::DeployForms(forms))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*form_events).iter().cloned());
-                        commit = form_commit;
-                    }
-                    // Deploy any generic resources in the same durable batch.
-                    if !generic_resources.is_empty() {
-                        let (res_events, res_commit) = engine
-                            .apply_command(Command::DeployGenericResources(generic_resources))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*res_events).iter().cloned());
-                        commit = res_commit;
-                    }
+                    let all_events = (*events).clone();
                     let events = Arc::new(all_events);
                     let resolved: Resolved = requested_ids
                         .iter()
@@ -21974,6 +22132,24 @@ impl ServerImpl {
         )
     }
 
+    /// The shared create admission policy (#932): the backpressure
+    /// concurrency gate followed by the active-backlog [`Self::admission_shed`]
+    /// rails. Every endpoint that creates process instances must consult this
+    /// before submitting, so no create path bypasses overload or drain-stall
+    /// shedding. `Some(message)` means shed with a `RESOURCE_EXHAUSTED` 503.
+    pub(crate) fn create_admission_shed(&self) -> Option<String> {
+        if let Some(limit) = self.backpressure.current_limit() {
+            let processing = self.processing.load(Ordering::Relaxed);
+            if self.backpressure.should_shed(processing) {
+                return Some(format!(
+                    "Backpressure: {processing} creates in flight at or above the \
+                     configured limit of {limit}. Retry after a backoff."
+                ));
+            }
+        }
+        self.admission_shed()
+    }
+
     /// Admission gate combining several signals. Returns `Some(reason)` once any
     /// active signal is at/above its limit (the create should be shed); `None`
     /// when all have headroom. Relaxed atomic loads — no engine round-trip; an
@@ -23166,6 +23342,43 @@ fn next_stateless_key() -> u64 {
 /// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
 /// durable keys.
 impl ServerImpl {
+    /// One immutable snapshot of every cluster variable, captured under a single
+    /// lock acquisition so the values an expression evaluates against and the
+    /// kinds its provenance is derived from are always consistent (#1296). The
+    /// overlay for a tenant layers globals first, then that tenant's variables
+    /// (which shadow a same-named global), matching the engine's resolution.
+    #[allow(clippy::type_complexity)]
+    fn cluster_variable_snapshot(
+        &self,
+    ) -> (
+        std::collections::HashMap<String, Value>,
+        std::collections::HashMap<String, models::ClusterVariableKindEnum>,
+        std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
+    ) {
+        let entries = self.cluster_variables.read();
+        let mut globals: std::collections::HashMap<String, Value> = Default::default();
+        let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
+            Default::default();
+        let mut tenants: std::collections::HashMap<
+            String,
+            Vec<(String, Value, models::ClusterVariableKindEnum)>,
+        > = Default::default();
+        for v in entries.by_key.values() {
+            match &v.tenant_id {
+                None => {
+                    globals.insert(v.name.clone(), v.value.clone());
+                    kinds.insert(v.name.clone(), v.kind);
+                }
+                Some(t) => tenants.entry(t.clone()).or_default().push((
+                    v.name.clone(),
+                    v.value.clone(),
+                    v.kind,
+                )),
+            }
+        }
+        (globals, kinds, tenants)
+    }
+
     /// `POST /v2/expression/evaluation` — evaluate a FEEL expression against the
     /// request-body variable context and return its result. An unparseable or
     /// otherwise invalid expression maps to a `400` invalid-argument
@@ -23176,24 +23389,89 @@ impl ServerImpl {
     ) -> Result<apis::expression::EvaluateExpressionResponse, ()> {
         use apis::expression::EvaluateExpressionResponse as Resp;
 
-        // The request body's `variables` are the only context: these endpoints
-        // are stateless, so no process-instance / element-instance scope is
-        // resolved here. `Nullable::Null` (an explicit `"variables": null`) and
-        // an omitted map both mean "no variables".
-        let ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
+        // Capture ONE immutable snapshot of the cluster variables (values and
+        // kinds together, under a single lock) so the evaluated values and the
+        // provenance derived from them can never race a concurrent
+        // create/update/delete (#1296).
+        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot();
+
+        // The request body's `variables` are the topmost context: these
+        // endpoints are stateless, so no process-instance / element-instance
+        // scope is resolved here. `Nullable::Null` (an explicit `"variables":
+        // null`) and an omitted map both mean "no variables".
+        let mut ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
             _ => std::collections::HashMap::new(),
         };
 
-        match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
-            Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
+        // Layer the cluster variables UNDERNEATH the request-body variables (a
+        // body variable shadows a same-named cluster variable, matching the
+        // engine's instance-shadows-cluster rule): globals first, then the
+        // requested tenant's overlay over them (tenant shadows global). The
+        // values pass through verbatim — a SECRET_REFERENCE variable's
+        // reference text is never resolved here (#1296). The default tenant
+        // applies when the request omits `tenantId`.
+        let tenant = body
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| nanobpmn_engine_core::DEFAULT_TENANT.to_string());
+        // Which names a request-body variable binds (those shadow any cluster
+        // variable and are never trusted carriers).
+        let body_bound: std::collections::HashSet<String> = ctx.keys().cloned().collect();
+        for (k, v) in &globals {
+            ctx.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if let Some(overlay) = tenants.get(&tenant) {
+            for (name, value, kind) in overlay {
+                // A tenant variable shadows a same-named global for both the
+                // value and its kind — unless a body variable already shadows
+                // both (a body binding is never a trusted carrier).
+                if !body_bound.contains(name.as_str()) {
+                    ctx.insert(name.clone(), value.clone());
+                    kinds.insert(name.clone(), *kind);
+                }
+            }
+        }
+
+        // The trusted provenance roots are exactly the SECRET_REFERENCE-kind
+        // cluster variables visible in this context AND NOT shadowed by a
+        // request-body binding (a body variable is never a trusted carrier, even
+        // when it shares a name with a SECRET_REFERENCE cluster variable).
+        // Provenance is structural and fail-closed (see
+        // `eval_with_provenance`): a reference is reported only when the
+        // expression's result is structurally a trusted reference — a bare
+        // literal path, a direct read of a trusted root, or a list/context
+        // literal composed of those.
+        let trusted_roots: Vec<String> = kinds
+            .iter()
+            .filter(|(name, kind)| {
+                **kind == models::ClusterVariableKindEnum::SecretReference
+                    && ctx.contains_key(*name)
+                    && !body_bound.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        match nanobpmn_engine_core::feel::eval_with_provenance(
+            &body.expression,
+            &ctx,
+            trusted_roots,
+        ) {
+            Ok(evaluated) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
                 models::ExpressionEvaluationResult {
                     expression: body.expression.clone(),
-                    result: types::Nullable::Present(types::Object(value_to_json(&value))),
+                    result: types::Nullable::Present(types::Object(value_to_json(
+                        &evaluated.value,
+                    ))),
                     warnings: Vec::new(),
-                    // Nano has no secret stores, so no `camunda.secrets.*`
-                    // reference can ever resolve from a trusted source.
-                    referenced_secrets: Vec::new(),
+                    referenced_secrets: evaluated
+                        .referenced_secrets
+                        .into_iter()
+                        .map(|secret_name| models::ExpressionSecretReferenceItem {
+                            store_id: "default".to_string(),
+                            secret_name,
+                        })
+                        .collect(),
                 },
             )),
             Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -23208,24 +23486,38 @@ impl ServerImpl {
     }
 
     /// `POST /v2/conditionals/evaluation` — evaluate root-level conditional start
-    /// events for the (optionally tenant-/definition-scoped) supplied variable
-    /// context. Nano's engine models conditional intermediate-catch and boundary
-    /// events but not root-level conditional *start* events, so no deployed
-    /// definition can be triggered by this evaluation: the result is always a
-    /// well-formed, spec-conformant empty `processInstances` list ("If no
-    /// root-level conditional start events evaluated to true, the list will be
-    /// empty") with a fresh evaluation key. A `processDefinitionKey` that does
-    /// not resolve to a deployed definition maps to a `404`.
+    /// events against the supplied variable context (#932). The engine command
+    /// [`Command::EvaluateConditionalStartEvents`] considers the latest version
+    /// of every deployed process (or exactly the version named by
+    /// `processDefinitionKey`) and creates one process instance — seeded with
+    /// the variables — per root-level conditional start event whose condition
+    /// evaluates to `true`. Each created instance is reported in
+    /// `processInstances`; the list is empty when no condition is satisfied. A
+    /// `processDefinitionKey` that does not resolve to a deployed definition
+    /// maps to a `404`.
     async fn evaluate_conditionals_impl(
         &self,
         body: &models::ConditionalEvaluationInstruction,
     ) -> Result<apis::conditional::EvaluateConditionalsResponse, ()> {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
 
-        let tenant_id = body
-            .tenant_id
-            .clone()
-            .unwrap_or_else(|| "<default>".to_string());
+        // Nano is single-tenant: every definition and instance belongs to
+        // `<default>`. A request scoped to any other tenant cannot be honoured,
+        // so reject it rather than execute an unscoped create that would start
+        // instances outside the requested tenant (spec/conditionals.yaml).
+        let tenant_id = match body.tenant_id.as_deref() {
+            None | Some("<default>") => "<default>".to_string(),
+            Some(other) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    format!(
+                        "Tenant '{other}' is not supported: this engine is single-tenant \
+                         and only evaluates conditional start events for tenant '<default>'."
+                    ),
+                )));
+            }
+        };
 
         if let Some(pdk) = body.process_definition_key.as_ref() {
             // Distinguish a malformed (non-numeric) key from a well-formed but
@@ -23250,14 +23542,109 @@ impl ServerImpl {
             }
         }
 
+        // An evaluation may create instances, so it is subject to the same
+        // create admission policy as `createProcessInstance`: shed under
+        // backpressure, backlog overload or a drain halt.
+        if let Some(message) = self.create_admission_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+
+        let variables = from_object_map(&body.variables);
+        // Charge the create accounting from admission until the write has been
+        // applied, and run apply + follow-up routing in a detached owner task
+        // (#1582): a cancelled caller must neither release the charge early nor
+        // leave a persisted instance whose cross-partition follow-ups nobody
+        // routes.
+        let accounting = CreateAccounting::enter(self, engine_vars_bytes(&variables));
+        let command = Command::EvaluateConditionalStartEvents {
+            variables,
+            process_definition_key: body
+                .process_definition_key
+                .as_ref()
+                .and_then(|pdk| pdk.0.parse::<u64>().ok()),
+        };
+        let server = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = server.apply_create_command(command).await;
+            drop(accounting);
+            if let Ok(events) = &outcome {
+                // A created instance may advance straight into an
+                // off-partition message catch or an activatable job: route
+                // follow-ups and wake long-pollers, exactly as every other
+                // instance-creating write does.
+                // Route BEFORE answering so a publish issued the moment the
+                // evaluation returns finds the subscription open (the
+                // create-then-publish ordering, #1582); a cancelled caller is
+                // fine because routing completes inside this detached task.
+                server
+                    .drive_subscription_routing(Self::routable_events(events), None)
+                    .await;
+                server.signal_jobs_available();
+            }
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .await
+            .unwrap_or_else(|_| Err((500, "conditional evaluation task aborted".to_string())));
+        let events = match outcome {
+            Ok(events) => events,
+            Err((status, detail)) => {
+                return Ok(match status {
+                    404 => Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
+                        problem("Process definition not found", 404, detail),
+                    ),
+                    400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "INVALID_ARGUMENT",
+                        400,
+                        detail,
+                    )),
+                    503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        detail,
+                    )),
+                    _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", 500, detail),
+                    ),
+                });
+            }
+        };
+        let process_instances = conditional_start_instances(&events);
+
         Ok(Resp::Status200_SuccessfullyEvaluatedRoot(
             models::EvaluateConditionalResult::new(
                 models::ConditionalEvaluationKey(next_stateless_key().to_string()),
                 tenant_id,
-                Vec::new(),
+                process_instances,
             ),
         ))
     }
+}
+
+/// The `processInstances` of a `/v2/conditionals/evaluation` response: one
+/// reference per root process instance the evaluation created (#932), in the
+/// engine's deterministic creation order.
+fn conditional_start_instances(events: &[Event]) -> Vec<models::ProcessInstanceReference> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_definition_key,
+                parent_process_instance_key: None,
+                ..
+            } => Some(models::ProcessInstanceReference::new(
+                models::ProcessDefinitionKey(process_definition_key.to_string()),
+                models::ProcessInstanceKey(instance_key.to_string()),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
@@ -31425,6 +31812,7 @@ mod clustered_startup_tests {
             id: "versioned-form".to_string(),
             resource_name: "versioned.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let form_v1 = form(r#"{"id":"versioned-form","type":"default","components":[]}"#);
         let form_v2 = form(
@@ -31434,6 +31822,7 @@ mod clustered_startup_tests {
             resource_id: "versioned.md".to_string(),
             resource_name: "versioned.md".to_string(),
             content: content.to_string(),
+            version_tag: None,
         };
         let resource_v1 = resource("# v1");
         let resource_v2 = resource("# v2");
@@ -31598,6 +31987,7 @@ mod clustered_startup_tests {
                 resource_id: "r.md".into(),
                 resource_name: "r.md".into(),
                 content: mib.clone(),
+                version_tag: None,
             })
             .collect();
         let total: usize = events
@@ -31658,11 +32048,13 @@ mod clustered_startup_tests {
             id: "legacy-form".to_string(),
             resource_name: "legacy.form".to_string(),
             schema: r#"{"id":"legacy-form","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
         };
         let resource = nanobpmn_engine_core::GenericResource {
             resource_id: "legacy.md".to_string(),
             resource_name: "legacy.md".to_string(),
             content: "# legacy".to_string(),
+            version_tag: None,
         };
         let mut state = node0
             .engine
@@ -39149,6 +39541,7 @@ mod clustered_startup_tests {
                             resource_id: "agent-prompt.md".to_string(),
                             resource_name: "agent-prompt.md".to_string(),
                             content: content.to_string(),
+                            version_tag: None,
                         }],
                         "<default>",
                     )
@@ -39336,6 +39729,7 @@ mod clustered_startup_tests {
             id: "greeting-form".to_string(),
             resource_name: "greeting.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let (result, _events) = server
             .deploy_resources_locally_with_forms(
@@ -39399,6 +39793,7 @@ mod clustered_startup_tests {
                     id: "greeting-form".to_string(),
                     resource_name: "greeting.form".to_string(),
                     schema: schema_v2.to_string(),
+                    version_tag: None,
                 }],
                 Vec::new(),
                 "<default>",
@@ -39474,6 +39869,80 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn a_mixed_deployment_stamps_one_deployment_key_on_every_resource() {
+        // #1193 review: one HTTP deployment (process + form + generic resource)
+        // must be ONE engine deployment. The mixed path used to issue a
+        // command per kind, each minting its own deployment key, so a
+        // co-deployed `bindingType: deployment` form incidented and a
+        // co-deployed linked resource vanished from the worker header.
+        let server = ServerImpl::default();
+        let bpmn = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bundle" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="bundle-form" bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let proc = parse_bpmn(bpmn).expect("valid BPMN").remove(0);
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("bundle".to_string(), "bundle.bpmn".to_string());
+        let (_result, events) = server
+            .deploy_resources_locally_with_forms(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "bundle-form".to_string(),
+                    resource_name: "bundle-form.form".to_string(),
+                    schema: r#"{"id":"bundle-form","components":[]}"#.to_string(),
+                    version_tag: None,
+                }],
+                vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "policy.md".to_string(),
+                    resource_name: "policy.md".to_string(),
+                    content: "# policy".to_string(),
+                    version_tag: None,
+                }],
+                "<default>",
+            )
+            .await
+            .expect("mixed deploy succeeds");
+        let keys: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::DeploymentCreated { deployment_key }
+                | Event::ProcessDeployed { deployment_key, .. }
+                | Event::FormDeployed { deployment_key, .. }
+                | Event::GenericResourceDeployed { deployment_key, .. } => Some(*deployment_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "every co-deployed resource shares one deployment key: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::DeploymentCreated { .. }))
+                .count(),
+            1,
+            "one deployment, one DeploymentCreated"
+        );
+    }
+
+    #[tokio::test]
     async fn a_user_task_form_definition_surfaces_form_key_and_external_reference_in_v2_search() {
         // End-to-end form linkage (issue #795): a `userTask` declaring a
         // `<zeebe:formDefinition formId="…"/>` must resolve that id to the
@@ -39489,6 +39958,7 @@ mod clustered_startup_tests {
             id: "feature-escalation".to_string(),
             resource_name: "feature-escalation.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
 
         // A process with two user tasks: one bound to the embedded form by id,
@@ -39699,6 +40169,7 @@ mod clustered_startup_tests {
             id: id.to_string(),
             resource_name: format!("{id}.form"),
             schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+            version_tag: None,
         };
 
         server
@@ -50981,6 +51452,250 @@ mod expression_conditional_tests {
         }
     }
 
+    /// #1296 / Camunda 8.10 `referencedSecrets`: the trusted secret references
+    /// an evaluation surfaced — a literal `camunda.secrets.<name>` path used in
+    /// the expression itself, plus any reference carried by a
+    /// `SECRET_REFERENCE`-kind cluster variable the expression READ. References
+    /// appearing only in request-body variables or JSON-kind cluster variables
+    /// are untrusted and excluded.
+    #[tokio::test]
+    async fn expression_evaluation_reports_trusted_referenced_secrets() {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+
+        let srv = server();
+        // A JSON-kind cluster variable carrying a reference-shaped string is
+        // NOT a trusted source.
+        srv.cluster_variables.create(
+            None,
+            "plain_ref",
+            super::json_to_value(&serde_json::json!("camunda.secrets.UNTRUSTED")),
+            None,
+            super::ClusterVariableMetadata::new(),
+        );
+        // A SECRET_REFERENCE-kind cluster variable IS trusted when read.
+        let mut req = models::CreateClusterVariableRequest {
+            name: "token_ref".to_string(),
+            value: types::Object(serde_json::json!("camunda.secrets.TOKEN")),
+            metadata: None,
+            kind: Some(models::ClusterVariableKindEnum::SecretReference),
+        };
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&req).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+        req.name = "unused_ref".to_string();
+        req.value = types::Object(serde_json::json!("camunda.secrets.UNUSED"));
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&req).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        async fn eval(
+            srv: &ServerImpl,
+            expr: &str,
+            variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+        ) -> models::ExpressionEvaluationResult {
+            let body = models::ExpressionEvaluationRequest {
+                expression: expr.to_string(),
+                tenant_id: None,
+                scope_key: None,
+                variables,
+            };
+            match srv.evaluate_expression_impl(&body).await.unwrap() {
+                Resp::Status200_ExpressionEvaluatedSuccessfully(r) => r,
+                other => panic!("expected 200 for '{expr}', got {other:?}"),
+            }
+        }
+        let secret_names = |r: &models::ExpressionEvaluationResult| {
+            let mut names: Vec<String> = r
+                .referenced_secrets
+                .iter()
+                .map(|s| s.secret_name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // A literal `camunda.secrets.<name>` path in the expression is trusted.
+        // The reference evaluates to its own text (Nano never resolves it).
+        let r = eval(&srv, "camunda.secrets.DIRECT", None).await;
+        assert_eq!(secret_names(&r), vec!["DIRECT"]);
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.DIRECT"),
+            "a trusted reference passes through as its own text, never resolved"
+        );
+
+        // Reading a SECRET_REFERENCE cluster variable surfaces its reference.
+        let r = eval(&srv, "token_ref", None).await;
+        assert_eq!(secret_names(&r), vec!["TOKEN"]);
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.TOKEN"),
+            "the cluster variable's reference text is returned verbatim"
+        );
+
+        // A JSON-kind cluster variable's reference-shaped value is untrusted,
+        // and an unread SECRET_REFERENCE variable contributes nothing.
+        let r = eval(&srv, "plain_ref", None).await;
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "a JSON-kind variable is never a trusted source: {:?}",
+            r.referenced_secrets
+        );
+
+        // A request-body variable's reference-shaped value is untrusted too.
+        let r = eval(
+            &srv,
+            "body_ref",
+            vars(&[("body_ref", serde_json::json!("camunda.secrets.BODY"))]),
+        )
+        .await;
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "request-body variables are never a trusted source: {:?}",
+            r.referenced_secrets
+        );
+    }
+
+    /// #1296 review findings: provenance is STRUCTURAL (fail-closed) and
+    /// tenant-aware, derived from one immutable snapshot. These regressions pin
+    /// the defect class a purely syntactic scan got wrong: (a) a shadowed
+    /// binding, skipped branch, or short-circuited operand never surfaces a
+    /// reference; (b) a reference nested in a STRUCTURED SECRET_REFERENCE value
+    /// is surfaced by a direct member-path read; (c) the requested tenant's
+    /// overlay (not just globals) is applied and its kind drives provenance.
+    #[tokio::test]
+    async fn expression_evaluation_provenance_is_evaluation_driven_and_tenant_aware() {
+        let srv = server();
+        // A SECRET_REFERENCE global carrying a STRUCTURED value (reference text
+        // nested in an object) — finding: provenance must survive projection.
+        let mut cfg = models::CreateClusterVariableRequest {
+            name: "cfg".to_string(),
+            value: types::Object(serde_json::json!({"token": "camunda.secrets.NESTED"})),
+            metadata: None,
+            kind: Some(models::ClusterVariableKindEnum::SecretReference),
+        };
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&cfg).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+        // A tenant-scoped SECRET_REFERENCE shadowing nothing globally.
+        cfg.name = "tenant_ref".to_string();
+        cfg.value = types::Object(serde_json::json!("camunda.secrets.ACME"));
+        let tenant_path = models::CreateTenantClusterVariablePathParams {
+            tenant_id: "acme".to_string(),
+        };
+        assert!(matches!(
+            srv.create_tenant_cluster_variable_impl(&tenant_path, &cfg)
+                .await
+                .unwrap(),
+            apis::cluster_variable::CreateTenantClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        async fn eval_t(
+            srv: &ServerImpl,
+            expr: &str,
+            tenant_id: Option<&str>,
+            variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+        ) -> models::ExpressionEvaluationResult {
+            use apis::expression::EvaluateExpressionResponse as Resp;
+            let body = models::ExpressionEvaluationRequest {
+                expression: expr.to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                scope_key: None,
+                variables,
+            };
+            match srv.evaluate_expression_impl(&body).await.unwrap() {
+                Resp::Status200_ExpressionEvaluatedSuccessfully(r) => r,
+                other => panic!("expected 200 for '{expr}', got {other:?}"),
+            }
+        }
+        let names = |r: &models::ExpressionEvaluationResult| {
+            let mut n: Vec<String> = r
+                .referenced_secrets
+                .iter()
+                .map(|s| s.secret_name.clone())
+                .collect();
+            n.sort();
+            n
+        };
+
+        // (b) A member access into a structured SECRET_REFERENCE value surfaces
+        // the nested reference.
+        let r = eval_t(&srv, "cfg.token", None, None).await;
+        assert_eq!(names(&r), vec!["NESTED"]);
+
+        // (a) Fail-closed (PR #1636 round-8): a conditional is never a
+        // structural trusted-reference shape, so even the TAKEN branch's
+        // literal is not reported — post-hoc attribution across control flow
+        // is exactly the leak this guards (a condition on a trusted variable
+        // can launder an untrusted branch value).
+        let r = eval_t(
+            &srv,
+            "if false then camunda.secrets.SKIPPED else camunda.secrets.TAKEN",
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            names(&r).is_empty(),
+            "a conditional reports nothing under fail-closed provenance: {:?}",
+            r.referenced_secrets
+        );
+        // Short-circuited `or` never surfaces the right operand's reference.
+        let r = eval_t(&srv, "true or camunda.secrets.SKIPPED", None, None).await;
+        assert!(names(&r).is_empty());
+
+        // (a) A request-body variable SHADOWING a trusted cluster variable is
+        // untrusted: the body value (not the cluster variable's) is returned,
+        // and because the body binding is never a trusted carrier the shadowed
+        // cluster variable's NESTED reference is NOT surfaced.
+        let r = eval_t(
+            &srv,
+            "cfg",
+            None,
+            vars(&[("cfg", serde_json::json!("camunda.secrets.BODY"))]),
+        )
+        .await;
+        assert!(
+            names(&r).is_empty(),
+            "a body binding shadows the trusted cluster variable and is itself untrusted: {:?}",
+            r.referenced_secrets
+        );
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.BODY"),
+            "the shadowing body value is returned, not the cluster variable's"
+        );
+
+        // (c) The requested tenant's overlay is applied: evaluating the
+        // tenant-scoped variable under tenant `acme` surfaces its reference…
+        let r = eval_t(&srv, "tenant_ref", Some("acme"), None).await;
+        assert_eq!(names(&r), vec!["ACME"]);
+        // …but under another tenant (or none) the variable is invisible, so the
+        // expression evaluates to null with no provenance.
+        let r = eval_t(&srv, "tenant_ref", None, None).await;
+        assert!(names(&r).is_empty());
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::Value::Null,
+            "a tenant-scoped variable is invisible to other tenants"
+        );
+    }
+
     /// `next_stateless_key` must be strictly increasing and collision-free across
     /// a burst issued within the same millisecond — the defect class the previous
     /// `seq % 1_000` implementation reintroduced (keys wrapped and collided after
@@ -51009,15 +51724,93 @@ mod expression_conditional_tests {
         );
     }
 
+    /// Nano is single-tenant: a conditional evaluation scoped to any tenant
+    /// other than `<default>` is rejected with a `400` instead of running an
+    /// unscoped evaluation that would create instances outside that tenant —
+    /// both keyed and unkeyed (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_rejects_a_non_default_tenant() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-tenant-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+        for targeted in [false, true] {
+            let body = models::ConditionalEvaluationInstruction {
+                tenant_id: Some("tenant-a".to_string()),
+                process_definition_key: targeted
+                    .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+                variables: std::collections::HashMap::new(),
+            };
+            match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+                Resp::Status400_TheProvidedDataIsNotValid(p) => assert_eq!(p.status, 400),
+                other => panic!("expected 400 (targeted={targeted}), got {other:?}"),
+            }
+        }
+        // An explicit `<default>` tenant is the engine's own tenant: accepted.
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: Some("<default>".to_string()),
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.tenant_id, "<default>");
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// A conditional evaluation creates instances, so it obeys the shared create
+    /// admission policy: with the drain-stall hard valve engaged it is shed with
+    /// a `503` and creates nothing (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_is_shed_by_create_admission() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-shed-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        deploy_and_await_definition(&srv, proc).await;
+        srv.drain_guard().publish(true, true);
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(p) => {
+                assert_eq!(p.status, 503);
+            }
+            other => panic!("expected 503 while halted, got {other:?}"),
+        }
+        // and once the valve releases, the same evaluation proceeds.
+        srv.drain_guard().publish(false, false);
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200 after release, got {other:?}"),
+        }
+    }
+
     /// A conditional evaluation with no targeted definition succeeds with a fresh
     /// evaluation key, the resolved tenant, and an empty `processInstances` list
-    /// (Nano has no root-level conditional start events to trigger).
+    /// when nothing deployed has a root-level conditional start event.
     #[tokio::test]
     async fn conditional_evaluation_returns_empty_result() {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
         let srv = server();
         let body = models::ConditionalEvaluationInstruction {
-            tenant_id: Some("tenant-a".to_string()),
+            tenant_id: None,
             process_definition_key: None,
             variables: [(
                 "orderAmount".to_string(),
@@ -51028,7 +51821,7 @@ mod expression_conditional_tests {
         };
         match srv.evaluate_conditionals_impl(&body).await.unwrap() {
             Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
-                assert_eq!(r.tenant_id, "tenant-a");
+                assert_eq!(r.tenant_id, "<default>");
                 assert!(r.process_instances.is_empty());
                 assert!(
                     r.conditional_evaluation_key.0.parse::<u64>().is_ok(),
@@ -51085,32 +51878,7 @@ mod expression_conditional_tests {
             .connect("start", "end")
             .build()
             .expect("valid process");
-        let mut names = std::collections::HashMap::new();
-        names.insert("cond-proc".to_string(), "cond.bpmn".to_string());
-        srv.deploy_resources_locally(
-            vec![proc],
-            &names,
-            Vec::new(),
-            &std::collections::HashMap::new(),
-            "<default>",
-        )
-        .await
-        .expect("deploy cond-proc");
-
-        // The read-model projection is asynchronous; poll for the definition key.
-        let mut key = None;
-        for _ in 0..300 {
-            for pd in srv.store.process_definitions() {
-                if pd.process_id == "cond-proc" {
-                    key = Some(pd.key);
-                }
-            }
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let key = key.expect("cond-proc definition is projected");
+        let key = deploy_and_await_definition(&srv, proc).await;
 
         let body = models::ConditionalEvaluationInstruction {
             tenant_id: None,
@@ -51123,6 +51891,93 @@ mod expression_conditional_tests {
                 assert!(r.process_instances.is_empty());
             }
             other => panic!("expected 200 for a deployed definition, got {other:?}"),
+        }
+    }
+
+    /// Deploys `proc` locally and polls the (asynchronous) read-model
+    /// projection until its definition key is visible.
+    async fn deploy_and_await_definition(
+        srv: &ServerImpl,
+        proc: nanobpmn_engine_core::ProcessDefinition,
+    ) -> u64 {
+        let process_id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(process_id.clone(), format!("{process_id}.bpmn"));
+        srv.deploy_resources_locally(
+            vec![proc],
+            &names,
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            "<default>",
+        )
+        .await
+        .expect("deploy process");
+        for _ in 0..300 {
+            if let Some(pd) = srv
+                .store
+                .process_definitions()
+                .into_iter()
+                .find(|pd| pd.process_id == process_id)
+            {
+                return pd.key;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{process_id} definition is never projected");
+    }
+
+    /// A deployed process whose root-level conditional start event condition
+    /// is satisfied by the supplied variables is started by the evaluation
+    /// (#932): the created instance is reported in `processInstances`, and an
+    /// unsatisfied condition starts nothing.
+    #[tokio::test]
+    async fn conditional_evaluation_starts_a_satisfied_conditional_start_event() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-start-proc")
+            .conditional_start_event("start", "=orderAmount > 100")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+
+        let evaluate = |amount: i64, targeted: bool| models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: targeted
+                .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+            variables: [(
+                "orderAmount".to_string(),
+                types::Object(serde_json::json!(amount)),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        for targeted in [false, true] {
+            match srv
+                .evaluate_conditionals_impl(&evaluate(1000, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert_eq!(r.process_instances.len(), 1, "targeted={targeted}");
+                    let created = &r.process_instances[0];
+                    assert_eq!(created.process_definition_key.0, definition_key.to_string());
+                    assert!(created.process_instance_key.0.parse::<u64>().is_ok());
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
+            match srv
+                .evaluate_conditionals_impl(&evaluate(50, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert!(r.process_instances.is_empty(), "targeted={targeted}");
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
         }
     }
 }

@@ -2350,11 +2350,10 @@ fn should_accept_explicit_latest_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_deployment_binding_on_a_user_task_form() {
+fn should_parse_deployment_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring `bindingType="deployment"`.
-    // The engine does not implement the `deployment` binding; degrading it to
-    // `latest` would silently mis-bind the form (#1190), so the deploy must
-    // be rejected loudly rather than parsed.
+    // The binding is implemented (#1193): it parses into the task's
+    // `form_binding_type` and dispatches at user-task creation.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2372,22 +2371,26 @@ fn should_reject_deployment_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest form binding is rejected");
+    // when
+    let def = &parse_bpmn(xml).expect("a deployment form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
     assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
-        }
+        props.form_binding_type,
+        crate::model::BindingType::Deployment
     );
+    assert_eq!(props.form_version_tag, None);
 }
 
 #[test]
-fn should_reject_version_tag_binding_on_a_user_task_form() {
-    // given: a user-task formDefinition declaring `bindingType="versionTag"`.
-    // Like `deployment`, this binding is unimplemented and must fail the
-    // deploy loudly rather than degrade to `latest` (#1190).
+fn should_parse_version_tag_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring `bindingType="versionTag"`
+    // with its `versionTag`. Both attributes parse into the task's form
+    // binding (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2406,23 +2409,27 @@ fn should_reject_version_tag_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a versionTag form binding is rejected");
+    // when
+    let def = &parse_bpmn(xml).expect("a versionTag form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
     assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "versionTag".to_string(),
-        }
+        props.form_binding_type,
+        crate::model::BindingType::VersionTag
     );
+    assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
 }
 
 #[test]
 fn should_ignore_non_latest_binding_on_an_external_reference_form() {
     // given: an externalReference form that also (redundantly) carries a
     // non-latest bindingType. The externalReference suppresses `formId` and
-    // no form version is resolved, so the unimplemented binding is moot and
-    // must not trip the interim guard.
+    // no form version is resolved, so the binding is moot and unrecorded
+    // (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2453,6 +2460,8 @@ fn should_ignore_non_latest_binding_on_an_external_reference_form() {
         props.external_form_reference.as_deref(),
         Some("https://forms.example/x")
     );
+    // The moot binding is not recorded: the task keeps the default `latest`.
+    assert_eq!(props.form_binding_type, crate::model::BindingType::Latest);
 }
 
 #[test]
@@ -2460,7 +2469,7 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring an explicitly *empty*
     // `bindingType=""`. An empty attribute is a present, explicit value — not
     // an absent one — so it must not be silently treated as the `latest`
-    // default (which would reopen the silent-degradation path #1190 closes).
+    // default (the #1190 fail-loud rule, kept for a value no binding maps to).
     // Only an omitted `bindingType` defaults.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -2491,13 +2500,46 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_non_latest_binding_when_form_id_is_absent() {
-    // given: a user-task formDefinition with an unimplemented
-    // `bindingType="deployment"` but no `formId` (and no `externalReference`).
-    // Keying the guard off the raw `externalReference` — not off a resolved
-    // `formId` — closes this path: a deployed (non-external) form must carry
-    // only the default binding regardless of whether a `formId` happens to be
-    // present, so this declaration is rejected rather than silently accepted.
+fn should_reject_an_unknown_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring a `bindingType` that is none
+    // of Camunda's three bindings. An unrecognised value is rejected loudly
+    // rather than silently treated as the `latest` default (#1190/#1193).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" bindingType="pinned" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an unknown form binding is rejected");
+    assert_eq!(
+        err,
+        ParseError::UnsupportedUserTaskFormBinding {
+            task_id: "review".to_string(),
+            binding_type: "pinned".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_a_form_definition_without_a_form_id_or_external_reference() {
+    // given: a user-task formDefinition carrying `bindingType="deployment"`
+    // but no `formId` (and no `externalReference`). With neither there is no
+    // form to resolve under any binding, so accepting it would create a
+    // form-less task with no incident — a silently dead declaration. Zeebe
+    // requires exactly one of the two and rejects the deployment; Nano
+    // surfaces the same hard parse error (#1193 review).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2516,13 +2558,81 @@ fn should_reject_non_latest_binding_when_form_id_is_absent() {
           </bpmn:definitions>"#;
 
     // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest binding without a formId is rejected");
+    let err = parse_bpmn(xml).expect_err("a form-less formDefinition is rejected");
     assert_eq!(
         err,
-        ParseError::UnsupportedUserTaskFormBinding {
+        ParseError::MissingUserTaskFormId {
             task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
         }
+    );
+}
+
+#[test]
+fn should_reject_an_empty_form_id_on_a_user_task_form() {
+    // given: the same defect class through an explicitly EMPTY `formId=""`
+    // (present but unusable) — rejected exactly like an absent one, on the
+    // default `latest` binding too: the rule is the missing form reference,
+    // not the binding type.
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an empty formId is rejected");
+    assert_eq!(
+        err,
+        ParseError::MissingUserTaskFormId {
+            task_id: "review".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_external_form_reference_without_a_form_id() {
+    // given: a user-task formDefinition with an `externalReference` and no
+    // `formId` — the one legitimate form-id-less shape (the form is hosted
+    // externally, so no deployed version is resolved and the binding is moot).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition externalReference="https://forms.example/review" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when
+    let def = &parse_bpmn(xml).expect("an external form reference parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id, None);
+    assert_eq!(
+        props.external_form_reference.as_deref(),
+        Some("https://forms.example/review")
     );
 }
 
@@ -3183,6 +3293,127 @@ fn should_parse_multi_instance_loop_characteristics() {
         def.element("each").unwrap().kind,
         ElementKind::ServiceTask { .. }
     ));
+}
+
+#[test]
+fn should_parse_a_root_level_conditional_start_event() {
+    // given: a process whose only start is a root-level conditional start
+    // (#932), plus a second process mixing a none start with a conditional one.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="cs">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition xsi:type="bpmn:tFormalExpression">=orderAmount &gt; 100</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+            </bpmn:process>
+            <bpmn:process id="q">
+              <bpmn:startEvent id="none" />
+              <bpmn:startEvent id="cond">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition>=go = true</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="g0" sourceRef="none" targetRef="e1" />
+              <bpmn:sequenceFlow id="g1" sourceRef="cond" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when
+    let defs = parse_bpmn(xml).unwrap();
+
+    // then: the start is a typed conditional start, never a plain none start.
+    let p = defs.iter().find(|d| d.id == "p").unwrap();
+    assert_eq!(
+        p.element("cs").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=orderAmount > 100".to_string(),
+        }
+    );
+    assert_eq!(p.start_event, "cs");
+    // and a none start alongside it stays the CreateInstance entry point.
+    let q = defs.iter().find(|d| d.id == "q").unwrap();
+    assert_eq!(q.start_event, "none");
+    assert_eq!(q.element("none").unwrap().kind, ElementKind::StartEvent);
+    assert_eq!(
+        q.element("cond").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=go = true".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_malformed_root_level_conditional_start_events() {
+    // given: every malformed root conditional-start shape (#932) — each must
+    // fail closed rather than deploy as a none start or a silently-picked
+    // single trigger.
+    let cases = [
+        ("missing condition", "<bpmn:conditionalEventDefinition />"),
+        (
+            "blank condition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>   </bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "duplicate definitions",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=b</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a message definition",
+            "<bpmn:messageEventDefinition messageRef=\"m\" />\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a signal definition and an empty condition",
+            "<bpmn:signalEventDefinition signalRef=\"sig\" />\
+             <bpmn:conditionalEventDefinition />",
+        ),
+        (
+            "mixed with a timer definition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>",
+        ),
+    ];
+    for (label, defs) in cases {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                <bpmn:message id="m" name="m" />
+                <bpmn:signal id="sig" name="sig" />
+                <bpmn:process id="p">
+                  <bpmn:startEvent id="cs">{defs}</bpmn:startEvent>
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+                </bpmn:process>
+              </bpmn:definitions>"#
+        );
+        // The same shape alongside a separate none start: surplus-start
+        // demotion must not reclassify the malformed start (e.g. as a surplus
+        // signal start) before the conditional-start validation sees it.
+        let xml_with_none_start = xml.replace(
+            r#"<bpmn:endEvent id="e" />"#,
+            r#"<bpmn:startEvent id="a_none" />
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f1" sourceRef="a_none" targetRef="e" />"#,
+        );
+
+        for (variant, doc) in [("alone", &xml), ("with a none start", &xml_with_none_start)] {
+            // when
+            let result = parse_bpmn(doc);
+
+            // then
+            assert!(
+                matches!(result, Err(ParseError::InvalidProcess { .. })),
+                "{label} ({variant}): expected InvalidProcess, got {result:?}"
+            );
+        }
+    }
 }
 
 #[test]

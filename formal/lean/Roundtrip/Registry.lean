@@ -82,6 +82,8 @@ def registry : List KindSpec :=
         , { key := "followUpDate", required := false, ty := .str }
         , { key := "priority", required := false, ty := .str }
         , { key := "formId", required := false, ty := .str }
+        , { key := "formBindingType", required := false, ty := .str }
+        , { key := "formVersionTag", required := false, ty := .str }
         , { key := "externalFormReference", required := false, ty := .str } ] }
   , { keyword := "exclusiveGateway", attrs := [] }
   , { keyword := "parallelGateway", attrs := [] }
@@ -115,6 +117,8 @@ def registry : List KindSpec :=
     , attrs :=
         [ { key := "interval", required := true, ty := .duration }
         , { key := "repeating", required := true, ty := .bool } ] }
+  , { keyword := "conditionalStartEvent"
+    , attrs := [ { key := "condition", required := true, ty := .str } ] }
   , { keyword := "subProcess"
     , attrs := [ { key := "startEvent", required := true, ty := .id } ] }
   , { keyword := "eventSubProcess"

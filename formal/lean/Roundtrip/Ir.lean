@@ -57,6 +57,7 @@ inductive Kind where
   | messageBoundaryEvent
   | messageStartEvent
   | timerStartEvent
+  | conditionalStartEvent
   | subProcess
   | eventSubProcess
   | escalationThrowEvent
@@ -82,7 +83,7 @@ def Kind.all : List Kind :=
   , .userTask, .exclusiveGateway, .parallelGateway, .inclusiveGateway
   , .eventBasedGateway, .errorBoundaryEvent, .timerIntermediateCatchEvent
   , .timerBoundaryEvent, .messageIntermediateCatchEvent, .messageBoundaryEvent
-  , .messageStartEvent, .timerStartEvent, .subProcess, .eventSubProcess
+  , .messageStartEvent, .timerStartEvent, .conditionalStartEvent, .subProcess, .eventSubProcess
   , .escalationThrowEvent
   , .escalationBoundaryEvent, .intermediateThrowEvent, .linkIntermediateThrowEvent
   , .linkIntermediateCatchEvent, .task, .scriptTask, .callActivity
@@ -110,6 +111,7 @@ def Kind.keyword : Kind → String
   | .messageBoundaryEvent => "messageBoundaryEvent"
   | .messageStartEvent => "messageStartEvent"
   | .timerStartEvent => "timerStartEvent"
+  | .conditionalStartEvent => "conditionalStartEvent"
   | .subProcess => "subProcess"
   | .eventSubProcess => "eventSubProcess"
   | .escalationThrowEvent => "escalationThrowEvent"
@@ -152,6 +154,8 @@ def Kind.schema : Kind → List AttrDecl
       , { key := "followUpDate", required := false, ty := .str }
       , { key := "priority", required := false, ty := .str }
       , { key := "formId", required := false, ty := .str }
+      , { key := "formBindingType", required := false, ty := .str }
+      , { key := "formVersionTag", required := false, ty := .str }
       , { key := "externalFormReference", required := false, ty := .str } ]
   | .exclusiveGateway => []
   | .parallelGateway => []
@@ -180,6 +184,8 @@ def Kind.schema : Kind → List AttrDecl
   | .timerStartEvent =>
       [ { key := "interval", required := true, ty := .duration }
       , { key := "repeating", required := true, ty := .bool } ]
+  | .conditionalStartEvent =>
+      [ { key := "condition", required := true, ty := .str } ]
   | .subProcess =>
       [ { key := "startEvent", required := true, ty := .id } ]
   | .eventSubProcess =>

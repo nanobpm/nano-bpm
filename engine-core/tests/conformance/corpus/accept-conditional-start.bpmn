@@ -1,0 +1,21 @@
+<!-- verdict: accept -->
+<!-- oracle: Zeebe deploys a root-level conditional start event (triggered via ConditionalEvaluation:EVALUATE, #932). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+  <bpmn:process id="accept_conditional_start" isExecutable="true">
+    <bpmn:startEvent id="condStart">
+      <bpmn:outgoing>f0</bpmn:outgoing>
+      <bpmn:conditionalEventDefinition>
+        <bpmn:condition>= orderAmount &gt; 100</bpmn:condition>
+      </bpmn:conditionalEventDefinition>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="condStart" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="d">
+    <bpmndi:BPMNPlane id="p" bpmnElement="accept_conditional_start">
+      <bpmndi:BPMNShape id="condStart_di" bpmnElement="condStart"><dc:Bounds x="100" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="200" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f0_di" bpmnElement="f0"><di:waypoint x="136" y="118" /><di:waypoint x="200" y="118" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

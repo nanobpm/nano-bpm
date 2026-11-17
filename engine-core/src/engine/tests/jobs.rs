@@ -595,6 +595,7 @@ fn activated_job_resolves_linked_resource_latest_binding_into_a_header() {
         resource_id: "agent-prompt.md".to_string(),
         resource_name: "agent-prompt.md".to_string(),
         content: content.to_string(),
+        version_tag: None,
     };
     engine
         .apply_command(Command::DeployGenericResources(vec![resource("# v1")]))

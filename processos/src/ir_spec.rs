@@ -193,6 +193,19 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
                       task creation.",
             },
             AttrSpec {
+                key: "formBindingType",
+                required: false,
+                ty: AttrType::Str,
+                doc: "How formId resolves at task creation: latest (default), deployment \
+                      (the version deployed with the process) or versionTag.",
+            },
+            AttrSpec {
+                key: "formVersionTag",
+                required: false,
+                ty: AttrType::Str,
+                doc: "The version tag matched when formBindingType is versionTag.",
+            },
+            AttrSpec {
                 key: "externalFormReference",
                 required: false,
                 ty: AttrType::Str,
@@ -357,6 +370,17 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
                 doc: "`true` re-arms after firing (a cycle); `false` fires exactly once.",
             },
         ],
+    },
+    KindSpec {
+        keyword: "conditionalStartEvent",
+        doc: "Conditional start. A conditional evaluation whose variables satisfy the FEEL \
+              boolean creates a new instance.",
+        attrs: &[AttrSpec {
+            key: "condition",
+            required: true,
+            ty: AttrType::Str,
+            doc: "FEEL boolean condition (leading `=` optional).",
+        }],
     },
     KindSpec {
         keyword: "subProcess",
@@ -977,6 +1001,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         MessageStartEvent { .. } => "messageStartEvent",
         TimerStartEvent { .. } => "timerStartEvent",
+        ConditionalStartEvent { .. } => "conditionalStartEvent",
         SubProcess { .. } => "subProcess",
         EventSubProcess { .. } => "eventSubProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
@@ -1040,6 +1065,10 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
                 follow_up_date: Some("=today()".into()),
                 priority: Some("50".into()),
                 form_id: Some("feature-escalation".into()),
+                // Off-default binding attributes (#1193) so the sample pins
+                // their IR/XML round-trip.
+                form_binding_type: nanobpmn_engine_core::BindingType::VersionTag,
+                form_version_tag: Some("v2".into()),
                 external_form_reference: Some("https://forms.example/x".into()),
             }),
         ),
@@ -1096,6 +1125,12 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             ElementKind::TimerStartEvent {
                 interval_millis: 3_600_000,
                 repeating: true,
+            },
+        ),
+        (
+            "conditionalStartEvent",
+            ElementKind::ConditionalStartEvent {
+                condition: "=orderAmount > 100".into(),
             },
         ),
         (

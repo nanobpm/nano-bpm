@@ -8745,6 +8745,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key,
                 version,
+                deployment_key: 0,
                 definition: def,
             }
         };
@@ -8804,6 +8805,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key: 42,
                 version: 3,
+                deployment_key: 0,
                 definition: def,
             },
         );
@@ -14520,6 +14522,7 @@ mod read_surface_tests {
             form_id: form_id.to_string(),
             resource_name: format!("{form_id}.form"),
             schema: schema.to_string(),
+            version_tag: None,
         }
     }
 

@@ -90,6 +90,18 @@ pub enum Command {
     /// does not execute generic resources; it stores them verbatim so they can be
     /// served by `GetResourceByKey` / searched by `resourceId`.
     DeployGenericResources(Vec<GenericResource>),
+    /// Atomically register one mixed deployment — processes, DRGs, forms and
+    /// generic resources submitted together (one REST `POST /deployments`) —
+    /// under ONE shared deployment key (#1193). `bindingType: deployment`
+    /// lookups (user-task forms, linked resources) resolve by exact
+    /// deployment membership, so co-deployed resources must share the key;
+    /// splitting a deployment into per-kind commands would mint one key per
+    /// kind and strand every co-deployed binding. Duplicate semantics follow
+    /// Zeebe: if EVERY resource is identical to its latest version the
+    /// deployment is a no-op (each keeps its existing identity); otherwise
+    /// every resource — unchanged ones included — is re-versioned under the new
+    /// deployment key, so the whole bundle stays mutually resolvable.
+    DeployBundle(DeploymentBundle),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
     /// deletion in the read model. `instance_key` is the owning process instance
     /// (`0` for a standalone evaluation), carried so the emitted
@@ -415,6 +427,31 @@ pub enum Command {
     BroadcastSignal {
         signal_name: String,
         variables: HashMap<String, Value>,
+    },
+    /// Evaluate root-level **conditional start events** (#932, Zeebe
+    /// `ConditionalEvaluation:EVALUATE`, `POST /v2/conditionals/evaluation`).
+    ///
+    /// For every deployed process — the **latest** version of each process id,
+    /// or only the exact version `process_definition_key` names when set — each
+    /// process-level [`crate::ElementKind::ConditionalStartEvent`] has its FEEL
+    /// condition evaluated against `variables`; every one that evaluates to
+    /// `true` creates a new instance (seeded with `variables`) on this partition,
+    /// starting at that event. Processes and start events are visited in a
+    /// deterministic order (process id, then element id) so replay mints the
+    /// same keys. A condition that errors or yields a non-boolean is simply not
+    /// satisfied (no instance, no incident). The created instances are the
+    /// [`crate::Event::ProcessInstanceCreated`] events in the returned log; an
+    /// unknown `process_definition_key` is
+    /// [`crate::EngineError::ProcessDefinitionNotFound`].
+    EvaluateConditionalStartEvents {
+        variables: HashMap<String, Value>,
+        /// Restrict the evaluation to this exact definition version. `None`
+        /// evaluates the latest version of every deployed process.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
     },
     /// Open the **canonical** record for a message subscription on the partition
     /// that owns its correlation key (`hash(correlation_key)`). Routed by the host
@@ -831,6 +868,21 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
+/// Every resource submitted in one deployment, registered atomically by
+/// [`Command::DeployBundle`] under a single shared deployment key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeploymentBundle {
+    /// BPMN process definitions.
+    pub processes: Vec<ProcessDefinition>,
+    /// DMN decision requirements graphs.
+    pub decisions: Vec<crate::dmn::DecisionRequirementsGraph>,
+    /// `form-js` forms.
+    pub forms: Vec<FormResource>,
+    /// Generic (stored-verbatim) resources.
+    pub resources: Vec<GenericResource>,
+}
+
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
 /// The engine stores it verbatim; it does not parse or execute the form beyond
 /// carrying its identity.
@@ -843,6 +895,11 @@ pub struct FormResource {
     pub resource_name: String,
     /// The verbatim form-js JSON document.
     pub schema: String,
+    /// The optional version tag this form version carries (form-js
+    /// `versionTag`), matched by a `versionTag`-bound user-task form (#1193).
+    /// `None` when the form declares no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// Extracts the form-js document `id` from a `.form` resource's JSON — the single
@@ -858,6 +915,23 @@ pub struct FormResource {
 pub fn form_id_of(schema: &str) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
     doc.get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the form-js document `versionTag` from a `.form` resource's JSON —
+/// the single canonical definition of "what counts as a form version tag"
+/// shared by every deploy boundary, mirroring [`form_id_of`]. Returns `None`
+/// when the document carries no non-empty string `versionTag` (an untagged
+/// form; Zeebe treats the tag as optional metadata matched only by a
+/// `versionTag` binding).
+///
+/// Gated behind the `serde` feature for the same reason as [`form_id_of`].
+#[cfg(feature = "serde")]
+pub fn form_version_tag_of(schema: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
+    doc.get("versionTag")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -882,6 +956,11 @@ pub struct GenericResource {
     pub resource_name: String,
     /// The verbatim resource content.
     pub content: String,
+    /// The optional version tag this resource version carries (Zeebe
+    /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+    /// `zeebe:linkedResource` (#1193). `None` when the deploy carried no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// The modification instruction shapes are persisted inside
@@ -949,6 +1028,7 @@ impl Command {
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
             Command::DeployForms(_) => "deploy_forms",
             Command::DeployGenericResources(_) => "deploy_generic_resources",
+            Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
             Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",
@@ -971,6 +1051,7 @@ impl Command {
             Command::SetVariables { .. } => "set_variables",
             Command::CorrelateMessage { .. } => "correlate_message",
             Command::BroadcastSignal { .. } => "broadcast_signal",
+            Command::EvaluateConditionalStartEvents { .. } => "evaluate_conditional_start_events",
             Command::OpenMessageSubscription { .. } => "open_message_subscription",
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
@@ -1013,6 +1094,7 @@ impl Command {
             | Command::SetVariables { variables, .. }
             | Command::CorrelateMessage { variables, .. }
             | Command::BroadcastSignal { variables, .. }
+            | Command::EvaluateConditionalStartEvents { variables, .. }
             | Command::CorrelateMessageSubscription { variables, .. }
             | Command::DispatchStartInstance { variables, .. } => vars(variables),
             Command::ModifyInstance {
