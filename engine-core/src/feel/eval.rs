@@ -1,8 +1,7 @@
 //! The FEEL evaluator: walks an [`ast::Node`] tree producing a [`FeelVal`].
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use super::ast::{BinOp, CallArgs, Node, Quantifier, RangeNode};
@@ -16,21 +15,6 @@ use crate::model::Value;
 pub struct Ctx<'a> {
     base: &'a HashMap<String, Value>,
     scopes: Vec<BTreeMap<String, FeelVal>>,
-    /// Records the names of the literal `camunda.secrets.<name>` paths that
-    /// surface on the executed path, when tracked (#1296). `None` — the
-    /// default for every caller but [`super::eval_with_provenance`]'s real
-    /// run — records nothing and costs nothing. Shared (`Rc<RefCell>`) so a
-    /// function call or builtin callback evaluating in a fresh `Ctx` still
-    /// records into the same set.
-    literal: Option<Rc<RefCell<HashSet<String>>>>,
-    /// Records the base-context variable names the evaluation actually READS,
-    /// when tracked (#1296 round 5). `None` — the default for every caller
-    /// but [`super::eval_with_provenance`]'s real run — records nothing.
-    /// Shared (`Rc<RefCell>`) so a function call or builtin callback
-    /// evaluating in a fresh `Ctx` still records into the same set. Only a
-    /// read that falls through every local frame to the base context counts:
-    /// a shadowed binding is not a read of the base variable.
-    read: Option<Rc<RefCell<HashSet<String>>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -38,36 +22,6 @@ impl<'a> Ctx<'a> {
         Ctx {
             base,
             scopes: Vec::new(),
-            literal: None,
-            read: None,
-        }
-    }
-
-    /// Attaches the literal-reference and base-read sinks, returning the
-    /// context so the caller can
-    /// `let mut ctx = Ctx::new(base).with_provenance(literal, read);`.
-    pub fn with_provenance(
-        mut self,
-        literal: Rc<RefCell<HashSet<String>>>,
-        read: Rc<RefCell<HashSet<String>>>,
-    ) -> Ctx<'a> {
-        self.literal = Some(literal);
-        self.read = Some(read);
-        self
-    }
-
-    /// Records a literal `camunda.secrets.<name>` path surfacing (a no-op when
-    /// not tracked).
-    fn record_literal(&self, name: &str) {
-        if let Some(l) = self.literal.as_ref() {
-            l.borrow_mut().insert(name.to_string());
-        }
-    }
-
-    /// Records a base-context variable read (a no-op when not tracked).
-    fn record_read(&self, name: &str) {
-        if let Some(r) = self.read.as_ref() {
-            r.borrow_mut().insert(name.to_string());
         }
     }
 
@@ -76,12 +30,6 @@ impl<'a> Ctx<'a> {
             if let Some(v) = frame.get(name) {
                 return Some(v.clone());
             }
-        }
-        // The read fell through every local frame to the base context: record
-        // it (a shadowed binding never reaches here). Only a base variable
-        // that EXISTS counts — an unbound name is not a read of anything.
-        if self.base.contains_key(name) {
-            self.record_read(name);
         }
         self.base.get(name).map(|v| FeelVal::from_value(v.clone()))
     }
@@ -99,31 +47,6 @@ impl<'a> Ctx<'a> {
 pub fn evaluate(node: &Node, base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
     let mut ctx = Ctx::new(base);
     eval_node(node, &mut ctx)
-}
-
-/// Evaluates a parsed expression, returning the result, the names of the
-/// literal `camunda.secrets.<name>` paths that surfaced on the executed path,
-/// and the base-context variable names the evaluation actually READ (#1296).
-/// Identical to [`evaluate`] except that the sentinel's references and the
-/// base reads are recorded; used only by [`super::eval_with_provenance`]'s
-/// real run.
-pub fn evaluate_tracked(
-    node: &Node,
-    base: &HashMap<String, Value>,
-) -> (Result<FeelVal, FeelError>, HashSet<String>, HashSet<String>) {
-    let literal = Rc::new(RefCell::new(HashSet::new()));
-    let read = Rc::new(RefCell::new(HashSet::new()));
-    let mut ctx = Ctx::new(base).with_provenance(literal.clone(), read.clone());
-    let out = eval_node(node, &mut ctx);
-    // Drop the context first so it releases its clones of the sinks; then this
-    // is the sole owner.
-    drop(ctx);
-    let take = |rc: Rc<RefCell<HashSet<String>>>| {
-        Rc::try_unwrap(rc)
-            .map(RefCell::into_inner)
-            .unwrap_or_default()
-    };
-    (out, take(literal), take(read))
 }
 
 fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
@@ -160,7 +83,7 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         })),
         Node::Member(obj, name) => {
             let v = eval_node(obj, ctx)?;
-            Ok(member(&v, name, ctx))
+            Ok(member(&v, name))
         }
         Node::Index(obj, idx) => eval_index(obj, idx, ctx),
         Node::Neg(inner) => {
@@ -436,8 +359,6 @@ pub fn apply(func: &Func, args: Vec<FeelVal>, ctx: &mut Ctx) -> Result<FeelVal, 
             closure,
         } => {
             let mut body_ctx = Ctx::new(ctx.base);
-            body_ctx.literal = ctx.literal.clone();
-            body_ctx.read = ctx.read.clone();
             body_ctx.push((**closure).clone());
             let mut frame = BTreeMap::new();
             for (i, p) in params.iter().enumerate() {
@@ -451,22 +372,19 @@ pub fn apply(func: &Func, args: Vec<FeelVal>, ctx: &mut Ctx) -> Result<FeelVal, 
 
 // --- Member access ----------------------------------------------------------
 
-fn member(v: &FeelVal, name: &str, ctx: &Ctx) -> FeelVal {
+fn member(v: &FeelVal, name: &str) -> FeelVal {
     match v {
         FeelVal::Context(entries) => entries.get(name).cloned().unwrap_or(FeelVal::Null),
         // #1296: `camunda.secrets.<name>` — the sentinel builtin marker the
         // `camunda` variable's `secrets` member carries — evaluates to its own
         // reference text (never resolved here; see the `Node::Var` arm). This
         // arm fires both for a direct access and for each element of a list
-        // projection (`[camunda.secrets].NAME`), so the literal reference is
-        // recorded here — the recursive-projection path the `Node::Member` arm
-        // cannot see.
+        // projection (`[camunda.secrets].NAME`).
         FeelVal::Function(Func::Builtin("camunda.secrets")) => {
-            ctx.record_literal(name);
             FeelVal::Str(format!("camunda.secrets.{name}"))
         }
         // Projection: `list.field` maps the access over each element.
-        FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name, ctx)).collect()),
+        FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name)).collect()),
         FeelVal::Date(d) => date_member(d, name),
         FeelVal::DateTime(dt) => datetime_member(dt, name),
         FeelVal::Time(t) => time_member(t, name),

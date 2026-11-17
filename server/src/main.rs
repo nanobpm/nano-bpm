@@ -23443,11 +23443,11 @@ impl ServerImpl {
         // cluster variables visible in this context AND NOT shadowed by a
         // request-body binding (a body variable is never a trusted carrier, even
         // when it shares a name with a SECRET_REFERENCE cluster variable).
-        // Provenance is evaluation-driven (see `eval_with_provenance`): a
-        // reference is reported only when evaluation surfaces it, so a shadowed
-        // binding, a skipped branch, or an un-called function body never
-        // contributes, and a reference nested in a structured value is found on
-        // access.
+        // Provenance is structural and fail-closed (see
+        // `eval_with_provenance`): a reference is reported only when the
+        // expression's result is structurally a trusted reference — a bare
+        // literal path, a direct read of a trusted root, or a list/context
+        // literal composed of those.
         let trusted_roots: Vec<String> = kinds
             .iter()
             .filter(|(name, kind)| {
@@ -50244,13 +50244,13 @@ mod expression_conditional_tests {
         );
     }
 
-    /// #1296 review findings: provenance is EVALUATION-DRIVEN and tenant-aware,
-    /// derived from one immutable snapshot. These regressions pin the defect
-    /// class a purely syntactic scan got wrong: (a) a shadowed binding, skipped
-    /// branch, or short-circuited operand never surfaces a reference; (b) a
-    /// reference nested in a STRUCTURED SECRET_REFERENCE value is surfaced by a
-    /// member access; (c) the requested tenant's overlay (not just globals) is
-    /// applied and its kind drives provenance.
+    /// #1296 review findings: provenance is STRUCTURAL (fail-closed) and
+    /// tenant-aware, derived from one immutable snapshot. These regressions pin
+    /// the defect class a purely syntactic scan got wrong: (a) a shadowed
+    /// binding, skipped branch, or short-circuited operand never surfaces a
+    /// reference; (b) a reference nested in a STRUCTURED SECRET_REFERENCE value
+    /// is surfaced by a direct member-path read; (c) the requested tenant's
+    /// overlay (not just globals) is applied and its kind drives provenance.
     #[tokio::test]
     async fn expression_evaluation_provenance_is_evaluation_driven_and_tenant_aware() {
         let srv = server();
@@ -50312,7 +50312,11 @@ mod expression_conditional_tests {
         let r = eval_t(&srv, "cfg.token", None, None).await;
         assert_eq!(names(&r), vec!["NESTED"]);
 
-        // (a) A skipped `if` branch never surfaces its reference.
+        // (a) Fail-closed (PR #1636 round-8): a conditional is never a
+        // structural trusted-reference shape, so even the TAKEN branch's
+        // literal is not reported — post-hoc attribution across control flow
+        // is exactly the leak this guards (a condition on a trusted variable
+        // can launder an untrusted branch value).
         let r = eval_t(
             &srv,
             "if false then camunda.secrets.SKIPPED else camunda.secrets.TAKEN",
@@ -50320,7 +50324,11 @@ mod expression_conditional_tests {
             None,
         )
         .await;
-        assert_eq!(names(&r), vec!["TAKEN"]);
+        assert!(
+            names(&r).is_empty(),
+            "a conditional reports nothing under fail-closed provenance: {:?}",
+            r.referenced_secrets
+        );
         // Short-circuited `or` never surfaces the right operand's reference.
         let r = eval_t(&srv, "true or camunda.secrets.SKIPPED", None, None).await;
         assert!(names(&r).is_empty());
