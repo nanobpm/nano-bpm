@@ -77,6 +77,7 @@ impl Engine {
             next_local: snapshot.next_local,
             num_partitions: snapshot.num_partitions.max(1),
             now: snapshot.now,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: snapshot.start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
