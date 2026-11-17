@@ -1394,8 +1394,14 @@ async fn handle_client_frame(
                 }),
             };
         }
-        ClientFrame::InstallDeployment { corr, events } => {
-            server.install_replicated_deployment(events).await;
+        ClientFrame::InstallDeployment {
+            corr,
+            events,
+            operation_reference,
+        } => {
+            server
+                .install_replicated_deployment(events, operation_reference)
+                .await;
             conn.send(ServerFrame::CommandResult {
                 corr,
                 status: 200,
@@ -1409,10 +1415,18 @@ async fn handle_client_frame(
             variables,
             business_id,
             only_partitions,
+            operation_reference,
         } => {
             let vars = to_engine_vars(variables);
             let (message_key, instance) = match server
-                .correlate_message_local(name, correlation_key, vars, business_id, only_partitions)
+                .correlate_message_local(
+                    name,
+                    correlation_key,
+                    vars,
+                    business_id,
+                    only_partitions,
+                    operation_reference,
+                )
                 .await
             {
                 Ok(correlated) => correlated,
@@ -1494,11 +1508,17 @@ async fn handle_client_frame(
             })
             .await;
         }
-        ClientFrame::RouteSubscription { corr, event } => {
+        ClientFrame::RouteSubscription {
+            corr,
+            event,
+            operation_reference,
+        } => {
             // The owner applies the routed command once and answers with a status
             // the source's bounded re-drive classifies (#1582): 200 delivered,
             // 503 not the leader (re-resolve and retry), 4xx permanent.
-            let (status, message) = server.apply_routed_subscription_remote(event).await;
+            let (status, message) = server
+                .apply_routed_subscription_remote(event, operation_reference)
+                .await;
             conn.send(ServerFrame::CommandResult {
                 corr,
                 status,
@@ -3307,6 +3327,7 @@ mod registry_tests {
             variables: None,
             business_id: Some(business_id),
             only_partitions: None,
+            operation_reference: None,
         };
         let status_of = |frame: Option<ServerFrame>| match frame {
             Some(ServerFrame::CommandResult { status, .. }) => status,

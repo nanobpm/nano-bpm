@@ -183,6 +183,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
             None,
             None,
             Some(vec![1]),
+            None,
         )
         .await
         .expect("scoped publish returns a result");
@@ -196,7 +197,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
 
     // Unscoped (legacy): the publish reaches partition 0 and starts an instance.
     let res = link
-        .publish_message("order-placed".to_string(), order_id, None, None, None)
+        .publish_message("order-placed".to_string(), order_id, None, None, None, None)
         .await
         .expect("unscoped publish returns a result");
     assert_eq!(res.status, 200);
@@ -205,4 +206,164 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
         body.get("messageKey").is_some_and(|v| v.as_str().is_some()),
         "the unscoped publish fires partition 0 and mints a message key: {body}"
     );
+}
+
+/// #1600: an `operationReference` riding a forwarded `PublishMessage` frame
+/// must survive the Falcon hop AND persistence on the peer. A DISK-backed
+/// 4-partition peer receives the publish over a real `PeerLink`; every record
+/// the publish produces there — the `MessagePublished` on the correlation-key
+/// partition and the message-start instance on partition 0 — is journaled with
+/// the reference, while the forwarded deploy (sent unreferenced) carries none.
+/// Guards the peer-forward / Falcon-handler leg against silently dropping it.
+#[tokio::test]
+async fn forwarded_publish_persists_operation_reference_on_the_peer() {
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nanobpmn-1600-peer-ref-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let topology = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://n0".to_string()],
+        num_partitions: 4,
+        replication_factor: 1,
+    };
+    let owned = topology.local_partitions();
+    let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("varstore"));
+    let (writer, recovery) =
+        crate::journal::SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore))
+            .expect("open segmented writer");
+    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+        recovery.engines.into_iter().collect();
+    let journals: Vec<crate::Journal> = owned
+        .iter()
+        .map(|&p| {
+            let engine = engines
+                .remove(&p)
+                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+            crate::Journal::from_engine_shared(p, engine, true, &writer)
+        })
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server, registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let link = PeerLink::connect(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to peer");
+
+    let intake_bpmn = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="intake">
+          <bpmn:startEvent id="s">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="order-placed" />
+      </bpmn:definitions>"#;
+    let res = link
+        .deploy(
+            vec![("intake.bpmn".to_string(), intake_bpmn.to_string())],
+            None,
+        )
+        .await
+        .expect("forwarded deploy");
+    assert_eq!(res.status, 200, "deploy should succeed: {res:?}");
+
+    // A correlation key off partition 0, so the publish spans two partitions.
+    let order_id = (0..)
+        .map(|i| format!("order-{i}"))
+        .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) == 1)
+        .expect("some key hashes to partition 1");
+    const REF: i64 = 0x1600_0001;
+    let res = link
+        .publish_message(
+            "order-placed".to_string(),
+            order_id,
+            None,
+            None,
+            None,
+            Some(REF),
+        )
+        .await
+        .expect("forwarded publish returns a result");
+    assert_eq!(res.status, 200, "publish should be 200: {res:?}");
+
+    // Wait until the peer's journal holds the message-start completion.
+    let read_records = || -> Vec<nanobpmn_engine_core::Record> {
+        std::fs::read_dir(&dir)
+            .expect("read journal dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| crate::seglog::read_segment_records(&p).expect("read segment"))
+            .collect()
+    };
+    let mut records = read_records();
+    for _ in 0..200 {
+        if records.iter().any(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::ProcessInstanceCompleted { .. }
+            )
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        records = read_records();
+    }
+
+    let published: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::MessagePublished { .. }
+            )
+        })
+        .collect();
+    assert!(
+        !published.is_empty(),
+        "the publish journals MessagePublished"
+    );
+    for r in &published {
+        assert_eq!(r.operation_reference, Some(REF), "{r:?}");
+    }
+    let completed = records
+        .iter()
+        .find(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::ProcessInstanceCompleted { .. }
+            )
+        })
+        .expect("the message-start instance completes on the peer");
+    assert_eq!(completed.operation_reference, Some(REF), "{completed:?}");
+    let deployed: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(r.event, nanobpmn_engine_core::Event::ProcessDeployed { .. }))
+        .collect();
+    assert!(!deployed.is_empty());
+    for r in &deployed {
+        assert_eq!(r.operation_reference, None, "unreferenced deploy: {r:?}");
+    }
+    drop(link);
+    let _ = std::fs::remove_dir_all(&dir);
 }

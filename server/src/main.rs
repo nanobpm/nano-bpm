@@ -7479,7 +7479,9 @@ impl ServerImpl {
                 commit.wait().await;
                 // Completing a job may advance the token into an off-partition
                 // message catch: route the resulting subscription open/correlate.
-                self.spawn_routing_if_needed(&events);
+                // The completion request carries no `operationReference` in the
+                // synced spec, so the routed follow-ups are unreferenced too.
+                self.spawn_routing_if_needed(&events, None);
                 self.observe_job_sojourn(&events, now_millis());
                 self.record_adhoc_events(&events);
                 // Completing a job may advance the token onto a following service
@@ -9285,6 +9287,11 @@ impl ServerImpl {
     /// on one node is never re-evaluated (and re-committed) on another when its
     /// leadership moves mid-publish (#1307). `None` applies every local target —
     /// the legacy behaviour for a peer frame predating the field.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1556 step 4, #1600): stamped on every record each per-partition apply
+    /// produces, and carried onward on the routed follow-ups those records
+    /// drive (the routing pump below).
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -9292,6 +9299,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
+        operation_reference: Option<i64>,
     ) -> Result<Vec<Event>, EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -9325,7 +9333,10 @@ impl ServerImpl {
                 variables: variables.clone(),
                 business_id: business_id.clone(),
             };
-            match self.apply_routed_command(target, command).await {
+            match self
+                .apply_routed_command(target, command, operation_reference)
+                .await
+            {
                 RoutedApply::Applied(events) => all_events.extend(events),
                 RoutedApply::NotHere => {}
                 RoutedApply::Failed(status, message) => {
@@ -9340,8 +9351,11 @@ impl ServerImpl {
         // `RemoteMessageCorrelation`), plus any start-instance dispatch a
         // message-start fan-out produced. A no-op single-partition.
         if Self::has_routable_subscription_events(&all_events) {
-            self.drive_subscription_routing(Self::routable_events(&all_events))
-                .await;
+            self.drive_subscription_routing(
+                Self::routable_events(&all_events),
+                operation_reference,
+            )
+            .await;
         }
         Ok(all_events)
     }
@@ -9355,7 +9369,9 @@ impl ServerImpl {
     /// The local building block for both the gateway fan-out and the peer-side
     /// `PublishMessage` handler. `only_partitions`, when set, restricts the apply
     /// to the listed target partitions (a scoped fan-out send); `None` applies
-    /// every local target (the legacy behaviour).
+    /// every local target (the legacy behaviour). `operation_reference` is the
+    /// publishing request's `operationReference` (#1600), threaded through to
+    /// every record the publish produces here.
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
@@ -9363,6 +9379,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(
@@ -9371,6 +9388,7 @@ impl ServerImpl {
                 variables,
                 business_id,
                 only_partitions.as_deref(),
+                operation_reference,
             )
             .await?;
         let message_key = message_key_of(&events);
@@ -9399,12 +9417,18 @@ impl ServerImpl {
     /// peer that is unreachable is logged and skipped (best-effort, matching the
     /// no-buffer correlate-and-drop model). A single-node cluster fans only
     /// locally — byte-identical to the pre-cluster path.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1600): threaded through the local apply AND carried on every peer
+    /// fan-out frame, so the records a publish produces on ANY node's
+    /// partitions carry it.
     async fn correlate_message_cluster(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
@@ -9421,6 +9445,7 @@ impl ServerImpl {
                 engine_vars,
                 business_id.clone(),
                 None,
+                operation_reference,
             )
             .await?;
 
@@ -9507,6 +9532,7 @@ impl ServerImpl {
                                 variables.clone(),
                                 business_id.clone(),
                                 Some(partitions.clone()),
+                                operation_reference,
                             )
                             .await
                         {
@@ -9653,12 +9679,26 @@ impl ServerImpl {
     /// follow-up would otherwise be unrecoverable (the retried parent is deduped
     /// to a no-op). The pump therefore runs as a detached task; awaiting it only
     /// observes completion, and dropping the await leaves it running.
-    async fn drive_subscription_routing(&self, events: Vec<Event>) {
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// committed records produced these follow-ups (#1556 step 4, #1600): it is
+    /// stamped on every record each routed command produces, on every partition
+    /// it routes to, and carried onward on any follow-ups those records route
+    /// in turn — so a caller's reference reaches the whole routed cascade.
+    async fn drive_subscription_routing(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         if self.engine.topology().num_partitions <= 1 {
             return;
         }
         let server = self.clone();
-        let pump = tokio::spawn(async move { server.drive_subscription_routing_now(events).await });
+        let pump = tokio::spawn(async move {
+            server
+                .drive_subscription_routing_now(events, operation_reference)
+                .await
+        });
         if let Err(e) = pump.await {
             tracing::warn!("subscription routing pump task failed: {e}");
         }
@@ -9671,21 +9711,33 @@ impl ServerImpl {
     fn route_late_follow_ups(
         &self,
         events: Vec<Event>,
+        operation_reference: Option<i64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         let server = self.clone();
-        Box::pin(async move { server.drive_subscription_routing(events).await })
+        Box::pin(async move {
+            server
+                .drive_subscription_routing(events, operation_reference)
+                .await
+        })
     }
 
     /// The routing pump body behind [`Self::drive_subscription_routing`]; only
     /// ever run inside that detached task.
-    async fn drive_subscription_routing_now(&self, events: Vec<Event>) {
+    async fn drive_subscription_routing_now(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            work.extend(self.route_with_redrive(target, command, event).await);
+            work.extend(
+                self.route_with_redrive(target, command, event, operation_reference)
+                    .await,
+            );
         }
     }
 
@@ -9698,8 +9750,15 @@ impl ServerImpl {
     /// backoff per [`ROUTE_REDRIVE`]; a 4xx is a permanent rejection and stops.
     /// Re-delivery is safe: routed deliveries carry stable source-minted keys the
     /// recipient dedups on (#1568), so a retry of an attempt whose reply was lost
-    /// is a no-op.
-    async fn route_with_redrive(&self, target: u64, command: Command, event: Event) -> Vec<Event> {
+    /// is a no-op. `operation_reference` rides every delivery (local apply and
+    /// peer forward alike) so the follow-up's records carry it (#1600).
+    async fn route_with_redrive(
+        &self,
+        target: u64,
+        command: Command,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> Vec<Event> {
         let mut last = String::new();
         // An unkeyed (zero / legacy) routed command has no dedup, so a retry
         // after an ambiguous outcome could apply it twice: deliver it at most
@@ -9710,13 +9769,16 @@ impl ServerImpl {
                 self.route_redrives.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
             }
-            let outcome = match self.apply_routed_command(target, command.clone()).await {
+            let outcome = match self
+                .apply_routed_command(target, command.clone(), operation_reference)
+                .await
+            {
                 RoutedApply::Applied(produced) => return produced,
                 RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
                 // Led by a peer (or a leadership gap): forward to the current
                 // writer, re-resolved on every attempt.
                 RoutedApply::NotHere => {
-                    self.forward_route_subscription(target, &event, attempt)
+                    self.forward_route_subscription(target, &event, attempt, operation_reference)
                         .await
                 }
             };
@@ -9932,7 +9994,17 @@ impl ServerImpl {
     /// forwards to the leader instead of applying on a local replica, which
     /// would diverge from the log (#1307). Without Raft it applies directly on
     /// the locally owned engine and awaits durability.
-    async fn apply_routed_command(&self, target: u64, command: Command) -> RoutedApply {
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// records produced the follow-up being applied (#1600): it rides the
+    /// replicated command envelope (Raft) or the journal apply (direct), so
+    /// every record the routed command produces on `target` carries it.
+    async fn apply_routed_command(
+        &self,
+        target: u64,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> RoutedApply {
         if !self.raft.is_empty() {
             let Some(part) = self.raft.get(target) else {
                 return RoutedApply::NotHere;
@@ -9957,7 +10029,10 @@ impl ServerImpl {
             // duplicate instance, so its outcome must be observed, never
             // timed out into a retryable non-delivery (#1582).
             if !Self::routed_command_is_idempotent(&command) {
-                return Self::classify_proposal(part.propose_result(command, now_millis()).await);
+                return Self::classify_proposal(
+                    part.propose_result_ref(command, now_millis(), operation_reference)
+                        .await,
+                );
             }
             // Exactly ONE routing owner for the produced follow-ups: the
             // detached task ALWAYS routes them itself, whether or not the
@@ -9978,14 +10053,18 @@ impl ServerImpl {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let server = self.clone();
             tokio::spawn(async move {
-                let result = part.propose_result(command, now_millis()).await;
+                let result = part
+                    .propose_result_ref(command, now_millis(), operation_reference)
+                    .await;
                 let follow_ups = match &result {
                     Ok(item) if item.error.is_none() => Self::routable_events(&item.events),
                     _ => Vec::new(),
                 };
                 let _ = tx.send(Self::strip_routable(result));
                 if !follow_ups.is_empty() {
-                    server.route_late_follow_ups(follow_ups).await;
+                    server
+                        .route_late_follow_ups(follow_ups, operation_reference)
+                        .await;
                     server.signal_jobs_available();
                 }
             });
@@ -10005,12 +10084,12 @@ impl ServerImpl {
             return RoutedApply::NotHere;
         };
         let (result, commit) = handle
-            .with(
-                move |journal| match journal.apply_command_at(command, now_millis()) {
+            .with(move |journal| {
+                match journal.apply_command_ref_at(command, now_millis(), operation_reference) {
                     Ok((events, commit)) => (Ok(events), commit),
                     Err(error) => (Err(error), Commit::ready()),
-                },
-            )
+                }
+            })
             .await;
         // Only a durable apply counts as delivered: its follow-ups are routed
         // onward with keys peers dedup on, so they must never outrun it (#1582).
@@ -10030,11 +10109,14 @@ impl ServerImpl {
     /// `event` to the node currently writing `target_partition`, over the Falcon
     /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
     /// it and drives its own pump for any further follow-ups.
+    /// `operation_reference` rides the frame so the records the follow-up
+    /// produces on the peer carry the originating request's reference (#1600).
     async fn forward_route_subscription(
         &self,
         target_partition: u64,
         event: &Event,
         attempt: u32,
+        operation_reference: Option<i64>,
     ) -> RouteAttempt {
         let owner = self.route_forward_candidate(target_partition, attempt);
         if owner == self.engine.topology().node_id {
@@ -10063,7 +10145,9 @@ impl ServerImpl {
                 }
             };
             used = Some(link.clone());
-            let result = link.route_subscription(event.clone()).await;
+            let result = link
+                .route_subscription(event.clone(), operation_reference)
+                .await;
             if result.is_err() {
                 // A dead/stalled link: drop it so the next attempt redials.
                 self.peers.drop_link_if_same(owner, &link).await;
@@ -10092,14 +10176,25 @@ impl ServerImpl {
     /// follow-ups the apply produced. Returns the status the source classifies
     /// (`200` delivered, `503` not the leader, otherwise the apply's status).
     /// Wakes pollers in case the correlation advanced a token onto a service task.
-    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) -> (u16, String) {
+    /// `operation_reference` is the originating request's `operationReference`
+    /// (#1600), stamped on every record the routed apply produces here and
+    /// carried onward on any follow-ups they route.
+    pub(crate) async fn apply_routed_subscription_remote(
+        &self,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> (u16, String) {
         let num_partitions = self.engine.topology().num_partitions;
         let Some((target, command)) = Self::route_event(&event, num_partitions) else {
             return (400, "event is not a routable subscription follow-up".into());
         };
-        match self.apply_routed_command(target, command).await {
+        match self
+            .apply_routed_command(target, command, operation_reference)
+            .await
+        {
             RoutedApply::Applied(produced) => {
-                self.drive_subscription_routing(produced).await;
+                self.drive_subscription_routing(produced, operation_reference)
+                    .await;
                 self.signal_jobs_available();
                 (200, String::new())
             }
@@ -10116,7 +10211,9 @@ impl ServerImpl {
     /// (`OpenMessageSubscription` keys on the subscription), so fire-and-forget is
     /// safe even if the instance partition has not yet fsynced — a crash re-emits
     /// the Opening on replay and re-routes. A no-op single-partition.
-    fn spawn_routing_if_needed(&self, events: &[Event]) {
+    /// `operation_reference` is the source command's `operationReference` (#1600),
+    /// carried onto every record the routed follow-ups produce.
+    fn spawn_routing_if_needed(&self, events: &[Event], operation_reference: Option<i64>) {
         if self.engine.topology().num_partitions <= 1 {
             return;
         }
@@ -10138,7 +10235,9 @@ impl ServerImpl {
             .collect();
         let server = self.clone();
         tokio::spawn(async move {
-            server.drive_subscription_routing(routable).await;
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
         });
     }
 
@@ -10155,6 +10254,7 @@ impl ServerImpl {
         &self,
         events: &[Event],
         commit: Commit,
+        operation_reference: Option<i64>,
     ) -> (Commit, Option<tokio::task::JoinHandle<bool>>) {
         if self.engine.topology().num_partitions <= 1
             || !Self::has_routable_subscription_events(events)
@@ -10171,7 +10271,9 @@ impl ServerImpl {
                 );
                 return false;
             }
-            server.drive_subscription_routing(routable).await;
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
             true
         });
         (caller, Some(task))
@@ -10276,8 +10378,9 @@ impl ServerImpl {
                 // open (the create-then-publish ordering clients rely on,
                 // #1582). The wait is bounded by the re-drive budget, and a
                 // dropped receiver (caller cancelled) is fine: routing already
-                // ran to completion inside this detached task.
-                server.drive_subscription_routing(routable).await;
+                // ran to completion inside this detached task. The create path
+                // maps no `operationReference` yet (#1602) — `None`.
+                server.drive_subscription_routing(routable, None).await;
                 server.signal_jobs_available();
                 let _ = tx.send(outcome);
                 return;
@@ -11814,12 +11917,16 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // The synced spec's `MessagePublicationRequest` has no
+        // `operationReference` yet (it arrives with the camunda#67491
+        // re-sync); the request-mapping seam passes `None` until then.
         let (message_key, _instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -11870,12 +11977,15 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // `MessageCorrelationRequest` has no `operationReference` in the synced
+        // spec yet (it arrives with the camunda#67491 re-sync) — `None` here.
         let (message_key, correlated_instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -14640,7 +14750,7 @@ impl ServerImpl {
         // barrier is handed back and a caller's own `commit.wait()` is a harmless
         // no-op.
         commit.wait().await;
-        self.spawn_routing_if_needed(&events);
+        self.spawn_routing_if_needed(&events, operation_reference);
         self.observe_job_sojourn(&events, now_millis());
         self.record_adhoc_events(&events);
         Ok((events, Commit::ready()))
@@ -15962,7 +16072,9 @@ impl ServerImpl {
                 .await
             {
                 Ok((result, events)) => {
-                    self.broadcast_deployment(&events).await;
+                    // The synced spec's deployment request has no
+                    // `operationReference` yet (camunda#67491 re-sync) — `None`.
+                    self.broadcast_deployment(&events, None).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
                 Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
@@ -16548,7 +16660,9 @@ impl ServerImpl {
             )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
-        self.broadcast_deployment(&events).await;
+        // The synced spec's deployment request carries no `operationReference`
+        // yet (it arrives with the camunda#67491 re-sync) — `None` here.
+        self.broadcast_deployment(&events, None).await;
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
     }
 
@@ -16566,7 +16680,15 @@ impl ServerImpl {
     /// definition. The durable owner's guard is released BEFORE the sibling
     /// fan-out (the durable commit is the serialized part; the in-memory
     /// sibling copies need no mutual ordering against each other).
-    pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
+    ///
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1556 step 4, #1600), stamped on the durable copies of the deployment
+    /// records this node journals.
+    pub async fn install_replicated_deployment(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         let handles = self.engine.all();
         let events = Arc::new(events);
         let durable = {
@@ -16574,7 +16696,9 @@ impl ServerImpl {
             // Owner's durable commit under its shared guard.
             let _lifecycle = handles[0].lifecycle_shared().await;
             handles[0]
-                .with(move |journal| journal.install_deployment_durable(&events))
+                .with(move |journal| {
+                    journal.install_deployment_durable_ref(&events, operation_reference)
+                })
                 .await
         };
         for handle in handles.iter().skip(1) {
@@ -16628,7 +16752,14 @@ impl ServerImpl {
     /// that is briefly unreachable is logged and skipped (a runtime deploy assumes
     /// the cluster is up; the startup seed broadcast retries until acknowledged).
     /// A no-op for a single-node cluster.
-    async fn broadcast_deployment(&self, events: &Arc<Vec<Event>>) {
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1600): it rides the `InstallDeployment` frame so each peer's durable
+    /// copies of the deployment records carry it.
+    async fn broadcast_deployment(
+        &self,
+        events: &Arc<Vec<Event>>,
+        operation_reference: Option<i64>,
+    ) {
         if !self.peers.has_peers() {
             return;
         }
@@ -16656,7 +16787,10 @@ impl ServerImpl {
             }
             match self.peers.link(node).await {
                 Ok(link) => {
-                    if let Err(e) = link.install_deployment(deployed.clone()).await {
+                    if let Err(e) = link
+                        .install_deployment(deployed.clone(), operation_reference)
+                        .await
+                    {
                         tracing::warn!("deploy broadcast to node {node} failed: {e}");
                     }
                 }
@@ -16698,8 +16832,13 @@ impl ServerImpl {
                 // not resent (install is idempotent per key either way).
                 let mut batch_idx = 0;
                 while batch_idx < batches.len() {
+                    // The startup seed replays RECOVERED definitions, not one
+                    // caller's deploy: there is no originating request whose
+                    // `operationReference` could stamp them (#1600) — `None`.
                     match server.peers.link(node).await {
-                        Ok(link) => match link.install_deployment(batches[batch_idx].clone()).await
+                        Ok(link) => match link
+                            .install_deployment(batches[batch_idx].clone(), None)
+                            .await
                         {
                             Ok(_) => {
                                 batch_idx += 1;
@@ -21200,7 +21339,12 @@ impl ServerImpl {
                     // budget, and a dropped receiver (caller cancelled) is fine:
                     // routing already ran to completion inside this task.
                     if !routable.is_empty() {
-                        server.drive_subscription_routing(routable.clone()).await;
+                        // The synced spec's create-request instruction carries
+                        // `operationReference` on the *instruction*, but the
+                        // create path does not map it yet (#1602) — `None`.
+                        server
+                            .drive_subscription_routing(routable.clone(), None)
+                            .await;
                     }
                     server.signal_jobs_available();
                     let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
@@ -21404,7 +21548,7 @@ impl ServerImpl {
             }
             return Err((status, message));
         }
-        self.spawn_routing_if_needed(&response.events);
+        self.spawn_routing_if_needed(&response.events, operation_reference);
         self.observe_job_sojourn(&response.events, now_millis());
         self.record_adhoc_events(&response.events);
         Ok((Arc::new(response.events), Commit::ready()))
@@ -21504,7 +21648,10 @@ impl ServerImpl {
         result: Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
     ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
         result.map(|(events, commit)| {
-            let (commit, _routing) = self.route_after_durable(&events, commit);
+            // Stream job commands carry no `operationReference` (the synced
+            // spec's job-completion requests have none), so their routed
+            // follow-ups are unreferenced too.
+            let (commit, _routing) = self.route_after_durable(&events, commit, None);
             (events, commit)
         })
     }
@@ -29886,7 +30033,9 @@ async fn main() {
                     routable.append(&mut r);
                 }
                 if !routable.is_empty() {
-                    tick_server.drive_subscription_routing(routable).await;
+                    // Clock-tick follow-ups originate from no caller request, so
+                    // there is no `operationReference` to carry (#1600) — `None`.
+                    tick_server.drive_subscription_routing(routable, None).await;
                 }
                 if produced {
                     jobs_available.notify_waiters();
@@ -31122,7 +31271,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         // Every historical key resolves on EVERY partition the peer owns — the
         // same resolution the deployment partition offers.
@@ -31973,7 +32122,7 @@ mod clustered_startup_tests {
 
         // The install cannot complete its durable commit while the rebuild
         // holds the lock: poll it in-line and assert it is still pending.
-        let mut install = Box::pin(node1.install_replicated_deployment(events));
+        let mut install = Box::pin(node1.install_replicated_deployment(events, None));
         use std::future::Future;
         use std::task::Poll;
         let pending =
@@ -32050,7 +32199,7 @@ mod clustered_startup_tests {
         // Installing the broadcast deployment makes the peer able to create.
         let events = demo_deployment_events().await;
         assert!(!events.is_empty());
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         let (key, completed) = node1
             .create_for_stream(Some("demo".into()), None, Default::default())
@@ -32111,7 +32260,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node0.broadcast_deployment(&Arc::new(events)).await;
+        node0.broadcast_deployment(&Arc::new(events), None).await;
 
         // The peer can now create the demo (the install rode the wire end-to-end).
         let (_, completed) = node1
@@ -32650,6 +32799,7 @@ mod clustered_startup_tests {
                 String::new(),
                 None,
                 Some("order-7".into()),
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -32755,7 +32905,7 @@ mod clustered_startup_tests {
         );
 
         let (message_key, instance) = node2
-            .correlate_message_cluster("order-placed".into(), String::new(), None, None)
+            .correlate_message_cluster("order-placed".into(), String::new(), None, None, None)
             .await
             .expect("correlation with a valid business id never panics on a no-local-target node");
         assert!(
@@ -32834,7 +32984,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -32875,7 +33027,7 @@ mod clustered_startup_tests {
         // 1), so the publish fans to node 1, which correlates and routes the
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
-            .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
+            .correlate_message_cluster("payment-received".into(), order.clone(), None, None, None)
             .await
             .expect("correlation with a valid business id");
         assert_eq!(
@@ -39067,7 +39219,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -39084,7 +39238,13 @@ mod clustered_startup_tests {
         // instance round-robin across all four partitions (1 & 3 on node 1).
         for i in 0..16u32 {
             node0
-                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
+                .correlate_message_cluster(
+                    "order-placed".into(),
+                    format!("order-{i}"),
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .expect("correlation with a valid business id");
         }
@@ -39816,7 +39976,7 @@ mod clustered_startup_tests {
         // node 1 owns no deployment partition, so install the demo over the wire
         // path (mirrors the centralized broadcast) before it can create.
         node1
-            .install_replicated_deployment(demo_deployment_events().await)
+            .install_replicated_deployment(demo_deployment_events().await, None)
             .await;
         let node1_url = serve_node(&node1).await;
 
@@ -40981,7 +41141,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -41195,7 +41357,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -41588,8 +41752,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -41925,8 +42093,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -43233,8 +43405,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy the DRG on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let before = raft_applied_total(&node0);
         let mut variables = std::collections::HashMap::new();
@@ -43442,7 +43618,7 @@ mod clustered_startup_tests {
         // the NEW partition-1 leader, and the routed continuation advances the
         // instance through partition 0's log.
         let (message_key, _) = node0
-            .correlate_message_cluster("go".into(), order_id, None, None)
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
             .await
             .expect("publish succeeds");
         assert!(message_key.is_some(), "the new leader minted a message key");
@@ -43608,7 +43784,7 @@ mod clustered_startup_tests {
             tap_replica_events(&node2, partition_of(instance_key)).await,
         ];
         let (message_key, _) = node0
-            .correlate_message_cluster("go".into(), order_id.clone(), None, None)
+            .correlate_message_cluster("go".into(), order_id.clone(), None, None, None)
             .await
             .expect("publish succeeds");
         assert!(message_key.is_some());
@@ -43649,7 +43825,7 @@ mod clustered_startup_tests {
             "no resurrected subscription (node2)"
         );
         let (_, correlated) = node0
-            .correlate_message_cluster("go".into(), order_id, None, None)
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
             .await
             .expect("second publish succeeds");
         assert_eq!(correlated, None, "nothing left to correlate");
@@ -48028,6 +48204,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -48044,6 +48221,182 @@ mod subscription_placement_tests {
             completed,
             "the instance completes after the cross-partition correlation is routed back"
         );
+    }
+
+    /// #1600 (#1556 step 4, red-first): a publish carrying an
+    /// `operationReference` stamps it on EVERY record the publish produces —
+    /// including the records produced on OTHER partitions by the routed
+    /// follow-up commands (the canonical subscription open on the hash
+    /// partition, the routed correlation back on the instance partition).
+    /// Upstream Zeebe leaves those cross-partition records unreferenced
+    /// (camunda/camunda#67542); Nano carries the reference end to end.
+    ///
+    /// Disk-backed (segmented shared writer): the assertion reads the journaled
+    /// record envelopes, not just the in-memory engine output, so it proves the
+    /// reference survives persistence on every partition the cascade touched.
+    #[tokio::test]
+    async fn cross_partition_publish_stamps_operation_reference_on_every_partition() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1600-routed-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        // Park an instance whose canonical subscription lives on a DIFFERENT
+        // partition: the Opening is routed there (a cross-partition follow-up).
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("order-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks at the message catch");
+            let p_inst = nanobpmn_engine_core::partition_of(key);
+            let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if p_sub != p_inst {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let p_inst = nanobpmn_engine_core::partition_of(instance_key);
+        let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+
+        // Publish WITH an operationReference: the local apply on the
+        // subscription partition, the routed correlation back on the instance
+        // partition — every record, everywhere — must carry it.
+        const REF: i64 = 0x1600;
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                order.clone(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+                Some(REF),
+            )
+            .await
+            .expect("correlation with a valid business id");
+        assert_eq!(correlated, Some(instance_key));
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(completed, "the routed correlation completes the instance");
+
+        // Every journaled record of the publish cascade carries REF. The
+        // publish's own records (`MessagePublished` + the match record on the
+        // subscription partition) and the routed `CorrelateMessageSubscription`
+        // records on the instance partition are disjoint from the deploy and
+        // create records, which carry NO reference.
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+
+        let publish_records: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, Event::MessagePublished { .. }))
+            .collect();
+        assert!(
+            !publish_records.is_empty(),
+            "the publish mints a MessagePublished record"
+        );
+        for record in &publish_records {
+            assert_eq!(
+                record.operation_reference,
+                Some(REF),
+                "MessagePublished on the publishing partition carries the reference: {record:?}"
+            );
+        }
+
+        // The routed correlation's records on the INSTANCE partition: the
+        // token advance + completion produced by the routed
+        // `CorrelateMessageSubscription` follow-up.
+        let instance_partition_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.event.instance_key() == Some(instance_key))
+            .collect();
+        let completion = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCompleted { .. }))
+            .expect("the routed correlation completes the instance");
+        assert_eq!(
+            completion.operation_reference,
+            Some(REF),
+            "the completion produced by the ROUTED follow-up carries the reference: {completion:?}"
+        );
+        // The create's own records (parked at the catch) predate the publish:
+        // they carry NO reference — proving the stamp is the publish's, not a
+        // blanket partition-wide tag.
+        let created = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCreated { .. }))
+            .expect("the create produced the instance");
+        assert_eq!(
+            created.operation_reference, None,
+            "the create's records are unreferenced: {created:?}"
+        );
+        assert!(
+            instance_partition_records
+                .iter()
+                .any(|r| r.operation_reference == Some(REF)),
+            "partition {p_inst} journaled referenced records from the routed follow-up"
+        );
+        // And the subscription partition journaled the publish's own records
+        // with the reference too.
+        assert!(
+            records.iter().any(|r| r.operation_reference == Some(REF)
+                && matches!(
+                    r.event,
+                    Event::MessageCorrelated { .. } | Event::RemoteMessageCorrelation { .. }
+                )),
+            "partition {p_sub} journaled the referenced match record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -48092,7 +48445,9 @@ mod subscription_placement_tests {
             .await
             .expect("cancel succeeds");
         commit.wait().await;
-        server.drive_subscription_routing(events.to_vec()).await;
+        server
+            .drive_subscription_routing(events.to_vec(), None)
+            .await;
 
         // The canonical subscription is gone, so the publish finds no match.
         let (_message_key, correlated) = server
@@ -48100,6 +48455,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
                 None,
                 None,
             )
@@ -48183,7 +48539,7 @@ mod subscription_placement_tests {
 
         // The source write never becomes durable: nothing may be routed.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
         drop(tx);
         let routed = routing.expect("cancel emits a routable close").await;
         assert!(!routed.expect("gate task"), "no routing before durability");
@@ -48198,7 +48554,7 @@ mod subscription_placement_tests {
 
         // The same follow-up routes once the source is durable.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
         tx.send(()).expect("gate listening");
         assert!(routing.expect("routable").await.expect("gate task"));
         assert!(caller.wait_durable().await);
@@ -48594,6 +48950,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("the publish applies");
@@ -48880,6 +49237,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -48935,6 +49293,7 @@ mod subscription_placement_tests {
                     "order-placed".into(),
                     format!("order-{i}"),
                     std::collections::HashMap::new(),
+                    None,
                     None,
                     None,
                 )
@@ -49053,6 +49412,7 @@ mod subscription_placement_tests {
                     std::collections::HashMap::new(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -49119,6 +49479,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -49157,6 +49518,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::HashMap::new(),
+                None,
                 None,
                 None,
             )
