@@ -6217,9 +6217,8 @@ impl Engine {
         // environment (#1642); the advanced RNG state is carried back so a
         // paused debug session resumes the same stream.
         let mut env = self.feel_env;
-        let result = crate::feel::with_env(&mut env, || {
-            self.run_with_inner(log, queue, cursor, driver)
-        });
+        let result =
+            crate::feel::with_env(&mut env, || self.run_with_inner(log, queue, cursor, driver));
         self.feel_env = env;
         result
     }

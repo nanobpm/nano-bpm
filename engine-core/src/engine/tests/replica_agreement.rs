@@ -87,7 +87,11 @@ fn replay_journal() -> Vec<Event> {
 fn replicas_replaying_the_same_journal_agree_on_feel_now_and_random() {
     let replica_a = replay_journal();
     let replica_b = replay_journal();
-    assert_eq!(replica_a.len(), replica_b.len(), "replicas emitted different event counts");
+    assert_eq!(
+        replica_a.len(),
+        replica_b.len(),
+        "replicas emitted different event counts"
+    );
     if let Some(i) = (0..replica_a.len()).find(|&i| replica_a[i] != replica_b[i]) {
         panic!(
             "replicas diverged at event {i}:\n  a: {:?}\n  b: {:?}",
@@ -102,7 +106,10 @@ fn feel_now_and_today_observe_the_command_timestamp() {
     let outputs: Vec<&HashMap<String, Value>> = events
         .iter()
         .filter_map(|e| match e {
-            Event::VariablesUpdated { variables, .. } | Event::ScopedVariablesUpdated { variables, .. } if variables.contains_key("t") => {
+            Event::VariablesUpdated { variables, .. }
+            | Event::ScopedVariablesUpdated { variables, .. }
+                if variables.contains_key("t") =>
+            {
                 Some(variables)
             }
             _ => None,
@@ -126,5 +133,8 @@ fn feel_now_and_today_observe_the_command_timestamp() {
         .iter()
         .filter(|e| matches!(e, Event::JobCreated { job_type, .. } if job_type == "a"))
         .count();
-    assert!(created_a > 0 && created_a < 32, "both gateway branches taken");
+    assert!(
+        created_a > 0 && created_a < 32,
+        "both gateway branches taken"
+    );
 }
