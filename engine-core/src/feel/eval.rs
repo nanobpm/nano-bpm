@@ -15,6 +15,61 @@ use crate::model::Value;
 pub struct Ctx<'a> {
     base: &'a HashMap<String, Value>,
     scopes: Vec<BTreeMap<String, FeelVal>>,
+    /// The trusted secret names surfaced so far, when provenance is tracked
+    /// (`None` = not tracked, the zero-cost default for every caller but the
+    /// expression-evaluation endpoint). See [`SecretProvenance`].
+    provenance: Option<SecretProvenance>,
+}
+
+/// Evaluation-time secret-provenance tracker (#1296). Unlike a syntactic scan
+/// of the expression text, this records a `camunda.secrets.<name>` reference
+/// only when evaluation actually *surfaces* it — so a shadowed binding, a
+/// skipped `if`/`and`/`or` branch, or an un-called function body never
+/// contributes, and a reference nested inside a structured (object/list)
+/// trusted value is found when a member/index access surfaces it.
+///
+/// "Trusted" is decided by the *binding*, not the syntax: a base-context
+/// variable the host marked trusted (a `SECRET_REFERENCE` cluster variable)
+/// contributes the references its value carries; a literal
+/// `camunda.secrets.<name>` path or a local/body binding does not (the literal
+/// path is recorded separately, as a *literal* reference).
+#[derive(Default)]
+pub struct SecretProvenance {
+    /// Base-context variable names the host trusts to carry secret references
+    /// (the `SECRET_REFERENCE`-kind cluster variables).
+    trusted_roots: std::collections::HashSet<String>,
+    /// Secret names surfaced by reading a trusted root's value.
+    pub referenced: std::collections::HashSet<String>,
+    /// Secret names surfaced by a literal `camunda.secrets.<name>` path.
+    pub literal: std::collections::HashSet<String>,
+}
+
+impl SecretProvenance {
+    /// Marks `name` (a base-context variable) as a trusted carrier of secret
+    /// references. Only base-context roots can be trusted; a local or
+    /// request-body binding of the same name shadows it and is NOT trusted.
+    pub fn trust_root(&mut self, name: impl Into<String>) {
+        self.trusted_roots.insert(name.into());
+    }
+
+    /// Records every `camunda.secrets.<name>` reference text reachable in `v`.
+    fn record_value(&mut self, v: &FeelVal) {
+        match v {
+            FeelVal::Str(s) => {
+                if let Some(name) = super::secret_reference_name(s) {
+                    self.referenced.insert(name.to_string());
+                }
+            }
+            FeelVal::List(items) => items.iter().for_each(|i| self.record_value(i)),
+            FeelVal::Context(entries) => entries.values().for_each(|i| self.record_value(i)),
+            _ => {}
+        }
+    }
+
+    /// Records a literal `camunda.secrets.<name>` path surfacing.
+    fn record_literal(&mut self, name: &str) {
+        self.literal.insert(name.to_string());
+    }
 }
 
 impl<'a> Ctx<'a> {
@@ -22,7 +77,31 @@ impl<'a> Ctx<'a> {
         Ctx {
             base,
             scopes: Vec::new(),
+            provenance: None,
         }
+    }
+
+    /// Attaches a provenance tracker, returning the context so the caller can
+    /// `let mut ctx = Ctx::new(base).with_provenance(prov);`.
+    pub fn with_provenance(mut self, provenance: SecretProvenance) -> Ctx<'a> {
+        self.provenance = Some(provenance);
+        self
+    }
+
+    /// Consumes the context, returning the tracker (after evaluation).
+    pub fn into_provenance(self) -> Option<SecretProvenance> {
+        self.provenance
+    }
+
+    /// `true` when `name` resolves to a base-context variable (not shadowed by
+    /// any local scope) — the only bindings that can be trusted carriers.
+    fn resolves_to_base(&self, name: &str) -> bool {
+        !self
+            .scopes
+            .iter()
+            .rev()
+            .any(|frame| frame.contains_key(name))
+            && self.base.contains_key(name)
     }
 
     fn lookup(&self, name: &str) -> Option<FeelVal> {
@@ -49,6 +128,12 @@ pub fn evaluate(node: &Node, base: &HashMap<String, Value>) -> Result<FeelVal, F
     eval_node(node, &mut ctx)
 }
 
+/// Evaluates a parsed expression against an existing [`Ctx`] (used by
+/// [`super::eval_with_provenance`] to attach a provenance tracker).
+pub fn eval_node_pub(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
+    eval_node(node, ctx)
+}
+
 fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
     match node {
         Node::Null => Ok(FeelVal::Null),
@@ -61,28 +146,57 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         Node::StrLit(s) => Ok(FeelVal::Str(s.clone())),
         Node::AtLit(s) => builtins::parse_temporal(s)
             .ok_or_else(|| FeelError(format!("invalid temporal literal @\"{s}\""))),
-        Node::Var(name) => Ok(ctx.lookup(name).unwrap_or_else(|| {
-            if name == "camunda" {
-                // #1296 / Camunda 8.10: a `camunda.secrets.<name>` reference is
-                // a TRUSTED secret pointer. It is never resolved during FEEL
-                // evaluation (upstream resolves it at job activation); instead
-                // the path evaluates to its own reference text, mirroring
-                // Zeebe's `SecretReferenceEvaluationContext`, so the reference
-                // string — never a secret value — is what travels onward. The
-                // `secrets` member is a sentinel builtin marker that `member`
-                // maps to the reference text.
-                FeelVal::Context(BTreeMap::from([(
-                    "secrets".to_string(),
-                    FeelVal::Function(Func::Builtin("camunda.secrets")),
-                )]))
-            } else if builtins::is_builtin(name) {
-                FeelVal::Function(Func::Builtin(builtins::canonical(name)))
-            } else {
-                FeelVal::Null
+        Node::Var(name) => {
+            // #1296: a base-context variable the host marked trusted (a
+            // `SECRET_REFERENCE` cluster variable) contributes the secret
+            // references its value carries — but ONLY when it actually resolves
+            // to the base context (not shadowed by a local/body binding) and is
+            // genuinely read here. This is evaluation-driven, so a skipped
+            // branch or a shadowed name never surfaces a reference.
+            if ctx
+                .provenance
+                .as_ref()
+                .is_some_and(|p| p.trusted_roots.contains(name.as_str()))
+                && ctx.resolves_to_base(name)
+            {
+                let v = ctx.lookup(name).unwrap_or(FeelVal::Null);
+                if let Some(p) = ctx.provenance.as_mut() {
+                    p.record_value(&v);
+                }
+                return Ok(v);
             }
-        })),
+            Ok(ctx.lookup(name).unwrap_or_else(|| {
+                if name == "camunda" {
+                    // #1296 / Camunda 8.10: a `camunda.secrets.<name>` reference
+                    // is a TRUSTED secret pointer. It is never resolved during
+                    // FEEL evaluation (upstream resolves it at job activation);
+                    // instead the path evaluates to its own reference text,
+                    // mirroring Zeebe's `SecretReferenceEvaluationContext`, so
+                    // the reference string — never a secret value — is what
+                    // travels onward. The `secrets` member is a sentinel builtin
+                    // marker that `member` maps to the reference text.
+                    FeelVal::Context(BTreeMap::from([(
+                        "secrets".to_string(),
+                        FeelVal::Function(Func::Builtin("camunda.secrets")),
+                    )]))
+                } else if builtins::is_builtin(name) {
+                    FeelVal::Function(Func::Builtin(builtins::canonical(name)))
+                } else {
+                    FeelVal::Null
+                }
+            }))
+        }
         Node::Member(obj, name) => {
             let v = eval_node(obj, ctx)?;
+            // #1296: a literal `camunda.secrets.<name>` path surfaces here, when
+            // the sentinel marker's member is taken. Record it as a literal
+            // (trusted) reference — but only on the actual evaluation path, so
+            // a skipped branch or shadowed `camunda` binding never contributes.
+            if matches!(v, FeelVal::Function(Func::Builtin("camunda.secrets"))) {
+                if let Some(p) = ctx.provenance.as_mut() {
+                    p.record_literal(name);
+                }
+            }
             Ok(member(&v, name))
         }
         Node::Index(obj, idx) => eval_index(obj, idx, ctx),

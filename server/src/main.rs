@@ -23348,42 +23348,41 @@ fn next_stateless_key() -> u64 {
 /// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
 /// durable keys.
 impl ServerImpl {
-    /// The Camunda 8.10 `referencedSecrets` of an expression evaluation (#1296):
-    /// the TRUSTED `camunda.secrets.<name>` references the expression surfaced —
-    /// a literal reference path used directly in the expression, plus the
-    /// reference carried by each `SECRET_REFERENCE`-kind cluster variable the
-    /// expression reads. References appearing only in request-body variables or
-    /// JSON-kind cluster variables are untrusted and excluded (spec/expression.yaml
-    /// `referencedSecrets`). Nano never resolves a reference here — the result
-    /// carries the reference text itself, and this list tells the caller which of
-    /// those occurrences it may safely resolve downstream.
-    fn referenced_secrets_of(
+    /// One immutable snapshot of every cluster variable, captured under a single
+    /// lock acquisition so the values an expression evaluates against and the
+    /// kinds its provenance is derived from are always consistent (#1296). The
+    /// overlay for a tenant layers globals first, then that tenant's variables
+    /// (which shadow a same-named global), matching the engine's resolution.
+    #[allow(clippy::type_complexity)]
+    fn cluster_variable_snapshot(
         &self,
-        expression: &str,
-    ) -> Vec<models::ExpressionSecretReferenceItem> {
-        let mut names = nanobpmn_engine_core::feel::literal_secret_references(expression);
-        for var in nanobpmn_engine_core::feel::referenced_variables(expression) {
-            let Some(stored) = self.cluster_variables.get(None, &var) else {
-                continue;
-            };
-            if stored.kind != models::ClusterVariableKindEnum::SecretReference {
-                continue;
-            }
-            if let Value::Str(s) = &stored.value
-                && let Some(name) = nanobpmn_engine_core::feel::secret_reference_name(s)
-            {
-                names.insert(name.to_string());
+    ) -> (
+        std::collections::HashMap<String, Value>,
+        std::collections::HashMap<String, models::ClusterVariableKindEnum>,
+        std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
+    ) {
+        let entries = self.cluster_variables.read();
+        let mut globals: std::collections::HashMap<String, Value> = Default::default();
+        let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
+            Default::default();
+        let mut tenants: std::collections::HashMap<
+            String,
+            Vec<(String, Value, models::ClusterVariableKindEnum)>,
+        > = Default::default();
+        for v in entries.by_key.values() {
+            match &v.tenant_id {
+                None => {
+                    globals.insert(v.name.clone(), v.value.clone());
+                    kinds.insert(v.name.clone(), v.kind);
+                }
+                Some(t) => tenants.entry(t.clone()).or_default().push((
+                    v.name.clone(),
+                    v.value.clone(),
+                    v.kind,
+                )),
             }
         }
-        let mut names: Vec<String> = names.into_iter().collect();
-        names.sort();
-        names
-            .into_iter()
-            .map(|secret_name| models::ExpressionSecretReferenceItem {
-                store_id: "default".to_string(),
-                secret_name,
-            })
-            .collect()
+        (globals, kinds, tenants)
     }
 
     /// `POST /v2/expression/evaluation` — evaluate a FEEL expression against the
@@ -23396,38 +23395,89 @@ impl ServerImpl {
     ) -> Result<apis::expression::EvaluateExpressionResponse, ()> {
         use apis::expression::EvaluateExpressionResponse as Resp;
 
-        // The request body's `variables` are the only context: these endpoints
-        // are stateless, so no process-instance / element-instance scope is
-        // resolved here. `Nullable::Null` (an explicit `"variables": null`) and
-        // an omitted map both mean "no variables".
+        // Capture ONE immutable snapshot of the cluster variables (values and
+        // kinds together, under a single lock) so the evaluated values and the
+        // provenance derived from them can never race a concurrent
+        // create/update/delete (#1296).
+        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot();
+
+        // The request body's `variables` are the topmost context: these
+        // endpoints are stateless, so no process-instance / element-instance
+        // scope is resolved here. `Nullable::Null` (an explicit `"variables":
+        // null`) and an omitted map both mean "no variables".
         let mut ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
             _ => std::collections::HashMap::new(),
         };
 
-        // Layer the global cluster variables UNDERNEATH the request-body
-        // variables (a body variable shadows a same-named cluster variable,
-        // matching the engine's instance-shadows-cluster rule). The values pass
-        // through verbatim — a SECRET_REFERENCE variable's reference text is
-        // never resolved here (#1296).
-        {
-            let snap = self
-                .cluster_variables
-                .runtime
-                .read()
-                .unwrap_or_else(|p| p.into_inner());
-            for (k, v) in &snap.global {
-                ctx.entry(k.clone()).or_insert_with(|| v.clone());
+        // Layer the cluster variables UNDERNEATH the request-body variables (a
+        // body variable shadows a same-named cluster variable, matching the
+        // engine's instance-shadows-cluster rule): globals first, then the
+        // requested tenant's overlay over them (tenant shadows global). The
+        // values pass through verbatim — a SECRET_REFERENCE variable's
+        // reference text is never resolved here (#1296). The default tenant
+        // applies when the request omits `tenantId`.
+        let tenant = body
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| nanobpmn_engine_core::DEFAULT_TENANT.to_string());
+        // Which names a request-body variable binds (those shadow any cluster
+        // variable and are never trusted carriers).
+        let body_bound: std::collections::HashSet<String> = ctx.keys().cloned().collect();
+        for (k, v) in &globals {
+            ctx.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if let Some(overlay) = tenants.get(&tenant) {
+            for (name, value, kind) in overlay {
+                // A tenant variable shadows a same-named global for both the
+                // value and its kind — unless a body variable already shadows
+                // both (a body binding is never a trusted carrier).
+                if !body_bound.contains(name.as_str()) {
+                    ctx.insert(name.clone(), value.clone());
+                    kinds.insert(name.clone(), *kind);
+                }
             }
         }
 
-        match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
-            Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
+        // The trusted provenance roots are exactly the SECRET_REFERENCE-kind
+        // cluster variables visible in this context AND NOT shadowed by a
+        // request-body binding (a body variable is never a trusted carrier, even
+        // when it shares a name with a SECRET_REFERENCE cluster variable).
+        // Provenance is evaluation-driven (see `eval_with_provenance`): a
+        // reference is reported only when evaluation surfaces it, so a shadowed
+        // binding, a skipped branch, or an un-called function body never
+        // contributes, and a reference nested in a structured value is found on
+        // access.
+        let trusted_roots: Vec<String> = kinds
+            .iter()
+            .filter(|(name, kind)| {
+                **kind == models::ClusterVariableKindEnum::SecretReference
+                    && ctx.contains_key(*name)
+                    && !body_bound.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        match nanobpmn_engine_core::feel::eval_with_provenance(
+            &body.expression,
+            &ctx,
+            trusted_roots,
+        ) {
+            Ok(evaluated) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
                 models::ExpressionEvaluationResult {
                     expression: body.expression.clone(),
-                    result: types::Nullable::Present(types::Object(value_to_json(&value))),
+                    result: types::Nullable::Present(types::Object(value_to_json(
+                        &evaluated.value,
+                    ))),
                     warnings: Vec::new(),
-                    referenced_secrets: self.referenced_secrets_of(&body.expression),
+                    referenced_secrets: evaluated
+                        .referenced_secrets
+                        .into_iter()
+                        .map(|secret_name| models::ExpressionSecretReferenceItem {
+                            store_id: "default".to_string(),
+                            secret_name,
+                        })
+                        .collect(),
                 },
             )),
             Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -50191,6 +50241,130 @@ mod expression_conditional_tests {
             r.referenced_secrets.is_empty(),
             "request-body variables are never a trusted source: {:?}",
             r.referenced_secrets
+        );
+    }
+
+    /// #1296 review findings: provenance is EVALUATION-DRIVEN and tenant-aware,
+    /// derived from one immutable snapshot. These regressions pin the defect
+    /// class a purely syntactic scan got wrong: (a) a shadowed binding, skipped
+    /// branch, or short-circuited operand never surfaces a reference; (b) a
+    /// reference nested in a STRUCTURED SECRET_REFERENCE value is surfaced by a
+    /// member access; (c) the requested tenant's overlay (not just globals) is
+    /// applied and its kind drives provenance.
+    #[tokio::test]
+    async fn expression_evaluation_provenance_is_evaluation_driven_and_tenant_aware() {
+        let srv = server();
+        // A SECRET_REFERENCE global carrying a STRUCTURED value (reference text
+        // nested in an object) — finding: provenance must survive projection.
+        let mut cfg = models::CreateClusterVariableRequest {
+            name: "cfg".to_string(),
+            value: types::Object(serde_json::json!({"token": "camunda.secrets.NESTED"})),
+            metadata: None,
+            kind: Some(models::ClusterVariableKindEnum::SecretReference),
+        };
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&cfg).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+        // A tenant-scoped SECRET_REFERENCE shadowing nothing globally.
+        cfg.name = "tenant_ref".to_string();
+        cfg.value = types::Object(serde_json::json!("camunda.secrets.ACME"));
+        let tenant_path = models::CreateTenantClusterVariablePathParams {
+            tenant_id: "acme".to_string(),
+        };
+        assert!(matches!(
+            srv.create_tenant_cluster_variable_impl(&tenant_path, &cfg)
+                .await
+                .unwrap(),
+            apis::cluster_variable::CreateTenantClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        async fn eval_t(
+            srv: &ServerImpl,
+            expr: &str,
+            tenant_id: Option<&str>,
+            variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+        ) -> models::ExpressionEvaluationResult {
+            use apis::expression::EvaluateExpressionResponse as Resp;
+            let body = models::ExpressionEvaluationRequest {
+                expression: expr.to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                scope_key: None,
+                variables,
+            };
+            match srv.evaluate_expression_impl(&body).await.unwrap() {
+                Resp::Status200_ExpressionEvaluatedSuccessfully(r) => r,
+                other => panic!("expected 200 for '{expr}', got {other:?}"),
+            }
+        }
+        let names = |r: &models::ExpressionEvaluationResult| {
+            let mut n: Vec<String> = r
+                .referenced_secrets
+                .iter()
+                .map(|s| s.secret_name.clone())
+                .collect();
+            n.sort();
+            n
+        };
+
+        // (b) A member access into a structured SECRET_REFERENCE value surfaces
+        // the nested reference.
+        let r = eval_t(&srv, "cfg.token", None, None).await;
+        assert_eq!(names(&r), vec!["NESTED"]);
+
+        // (a) A skipped `if` branch never surfaces its reference.
+        let r = eval_t(
+            &srv,
+            "if false then camunda.secrets.SKIPPED else camunda.secrets.TAKEN",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(names(&r), vec!["TAKEN"]);
+        // Short-circuited `or` never surfaces the right operand's reference.
+        let r = eval_t(&srv, "true or camunda.secrets.SKIPPED", None, None).await;
+        assert!(names(&r).is_empty());
+
+        // (a) A request-body variable SHADOWING a trusted cluster variable is
+        // untrusted: the body value (not the cluster variable's) is returned,
+        // and because the body binding is never a trusted carrier the shadowed
+        // cluster variable's NESTED reference is NOT surfaced.
+        let r = eval_t(
+            &srv,
+            "cfg",
+            None,
+            vars(&[("cfg", serde_json::json!("camunda.secrets.BODY"))]),
+        )
+        .await;
+        assert!(
+            names(&r).is_empty(),
+            "a body binding shadows the trusted cluster variable and is itself untrusted: {:?}",
+            r.referenced_secrets
+        );
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.BODY"),
+            "the shadowing body value is returned, not the cluster variable's"
+        );
+
+        // (c) The requested tenant's overlay is applied: evaluating the
+        // tenant-scoped variable under tenant `acme` surfaces its reference…
+        let r = eval_t(&srv, "tenant_ref", Some("acme"), None).await;
+        assert_eq!(names(&r), vec!["ACME"]);
+        // …but under another tenant (or none) the variable is invisible, so the
+        // expression evaluates to null with no provenance.
+        let r = eval_t(&srv, "tenant_ref", None, None).await;
+        assert!(names(&r).is_empty());
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::Value::Null,
+            "a tenant-scoped variable is invisible to other tenants"
         );
     }
 
