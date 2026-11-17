@@ -44920,7 +44920,7 @@ mod clustered_startup_tests {
                 }
                 "fail" => {
                     node0
-                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
                         .await
                 }
                 _ => {
@@ -45024,7 +45024,7 @@ mod clustered_startup_tests {
         new_leader.run_lease_digest(recover_now).await;
 
         let (leader_events, _) = new_leader
-            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
             .await
             .expect("the fail commits on the new leader");
         let on_leader =
