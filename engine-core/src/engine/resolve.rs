@@ -1081,6 +1081,33 @@ mod tests {
             "instance variable must shadow the same-named cluster variable"
         );
     }
+
+    /// #1296: a `SECRET_REFERENCE` cluster variable's value is ordinary JSON
+    /// that may carry `camunda.secrets.<name>` reference text. The engine NEVER
+    /// resolves it — the overlay hands the reference text through unchanged, so
+    /// nothing resolved can ever reach the journal or a snapshot. (Resolution
+    /// happens at job activation, host-side; see the issue's follow-up.)
+    #[test]
+    fn cluster_variable_overlay_passes_secret_reference_text_through() {
+        use std::sync::{Arc as StdArc, RwLock};
+
+        use crate::cluster_vars::ClusterVariableSnapshot;
+
+        let mut engine = Engine::new();
+        let mut snap = ClusterVariableSnapshot::default();
+        snap.global.insert(
+            "api_token".to_string(),
+            Value::Str("camunda.secrets.API_TOKEN".to_string()),
+        );
+        engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
+
+        let out = engine.overlay_cluster_variables(Arc::new(HashMap::new()));
+        assert_eq!(
+            out.get("api_token"),
+            Some(&Value::Str("camunda.secrets.API_TOKEN".to_string())),
+            "the reference text passes through verbatim, never resolved"
+        );
+    }
 }
 
 // Test-only probe counting how often the conditional re-evaluation candidate
