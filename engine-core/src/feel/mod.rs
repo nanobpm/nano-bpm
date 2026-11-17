@@ -162,6 +162,144 @@ pub fn variable_reference_root(expr: &str) -> Option<String> {
     root(&node).map(str::to_owned)
 }
 
+/// The dotted path of an expression that is *just* a variable or a nested member
+/// access of one (`a` → `["a"]`, `=a.b.c` → `["a", "b", "c"]`); `None` for
+/// anything else (literals, calls, index access, operators) or an unparseable
+/// expression. Unlike [`variable_reference_root`] this keeps the whole path.
+pub fn variable_reference_path(expr: &str) -> Option<Vec<String>> {
+    fn path(node: &ast::Node, out: &mut Vec<String>) -> Option<()> {
+        match node {
+            ast::Node::Var(name) => {
+                out.push(name.clone());
+                Some(())
+            }
+            ast::Node::Member(base, name) => {
+                path(base, out)?;
+                out.push(name.clone());
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let node = parser::parse(lexer::tokenize(strip_marker(expr)).ok()?).ok()?;
+    let mut out = Vec::new();
+    path(&node, &mut out)?;
+    Some(out)
+}
+
+/// The prefix of a Camunda secret reference path: `camunda.secrets.<name>`.
+pub const SECRET_REFERENCE_PREFIX: &str = "camunda.secrets.";
+
+/// The secret name of a `camunda.secrets.<name>` reference string (the value a
+/// `SECRET_REFERENCE` cluster variable carries, or the text a trusted reference
+/// evaluates to); `None` when `s` is not exactly that shape.
+pub fn secret_reference_name(s: &str) -> Option<&str> {
+    let name = s.strip_prefix(SECRET_REFERENCE_PREFIX)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// The secret names of the literal `camunda.secrets.<name>` paths an expression
+/// uses directly (`=camunda.secrets.token` → `{token}`). Per Camunda 8.10
+/// `referencedSecrets` semantics a literal reference in the expression is a
+/// TRUSTED source; a reference string arriving via a request-body variable or a
+/// JSON-kind cluster variable is not (the caller distinguishes those — this
+/// helper only sees the expression text). An unparseable expression yields an
+/// empty set.
+pub fn literal_secret_references(expr: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let src = strip_marker(expr);
+    if let Ok(tokens) = lexer::tokenize(src) {
+        if let Ok(node) = parser::parse(tokens) {
+            collect_secret_paths(&node, &mut out);
+        }
+    }
+    out
+}
+
+/// Walks a FEEL AST collecting the secret name of every maximal
+/// `Var/Member` chain that spells `camunda.secrets.<name>`. The helper returns
+/// the chain a `Var`/`Member` subtree spells (e.g. `["camunda", "secrets",
+/// "token"]`); the caller records `<name>` only when the chain is EXACTLY
+/// `camunda.secrets.<name>` and is not extended further (`camunda.secrets.a.b`
+/// is not a reference to `a`). Any non-chain node recurses with a fresh
+/// accumulator, so `camunda.secrets.x + 1` still finds `x` while
+/// `f(camunda.secrets)` does not (the chain is not a full reference).
+fn collect_secret_paths(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+    if let Some(chain) = member_chain(node) {
+        if chain.len() == 3 && chain[0] == "camunda" && chain[1] == "secrets" {
+            out.insert(chain[2].clone());
+        }
+        return;
+    }
+    collect_vars_shallow(node, out);
+}
+
+/// The dotted path a pure `Var`/`Member` subtree spells (`a.b.c` →
+/// `["a", "b", "c"]`); `None` when the subtree contains anything else.
+fn member_chain(node: &ast::Node) -> Option<Vec<String>> {
+    match node {
+        ast::Node::Var(name) => Some(vec![name.clone()]),
+        ast::Node::Member(base, name) => {
+            let mut chain = member_chain(base)?;
+            chain.push(name.clone());
+            Some(chain)
+        }
+        _ => None,
+    }
+}
+
+/// Recurses into every child of `node`, for the non-chain nodes of
+/// [`collect_secret_paths`].
+fn collect_vars_shallow(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+    use ast::Node;
+    let mut recur = |n: &ast::Node| collect_secret_paths(n, out);
+    match node {
+        Node::Null
+        | Node::BoolLit(_)
+        | Node::NumLit(..)
+        | Node::StrLit(_)
+        | Node::AtLit(_)
+        | Node::Var(_)
+        | Node::Member(..) => {}
+        Node::Index(a, b) | Node::Bin(_, a, b) | Node::In(a, b) => {
+            recur(a);
+            recur(b);
+        }
+        Node::Neg(inner) | Node::Not(inner) | Node::InstanceOf(inner, _) => recur(inner),
+        Node::List(items) => items.iter().for_each(&mut recur),
+        Node::Context(entries) => entries.iter().for_each(|(_, n)| recur(n)),
+        Node::If(a, b, c) | Node::Between(a, b, c) => {
+            recur(a);
+            recur(b);
+            recur(c);
+        }
+        Node::For(clauses, body) | Node::Quant(_, clauses, body) => {
+            clauses.iter().for_each(|(_, n)| recur(n));
+            recur(body);
+        }
+        Node::FuncDef(_, body) => recur(body),
+        Node::Call(callee, args) => {
+            recur(callee);
+            match args {
+                ast::CallArgs::Positional(ns) => ns.iter().for_each(&mut recur),
+                ast::CallArgs::Named(ns) => ns.iter().for_each(|(_, n)| recur(n)),
+            }
+        }
+        Node::Range(r) => {
+            if let Some(s) = &r.start {
+                recur(s);
+            }
+            if let Some(e) = &r.end {
+                recur(e);
+            }
+        }
+    }
+}
+
 /// Walks a FEEL AST, collecting the name of every [`ast::Node::Var`] it contains.
 /// A dotted path `a.b` parses to `Member(Var("a"), "b")`, so recursing into the
 /// base of a member/index access naturally yields the root variable. Names bound
@@ -463,6 +601,62 @@ mod tests {
         assert_eq!(vars("=orders[1] > amount"), vec!["amount", "orders"]);
         // Literals reference nothing.
         assert!(vars("=1 > 0").is_empty());
+    }
+
+    /// #1296: the literal `camunda.secrets.<name>` paths of an expression (the
+    /// trusted direct-reference half of Camunda 8.10 `referencedSecrets`).
+    #[test]
+    fn literal_secret_references_finds_direct_paths() {
+        let refs = |e: &str| {
+            let mut v: Vec<String> = literal_secret_references(e).into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(refs("=camunda.secrets.token"), vec!["token"]);
+        assert_eq!(refs("camunda.secrets.token"), vec!["token"]);
+        // Inside a larger expression.
+        assert_eq!(
+            refs(r#"=camunda.secrets.a + camunda.secrets.b"#),
+            vec!["a", "b"]
+        );
+        // A reference-shaped STRING literal is not a path.
+        assert!(refs(r#"="camunda.secrets.token""#).is_empty());
+        // An incomplete chain is not a reference.
+        assert!(refs("=camunda.secrets").is_empty());
+        assert!(refs("=camunda.other.token").is_empty());
+        // A chain extended past the name is not a reference.
+        assert!(refs("=camunda.secrets.a.b").is_empty());
+        // An unparseable expression has no known reference.
+        assert!(refs("=for in").is_empty());
+        // No false positives on ordinary variables.
+        assert!(refs("=secrets.token").is_empty());
+        assert!(refs("=x + 1").is_empty());
+    }
+
+    #[test]
+    fn secret_reference_name_parses_the_reference_shape() {
+        assert_eq!(
+            secret_reference_name("camunda.secrets.TOKEN"),
+            Some("TOKEN")
+        );
+        assert_eq!(secret_reference_name("camunda.secrets."), None);
+        assert_eq!(secret_reference_name("camunda.secrets"), None);
+        assert_eq!(secret_reference_name("TOKEN"), None);
+        assert_eq!(secret_reference_name("x camunda.secrets.TOKEN"), None);
+    }
+
+    #[test]
+    fn variable_reference_path_keeps_the_whole_chain() {
+        assert_eq!(
+            variable_reference_path("=a.b.c"),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            variable_reference_path("result"),
+            Some(vec!["result".to_string()])
+        );
+        assert_eq!(variable_reference_path("=a[1]"), None);
+        assert_eq!(variable_reference_path("=a + b"), None);
     }
 
     #[test]

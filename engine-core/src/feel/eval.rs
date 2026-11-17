@@ -62,7 +62,20 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         Node::AtLit(s) => builtins::parse_temporal(s)
             .ok_or_else(|| FeelError(format!("invalid temporal literal @\"{s}\""))),
         Node::Var(name) => Ok(ctx.lookup(name).unwrap_or_else(|| {
-            if builtins::is_builtin(name) {
+            if name == "camunda" {
+                // #1296 / Camunda 8.10: a `camunda.secrets.<name>` reference is
+                // a TRUSTED secret pointer. It is never resolved during FEEL
+                // evaluation (upstream resolves it at job activation); instead
+                // the path evaluates to its own reference text, mirroring
+                // Zeebe's `SecretReferenceEvaluationContext`, so the reference
+                // string — never a secret value — is what travels onward. The
+                // `secrets` member is a sentinel builtin marker that `member`
+                // maps to the reference text.
+                FeelVal::Context(BTreeMap::from([(
+                    "secrets".to_string(),
+                    FeelVal::Function(Func::Builtin("camunda.secrets")),
+                )]))
+            } else if builtins::is_builtin(name) {
                 FeelVal::Function(Func::Builtin(builtins::canonical(name)))
             } else {
                 FeelVal::Null
@@ -364,6 +377,12 @@ pub fn apply(
 fn member(v: &FeelVal, name: &str) -> FeelVal {
     match v {
         FeelVal::Context(entries) => entries.get(name).cloned().unwrap_or(FeelVal::Null),
+        // #1296: `camunda.secrets.<name>` — the sentinel builtin marker the
+        // `camunda` variable's `secrets` member carries — evaluates to its own
+        // reference text (never resolved here; see the `Node::Var` arm).
+        FeelVal::Function(Func::Builtin("camunda.secrets")) => {
+            FeelVal::Str(format!("camunda.secrets.{name}"))
+        }
         // Projection: `list.field` maps the access over each element.
         FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name)).collect()),
         FeelVal::Date(d) => date_member(d, name),
