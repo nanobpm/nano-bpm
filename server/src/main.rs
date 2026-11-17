@@ -23378,8 +23378,8 @@ fn decision_instance_get_result(
 ///
 /// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
 /// (element instances, jobs, incidents) is scanned only when a filter that
-/// reads it is supplied, mirroring the `variables_index` construction in
-/// `search_process_instances_impl`.
+/// reads it is supplied — at the top level or in any `$or` clause — mirroring
+/// the `variables_index` construction in `search_process_instances_impl`.
 #[derive(Default)]
 struct InstanceCrossEntityIndex {
     /// `instance_key → its element instances` (for the element predicates).
@@ -23422,15 +23422,16 @@ struct CrossEntitySources {
 }
 
 impl InstanceCrossEntityIndex {
-    /// Builds the index, populating only the maps the supplied `filter`
-    /// actually constrains on and reading only the sources in `sources`.
+    /// Builds the index, populating only the maps the supplied `filters`
+    /// (the base filter plus every `$or` clause) actually constrain on and
+    /// reading only the sources in `sources`.
     #[allow(
         clippy::expect_used,
-        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filters read, so a missing source here is a wiring bug between the two, not a runtime condition"
     )]
-    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
+    fn new(filters: &[&models::ProcessInstanceFilter], sources: &CrossEntitySources) -> Self {
         let mut idx = InstanceCrossEntityIndex::default();
-        if Self::needs_elements(filter) {
+        if Self::needs_elements_any(filters) {
             let rows = sources
                 .element_instances
                 .as_deref()
@@ -23446,7 +23447,7 @@ impl InstanceCrossEntityIndex {
                     });
             }
         }
-        if filter.error_message.is_some() {
+        if filters.iter().any(|f| f.error_message.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -23470,7 +23471,7 @@ impl InstanceCrossEntityIndex {
                     .push(i.reason.clone());
             }
         }
-        if filter.has_retries_left.is_some() {
+        if filters.iter().any(|f| f.has_retries_left.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -23493,15 +23494,31 @@ impl InstanceCrossEntityIndex {
             || filter.has_element_instance_incident.is_some()
     }
 
+    /// [`Self::needs_elements`] over every group of one query (base + `$or`
+    /// clauses).
+    fn needs_elements_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_elements(f))
+    }
+
     /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
     /// is present.
     fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some() || filter.has_retries_left.is_some()
     }
 
+    /// [`Self::needs_jobs`] over every group of one query.
+    fn needs_jobs_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_jobs(f))
+    }
+
     /// Whether any incident-reading predicate (`errorMessage`) is present.
     fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some()
+    }
+
+    /// [`Self::needs_incidents`] over every group of one query.
+    fn needs_incidents_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_incidents(f))
     }
 
     /// Whether any cross-entity filter is present (so the caller can skip
@@ -23510,20 +23527,21 @@ impl InstanceCrossEntityIndex {
         Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
     }
 
-    /// Loads exactly the child-row sources `filter` reads: the element-instance
-    /// table only when an element predicate is present, jobs only for
-    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
-    /// so an `elementId`-only query never scans the job or incident tables.
-    /// Shared by the search and batch-selection paths so both honour the same
+    /// Loads exactly the child-row sources the supplied `filters` (the base
+    /// filter plus every `$or` clause) read: the element-instance table only
+    /// when an element predicate is present, jobs only for `errorMessage` /
+    /// `hasRetriesLeft`, incidents only for `errorMessage` — so an
+    /// `elementId`-only query never scans the job or incident tables. Shared
+    /// by the search and batch-selection paths so both honour the same
     /// lazy-source contract.
     fn sources_for(
-        filter: &models::ProcessInstanceFilter,
+        filters: &[&models::ProcessInstanceFilter],
         store: &readstore::ReadModel,
     ) -> CrossEntitySources {
         CrossEntitySources {
-            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
-            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
-            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+            element_instances: Self::needs_elements_any(filters).then(|| store.element_instances()),
+            jobs: Self::needs_jobs_any(filters).then(|| store.jobs()),
+            incidents: Self::needs_incidents_any(filters).then(|| store.incidents()),
         }
     }
 }
@@ -23688,10 +23706,12 @@ struct ProcessInstanceIndexes {
     /// Root variables for the UNION of variable names referenced by the base
     /// filter and every `$or` clause — one scan, one map.
     variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
-    /// Cross-entity (element / job / incident) index. Only the top-level filter
-    /// can carry these fields: `ProcessInstanceFilterFields` (the `$or` clause
-    /// shape) has none of them, which `process_instance_or_clause`'s exhaustive
-    /// destructuring keeps compile-checked.
+    /// Cross-entity (element / job / incident) index, built from the UNION of
+    /// the base filter and every `$or` clause: the clause shape
+    /// (`ProcessInstanceFilterFields`) carries the same cross-entity fields the
+    /// top-level filter does, so a clause-only `elementId` / `hasRetriesLeft` /
+    /// `errorMessage` must populate the index too — otherwise it matches
+    /// against an empty index (missed matches, or overbroad `false` matches).
     cross: InstanceCrossEntityIndex,
 }
 
@@ -23722,23 +23742,27 @@ impl ProcessInstanceMatcher {
             .flatten()
             .map(|e| e.name.clone())
             .collect();
+        // One cross-entity index for the whole query, built from every group
+        // that can carry element / job / incident predicates: the base filter
+        // AND each `$or` clause (the clause schema carries the same fields).
+        // `needs_elements` / `needs_jobs` / `needs_incidents` keep the build
+        // lazy — a source table is loaded only when some group reads it.
+        let index_groups: Vec<&models::ProcessInstanceFilter> =
+            std::iter::once(&base).chain(clauses.iter()).collect();
         let indexes = ProcessInstanceIndexes {
             variables: root_variables_index(&variable_names, store),
-            cross: if InstanceCrossEntityIndex::is_needed(&base) {
+            cross: if index_groups
+                .iter()
+                .any(|f| InstanceCrossEntityIndex::is_needed(f))
+            {
                 InstanceCrossEntityIndex::new(
-                    &base,
-                    &InstanceCrossEntityIndex::sources_for(&base, store),
+                    &index_groups,
+                    &InstanceCrossEntityIndex::sources_for(&index_groups, store),
                 )
             } else {
                 InstanceCrossEntityIndex::default()
             },
         };
-        debug_assert!(
-            clauses
-                .iter()
-                .all(|c| !InstanceCrossEntityIndex::is_needed(c)),
-            "$or clauses cannot carry cross-entity fields"
-        );
         ProcessInstanceMatcher {
             base: ProcessInstanceFilterGroup { filter: base },
             or_clauses: clauses
@@ -34947,6 +34971,160 @@ mod clustered_startup_tests {
 
         // An empty $or list places no constraint.
         assert_eq!(search(or_filter(None, vec![])).await.len(), 3);
+    }
+
+    /// Clause-only cross-entity predicates (#1293 review): the `$or` clause
+    /// schema carries the same element / job / incident fields as the top-level
+    /// filter, so the shared cross-entity index must be built from the UNION of
+    /// the base filter and every clause. A clause-only `elementId` must find
+    /// its instances (an index built from the base alone is empty, so the
+    /// clause misses them); a clause-only `hasRetriesLeft: false` must still
+    /// EXCLUDE instances whose failed jobs have retries (against an empty index
+    /// every instance reads `false`, silently broadening a mutating batch).
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_clause_only_cross_entity_predicates() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let job_created = |job_key: u64, instance_key: u64| Event::JobCreated {
+            job_key,
+            instance_key,
+            element_instance_key: job_key + 1,
+            element_id: "work".to_string(),
+            job_type: "t".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+        };
+        let job_failed = |job_key: u64, instance_key: u64, retries: i32| Event::JobFailed {
+            job_key,
+            instance_key,
+            retries,
+            worker: None,
+            error_message: Some("boom".to_string()),
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1),
+                &created(2),
+                &created(3),
+                &activated(1, 11, "review"),
+                &activated(2, 21, "approve"),
+                // Instance 1 has a failed job WITH retries left; instance 2's
+                // failed job is terminal.
+                &job_created(111, 1),
+                &job_failed(111, 1, 2),
+                &job_created(222, 2),
+                &job_failed(222, 2, 0),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+        let clause = |build: &dyn Fn(&mut models::ProcessInstanceFilterFields)| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            build(&mut c);
+            c
+        };
+        let or_filter = |clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.dollar_or = Some(clauses);
+            f
+        };
+
+        // Clause-only `elementId`: the clause matches only the instance
+        // carrying that element — on the search path AND the batch path.
+        let by_element = or_filter(vec![
+            clause(&|c| c.element_id = Some(s("review"))),
+            clause(&|c| c.element_id = Some(s("approve"))),
+        ]);
+        assert_eq!(search(by_element.clone()).await, vec![1, 2]);
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            assert_eq!(
+                server.batch_matched_process_instances(&by_element, policy),
+                vec![1, 2],
+                "clause-only elementId narrows the batch ({policy:?})"
+            );
+        }
+        // A single clause-only `elementId` finds its one instance (never the
+        // empty-index miss).
+        let one = or_filter(vec![clause(&|c| c.element_id = Some(s("review")))]);
+        assert_eq!(search(one.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&one, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+
+        // Clause-only `hasRetriesLeft`: `true` selects only instance 1...
+        let retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(true))]);
+        assert_eq!(search(retries.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&retries, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+        // ...and `false` must EXCLUDE instance 1 (its failed job still has
+        // retries) rather than matching every instance against an empty index.
+        let no_retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(false))]);
+        assert_eq!(search(no_retries.clone()).await, vec![2, 3]);
+        assert_eq!(
+            server
+                .batch_matched_process_instances(&no_retries, BatchHierarchyPolicy::HonourFilters),
+            vec![2, 3],
+            "clause-only hasRetriesLeft=false must not broaden the batch"
+        );
+
+        // Clause-only `errorMessage`: existential over job/incident messages.
+        let errored = or_filter(vec![clause(&|c| c.error_message = Some(s("boom")))]);
+        assert_eq!(search(errored.clone()).await, vec![1, 2]);
+        assert_eq!(
+            server.batch_matched_process_instances(&errored, BatchHierarchyPolicy::HonourFilters),
+            vec![1, 2]
+        );
     }
 
     /// `UserTaskFilter.processInstanceVariables` / `localVariables` (#1293):
