@@ -628,12 +628,12 @@ pub fn eval_with_provenance(
     // expression READ them. Only a READ carrier justifies a second
     // (neutralised) evaluation — the common case (no read carrier, or a
     // reference-free result) pays for exactly one evaluation, however many
-    // SECRET_REFERENCE variables are visible. An UNREAD carrier's names are
-    // untrusted occurrences in any result (the expression never surfaced
-    // them), so they explain a same-named literal's result occurrence without
-    // any re-evaluation.
+    // SECRET_REFERENCE variables are visible. An UNREAD carrier is then
+    // irrelevant in both directions: the expression never surfaced its value,
+    // so it supplies no result occurrence — it can neither be attributed NOR
+    // contest a literal that reaches the result (#1296 round-6 review: an
+    // unread same-named variable must not suppress a reaching literal).
     let mut carriers: Vec<(String, HashSet<String>)> = Vec::new();
-    let mut unread_carrier_names: HashSet<String> = HashSet::new();
     for name in trusted_roots {
         let Some(value) = ctx.get(&name) else {
             continue;
@@ -645,21 +645,25 @@ pub fn eval_with_provenance(
         }
         if read.contains(&name) {
             carriers.push((name, names));
-        } else {
-            unread_carrier_names.extend(names);
         }
     }
     // A read base variable that is NOT a trusted carrier is an untrusted
-    // source: when its value carries reference text into the result, that
-    // occurrence is untrusted, so a same-named literal's own (discarded)
+    // source. A reference such a source carries into the result is an
+    // untrusted occurrence, so a same-named literal's own (discarded)
     // contribution must not be reported — the discarded literal would
     // otherwise launder the untrusted copy into a trusted report
     // (`fromAi(u, camunda.secrets.TOKEN)` returning the body variable `u`).
-    let mut untrusted_result_names: HashSet<String> = unread_carrier_names
-        .iter()
-        .filter(|n| real_names.contains(*n))
-        .cloned()
-        .collect();
+    //
+    // The set is deliberately CONSERVATIVE — keyed on the carrier's whole
+    // value, not on which occurrence reached the result — so it may name a
+    // reference its source only discarded. That over-inclusion is sound here
+    // because it is gated behind the trusted-occurrence WITNESS below: a name
+    // in this set is excluded only when NO trusted carrier's neutralisation
+    // witnessed a trusted occurrence of it, so a literal that genuinely
+    // supplies the result (no untrusted occurrence in play) is unaffected,
+    // and a contested name falls back to the carrier attribution (#1296
+    // round-6 review: trust follows the returned VALUE, never a bare name).
+    let mut untrusted_result_names: HashSet<String> = HashSet::new();
     for name in read
         .iter()
         .filter(|n| !carriers.iter().any(|(c, _)| c == *n))
@@ -774,18 +778,33 @@ pub fn eval_with_provenance(
         }
     }
 
-    // A literal path's name is reported when its occurrence reaches the
-    // result as a TRUSTED occurrence: no trusted carrier's neutralisation may
-    // be what explains it (that is the carrier's value reaching the result),
-    // and no untrusted source may account for the result's occurrence —
-    // neither an unread trusted root nor a read untrusted variable carrying
-    // the same text (`fromAi(u, camunda.secrets.TOKEN)` returning the body
-    // variable `u`: the discarded literal must not launder that copy into a
-    // trusted report).
+    // A literal path's name is reported only when its occurrence reaches the
+    // result as a TRUSTED occurrence — the literal itself must be what
+    // supplies it (#1296 round-6 review: trust follows the returned VALUE,
+    // never a bare name match). A trusted carrier's neutralisation REMOVING
+    // the name is the witness that a trusted occurrence of it is in the
+    // result; that occurrence is then the carrier's (or, when the literal is
+    // also on the result path, the literal's indistinguishably) and is
+    // already reported by the carrier attribution above. Without that
+    // witness, the literal is trusted only when its result occurrence is not
+    // explained by an UNTRUSTED source: a read untrusted variable carrying
+    // the same text into the result (`fromAi(u, camunda.secrets.TOKEN)`), or
+    // an extra occurrence beyond the literal's own single contribution (an
+    // ordinary local string — `{x: "camunda.secrets.TOKEN", ignored:
+    // camunda.secrets.TOKEN}.x`). A literal that supplies the result alone
+    // (one occurrence, none carrier-removed, no untrusted source) is
+    // unaffected, and an unread or discarded carrier never suppresses it.
+    let mut real_counts: HashMap<String, usize> = HashMap::new();
+    count_secret_names_value(&value, &mut real_counts);
+
     referenced.extend(
         literal
             .iter()
-            .filter(|n| !removed_by_carrier.contains(*n) && !untrusted_result_names.contains(*n))
+            .filter(|n| {
+                !removed_by_carrier.contains(*n)
+                    && !untrusted_result_names.contains(*n)
+                    && real_counts.get(*n).copied().unwrap_or(0) <= 1
+            })
             .cloned(),
     );
     let mut referenced_secrets: Vec<String> = referenced.into_iter().collect();
@@ -864,17 +883,28 @@ fn collect_secret_names_value(v: &Value, out: &mut HashSet<String>) {
 }
 
 /// Whether `a` and `b` agree everywhere except on whole-string
-/// `camunda.secrets.<name>` reference occurrences: the neutralised run's
-/// result may differ from the real result only by a reference string becoming
-/// [`SECRET_NEUTRALISED`]. Any other difference — a flipped branch, a
-/// different selection, a changed length, a reference becoming `null` — means
+/// `camunda.secrets.<name>` reference occurrences and fresh nondeterministic
+/// draws: the neutralised run's result may differ from the real result only by
+/// a reference string becoming [`SECRET_NEUTRALISED`], or by a `uuid()` /
+/// `random number()` / `now()` builtin drawing a fresh value on the
+/// re-evaluation. Any other difference — a flipped branch, a different
+/// selection, a changed length, a reference becoming `null` — means
 /// neutralising the root changed the *control flow*, so a name that
 /// disappears is a control-flow artifact, not provenance from that root
 /// (#1296 round-5 review: branch-aware attribution).
+///
+/// The nondeterminism tolerance is keyed on the *shape* of a fresh draw, not
+/// the value (#1296 round-6 review): a v4 UUID string, a `[0, 1)` `random
+/// number()` double, and a `now()` dateTime each have a recognisable shape a
+/// neutralisation marker or an ordinary input never takes, so two differing
+/// draws of the same kind are the same shape — while a reference string
+/// becoming `null` (a flipped branch) still fails the comparison.
 fn same_shape(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => {
-            x == y || (secret_reference_name(x).is_some() && y == SECRET_NEUTRALISED)
+            x == y
+                || (secret_reference_name(x).is_some() && y == SECRET_NEUTRALISED)
+                || nondeterministic_pair(a, b)
         }
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_shape(x, y))
@@ -885,8 +915,66 @@ fn same_shape(a: &Value, b: &Value) -> bool {
                     .iter()
                     .all(|(k, x)| ys.get(k).map(|y| same_shape(x, y)).unwrap_or(false))
         }
-        _ => a == b,
+        _ => a == b || nondeterministic_pair(a, b),
     }
+}
+
+/// Whether two differing scalar values are a fresh draw of the SAME
+/// nondeterministic builtin: both v4 UUID strings (`uuid()`), both `[0, 1)`
+/// doubles (`random number()`), or both ISO-8601 dateTime strings (`now()`,
+/// which [`FeelVal::into_value`] renders as a string). Keyed on the draw's
+/// shape so the neutralisation marker (a NUL-carrying string) and ordinary
+/// inputs never qualify — only a genuine re-draw does.
+fn nondeterministic_pair(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => {
+            (is_uuid_v4(x) && is_uuid_v4(y)) || (is_datetime_string(x) && is_datetime_string(y))
+        }
+        (Value::Double(x), Value::Double(y)) => (0.0..1.0).contains(x) && (0.0..1.0).contains(y),
+        _ => false,
+    }
+}
+
+/// Whether `s` has the canonical RFC-4122 v4 UUID shape `uuid()` draws
+/// (`8-4-4-4-12` hex, version nibble `4`, variant nibble `8`/`9`/`a`/`b`).
+fn is_uuid_v4(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return false;
+    }
+    let hex = |c: u8| c.is_ascii_hexdigit();
+    b[..8].iter().all(|&c| hex(c))
+        && b[9..13].iter().all(|&c| hex(c))
+        && b[14] == b'4'
+        && b[15..18].iter().all(|&c| hex(c))
+        && matches!(b[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+        && b[20..23].iter().all(|&c| hex(c))
+        && b[24..36].iter().all(|&c| hex(c))
+}
+
+/// Whether `s` has the ISO-8601 dateTime shape `now()` renders
+/// (`YYYY-MM-DDThh:mm:ss…`): a four-digit year, `-`-separated date, a `T`
+/// separator, and a `:`-separated time. Distinct from the v4-UUID shape (no
+/// `T`, different hyphen layout), so a `uuid()` draw and a `now()` draw never
+/// match each other.
+fn is_datetime_string(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return false;
+    }
+    let digit = |c: u8| c.is_ascii_digit();
+    b[..4].iter().all(|&c| digit(c))
+        && b[5..7].iter().all(|&c| digit(c))
+        && b[8..10].iter().all(|&c| digit(c))
+        && b[11..13].iter().all(|&c| digit(c))
+        && b[14..16].iter().all(|&c| digit(c))
+        && b[17..19].iter().all(|&c| digit(c))
 }
 
 fn strip_marker(expr: &str) -> &str {
@@ -1543,6 +1631,106 @@ mod tests {
             prov("1 + 1", &c, &["token_ref", "unused"]).is_empty(),
             "an expression that reads no trusted root reports nothing"
         );
+    }
+
+    /// #1296 review (round 6): trust must follow the returned VALUE, never a
+    /// bare name match. Three defect classes the name-only checks got wrong,
+    /// pinned red-first:
+    ///
+    /// 1. A discarded literal `camunda.secrets.<name>` path must not launder a
+    ///    *read untrusted variable's* same-text copy into a trusted report
+    ///    (`fromAi(u, camunda.secrets.TOKEN)`). (A *computed* or *locally-bound*
+    ///    single occurrence — `fromAi("camunda.secrets." + name, …)`, `{x:
+    ///    "camunda.secrets.TOKEN", …}.x` — is indistinguishable from the
+    ///    literal's own by the result value alone; declined on the thread.)
+    /// 2. An UNREAD cluster variable must not suppress a literal reference
+    ///    that actually reaches the result: only a source that supplies a
+    ///    returned occurrence can contest a literal's trust.
+    /// 3. Nondeterministic draws (`uuid()`, `random number()`, `now()`) must
+    ///    not break the neutralisation comparison: a fresh draw in the
+    ///    re-evaluation is not a shape change.
+    #[test]
+    fn eval_with_provenance_trusts_only_returned_trusted_occurrences() {
+        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+            eval_with_provenance(
+                e,
+                c,
+                trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .referenced_secrets
+        };
+
+        // --- (1) Discarded-literal laundering is bounded to the sound core --
+        // A literal that supplies the result's ONLY occurrence is trusted…
+        assert_eq!(
+            prov("camunda.secrets.DIRECT", &ctx(&[]), &[]),
+            vec!["DIRECT"]
+        );
+        // …and a discarded literal whose result occurrence a read UNTRUSTED
+        // variable also carries is not (the untrusted copy contests it).
+        let c = ctx(&[("u", Value::Str("camunda.secrets.TOKEN".into()))]);
+        assert!(
+            prov(r#"fromAi(u, camunda.secrets.TOKEN)"#, &c, &[]).is_empty(),
+            "a discarded literal must not launder a read untrusted variable's copy"
+        );
+        // A *computed* or *locally-bound* single occurrence that merely
+        // matches the reference text (`fromAi("camunda.secrets." + name, …)`,
+        // `{x: "camunda.secrets.TOKEN", …}.x`) is indistinguishable from the
+        // literal's own occurrence by the result value alone — the
+        // differential mechanism is value-based, so it cannot separate two
+        // identical strings. Those are declined on the thread: closing them
+        // needs provenance attached to the value (the in-band taint wrapper
+        // the round-4 review removed for breaking native dispatch), not a
+        // name/occurrence check.
+
+        // --- (2) An unread carrier must not suppress a reaching literal ---
+        // `unrelated` is a visible SECRET_REFERENCE variable the expression
+        // never reads; the literal itself supplies the result's occurrence.
+        let c = ctx(&[("unrelated", Value::Str("camunda.secrets.TOKEN".into()))]);
+        assert_eq!(
+            prov("camunda.secrets.TOKEN", &c, &["unrelated"]),
+            vec!["TOKEN"],
+            "an unread same-named cluster variable must not suppress the literal"
+        );
+
+        // --- (3) Nondeterministic draws do not suppress attribution -------
+        // The trusted token is returned alongside a fresh UUID; the
+        // neutralised re-evaluation draws a different UUID, which must not
+        // count as a shape change.
+        let c = ctx(&[("t", Value::Str("camunda.secrets.TOKEN".into()))]);
+        let r = eval_with_provenance("{token: t, id: uuid()}", &c, vec!["t".to_string()]).unwrap();
+        assert_eq!(
+            r.referenced_secrets,
+            vec!["TOKEN"],
+            "a fresh uuid() in the re-evaluation must not suppress attribution"
+        );
+        let id = r.value;
+        // `random number()` and `now()` are the same class.
+        let r = eval_with_provenance(
+            "{token: t, roll: random number()}",
+            &c,
+            vec!["t".to_string()],
+        )
+        .unwrap();
+        assert_eq!(r.referenced_secrets, vec!["TOKEN"]);
+        let r = eval_with_provenance("{token: t, at: now()}", &c, vec!["t".to_string()]).unwrap();
+        assert_eq!(r.referenced_secrets, vec!["TOKEN"]);
+        // …and the uuid really is nondeterministic (the test above is not
+        // vacuously passing on a constant).
+        if let Value::Map(entries) = &id {
+            let first = entries.get("id").cloned().unwrap_or(Value::Null);
+            let second = eval_with_provenance("{token: t, id: uuid()}", &c, vec!["t".to_string()])
+                .unwrap()
+                .value;
+            if let Value::Map(entries2) = &second {
+                assert_ne!(
+                    first,
+                    entries2.get("id").cloned().unwrap_or(Value::Null),
+                    "uuid() must draw fresh values"
+                );
+            }
+        }
     }
 
     #[test]
