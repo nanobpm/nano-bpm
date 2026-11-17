@@ -2533,11 +2533,13 @@ fn should_reject_an_unknown_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_parse_a_binding_without_a_form_id() {
+fn should_reject_a_form_definition_without_a_form_id_or_external_reference() {
     // given: a user-task formDefinition carrying `bindingType="deployment"`
-    // but no `formId` (and no `externalReference`). The binding parses — with
-    // no `formId` there is nothing to resolve at task creation, so the binding
-    // is inert (a task with no form resolves no version under any binding).
+    // but no `formId` (and no `externalReference`). With neither there is no
+    // form to resolve under any binding, so accepting it would create a
+    // form-less task with no incident — a silently dead declaration. Zeebe
+    // requires exactly one of the two and rejects the deployment; Nano
+    // surfaces the same hard parse error (#1193 review).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2555,8 +2557,73 @@ fn should_parse_a_binding_without_a_form_id() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
+    // when / then
+    let err = parse_bpmn(xml).expect_err("a form-less formDefinition is rejected");
+    assert_eq!(
+        err,
+        ParseError::MissingUserTaskFormId {
+            task_id: "review".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_an_empty_form_id_on_a_user_task_form() {
+    // given: the same defect class through an explicitly EMPTY `formId=""`
+    // (present but unusable) — rejected exactly like an absent one, on the
+    // default `latest` binding too: the rule is the missing form reference,
+    // not the binding type.
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an empty formId is rejected");
+    assert_eq!(
+        err,
+        ParseError::MissingUserTaskFormId {
+            task_id: "review".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_external_form_reference_without_a_form_id() {
+    // given: a user-task formDefinition with an `externalReference` and no
+    // `formId` — the one legitimate form-id-less shape (the form is hosted
+    // externally, so no deployed version is resolved and the binding is moot).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition externalReference="https://forms.example/review" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
     // when
-    let def = &parse_bpmn(xml).expect("a binding without a formId parses")[0];
+    let def = &parse_bpmn(xml).expect("an external form reference parses")[0];
 
     // then
     let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
@@ -2564,8 +2631,8 @@ fn should_parse_a_binding_without_a_form_id() {
     };
     assert_eq!(props.form_id, None);
     assert_eq!(
-        props.form_binding_type,
-        crate::model::BindingType::Deployment
+        props.external_form_reference.as_deref(),
+        Some("https://forms.example/review")
     );
 }
 

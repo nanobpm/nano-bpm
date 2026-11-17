@@ -32,6 +32,13 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
+    /// A user task's `zeebe:formDefinition` declared neither a non-empty
+    /// `formId` nor an `externalReference` — there is no form to resolve under
+    /// any binding, so the task would be created form-less with no incident
+    /// (#1193 review). Zeebe requires exactly one of the two and rejects the
+    /// deployment (`INVALID_ARGUMENT`), so Nano surfaces a hard parse error for
+    /// parity rather than silently accepting a form-less definition.
+    MissingUserTaskFormId { task_id: String },
     /// A user task's `zeebe:formDefinition` declared a `bindingType` value that
     /// is not one of Camunda's three bindings (`latest`, `deployment`,
     /// `versionTag`) — including an explicitly empty `bindingType=""`, which is
@@ -221,6 +228,11 @@ impl std::fmt::Display for ParseError {
                     "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
                 )
             }
+            ParseError::MissingUserTaskFormId { task_id } => write!(
+                f,
+                "user task '{task_id}' declares a formDefinition with neither a formId nor an \
+externalReference: one of the two is required"
+            ),
             ParseError::UnsupportedUserTaskFormBinding {
                 task_id,
                 binding_type,

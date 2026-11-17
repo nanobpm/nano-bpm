@@ -1004,6 +1004,21 @@ pub(crate) fn parse_with_captures(
                                     .filter(|s| !s.is_empty())
                                     .map(str::to_string);
                                 if let Some(idx) = cur_user_task {
+                                    // Zeebe requires exactly one of `formId` /
+                                    // `externalReference` on a user task's
+                                    // formDefinition and rejects the deployment
+                                    // otherwise: with neither there is no form
+                                    // to resolve under any binding, so the task
+                                    // would be created form-less with no
+                                    // incident — a silently accepted dead
+                                    // declaration (#1193 review). Reject it
+                                    // loudly, like the other required-attribute
+                                    // rules.
+                                    if form_id.is_none() && external_reference.is_none() {
+                                        return Err(ParseError::MissingUserTaskFormId {
+                                            task_id: acc.nodes[idx].id.clone(),
+                                        });
+                                    }
                                     let props = &mut acc.nodes[idx].user_task;
                                     props.external_form_reference = external_reference;
                                     props.form_id = if props.external_form_reference.is_some() {

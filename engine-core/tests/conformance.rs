@@ -108,6 +108,11 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         origin: "#1193",
     },
     Mapping {
+        nano: "MissingUserTaskFormId",
+        zeebe: "INVALID_ARGUMENT (zeebe:formDefinition requires exactly one of formId / externalReference)",
+        origin: "#1193 review",
+    },
+    Mapping {
         nano: "UnresolvedReference",
         zeebe: "INVALID_ARGUMENT (camunda-xml-model eager QName resolution failure)",
         origin: "#849/#851",
@@ -166,6 +171,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::InvalidMessageEvent { .. } => "InvalidMessageEvent",
         ParseError::InvalidLinkedResource { .. } => "InvalidLinkedResource",
         ParseError::UnsupportedUserTaskFormBinding { .. } => "UnsupportedUserTaskFormBinding",
+        ParseError::MissingUserTaskFormId { .. } => "MissingUserTaskFormId",
         ParseError::UnresolvedReference { .. } => "UnresolvedReference",
         ParseError::UnsupportedElement { .. } => "UnsupportedElement",
         ParseError::InvalidGateway { .. } => "InvalidGateway",
@@ -620,6 +626,9 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             task_id: String::new(),
             binding_type: String::new(),
         },
+        ParseError::MissingUserTaskFormId {
+            task_id: String::new(),
+        },
         ParseError::UnresolvedReference {
             kind: String::new(),
             id: String::new(),
@@ -687,6 +696,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::InvalidMessageEvent { .. }
             | ParseError::InvalidLinkedResource { .. }
             | ParseError::UnsupportedUserTaskFormBinding { .. }
+            | ParseError::MissingUserTaskFormId { .. }
             | ParseError::UnresolvedReference { .. }
             | ParseError::UnsupportedElement { .. }
             | ParseError::InvalidGateway { .. }

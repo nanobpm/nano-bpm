@@ -1317,3 +1317,150 @@ fn a_partially_changed_bundle_reversions_its_unchanged_resources_under_the_new_k
     assert_eq!(created_form_key(&created), Some(v2_form));
     assert!(engine.active_incidents().is_empty());
 }
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_together_when_its_deployment_bindings_would_dangle() {
+    // #1193 review: content equality does not guarantee SHARED deployment
+    // membership. A process and its `deployment`-bound form deployed
+    // SEPARATELY and then resubmitted unchanged TOGETHER must not be skipped
+    // as duplicates — reuse would pin the process to a deployment without the
+    // form, so every new instance would raise a deployment-binding incident.
+    // The bundle is re-versioned together instead, making the submitted
+    // binding resolvable.
+    let process = || form_binding_process(r#"bindingType="deployment""#);
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    let key = sole_deployment_key(&together);
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "the unchanged process is re-versioned into the shared deployment: {together:?}"
+    );
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::FormDeployed { version: 2, .. })),
+        "the unchanged form is re-versioned into the shared deployment: {together:?}"
+    );
+    assert_eq!(engine.state().processes["p"].deployment_key, key);
+    let form_key = form_key_of(&together, "review-form");
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(created_form_key(&created), Some(form_key));
+    assert!(engine.active_incidents().is_empty());
+
+    // Resubmitting the original XML parses to the original `deployment`
+    // binding again, so it re-triggers the forced re-version (another version)
+    // rather than ever comparing equal to the rebound record — the rewrite
+    // cannot wedge the idempotency skip into reusing an unsatisfying
+    // deployment.
+    let resubmitted = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        resubmitted
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 3, .. })),
+        "the original XML re-versions again rather than reusing: {resubmitted:?}"
+    );
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(created_form_key(&created).is_some());
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_stays_a_noop_when_its_deployment_binding_already_resolves() {
+    // The membership gate's negative case: the process and its
+    // `deployment`-bound form were deployed together originally, so reuse
+    // keeps the submitted binding resolvable and the unchanged resubmission
+    // must remain an idempotent no-op (no re-version churn).
+    let bundle = || {
+        Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![form_binding_process(r#"bindingType="deployment""#)],
+            forms: vec![tagged_form("review-form", None)],
+            ..Default::default()
+        })
+    };
+    let mut engine = Engine::new();
+    engine.apply_command(bundle()).unwrap();
+    let again = engine.apply_command(bundle()).unwrap();
+    assert!(
+        again.iter().all(|e| !matches!(
+            e,
+            Event::ProcessDeployed { .. } | Event::FormDeployed { .. }
+        )),
+        "a satisfied membership keeps the all-duplicate no-op: {again:?}"
+    );
+}
+
+// zeebe-cells: element:ServiceTask
+#[test]
+fn an_all_duplicate_bundle_reversions_together_when_a_deployment_bound_linked_resource_would_dangle(
+) {
+    // The same membership defect class through a service task's
+    // `deployment`-bound linked resource: process and resource deployed
+    // separately, then resubmitted unchanged together — reuse would leave the
+    // worker's `linkedResources` header unable to resolve the link.
+    let process = || linked_resource_process();
+    let resource = || policy("# v1");
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployGenericResources(vec![resource()]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            resources: vec![resource()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "the unchanged process is re-versioned into the shared deployment: {together:?}"
+    );
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::GenericResourceDeployed { version: 2, .. })),
+        "the unchanged resource is re-versioned into the shared deployment: {together:?}"
+    );
+
+    engine
+        .apply_command(Command::create_instance("lp"))
+        .unwrap();
+    let activated = engine.activate_jobs("run-agent", "w1", 10, 60_000, 0);
+    let resource_key = engine.state().resources["policy.md"].key;
+    assert_eq!(
+        activated[0].custom_headers.get("linkedResources"),
+        Some(&format!(
+            "[{{\"resourceKey\":\"{resource_key}\",\"resourceType\":\"GenericScript\",\"linkName\":\"policy\"}}]"
+        )),
+        "the re-versioned shared deployment resolves the linked resource"
+    );
+}

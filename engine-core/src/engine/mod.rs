@@ -1744,11 +1744,26 @@ impl Engine {
         for process in &mut bundle.processes {
             process.normalize_legacy_agent_tasks();
         }
-        let all_duplicates = self.bundle_is_all_duplicates(&bundle);
         // Zeebe: an all-duplicate deployment is a no-op; otherwise every
         // resource is re-versioned under the new deployment key so the bundle
         // stays mutually resolvable for `bindingType: deployment`.
-        let force = !all_duplicates;
+        let force = !self.bundle_is_all_duplicates(&bundle);
+        if !force {
+            // …with one membership refinement (#1193 review): content equality
+            // does not imply SHARED deployment membership. A duplicate process
+            // may be reused only while the bundle's submitted `deployment`
+            // bindings still resolve against the deployment the reuse pins —
+            // otherwise the bundle is re-versioned together. Deploying a
+            // process and its form separately and then resubmitting them
+            // unchanged together must not leave the process pinned to a
+            // deployment without the form (an incident on every instance).
+            if !self.bundle_membership_satisfies_submitted_bindings(&bundle) {
+                for process in &mut bundle.processes {
+                    Self::unbind_process_for_redeploy(process);
+                }
+                return self.deploy_bundle(log, bundle);
+            }
+        }
         let crate::command::DeploymentBundle {
             processes,
             decisions,
@@ -1775,6 +1790,73 @@ impl Engine {
                 .resources
                 .iter()
                 .all(|r| self.is_duplicate_resource(r))
+    }
+
+    /// Whether reusing every duplicate resource's existing version (the
+    /// all-duplicates no-op) keeps the bundle's submitted `deployment` bindings
+    /// resolvable (#1193 review): for each `deployment`-bound form / linked
+    /// resource a bundle process declares, the bound id must already be
+    /// versioned under the deployment the process's reuse pins. Merely being
+    /// submitted in the same bundle is NOT sufficient — an unchanged
+    /// submission is itself skipped, so it would not join the process's
+    /// deployment. A bundle that fails this is re-versioned together instead
+    /// of skipping, so the bindings become satisfiable.
+    fn bundle_membership_satisfies_submitted_bindings(
+        &self,
+        bundle: &crate::command::DeploymentBundle,
+    ) -> bool {
+        bundle.processes.iter().all(|process| {
+            let deployment_key = self
+                .state
+                .processes
+                .get(&process.id)
+                .map(|existing| existing.deployment_key)
+                .unwrap_or(0);
+            if deployment_key == 0 {
+                // The process itself is not a reusable duplicate (it is new, or
+                // predates deployment tracking): the bundle is not an
+                // all-duplicates reuse, so this gate never runs for it.
+                return true;
+            }
+            process.elements.values().all(|element| {
+                let form_ok = match &element.kind {
+                    ElementKind::UserTask(props)
+                        if props.form_binding_type == crate::model::BindingType::Deployment =>
+                    {
+                        props.form_id.as_deref().is_none_or(|form_id| {
+                            self.form_versioned_under(form_id, deployment_key)
+                        })
+                    }
+                    _ => true,
+                };
+                let links_ok = match &element.kind {
+                    ElementKind::ServiceTask {
+                        linked_resources, ..
+                    } => linked_resources.iter().all(|link| {
+                        link.binding_type != crate::model::BindingType::Deployment
+                            || self.resource_versioned_under(&link.resource_id, deployment_key)
+                    }),
+                    _ => true,
+                };
+                form_ok && links_ok
+            })
+        })
+    }
+
+    /// Whether a deployed version of `form_id` is pinned to `deployment_key`.
+    fn form_versioned_under(&self, form_id: &str, deployment_key: Key) -> bool {
+        self.state
+            .form_versions
+            .values()
+            .any(|f| f.form_id == form_id && f.deployment_key == deployment_key)
+    }
+
+    /// Whether a deployed version of `resource_id` is pinned to `deployment_key`.
+    fn resource_versioned_under(&self, resource_id: &str, deployment_key: Key) -> bool {
+        self.state
+            .resource_versions
+            .values()
+            .any(|r| r.resource_id == resource_id && r.deployment_key == deployment_key)
     }
 
     fn is_duplicate_process(&self, process: &ProcessDefinition) -> bool {
@@ -1809,6 +1891,40 @@ impl Engine {
                     && existing.content == resource.content
                     && existing.version_tag == resource.version_tag
             })
+    }
+
+    /// Rewrites a duplicate process whose `deployment` bindings the bundle
+    /// cannot satisfy (see [`Self::bundle_membership_satisfies_submitted_bindings`])
+    /// so it no longer compares byte-equal to its deployed predecessor:
+    /// `bindingType: deployment` references are rebound to `latest` in the
+    /// retained XML — the verbatim model record the duplicate check compares
+    /// — while the in-memory elements the engine executes are untouched. The
+    /// bundle then re-deploys the process as "changed" under the new shared
+    /// deployment key, where the submitted bindings resolve (#1193 review).
+    /// The rewrite is stable: resubmitting the original XML parses to the
+    /// original binding again, so it re-triggers this path (re-versioning
+    /// once more) rather than ever comparing equal to the rewritten record.
+    fn unbind_process_for_redeploy(process: &mut ProcessDefinition) {
+        let rebound = process
+            .elements
+            .values()
+            .any(|element| match &element.kind {
+                ElementKind::UserTask(props) => {
+                    props.form_binding_type == crate::model::BindingType::Deployment
+                        && props.form_id.is_some()
+                }
+                ElementKind::ServiceTask {
+                    linked_resources, ..
+                } => linked_resources
+                    .iter()
+                    .any(|l| l.binding_type == crate::model::BindingType::Deployment),
+                _ => false,
+            });
+        if rebound && !process.xml.is_empty() {
+            process.xml = process
+                .xml
+                .replace("bindingType=\"deployment\"", "bindingType=\"latest\"");
+        }
     }
 
     /// Validates and registers a batch of process definitions as one deployment.
