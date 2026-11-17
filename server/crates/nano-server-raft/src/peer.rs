@@ -837,12 +837,19 @@ impl PeerLink {
 
     /// Broadcasts an already-minted deployment's `ProcessDeployed` events to this
     /// peer so it durably installs the definition(s) on its owned partitions.
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1600), stamped on the peer's durable copies of the records.
     pub async fn install_deployment(
         &self,
         events: Vec<nanobpmn_engine_core::Event>,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::InstallDeployment { corr, events })
-            .await
+        self.request(|corr| ClientFrame::InstallDeployment {
+            corr,
+            events,
+            operation_reference,
+        })
+        .await
     }
 
     /// Fans a published message out to this peer so it correlates against the
@@ -850,7 +857,9 @@ impl PeerLink {
     /// `{messageKey, correlatedInstanceKey}`. `only_partitions` scopes the apply
     /// to just those target partitions (the ones the fan-out has not yet
     /// delivered); `None` applies every locally led target partition (legacy
-    /// behaviour for a peer predating the field).
+    /// behaviour for a peer predating the field). `operation_reference` is the
+    /// publishing request's `operationReference` (#1600), stamped on every
+    /// record the publish produces on the peer's partitions.
     pub async fn publish_message(
         &self,
         name: String,
@@ -858,6 +867,7 @@ impl PeerLink {
         variables: Option<serde_json::Map<String, Value>>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::PublishMessage {
             corr,
@@ -866,6 +876,7 @@ impl PeerLink {
             variables,
             business_id,
             only_partitions,
+            operation_reference,
         })
         .await
     }
@@ -975,12 +986,20 @@ impl PeerLink {
     /// 503 not the target's leader). Bounded by the fast write-forward deadline:
     /// this is one attempt of the caller's bounded re-drive (#1582), so a
     /// leaderless target fails fast and is retried against the new leader.
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// records produced the follow-up (#1600), stamped on every record the
+    /// routed command produces on the peer.
     pub async fn route_subscription(
         &self,
         event: nanobpmn_engine_core::Event,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| {
-            ClientFrame::RouteSubscription { corr, event }
+            ClientFrame::RouteSubscription {
+                corr,
+                event,
+                operation_reference,
+            }
         })
         .await
     }
@@ -1596,6 +1615,7 @@ mod tests {
                     event: nanobpmn_engine_core::Event::ProcessInstanceCompleted {
                         instance_key: 1,
                     },
+                    operation_reference: None,
                 }
             }),
         )
@@ -1634,6 +1654,7 @@ mod tests {
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
             event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+            operation_reference: None,
         };
         // Occupy the single queue slot with an in-flight request (spawned so
         // it actually runs while the test body continues).
@@ -1709,6 +1730,7 @@ mod tests {
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
             event: nanobpmn_engine_core::Event::ProcessInstanceCompleted { instance_key: 1 },
+            operation_reference: None,
         };
         let timeout = Duration::from_millis(400);
         let drain = tokio::spawn(async move {
