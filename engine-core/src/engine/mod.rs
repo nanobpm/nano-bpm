@@ -4629,24 +4629,23 @@ impl Engine {
                 // the latest version of every deployed process id. Ordered by
                 // process id (then start element id below) so key minting is
                 // deterministic and replay stays in lock-step.
-                let mut candidates: Vec<(Key, ProcessDefinition)> =
-                    match process_definition_key.filter(|k| *k != 0) {
-                        Some(key) => {
-                            let p = self.state.process_by_key(key).ok_or_else(|| {
-                                EngineError::ProcessNotFound {
-                                    process_id: key.to_string(),
-                                }
-                            })?;
-                            vec![(p.key, p.definition.clone())]
-                        }
-                        None => self
-                            .state
-                            .processes
-                            .values()
-                            .filter(|p| has_conditional_start(&p.definition))
-                            .map(|p| (p.key, p.definition.clone()))
-                            .collect(),
-                    };
+                let mut candidates: Vec<(Key, ProcessDefinition)> = match process_definition_key {
+                    Some(key) => {
+                        let p = self.state.process_by_key(key).ok_or_else(|| {
+                            EngineError::ProcessNotFound {
+                                process_id: key.to_string(),
+                            }
+                        })?;
+                        vec![(p.key, p.definition.clone())]
+                    }
+                    None => self
+                        .state
+                        .processes
+                        .values()
+                        .filter(|p| has_conditional_start(&p.definition))
+                        .map(|p| (p.key, p.definition.clone()))
+                        .collect(),
+                };
                 candidates.sort_by(|a, b| a.1.id.cmp(&b.1.id));
                 for (definition_key, definition) in candidates {
                     let mut starts: Vec<(&ElementId, &String)> = definition

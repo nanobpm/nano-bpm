@@ -154,6 +154,11 @@ fn conditional_evaluation_scoped_to_a_definition_key() {
     // An unknown key is rejected, with nothing emitted.
     let err = evaluate(&mut engine, HashMap::new(), Some(987_654_321)).unwrap_err();
     assert!(matches!(err, EngineError::ProcessNotFound { .. }));
+
+    // Key 0 is an explicit (never-minted) key, not "unscoped": it must fail
+    // the lookup rather than broaden the evaluation to every definition.
+    let err = evaluate(&mut engine, vars(&[("go", Value::Bool(true))]), Some(0)).unwrap_err();
+    assert!(matches!(err, EngineError::ProcessNotFound { .. }));
 }
 
 #[test]
