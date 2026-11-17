@@ -75,9 +75,11 @@ pub(super) struct NodeAcc {
     ///
     /// [`EventSubProcessTrigger::Escalation`]: crate::model::EventSubProcessTrigger::Escalation
     pub(super) esp_escalation_ref: Option<Option<String>>,
-    /// For a start event nested in an event sub-process: the FEEL `condition`
-    /// of its `conditionalEventDefinition` (an
-    /// [`EventSubProcessTrigger::Conditional`]).
+    /// The FEEL `condition` of a start event's `conditionalEventDefinition`:
+    /// for a start nested in an event sub-process, an
+    /// [`EventSubProcessTrigger::Conditional`]; for a process-level start, a
+    /// root-level [`ConditionalStartEvent`](crate::model::ElementKind::ConditionalStartEvent)
+    /// (#932).
     ///
     /// [`EventSubProcessTrigger::Conditional`]: crate::model::EventSubProcessTrigger::Conditional
     pub(super) esp_condition: Option<String>,
@@ -1294,11 +1296,17 @@ impl ProcessAcc {
         if proc_starts.len() > 1 {
             // A none start carries no message/timer/signal event definition.
             let is_none_start = |n: &NodeAcc| {
-                n.message_ref.is_none() && n.timer_repeating.is_none() && n.signal_ref.is_none()
+                n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.signal_ref.is_none()
+                    && n.esp_condition.is_none()
             };
             // A signal start carries a signalRef but no message/timer definition.
             let is_signal_start = |n: &NodeAcc| {
-                n.signal_ref.is_some() && n.message_ref.is_none() && n.timer_repeating.is_none()
+                n.signal_ref.is_some()
+                    && n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.esp_condition.is_none()
             };
             // Keep a single none/signal start as the process-entry `StartEvent`
             // (prefer a none start); any additional *signal* start is surplus.
@@ -1676,6 +1684,12 @@ impl ProcessAcc {
                             }
                         })?;
                         builder.message_start_event(node.id, decl.name.clone())
+                    } else if let Some(condition) = node.esp_condition {
+                        // A root-level `conditionalEventDefinition` start (#932):
+                        // triggered by a conditional evaluation, not a
+                        // subscription. (Inside an event sub-process the
+                        // condition lives on the container trigger, above.)
+                        builder.conditional_start_event(node.id, condition)
                     } else if let Some(repeating) = node.timer_repeating {
                         let interval_millis = node.duration_millis.unwrap_or(0);
                         if repeating {

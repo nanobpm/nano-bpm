@@ -359,6 +359,17 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         ],
     },
     KindSpec {
+        keyword: "conditionalStartEvent",
+        doc: "Conditional start. A conditional evaluation whose variables satisfy the FEEL \
+              boolean creates a new instance.",
+        attrs: &[AttrSpec {
+            key: "condition",
+            required: true,
+            ty: AttrType::Str,
+            doc: "FEEL boolean condition (leading `=` optional).",
+        }],
+    },
+    KindSpec {
         keyword: "subProcess",
         doc: "Embedded sub-process. Container holding its own flow; child elements set `parent` \
               to its id.",
@@ -977,6 +988,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         MessageStartEvent { .. } => "messageStartEvent",
         TimerStartEvent { .. } => "timerStartEvent",
+        ConditionalStartEvent { .. } => "conditionalStartEvent",
         SubProcess { .. } => "subProcess",
         EventSubProcess { .. } => "eventSubProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
@@ -1096,6 +1108,12 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             ElementKind::TimerStartEvent {
                 interval_millis: 3_600_000,
                 repeating: true,
+            },
+        ),
+        (
+            "conditionalStartEvent",
+            ElementKind::ConditionalStartEvent {
+                condition: "=orderAmount > 100".into(),
             },
         ),
         (

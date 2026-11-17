@@ -23232,14 +23232,15 @@ impl ServerImpl {
     }
 
     /// `POST /v2/conditionals/evaluation` — evaluate root-level conditional start
-    /// events for the (optionally tenant-/definition-scoped) supplied variable
-    /// context. Nano's engine models conditional intermediate-catch and boundary
-    /// events but not root-level conditional *start* events, so no deployed
-    /// definition can be triggered by this evaluation: the result is always a
-    /// well-formed, spec-conformant empty `processInstances` list ("If no
-    /// root-level conditional start events evaluated to true, the list will be
-    /// empty") with a fresh evaluation key. A `processDefinitionKey` that does
-    /// not resolve to a deployed definition maps to a `404`.
+    /// events against the supplied variable context (#932). The engine command
+    /// [`Command::EvaluateConditionalStartEvents`] considers the latest version
+    /// of every deployed process (or exactly the version named by
+    /// `processDefinitionKey`) and creates one process instance — seeded with
+    /// the variables — per root-level conditional start event whose condition
+    /// evaluates to `true`. Each created instance is reported in
+    /// `processInstances`; the list is empty when no condition is satisfied. A
+    /// `processDefinitionKey` that does not resolve to a deployed definition
+    /// maps to a `404`.
     async fn evaluate_conditionals_impl(
         &self,
         body: &models::ConditionalEvaluationInstruction,
@@ -23274,14 +23275,72 @@ impl ServerImpl {
             }
         }
 
+        let command = Command::EvaluateConditionalStartEvents {
+            variables: from_object_map(&body.variables),
+            process_definition_key: body
+                .process_definition_key
+                .as_ref()
+                .and_then(|pdk| pdk.0.parse::<u64>().ok()),
+        };
+        let events = match self.apply_create_command(command).await {
+            Ok(events) => events,
+            Err((status, detail)) => {
+                return Ok(match status {
+                    404 => Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
+                        problem("Process definition not found", 404, detail),
+                    ),
+                    400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "INVALID_ARGUMENT",
+                        400,
+                        detail,
+                    )),
+                    503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        detail,
+                    )),
+                    _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", 500, detail),
+                    ),
+                });
+            }
+        };
+        // A created instance may advance straight into an off-partition message
+        // catch or an activatable job: route follow-ups and wake long-pollers,
+        // exactly as every other instance-creating write does.
+        self.spawn_routing_if_needed(&events);
+        self.signal_jobs_available();
+        let process_instances = conditional_start_instances(&events);
+
         Ok(Resp::Status200_SuccessfullyEvaluatedRoot(
             models::EvaluateConditionalResult::new(
                 models::ConditionalEvaluationKey(next_stateless_key().to_string()),
                 tenant_id,
-                Vec::new(),
+                process_instances,
             ),
         ))
     }
+}
+
+/// The `processInstances` of a `/v2/conditionals/evaluation` response: one
+/// reference per root process instance the evaluation created (#932), in the
+/// engine's deterministic creation order.
+fn conditional_start_instances(events: &[Event]) -> Vec<models::ProcessInstanceReference> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_definition_key,
+                parent_process_instance_key: None,
+                ..
+            } => Some(models::ProcessInstanceReference::new(
+                models::ProcessDefinitionKey(process_definition_key.to_string()),
+                models::ProcessInstanceKey(instance_key.to_string()),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
@@ -49902,7 +49961,7 @@ mod expression_conditional_tests {
 
     /// A conditional evaluation with no targeted definition succeeds with a fresh
     /// evaluation key, the resolved tenant, and an empty `processInstances` list
-    /// (Nano has no root-level conditional start events to trigger).
+    /// when nothing deployed has a root-level conditional start event.
     #[tokio::test]
     async fn conditional_evaluation_returns_empty_result() {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
@@ -49976,32 +50035,7 @@ mod expression_conditional_tests {
             .connect("start", "end")
             .build()
             .expect("valid process");
-        let mut names = std::collections::HashMap::new();
-        names.insert("cond-proc".to_string(), "cond.bpmn".to_string());
-        srv.deploy_resources_locally(
-            vec![proc],
-            &names,
-            Vec::new(),
-            &std::collections::HashMap::new(),
-            "<default>",
-        )
-        .await
-        .expect("deploy cond-proc");
-
-        // The read-model projection is asynchronous; poll for the definition key.
-        let mut key = None;
-        for _ in 0..300 {
-            for pd in srv.store.process_definitions() {
-                if pd.process_id == "cond-proc" {
-                    key = Some(pd.key);
-                }
-            }
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let key = key.expect("cond-proc definition is projected");
+        let key = deploy_and_await_definition(&srv, proc).await;
 
         let body = models::ConditionalEvaluationInstruction {
             tenant_id: None,
@@ -50014,6 +50048,93 @@ mod expression_conditional_tests {
                 assert!(r.process_instances.is_empty());
             }
             other => panic!("expected 200 for a deployed definition, got {other:?}"),
+        }
+    }
+
+    /// Deploys `proc` locally and polls the (asynchronous) read-model
+    /// projection until its definition key is visible.
+    async fn deploy_and_await_definition(
+        srv: &ServerImpl,
+        proc: nanobpmn_engine_core::ProcessDefinition,
+    ) -> u64 {
+        let process_id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(process_id.clone(), format!("{process_id}.bpmn"));
+        srv.deploy_resources_locally(
+            vec![proc],
+            &names,
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            "<default>",
+        )
+        .await
+        .expect("deploy process");
+        for _ in 0..300 {
+            if let Some(pd) = srv
+                .store
+                .process_definitions()
+                .into_iter()
+                .find(|pd| pd.process_id == process_id)
+            {
+                return pd.key;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{process_id} definition is never projected");
+    }
+
+    /// A deployed process whose root-level conditional start event condition
+    /// is satisfied by the supplied variables is started by the evaluation
+    /// (#932): the created instance is reported in `processInstances`, and an
+    /// unsatisfied condition starts nothing.
+    #[tokio::test]
+    async fn conditional_evaluation_starts_a_satisfied_conditional_start_event() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-start-proc")
+            .conditional_start_event("start", "=orderAmount > 100")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+
+        let evaluate = |amount: i64, targeted: bool| models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: targeted
+                .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+            variables: [(
+                "orderAmount".to_string(),
+                types::Object(serde_json::json!(amount)),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        for targeted in [false, true] {
+            match srv
+                .evaluate_conditionals_impl(&evaluate(1000, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert_eq!(r.process_instances.len(), 1, "targeted={targeted}");
+                    let created = &r.process_instances[0];
+                    assert_eq!(created.process_definition_key.0, definition_key.to_string());
+                    assert!(created.process_instance_key.0.parse::<u64>().is_ok());
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
+            match srv
+                .evaluate_conditionals_impl(&evaluate(50, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert!(r.process_instances.is_empty(), "targeted={targeted}");
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
         }
     }
 }

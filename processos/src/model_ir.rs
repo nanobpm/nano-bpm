@@ -161,6 +161,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
+        ElementKind::ConditionalStartEvent { .. } => "conditionalStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
@@ -356,7 +357,8 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             attrs.push(format!("signal {}", quote(signal_name)));
             attrs.push(format!("interrupting {interrupting}"));
         }
-        ElementKind::ConditionalIntermediateCatchEvent { condition } => {
+        ElementKind::ConditionalIntermediateCatchEvent { condition }
+        | ElementKind::ConditionalStartEvent { condition } => {
             attrs.push(format!("condition {}", quote(condition)));
         }
         ElementKind::ConditionalBoundaryEvent {
@@ -1457,6 +1459,9 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
                 repeating: attrs.bool_or("repeating", false)?,
             }
         }
+        "conditionalStartEvent" => ElementKind::ConditionalStartEvent {
+            condition: attrs.require("condition", id)?,
+        },
         "subProcess" => ElementKind::SubProcess {
             start_event: attrs.require("startEvent", id)?,
         },

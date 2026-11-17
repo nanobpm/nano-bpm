@@ -1924,7 +1924,8 @@ pub(crate) fn parse_with_captures(
                                 boundary.condition = Some(trimmed.to_string());
                             } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
                                 // A `<condition>` on a START event is an event
-                                // sub-process's conditional trigger (#1555).
+                                // sub-process's conditional trigger (#1555), or
+                                // a root-level conditional start (#932).
                                 acc.nodes[idx].esp_condition = Some(trimmed.to_string());
                             }
                         }
