@@ -23677,10 +23677,21 @@ enum ProcessInstanceStatePolicy {
 }
 
 /// One AND-group of a process-instance filter (the top-level fields, or one
-/// `$or` clause) with the per-group indexes its predicates read.
+/// `$or` clause). Indexes are NOT per-group: they live once on the
+/// [`ProcessInstanceMatcher`] so N `$or` clauses never build N copies.
 struct ProcessInstanceFilterGroup {
     filter: models::ProcessInstanceFilter,
+}
+
+/// Query-level indexes shared by every group of one [`ProcessInstanceMatcher`].
+struct ProcessInstanceIndexes {
+    /// Root variables for the UNION of variable names referenced by the base
+    /// filter and every `$or` clause — one scan, one map.
     variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    /// Cross-entity (element / job / incident) index. Only the top-level filter
+    /// can carry these fields: `ProcessInstanceFilterFields` (the `$or` clause
+    /// shape) has none of them, which `process_instance_or_clause`'s exhaustive
+    /// destructuring keeps compile-checked.
     cross: InstanceCrossEntityIndex,
 }
 
@@ -23692,27 +23703,49 @@ struct ProcessInstanceFilterGroup {
 struct ProcessInstanceMatcher {
     base: ProcessInstanceFilterGroup,
     or_clauses: Vec<ProcessInstanceFilterGroup>,
+    indexes: ProcessInstanceIndexes,
 }
 
 impl ProcessInstanceMatcher {
     fn new(filter: &models::ProcessInstanceFilter, store: &readstore::ReadModel) -> Self {
-        let group = |f: models::ProcessInstanceFilter| ProcessInstanceFilterGroup {
-            variables: root_variables_index(&f.variables, store),
-            cross: if InstanceCrossEntityIndex::is_needed(&f) {
-                InstanceCrossEntityIndex::new(&f, &InstanceCrossEntityIndex::sources_for(&f, store))
+        let mut base = filter.clone();
+        let clauses: Vec<models::ProcessInstanceFilter> = base
+            .dollar_or
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(process_instance_or_clause)
+            .collect();
+        let variable_names: std::collections::HashSet<String> = std::iter::once(&base)
+            .chain(clauses.iter())
+            .filter_map(|f| f.variables.as_ref())
+            .flatten()
+            .map(|e| e.name.clone())
+            .collect();
+        let indexes = ProcessInstanceIndexes {
+            variables: root_variables_index(&variable_names, store),
+            cross: if InstanceCrossEntityIndex::is_needed(&base) {
+                InstanceCrossEntityIndex::new(
+                    &base,
+                    &InstanceCrossEntityIndex::sources_for(&base, store),
+                )
             } else {
                 InstanceCrossEntityIndex::default()
             },
-            filter: f,
         };
-        let mut base = filter.clone();
-        let clauses = base.dollar_or.take().unwrap_or_default();
+        debug_assert!(
+            clauses
+                .iter()
+                .all(|c| !InstanceCrossEntityIndex::is_needed(c)),
+            "$or clauses cannot carry cross-entity fields"
+        );
         ProcessInstanceMatcher {
-            base: group(base),
+            base: ProcessInstanceFilterGroup { filter: base },
             or_clauses: clauses
                 .into_iter()
-                .map(|c| group(process_instance_or_clause(c)))
+                .map(|filter| ProcessInstanceFilterGroup { filter })
                 .collect(),
+            indexes,
         }
     }
 
@@ -23735,12 +23768,17 @@ impl ProcessInstanceMatcher {
         };
         state_ok
             && root_ok
-            && match_process_instance_group(inst, &self.base, state_policy, hierarchy)
+            && match_process_instance_group(
+                inst,
+                &self.base,
+                &self.indexes,
+                state_policy,
+                hierarchy,
+            )
             && (self.or_clauses.is_empty()
-                || self
-                    .or_clauses
-                    .iter()
-                    .any(|g| match_process_instance_group(inst, g, state_policy, hierarchy)))
+                || self.or_clauses.iter().any(|g| {
+                    match_process_instance_group(inst, g, &self.indexes, state_policy, hierarchy)
+                }))
     }
 }
 
@@ -23808,22 +23846,19 @@ fn process_instance_or_clause(
 }
 
 /// Indexes process-scoped (root) variables by instance, restricted to the
-/// variable names `filter` references; empty (no scan) when there is no
-/// variable filter.
+/// `requested` variable names; empty (no scan) when none are requested.
 fn root_variables_index(
-    filter: &Option<Vec<models::VariableValueFilterProperty>>,
+    requested: &std::collections::HashSet<String>,
     store: &readstore::ReadModel,
 ) -> std::collections::HashMap<u64, std::collections::HashMap<String, String>> {
     let mut idx: std::collections::HashMap<u64, std::collections::HashMap<String, String>> =
         std::collections::HashMap::new();
-    let Some(entries) = filter.as_ref().filter(|e| !e.is_empty()) else {
+    if requested.is_empty() {
         return idx;
-    };
-    let requested: std::collections::HashSet<&str> =
-        entries.iter().map(|entry| entry.name.as_str()).collect();
+    }
     for v in store.variables() {
         // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
-        if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+        if v.scope_key == v.instance_key && requested.contains(&v.name) {
             idx.entry(v.instance_key)
                 .or_default()
                 .insert(v.name, v.value);
@@ -23836,6 +23871,7 @@ fn root_variables_index(
 fn match_process_instance_group(
     inst: &readstore::ProcessInstanceRow,
     g: &ProcessInstanceFilterGroup,
+    idx: &ProcessInstanceIndexes,
     state_policy: ProcessInstanceStatePolicy,
     hierarchy: BatchHierarchyPolicy,
 ) -> bool {
@@ -23893,10 +23929,10 @@ fn match_process_instance_group(
         // against an absent value.
         && query::match_string_opt(&f.process_definition_name, None)
         && query::match_string_opt(&f.process_definition_version_tag, None)
-        && match_instance_variables(&f.variables, g.variables.get(&inst.key))
+        && match_instance_variables(&f.variables, idx.variables.get(&inst.key))
         && match_instance_tags(&f.tags, &inst.tags)
         // Inherited element / job / incident / batch-operation filters.
-        && match_instance_cross_entity_filters(f, inst.key, &g.cross)
+        && match_instance_cross_entity_filters(f, inst.key, &idx.cross)
 }
 
 /// Matches the `tags` filter against an instance's carried tags. Every
@@ -34751,6 +34787,19 @@ mod clustered_startup_tests {
         let def = ProcessBuilder::new("tiered")
             .start_event("s")
             .user_task("review")
+            // A same-named task-LOCAL shadow (`tier = "local-<tier>"`) via an
+            // input mapping, so `localVariables` vs `processInstanceVariables`
+            // filters are distinguishable per scope.
+            .with_io(
+                "review",
+                nanobpmn_engine_core::IoMapping {
+                    inputs: vec![nanobpmn_engine_core::Mapping {
+                        source: "=\"local-\" + tier".into(),
+                        target: "tier".into(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
             .end_event("e")
             .connect("s", "review")
             .connect("review", "e")
@@ -34788,7 +34837,16 @@ mod clustered_startup_tests {
                 .into_iter()
                 .filter(|v| v.name == "tier" && v.scope_key == v.instance_key)
                 .count();
-            if server.store.user_tasks().len() == tiers.len() && root_vars == tiers.len() {
+            let local_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key != v.instance_key)
+                .count();
+            if server.store.user_tasks().len() == tiers.len()
+                && root_vars == tiers.len()
+                && local_vars == tiers.len()
+            {
                 return instances;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -34934,12 +34992,35 @@ mod clustered_startup_tests {
         either.dollar_or = Some(vec![clause("a"), clause("c")]);
         assert_eq!(search(either).await, vec![instances[0], instances[2]]);
 
-        // `tier` is a root (process-instance) variable, not local to the task's
-        // element-instance scope, so a `localVariables` filter on it excludes
-        // every task instead of being ignored.
+        // The root `tier` value is not a task-local value (the local scope holds
+        // `"local-<tier>"`), so a `localVariables` filter on it excludes every
+        // task instead of being ignored.
         let mut local = models::UserTaskFilter::new();
         local.local_variables = tier_filter("a");
         assert!(search(local).await.is_empty());
+
+        // Positive case: each task carries a task-LOCAL `tier = "local-<tier>"`
+        // (input mapping) shadowing its root `tier`, so only the owning task
+        // matches — at top level and inside `$or`.
+        let mut local_top = models::UserTaskFilter::new();
+        local_top.local_variables = tier_filter("local-b");
+        assert_eq!(search(local_top).await, vec![instances[1]]);
+        // The root value is NOT visible through localVariables...
+        let mut local_root = models::UserTaskFilter::new();
+        local_root.local_variables = tier_filter("b");
+        assert!(search(local_root).await.is_empty());
+        // ...and the local value is NOT visible through processInstanceVariables.
+        let mut root_local = models::UserTaskFilter::new();
+        root_local.process_instance_variables = tier_filter("local-b");
+        assert!(search(root_local).await.is_empty());
+        let local_clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.local_variables = tier_filter(t);
+            c
+        };
+        let mut local_or = models::UserTaskFilter::new();
+        local_or.dollar_or = Some(vec![local_clause("zzz"), local_clause("local-b")]);
+        assert_eq!(search(local_or).await, vec![instances[1]]);
     }
 
     #[tokio::test]
