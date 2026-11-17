@@ -586,6 +586,16 @@ pub struct Job {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub has_failed_with_retries_left: bool,
+    /// Camunda 8 v2 `retryBackOff` (#933): the logical instant (ms) before
+    /// which this job — failed with retries left and a positive backoff — is
+    /// not activatable. Set from [`crate::Event::JobFailed`], cleared on the
+    /// next activation. `None` = no pending backoff (and for pre-field
+    /// records).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub retry_backoff_until: Option<u64>,
     /// The settlements this job has already consumed (#1181): each lease token
     /// (per-activation fence) that settled it, with the outcome. This is the
     /// replay fence for a **live** job — unlike the bounded
@@ -3145,6 +3155,7 @@ mod job_attribution_worker_tests {
             error_message: None,
             error_code: None,
             has_failed_with_retries_left: false,
+            retry_backoff_until: None,
             settled_tokens: Vec::new(),
             terminal_end: None,
         }

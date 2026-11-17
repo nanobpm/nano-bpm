@@ -280,6 +280,13 @@ pub enum Command {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        /// Camunda 8 v2 `retryBackOff` (ms, #933): with retries left, the job is
+        /// not re-activatable before `now + retry_back_off`. `0` (the default,
+        /// and any negative request clamped to it) means retryable immediately;
+        /// ignored when no retries remain (the job parks with an incident).
+        /// Skipped when `0`, so commands without a backoff stay byte-identical.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+        retry_back_off: u64,
         /// Authoritative terminal attribution resolved by the PROPOSING leader
         /// (#963). `None` = unstamped (a legacy/locally-applied command: the
         /// engine falls back to the live job). `Some(..)` is authoritative on
@@ -1263,12 +1270,26 @@ impl Command {
 
     /// Convenience constructor for a `FailJob`.
     pub fn fail_job(job_key: Key, retries: i32, error_message: impl Into<String>) -> Self {
+        Self::fail_job_with_backoff(job_key, retries, error_message, 0)
+    }
+
+    /// Convenience constructor for a `FailJob` carrying a Camunda 8 v2
+    /// `retryBackOff` in milliseconds (#933). A negative backoff is clamped to
+    /// `0` (retryable immediately), matching Zeebe, which only defers the job
+    /// when the backoff is strictly positive.
+    pub fn fail_job_with_backoff(
+        job_key: Key,
+        retries: i32,
+        error_message: impl Into<String>,
+        retry_back_off: i64,
+    ) -> Self {
         Command::FailJob {
             job_key,
             attribution: None,
             lease_token: None,
             retries,
             error_message: error_message.into(),
+            retry_back_off: u64::try_from(retry_back_off).unwrap_or(0),
         }
     }
 

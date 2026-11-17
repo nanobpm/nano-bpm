@@ -38,6 +38,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
                 },
@@ -89,6 +90,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
                 },
@@ -140,6 +142,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
                 },
@@ -184,6 +187,8 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.lease_token = lease_token.clone();
                 job.durable_activation |= *durable;
                 job.activated = true;
+                // An activation consumes any elapsed `retryBackOff` (#933).
+                job.retry_backoff_until = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -206,10 +211,13 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             retries,
             worker,
             error_message,
+            retry_backoff_until,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.retries = *retries;
+                // Only a fail with retries left can defer re-activation (#933).
+                job.retry_backoff_until = retry_backoff_until.filter(|_| *retries > 0);
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;

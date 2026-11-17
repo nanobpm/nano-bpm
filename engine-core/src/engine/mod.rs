@@ -3291,6 +3291,7 @@ impl Engine {
                 lease_token,
                 retries,
                 error_message,
+                retry_back_off,
             } => {
                 // Idempotent replay (#1181): the same fence re-asserting the
                 // outcome it already recorded is a no-op success on any replica.
@@ -3341,6 +3342,13 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let worker = Self::terminal_worker(job, attribution.as_ref());
                 let retries = retries.max(0);
+                // Camunda 8 v2 `retryBackOff` (#933): a positive backoff with
+                // retries left defers re-activation until `now + backoff`;
+                // zero/absent (negatives are clamped to zero at the boundary)
+                // is retryable immediately; with no retries left the job parks
+                // with an incident, so a backoff is meaningless and dropped.
+                let retry_backoff_until = (retries > 0 && retry_back_off > 0)
+                    .then(|| self.now.saturating_add(retry_back_off));
 
                 self.record_settlement(
                     &mut log,
@@ -3356,6 +3364,7 @@ impl Engine {
                         retries,
                         worker,
                         error_message: Some(limit_error_message(error_message.clone())),
+                        retry_backoff_until,
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -17119,7 +17128,8 @@ impl Engine {
             let Some(job) = self.state.jobs.get(&job_key) else {
                 continue;
             };
-            let activatable = job.state == state::JobState::Created
+            let activatable = (job.state == state::JobState::Created
+                && job_backoff_elapsed(job, now))
                 || (job.state == state::JobState::Activated
                     && !self.job_requires_durable_activation(job_key));
             if !activatable || (!options.with_lease && job.lease_token.is_some()) {
@@ -18712,9 +18722,16 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
         | state::JobState::Failed
         | state::JobState::Errored
         | state::JobState::Canceled => false,
-        state::JobState::Created => true,
+        // A failed-with-backoff job (#933) waits out its `retryBackOff`.
+        state::JobState::Created => job_backoff_elapsed(job, now),
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
+}
+
+/// Whether a job's Camunda 8 v2 `retryBackOff` (#933) has elapsed at `now`:
+/// true when no backoff is pending or its instant has been reached.
+fn job_backoff_elapsed(job: &state::Job, now: u64) -> bool {
+    job.retry_backoff_until.is_none_or(|until| until <= now)
 }
 
 #[cfg(test)]

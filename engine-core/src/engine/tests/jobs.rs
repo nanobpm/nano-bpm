@@ -3017,6 +3017,132 @@ fn fail_job_with_retries_left_records_the_error_message_on_the_event() {
     );
 }
 
+/// #933 — Camunda 8 v2 `retryBackOff`: a job failed with retries left and a
+/// positive backoff is not re-activatable before `now + retryBackOff`, then is.
+#[test]
+fn fail_job_retry_backoff_delays_reactivation_until_elapsed() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "flaky upstream", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: Some(6_000),
+                ..
+            }
+        )),
+        "JobFailed must carry the absolute backoff instant: {log:?}"
+    );
+    assert!(engine
+        .activate_jobs("payment", "w2", 10, 60_000, 1_000)
+        .is_empty());
+    assert!(engine
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    let jobs = engine.activate_jobs("payment", "w2", 10, 60_000, 6_000);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].key, job_key);
+    assert_eq!(engine.job(job_key).unwrap().retry_backoff_until, None);
+}
+
+/// #933 — zero, negative and absent backoffs are retryable immediately; a
+/// backoff with no retries left is dropped (the job parks with an incident).
+#[test]
+fn fail_job_retry_backoff_zero_negative_and_terminal_are_immediate_or_ignored() {
+    for backoff in [0_i64, -5_000] {
+        let mut engine = Engine::new();
+        let job_key = activated_payment_job(&mut engine);
+        let log = engine
+            .apply_command_at(
+                Command::fail_job_with_backoff(job_key, 1, "x", backoff),
+                1_000,
+            )
+            .unwrap();
+        assert!(log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: None,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine
+                .activate_jobs("payment", "w2", 10, 60_000, 1_000)
+                .len(),
+            1,
+            "backoff {backoff} must be retryable immediately"
+        );
+    }
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 0, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(log.iter().any(|e| matches!(
+        e,
+        Event::JobFailed {
+            retry_backoff_until: None,
+            ..
+        }
+    )));
+    assert_eq!(engine.job(job_key).unwrap().retry_backoff_until, None);
+}
+
+/// #933 — the backoff is carried on the event, so replay (a follower / a
+/// restart) reconstructs the same deferral deterministically.
+#[test]
+fn fail_job_retry_backoff_survives_replay() {
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::activate_jobs("payment", "w1", 10, 60_000, 0), 0)
+            .unwrap(),
+    );
+    let job_key = engine.state().jobs.keys().copied().next().unwrap();
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+                1_000,
+            )
+            .unwrap(),
+    );
+    let mut replayed = Engine::replay(journal);
+    assert_eq!(
+        replayed.job(job_key).unwrap().retry_backoff_until,
+        Some(6_000)
+    );
+    assert!(replayed
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    assert_eq!(
+        replayed
+            .activate_jobs("payment", "w2", 10, 60_000, 6_000)
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn throw_job_error_records_the_error_message_on_the_event() {
     let mut engine = Engine::new();
@@ -3276,6 +3402,7 @@ fn retries_left_flag_survives_replayed_out_of_order_terminal_and_retries_records
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     let terminal = dup
         .iter()
@@ -3335,6 +3462,7 @@ fn retries_left_flag_clears_on_every_terminal_transition_under_nonzero_timestamp
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     journal.push(terminal);
     let replayed = Engine::replay(journal);
@@ -3376,6 +3504,7 @@ fn retries_left_flag_clears_on_every_terminal_transition_under_nonzero_timestamp
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     journal.push(cancel);
     let replayed = Engine::replay(journal);
@@ -3420,6 +3549,7 @@ fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
         retries: 0,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     let engine = Engine::replay(journal);
     let job = &engine.state().jobs[&job_key];

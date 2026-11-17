@@ -625,6 +625,7 @@ impl TestEngine {
             lease_token,
             retries,
             error_message: message.to_string(),
+            retry_back_off: 0,
         })
         .map_err(|e| js_err(&format!("fail error: {e}")))?;
         to_json(&self.snapshot_value(None))
