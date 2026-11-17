@@ -2974,12 +2974,38 @@ impl State {
     /// indices are disjoint and kept in lockstep with `jobs`, so their combined
     /// size is the exact live backlog at `O(#job_types)`.
     pub fn live_job_count(&self) -> usize {
+        // Deferred (`retryBackOff`, #933) jobs are `Created` and live: they sit
+        // in `deferred_jobs` instead of `activatable_jobs`, never in both.
         self.activated_jobs.len()
+            + self.deferred_jobs.len()
             + self
                 .activatable_jobs
                 .values()
                 .map(|set| set.len())
                 .sum::<usize>()
+    }
+
+    /// Waiting (activatable) job counts per job type at logical instant `now`:
+    /// the ready index plus every deferred (`retryBackOff`, #933) job whose
+    /// deadline has been reached. Each job is counted once (a job is in exactly
+    /// one of the two indices). The single canonical waiting-count derivation
+    /// for monitors, so the deferred index can never be silently omitted.
+    pub fn waiting_job_counts(&self, now: u64) -> HashMap<String, u64> {
+        let mut counts: HashMap<String, u64> = self
+            .activatable_jobs
+            .iter()
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(job_type, set)| (job_type.clone(), set.len() as u64))
+            .collect();
+        for &(until, key) in &self.deferred_jobs {
+            if until > now {
+                break;
+            }
+            if let Some(job) = self.jobs.get(&key) {
+                *counts.entry(job.job_type.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     /// Removes `key` from all three job indices (the activatable set under
@@ -3179,6 +3205,23 @@ fn remove_deferred_job(state: &mut State, job_key: Key) {
 #[cfg(test)]
 mod deferred_index_tests {
     use super::{resync_job_index, JobState, State};
+
+    #[test]
+    fn deferred_jobs_are_live_and_waiting_once_due() {
+        let state = state_with_deferred_job(7, 1_000);
+        let job_type = state.jobs[&7].job_type.clone();
+        assert_eq!(state.live_job_count(), 1, "a deferred job is live");
+        assert_eq!(
+            state.waiting_job_counts(999).get(&job_type),
+            None,
+            "not waiting before its deadline"
+        );
+        assert_eq!(
+            state.waiting_job_counts(1_000).get(&job_type),
+            Some(&1),
+            "waiting (counted once) once its deadline is reached"
+        );
+    }
 
     fn state_with_deferred_job(key: u64, until: u64) -> State {
         let mut job = super::job_attribution_worker_tests::job_with_worker(None);

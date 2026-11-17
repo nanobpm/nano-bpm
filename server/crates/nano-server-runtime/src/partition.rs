@@ -615,13 +615,16 @@ impl Partitions {
     /// completion work, and awaited only off the hot path.
     pub async fn activatable_job_counts(&self) -> std::collections::HashMap<String, u64> {
         let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         for h in self.all() {
             let per_partition = h
                 .with_low(|j: &mut crate::journal::Journal| {
+                    // Includes elapsed `retryBackOff` deferred jobs (#933).
                     j.state()
-                        .activatable_jobs
-                        .iter()
-                        .map(|(job_type, jobs)| (job_type.clone(), jobs.len() as u64))
+                        .waiting_job_counts(now)
+                        .into_iter()
                         .collect::<Vec<_>>()
                 })
                 .await;

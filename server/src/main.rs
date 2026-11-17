@@ -47636,6 +47636,10 @@ mod clustered_startup_tests {
         fail.retries = Some(2);
         fail.retry_back_off = Some(backoff_ms as i64);
         let failed_at = std::time::Instant::now();
+        // Lower bound on the persisted deadline: the server stamps
+        // `retry_backoff_until` no earlier than this wall-clock instant plus
+        // the backoff, so a serve at/after the deadline is at/after this too.
+        let backoff_until = now_millis() + backoff_ms;
         let failed = server
             .fail_job_impl(
                 &models::FailJobPathParams {
@@ -47665,13 +47669,10 @@ mod clustered_startup_tests {
         let waited = failed_at.elapsed();
         assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
         assert_eq!(jobs[0].job_key.0, job_key.to_string());
-        // Compare the server clock against the PERSISTED deadline: the backoff
-        // began inside `apply_job_command_direct`, before `parked_at`, so the
-        // wait measured from `parked_at` may legitimately be shorter.
         let served_at = now_millis();
         assert!(
             served_at >= backoff_until,
-            "re-served at {served_at}, before the persisted deadline {backoff_until}"
+            "re-served at {served_at}, before the backoff deadline lower bound {backoff_until}"
         );
         assert!(
             waited < std::time::Duration::from_millis(9_000),
