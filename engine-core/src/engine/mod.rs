@@ -1799,13 +1799,22 @@ impl Engine {
     /// Whether reusing every duplicate resource's existing version (the
     /// all-duplicates no-op) keeps the bundle's submitted `deployment` bindings
     /// resolvable (#1193 review): for each `deployment`-bound form / linked
-    /// resource a bundle process declares, the bound id must already be
-    /// versioned under the deployment the process's reuse pins — at the
-    /// SUBMITTED content, not merely by id. Merely being submitted in the same
-    /// bundle is NOT sufficient — an unchanged submission is itself skipped, so
-    /// it would not join the process's deployment. A bundle that fails this is
-    /// re-versioned together instead of skipping, so the bindings become
-    /// satisfiable.
+    /// resource a bundle process declares AND the bundle itself carries, the
+    /// bound id must already be versioned under the deployment the process's
+    /// reuse pins — at the SUBMITTED content, not merely by id. Merely being
+    /// submitted in the same bundle is NOT sufficient — an unchanged submission
+    /// is itself skipped, so it would not join the process's deployment. A
+    /// bundle that fails this is re-versioned together instead of skipping, so
+    /// the bindings become satisfiable.
+    ///
+    /// Only dependencies the bundle CARRIES constrain reuse (#1193 review): a
+    /// binding whose form / linked resource is NOT in the submission cannot be
+    /// repaired by re-versioning this bundle — the process-only resubmission
+    /// contains nothing that would co-deploy the missing dependency, so forcing
+    /// a new version would mint one on EVERY identical resubmission and reset
+    /// timer starts without ever making the binding resolvable. Such a binding
+    /// is left to its runtime resolution (a resolvable incident), and the
+    /// unchanged redeployment stays the idempotent no-op Zeebe specifies.
     fn bundle_membership_satisfies_submitted_bindings(
         &self,
         bundle: &crate::command::DeploymentBundle,
@@ -1815,7 +1824,9 @@ impl Engine {
             // process declares — across both the executable graph
             // (`process.elements`) and the ad-hoc tool catalog
             // (`process.adhoc[*].tools`, whose pruned user-task tools still
-            // carry a form binding, #1193 review).
+            // carry a form binding, #1193 review) — INTERSECTED with the ids
+            // this bundle actually carries. A binding to a dependency outside
+            // the bundle is unrepairable here, so it does not force reuse.
             let mut bound_form_ids: Vec<&str> = Vec::new();
             let mut bound_resource_ids: Vec<&str> = Vec::new();
             for element in process.elements.values() {
@@ -1840,6 +1851,8 @@ impl Engine {
                     }
                 }
             }
+            bound_form_ids.retain(|id| bundle.forms.iter().any(|f| f.id == *id));
+            bound_resource_ids.retain(|id| bundle.resources.iter().any(|r| r.resource_id == *id));
 
             let deployment_key = self
                 .state
@@ -1854,23 +1867,18 @@ impl Engine {
                 // a duplicate (the definition compares equal) whose deployment
                 // membership is UNKNOWN — and key 0 never resolves a
                 // `deployment` binding. Treat unknown membership as unsatisfied
-                // whenever the process declares a deployment binding, so the
-                // bundle is re-versioned together under a real key (#1193
-                // review). With no deployment binding there is nothing to
-                // resolve, so reuse stays a no-op.
+                // whenever the bundle carries a repairable deployment binding,
+                // so the bundle is re-versioned together under a real key (#1193
+                // review). With no bundle-carried deployment binding there is
+                // nothing this redeployment can repair, so reuse stays a no-op.
                 return bound_form_ids.is_empty() && bound_resource_ids.is_empty();
             }
 
-            // Each bound id must be versioned under the pinned deployment at
-            // the SUBMITTED content. When the bundle carries the resource, the
-            // co-deployed version must match its schema/tag (form) or
-            // name/content/tag (generic resource) — otherwise reuse would bind
+            // Each bundle-carried bound id must be versioned under the pinned
+            // deployment at the SUBMITTED content — otherwise reuse would bind
             // the STALE co-deployed version (e.g. P+F(v1) deployed together, F
             // updated to v2 separately, then P+F(v2) resubmitted: an id-only
             // check finds v1 and binds it, not the submitted v2, #1193 review).
-            // When the bundle does NOT carry the resource the binding targets
-            // an externally deployed version, so id-presence under the pinned
-            // deployment is the available signal.
             bound_form_ids.iter().all(|form_id| {
                 self.form_versioned_under(
                     form_id,

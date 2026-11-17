@@ -1893,3 +1893,74 @@ fn an_external_form_reference_on_an_adhoc_tool_makes_its_binding_moot_for_member
     );
     assert_eq!(engine.state().processes["ahp-ext"].version, 1);
 }
+
+// zeebe-cells: element:UserTask
+#[test]
+fn a_process_only_redeploy_with_a_missing_deployment_bound_form_is_a_noop() {
+    // #1193 review (round 7): a process-only redeployment carries nothing that
+    // can repair a `deployment`-bound form the bundle omits, so the membership
+    // gate must not force a re-version for it. Forcing would mint a new version
+    // on EVERY identical resubmission and reset timer starts (submissions more
+    // frequent than the timer duration would keep it from ever firing) without
+    // ever making the binding resolvable. The missing form is left to its
+    // runtime resolution (a resolvable incident), and the unchanged redeploy
+    // stays the idempotent no-op Zeebe specifies.
+    let process = || form_binding_process(r#"bindingType="deployment""#);
+    let mut engine = Engine::new();
+    // The process deploys alone; the form is NEVER deployed.
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    assert_eq!(engine.state().processes["p"].version, 1);
+
+    // Repeated identical process-only resubmissions stay no-ops — no version
+    // churn, no timer reset — even though the deployment-bound form is missing.
+    for _ in 0..2 {
+        let redeploy = engine
+            .apply_command(Command::DeployProcess(process()))
+            .unwrap();
+        assert!(
+            !redeploy
+                .iter()
+                .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+            "an unrepairable missing form must not force a re-version: {redeploy:?}"
+        );
+    }
+    assert_eq!(
+        engine.state().processes["p"].version,
+        1,
+        "the process is never re-versioned by an unrepairable binding"
+    );
+}
+
+// zeebe-cells: element:ServiceTask
+#[test]
+fn a_process_only_redeploy_with_a_missing_deployment_bound_linked_resource_is_a_noop() {
+    // #1193 review (round 7): the same unrepairable-missing-dependency class
+    // through a `deployment`-bound linked resource. The process-only bundle
+    // omits the resource, so re-versioning cannot co-deploy it; the unchanged
+    // redeploy must stay a no-op rather than churn versions.
+    let process = || linked_resource_process();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    assert_eq!(engine.state().processes["lp"].version, 1);
+
+    for _ in 0..2 {
+        let redeploy = engine
+            .apply_command(Command::DeployProcess(process()))
+            .unwrap();
+        assert!(
+            !redeploy
+                .iter()
+                .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+            "an unrepairable missing linked resource must not force a re-version: {redeploy:?}"
+        );
+    }
+    assert_eq!(
+        engine.state().processes["lp"].version,
+        1,
+        "the process is never re-versioned by an unrepairable binding"
+    );
+}
