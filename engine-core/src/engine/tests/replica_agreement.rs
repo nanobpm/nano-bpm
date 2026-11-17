@@ -224,6 +224,7 @@ fn distinct_partitions_with_matching_clock_and_allocator_do_not_share_streams() 
     );
 }
 
+#[cfg(feature = "serde")]
 #[test]
 fn snapshot_recovery_continues_the_seed_sequence() {
     // Drive two same-timestamp completions, snapshot, restore, then complete a
@@ -304,4 +305,91 @@ fn feel_now_and_today_observe_the_command_timestamp() {
         created_a > 0 && created_a < 32,
         "both gateway branches taken"
     );
+}
+
+/// Live execution and every recovery path (event-only replay, snapshot plus
+/// journal tail) must seed the NEXT command identically (#1649 review): the
+/// seed is a pure function of the replicated command and replicated state, so
+/// there is no hidden counter for recovery to lose or a batch to skew.
+#[test]
+fn recovered_engines_seed_the_next_command_like_the_live_engine() {
+    let mut live = Engine::new();
+    let mut journal = Vec::new();
+    let def = crate::bpmn::parse_bpmn(SINK_XML).unwrap().remove(0);
+    journal.extend(
+        live.apply_command_at(Command::DeployProcess(def), T0)
+            .unwrap(),
+    );
+    for _ in 0..3 {
+        journal.extend(
+            live.apply_command_at(Command::create_instance("sink"), T0)
+                .unwrap(),
+        );
+    }
+    let jobs = activate_sink_jobs(&mut live);
+    assert_eq!(jobs.len(), 3);
+    journal.extend(
+        live.apply_command_at(Command::complete_job(jobs[0]), T0)
+            .unwrap(),
+    );
+
+    // Event-only replay of the whole journal (no `RaftEntryApplied` records).
+    let mut replayed = Engine::replay(journal.clone());
+    replayed.activate_jobs("a", "w", 64, 60_000, T0);
+
+    let expected = sink_outputs(
+        &live
+            .apply_command_at(Command::complete_job(jobs[1]), T0)
+            .unwrap(),
+    );
+    let got = sink_outputs(
+        &replayed
+            .apply_command_at(Command::complete_job(jobs[1]), T0)
+            .unwrap(),
+    );
+    assert_eq!(expected.len(), 1);
+    assert_eq!(got, expected, "event-only replay seeded differently");
+}
+
+/// Snapshot taken mid-journal plus the journal tail must also agree with the
+/// live engine on the next command's seed (#1649 review).
+#[cfg(feature = "serde")]
+#[test]
+fn snapshot_plus_tail_seeds_the_next_command_like_the_live_engine() {
+    let mut live = Engine::new();
+    let def = crate::bpmn::parse_bpmn(SINK_XML).unwrap().remove(0);
+    live.apply_command_at(Command::DeployProcess(def), T0)
+        .unwrap();
+    live.apply_command_at(Command::create_instance("sink"), T0)
+        .unwrap();
+    live.apply_command_at(Command::create_instance("sink"), T0)
+        .unwrap();
+    let snap = live.snapshot();
+    let mut tail = Vec::new();
+    tail.extend(
+        live.apply_command_at(Command::create_instance("sink"), T0)
+            .unwrap(),
+    );
+    let jobs = activate_sink_jobs(&mut live);
+    tail.extend(
+        live.apply_command_at(Command::complete_job(jobs[0]), T0)
+            .unwrap(),
+    );
+
+    let mut recovered = Engine::from_snapshot(snap);
+    recovered.apply_replayed_events(tail);
+    recovered.activate_jobs("a", "w", 64, 60_000, T0);
+
+    let expected = sink_outputs(
+        &live
+            .apply_command_at(Command::complete_job(jobs[1]), T0)
+            .unwrap(),
+    );
+    let got = sink_outputs(
+        &recovered
+            .apply_command_at(Command::complete_job(jobs[1]), T0)
+            .unwrap(),
+    );
+    assert_eq!(expected.len(), 1);
+    assert_eq!(got, expected, "snapshot+tail recovery seeded differently");
 }

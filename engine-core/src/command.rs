@@ -963,6 +963,174 @@ impl Command {
         (key != 0).then_some(key)
     }
 
+    /// A replica-deterministic fingerprint of this command's identity, mixed
+    /// into the FEEL random-stream seed (#1642 / #1649 review) so two commands
+    /// planned at the same timestamp and allocator position (neither minting a
+    /// key) still derive distinct `random number()` / `uuid()` streams.
+    ///
+    /// Pure function of the command — which is itself the replicated log
+    /// entry — so live apply, full replay, snapshot+tail recovery and every
+    /// follower compute the same value with no extra persisted state. Hashes
+    /// the [`Command::kind`] plus the command's target key(s) / names with a
+    /// fixed FNV-1a (never `RandomState`, never `HashMap` iteration order).
+    /// The match is exhaustive so a new variant must decide its identity.
+    pub fn seed_fingerprint(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.str(self.kind());
+        match self {
+            Command::DeployProcess(d) => h.str(&d.id),
+            Command::DeployResources(ds) => {
+                for d in ds {
+                    h.str(&d.id);
+                }
+            }
+            Command::DeployDecisionRequirements(_)
+            | Command::DeployForms(_)
+            | Command::DeployGenericResources(_)
+            | Command::EvaluateConditionalStartEvents { .. } => {}
+            Command::DeleteDecisionInstance {
+                instance_key,
+                decision_evaluation_key,
+            } => {
+                h.key(*instance_key);
+                h.key(*decision_evaluation_key);
+            }
+            Command::EvaluateDecision { decision, .. } => match decision {
+                DecisionReference::Id(id) => h.str(id),
+                DecisionReference::Key(key) => h.key(*key),
+            },
+            Command::CreateInstance {
+                process_id,
+                business_id,
+                ..
+            } => {
+                h.str(process_id);
+                h.opt(business_id.as_deref());
+            }
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. }
+            | Command::UpdateJobRetries { job_key, .. }
+            | Command::UpdateJobTimeout { job_key, .. }
+            | Command::UpdateJob { job_key, .. } => h.key(*job_key),
+            Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. }
+            | Command::CompleteUserTask { user_task_key, .. } => h.key(*user_task_key),
+            Command::ActivateJobs {
+                job_type,
+                worker,
+                now,
+                ..
+            } => {
+                h.str(job_type);
+                h.str(worker);
+                h.key(*now);
+            }
+            Command::ActivateJobsByKey {
+                job_keys,
+                worker,
+                now,
+                ..
+            } => {
+                for k in job_keys {
+                    h.key(*k);
+                }
+                h.str(worker);
+                h.key(*now);
+            }
+            Command::ExpireJobs { now } | Command::TriggerTimers { now } => h.key(*now),
+            Command::ExpireJobsByDurability { now, durable } => {
+                h.key(*now);
+                h.key(u64::from(*durable));
+            }
+            Command::ResolveIncident { incident_key } => h.key(*incident_key),
+            Command::SetVariables { scope_key, .. } => h.key(*scope_key),
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                business_id,
+                ..
+            } => {
+                h.str(message_name);
+                h.str(correlation_key);
+                h.opt(business_id.as_deref());
+            }
+            Command::BroadcastSignal { signal_name, .. } => h.str(signal_name),
+            Command::OpenMessageSubscription {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Command::CloseMessageSubscription {
+                subscription_key,
+                element_instance_key,
+                ..
+            } => {
+                h.key(*subscription_key);
+                h.key(*element_instance_key);
+            }
+            Command::CorrelateMessageSubscription {
+                subscription_key,
+                message_key,
+                element_instance_key,
+                ..
+            } => {
+                h.key(*subscription_key);
+                h.key(*message_key);
+                h.key(*element_instance_key);
+            }
+            Command::CancelInstance { instance_key }
+            | Command::SuspendInstance { instance_key }
+            | Command::ResumeInstance { instance_key }
+            | Command::ModifyInstance { instance_key, .. }
+            | Command::QuarantineOffheapOrphan { instance_key, .. }
+            | Command::QuarantineColdOrphan { instance_key } => h.key(*instance_key),
+            Command::MigrateInstance {
+                instance_key,
+                target_process_definition_key,
+                ..
+            } => {
+                h.key(*instance_key);
+                h.key(*target_process_definition_key);
+            }
+            Command::DispatchStartInstance {
+                process_id,
+                start_element_id,
+                business_id,
+                delivery_key,
+                ..
+            } => {
+                h.str(process_id);
+                h.str(start_element_id);
+                h.opt(business_id.as_deref());
+                h.key(*delivery_key);
+            }
+            Command::ActivateAdHocActivities {
+                ad_hoc_instance_key,
+                ..
+            } => h.key(*ad_hoc_instance_key),
+            Command::CreateAgentInstance {
+                element_instance_key,
+                job_key,
+                ..
+            } => {
+                h.key(*element_instance_key);
+                h.key(*job_key);
+            }
+            Command::UpdateAgentInstance {
+                agent_instance_key,
+                job_key,
+                ..
+            } => {
+                h.key(*agent_instance_key);
+                h.key(*job_key);
+            }
+            Command::CompleteAgentInstance { agent_instance_key } => h.key(*agent_instance_key),
+        }
+        h.0
+    }
+
     /// A stable, allocation-free `&'static str` discriminant for this command,
     /// used as a metrics label so per-command actor cost (wall time and
     /// allocated bytes) can be attributed by kind. Kept in lockstep with the
@@ -1555,6 +1723,39 @@ impl Command {
             terminate_instructions,
             terminate_element_ids: Vec::new(),
             move_instructions: Vec::new(),
+        }
+    }
+}
+
+/// Fixed FNV-1a 64 hasher for [`Command::seed_fingerprint`]: deterministic
+/// across processes and replicas (unlike `std`'s randomly-keyed `RandomState`).
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn bytes(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn str(&mut self, s: &str) {
+        // Length-prefixed so adjacent fields cannot alias ("ab","c" vs "a","bc").
+        self.key(s.len() as u64);
+        self.bytes(s.as_bytes());
+    }
+    fn key(&mut self, k: u64) {
+        self.bytes(&k.to_le_bytes());
+    }
+    fn opt(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => {
+                self.key(1);
+                self.str(s);
+            }
+            None => self.key(0),
         }
     }
 }

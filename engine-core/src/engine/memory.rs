@@ -24,7 +24,6 @@ impl Engine {
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
             raft_applied: self.raft_applied.clone(),
-            command_seq: self.command_seq,
         }
     }
 
@@ -79,9 +78,6 @@ impl Engine {
             num_partitions: snapshot.num_partitions.max(1),
             now: snapshot.now,
             feel_env: crate::feel::EvalEnv::default(),
-            command_seq: snapshot.command_seq,
-            last_seed_seq: snapshot.command_seq,
-            pending_seed_seq: snapshot.command_seq,
             start_dispatch_rr: snapshot.start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -175,7 +171,6 @@ impl Engine {
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
             raft_applied: self.raft_applied.clone(),
-            command_seq: self.command_seq,
         }
     }
 

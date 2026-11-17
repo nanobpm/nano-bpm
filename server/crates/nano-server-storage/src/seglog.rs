@@ -1920,7 +1920,6 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
             now: snap.now,
             start_dispatch_rr: snap.start_dispatch_rr,
             raft_applied: snap.raft_applied,
-            command_seq: snap.command_seq,
         },
         resident,
     };
@@ -2519,7 +2518,6 @@ fn decompose_multi_entries(
                         now: snap.now,
                         start_dispatch_rr: snap.start_dispatch_rr,
                         raft_applied: snap.raft_applied,
-                        command_seq: snap.command_seq,
                     },
                     resident,
                 },
