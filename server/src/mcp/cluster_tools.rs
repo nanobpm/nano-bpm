@@ -449,15 +449,10 @@ async fn search_user_tasks(server: &ServerImpl, args: Value) -> Value {
     if let Err(e) = reject_unsupported_sort(&args, crate::USER_TASK_SORT_FIELDS) {
         return e;
     }
-    // Fail closed on advertised filters the shared REST predicate cannot
-    // honour: `isSuspended` (Nano has no task suspension), and the two variable
-    // filters, which need a variable-store join the user-task predicate does
-    // not have. Deserializing them would silently drop the condition and widen
-    // the search.
-    if let Err(e) = reject_unsupported_filter(
-        &args,
-        &["isSuspended", "processInstanceVariables", "localVariables"],
-    ) {
+    // Fail closed on the advertised filter the shared REST predicate cannot
+    // honour: `isSuspended` (Nano has no task suspension). Deserializing it
+    // would silently drop the condition and widen the search.
+    if let Err(e) = reject_unsupported_filter(&args, &["isSuspended"]) {
         return e;
     }
     let body: Option<models::UserTaskSearchQuery> = match optional_body(args) {

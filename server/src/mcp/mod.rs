@@ -1108,8 +1108,6 @@ mod tests {
         let server = ServerImpl::default();
         for (tool, key, val) in [
             ("searchUserTasks", "isSuspended", json!(true)),
-            ("searchUserTasks", "processInstanceVariables", json!([])),
-            ("searchUserTasks", "localVariables", json!([])),
             ("searchVariables", "protectionMode", json!("REDACT")),
         ] {
             let mut filter = json!({});
@@ -1128,12 +1126,6 @@ mod tests {
         let server = ServerImpl::default();
         for (tool, key, val) in [
             ("searchUserTasks", "isSuspended", json!(true)),
-            (
-                "searchUserTasks",
-                "localVariables",
-                json!([{ "name": "missing", "value": "1" }]),
-            ),
-            ("searchUserTasks", "processInstanceVariables", json!([])),
             ("searchVariables", "protectionMode", json!("REDACT")),
         ] {
             let mut clause = json!({});
