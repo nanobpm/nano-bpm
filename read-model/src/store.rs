@@ -15784,6 +15784,7 @@ mod agent_projection_tests {
             resource_id: id.to_string(),
             resource_name: id.to_string(),
             content: String::new(),
+            version_tag: None,
         };
         let store = store_with(&[
             deployed(10, 11, "a.txt"),
