@@ -14532,8 +14532,18 @@ impl ServerImpl {
             let Some(handle) = self.engine.try_for_create() else {
                 return Err((500, "this node hosts no engine partition".to_string()));
             };
+            // Creation intake (e.g. conditional-start evaluation, #932) yields
+            // to the drain path on the engine mailbox, mirroring the Raft
+            // batcher's lane choice from the same predicate.
+            let priority = if crate::raft::is_creation_intake(&command) {
+                crate::deepthi::Priority::Low
+            } else {
+                crate::deepthi::Priority::High
+            };
             let (events, commit) = handle
-                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .with_priority(priority, move |journal| {
+                    journal.apply_command_at(command, now_millis())
+                })
                 .await
                 .map_err(|error| crate::raft::engine_error_status(&error))?;
             commit.wait().await;

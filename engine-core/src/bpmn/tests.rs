@@ -3261,6 +3261,11 @@ fn should_reject_malformed_root_level_conditional_start_events() {
              <bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>",
         ),
         (
+            "mixed with a signal definition and an empty condition",
+            "<bpmn:signalEventDefinition signalRef=\"sig\" />\
+             <bpmn:conditionalEventDefinition />",
+        ),
+        (
             "mixed with a timer definition",
             "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
              <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>",
@@ -3270,6 +3275,7 @@ fn should_reject_malformed_root_level_conditional_start_events() {
         let xml = format!(
             r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
                 <bpmn:message id="m" name="m" />
+                <bpmn:signal id="sig" name="sig" />
                 <bpmn:process id="p">
                   <bpmn:startEvent id="cs">{defs}</bpmn:startEvent>
                   <bpmn:endEvent id="e" />
@@ -3277,15 +3283,26 @@ fn should_reject_malformed_root_level_conditional_start_events() {
                 </bpmn:process>
               </bpmn:definitions>"#
         );
-
-        // when
-        let result = parse_bpmn(&xml);
-
-        // then
-        assert!(
-            matches!(result, Err(ParseError::InvalidProcess { .. })),
-            "{label}: expected InvalidProcess, got {result:?}"
+        // The same shape alongside a separate none start: surplus-start
+        // demotion must not reclassify the malformed start (e.g. as a surplus
+        // signal start) before the conditional-start validation sees it.
+        let xml_with_none_start = xml.replace(
+            r#"<bpmn:endEvent id="e" />"#,
+            r#"<bpmn:startEvent id="a_none" />
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f1" sourceRef="a_none" targetRef="e" />"#,
         );
+
+        for (variant, doc) in [("alone", &xml), ("with a none start", &xml_with_none_start)] {
+            // when
+            let result = parse_bpmn(doc);
+
+            // then
+            assert!(
+                matches!(result, Err(ParseError::InvalidProcess { .. })),
+                "{label} ({variant}): expected InvalidProcess, got {result:?}"
+            );
+        }
     }
 }
 

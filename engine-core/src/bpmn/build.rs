@@ -1307,6 +1307,7 @@ impl ProcessAcc {
                     && n.timer_repeating.is_none()
                     && n.signal_ref.is_none()
                     && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // A signal start carries a signalRef but no message/timer definition.
             let is_signal_start = |n: &NodeAcc| {
@@ -1314,6 +1315,7 @@ impl ProcessAcc {
                     && n.message_ref.is_none()
                     && n.timer_repeating.is_none()
                     && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // Keep a single none/signal start as the process-entry `StartEvent`
             // (prefer a none start); any additional *signal* start is surplus.

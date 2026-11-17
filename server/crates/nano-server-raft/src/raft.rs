@@ -2697,12 +2697,18 @@ struct Submission {
 ///
 /// It matches the engine actor's High/Low mailbox (`deepthi::Priority`) one layer
 /// down, so the two agree end to end.
-fn is_creation_intake(command: &Command) -> bool {
+///
+/// `EvaluateConditionalStartEvents` (#932) is creation intake too: every
+/// instance it starts is fresh demand, so it must yield to the drain path
+/// exactly like `CreateInstance`. The non-Raft path derives its engine-mailbox
+/// priority from this same predicate (`apply_create_command`).
+pub fn is_creation_intake(command: &Command) -> bool {
     matches!(
         command,
         Command::CreateInstance { .. }
             | Command::ActivateJobs { .. }
             | Command::DispatchStartInstance { .. }
+            | Command::EvaluateConditionalStartEvents { .. }
     )
 }
 
@@ -5042,6 +5048,13 @@ mod tests {
         assert!(is_creation_intake(&Command::activate_jobs(
             "t", "w", 1, 1, 0
         )));
+        // #932: conditional-start evaluation creates instances — creation intake.
+        assert!(is_creation_intake(
+            &Command::EvaluateConditionalStartEvents {
+                variables: HashMap::new(),
+                process_definition_key: None,
+            }
+        ));
 
         // The drain / progress path (finalization, cancellation, maintenance)
         // takes the high-priority lane; its volume is bounded by low-lane
