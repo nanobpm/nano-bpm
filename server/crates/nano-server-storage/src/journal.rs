@@ -484,6 +484,14 @@ pub struct Journal {
 /// unreadable rows (#1388).
 const ACTIVATION_EXTRA_READS: usize = 8;
 
+/// Maximum bounded read passes one activation poll may spend paging past
+/// deferred-only cold instances (#933). Caps a single poll's cold restores at
+/// `ACTIVATION_MAX_PASSES * (max_jobs + ACTIVATION_EXTRA_READS)`, so a large
+/// deferred-only cold backlog cannot be restored wholesale by one empty poll.
+/// Restored rows become resident (leave the cold index), so the next poll
+/// continues past them — ready work beyond the cap is reached by later polls.
+const ACTIVATION_MAX_PASSES: usize = 4;
+
 /// Outcome of [`Journal::rehydrate_cold`] (#1388). `Unreadable` is the
 /// transient case a command must fail closed on rather than run against state
 /// missing the instance.
@@ -3515,9 +3523,6 @@ impl Journal {
             return Vec::new(); // see `activate_jobs_with_fetch` (#1405)
         }
         self.rehydrate_activation_candidates(job_type, max_jobs);
-        // Promote any deferred (`retryBackOff`) jobs whose deadline has passed,
-        // so selection sees newly-eligible work (#933).
-        self.engine.promote_due_deferred_jobs(now);
         self.engine
             .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
     }
@@ -3588,9 +3593,12 @@ impl Journal {
         // deferred by a `retryBackOff` do not count toward `max_jobs`, so a pass
         // can exhaust its read budget on deferred-only rows while a ready row
         // sits just beyond it. Keep paging (each pass bounded by `budget`) until
-        // the limit is filled or every cold candidate has been visited once —
-        // never park a long-poll while ready work remains cold.
+        // the limit is filled, every cold candidate has been visited once, or
+        // the overall read budget (`ACTIVATION_MAX_PASSES` passes) is spent —
+        // so one poll can neither hide reachable ready work nor restore an
+        // unbounded deferred-only backlog.
         let mut seen: HashSet<Key> = HashSet::new();
+        let total_budget = budget.saturating_mul(ACTIVATION_MAX_PASSES);
         'passes: while restored < max_jobs {
             let Some(cold) = self.cold.as_ref() else {
                 return;
@@ -3605,7 +3613,7 @@ impl Journal {
                 break;
             }
             for key in candidates {
-                if restored >= max_jobs {
+                if restored >= max_jobs || seen.len() >= total_budget {
                     break 'passes;
                 }
                 seen.insert(key);
@@ -5713,8 +5721,45 @@ mod tests {
         assert_eq!(journal.cold_count(), deferred_count + 1);
 
         let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 2_000);
-        assert_eq!(jobs.len(), 1, "the ready cold job beyond the budget is served");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the ready cold job beyond the budget is served"
+        );
         assert_eq!(jobs[0].instance_key, ready_inst);
+    }
+
+    /// #933 (review) — a deferred-only cold backlog far larger than the read
+    /// budget must not be restored wholesale by one empty poll: the poll's
+    /// cold reads are capped at `ACTIVATION_MAX_PASSES` bounded passes.
+    #[test]
+    fn deferred_only_cold_backlog_restores_at_most_the_overall_read_budget() {
+        let mut journal = cold_journal();
+        let budget = (1 + ACTIVATION_EXTRA_READS) * ACTIVATION_MAX_PASSES;
+        let deferred_count = budget * 3;
+        for _ in 0..deferred_count {
+            deploy_and_create(&mut journal);
+        }
+        let jobs = journal.activate_jobs("demo-work", "w", deferred_count, 1_000, 0);
+        assert_eq!(jobs.len(), deferred_count);
+        for job in &jobs {
+            let _ = journal
+                .apply_command_at(
+                    Command::fail_job_with_backoff(job.key, 2, "flaky", 60_000),
+                    1_000,
+                )
+                .unwrap();
+        }
+        journal.force_cold_spill_all();
+        assert_eq!(journal.cold_count(), deferred_count);
+
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 2_000);
+        assert!(jobs.is_empty());
+        assert_eq!(
+            journal.cold_count(),
+            deferred_count - budget,
+            "one poll restores at most the overall read budget"
+        );
     }
 
     // Copilot on #1418: modification/migration/cancel of a parent must page in

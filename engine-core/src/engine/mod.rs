@@ -3061,10 +3061,6 @@ impl Engine {
                 fetch_variables,
                 with_lease,
             } => {
-                // Promote any deferred (`retryBackOff`) jobs whose deadline has
-                // passed before selecting, so a poll serves newly-eligible work
-                // without scanning the still-deferred prefix (#933).
-                self.promote_due_deferred_jobs(now);
                 let keys = self.select_activatable_job_keys(&job_type, max_jobs, now, with_lease);
                 self.apply_activation_plan(
                     &mut log,

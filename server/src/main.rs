@@ -47665,9 +47665,13 @@ mod clustered_startup_tests {
         let waited = failed_at.elapsed();
         assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
         assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        // Compare the server clock against the PERSISTED deadline: the backoff
+        // began inside `apply_job_command_direct`, before `parked_at`, so the
+        // wait measured from `parked_at` may legitimately be shorter.
+        let served_at = now_millis();
         assert!(
-            waited >= std::time::Duration::from_millis(backoff_ms),
-            "re-served after {waited:?}, before the {backoff_ms}ms backoff"
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the persisted deadline {backoff_until}"
         );
         assert!(
             waited < std::time::Duration::from_millis(9_000),
@@ -47752,13 +47756,16 @@ mod clustered_startup_tests {
             )
             .await
             .expect("the fail applies");
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::JobFailed {
-                retry_backoff_until: Some(_),
-                ..
-            }
-        )));
+        let backoff_until = events
+            .iter()
+            .find_map(|e| match e {
+                Event::JobFailed {
+                    retry_backoff_until: Some(until),
+                    ..
+                } => Some(*until),
+                _ => None,
+            })
+            .expect("the fail persists a backoff deadline");
 
         let parked_at = std::time::Instant::now();
         // Boot recovery: re-arm the wake from the replayed deadline.
@@ -47774,9 +47781,13 @@ mod clustered_startup_tests {
         let waited = parked_at.elapsed();
         assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
         assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        // Compare the server clock against the PERSISTED deadline: the backoff
+        // began inside `apply_job_command_direct`, before `parked_at`, so the
+        // wait measured from `parked_at` may legitimately be shorter.
+        let served_at = now_millis();
         assert!(
-            waited >= std::time::Duration::from_millis(backoff_ms),
-            "re-served after {waited:?}, before the {backoff_ms}ms backoff"
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the persisted deadline {backoff_until}"
         );
         assert!(
             waited < std::time::Duration::from_millis(9_000),

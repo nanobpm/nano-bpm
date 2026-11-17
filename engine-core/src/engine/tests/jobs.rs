@@ -3719,3 +3719,48 @@ fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
     );
     assert_eq!(job.error_code.as_deref(), Some("E42"));
 }
+
+/// #933 — the side-effect-free selector serves a backed-off job once its
+/// deadline is reached (select → `ActivateJobsByKey` planning flow), and a poll
+/// that does not activate it never clears its durable `retry_backoff_until`
+/// (live state must not diverge from replay).
+#[test]
+fn deferred_job_is_selectable_at_expiry_and_poll_keeps_durable_deadline() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(engine
+        .select_activatable_job_keys("payment", 10, 5_999, false)
+        .is_empty());
+    assert_eq!(
+        engine.select_activatable_job_keys("payment", 10, 6_000, false),
+        vec![job_key]
+    );
+    // A poll for another type after the deadline must not touch this job.
+    assert!(engine
+        .activate_jobs("other", "w", 10, 60_000, 7_000)
+        .is_empty());
+    assert_eq!(
+        engine.state().jobs[&job_key].retry_backoff_until,
+        Some(6_000)
+    );
+    // Nor does a selection: it is side-effect free.
+    let _ = engine.select_activatable_job_keys("payment", 10, 7_000, false);
+    assert_eq!(
+        engine.state().jobs[&job_key].retry_backoff_until,
+        Some(6_000)
+    );
+    // The real activation clears it via `JobActivated`.
+    assert_eq!(
+        engine
+            .activate_jobs("payment", "w", 10, 60_000, 7_000)
+            .len(),
+        1
+    );
+    assert!(engine.state().deferred_jobs.is_empty());
+}

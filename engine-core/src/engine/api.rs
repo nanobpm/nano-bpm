@@ -206,46 +206,6 @@ impl Engine {
         })
     }
 
-    /// Promotes every deferred (`retryBackOff`, #933) job whose eligibility
-    /// deadline has been reached at `now` back into the activatable index, so a
-    /// worker poll serves it. Deferred jobs are held OUT of the ready set
-    /// (indexed by deadline in [`State::deferred_jobs`]), so a poll never scans
-    /// the delayed prefix: it promotes only the due prefix (O(due)) and then
-    /// walks the ready set. Returns the number promoted. Mutating but
-    /// event-free: promotion only moves a job between two derived in-memory
-    /// indices — the job's `retry_backoff_until` (its durable eligibility) is
-    /// unchanged, and the next activation clears it via `JobActivated` as before.
-    pub fn promote_due_deferred_jobs(&mut self, now: u64) -> usize {
-        let due: Vec<Key> = {
-            let mut due = Vec::new();
-            for &(until, key) in self.state.deferred_jobs.iter() {
-                if until > now {
-                    break; // ordered by deadline: the rest are not yet due
-                }
-                due.push(key);
-            }
-            due
-        };
-        let mut promoted = 0usize;
-        for key in due {
-            // Re-sync moves the job from the deferred index into the activatable
-            // set. Its backoff has elapsed, so it must be activatable: clear the
-            // volatile deferral marker so `resync_job_index` classifies it ready.
-            let eligible = self.state.jobs.get(&key).is_some_and(|job| {
-                job.state == state::JobState::Created
-                    && job.retry_backoff_until.is_some_and(|until| until <= now)
-            });
-            if eligible {
-                if let Some(job) = self.state.jobs.get_mut(&key) {
-                    job.retry_backoff_until = None;
-                }
-                state::resync_job_index(&mut self.state, key);
-                promoted += 1;
-            }
-        }
-        promoted
-    }
-
     /// Side-effect-free activation planning in priority-descending, key-ascending
     /// order. The host must serialize selection through replicated plan commit
     /// against every local activation; followers must apply the planned keys,
@@ -257,22 +217,48 @@ impl Engine {
         now: u64,
         with_lease: bool,
     ) -> Vec<Key> {
-        self.state
+        let eligible = |key: &Key| {
+            self.state.jobs.get(key).is_some_and(|job| {
+                job.job_type == job_type
+                    && super::job_activatable(job, now)
+                    && (with_lease || job.lease_token.is_none())
+                    // A suspended instance makes no progress: its jobs are
+                    // not activatable until it is resumed (Camunda parity).
+                    && !self.instance_is_suspended(job.instance_key)
+            })
+        };
+        // Ready set: already in activation order, so its first `max_jobs`
+        // eligible entries are the only ones that can win.
+        let mut candidates: Vec<(i64, Key)> = self
+            .state
             .activatable_jobs
             .get(job_type)
             .into_iter()
-            .flat_map(|set| set.iter())
-            .map(|&(_, key)| key)
-            .filter(|key| {
-                self.state.jobs.get(key).is_some_and(|job| {
-                    super::job_activatable(job, now)
-                        && (with_lease || job.lease_token.is_none())
-                        // A suspended instance makes no progress: its jobs are
-                        // not activatable until it is resumed (Camunda parity).
-                        && !self.instance_is_suspended(job.instance_key)
-                })
-            })
+            .flat_map(|set| set.iter().copied())
+            .filter(|(_, key)| eligible(key))
             .take(max_jobs)
+            .collect();
+        // Deferred (`retryBackOff`, #933) jobs whose deadline has been reached
+        // are activatable too. They stay in the deadline-ordered deferred index
+        // (their durable `retry_backoff_until` is untouched until
+        // `JobActivated` clears it, so live state never diverges from replay);
+        // only the due prefix is walked, never the still-deferred tail.
+        for &(until, key) in &self.state.deferred_jobs {
+            if until > now {
+                break;
+            }
+            if eligible(&key) {
+                if let Some(job) = self.state.jobs.get(&key) {
+                    candidates.push(crate::state::activation_order(job.priority, key));
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .into_iter()
+            .take(max_jobs)
+            .map(|(_, key)| key)
             .collect()
     }
 
