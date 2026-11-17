@@ -1629,6 +1629,18 @@ impl Journal {
     /// this node's partitions. Returns a [`Commit`] the caller awaits before
     /// acknowledging the install.
     pub fn install_deployment_durable(&mut self, events: &[Event]) -> Commit {
+        self.install_deployment_durable_ref(events, None)
+    }
+
+    /// [`install_deployment_durable`](Self::install_deployment_durable) for a
+    /// deployment broadcast carrying the deploying request's
+    /// `operationReference` (#1556 step 4, #1600): the durable copies of the
+    /// deployment records are journaled as record envelopes stamped with it.
+    pub fn install_deployment_durable_ref(
+        &mut self,
+        events: &[Event],
+        operation_reference: Option<i64>,
+    ) -> Commit {
         self.engine.install_deployment(events);
         let deployed: Vec<Event> = events
             .iter()
@@ -1644,7 +1656,7 @@ impl Journal {
             })
             .cloned()
             .collect();
-        self.persist(&Arc::new(deployed))
+        self.persist_with(&Arc::new(deployed), operation_reference)
     }
 
     /// Wires the disk-backed variable spill. `budget` is the maximum number of
