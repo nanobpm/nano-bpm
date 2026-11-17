@@ -1593,3 +1593,206 @@ fn a_forced_redeploy_preserves_the_submitted_xml_verbatim() {
         "the retained XML is never rebound to latest: {persisted}"
     );
 }
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_a_legacy_restored_process_with_a_deployment_binding() {
+    // #1193 review (round 5): a process restored from a pre-#1193 snapshot has
+    // `deployment_key == 0` (unknown membership), yet `is_duplicate_process`
+    // still matches it (the definition compares equal), so the membership gate
+    // runs. Key 0 never resolves a `deployment` binding — treating it as
+    // satisfied would skip the process and its form, leaving every new instance
+    // to incident. Unknown membership with a deployment binding must force the
+    // bundle to re-version together under a real key.
+    let process = || form_binding_process(r#"bindingType="deployment""#);
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+    // Simulate a legacy-snapshot restore: the process's deployment membership
+    // is unknown (key 0), as a pre-#1193 record deserializes.
+    engine
+        .state_mut()
+        .processes
+        .get_mut("p")
+        .unwrap()
+        .deployment_key = 0;
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "unknown (key-0) membership with a deployment binding re-versions: {together:?}"
+    );
+    let key = sole_deployment_key(&together);
+    assert_eq!(engine.state().processes["p"].deployment_key, key);
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(created_form_key(&created).is_some());
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_when_an_adhoc_tool_form_binding_would_dangle() {
+    // #1193 review (round 5): the membership scan must cover the ad-hoc tool
+    // catalog (`process.adhoc[*].tools`), whose pruned user-task tools still
+    // carry a form binding — not only `process.elements`. A process whose ONLY
+    // deployment-bound form is on an ad-hoc tool, deployed separately from the
+    // form and resubmitted unchanged together, must re-version together rather
+    // than skip and leave tool activation raising a missing-form incident.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="ahp">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:userTask id="Tool">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+                <zeebe:formDefinition formId="review-form" bindingType="deployment" />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="b" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let process = || crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let form = || tagged_form("review-form", None);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![form()]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![form()],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "an ad-hoc tool's deployment-bound form forces re-versioning: {together:?}"
+    );
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::FormDeployed { version: 2, .. })),
+        "the form re-versions into the shared deployment: {together:?}"
+    );
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn an_all_duplicate_bundle_reversions_when_the_co_deployed_form_is_a_stale_version() {
+    // #1193 review (round 5): the membership check must compare the co-deployed
+    // version's CONTENT, not just its id. Deploy P+F(v1) together, update F to
+    // v2 SEPARATELY, then resubmit unchanged P+F(v2): an id-only check finds
+    // F(v1) under the process's deployment and skips the bundle, binding new
+    // tasks to v1 instead of the submitted v2. The content mismatch must force
+    // a shared redeployment.
+    let process = || form_binding_process(r#"bindingType="deployment""#);
+    let mut engine = Engine::new();
+    // P + F(v1) together.
+    engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![tagged_form("review-form", Some("v1"))],
+            ..Default::default()
+        }))
+        .unwrap();
+    // F updated to v2 separately (new deployment).
+    engine
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v2"),
+        )]))
+        .unwrap();
+
+    // Resubmit unchanged P + F(v2): the process's pinned deployment holds only
+    // v1, so reuse would bind v1 — the submitted v2 must force a re-version.
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            forms: vec![tagged_form("review-form", Some("v2"))],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "a stale co-deployed form forces re-versioning to the submitted version: {together:?}"
+    );
+    let v2_key = form_key_of(&together, "review-form");
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(
+        created_form_key(&created),
+        Some(v2_key),
+        "the new task binds the submitted v2, not the stale v1"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:ServiceTask
+#[test]
+fn an_all_duplicate_bundle_reversions_when_the_co_deployed_resource_is_stale() {
+    // #1193 review (round 5): the same content-mismatch defect class through a
+    // `deployment`-bound linked resource. P+R(v1) together, R updated to v2
+    // separately, then unchanged P+R(v2) resubmitted: an id-only check finds
+    // R(v1) and skips, so the worker's `linkedResources` resolves the stale v1.
+    let process = || linked_resource_process();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            resources: vec![policy("# v1")],
+            ..Default::default()
+        }))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployGenericResources(vec![policy("# v2")]))
+        .unwrap();
+
+    let together = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![process()],
+            resources: vec![policy("# v2")],
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "a stale co-deployed resource forces re-versioning: {together:?}"
+    );
+    assert!(
+        together
+            .iter()
+            .any(|e| matches!(e, Event::GenericResourceDeployed { version: 3, .. })),
+        "the submitted v2 resource is re-versioned into the shared deployment: {together:?}"
+    );
+}

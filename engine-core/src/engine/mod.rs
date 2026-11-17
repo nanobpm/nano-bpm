@@ -1800,16 +1800,43 @@ impl Engine {
     /// all-duplicates no-op) keeps the bundle's submitted `deployment` bindings
     /// resolvable (#1193 review): for each `deployment`-bound form / linked
     /// resource a bundle process declares, the bound id must already be
-    /// versioned under the deployment the process's reuse pins. Merely being
-    /// submitted in the same bundle is NOT sufficient — an unchanged
-    /// submission is itself skipped, so it would not join the process's
-    /// deployment. A bundle that fails this is re-versioned together instead
-    /// of skipping, so the bindings become satisfiable.
+    /// versioned under the deployment the process's reuse pins — at the
+    /// SUBMITTED content, not merely by id. Merely being submitted in the same
+    /// bundle is NOT sufficient — an unchanged submission is itself skipped, so
+    /// it would not join the process's deployment. A bundle that fails this is
+    /// re-versioned together instead of skipping, so the bindings become
+    /// satisfiable.
     fn bundle_membership_satisfies_submitted_bindings(
         &self,
         bundle: &crate::command::DeploymentBundle,
     ) -> bool {
         bundle.processes.iter().all(|process| {
+            // Every `deployment`-bound form id and linked resource id the
+            // process declares — across both the executable graph
+            // (`process.elements`) and the ad-hoc tool catalog
+            // (`process.adhoc[*].tools`, whose pruned user-task tools still
+            // carry a form binding, #1193 review).
+            let mut bound_form_ids: Vec<&str> = Vec::new();
+            let mut bound_resource_ids: Vec<&str> = Vec::new();
+            for element in process.elements.values() {
+                Self::collect_deployment_bindings(
+                    &element.kind,
+                    &mut bound_form_ids,
+                    &mut bound_resource_ids,
+                );
+            }
+            for adhoc in &process.adhoc {
+                for tool in &adhoc.tools {
+                    if let crate::model::AdHocToolKind::UserTask(props) = &tool.kind {
+                        if props.form_binding_type == crate::model::BindingType::Deployment {
+                            if let Some(form_id) = props.form_id.as_deref() {
+                                bound_form_ids.push(form_id);
+                            }
+                        }
+                    }
+                }
+            }
+
             let deployment_key = self
                 .state
                 .processes
@@ -1817,50 +1844,109 @@ impl Engine {
                 .map(|existing| existing.deployment_key)
                 .unwrap_or(0);
             if deployment_key == 0 {
-                // The process itself is not a reusable duplicate (it is new, or
-                // predates deployment tracking): the bundle is not an
-                // all-duplicates reuse, so this gate never runs for it.
-                return true;
+                // The process predates deployment tracking (a legacy-snapshot
+                // restore) or is new. A NEW process is not a reusable duplicate,
+                // so this gate is moot for it; but a legacy-restored process IS
+                // a duplicate (the definition compares equal) whose deployment
+                // membership is UNKNOWN — and key 0 never resolves a
+                // `deployment` binding. Treat unknown membership as unsatisfied
+                // whenever the process declares a deployment binding, so the
+                // bundle is re-versioned together under a real key (#1193
+                // review). With no deployment binding there is nothing to
+                // resolve, so reuse stays a no-op.
+                return bound_form_ids.is_empty() && bound_resource_ids.is_empty();
             }
-            process.elements.values().all(|element| {
-                let form_ok = match &element.kind {
-                    ElementKind::UserTask(props)
-                        if props.form_binding_type == crate::model::BindingType::Deployment =>
-                    {
-                        props.form_id.as_deref().is_none_or(|form_id| {
-                            self.form_versioned_under(form_id, deployment_key)
-                        })
-                    }
-                    _ => true,
-                };
-                let links_ok = match &element.kind {
-                    ElementKind::ServiceTask {
-                        linked_resources, ..
-                    } => linked_resources.iter().all(|link| {
-                        link.binding_type != crate::model::BindingType::Deployment
-                            || self.resource_versioned_under(&link.resource_id, deployment_key)
-                    }),
-                    _ => true,
-                };
-                form_ok && links_ok
+
+            // Each bound id must be versioned under the pinned deployment at
+            // the SUBMITTED content. When the bundle carries the resource, the
+            // co-deployed version must match its schema/tag (form) or
+            // name/content/tag (generic resource) — otherwise reuse would bind
+            // the STALE co-deployed version (e.g. P+F(v1) deployed together, F
+            // updated to v2 separately, then P+F(v2) resubmitted: an id-only
+            // check finds v1 and binds it, not the submitted v2, #1193 review).
+            // When the bundle does NOT carry the resource the binding targets
+            // an externally deployed version, so id-presence under the pinned
+            // deployment is the available signal.
+            bound_form_ids.iter().all(|form_id| {
+                self.form_versioned_under(
+                    form_id,
+                    deployment_key,
+                    bundle.forms.iter().find(|f| f.id == *form_id),
+                )
+            }) && bound_resource_ids.iter().all(|resource_id| {
+                self.resource_versioned_under(
+                    resource_id,
+                    deployment_key,
+                    bundle
+                        .resources
+                        .iter()
+                        .find(|r| r.resource_id == *resource_id),
+                )
             })
         })
     }
 
-    /// Whether a deployed version of `form_id` is pinned to `deployment_key`.
-    fn form_versioned_under(&self, form_id: &str, deployment_key: Key) -> bool {
-        self.state
-            .form_versions
-            .values()
-            .any(|f| f.form_id == form_id && f.deployment_key == deployment_key)
+    /// Collects the `deployment`-bound form ids and linked resource ids one
+    /// executable-graph element declares (#1193 review).
+    fn collect_deployment_bindings<'a>(
+        kind: &'a ElementKind,
+        bound_form_ids: &mut Vec<&'a str>,
+        bound_resource_ids: &mut Vec<&'a str>,
+    ) {
+        match kind {
+            ElementKind::UserTask(props)
+                if props.form_binding_type == crate::model::BindingType::Deployment =>
+            {
+                if let Some(form_id) = props.form_id.as_deref() {
+                    bound_form_ids.push(form_id);
+                }
+            }
+            ElementKind::ServiceTask {
+                linked_resources, ..
+            } => {
+                for link in linked_resources {
+                    if link.binding_type == crate::model::BindingType::Deployment {
+                        bound_resource_ids.push(link.resource_id.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
-    /// Whether a deployed version of `resource_id` is pinned to `deployment_key`.
-    fn resource_versioned_under(&self, resource_id: &str, deployment_key: Key) -> bool {
-        self.state
-            .resource_versions
-            .values()
-            .any(|r| r.resource_id == resource_id && r.deployment_key == deployment_key)
+    /// Whether a deployed version of `form_id` is pinned to `deployment_key` —
+    /// at the submitted schema/tag when `submitted` carries it (#1193 review).
+    fn form_versioned_under(
+        &self,
+        form_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::FormResource>,
+    ) -> bool {
+        self.state.form_versions.values().any(|f| {
+            f.form_id == form_id
+                && f.deployment_key == deployment_key
+                && submitted.is_none_or(|s| f.schema == s.schema && f.version_tag == s.version_tag)
+        })
+    }
+
+    /// Whether a deployed version of `resource_id` is pinned to `deployment_key`
+    /// — at the submitted name/content/tag when `submitted` carries it (#1193
+    /// review).
+    fn resource_versioned_under(
+        &self,
+        resource_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::GenericResource>,
+    ) -> bool {
+        self.state.resource_versions.values().any(|r| {
+            r.resource_id == resource_id
+                && r.deployment_key == deployment_key
+                && submitted.is_none_or(|s| {
+                    r.resource_name == s.resource_name
+                        && r.content == s.content
+                        && r.version_tag == s.version_tag
+                })
+        })
     }
 
     fn is_duplicate_process(&self, process: &ProcessDefinition) -> bool {
