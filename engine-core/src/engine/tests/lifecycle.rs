@@ -8325,3 +8325,64 @@ fn routed_delivery_ledger_round_trips_with_indexes() {
         vec![9, 3, 7]
     );
 }
+
+#[test]
+fn tag_only_form_and_resource_redeploys_are_not_skipped_as_duplicates() {
+    // #1193 review: an identical-content redeploy that carries a NEW
+    // `version_tag` must mint a version so the tag reaches state; only a
+    // content- AND tag-identical redeploy is idempotent.
+    use crate::command::{FormResource, GenericResource};
+    let mut engine = Engine::new();
+    let form = |tag: Option<&str>| FormResource {
+        id: "f".to_string(),
+        resource_name: "f.form".to_string(),
+        schema: r#"{"id":"f","components":[]}"#.to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let res = |tag: Option<&str>| GenericResource {
+        resource_id: "p.md".to_string(),
+        resource_name: "p.md".to_string(),
+        content: "same".to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let forms = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::FormDeployed { .. }))
+            .count()
+    };
+    let resources = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::GenericResourceDeployed { .. }))
+            .count()
+    };
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(None)]))
+        .unwrap();
+    assert_eq!(forms(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(engine.state().forms["f"].version_tag.as_deref(), Some("v1"));
+
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(None)]))
+        .unwrap();
+    assert_eq!(resources(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(
+        engine.state().resources["p.md"].version_tag.as_deref(),
+        Some("v1")
+    );
+}

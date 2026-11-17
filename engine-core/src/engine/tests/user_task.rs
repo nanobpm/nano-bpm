@@ -1133,3 +1133,54 @@ fn omitted_binding_type_still_resolves_the_latest_form_at_creation() {
     );
     assert!(engine.active_incidents().is_empty());
 }
+
+// zeebe-cells: element:UserTask
+#[test]
+fn form_miss_resolution_does_not_reapply_input_mappings() {
+    // #1193 review: the form lookup runs after input mappings succeeded, so
+    // resolving its incident must re-run only the activation body — never
+    // re-apply a (possibly non-idempotent) input mapping.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:formDefinition formId="review-form" bindingType="versionTag" versionTag="v9" />
+              <zeebe:ioMapping><zeebe:input source="=counter + 1" target="counter" /></zeebe:ioMapping>
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut create = Command::create_instance("p");
+    if let Command::CreateInstance { variables, .. } = &mut create {
+        variables.insert("counter".to_string(), crate::model::Value::Int(1));
+    }
+    engine.apply_command(create).unwrap();
+    let incident_key = engine.active_incidents()[0].key;
+    engine
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("v9"),
+        )]))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(created_form_key(&resolved).is_some(), "{resolved:?}");
+    assert!(
+        resolved.iter().all(|e| !matches!(
+            e,
+            Event::VariablesUpdated { .. } | Event::ScopedVariablesUpdated { .. }
+        )),
+        "input mappings must not be re-applied on resolution: {resolved:?}"
+    );
+}

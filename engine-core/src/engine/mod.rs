@@ -2049,14 +2049,9 @@ impl Engine {
         self.emit(log, Event::DeploymentCreated { deployment_key });
 
         for form in forms {
-            if self
-                .state
-                .forms
-                .get(&form.id)
-                .is_some_and(|existing| {
-                    existing.schema == form.schema && existing.version_tag == form.version_tag
-                })
-            {
+            if self.state.forms.get(&form.id).is_some_and(|existing| {
+                existing.schema == form.schema && existing.version_tag == form.version_tag
+            }) {
                 // Idempotent redeploy of the identical latest form: skip. The
                 // `version_tag` must match too (#1193 review): a schema-identical
                 // redeploy that carries a NEW tag (e.g. the first deploy to tag a
