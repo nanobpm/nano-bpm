@@ -4617,3 +4617,93 @@ fn error_caught_at_adhoc_cancels_the_failed_agent_job_before_resolving() {
     assert!(engine.active_incidents().is_empty());
     assert!(engine.is_completed(inst));
 }
+
+/// #1193 review: a user-task ad-hoc TOOL whose `versionTag`-bound form is
+/// missing parks on a resolvable incident. Leaf tools live only in the
+/// container's catalog (pruned from the executable graph), so the generic
+/// activation-body retry could not see them: resolving cleared the incident
+/// without ever creating the task, stranding the tool child active forever.
+/// The catalog-aware retry must resume the SAME child and create its task.
+#[test]
+fn adhoc_user_task_tool_form_miss_resolution_creates_the_task() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+            </bpmn:extensionElements>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+                <zeebe:formDefinition formId="tool-form" bindingType="versionTag" versionTag="v1" />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("p", vars(&[])))
+        .unwrap();
+    let agent = engine.activate_jobs("probe-agent", "W", 1, 1_000, 0);
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        activated
+            .iter()
+            .all(|e| !matches!(e, Event::UserTaskCreated { .. })),
+        "a form miss creates no task"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    let (incident_key, child_key) = (incidents[0].key, incidents[0].element_instance_key);
+
+    engine
+        .apply_command(Command::DeployForms(vec![crate::command::FormResource {
+            id: "tool-form".to_string(),
+            resource_name: "tool-form.form".to_string(),
+            schema: r#"{"id":"tool-form","components":[]}"#.to_string(),
+            version_tag: Some("v1".to_string()),
+        }]))
+        .unwrap();
+    let form_key = engine.state().forms["tool-form"].key;
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let created = resolved.iter().find_map(|e| match e {
+        Event::UserTaskCreated {
+            element_instance_key,
+            form_key,
+            ..
+        } => Some((*element_instance_key, *form_key)),
+        _ => None,
+    });
+    assert_eq!(
+        created,
+        Some((child_key, Some(form_key))),
+        "resolution resumes the SAME tool child and creates its task: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .iter()
+            .all(|e| !matches!(e, Event::ElementActivated { .. })),
+        "the parked child is resumed, never re-activated"
+    );
+    assert!(engine.active_incidents().is_empty());
+}

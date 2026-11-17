@@ -251,6 +251,20 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             if let Some(v) = &props.form_id {
                 attrs.push(format!("formId {}", quote(v)));
             }
+            // The form binding attributes (#1193) are emitted only off the
+            // default, so a pre-#1193 IR text (which never carries them)
+            // round-trips byte-identically.
+            if props.form_binding_type != nanobpmn_engine_core::BindingType::Latest {
+                let binding = match props.form_binding_type {
+                    nanobpmn_engine_core::BindingType::Deployment => "deployment",
+                    nanobpmn_engine_core::BindingType::Latest => unreachable!("guarded above"),
+                    nanobpmn_engine_core::BindingType::VersionTag => "versionTag",
+                };
+                attrs.push(format!("formBindingType {}", quote(binding)));
+            }
+            if let Some(v) = &props.form_version_tag {
+                attrs.push(format!("formVersionTag {}", quote(v)));
+            }
             if let Some(v) = &props.external_form_reference {
                 attrs.push(format!("externalFormReference {}", quote(v)));
             }
@@ -1407,16 +1421,31 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             decision_id: attrs.require("decisionId", id)?,
             result_variable: attrs.take("resultVariable"),
         },
-        "userTask" => ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
-            assignee: attrs.take("assignee"),
-            candidate_groups: attrs.take("candidateGroups"),
-            candidate_users: attrs.take("candidateUsers"),
-            due_date: attrs.take("dueDate"),
-            follow_up_date: attrs.take("followUpDate"),
-            priority: attrs.take("priority"),
-            form_id: attrs.take("formId"),
-            external_form_reference: attrs.take("externalFormReference"),
-        }),
+        "userTask" => {
+            let form_binding_type = match attrs.take("formBindingType").as_deref() {
+                None | Some("latest") => nanobpmn_engine_core::BindingType::Latest,
+                Some("deployment") => nanobpmn_engine_core::BindingType::Deployment,
+                Some("versionTag") => nanobpmn_engine_core::BindingType::VersionTag,
+                Some(other) => {
+                    return Err(format!(
+                        "userTask {id}: unknown formBindingType {other:?} \
+                         (expected latest, deployment or versionTag)"
+                    ));
+                }
+            };
+            ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
+                assignee: attrs.take("assignee"),
+                candidate_groups: attrs.take("candidateGroups"),
+                candidate_users: attrs.take("candidateUsers"),
+                due_date: attrs.take("dueDate"),
+                follow_up_date: attrs.take("followUpDate"),
+                priority: attrs.take("priority"),
+                form_id: attrs.take("formId"),
+                form_binding_type,
+                form_version_tag: attrs.take("formVersionTag"),
+                external_form_reference: attrs.take("externalFormReference"),
+            })
+        }
         "errorBoundaryEvent" => ElementKind::ErrorBoundaryEvent {
             attached_to: attrs.require("attachedTo", id)?,
             error_code: attrs.require("errorCode", id)?,

@@ -339,6 +339,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim form-js JSON document.
         schema: String,
+        /// The optional version tag this form version carries (form-js
+        /// `versionTag`), matched by a `versionTag`-bound user-task form
+        /// (#1193). Additive: `serde(default)` so journals written before the
+        /// field existed decode with `None` (no tag).
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A generic resource (any deployed file that is not a BPMN/DMN/form — e.g. a
@@ -357,6 +363,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim resource content.
         content: String,
+        /// The optional version tag this resource version carries (Zeebe
+        /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+        /// `zeebe:linkedResource` (#1193). Additive: `serde(default)` so
+        /// journals written before the field existed decode with `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
