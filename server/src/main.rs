@@ -935,12 +935,12 @@ impl ServerImpl {
             |v, field| match field {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(cluster_variable_value_string(&v.value)),
-                "tenantId" => query::SortVal::Str(v.tenant_id.clone().unwrap_or_default()),
+                "tenantId" => query::opt_str_sort_val(v.tenant_id.as_deref()),
                 "scope" => {
                     let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
                     query::SortVal::Str(scope_enum.to_string())
                 }
-                _ => query::SortVal::Num(v.id as i64),
+                _ => query::SortVal::Num(v.id as i128),
             },
             |v| v.id,
         );
@@ -12131,18 +12131,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i64),
-                "jobKey" => query::SortVal::Num(inc.job_key.map_or(-1, |k| k as i64)),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
                 "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
                 "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i64),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i64),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -12252,18 +12252,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i64),
-                "jobKey" => query::SortVal::Num(inc.job_key.map_or(-1, |k| k as i64)),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
                 "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
                 "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i64),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i64),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -12567,13 +12567,13 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ws, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i128),
                 "rootProcessInstanceKey" => query::SortVal::Num(
-                    roots.root_process_instance_key(ws.process_instance_key) as i64,
+                    roots.root_process_instance_key(ws.process_instance_key) as i128,
                 ),
                 "elementId" => query::SortVal::Str(ws.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(ws.element_instance_key as i64),
-                _ => query::SortVal::Num(ws.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(ws.element_instance_key as i128),
+                _ => query::SortVal::Num(ws.element_instance_key as i128),
             },
             |ws| (ws.element_instance_key, ws.source_key),
         );
@@ -12806,29 +12806,27 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |row, field| match field {
-                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i64),
+                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i128),
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
                 "decisionDefinitionName" => query::SortVal::Str(row.decision_name.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
-                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
+                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i128),
                 "decisionDefinitionType" => query::SortVal::Str(row.decision_type.clone()),
-                "processInstanceKey" => query::SortVal::Num(row.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(row.instance_key as i128),
                 "state" => query::SortVal::Str(row.state.clone()),
                 "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
                 "decisionEvaluationInstanceKey" => {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
-                "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
-                "decisionEvaluationKey" => query::SortVal::Num(row.decision_evaluation_key as i64),
-                "elementInstanceKey" => query::SortVal::Num(row.element_instance_key as i64),
-                "evaluationFailure" => {
-                    query::SortVal::Str(row.evaluation_failure.clone().unwrap_or_default())
-                }
+                "businessId" => query::opt_str_sort_val(row.business_id.as_deref()),
+                "decisionEvaluationKey" => query::SortVal::Num(row.decision_evaluation_key as i128),
+                "elementInstanceKey" => query::SortVal::Num(row.element_instance_key as i128),
+                "evaluationFailure" => query::opt_str_sort_val(row.evaluation_failure.as_deref()),
                 "processDefinitionKey" => query::key_sort_val(&row.process_definition_key),
-                "rootDecisionDefinitionKey" => query::SortVal::Num(row.root_decision_key as i64),
+                "rootDecisionDefinitionKey" => query::SortVal::Num(row.root_decision_key as i128),
                 // Default (key) sort: by evaluation key, then the within-
                 // evaluation index via the composite tiebreak below.
-                _ => query::SortVal::Num(row.decision_evaluation_key as i64),
+                _ => query::SortVal::Num(row.decision_evaluation_key as i128),
             },
             |row| entity_key(row),
         );
@@ -12997,23 +12995,23 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
                 "name" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "decisionRequirementsId" => {
                     query::SortVal::Str(row.decision_requirements_id.clone())
                 }
                 "decisionRequirementsKey" => {
-                    query::SortVal::Num(row.decision_requirements_key as i64)
+                    query::SortVal::Num(row.decision_requirements_key as i128)
                 }
                 "decisionRequirementsName" => {
                     query::SortVal::Str(row.decision_requirements_name.clone())
                 }
                 "decisionRequirementsVersion" => {
-                    query::SortVal::Num(row.decision_requirements_version as i64)
+                    query::SortVal::Num(row.decision_requirements_version as i128)
                 }
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.decision_key as i64),
+                _ => query::SortVal::Num(row.decision_key as i128),
             },
             |row| row.decision_key,
         );
@@ -13145,12 +13143,12 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionRequirementsId" => query::SortVal::Str(row.drg_id.clone()),
-                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i64),
+                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i128),
                 "decisionRequirementsName" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "resourceName" => query::SortVal::Str(row.resource_name.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.drg_key as i64),
+                _ => query::SortVal::Num(row.drg_key as i128),
             },
             |row| row.drg_key,
         );
@@ -13315,23 +13313,7 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |row, field| match field {
-                "resourceId" => query::SortVal::Str(row.resource_id.clone()),
-                "resourceName" => query::SortVal::Str(row.resource_name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
-                // `versionTag` is nullable; a null tag sorts as the empty string
-                // (before any present tag ascending), matching how the read model
-                // projects `versionTag: null`.
-                "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
-                "resourceKey" => query::SortVal::Num(row.resource_key as i64),
-                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-                // Nano allocates a deployment's key and its resources' keys from
-                // one monotonic key space in the same deploy, so resource-key
-                // order IS deployment-key order (resources of one deployment
-                // tie on deploymentKey and fall to the resource-key tiebreak).
-                "deploymentKey" => query::SortVal::Num(row.resource_key as i64),
-                _ => query::SortVal::Num(row.resource_key as i64),
-            },
+            |row, field| resource_sort_val(row, field),
             |row| row.resource_key,
         );
 
@@ -13381,32 +13363,30 @@ impl ServerImpl {
             &sort,
             |inst, field| match field {
                 "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
-                }
+                "processDefinitionKey" => query::key_sort_val(&inst.process_definition_key),
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
-                "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
-                "startDate" => query::SortVal::Num(inst.start_date_ms as i64),
+                "businessId" => query::opt_str_sort_val(inst.business_id.as_deref()),
+                "startDate" => query::SortVal::Num(inst.start_date_ms as i128),
                 "suspendedDate" => {
-                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i64))
+                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i128))
                 }
-                "hasIncident" => query::SortVal::Num(i64::from(inst.has_incident)),
+                "hasIncident" => query::SortVal::Num(i128::from(inst.has_incident)),
                 "parentProcessInstanceKey" => {
-                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i64))
+                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i128))
                 }
                 "parentElementInstanceKey" => {
-                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i64))
+                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i128))
                 }
-                "processDefinitionVersion" => query::SortVal::Num(i64::from(inst.version)),
+                "processDefinitionVersion" => query::SortVal::Num(i128::from(inst.version)),
                 // Constant in Nano: the result always projects these as null
                 // (`process_instance_result`), so every row ties and the
                 // entity-key tiebreak orders them.
                 "endDate" | "processDefinitionName" | "processDefinitionVersionTag" => {
                     query::SortVal::Num(0)
                 }
-                "processInstanceKey" => query::SortVal::Num(inst.key as i64),
+                "processInstanceKey" => query::SortVal::Num(inst.key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inst.key as i64),
+                _ => query::SortVal::Num(inst.key as i128),
             },
             |inst| inst.key,
         );
@@ -13628,29 +13608,24 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
+                }
                 "processDefinitionVersion" => {
-                    query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.process_definition_version.map(|v| v as i128))
                 }
                 "processInstanceKey" => {
-                    query::SortVal::Num(e.process_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.process_instance_key.map(|v| v as i128))
                 }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
                 "elementInstanceKey" => {
-                    query::SortVal::Num(e.element_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.element_instance_key.map(|v| v as i128))
                 }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => {
-                    query::SortVal::Str(e.correlation_key.clone().unwrap_or_default())
-                }
-                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
+                "correlationKey" => query::opt_str_sort_val(e.correlation_key.as_deref()),
+                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i128),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "toolName" => query::opt_str_sort_val(e.tool_name.as_deref()),
                 "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
                 // Constant in Nano: every retained subscription is `CREATED`
                 // (`state_str`), and `processDefinitionName` /
@@ -13658,9 +13633,9 @@ impl ServerImpl {
                 // rows tie and the subscription-key tiebreak orders them.
                 "messageSubscriptionState" => query::SortVal::Str(state_str.clone()),
                 "processDefinitionName" | "inboundConnectorType" => query::SortVal::Num(0),
-                "messageSubscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "messageSubscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(e.subscription_key as i64),
+                _ => query::SortVal::Num(e.subscription_key as i128),
             },
             |e| e.subscription_key,
         );
@@ -13861,24 +13836,21 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
-                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i64),
+                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i128),
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i128),
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "partitionId" => query::SortVal::Num(e.partition_id as i64),
+                "partitionId" => query::SortVal::Num(e.partition_id as i128),
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
-                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
+                }
+                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i128),
+                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                "messageKey" => query::SortVal::Num(e.message_key as i64),
-                _ => query::SortVal::Num(e.message_key as i64),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "messageKey" => query::SortVal::Num(e.message_key as i128),
+                _ => query::SortVal::Num(e.message_key as i128),
             },
             // A single published message can fan out to multiple subscriptions,
             // and a non-interrupting boundary subscription correlates repeatedly,
@@ -14064,10 +14036,8 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ei, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i64),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(ei.process_definition_key.parse().unwrap_or(0))
-                }
+                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i128),
+                "processDefinitionKey" => query::key_sort_val(&ei.process_definition_key),
                 "processDefinitionId" => query::SortVal::Str(ei.process_definition_id.clone()),
                 "elementId" => query::SortVal::Str(ei.element_id.clone()),
                 "elementName" => query::SortVal::Str(
@@ -14077,12 +14047,12 @@ impl ServerImpl {
                 ),
                 "type" => query::SortVal::Str(ei.element_type.clone()),
                 "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
-                "startDate" => query::SortVal::Num(ei.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(ei.end_date_ms.unwrap_or(0) as i64),
-                "incidentKey" => query::opt_num_sort_val(ei.incident_key.map(|k| k as i64)),
-                "elementInstanceKey" => query::SortVal::Num(ei.element_instance_key as i64),
+                "startDate" => query::SortVal::Num(ei.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(ei.end_date_ms.map(|v| v as i128)),
+                "incidentKey" => query::opt_num_sort_val(ei.incident_key.map(|k| k as i128)),
+                "elementInstanceKey" => query::SortVal::Num(ei.element_instance_key as i128),
                 "tenantId" => query::SortVal::Str(ei.tenant_id.clone()),
-                _ => query::SortVal::Num(ei.element_instance_key as i64),
+                _ => query::SortVal::Num(ei.element_instance_key as i128),
             },
             |ei| ei.element_instance_key,
         );
@@ -14976,12 +14946,12 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |task, field| match field {
-                "processInstanceKey" => query::SortVal::Num(task.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(task.instance_key as i128),
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
-                "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
-                "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
-                "priority" => query::SortVal::Num(i64::from(task.priority)),
+                "creationDate" => query::SortVal::Num(task.created_at_ms as i128),
+                "businessId" => query::opt_str_sort_val(task.business_id.as_deref()),
+                "priority" => query::SortVal::Num(i128::from(task.priority)),
                 // Sort on the instant, not the stored string, so differing
                 // offsets/precision still order chronologically.
                 "dueDate" => query::opt_num_sort_val(rfc3339_ms(task.due_date.as_deref())),
@@ -14992,7 +14962,7 @@ impl ServerImpl {
                 // `completionDate` as null, so every row ties and the task-key
                 // tiebreak orders them.
                 "name" | "completionDate" => query::SortVal::Num(0),
-                _ => query::SortVal::Num(task.key as i64),
+                _ => query::SortVal::Num(task.key as i128),
             },
             |task| task.key,
         );
@@ -15708,10 +15678,10 @@ impl ServerImpl {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(v.value.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "scopeKey" => query::SortVal::Num(v.scope_key as i64),
-                "processInstanceKey" => query::SortVal::Num(v.instance_key as i64),
-                "variableKey" => query::SortVal::Num(v.key as i64),
-                _ => query::SortVal::Num(v.key as i64),
+                "scopeKey" => query::SortVal::Num(v.scope_key as i128),
+                "processInstanceKey" => query::SortVal::Num(v.instance_key as i128),
+                "variableKey" => query::SortVal::Num(v.key as i128),
+                _ => query::SortVal::Num(v.key as i128),
             },
             |v| v.key,
         );
@@ -15863,15 +15833,15 @@ impl ServerImpl {
                 "name" => {
                     query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
                 }
-                "version" => query::SortVal::Num(d.version as i64),
+                "version" => query::SortVal::Num(d.version as i128),
                 // Derived exactly as `process_definition_result` projects it.
                 "resourceName" => query::SortVal::Str(resource_name(&d.process_id)),
                 // Constant in Nano: `versionTag` is always projected null, so
                 // every row ties and the definition-key tiebreak orders them.
                 "versionTag" => query::SortVal::Num(0),
-                "processDefinitionKey" => query::SortVal::Num(d.key as i64),
+                "processDefinitionKey" => query::SortVal::Num(d.key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(d.key as i64),
+                _ => query::SortVal::Num(d.key as i128),
             },
             |d| d.key,
         );
@@ -22880,14 +22850,14 @@ impl ServerImpl {
             |rec, field| match field {
                 "state" => query::SortVal::Str(rec.state.to_string()),
                 "operationType" => query::SortVal::Str(rec.op_type.to_string()),
-                "startDate" => query::SortVal::Num(rec.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(rec.end_date_ms.unwrap_or(0) as i64),
+                "startDate" => query::SortVal::Num(rec.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(rec.end_date_ms.map(|v| v as i128)),
                 // Constant in Nano: `batch_operation_response` always projects
                 // `actorId` / `actorType` as null (no identity layer), so every
                 // row ties and the batch-key tiebreak orders them.
                 "actorId" | "actorType" => query::SortVal::Num(0),
-                "batchOperationKey" => query::SortVal::Num(rec.key as i64),
-                _ => query::SortVal::Num(rec.key as i64),
+                "batchOperationKey" => query::SortVal::Num(rec.key as i128),
+                _ => query::SortVal::Num(rec.key as i128),
             },
             |rec| rec.key,
         );
@@ -22957,16 +22927,16 @@ impl ServerImpl {
             &sort,
             |(batch_key, op_type, item), field| match field {
                 "state" => query::SortVal::Str(item.state.to_string()),
-                "batchOperationKey" => query::SortVal::Num(*batch_key as i64),
+                "batchOperationKey" => query::SortVal::Num(*batch_key as i128),
                 "processedDate" => {
-                    query::opt_num_sort_val(item.processed_date_ms.map(|ms| ms as i64))
+                    query::opt_num_sort_val(item.processed_date_ms.map(|ms| ms as i128))
                 }
                 "operationType" => query::SortVal::Str(op_type.to_string()),
                 "processInstanceKey" => {
-                    query::SortVal::Num(item.process_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(item.process_instance_key.map(|v| v as i128))
                 }
-                "itemKey" => query::SortVal::Num(item.item_key as i64),
-                _ => query::SortVal::Num(item.item_key as i64),
+                "itemKey" => query::SortVal::Num(item.item_key as i128),
+                _ => query::SortVal::Num(item.item_key as i128),
             },
             // No single column is unique (the same instance can appear in two
             // batches), so the cursor key is the composite (batchKey, itemKey).
@@ -23473,6 +23443,26 @@ fn decision_requirements_result(
         "<default>".to_string(),
         row.version,
     )
+}
+
+/// The `searchResources` sort projection: every spec sort field explicitly
+/// (#1298). Shared by the handler and its regression tests.
+fn resource_sort_val(row: &readstore::ResourceMetaRow, field: &str) -> query::SortVal {
+    match field {
+        "resourceId" => query::SortVal::Str(row.resource_id.clone()),
+        "resourceName" => query::SortVal::Str(row.resource_name.clone()),
+        "version" => query::SortVal::Num(row.version as i128),
+        // `versionTag` is nullable; a null tag is absent (sorts before
+        // every present tag ascending).
+        "versionTag" => query::opt_str_sort_val(row.version_tag.as_deref()),
+        "resourceKey" => query::SortVal::Num(row.resource_key as i128),
+        "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+        // The creating deployment's key, projected from the event:
+        // resources of one deployment genuinely tie here, so a
+        // secondary sort (or the resource-key tiebreak) orders them.
+        "deploymentKey" => query::opt_num_sort_val(row.deployment_key),
+        _ => query::SortVal::Num(row.resource_key as i128),
+    }
 }
 
 fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
@@ -25412,28 +25402,28 @@ fn validate_agent_history(items: &[models::AgentInstanceHistoryItem]) -> Result<
 /// The [`query::SortVal`] for an agent-instance row on the given REST sort field.
 fn agent_instance_sort_val(row: &readstore::AgentInstanceRow, field: &str) -> query::SortVal {
     match field {
-        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i64),
+        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i128),
         "status" => query::SortVal::Str(row.status.as_str().to_string()),
         "elementId" => query::SortVal::Str(row.element_id.clone()),
-        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i64),
-        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i64),
-        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i64),
+        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i128),
+        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i128),
+        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i128),
         "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-        "creationDate" => query::SortVal::Num(row.creation_date_ms as i64),
-        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i64),
-        "completionDate" => query::SortVal::Num(row.completion_date_ms.unwrap_or(0) as i64),
-        "agentInstanceKey" => query::SortVal::Num(row.agent_instance_key as i64),
-        _ => query::SortVal::Num(row.agent_instance_key as i64),
+        "creationDate" => query::SortVal::Num(row.creation_date_ms as i128),
+        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i128),
+        "completionDate" => query::opt_num_sort_val(row.completion_date_ms.map(|v| v as i128)),
+        "agentInstanceKey" => query::SortVal::Num(row.agent_instance_key as i128),
+        _ => query::SortVal::Num(row.agent_instance_key as i128),
     }
 }
 
 /// The [`query::SortVal`] for an agent-history row on the given REST sort field.
 fn agent_history_sort_val(row: &readstore::AgentHistoryRow, field: &str) -> query::SortVal {
     match field {
-        "producedAt" => query::SortVal::Num(row.produced_at_ms as i64),
-        "loopIteration" => query::SortVal::Num(row.loop_iteration as i64),
-        "historyItemKey" => query::SortVal::Num(row.agent_history_key as i64),
-        _ => query::SortVal::Num(row.agent_history_key as i64),
+        "producedAt" => query::SortVal::Num(row.produced_at_ms as i128),
+        "loopIteration" => query::SortVal::Num(row.loop_iteration as i128),
+        "historyItemKey" => query::SortVal::Num(row.agent_history_key as i128),
+        _ => query::SortVal::Num(row.agent_history_key as i128),
     }
 }
 
@@ -25703,27 +25693,25 @@ mod sort_projection_tests {
 
 fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
     match field {
-        "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+        "processInstanceKey" => query::SortVal::Num(job.instance_key as i128),
         "elementId" => query::SortVal::Str(job.element_id.clone()),
-        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
+        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i128),
         "type" => query::SortVal::Str(job.job_type.clone()),
         "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
-        "retries" => query::SortVal::Num(job.retries as i64),
-        "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+        "retries" => query::SortVal::Num(job.retries as i128),
+        "worker" => query::opt_str_sort_val(job.worker.as_deref()),
         "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
-        "processDefinitionKey" => {
-            query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
-        }
-        "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
-        "errorMessage" => query::SortVal::Str(job.error_message.clone().unwrap_or_default()),
+        "processDefinitionKey" => query::key_sort_val(&job.process_definition_key),
+        "errorCode" => query::opt_str_sort_val(job.error_code.as_deref()),
+        "errorMessage" => query::opt_str_sort_val(job.error_message.as_deref()),
         // Camunda-parity timing sort fields (#1344). Missing values sort as 0
         // (epoch), so jobs lacking a timestamp group first ascending.
-        "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
-        "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
-        "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
-        "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
+        "creationTime" => query::SortVal::Num(job.created_at_ms as i128),
+        "lastUpdateTime" => query::opt_num_sort_val(job.last_update_ms.map(|v| v as i128)),
+        "endTime" => query::opt_num_sort_val(job.end_ms.map(|v| v as i128)),
+        "deadline" => query::opt_num_sort_val(job.deadline_ms.map(|v| v as i128)),
         "hasFailedWithRetriesLeft" => {
-            query::SortVal::Num(i64::from(job.has_failed_with_retries_left))
+            query::SortVal::Num(i128::from(job.has_failed_with_retries_left))
         }
         "kind" => query::SortVal::Str(job_kind_enums(&job.kind).0.to_string()),
         "listenerEventType" => query::SortVal::Str(job_kind_enums(&job.kind).1.to_string()),
@@ -25731,9 +25719,9 @@ fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
         // and null `isDenied` / `deniedReason`, so every row ties and the
         // job-key tiebreak orders them.
         "priority" | "isDenied" | "deniedReason" => query::SortVal::Num(0),
-        "jobKey" => query::SortVal::Num(job.key as i64),
+        "jobKey" => query::SortVal::Num(job.key as i128),
         "tenantId" => query::SortVal::Str("<default>".to_string()),
-        _ => query::SortVal::Num(job.key as i64),
+        _ => query::SortVal::Num(job.key as i128),
     }
 }
 
@@ -47932,6 +47920,60 @@ mod clustered_startup_tests {
             sorted(true),
             vec![200, 100],
             "descending numeric sort: processDefinitionKey 10 before 2"
+        );
+    }
+
+    /// #1298 — `searchResources` sorts `deploymentKey` on the creating
+    /// deployment's key, not the per-resource key: resources of one deployment
+    /// tie, so a secondary sort orders them, and DESC reverses deployments
+    /// while keeping the ascending resource-key tiebreak within one.
+    #[test]
+    fn resource_sort_deployment_key_ties_within_a_deployment() {
+        fn row(
+            resource_key: u64,
+            deployment_key: Option<u64>,
+            name: &str,
+        ) -> readstore::ResourceMetaRow {
+            readstore::ResourceMetaRow {
+                resource_key,
+                resource_id: name.to_string(),
+                resource_name: name.to_string(),
+                version: 1,
+                version_tag: None,
+                tenant_id: "<default>".to_string(),
+                deployment_key,
+            }
+        }
+        // Deployment 10 owns resources 11 ("z") and 12 ("a"); deployment 20
+        // owns 21 ("m"); 5 is a legacy row with no recorded deployment.
+        let rows = [
+            row(11, Some(10), "z"),
+            row(12, Some(10), "a"),
+            row(21, Some(20), "m"),
+            row(5, None, "legacy"),
+        ];
+        let sorted = |keys: &[(&str, bool)]| {
+            let mut refs: Vec<&readstore::ResourceMetaRow> = rows.iter().collect();
+            let keys: Vec<query::SortKey> = keys
+                .iter()
+                .map(|(f, d)| query::SortKey {
+                    field: (*f).to_string(),
+                    descending: *d,
+                })
+                .collect();
+            query::sort_items(
+                &mut refs,
+                &keys,
+                |r, f| resource_sort_val(r, f),
+                |r| r.resource_key,
+            );
+            refs.iter().map(|r| r.resource_key).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&[("deploymentKey", false)]), vec![5, 11, 12, 21]);
+        assert_eq!(sorted(&[("deploymentKey", true)]), vec![21, 11, 12, 5]);
+        assert_eq!(
+            sorted(&[("deploymentKey", false), ("resourceName", false)]),
+            vec![5, 12, 11, 21]
         );
     }
 

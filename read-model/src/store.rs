@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -88,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 5936058379013217281;
+const SCHEMA_FINGERPRINT: i64 = 5885629061888775070;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -398,7 +398,8 @@ CREATE TABLE resources (
     version        INTEGER NOT NULL,
     version_tag    TEXT,
     content        TEXT NOT NULL,
-    tenant_id      TEXT NOT NULL DEFAULT '<default>'
+    tenant_id      TEXT NOT NULL DEFAULT '<default>',
+    deployment_key INTEGER
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
 CREATE TABLE agent_instances (
@@ -1829,6 +1830,10 @@ pub struct ResourceMetaRow {
     pub version: i32,
     pub version_tag: Option<String>,
     pub tenant_id: String,
+    /// The key of the deployment that created this resource version, when
+    /// known. `None` only for a row projected before schema v17 (or seeded from
+    /// an engine snapshot, which does not carry it) — sorts as absent.
+    pub deployment_key: Option<Key>,
 }
 
 /// Minimum `-wal` sidecar size (bytes) before the adaptive pruner spends a
@@ -3837,7 +3842,7 @@ fn map_resource(r: &rusqlite::Row) -> rusqlite::Result<ResourceRow> {
 }
 
 const RESOURCE_META_COLS: &str =
-    "resource_key, resource_id, resource_name, version, version_tag, tenant_id";
+    "resource_key, resource_id, resource_name, version, version_tag, tenant_id, deployment_key";
 
 fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
     Ok(ResourceMetaRow {
@@ -3847,6 +3852,7 @@ fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
         version: r.get(3)?,
         version_tag: r.get(4)?,
         tenant_id: r.get(5)?,
+        deployment_key: r.get::<_, Option<i64>>(6)?.map(|k| k as Key),
     })
 }
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
@@ -4326,6 +4332,8 @@ fn project_engine_state(
              version_tag = excluded.version_tag, content = excluded.content, \
              tenant_id = excluded.tenant_id",
             // `tenant_id` is not modeled in engine state; default to '<default>'.
+            // Neither is `deployment_key`: it is left untouched (NULL on a fresh
+            // row, the event-projected value preserved on an existing one).
             params![
                 res.key as i64,
                 res.resource_id,
@@ -6616,6 +6624,7 @@ fn project_event(
         }
 
         Event::GenericResourceDeployed {
+            deployment_key,
             resource_key,
             version,
             resource_id,
@@ -6628,12 +6637,12 @@ fn project_event(
             // is idempotent on a journal replay.
             tx.cexecute(
                 "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-                 version_tag, content, tenant_id) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+                 version_tag, content, tenant_id, deployment_key) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
                  ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
                  resource_name = excluded.resource_name, version = excluded.version, \
                  version_tag = excluded.version_tag, content = excluded.content, \
-                 tenant_id = excluded.tenant_id",
+                 tenant_id = excluded.tenant_id, deployment_key = excluded.deployment_key",
                 params![
                     *resource_key as i64,
                     resource_id,
@@ -6641,6 +6650,7 @@ fn project_event(
                     version,
                     content,
                     "<default>",
+                    *deployment_key as i64,
                 ],
             )?;
         }
@@ -15757,6 +15767,32 @@ mod agent_projection_tests {
         let refs: Vec<&Event> = events.iter().collect();
         store.export(&refs).unwrap();
         store
+    }
+
+    /// Issue #1298: `searchResources` sorts on `deploymentKey`, so the resource
+    /// projection must retain the creating deployment's key (resources of one
+    /// deployment share it), not substitute the per-resource key.
+    #[test]
+    fn generic_resource_projection_retains_deployment_key() {
+        let deployed = |deployment_key, resource_key, id: &str| Event::GenericResourceDeployed {
+            deployment_key,
+            resource_key,
+            version: 1,
+            resource_id: id.to_string(),
+            resource_name: id.to_string(),
+            content: String::new(),
+        };
+        let store = store_with(&[
+            deployed(10, 11, "a.txt"),
+            deployed(10, 12, "b.txt"),
+            deployed(20, 21, "c.txt"),
+        ]);
+        let got: Vec<(Key, Option<Key>)> = store
+            .resources_meta()
+            .into_iter()
+            .map(|r| (r.resource_key, r.deployment_key))
+            .collect();
+        assert_eq!(got, vec![(11, Some(10)), (12, Some(10)), (21, Some(20))]);
     }
 
     #[test]
