@@ -7464,7 +7464,9 @@ impl ServerImpl {
                 commit.wait().await;
                 // Completing a job may advance the token into an off-partition
                 // message catch: route the resulting subscription open/correlate.
-                self.spawn_routing_if_needed(&events);
+                // The completion request carries no `operationReference` in the
+                // synced spec, so the routed follow-ups are unreferenced too.
+                self.spawn_routing_if_needed(&events, None);
                 self.observe_job_sojourn(&events, now_millis());
                 self.record_adhoc_events(&events);
                 // Completing a job may advance the token onto a following service
@@ -9270,6 +9272,11 @@ impl ServerImpl {
     /// on one node is never re-evaluated (and re-committed) on another when its
     /// leadership moves mid-publish (#1307). `None` applies every local target —
     /// the legacy behaviour for a peer frame predating the field.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1556 step 4, #1600): stamped on every record each per-partition apply
+    /// produces, and carried onward on the routed follow-ups those records
+    /// drive (the routing pump below).
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -9277,6 +9284,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
+        operation_reference: Option<i64>,
     ) -> Result<Vec<Event>, EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -9310,7 +9318,10 @@ impl ServerImpl {
                 variables: variables.clone(),
                 business_id: business_id.clone(),
             };
-            match self.apply_routed_command(target, command).await {
+            match self
+                .apply_routed_command(target, command, operation_reference)
+                .await
+            {
                 RoutedApply::Applied(events) => all_events.extend(events),
                 RoutedApply::NotHere => {}
                 RoutedApply::Failed(status, message) => {
@@ -9325,8 +9336,11 @@ impl ServerImpl {
         // `RemoteMessageCorrelation`), plus any start-instance dispatch a
         // message-start fan-out produced. A no-op single-partition.
         if Self::has_routable_subscription_events(&all_events) {
-            self.drive_subscription_routing(Self::routable_events(&all_events))
-                .await;
+            self.drive_subscription_routing(
+                Self::routable_events(&all_events),
+                operation_reference,
+            )
+            .await;
         }
         Ok(all_events)
     }
@@ -9340,7 +9354,9 @@ impl ServerImpl {
     /// The local building block for both the gateway fan-out and the peer-side
     /// `PublishMessage` handler. `only_partitions`, when set, restricts the apply
     /// to the listed target partitions (a scoped fan-out send); `None` applies
-    /// every local target (the legacy behaviour).
+    /// every local target (the legacy behaviour). `operation_reference` is the
+    /// publishing request's `operationReference` (#1600), threaded through to
+    /// every record the publish produces here.
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
@@ -9348,6 +9364,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(
@@ -9356,6 +9373,7 @@ impl ServerImpl {
                 variables,
                 business_id,
                 only_partitions.as_deref(),
+                operation_reference,
             )
             .await?;
         let message_key = message_key_of(&events);
@@ -9384,12 +9402,18 @@ impl ServerImpl {
     /// peer that is unreachable is logged and skipped (best-effort, matching the
     /// no-buffer correlate-and-drop model). A single-node cluster fans only
     /// locally — byte-identical to the pre-cluster path.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1600): threaded through the local apply AND carried on every peer
+    /// fan-out frame, so the records a publish produces on ANY node's
+    /// partitions carry it.
     async fn correlate_message_cluster(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
@@ -9406,6 +9430,7 @@ impl ServerImpl {
                 engine_vars,
                 business_id.clone(),
                 None,
+                operation_reference,
             )
             .await?;
 
@@ -9492,6 +9517,7 @@ impl ServerImpl {
                                 variables.clone(),
                                 business_id.clone(),
                                 Some(partitions.clone()),
+                                operation_reference,
                             )
                             .await
                         {
@@ -9638,12 +9664,26 @@ impl ServerImpl {
     /// follow-up would otherwise be unrecoverable (the retried parent is deduped
     /// to a no-op). The pump therefore runs as a detached task; awaiting it only
     /// observes completion, and dropping the await leaves it running.
-    async fn drive_subscription_routing(&self, events: Vec<Event>) {
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// committed records produced these follow-ups (#1556 step 4, #1600): it is
+    /// stamped on every record each routed command produces, on every partition
+    /// it routes to, and carried onward on any follow-ups those records route
+    /// in turn — so a caller's reference reaches the whole routed cascade.
+    async fn drive_subscription_routing(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         if self.engine.topology().num_partitions <= 1 {
             return;
         }
         let server = self.clone();
-        let pump = tokio::spawn(async move { server.drive_subscription_routing_now(events).await });
+        let pump = tokio::spawn(async move {
+            server
+                .drive_subscription_routing_now(events, operation_reference)
+                .await
+        });
         if let Err(e) = pump.await {
             tracing::warn!("subscription routing pump task failed: {e}");
         }
@@ -9656,21 +9696,33 @@ impl ServerImpl {
     fn route_late_follow_ups(
         &self,
         events: Vec<Event>,
+        operation_reference: Option<i64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         let server = self.clone();
-        Box::pin(async move { server.drive_subscription_routing(events).await })
+        Box::pin(async move {
+            server
+                .drive_subscription_routing(events, operation_reference)
+                .await
+        })
     }
 
     /// The routing pump body behind [`Self::drive_subscription_routing`]; only
     /// ever run inside that detached task.
-    async fn drive_subscription_routing_now(&self, events: Vec<Event>) {
+    async fn drive_subscription_routing_now(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            work.extend(self.route_with_redrive(target, command, event).await);
+            work.extend(
+                self.route_with_redrive(target, command, event, operation_reference)
+                    .await,
+            );
         }
     }
 
@@ -9683,8 +9735,15 @@ impl ServerImpl {
     /// backoff per [`ROUTE_REDRIVE`]; a 4xx is a permanent rejection and stops.
     /// Re-delivery is safe: routed deliveries carry stable source-minted keys the
     /// recipient dedups on (#1568), so a retry of an attempt whose reply was lost
-    /// is a no-op.
-    async fn route_with_redrive(&self, target: u64, command: Command, event: Event) -> Vec<Event> {
+    /// is a no-op. `operation_reference` rides every delivery (local apply and
+    /// peer forward alike) so the follow-up's records carry it (#1600).
+    async fn route_with_redrive(
+        &self,
+        target: u64,
+        command: Command,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> Vec<Event> {
         let mut last = String::new();
         // An unkeyed (zero / legacy) routed command has no dedup, so a retry
         // after an ambiguous outcome could apply it twice: deliver it at most
@@ -9695,13 +9754,16 @@ impl ServerImpl {
                 self.route_redrives.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
             }
-            let outcome = match self.apply_routed_command(target, command.clone()).await {
+            let outcome = match self
+                .apply_routed_command(target, command.clone(), operation_reference)
+                .await
+            {
                 RoutedApply::Applied(produced) => return produced,
                 RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
                 // Led by a peer (or a leadership gap): forward to the current
                 // writer, re-resolved on every attempt.
                 RoutedApply::NotHere => {
-                    self.forward_route_subscription(target, &event, attempt)
+                    self.forward_route_subscription(target, &event, attempt, operation_reference)
                         .await
                 }
             };
@@ -9917,7 +9979,17 @@ impl ServerImpl {
     /// forwards to the leader instead of applying on a local replica, which
     /// would diverge from the log (#1307). Without Raft it applies directly on
     /// the locally owned engine and awaits durability.
-    async fn apply_routed_command(&self, target: u64, command: Command) -> RoutedApply {
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// records produced the follow-up being applied (#1600): it rides the
+    /// replicated command envelope (Raft) or the journal apply (direct), so
+    /// every record the routed command produces on `target` carries it.
+    async fn apply_routed_command(
+        &self,
+        target: u64,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> RoutedApply {
         if !self.raft.is_empty() {
             let Some(part) = self.raft.get(target) else {
                 return RoutedApply::NotHere;
@@ -9942,7 +10014,10 @@ impl ServerImpl {
             // duplicate instance, so its outcome must be observed, never
             // timed out into a retryable non-delivery (#1582).
             if !Self::routed_command_is_idempotent(&command) {
-                return Self::classify_proposal(part.propose_result(command, now_millis()).await);
+                return Self::classify_proposal(
+                    part.propose_result_ref(command, now_millis(), operation_reference)
+                        .await,
+                );
             }
             // Exactly ONE routing owner for the produced follow-ups: the
             // detached task ALWAYS routes them itself, whether or not the
@@ -9963,14 +10038,18 @@ impl ServerImpl {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let server = self.clone();
             tokio::spawn(async move {
-                let result = part.propose_result(command, now_millis()).await;
+                let result = part
+                    .propose_result_ref(command, now_millis(), operation_reference)
+                    .await;
                 let follow_ups = match &result {
                     Ok(item) if item.error.is_none() => Self::routable_events(&item.events),
                     _ => Vec::new(),
                 };
                 let _ = tx.send(Self::strip_routable(result));
                 if !follow_ups.is_empty() {
-                    server.route_late_follow_ups(follow_ups).await;
+                    server
+                        .route_late_follow_ups(follow_ups, operation_reference)
+                        .await;
                     server.signal_jobs_available();
                 }
             });
@@ -9990,12 +10069,12 @@ impl ServerImpl {
             return RoutedApply::NotHere;
         };
         let (result, commit) = handle
-            .with(
-                move |journal| match journal.apply_command_at(command, now_millis()) {
+            .with(move |journal| {
+                match journal.apply_command_ref_at(command, now_millis(), operation_reference) {
                     Ok((events, commit)) => (Ok(events), commit),
                     Err(error) => (Err(error), Commit::ready()),
-                },
-            )
+                }
+            })
             .await;
         // Only a durable apply counts as delivered: its follow-ups are routed
         // onward with keys peers dedup on, so they must never outrun it (#1582).
@@ -10015,11 +10094,14 @@ impl ServerImpl {
     /// `event` to the node currently writing `target_partition`, over the Falcon
     /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
     /// it and drives its own pump for any further follow-ups.
+    /// `operation_reference` rides the frame so the records the follow-up
+    /// produces on the peer carry the originating request's reference (#1600).
     async fn forward_route_subscription(
         &self,
         target_partition: u64,
         event: &Event,
         attempt: u32,
+        operation_reference: Option<i64>,
     ) -> RouteAttempt {
         let owner = self.route_forward_candidate(target_partition, attempt);
         if owner == self.engine.topology().node_id {
@@ -10048,7 +10130,9 @@ impl ServerImpl {
                 }
             };
             used = Some(link.clone());
-            let result = link.route_subscription(event.clone()).await;
+            let result = link
+                .route_subscription(event.clone(), operation_reference)
+                .await;
             if result.is_err() {
                 // A dead/stalled link: drop it so the next attempt redials.
                 self.peers.drop_link_if_same(owner, &link).await;
@@ -10077,14 +10161,25 @@ impl ServerImpl {
     /// follow-ups the apply produced. Returns the status the source classifies
     /// (`200` delivered, `503` not the leader, otherwise the apply's status).
     /// Wakes pollers in case the correlation advanced a token onto a service task.
-    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) -> (u16, String) {
+    /// `operation_reference` is the originating request's `operationReference`
+    /// (#1600), stamped on every record the routed apply produces here and
+    /// carried onward on any follow-ups they route.
+    pub(crate) async fn apply_routed_subscription_remote(
+        &self,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> (u16, String) {
         let num_partitions = self.engine.topology().num_partitions;
         let Some((target, command)) = Self::route_event(&event, num_partitions) else {
             return (400, "event is not a routable subscription follow-up".into());
         };
-        match self.apply_routed_command(target, command).await {
+        match self
+            .apply_routed_command(target, command, operation_reference)
+            .await
+        {
             RoutedApply::Applied(produced) => {
-                self.drive_subscription_routing(produced).await;
+                self.drive_subscription_routing(produced, operation_reference)
+                    .await;
                 self.signal_jobs_available();
                 (200, String::new())
             }
@@ -10101,7 +10196,9 @@ impl ServerImpl {
     /// (`OpenMessageSubscription` keys on the subscription), so fire-and-forget is
     /// safe even if the instance partition has not yet fsynced — a crash re-emits
     /// the Opening on replay and re-routes. A no-op single-partition.
-    fn spawn_routing_if_needed(&self, events: &[Event]) {
+    /// `operation_reference` is the source command's `operationReference` (#1600),
+    /// carried onto every record the routed follow-ups produce.
+    fn spawn_routing_if_needed(&self, events: &[Event], operation_reference: Option<i64>) {
         if self.engine.topology().num_partitions <= 1 {
             return;
         }
@@ -10123,7 +10220,9 @@ impl ServerImpl {
             .collect();
         let server = self.clone();
         tokio::spawn(async move {
-            server.drive_subscription_routing(routable).await;
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
         });
     }
 
@@ -10140,6 +10239,7 @@ impl ServerImpl {
         &self,
         events: &[Event],
         commit: Commit,
+        operation_reference: Option<i64>,
     ) -> (Commit, Option<tokio::task::JoinHandle<bool>>) {
         if self.engine.topology().num_partitions <= 1
             || !Self::has_routable_subscription_events(events)
@@ -10156,7 +10256,9 @@ impl ServerImpl {
                 );
                 return false;
             }
-            server.drive_subscription_routing(routable).await;
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
             true
         });
         (caller, Some(task))
@@ -10261,8 +10363,9 @@ impl ServerImpl {
                 // open (the create-then-publish ordering clients rely on,
                 // #1582). The wait is bounded by the re-drive budget, and a
                 // dropped receiver (caller cancelled) is fine: routing already
-                // ran to completion inside this detached task.
-                server.drive_subscription_routing(routable).await;
+                // ran to completion inside this detached task. The create path
+                // maps no `operationReference` yet (#1602) — `None`.
+                server.drive_subscription_routing(routable, None).await;
                 server.signal_jobs_available();
                 let _ = tx.send(outcome);
                 return;
@@ -11799,12 +11902,16 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // The synced spec's `MessagePublicationRequest` has no
+        // `operationReference` yet (it arrives with the camunda#67491
+        // re-sync); the request-mapping seam passes `None` until then.
         let (message_key, _instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -11855,12 +11962,15 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // `MessageCorrelationRequest` has no `operationReference` in the synced
+        // spec yet (it arrives with the camunda#67491 re-sync) — `None` here.
         let (message_key, correlated_instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -13206,146 +13316,19 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
-        // The `variables` filter constrains results to instances whose
-        // process-scoped (root) variables match. Pre-index those variables by
-        // instance only when a variable filter is actually present, so the
-        // common (no variable-filter) path pays nothing for the extra scan.
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match filter {
-            Some(f) if f.variables.as_ref().is_some_and(|v| !v.is_empty()) => {
-                // Only the variable names referenced by the filter can affect
-                // the match, so restrict the index to that set. This keeps the
-                // scan a single pass while avoiding HashMap churn for unrelated
-                // variable names in a large store.
-                let requested: std::collections::HashSet<&str> = f
-                    .variables
-                    .as_ref()
-                    .map(|v| v.iter().map(|entry| entry.name.as_str()).collect())
-                    .unwrap_or_default();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = match filter {
-            Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
-                f,
-                &InstanceCrossEntityIndex::sources_for(f, &self.store),
-            ),
-            _ => InstanceCrossEntityIndex::default(),
-        };
-
+        // One shared matcher (the same algebra the batch-selection path uses),
+        // honouring every top-level field AND the `$or` clause list (#1293).
+        let matcher = filter.map(|f| ProcessInstanceMatcher::new(f, &self.store));
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
-            .filter(|inst| match filter {
-                None => true,
-                Some(f) => {
-                    let state_str = process_instance_state_enum(inst.state).to_string();
-                    query::match_process_instance_key(
-                        &f.process_instance_key,
-                        &inst.key.to_string(),
-                    ) && query::match_process_definition_key(
-                        &f.process_definition_key,
-                        &inst.process_definition_key,
-                    ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
-                        && query::match_integer(
-                            &f.process_definition_version,
-                            Some(i64::from(inst.version)),
-                        )
-                        && query::match_process_instance_state(&f.state, &state_str)
-                        && f.has_incident.is_none_or(|want| want == inst.has_incident)
-                        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
-                        // Nano does not yet project a process-instance completion
-                        // timestamp, so an `endDate` filter matches against an
-                        // absent value: range/equality operators correctly exclude
-                        // (honest, not silently ignored) while `$exists: false`
-                        // still matches.
-                        && query::match_date_time_ms(&f.end_date, None)
-                        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
-                        // `suspendedDate`: read straight from the read-model's
-                        // `suspended_date_ms` (the single source of truth for
-                        // suspension) — a datetime while suspended, absent otherwise.
-                        && query::match_date_time_ms(
-                            &f.suspended_date,
-                            inst.suspended_date_ms.map(|ms| ms as i64),
-                        )
-                        // Nano is single-tenant: every instance's `tenantId` is the
-                        // `<default>` constant, so honour the filter against it.
-                        && query::match_string(&f.tenant_id, "<default>")
-                        // `processDefinitionName` / `processDefinitionVersionTag` are
-                        // never projected (always null in `process_instance_result`),
-                        // so match against an absent value: equality / `$like` /
-                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
-                        // matches.
-                        && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.process_definition_version_tag, None)
-                        // Call-activity hierarchy filters (C8 parity, issue
-                        // #977): a bare parent key enumerates the direct children
-                        // of that instance; `$exists:false` selects top-level
-                        // instances. A top-level instance carries no parent, so
-                        // its parent keys match against an absent value.
-                        && query::match_process_instance_key_opt(
-                            &f.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        && query::match_element_instance_key_opt(
-                            &f.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        // The read model does not project the definition's
-                        // display name or version tag onto the instance row, so
-                        // those filters match against an absent value — value
-                        // operators exclude (honest, never silently widening)
-                        // while `$exists: false` still matches (the `endDate`
-                        // convention above).
-                        && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.process_definition_version_tag, None)
-                        // `suspendedDate` is the nullable column the read model
-                        // maintains (the single source of truth for suspension).
-                        && query::match_date_time_ms(
-                            &f.suspended_date,
-                            inst.suspended_date_ms.map(|ms| ms as i64),
-                        )
-                        // Camunda's `tags` filter is a conjunction: an instance
-                        // must carry every listed tag.
-                        && f.tags.as_ref().is_none_or(|tags| {
-                            tags.iter().all(|t| inst.tags.contains(&t.0))
-                        })
-                        && match_instance_variables(
-                            &f.variables,
-                            variables_index.get(&inst.key),
-                        )
-                        && match_instance_tags(&f.tags, &inst.tags)
-                        // Inherited element / job / incident / batch-operation
-                        // filters (C8 parity): existential predicates over the
-                        // instance's child rows, evaluated against the
-                        // pre-indexed cross-entity index.
-                        && match_instance_cross_entity_filters(f, inst.key, &cross_index)
-                }
+            .filter(|inst| {
+                matcher.as_ref().is_none_or(|m| {
+                    m.matches(
+                        inst,
+                        ProcessInstanceStatePolicy::HonourFilter,
+                        BatchHierarchyPolicy::HonourFilters,
+                    )
+                })
             })
             .collect();
 
@@ -14643,7 +14626,7 @@ impl ServerImpl {
         // barrier is handed back and a caller's own `commit.wait()` is a harmless
         // no-op.
         commit.wait().await;
-        self.spawn_routing_if_needed(&events);
+        self.spawn_routing_if_needed(&events, operation_reference);
         self.observe_job_sojourn(&events, now_millis());
         self.record_adhoc_events(&events);
         Ok((events, Commit::ready()))
@@ -14920,10 +14903,15 @@ impl ServerImpl {
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let tasks = self.store.user_tasks();
+        // Variable-store join for `processInstanceVariables` / `localVariables`
+        // (#1293), built only for the names the filter references.
+        let variables = filter
+            .map(|f| UserTaskVariableIndex::new(f, &self.store))
+            .unwrap_or_default();
 
         let mut matched: Vec<&readstore::UserTaskRow> = tasks
             .iter()
-            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f)))
+            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f, &variables)))
             .collect();
 
         let sort = query::sort_keys(
@@ -15965,7 +15953,9 @@ impl ServerImpl {
                 .await
             {
                 Ok((result, events)) => {
-                    self.broadcast_deployment(&events).await;
+                    // The synced spec's deployment request has no
+                    // `operationReference` yet (camunda#67491 re-sync) — `None`.
+                    self.broadcast_deployment(&events, None).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
                 Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
@@ -16551,7 +16541,9 @@ impl ServerImpl {
             )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
-        self.broadcast_deployment(&events).await;
+        // The synced spec's deployment request carries no `operationReference`
+        // yet (it arrives with the camunda#67491 re-sync) — `None` here.
+        self.broadcast_deployment(&events, None).await;
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
     }
 
@@ -16569,7 +16561,15 @@ impl ServerImpl {
     /// definition. The durable owner's guard is released BEFORE the sibling
     /// fan-out (the durable commit is the serialized part; the in-memory
     /// sibling copies need no mutual ordering against each other).
-    pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
+    ///
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1556 step 4, #1600), stamped on the durable copies of the deployment
+    /// records this node journals.
+    pub async fn install_replicated_deployment(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         let handles = self.engine.all();
         let events = Arc::new(events);
         let durable = {
@@ -16577,7 +16577,9 @@ impl ServerImpl {
             // Owner's durable commit under its shared guard.
             let _lifecycle = handles[0].lifecycle_shared().await;
             handles[0]
-                .with(move |journal| journal.install_deployment_durable(&events))
+                .with(move |journal| {
+                    journal.install_deployment_durable_ref(&events, operation_reference)
+                })
                 .await
         };
         for handle in handles.iter().skip(1) {
@@ -16631,7 +16633,14 @@ impl ServerImpl {
     /// that is briefly unreachable is logged and skipped (a runtime deploy assumes
     /// the cluster is up; the startup seed broadcast retries until acknowledged).
     /// A no-op for a single-node cluster.
-    async fn broadcast_deployment(&self, events: &Arc<Vec<Event>>) {
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1600): it rides the `InstallDeployment` frame so each peer's durable
+    /// copies of the deployment records carry it.
+    async fn broadcast_deployment(
+        &self,
+        events: &Arc<Vec<Event>>,
+        operation_reference: Option<i64>,
+    ) {
         if !self.peers.has_peers() {
             return;
         }
@@ -16659,7 +16668,10 @@ impl ServerImpl {
             }
             match self.peers.link(node).await {
                 Ok(link) => {
-                    if let Err(e) = link.install_deployment(deployed.clone()).await {
+                    if let Err(e) = link
+                        .install_deployment(deployed.clone(), operation_reference)
+                        .await
+                    {
                         tracing::warn!("deploy broadcast to node {node} failed: {e}");
                     }
                 }
@@ -16701,8 +16713,13 @@ impl ServerImpl {
                 // not resent (install is idempotent per key either way).
                 let mut batch_idx = 0;
                 while batch_idx < batches.len() {
+                    // The startup seed replays RECOVERED definitions, not one
+                    // caller's deploy: there is no originating request whose
+                    // `operationReference` could stamp them (#1600) — `None`.
                     match server.peers.link(node).await {
-                        Ok(link) => match link.install_deployment(batches[batch_idx].clone()).await
+                        Ok(link) => match link
+                            .install_deployment(batches[batch_idx].clone(), None)
+                            .await
                         {
                             Ok(_) => {
                                 batch_idx += 1;
@@ -21203,7 +21220,12 @@ impl ServerImpl {
                     // budget, and a dropped receiver (caller cancelled) is fine:
                     // routing already ran to completion inside this task.
                     if !routable.is_empty() {
-                        server.drive_subscription_routing(routable.clone()).await;
+                        // The synced spec's create-request instruction carries
+                        // `operationReference` on the *instruction*, but the
+                        // create path does not map it yet (#1602) — `None`.
+                        server
+                            .drive_subscription_routing(routable.clone(), None)
+                            .await;
                     }
                     server.signal_jobs_available();
                     let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
@@ -21407,7 +21429,7 @@ impl ServerImpl {
             }
             return Err((status, message));
         }
-        self.spawn_routing_if_needed(&response.events);
+        self.spawn_routing_if_needed(&response.events, operation_reference);
         self.observe_job_sojourn(&response.events, now_millis());
         self.record_adhoc_events(&response.events);
         Ok((Arc::new(response.events), Commit::ready()))
@@ -21507,7 +21529,10 @@ impl ServerImpl {
         result: Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
     ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
         result.map(|(events, commit)| {
-            let (commit, _routing) = self.route_after_durable(&events, commit);
+            // Stream job commands carry no `operationReference` (the synced
+            // spec's job-completion requests have none), so their routed
+            // follow-ups are unreferenced too.
+            let (commit, _routing) = self.route_after_durable(&events, commit, None);
             (events, commit)
         })
     }
@@ -22452,127 +22477,20 @@ impl ServerImpl {
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
-        // Pre-index root-scope variables by instance only when the filter
-        // actually constrains on them, restricted to the variable names the
-        // filter references (same construction as `search_process_instances_impl`).
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match &filter.variables {
-            Some(entries) if !entries.is_empty() => {
-                let requested: std::collections::HashSet<&str> =
-                    entries.iter().map(|entry| entry.name.as_str()).collect();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
-            InstanceCrossEntityIndex::new(
-                filter,
-                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
-            )
-        } else {
-            InstanceCrossEntityIndex::default()
-        };
+        // The same matcher `search_process_instances_impl` uses (one algebra,
+        // including `$or` — #1293: an ignored `$or` here would silently broaden
+        // a mutating batch), with the batch-specific state/hierarchy overrides.
+        let matcher = ProcessInstanceMatcher::new(filter, &self.store);
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
             .into_iter()
             .filter(|inst| {
-                // Batch operations are ACTIVE-only by contract; `filter.state` is
-                // ignored and overridden to ACTIVE (see the doc comment above).
-                let state_matches = matches!(inst.state, ProcessInstanceState::Active);
-                let hierarchy_matches = match honour_hierarchy {
-                    // Incident-resolution / search: honour the supplied
-                    // call-activity hierarchy predicates verbatim.
-                    BatchHierarchyPolicy::HonourFilters => {
-                        query::match_process_instance_key_opt(
-                            &filter.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        ) && query::match_element_instance_key_opt(
-                            &filter.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                    }
-                    // Cancellation: ignore the supplied parent filters and target
-                    // only root instances (spec §371-375) — never active children.
-                    BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
-                };
-                query::match_process_instance_key(
-                    &filter.process_instance_key,
-                    &inst.key.to_string(),
-                ) && query::match_process_definition_key(
-                    &filter.process_definition_key,
-                    &inst.process_definition_key,
-                ) && query::match_string(&filter.process_definition_id, &inst.process_definition_id)
-                    && query::match_integer(
-                        &filter.process_definition_version,
-                        Some(i64::from(inst.version)),
-                    )
-                    && state_matches
-                    && filter
-                        .has_incident
-                        .is_none_or(|want| want == inst.has_incident)
-                    && query::match_date_time_ms(
-                        &filter.start_date,
-                        Some(inst.start_date_ms as i64),
-                    )
-                    && query::match_date_time_ms(&filter.end_date, None)
-                    && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
-                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
-                    // single source of truth. A batch is ACTIVE-only, so a matched
-                    // instance is never suspended and the value is always absent —
-                    // `$exists: true` / value operators then correctly exclude
-                    // every candidate (fail closed) instead of silently broadening.
-                    && query::match_date_time_ms(
-                        &filter.suspended_date,
-                        inst.suspended_date_ms.map(|ms| ms as i64),
-                    )
-                    // Nano is single-tenant: every instance's `tenantId` is the
-                    // `<default>` constant, so honour the filter against it.
-                    && query::match_string(&filter.tenant_id, "<default>")
-                    // `processDefinitionName` / `processDefinitionVersionTag` are
-                    // never projected (always null in `process_instance_result`), so
-                    // match against an absent value: equality / `$like` / `$in` /
-                    // `$exists: true` correctly exclude, `$exists: false` matches.
-                    && query::match_string_opt(&filter.process_definition_name, None)
-                    && query::match_string_opt(&filter.process_definition_version_tag, None)
-                    // Call-activity hierarchy filters (C8 parity, issue #977),
-                    // gated per the per-operation contract above.
-                    && hierarchy_matches
-                    && match_instance_variables(
-                        &filter.variables,
-                        variables_index.get(&inst.key),
-                    )
-                    && match_instance_tags(&filter.tags, &inst.tags)
-                    // Inherited element / job / incident / batch-operation
-                    // filters (C8 parity): existential predicates over the
-                    // instance's child rows, evaluated against the pre-indexed
-                    // cross-entity index so a nonmatching instance is excluded
-                    // from the batch instead of silently broadening it.
-                    && match_instance_cross_entity_filters(filter, inst.key, &cross_index)
+                matcher.matches(
+                    inst,
+                    ProcessInstanceStatePolicy::ActiveOnly,
+                    honour_hierarchy,
+                )
             })
             .map(|inst| inst.key)
             .collect();
@@ -23737,8 +23655,8 @@ fn decision_instance_get_result(
 ///
 /// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
 /// (element instances, jobs, incidents) is scanned only when a filter that
-/// reads it is supplied, mirroring the `variables_index` construction in
-/// `search_process_instances_impl`.
+/// reads it is supplied — at the top level or in any `$or` clause — mirroring
+/// the `variables_index` construction in `search_process_instances_impl`.
 #[derive(Default)]
 struct InstanceCrossEntityIndex {
     /// `instance_key → its element instances` (for the element predicates).
@@ -23781,15 +23699,16 @@ struct CrossEntitySources {
 }
 
 impl InstanceCrossEntityIndex {
-    /// Builds the index, populating only the maps the supplied `filter`
-    /// actually constrains on and reading only the sources in `sources`.
+    /// Builds the index, populating only the maps the supplied `filters`
+    /// (the base filter plus every `$or` clause) actually constrain on and
+    /// reading only the sources in `sources`.
     #[allow(
         clippy::expect_used,
-        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filters read, so a missing source here is a wiring bug between the two, not a runtime condition"
     )]
-    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
+    fn new(filters: &[&models::ProcessInstanceFilter], sources: &CrossEntitySources) -> Self {
         let mut idx = InstanceCrossEntityIndex::default();
-        if Self::needs_elements(filter) {
+        if Self::needs_elements_any(filters) {
             let rows = sources
                 .element_instances
                 .as_deref()
@@ -23805,7 +23724,7 @@ impl InstanceCrossEntityIndex {
                     });
             }
         }
-        if filter.error_message.is_some() {
+        if filters.iter().any(|f| f.error_message.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -23829,7 +23748,7 @@ impl InstanceCrossEntityIndex {
                     .push(i.reason.clone());
             }
         }
-        if filter.has_retries_left.is_some() {
+        if filters.iter().any(|f| f.has_retries_left.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -23852,15 +23771,31 @@ impl InstanceCrossEntityIndex {
             || filter.has_element_instance_incident.is_some()
     }
 
+    /// [`Self::needs_elements`] over every group of one query (base + `$or`
+    /// clauses).
+    fn needs_elements_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_elements(f))
+    }
+
     /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
     /// is present.
     fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some() || filter.has_retries_left.is_some()
     }
 
+    /// [`Self::needs_jobs`] over every group of one query.
+    fn needs_jobs_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_jobs(f))
+    }
+
     /// Whether any incident-reading predicate (`errorMessage`) is present.
     fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some()
+    }
+
+    /// [`Self::needs_incidents`] over every group of one query.
+    fn needs_incidents_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_incidents(f))
     }
 
     /// Whether any cross-entity filter is present (so the caller can skip
@@ -23869,20 +23804,21 @@ impl InstanceCrossEntityIndex {
         Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
     }
 
-    /// Loads exactly the child-row sources `filter` reads: the element-instance
-    /// table only when an element predicate is present, jobs only for
-    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
-    /// so an `elementId`-only query never scans the job or incident tables.
-    /// Shared by the search and batch-selection paths so both honour the same
+    /// Loads exactly the child-row sources the supplied `filters` (the base
+    /// filter plus every `$or` clause) read: the element-instance table only
+    /// when an element predicate is present, jobs only for `errorMessage` /
+    /// `hasRetriesLeft`, incidents only for `errorMessage` — so an
+    /// `elementId`-only query never scans the job or incident tables. Shared
+    /// by the search and batch-selection paths so both honour the same
     /// lazy-source contract.
     fn sources_for(
-        filter: &models::ProcessInstanceFilter,
+        filters: &[&models::ProcessInstanceFilter],
         store: &readstore::ReadModel,
     ) -> CrossEntitySources {
         CrossEntitySources {
-            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
-            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
-            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+            element_instances: Self::needs_elements_any(filters).then(|| store.element_instances()),
+            jobs: Self::needs_jobs_any(filters).then(|| store.jobs()),
+            incidents: Self::needs_incidents_any(filters).then(|| store.incidents()),
         }
     }
 }
@@ -24023,6 +23959,281 @@ fn match_instance_variables(
             query::match_string_property(&entry.value, value)
         }),
     }
+}
+
+/// How a [`ProcessInstanceMatcher`] treats the filter's `state` field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcessInstanceStatePolicy {
+    /// Search: honour the supplied `state` predicate.
+    HonourFilter,
+    /// Process-instance batch operations: `state` is ignored and overridden to
+    /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
+    ActiveOnly,
+}
+
+/// One AND-group of a process-instance filter (the top-level fields, or one
+/// `$or` clause). Indexes are NOT per-group: they live once on the
+/// [`ProcessInstanceMatcher`] so N `$or` clauses never build N copies.
+struct ProcessInstanceFilterGroup {
+    filter: models::ProcessInstanceFilter,
+}
+
+/// Query-level indexes shared by every group of one [`ProcessInstanceMatcher`].
+struct ProcessInstanceIndexes {
+    /// Root variables for the UNION of variable names referenced by the base
+    /// filter and every `$or` clause — one scan, one map.
+    variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    /// Cross-entity (element / job / incident) index, built from the UNION of
+    /// the base filter and every `$or` clause: the clause shape
+    /// (`ProcessInstanceFilterFields`) carries the same cross-entity fields the
+    /// top-level filter does, so a clause-only `elementId` / `hasRetriesLeft` /
+    /// `errorMessage` must populate the index too — otherwise it matches
+    /// against an empty index (missed matches, or overbroad `false` matches).
+    cross: InstanceCrossEntityIndex,
+}
+
+/// The single process-instance filter predicate, shared by
+/// `searchProcessInstances` and every process-instance batch creator so the
+/// two can never drift. Honours every top-level field AND, when a non-empty
+/// `$or` list is present, requires at least one clause to match (each clause an
+/// AND of its own fields) — #1293.
+struct ProcessInstanceMatcher {
+    base: ProcessInstanceFilterGroup,
+    or_clauses: Vec<ProcessInstanceFilterGroup>,
+    indexes: ProcessInstanceIndexes,
+}
+
+impl ProcessInstanceMatcher {
+    fn new(filter: &models::ProcessInstanceFilter, store: &readstore::ReadModel) -> Self {
+        let mut base = filter.clone();
+        let clauses: Vec<models::ProcessInstanceFilter> = base
+            .dollar_or
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(process_instance_or_clause)
+            .collect();
+        let variable_names: std::collections::HashSet<String> = std::iter::once(&base)
+            .chain(clauses.iter())
+            .filter_map(|f| f.variables.as_ref())
+            .flatten()
+            .map(|e| e.name.clone())
+            .collect();
+        // One cross-entity index for the whole query, built from every group
+        // that can carry element / job / incident predicates: the base filter
+        // AND each `$or` clause (the clause schema carries the same fields).
+        // `needs_elements` / `needs_jobs` / `needs_incidents` keep the build
+        // lazy — a source table is loaded only when some group reads it.
+        let index_groups: Vec<&models::ProcessInstanceFilter> =
+            std::iter::once(&base).chain(clauses.iter()).collect();
+        let indexes = ProcessInstanceIndexes {
+            variables: root_variables_index(&variable_names, store),
+            cross: if index_groups
+                .iter()
+                .any(|f| InstanceCrossEntityIndex::is_needed(f))
+            {
+                InstanceCrossEntityIndex::new(
+                    &index_groups,
+                    &InstanceCrossEntityIndex::sources_for(&index_groups, store),
+                )
+            } else {
+                InstanceCrossEntityIndex::default()
+            },
+        };
+        ProcessInstanceMatcher {
+            base: ProcessInstanceFilterGroup { filter: base },
+            or_clauses: clauses
+                .into_iter()
+                .map(|filter| ProcessInstanceFilterGroup { filter })
+                .collect(),
+            indexes,
+        }
+    }
+
+    fn matches(
+        &self,
+        inst: &readstore::ProcessInstanceRow,
+        state_policy: ProcessInstanceStatePolicy,
+        hierarchy: BatchHierarchyPolicy,
+    ) -> bool {
+        let state_ok = match state_policy {
+            ProcessInstanceStatePolicy::HonourFilter => true,
+            ProcessInstanceStatePolicy::ActiveOnly => {
+                matches!(inst.state, ProcessInstanceState::Active)
+            }
+        };
+        let root_ok = match hierarchy {
+            BatchHierarchyPolicy::HonourFilters => true,
+            // Cancellation: only root instances, never active children.
+            BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
+        };
+        state_ok
+            && root_ok
+            && match_process_instance_group(
+                inst,
+                &self.base,
+                &self.indexes,
+                state_policy,
+                hierarchy,
+            )
+            && (self.or_clauses.is_empty()
+                || self.or_clauses.iter().any(|g| {
+                    match_process_instance_group(inst, g, &self.indexes, state_policy, hierarchy)
+                }))
+    }
+}
+
+/// Lifts one `$or` clause into a `ProcessInstanceFilter` (no nested `$or`).
+/// Exhaustive destructuring: a field added to the clause schema fails to
+/// compile here instead of being silently dropped.
+fn process_instance_or_clause(
+    c: models::ProcessInstanceFilterFields,
+) -> models::ProcessInstanceFilter {
+    let models::ProcessInstanceFilterFields {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+    } = c;
+    models::ProcessInstanceFilter {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+        dollar_or: None,
+    }
+}
+
+/// Indexes process-scoped (root) variables by instance, restricted to the
+/// `requested` variable names; empty (no scan) when none are requested.
+fn root_variables_index(
+    requested: &std::collections::HashSet<String>,
+    store: &readstore::ReadModel,
+) -> std::collections::HashMap<u64, std::collections::HashMap<String, String>> {
+    let mut idx: std::collections::HashMap<u64, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    if requested.is_empty() {
+        return idx;
+    }
+    for v in store.variables() {
+        // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
+        if v.scope_key == v.instance_key && requested.contains(&v.name) {
+            idx.entry(v.instance_key)
+                .or_default()
+                .insert(v.name, v.value);
+        }
+    }
+    idx
+}
+
+/// Evaluates one AND-group of process-instance filter fields.
+fn match_process_instance_group(
+    inst: &readstore::ProcessInstanceRow,
+    g: &ProcessInstanceFilterGroup,
+    idx: &ProcessInstanceIndexes,
+    state_policy: ProcessInstanceStatePolicy,
+    hierarchy: BatchHierarchyPolicy,
+) -> bool {
+    let f = &g.filter;
+    let state_ok = match state_policy {
+        ProcessInstanceStatePolicy::HonourFilter => query::match_process_instance_state(
+            &f.state,
+            &process_instance_state_enum(inst.state).to_string(),
+        ),
+        // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
+        ProcessInstanceStatePolicy::ActiveOnly => true,
+    };
+    // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
+    // enumerates direct children; `$exists:false` selects top-level instances.
+    // Cancellation (`RootOnly`) ignores them (the caller enforces root-only).
+    let hierarchy_ok = match hierarchy {
+        BatchHierarchyPolicy::HonourFilters => {
+            query::match_process_instance_key_opt(
+                &f.parent_process_instance_key,
+                inst.parent_process_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            ) && query::match_element_instance_key_opt(
+                &f.parent_element_instance_key,
+                inst.parent_element_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            )
+        }
+        BatchHierarchyPolicy::RootOnly => true,
+    };
+    state_ok
+        && hierarchy_ok
+        && query::match_process_instance_key(&f.process_instance_key, &inst.key.to_string())
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inst.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inst.process_definition_id)
+        && query::match_integer(&f.process_definition_version, Some(i64::from(inst.version)))
+        && f.has_incident.is_none_or(|want| want == inst.has_incident)
+        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
+        // No projected completion timestamp: `endDate` matches an absent value
+        // (value operators exclude, `$exists: false` matches).
+        && query::match_date_time_ms(&f.end_date, None)
+        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+        // `suspended_date_ms` is the single source of truth for suspension.
+        && query::match_date_time_ms(
+            &f.suspended_date,
+            inst.suspended_date_ms.map(|ms| ms as i64),
+        )
+        // Single-tenant: every instance's `tenantId` is `<default>`.
+        && query::match_string(&f.tenant_id, "<default>")
+        // Never projected (always null in `process_instance_result`): matched
+        // against an absent value.
+        && query::match_string_opt(&f.process_definition_name, None)
+        && query::match_string_opt(&f.process_definition_version_tag, None)
+        && match_instance_variables(&f.variables, idx.variables.get(&inst.key))
+        && match_instance_tags(&f.tags, &inst.tags)
+        // Inherited element / job / incident / batch-operation filters.
+        && match_instance_cross_entity_filters(f, inst.key, &idx.cross)
 }
 
 /// Matches the `tags` filter against an instance's carried tags. Every
@@ -24319,10 +24530,14 @@ fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilte
 /// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
 /// absent value: value operators exclude the row (honest, never silently
 /// widening the search) while `$exists: false` still matches. The variable
-/// filters (`processInstanceVariables` / `localVariables`) are NOT evaluated
-/// here — they need a variable-store join this predicate cannot see, so the
-/// MCP adapter rejects them instead of letting them widen results silently.
-fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
+/// filters match through `vars` (#1293): `processInstanceVariables` against
+/// the owning instance's root-scope variables, `localVariables` against the
+/// variables held at the task's element-instance scope.
+fn match_user_task_fields(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilterFields,
+    vars: &UserTaskVariableIndex,
+) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
     // The task's due/follow-up dates are stored as RFC 3339 strings; project
     // them to epoch millis for the date-time filter algebra. An unparseable or
@@ -24380,6 +24595,61 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
         // tag excludes the row.
         && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
         && query::match_string_opt(&f.tenant_id, None)
+        && match_instance_variables(
+            &f.process_instance_variables,
+            vars.process_instance.get(&task.instance_key),
+        )
+        && match_instance_variables(
+            &f.local_variables,
+            vars.local.get(&task.element_instance_key),
+        )
+}
+
+/// `name -> serialized value` maps keyed by instance (root scope) and by
+/// element-instance scope, restricted to the variable names a user-task filter
+/// references (empty — no scan — when it references none).
+#[derive(Default)]
+struct UserTaskVariableIndex {
+    process_instance: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    local: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+}
+
+impl UserTaskVariableIndex {
+    fn new(f: &models::UserTaskFilter, store: &readstore::ReadModel) -> Self {
+        let mut groups = vec![user_task_filter_base(f)];
+        groups.extend(f.dollar_or.iter().flatten().cloned());
+        let names = |pick: fn(
+            &models::UserTaskFilterFields,
+        ) -> &Option<Vec<models::VariableValueFilterProperty>>| {
+            groups
+                .iter()
+                .filter_map(|g| pick(g).as_ref())
+                .flatten()
+                .map(|e| e.name.clone())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let root_names = names(|g| &g.process_instance_variables);
+        let local_names = names(|g| &g.local_variables);
+        let mut idx = UserTaskVariableIndex::default();
+        if root_names.is_empty() && local_names.is_empty() {
+            return idx;
+        }
+        for v in store.variables() {
+            if v.scope_key == v.instance_key && root_names.contains(&v.name) {
+                idx.process_instance
+                    .entry(v.instance_key)
+                    .or_default()
+                    .insert(v.name.clone(), v.value.clone());
+            }
+            if local_names.contains(&v.name) {
+                idx.local
+                    .entry(v.scope_key)
+                    .or_default()
+                    .insert(v.name, v.value);
+            }
+        }
+        idx
+    }
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -24436,12 +24706,16 @@ fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFi
 
 /// Full user-task filter match: every top-level field AND, when a non-empty
 /// `$or` list is present, at least one clause (each an AND of its fields).
-fn match_user_task_filter(task: &readstore::UserTaskRow, f: &models::UserTaskFilter) -> bool {
-    match_user_task_fields(task, &user_task_filter_base(f))
+fn match_user_task_filter(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilter,
+    vars: &UserTaskVariableIndex,
+) -> bool {
+    match_user_task_fields(task, &user_task_filter_base(f), vars)
         && match &f.dollar_or {
-            Some(clauses) if !clauses.is_empty() => {
-                clauses.iter().any(|c| match_user_task_fields(task, c))
-            }
+            Some(clauses) if !clauses.is_empty() => clauses
+                .iter()
+                .any(|c| match_user_task_fields(task, c, vars)),
             _ => true,
         }
 }
@@ -30016,7 +30290,9 @@ async fn main() {
                     routable.append(&mut r);
                 }
                 if !routable.is_empty() {
-                    tick_server.drive_subscription_routing(routable).await;
+                    // Clock-tick follow-ups originate from no caller request, so
+                    // there is no `operationReference` to carry (#1600) — `None`.
+                    tick_server.drive_subscription_routing(routable, None).await;
                 }
                 if produced {
                     jobs_available.notify_waiters();
@@ -31252,7 +31528,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         // Every historical key resolves on EVERY partition the peer owns — the
         // same resolution the deployment partition offers.
@@ -32103,7 +32379,7 @@ mod clustered_startup_tests {
 
         // The install cannot complete its durable commit while the rebuild
         // holds the lock: poll it in-line and assert it is still pending.
-        let mut install = Box::pin(node1.install_replicated_deployment(events));
+        let mut install = Box::pin(node1.install_replicated_deployment(events, None));
         use std::future::Future;
         use std::task::Poll;
         let pending =
@@ -32180,7 +32456,7 @@ mod clustered_startup_tests {
         // Installing the broadcast deployment makes the peer able to create.
         let events = demo_deployment_events().await;
         assert!(!events.is_empty());
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         let (key, completed) = node1
             .create_for_stream(Some("demo".into()), None, Default::default())
@@ -32241,7 +32517,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node0.broadcast_deployment(&Arc::new(events)).await;
+        node0.broadcast_deployment(&Arc::new(events), None).await;
 
         // The peer can now create the demo (the install rode the wire end-to-end).
         let (_, completed) = node1
@@ -32780,6 +33056,7 @@ mod clustered_startup_tests {
                 String::new(),
                 None,
                 Some("order-7".into()),
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -32885,7 +33162,7 @@ mod clustered_startup_tests {
         );
 
         let (message_key, instance) = node2
-            .correlate_message_cluster("order-placed".into(), String::new(), None, None)
+            .correlate_message_cluster("order-placed".into(), String::new(), None, None, None)
             .await
             .expect("correlation with a valid business id never panics on a no-local-target node");
         assert!(
@@ -32964,7 +33241,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -33005,7 +33284,7 @@ mod clustered_startup_tests {
         // 1), so the publish fans to node 1, which correlates and routes the
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
-            .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
+            .correlate_message_cluster("payment-received".into(), order.clone(), None, None, None)
             .await
             .expect("correlation with a valid business id");
         assert_eq!(
@@ -34805,6 +35084,403 @@ mod clustered_startup_tests {
         // An empty $or list places no constraint.
         let empty = search(or_filter(None, vec![])).await;
         assert_eq!(empty.len(), 3);
+    }
+
+    /// Deploys a one-user-task process and starts one instance per `tier`
+    /// value (root variable `tier`), waiting until the read model has
+    /// projected every task and root variable. Returns the instance keys.
+    async fn deploy_tiered_user_task_instances(server: &ServerImpl, tiers: &[&str]) -> Vec<u64> {
+        let def = ProcessBuilder::new("tiered")
+            .start_event("s")
+            .user_task("review")
+            // A same-named task-LOCAL shadow (`tier = "local-<tier>"`) via an
+            // input mapping, so `localVariables` vs `processInstanceVariables`
+            // filters are distinguishable per scope.
+            .with_io(
+                "review",
+                nanobpmn_engine_core::IoMapping {
+                    inputs: vec![nanobpmn_engine_core::Mapping {
+                        source: "=\"local-\" + tier".into(),
+                        target: "tier".into(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("tiered".to_string(), "tiered.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut instances = Vec::new();
+        for tier in tiers {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert(
+                "tier".to_string(),
+                nanobpmn_engine_core::Value::Str((*tier).into()),
+            );
+            let (k, _) = server
+                .create_for_stream(Some("tiered".into()), None, vars)
+                .await
+                .expect("create instance");
+            instances.push(k);
+        }
+        for _ in 0..500 {
+            let root_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key == v.instance_key)
+                .count();
+            let local_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key != v.instance_key)
+                .count();
+            if server.store.user_tasks().len() == tiers.len()
+                && root_vars == tiers.len()
+                && local_vars == tiers.len()
+            {
+                return instances;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("read model never projected the tiered instances");
+    }
+
+    fn tier_filter(tier: &str) -> Option<Vec<models::VariableValueFilterProperty>> {
+        Some(vec![models::VariableValueFilterProperty::new(
+            "tier".to_string(),
+            models::StringFilterProperty::String(format!("\"{tier}\"")),
+        )])
+    }
+
+    /// `ProcessInstanceFilter.$or` (#1293): top-level fields AND any one clause.
+    /// Previously the clause list was silently ignored, so the search — and,
+    /// worse, a mutating batch selection sharing the same filter — returned a
+    /// superset.
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_or_clauses() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let pik = |k: u64| {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(k.to_string()),
+                ),
+            )
+        };
+        let by_key = |k: u64| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.process_instance_key = pik(k);
+            c
+        };
+        let by_tier = |t: &str| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.variables = tier_filter(t);
+            c
+        };
+        let or_filter = |top: Option<u64>, clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.process_instance_key = top.and_then(pik);
+            f.dollar_or = Some(clauses);
+            f
+        };
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        // Any one clause (a key clause, or a variable clause) → the union.
+        let either = or_filter(None, vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(
+            search(either.clone()).await,
+            vec![instances[0], instances[1]]
+        );
+        // The batch-selection path shares the matcher: same union, never all.
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::HonourFilters),
+            vec![instances[0], instances[1]]
+        );
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::RootOnly),
+            vec![instances[0], instances[1]]
+        );
+
+        // Top-level fields AND the $or: only the overlap survives.
+        let overlap = or_filter(Some(instances[1]), vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(search(overlap).await, vec![instances[1]]);
+
+        // No clause matches → nothing (not the unfiltered superset).
+        assert!(
+            search(or_filter(None, vec![by_tier("zzz")]))
+                .await
+                .is_empty()
+        );
+
+        // An empty $or list places no constraint.
+        assert_eq!(search(or_filter(None, vec![])).await.len(), 3);
+    }
+
+    /// Clause-only cross-entity predicates (#1293 review): the `$or` clause
+    /// schema carries the same element / job / incident fields as the top-level
+    /// filter, so the shared cross-entity index must be built from the UNION of
+    /// the base filter and every clause. A clause-only `elementId` must find
+    /// its instances (an index built from the base alone is empty, so the
+    /// clause misses them); a clause-only `hasRetriesLeft: false` must still
+    /// EXCLUDE instances whose failed jobs have retries (against an empty index
+    /// every instance reads `false`, silently broadening a mutating batch).
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_clause_only_cross_entity_predicates() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let job_created = |job_key: u64, instance_key: u64| Event::JobCreated {
+            job_key,
+            instance_key,
+            element_instance_key: job_key + 1,
+            element_id: "work".to_string(),
+            job_type: "t".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+        };
+        let job_failed = |job_key: u64, instance_key: u64, retries: i32| Event::JobFailed {
+            job_key,
+            instance_key,
+            retries,
+            worker: None,
+            error_message: Some("boom".to_string()),
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1),
+                &created(2),
+                &created(3),
+                &activated(1, 11, "review"),
+                &activated(2, 21, "approve"),
+                // Instance 1 has a failed job WITH retries left; instance 2's
+                // failed job is terminal.
+                &job_created(111, 1),
+                &job_failed(111, 1, 2),
+                &job_created(222, 2),
+                &job_failed(222, 2, 0),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+        let clause = |build: &dyn Fn(&mut models::ProcessInstanceFilterFields)| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            build(&mut c);
+            c
+        };
+        let or_filter = |clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.dollar_or = Some(clauses);
+            f
+        };
+
+        // Clause-only `elementId`: the clause matches only the instance
+        // carrying that element — on the search path AND the batch path.
+        let by_element = or_filter(vec![
+            clause(&|c| c.element_id = Some(s("review"))),
+            clause(&|c| c.element_id = Some(s("approve"))),
+        ]);
+        assert_eq!(search(by_element.clone()).await, vec![1, 2]);
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            assert_eq!(
+                server.batch_matched_process_instances(&by_element, policy),
+                vec![1, 2],
+                "clause-only elementId narrows the batch ({policy:?})"
+            );
+        }
+        // A single clause-only `elementId` finds its one instance (never the
+        // empty-index miss).
+        let one = or_filter(vec![clause(&|c| c.element_id = Some(s("review")))]);
+        assert_eq!(search(one.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&one, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+
+        // Clause-only `hasRetriesLeft`: `true` selects only instance 1...
+        let retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(true))]);
+        assert_eq!(search(retries.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&retries, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+        // ...and `false` must EXCLUDE instance 1 (its failed job still has
+        // retries) rather than matching every instance against an empty index.
+        let no_retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(false))]);
+        assert_eq!(search(no_retries.clone()).await, vec![2, 3]);
+        assert_eq!(
+            server
+                .batch_matched_process_instances(&no_retries, BatchHierarchyPolicy::HonourFilters),
+            vec![2, 3],
+            "clause-only hasRetriesLeft=false must not broaden the batch"
+        );
+
+        // Clause-only `errorMessage`: existential over job/incident messages.
+        let errored = or_filter(vec![clause(&|c| c.error_message = Some(s("boom")))]);
+        assert_eq!(search(errored.clone()).await, vec![1, 2]);
+        assert_eq!(
+            server.batch_matched_process_instances(&errored, BatchHierarchyPolicy::HonourFilters),
+            vec![1, 2]
+        );
+    }
+
+    /// `UserTaskFilter.processInstanceVariables` / `localVariables` (#1293):
+    /// matched via a variable-store join, at top level and inside `$or`.
+    #[tokio::test]
+    async fn user_task_search_honours_variable_filters() {
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let search = |filter: models::UserTaskFilter| {
+            let server = &server;
+            async move {
+                let q = models::UserTaskSearchQuery {
+                    sort: None,
+                    page: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheUserTaskSearchResult(r) =
+                    server.search_user_tasks_impl(&Some(q)).await.unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|t| t.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        let mut top = models::UserTaskFilter::new();
+        top.process_instance_variables = tier_filter("b");
+        assert_eq!(search(top).await, vec![instances[1]]);
+
+        let clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.process_instance_variables = tier_filter(t);
+            c
+        };
+        let mut either = models::UserTaskFilter::new();
+        either.dollar_or = Some(vec![clause("a"), clause("c")]);
+        assert_eq!(search(either).await, vec![instances[0], instances[2]]);
+
+        // The root `tier` value is not a task-local value (the local scope holds
+        // `"local-<tier>"`), so a `localVariables` filter on it excludes every
+        // task instead of being ignored.
+        let mut local = models::UserTaskFilter::new();
+        local.local_variables = tier_filter("a");
+        assert!(search(local).await.is_empty());
+
+        // Positive case: each task carries a task-LOCAL `tier = "local-<tier>"`
+        // (input mapping) shadowing its root `tier`, so only the owning task
+        // matches — at top level and inside `$or`.
+        let mut local_top = models::UserTaskFilter::new();
+        local_top.local_variables = tier_filter("local-b");
+        assert_eq!(search(local_top).await, vec![instances[1]]);
+        // The root value is NOT visible through localVariables...
+        let mut local_root = models::UserTaskFilter::new();
+        local_root.local_variables = tier_filter("b");
+        assert!(search(local_root).await.is_empty());
+        // ...and the local value is NOT visible through processInstanceVariables.
+        let mut root_local = models::UserTaskFilter::new();
+        root_local.process_instance_variables = tier_filter("local-b");
+        assert!(search(root_local).await.is_empty());
+        let local_clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.local_variables = tier_filter(t);
+            c
+        };
+        let mut local_or = models::UserTaskFilter::new();
+        local_or.dollar_or = Some(vec![local_clause("zzz"), local_clause("local-b")]);
+        assert_eq!(search(local_or).await, vec![instances[1]]);
     }
 
     #[tokio::test]
@@ -39197,7 +39873,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -39214,7 +39892,13 @@ mod clustered_startup_tests {
         // instance round-robin across all four partitions (1 & 3 on node 1).
         for i in 0..16u32 {
             node0
-                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
+                .correlate_message_cluster(
+                    "order-placed".into(),
+                    format!("order-{i}"),
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .expect("correlation with a valid business id");
         }
@@ -39946,7 +40630,7 @@ mod clustered_startup_tests {
         // node 1 owns no deployment partition, so install the demo over the wire
         // path (mirrors the centralized broadcast) before it can create.
         node1
-            .install_replicated_deployment(demo_deployment_events().await)
+            .install_replicated_deployment(demo_deployment_events().await, None)
             .await;
         let node1_url = serve_node(&node1).await;
 
@@ -41111,7 +41795,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -41325,7 +42011,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -41718,8 +42406,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -42055,8 +42747,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -43363,8 +44059,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy the DRG on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let before = raft_applied_total(&node0);
         let mut variables = std::collections::HashMap::new();
@@ -43572,7 +44272,7 @@ mod clustered_startup_tests {
         // the NEW partition-1 leader, and the routed continuation advances the
         // instance through partition 0's log.
         let (message_key, _) = node0
-            .correlate_message_cluster("go".into(), order_id, None, None)
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
             .await
             .expect("publish succeeds");
         assert!(message_key.is_some(), "the new leader minted a message key");
@@ -43738,7 +44438,7 @@ mod clustered_startup_tests {
             tap_replica_events(&node2, partition_of(instance_key)).await,
         ];
         let (message_key, _) = node0
-            .correlate_message_cluster("go".into(), order_id.clone(), None, None)
+            .correlate_message_cluster("go".into(), order_id.clone(), None, None, None)
             .await
             .expect("publish succeeds");
         assert!(message_key.is_some());
@@ -43779,7 +44479,7 @@ mod clustered_startup_tests {
             "no resurrected subscription (node2)"
         );
         let (_, correlated) = node0
-            .correlate_message_cluster("go".into(), order_id, None, None)
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
             .await
             .expect("second publish succeeds");
         assert_eq!(correlated, None, "nothing left to correlate");
@@ -48158,6 +48858,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -48174,6 +48875,182 @@ mod subscription_placement_tests {
             completed,
             "the instance completes after the cross-partition correlation is routed back"
         );
+    }
+
+    /// #1600 (#1556 step 4, red-first): a publish carrying an
+    /// `operationReference` stamps it on EVERY record the publish produces —
+    /// including the records produced on OTHER partitions by the routed
+    /// follow-up commands (the canonical subscription open on the hash
+    /// partition, the routed correlation back on the instance partition).
+    /// Upstream Zeebe leaves those cross-partition records unreferenced
+    /// (camunda/camunda#67542); Nano carries the reference end to end.
+    ///
+    /// Disk-backed (segmented shared writer): the assertion reads the journaled
+    /// record envelopes, not just the in-memory engine output, so it proves the
+    /// reference survives persistence on every partition the cascade touched.
+    #[tokio::test]
+    async fn cross_partition_publish_stamps_operation_reference_on_every_partition() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1600-routed-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        // Park an instance whose canonical subscription lives on a DIFFERENT
+        // partition: the Opening is routed there (a cross-partition follow-up).
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("order-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks at the message catch");
+            let p_inst = nanobpmn_engine_core::partition_of(key);
+            let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if p_sub != p_inst {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let p_inst = nanobpmn_engine_core::partition_of(instance_key);
+        let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+
+        // Publish WITH an operationReference: the local apply on the
+        // subscription partition, the routed correlation back on the instance
+        // partition — every record, everywhere — must carry it.
+        const REF: i64 = 0x1600;
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                order.clone(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+                Some(REF),
+            )
+            .await
+            .expect("correlation with a valid business id");
+        assert_eq!(correlated, Some(instance_key));
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(completed, "the routed correlation completes the instance");
+
+        // Every journaled record of the publish cascade carries REF. The
+        // publish's own records (`MessagePublished` + the match record on the
+        // subscription partition) and the routed `CorrelateMessageSubscription`
+        // records on the instance partition are disjoint from the deploy and
+        // create records, which carry NO reference.
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+
+        let publish_records: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, Event::MessagePublished { .. }))
+            .collect();
+        assert!(
+            !publish_records.is_empty(),
+            "the publish mints a MessagePublished record"
+        );
+        for record in &publish_records {
+            assert_eq!(
+                record.operation_reference,
+                Some(REF),
+                "MessagePublished on the publishing partition carries the reference: {record:?}"
+            );
+        }
+
+        // The routed correlation's records on the INSTANCE partition: the
+        // token advance + completion produced by the routed
+        // `CorrelateMessageSubscription` follow-up.
+        let instance_partition_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.event.instance_key() == Some(instance_key))
+            .collect();
+        let completion = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCompleted { .. }))
+            .expect("the routed correlation completes the instance");
+        assert_eq!(
+            completion.operation_reference,
+            Some(REF),
+            "the completion produced by the ROUTED follow-up carries the reference: {completion:?}"
+        );
+        // The create's own records (parked at the catch) predate the publish:
+        // they carry NO reference — proving the stamp is the publish's, not a
+        // blanket partition-wide tag.
+        let created = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCreated { .. }))
+            .expect("the create produced the instance");
+        assert_eq!(
+            created.operation_reference, None,
+            "the create's records are unreferenced: {created:?}"
+        );
+        assert!(
+            instance_partition_records
+                .iter()
+                .any(|r| r.operation_reference == Some(REF)),
+            "partition {p_inst} journaled referenced records from the routed follow-up"
+        );
+        // And the subscription partition journaled the publish's own records
+        // with the reference too.
+        assert!(
+            records.iter().any(|r| r.operation_reference == Some(REF)
+                && matches!(
+                    r.event,
+                    Event::MessageCorrelated { .. } | Event::RemoteMessageCorrelation { .. }
+                )),
+            "partition {p_sub} journaled the referenced match record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -48222,7 +49099,9 @@ mod subscription_placement_tests {
             .await
             .expect("cancel succeeds");
         commit.wait().await;
-        server.drive_subscription_routing(events.to_vec()).await;
+        server
+            .drive_subscription_routing(events.to_vec(), None)
+            .await;
 
         // The canonical subscription is gone, so the publish finds no match.
         let (_message_key, correlated) = server
@@ -48230,6 +49109,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
                 None,
                 None,
             )
@@ -48313,7 +49193,7 @@ mod subscription_placement_tests {
 
         // The source write never becomes durable: nothing may be routed.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
         drop(tx);
         let routed = routing.expect("cancel emits a routable close").await;
         assert!(!routed.expect("gate task"), "no routing before durability");
@@ -48328,7 +49208,7 @@ mod subscription_placement_tests {
 
         // The same follow-up routes once the source is durable.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx));
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
         tx.send(()).expect("gate listening");
         assert!(routing.expect("routable").await.expect("gate task"));
         assert!(caller.wait_durable().await);
@@ -48724,6 +49604,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("the publish applies");
@@ -49010,6 +49891,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -49065,6 +49947,7 @@ mod subscription_placement_tests {
                     "order-placed".into(),
                     format!("order-{i}"),
                     std::collections::HashMap::new(),
+                    None,
                     None,
                     None,
                 )
@@ -49183,6 +50066,7 @@ mod subscription_placement_tests {
                     std::collections::HashMap::new(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -49249,6 +50133,7 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -49287,6 +50172,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::HashMap::new(),
+                None,
                 None,
                 None,
             )

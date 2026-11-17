@@ -166,11 +166,56 @@ fn should_park_on_a_user_task_then_resume_when_completed() {
         state::UserTaskState::Completed
     );
 
-    // Completing again is rejected: the task is no longer active.
-    assert!(matches!(
+    // Completing again is rejected NOT_FOUND (Zeebe parity, #1401): completion
+    // consumes the task, so a second Complete finds no user task at all — it is
+    // NOT the INVALID_STATE of a live-but-not-completable task.
+    assert_eq!(
         engine.apply_command(Command::complete_user_task(user_task_key)),
-        Err(EngineError::UserTaskNotActive { .. })
-    ));
+        Err(EngineError::UserTaskNotFound { user_task_key })
+    );
+}
+
+#[test]
+fn should_reject_completing_a_canceled_user_task_as_not_found() {
+    // Zeebe parity (#1401): a canceled user task is consumed just like a
+    // completed one — re-completing it is NOT_FOUND, not INVALID_STATE.
+    let def = ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task("review")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("approval"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+
+    // Cancelling the instance cancels its parked user task.
+    engine
+        .apply_command(Command::cancel_instance(instance_key))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&user_task_key].state,
+        state::UserTaskState::Canceled
+    );
+
+    // Completing the canceled task is NOT_FOUND, not INVALID_STATE.
+    assert_eq!(
+        engine.apply_command(Command::complete_user_task(user_task_key)),
+        Err(EngineError::UserTaskNotFound { user_task_key })
+    );
 }
 
 #[test]

@@ -1,0 +1,18 @@
+{
+  "description": "Completing an already-completed job is rejected NOT_FOUND (Zeebe deletes the job entity on completion; #1401).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "service-task"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work",
+      "expectRejection": true
+    }
+  ]
+}

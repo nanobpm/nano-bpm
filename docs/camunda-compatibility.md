@@ -307,6 +307,25 @@ The search/read endpoints are served from a read model that is **eventually
 consistent** with the write path; a create followed immediately by a search may not
 yet reflect the new instance. See [README "Read model and consistency"](../README.md#read-model-and-consistency).
 
+### `operationReference` on cross-partition records — Nano is correct where Zeebe is not
+
+A command's `operationReference` is stamped on **every** record it produces
+(#1556, #1603) — including the records its **routed cross-partition follow-ups**
+produce on *other* partitions and nodes (#1600): the canonical
+message-subscription open/close on the correlation-key hash partition, the
+routed correlation that advances a parked token on the instance's partition, a
+message-start dispatch, the peer-side apply of a fanned-out publish, and the
+durable deployment copies a peer journals from an `InstallDeployment`
+broadcast. Zeebe does **not** propagate the reference across its partition
+boundary (camunda/camunda#67542: `MESSAGE_CORRELATION:CORRELATED` on a remote
+partition, distributed `SIGNAL:BROADCASTED` / `DEPLOYMENT:CREATED` carry none),
+so on this point Nano deliberately diverges from Zeebe's *observable* output —
+a client correlating by `operationReference` sees the whole cascade, not just
+the owning partition's records. The reference rides the intra-cluster Falcon
+frames (`PublishMessage` / `RouteSubscription` / `InstallDeployment`) as an
+additive field, so a mixed-version cluster during a rolling upgrade simply
+decodes it as absent (the legacy unreferenced behaviour) on older peers.
+
 ---
 
 ## 6. What is deliberately absent

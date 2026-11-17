@@ -2456,13 +2456,20 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED
+                // (Zeebe deletes the entity on completion/cancellation/error),
+                // so re-completing it is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised, recoverable via
+                // `UpdateJobRetries` + `ResolveIncident`) is INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
@@ -2771,7 +2778,14 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): a terminal user task is CONSUMED (Zeebe
+                // deletes the entity on completion/cancellation), so operating
+                // on it is NOT_FOUND. Only a live task mid-listener-transition
+                // (`pending`) is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 // Mirror Camunda: when override is disallowed and the task is
@@ -2826,7 +2840,12 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): terminal => consumed => NOT_FOUND; only
+                // a live task mid-listener-transition is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -2878,7 +2897,12 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): terminal => consumed => NOT_FOUND; only
+                // a live task mid-listener-transition is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -2949,7 +2973,14 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): completion/cancellation CONSUMES the
+                // user task (Zeebe deletes the entity), so re-completing it is
+                // NOT_FOUND — never the INVALID_STATE of a live task that is
+                // merely mid-listener-transition (`pending`).
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -3284,13 +3315,19 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so
+                // settling it again is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised) is
+                // INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
@@ -3373,13 +3410,19 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so
+                // settling it again is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised) is
+                // INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 if !self.lenient_completion && !job.activated {
@@ -17183,11 +17226,14 @@ impl Engine {
             .jobs
             .get(&job_key)
             .ok_or(EngineError::JobNotFound { job_key })?;
+        // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so updating
+        // it is NOT_FOUND — the same rejection as for an unknown key, not the
+        // INVALID_STATE of a live-but-parked job.
         if matches!(
             job.state,
             state::JobState::Completed | state::JobState::Canceled
         ) {
-            return Err(EngineError::JobNotActive { job_key });
+            return Err(EngineError::JobNotFound { job_key });
         }
         Self::validate_job_lease(job, lease_token, false)?;
         if retries.is_some_and(|value| value < 1) {

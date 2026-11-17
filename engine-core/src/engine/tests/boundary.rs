@@ -835,11 +835,12 @@ fn should_route_to_an_error_boundary_when_a_job_throws_a_matching_error() {
         e,
         Event::SequenceFlowTaken { to, .. } if to == "done"
     )));
-    // and the job is consumed: it cannot be completed afterwards
+    // and the job is consumed: completing it afterwards is NOT_FOUND (Zeebe
+    // parity, #1401 — the entity is deleted with its terminal settlement).
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 }
 
 // zeebe-cells: element:SubProcess
@@ -877,11 +878,12 @@ fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
         e,
         Event::SequenceFlowTaken { to, .. } if to == "done"
     )));
-    // The interrupted inner job is consumed and cannot be completed.
+    // The interrupted inner job is consumed: completing it is NOT_FOUND
+    // (Zeebe parity, #1401).
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 
     // The instance is not yet complete: it is parked on the sad-flow task.
     assert!(!engine.is_completed(instance_key));

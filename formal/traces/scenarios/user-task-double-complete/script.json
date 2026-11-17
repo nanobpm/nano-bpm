@@ -1,0 +1,18 @@
+{
+  "description": "Completing an already-completed user task is rejected NOT_FOUND (Zeebe deletes the user task entity on completion; #1401).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "user-task"
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review"
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review",
+      "expectRejection": true
+    }
+  ]
+}
