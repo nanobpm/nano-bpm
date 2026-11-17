@@ -33,6 +33,7 @@
 
 mod ast;
 mod builtins;
+mod env;
 mod error;
 mod eval;
 mod lexer;
@@ -43,6 +44,7 @@ mod value;
 
 use std::collections::HashMap;
 
+pub use env::{with_env, EvalEnv};
 pub use error::FeelError;
 
 use crate::model::Value;

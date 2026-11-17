@@ -171,6 +171,12 @@ pub struct Engine {
     /// never reads a wall clock itself; replay is unaffected because the
     /// timestamp is carried on the event.
     now: u64,
+    /// Per-command FEEL evaluation environment (#1642): the command's `now`
+    /// plus an RNG seeded from replicated engine state, installed around
+    /// planning and draining so FEEL's `now()`/`today()`/`random number()`/
+    /// `uuid()` agree across Raft replicas. Reseeded by every
+    /// `plan_command_at`, so it is per-command scratch and never snapshotted.
+    feel_env: crate::feel::EvalEnv,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
     /// instances across the cluster's partitions. Not derived from events (the
     /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
@@ -677,6 +683,7 @@ impl Engine {
             next_local: 0,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -835,6 +842,7 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -2276,6 +2284,21 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
+        // Seed the FEEL environment from replicated state only: the command's
+        // timestamp and the key counter (identical on every replica at this
+        // log position), never a wall clock or process-local entropy (#1642).
+        self.feel_env = crate::feel::EvalEnv::new(now, self.next_local);
+        let mut env = self.feel_env;
+        let result = crate::feel::with_env(&mut env, || self.plan_command_inner(command));
+        self.feel_env = env;
+        result
+    }
+
+    fn plan_command_inner(
+        &mut self,
+        command: Command,
+    ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
+        let now = self.now;
         // Clear the per-command scratch of sub-process scopes torn down mid-drain
         // (see [`torn_down_scopes`]): each command drains independently, so a
         // scope invalidated by a previous command's terminate must not leak into
@@ -6184,6 +6207,24 @@ impl Engine {
     /// reachable through the debug entrypoints (which pass their own concrete
     /// drivers) — the RTC contract for real workers is unchanged.
     fn run_with<D: StepDriver>(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: VecDeque<Step>,
+        cursor: usize,
+        driver: &mut D,
+    ) -> Option<Paused> {
+        // Every FEEL evaluation while draining sees the command's replicated
+        // environment (#1642); the advanced RNG state is carried back so a
+        // paused debug session resumes the same stream.
+        let mut env = self.feel_env;
+        let result = crate::feel::with_env(&mut env, || {
+            self.run_with_inner(log, queue, cursor, driver)
+        });
+        self.feel_env = env;
+        result
+    }
+
+    fn run_with_inner<D: StepDriver>(
         &mut self,
         log: &mut Vec<Event>,
         mut queue: VecDeque<Step>,
