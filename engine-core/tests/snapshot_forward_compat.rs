@@ -410,6 +410,7 @@ fn callactivity_variant_witness_is_exhaustive() {
             MessageBoundaryEvent { .. } => "messageBoundaryEvent",
             MessageStartEvent { .. } => "messageStartEvent",
             TimerStartEvent { .. } => "timerStartEvent",
+            ConditionalStartEvent { .. } => "conditionalStartEvent",
             SubProcess { .. } => "subProcess",
             IntermediateThrowEvent => "intermediateThrowEvent",
             EscalationThrowEvent { .. } => "escalationThrowEvent",

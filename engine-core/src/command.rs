@@ -428,6 +428,31 @@ pub enum Command {
         signal_name: String,
         variables: HashMap<String, Value>,
     },
+    /// Evaluate root-level **conditional start events** (#932, Zeebe
+    /// `ConditionalEvaluation:EVALUATE`, `POST /v2/conditionals/evaluation`).
+    ///
+    /// For every deployed process — the **latest** version of each process id,
+    /// or only the exact version `process_definition_key` names when set — each
+    /// process-level [`crate::ElementKind::ConditionalStartEvent`] has its FEEL
+    /// condition evaluated against `variables`; every one that evaluates to
+    /// `true` creates a new instance (seeded with `variables`) on this partition,
+    /// starting at that event. Processes and start events are visited in a
+    /// deterministic order (process id, then element id) so replay mints the
+    /// same keys. A condition that errors or yields a non-boolean is simply not
+    /// satisfied (no instance, no incident). The created instances are the
+    /// [`crate::Event::ProcessInstanceCreated`] events in the returned log; an
+    /// unknown `process_definition_key` is
+    /// [`crate::EngineError::ProcessDefinitionNotFound`].
+    EvaluateConditionalStartEvents {
+        variables: HashMap<String, Value>,
+        /// Restrict the evaluation to this exact definition version. `None`
+        /// evaluates the latest version of every deployed process.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
+    },
     /// Open the **canonical** record for a message subscription on the partition
     /// that owns its correlation key (`hash(correlation_key)`). Routed by the host
     /// to the message partition after the instance partition emitted a
@@ -1026,6 +1051,7 @@ impl Command {
             Command::SetVariables { .. } => "set_variables",
             Command::CorrelateMessage { .. } => "correlate_message",
             Command::BroadcastSignal { .. } => "broadcast_signal",
+            Command::EvaluateConditionalStartEvents { .. } => "evaluate_conditional_start_events",
             Command::OpenMessageSubscription { .. } => "open_message_subscription",
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
@@ -1068,6 +1094,7 @@ impl Command {
             | Command::SetVariables { variables, .. }
             | Command::CorrelateMessage { variables, .. }
             | Command::BroadcastSignal { variables, .. }
+            | Command::EvaluateConditionalStartEvents { variables, .. }
             | Command::CorrelateMessageSubscription { variables, .. }
             | Command::DispatchStartInstance { variables, .. } => vars(variables),
             Command::ModifyInstance {

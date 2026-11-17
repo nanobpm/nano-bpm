@@ -104,6 +104,7 @@ def toBpmn : Kind → BpmnShape
   | .messageBoundaryEvent => ⟨.boundaryEvent, .message, false⟩
   | .messageStartEvent => ⟨.startEvent, .message, false⟩
   | .timerStartEvent => ⟨.startEvent, .timer, false⟩
+  | .conditionalStartEvent => ⟨.startEvent, .conditional, false⟩
   | .subProcess => ⟨.subProcess, .none, false⟩
   | .eventSubProcess => ⟨.subProcess, .none, true⟩
   | .escalationThrowEvent => ⟨.intermediateThrowEvent, .escalation, false⟩
@@ -128,6 +129,7 @@ def fromBpmn : BpmnShape → Option Kind
   | ⟨.startEvent, .none, false⟩ => some .startEvent
   | ⟨.startEvent, .message, false⟩ => some .messageStartEvent
   | ⟨.startEvent, .timer, false⟩ => some .timerStartEvent
+  | ⟨.startEvent, .conditional, false⟩ => some .conditionalStartEvent
   | ⟨.endEvent, .none, false⟩ => some .endEvent
   | ⟨.endEvent, .terminate, false⟩ => some .terminateEndEvent
   | ⟨.endEvent, .error, false⟩ => some .errorEndEvent

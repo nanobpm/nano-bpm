@@ -786,6 +786,7 @@ element_families! {
     IntermediateThrowEvent,
     MessageStartEvent,
     TimerStartEvent,
+    ConditionalStartEvent,
     SubProcess,
     CallActivity,
 }
@@ -833,6 +834,7 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         | ElementKind::CompensationThrowEvent => ElementFamily::IntermediateThrowEvent,
         ElementKind::MessageStartEvent { .. } => ElementFamily::MessageStartEvent,
         ElementKind::TimerStartEvent { .. } => ElementFamily::TimerStartEvent,
+        ElementKind::ConditionalStartEvent { .. } => ElementFamily::ConditionalStartEvent,
         // An event sub-process is a sub-process-shaped container (never entered
         // by token flow); it maps to the SubProcess family, not a new family.
         ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. } => {

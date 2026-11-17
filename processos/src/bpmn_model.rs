@@ -56,6 +56,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
+        ElementKind::ConditionalStartEvent { .. } => "conditionalStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
@@ -165,6 +166,9 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         } => {
             m.insert("intervalMs".into(), json!(interval_millis));
             m.insert("repeating".into(), json!(repeating));
+        }
+        ElementKind::ConditionalStartEvent { condition } => {
+            m.insert("condition".into(), json!(condition));
         }
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
@@ -2894,6 +2898,17 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 ));
             }
             out.push_str("      </bpmn:timerEventDefinition>\n");
+            out.push_str("    </bpmn:startEvent>\n");
+        }
+        ElementKind::ConditionalStartEvent { condition } => {
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
+            out.push_str("      <bpmn:conditionalEventDefinition>\n");
+            out.push_str(&format!(
+                "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
+                xml_escape(condition)
+            ));
+            out.push_str("      </bpmn:conditionalEventDefinition>\n");
             out.push_str("    </bpmn:startEvent>\n");
         }
         ElementKind::SignalIntermediateCatchEvent { signal_name } => {

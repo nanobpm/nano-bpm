@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-errorEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-eventSubProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-errorEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-conditionalStartEvent | elem-subProcess | elem-eventSubProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -135,6 +135,12 @@ attrs-timerStartEvent   ::= "{" nl (indent2 attr-line-timerStartEvent nl)+ inden
 attr-line-timerStartEvent  ::= attr-timerStartEvent-interval | attr-timerStartEvent-repeating | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-timerStartEvent-interval  ::= "interval" sp attr-duration   # Delay from deployment to first fire (also the period when `repeating`).
 attr-timerStartEvent-repeating  ::= "repeating" sp attr-bool   # `true` re-arms after firing (a cycle); `false` fires exactly once.
+
+# conditionalStartEvent — Conditional start. A conditional evaluation whose variables satisfy the FEEL boolean creates a new instance.
+elem-conditionalStartEvent  ::= indent "conditionalStartEvent" sp id (sp string)? (sp attrs-conditionalStartEvent)? nl
+attrs-conditionalStartEvent   ::= "{" nl (indent2 attr-line-conditionalStartEvent nl)+ indent "}"
+attr-line-conditionalStartEvent  ::= attr-conditionalStartEvent-condition | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
+attr-conditionalStartEvent-condition  ::= "condition" sp attr-str   # FEEL boolean condition (leading `=` optional).
 
 # subProcess — Embedded sub-process. Container holding its own flow; child elements set `parent` to its id.
 elem-subProcess  ::= indent "subProcess" sp id (sp string)? (sp attrs-subProcess)? nl

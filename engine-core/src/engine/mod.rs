@@ -4892,6 +4892,66 @@ impl Engine {
                 }
             }
 
+            Command::EvaluateConditionalStartEvents {
+                variables,
+                process_definition_key,
+            } => {
+                // The candidate definitions: the exact version named by key, or
+                // the latest version of every deployed process id. Ordered by
+                // process id (then start element id below) so key minting is
+                // deterministic and replay stays in lock-step.
+                let mut candidates: Vec<(Key, ProcessDefinition)> = match process_definition_key {
+                    Some(key) => {
+                        let p = self.state.process_by_key(key).ok_or_else(|| {
+                            EngineError::ProcessNotFound {
+                                process_id: key.to_string(),
+                            }
+                        })?;
+                        vec![(p.key, p.definition.clone())]
+                    }
+                    None => self
+                        .state
+                        .processes
+                        .values()
+                        .filter(|p| has_conditional_start(&p.definition))
+                        .map(|p| (p.key, p.definition.clone()))
+                        .collect(),
+                };
+                candidates.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+                for (definition_key, definition) in candidates {
+                    let mut starts: Vec<(&ElementId, &String)> = definition
+                        .elements
+                        .values()
+                        .filter(|e| e.parent.is_none())
+                        .filter_map(|e| match &e.kind {
+                            ElementKind::ConditionalStartEvent { condition } => {
+                                Some((&e.id, condition))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    starts.sort_by(|a, b| a.0.cmp(b.0));
+                    for (start_id, condition) in starts {
+                        // A condition that errors or is non-boolean is simply
+                        // not satisfied — the same wait-until reading the
+                        // conditional catch event applies.
+                        if !matches!(crate::feel::eval_bool(condition, &variables), Ok(true)) {
+                            continue;
+                        }
+                        self.start_instance(
+                            &mut log,
+                            &mut queue,
+                            definition.id.clone(),
+                            start_id.clone(),
+                            variables.clone(),
+                            Vec::new(),
+                            None,
+                            definition_key,
+                        );
+                    }
+                }
+            }
+
             // These three commands are routed by the host between the instance
             // partition (where a token waits) and the message partition
             // (`hash(correlation_key)`, where the canonical subscription lives and
@@ -18403,6 +18463,16 @@ pub enum EngineError {
     /// read back right now, so the command was not applied (#1388). Transient
     /// and retryable (503) — distinct from [`EngineError::InstanceNotFound`].
     InstanceUnavailable { instance_key: Key },
+}
+
+/// Whether `definition` declares a process-level (root) conditional start
+/// event — the definitions a [`Command::EvaluateConditionalStartEvents`] can
+/// trigger.
+fn has_conditional_start(definition: &ProcessDefinition) -> bool {
+    definition
+        .elements
+        .values()
+        .any(|e| e.parent.is_none() && matches!(e.kind, ElementKind::ConditionalStartEvent { .. }))
 }
 
 /// Whether `element_id` is an intermediate catch event — the only element

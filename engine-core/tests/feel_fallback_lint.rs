@@ -90,6 +90,18 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "mod.rs",
+        contains: "crate::feel::eval_bool(condition, &variables)",
+        rule: Rule::DirectFeel,
+        count: 1,
+        why: Why::Zeebe(
+            "root-level conditional start (#932): an evaluation failure is simply not \
+             satisfied — no instance, no incident (Zeebe ConditionalEvaluation:EVALUATE \
+             evaluates start conditions via BpmnConditionalBehavior.shouldTrigger, which \
+             ignores the Failure)",
+        ),
+    },
+    Allow {
+        file: "mod.rs",
         contains: "match crate::feel::eval(&expression, &vars)",
         rule: Rule::DirectFeel,
         count: 1,

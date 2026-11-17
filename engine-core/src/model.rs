@@ -813,6 +813,18 @@ pub enum ElementKind {
         /// Whether the timer re-arms after firing (a cycle) or fires once.
         repeating: bool,
     },
+    /// A root-level conditional start event (`<startEvent>` with a
+    /// `conditionalEventDefinition`, #932). It has no incoming sequence flow and
+    /// opens no subscription: a [`crate::Command::EvaluateConditionalStartEvents`]
+    /// (the `POST /v2/conditionals/evaluation` endpoint) evaluates its FEEL
+    /// `condition` against the supplied variables and, when it is `true`,
+    /// **creates a new instance** (seeded with those variables) that runs along
+    /// this event's outgoing flow. Behaves as a pass-through once an instance
+    /// starts.
+    ConditionalStartEvent {
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+    },
     /// An embedded sub-process: a container holding its own flow (its inner
     /// elements carry [`Element::parent`] equal to this element's id). On
     /// activation it opens a token scope and activates its inner start event
@@ -1141,7 +1153,7 @@ impl ElementKind {
         )
     }
 
-    /// Whether this is a start-event kind (none, message or timer start). A
+    /// Whether this is a start-event kind (none, message, timer or conditional start). A
     /// process has exactly one process-entry start ([`ProcessDefinition::start_event`],
     /// where a CreateInstance begins) but may declare several process-level starts
     /// — a none start alongside any number of message/timer starts, each wired to
@@ -1152,6 +1164,7 @@ impl ElementKind {
             ElementKind::StartEvent
                 | ElementKind::MessageStartEvent { .. }
                 | ElementKind::TimerStartEvent { .. }
+                | ElementKind::ConditionalStartEvent { .. }
         )
     }
 
@@ -1182,6 +1195,7 @@ impl ElementKind {
             | ElementKind::MessageIntermediateCatchEvent { .. }
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. }
             | ElementKind::SubProcess { .. }
             | ElementKind::EventSubProcess { .. }
             | ElementKind::IntermediateThrowEvent
@@ -1220,6 +1234,7 @@ impl ElementKind {
             | ElementKind::ErrorEndEvent { .. }
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. }
             | ElementKind::IntermediateThrowEvent
             | ElementKind::LinkIntermediateThrowEvent { .. }
             | ElementKind::LinkIntermediateCatchEvent { .. }
@@ -1253,7 +1268,8 @@ impl ElementKind {
         match self {
             ElementKind::StartEvent
             | ElementKind::MessageStartEvent { .. }
-            | ElementKind::TimerStartEvent { .. } => "START_EVENT",
+            | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::TerminateEndEvent => "END_EVENT",
             ElementKind::ErrorEndEvent { .. } => "END_EVENT",
@@ -2238,6 +2254,22 @@ impl ProcessBuilder {
             ElementKind::TimerStartEvent {
                 interval_millis,
                 repeating: true,
+            },
+        )
+    }
+
+    /// Adds a root-level conditional start event: a
+    /// [`crate::Command::EvaluateConditionalStartEvents`] whose variables make the
+    /// FEEL `condition` `true` creates a new instance starting here.
+    pub fn conditional_start_event(
+        self,
+        id: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ConditionalStartEvent {
+                condition: condition.into(),
             },
         )
     }
