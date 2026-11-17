@@ -3577,36 +3577,55 @@ impl Journal {
         // Selection rotates past the last unreadable row (#1388) under a bounded
         // read budget, so a permanently unreadable oldest row (kept cold and
         // routable) cannot starve healthy later instances of the same type.
-        let Some(cold) = self.cold.as_ref() else {
+        if self.cold.is_none() {
             return;
-        };
+        }
         let budget = max_jobs.saturating_add(ACTIVATION_EXTRA_READS);
-        let after = self.activation_cursor.get(job_type).copied();
-        let candidates = cold
-            .index
-            .instances_for_job_type_rotated(job_type, after, budget);
+        let mut after = self.activation_cursor.get(job_type).copied();
         let now = self.engine.now();
         let mut restored = 0usize;
-        for key in candidates {
-            if restored >= max_jobs {
+        // Bounded passes (#933): instances whose jobs of this type are all still
+        // deferred by a `retryBackOff` do not count toward `max_jobs`, so a pass
+        // can exhaust its read budget on deferred-only rows while a ready row
+        // sits just beyond it. Keep paging (each pass bounded by `budget`) until
+        // the limit is filled or every cold candidate has been visited once —
+        // never park a long-poll while ready work remains cold.
+        let mut seen: HashSet<Key> = HashSet::new();
+        'passes: while restored < max_jobs {
+            let Some(cold) = self.cold.as_ref() else {
+                return;
+            };
+            let candidates: Vec<Key> = cold
+                .index
+                .instances_for_job_type_rotated(job_type, after, budget)
+                .into_iter()
+                .filter(|key| !seen.contains(key))
+                .collect();
+            if candidates.is_empty() {
                 break;
             }
-            match self.rehydrate_cold(key) {
-                ColdRehydration::Restored => {
-                    // A restored instance whose every job of this type is still
-                    // deferred by a `retryBackOff` (#933) must not consume the
-                    // rehydration limit ahead of an instance with ready work:
-                    // continue past it so eligible jobs fill the request.
-                    if self.instance_has_ready_job_of_type(key, job_type, now) {
-                        restored += 1;
+            for key in candidates {
+                if restored >= max_jobs {
+                    break 'passes;
+                }
+                seen.insert(key);
+                after = Some(key);
+                match self.rehydrate_cold(key) {
+                    ColdRehydration::Restored => {
+                        // A restored instance whose every job of this type is
+                        // still deferred must not consume the rehydration limit
+                        // ahead of an instance with ready work.
+                        if self.instance_has_ready_job_of_type(key, job_type, now) {
+                            restored += 1;
+                        }
                     }
+                    // Unreadable rows stay cold; their jobs are simply not
+                    // offered this poll, and the next poll starts after them.
+                    ColdRehydration::Unreadable => {
+                        self.activation_cursor.insert(job_type.to_string(), key);
+                    }
+                    ColdRehydration::NotCold | ColdRehydration::Absent => {}
                 }
-                // Unreadable rows stay cold; their jobs are simply not offered
-                // this poll, and the next poll starts after them.
-                ColdRehydration::Unreadable => {
-                    self.activation_cursor.insert(job_type.to_string(), key);
-                }
-                ColdRehydration::NotCold | ColdRehydration::Absent => {}
             }
         }
     }
@@ -5667,6 +5686,35 @@ mod tests {
         assert_eq!(jobs.len(), 1, "the ready cold job is served");
         assert_eq!(jobs[0].instance_key, ready_inst);
         assert_ne!(jobs[0].instance_key, deferred_inst);
+    }
+
+    /// #933 (review) — deferred-only cold instances beyond the per-pass read
+    /// budget (`max_jobs + ACTIVATION_EXTRA_READS`) must not hide a ready cold
+    /// instance: selection keeps paging in bounded passes before giving up.
+    #[test]
+    fn deferred_cold_backlog_beyond_the_read_budget_does_not_hide_ready_work() {
+        let mut journal = cold_journal();
+        let deferred_count = ACTIVATION_EXTRA_READS + 4;
+        for _ in 0..deferred_count {
+            deploy_and_create(&mut journal);
+        }
+        let jobs = journal.activate_jobs("demo-work", "w", deferred_count, 1_000, 0);
+        assert_eq!(jobs.len(), deferred_count);
+        for job in &jobs {
+            let _ = journal
+                .apply_command_at(
+                    Command::fail_job_with_backoff(job.key, 2, "flaky", 60_000),
+                    1_000,
+                )
+                .unwrap();
+        }
+        let ready_inst = deploy_and_create(&mut journal);
+        journal.force_cold_spill_all();
+        assert_eq!(journal.cold_count(), deferred_count + 1);
+
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 2_000);
+        assert_eq!(jobs.len(), 1, "the ready cold job beyond the budget is served");
+        assert_eq!(jobs[0].instance_key, ready_inst);
     }
 
     // Copilot on #1418: modification/migration/cancel of a parent must page in

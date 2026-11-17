@@ -17187,6 +17187,12 @@ impl ServerImpl {
             // reaped mid-`put` — and the whole sweep skips itself when any
             // member failed to host (its live set would not be authoritative).
             server.gc_offheap_orphans_once().await;
+
+            // #933: re-arm the process-local `retryBackOff` wakes only NOW,
+            // after every hosted member restored its durable Raft snapshot — a
+            // scan at spawn time races this bootstrap and would miss deadlines
+            // the snapshot restore introduces (see `boot_backoff_rearm_at_spawn`).
+            server.reschedule_backoff_wakes().await;
         }
     }
 
@@ -27702,6 +27708,14 @@ fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
     !raft
 }
 
+/// Whether the #933 `retryBackOff` wake re-arm runs at server spawn. Only on the
+/// non-Raft path, where the owned journals are fully recovered before their
+/// actors spawn; under Raft, `raft_bootstrap` restores durable snapshots
+/// asynchronously, so the re-arm runs at the end of the bootstrap instead.
+fn boot_backoff_rearm_at_spawn(raft: bool) -> bool {
+    !raft
+}
+
 /// Refuses a Raft-backed node over the legacy unsegmented journal
 /// (`NANOBPMN_JOURNAL_SEGMENTED=0`, #1405). Raft apply journals each committed
 /// entry as one atomic frame ending in a keyless `RaftEntryApplied` record; the
@@ -29749,7 +29763,10 @@ async fn main() {
     // long-poll parked across a restart would otherwise sleep until its
     // request timeout. The owned journals were recovered before their actors
     // spawned, so their engine state is already authoritative here.
-    {
+    // Under Raft the re-arm runs at the END of `raft_bootstrap` instead, after
+    // every hosted member's durable snapshot is restored (a scan here would race
+    // that restore and miss the deadlines it introduces).
+    if boot_backoff_rearm_at_spawn(raft_enabled()) {
         let server = server.clone();
         tokio::spawn(async move {
             server.reschedule_backoff_wakes().await;
@@ -41612,6 +41629,14 @@ mod clustered_startup_tests {
         // #1387: Raft startup must leave unresolved spilled orphans flagged.
         assert!(!boot_offheap_reconcile_allowed(true));
         assert!(boot_offheap_reconcile_allowed(false));
+    }
+
+    #[test]
+    fn boot_backoff_rearm_waits_for_raft_recovery() {
+        // #933 review: under Raft the spawn-time scan would race the snapshot
+        // restore in `raft_bootstrap`, which re-arms the wakes itself instead.
+        assert!(!boot_backoff_rearm_at_spawn(true));
+        assert!(boot_backoff_rearm_at_spawn(false));
     }
 
     #[tokio::test]

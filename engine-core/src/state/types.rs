@@ -2435,6 +2435,13 @@ pub struct State {
     /// snapshot restore, so it needs no serde field.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub deferred_jobs: BTreeSet<(u64, Key)>,
+    /// Reverse index of [`State::deferred_jobs`]: job key → the exact deadline
+    /// slot it occupies there. Lets a transition remove or replace a job's
+    /// deferred entry in O(log n) without scanning the whole deferred backlog,
+    /// and guarantees a re-deferred job never leaves a stale `(old, key)` tuple
+    /// behind. In-memory only, rebuilt with `deferred_jobs` on restore.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub deferred_job_deadlines: HashMap<Key, u64>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
@@ -3143,9 +3150,11 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
         }
     }
     if deferred {
-        state
-            .deferred_jobs
-            .insert((backoff_until.unwrap_or(0), job_key));
+        let until = backoff_until.unwrap_or(0);
+        if let Some(old) = state.deferred_job_deadlines.insert(job_key, until) {
+            state.deferred_jobs.remove(&(old, job_key));
+        }
+        state.deferred_jobs.insert((until, job_key));
     } else {
         remove_deferred_job(state, job_key);
     }
@@ -3157,20 +3166,79 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
 }
 
 /// Removes `job_key` from the deferred index whatever its (possibly already
-/// cleared) deadline slot. The deferred index is keyed by `(deadline, key)`, but
-/// a transition out of deferred (activation, eviction, terminal settle) may
-/// clear `retry_backoff_until` before re-syncing, so the exact slot is not
-/// always known here. Deferred sets are tiny (only jobs mid-`retryBackOff`), so
-/// a key scan is cheap and always correct.
+/// cleared) deadline slot. A transition out of deferred (activation, eviction,
+/// terminal settle) may clear `retry_backoff_until` before re-syncing, so the
+/// exact slot is looked up in the [`State::deferred_job_deadlines`] reverse
+/// index — O(log n), never a scan of the deferred backlog.
 fn remove_deferred_job(state: &mut State, job_key: Key) {
-    state.deferred_jobs.retain(|&(_, key)| key != job_key);
+    if let Some(until) = state.deferred_job_deadlines.remove(&job_key) {
+        state.deferred_jobs.remove(&(until, job_key));
+    }
+}
+
+#[cfg(test)]
+mod deferred_index_tests {
+    use super::{resync_job_index, JobState, State};
+
+    fn state_with_deferred_job(key: u64, until: u64) -> State {
+        let mut job = super::job_attribution_worker_tests::job_with_worker(None);
+        job.key = key;
+        job.state = JobState::Created;
+        job.retry_backoff_until = Some(until);
+        let mut state = State::default();
+        state.jobs.insert(key, job);
+        resync_job_index(&mut state, key);
+        state
+    }
+
+    /// Re-deferring a job with a new deadline replaces its slot instead of
+    /// leaving a stale `(old, key)` tuple behind (#933 review).
+    #[test]
+    fn re_deferring_a_job_replaces_its_deadline_slot() {
+        let mut state = state_with_deferred_job(7, 1_000);
+        for until in [2_000, 500, 9_000] {
+            if let Some(job) = state.jobs.get_mut(&7) {
+                job.retry_backoff_until = Some(until);
+            }
+            resync_job_index(&mut state, 7);
+            assert_eq!(
+                state.deferred_jobs.iter().copied().collect::<Vec<_>>(),
+                vec![(until, 7)]
+            );
+            assert_eq!(state.deferred_job_deadlines.get(&7), Some(&until));
+        }
+    }
+
+    /// Leaving deferral (even with the deadline already cleared) removes the
+    /// exact slot via the reverse index, for every job in a large backlog.
+    #[test]
+    fn undeferring_removes_the_exact_slot_in_a_large_backlog() {
+        let mut state = State::default();
+        for key in 1..=2_000u64 {
+            let mut job = super::job_attribution_worker_tests::job_with_worker(None);
+            job.key = key;
+            job.state = JobState::Created;
+            job.retry_backoff_until = Some(10_000 - key);
+            state.jobs.insert(key, job);
+            resync_job_index(&mut state, key);
+        }
+        assert_eq!(state.deferred_jobs.len(), 2_000);
+        for key in 1..=2_000u64 {
+            if let Some(job) = state.jobs.get_mut(&key) {
+                job.retry_backoff_until = None;
+            }
+            resync_job_index(&mut state, key);
+        }
+        assert!(state.deferred_jobs.is_empty());
+        assert!(state.deferred_job_deadlines.is_empty());
+    }
 }
 
 #[cfg(test)]
 mod job_attribution_worker_tests {
     use super::{Job, JobKind, JobState};
 
-    fn job_with_worker(worker: Option<&str>) -> Job {
+    pub(super) fn job_with_worker(worker: Option<&str>) -> Job {
         Job {
             key: 1,
             instance_key: 2,

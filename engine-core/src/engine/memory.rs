@@ -86,6 +86,8 @@ impl Engine {
             })
             .map(|job| (job.retry_backoff_until.unwrap_or(0), job.key))
             .collect();
+        snapshot.state.deferred_job_deadlines =
+            deferred.iter().map(|&(until, key)| (key, until)).collect();
         snapshot.state.deferred_jobs = deferred.into_iter().collect();
         Self {
             state: snapshot.state,
