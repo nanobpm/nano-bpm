@@ -224,6 +224,13 @@ record-ordering divergence.
 3. Run the nano runner. If nano diverges, fix nano (red/green), or file an
    issue and add an allow-list entry for it.
 
+A scenario authored from a **known** Zeebe behaviour (e.g. a rejection the
+issue pins by site, like the double-complete NOT_FOUND of #1401) may land with
+a hand-authored golden when the capture harness is unavailable: the golden's
+rejection records are derived from the pinned Zeebe behaviour, and the next
+`capture.sh <name>` run refreshes the file (and its `sites` line numbers) in
+place — a capture-side difference then fails the gate as an ordinary diff.
+
 **One job per step.** `completeJob` activates and completes a *single* job of
 its `jobType` (both runners pick one job by type). To drive several jobs of one
 logical task — e.g. the parallel inner instances of a multi-instance body —

@@ -1333,11 +1333,13 @@ fn should_let_a_previous_worker_complete_after_re_activation() {
     // then completion succeeds and the instance finishes
     assert!(engine.is_completed(instance_key));
 
-    // and B can no longer complete the already-completed job
+    // and B can no longer complete the already-completed job: completion
+    // consumed it, so the second Complete is NOT_FOUND (Zeebe parity, #1401),
+    // not the INVALID_STATE of a live-but-not-completable job.
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 }
 
 #[test]

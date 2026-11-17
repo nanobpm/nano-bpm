@@ -2041,11 +2041,12 @@ fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     );
     // No token survives: the instance holds no active elements after completion.
     assert!(engine.instance(instance_key).unwrap().active.is_empty());
-    // The cancelled sibling job can no longer be completed.
+    // The cancelled sibling job is consumed: completing it is NOT_FOUND
+    // (Zeebe parity, #1401).
     let err = engine
         .apply_command(Command::complete_job(work_job))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key: work_job });
+    assert_eq!(err, EngineError::JobNotFound { job_key: work_job });
 }
 
 #[test]
