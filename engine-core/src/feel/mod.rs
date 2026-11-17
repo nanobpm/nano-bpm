@@ -558,22 +558,40 @@ pub struct EvaluatedWithProvenance {
 ///
 /// 1. The expression is evaluated **once, plainly** — the evaluator never
 ///    wraps a value, so native FEEL dispatch, collection traversal and
-///    function calls behave exactly as they do without provenance.
-/// 2. Only when a trusted root's value actually contains a
+///    function calls behave exactly as they do without provenance. The real
+///    run records only the literal `camunda.secrets.<name>` paths that surface
+///    and the base-context variables actually read (both via a shared sink a
+///    shadowed binding never reaches).
+/// 2. Only when a trusted root the expression **actually read** carries a
 ///    `camunda.secrets.` reference does a **second** evaluation run, with that
 ///    one root's reference strings replaced by an inert marker
 ///    ([`SECRET_NEUTRALISED`]). A reference in the real result that disappears
-///    or changes under that neutralisation came from that trusted root and is
-///    reported.
+///    under that neutralisation — *and whose removal leaves the result
+///    otherwise unchanged* — came from that trusted root and is reported.
 ///
 /// Neutralising **one root at a time** is what keeps attribution structural: a
 /// reference string that arrives via an *untrusted* source (a request-body or
 /// JSON-kind variable) never diffs, even when its text matches a trusted
 /// reference — and a secret name that is a prefix of another cannot be
 /// mis-attributed, because comparison is on whole strings, never substrings.
-/// Literal `camunda.secrets.<name>` paths on the executed path are recorded
-/// during the real run (a shadowed binding, skipped branch or un-called
-/// function body never contributes).
+///
+/// Two refinements keep the diff honest (PR #1636 round-5 review):
+///
+/// - **Result-reachability for literal paths.** A literal
+///   `camunda.secrets.<name>` path is reported only when its text occurs in
+///   the result — a discarded function argument, a condition-only literal, or
+///   a context member projected away never reaches the result, so it is not
+///   an occurrence the caller may resolve. (A literal path evaluates to its
+///   own reference text, so result-occurrence is exactly reachability.)
+/// - **Branch-aware attribution.** Neutralising a root can flip a branch
+///   rather than remove a returned value (`if t = "…" then u else null`):
+///   the name then disappears from the neutralised result even though `u`
+///   (untrusted) supplied it. Requiring the neutralised result to be
+///   otherwise *structurally equal* to the real result refuses that false
+///   attribution. And because a name is reported when **any** read trusted
+///   root's neutralisation removes it, two roots carrying the same name into
+///   the result cannot mask each other — the root whose removal changes the
+///   result is attributed, and the name surfaces regardless.
 pub fn eval_with_provenance(
     expr: &str,
     ctx: &HashMap<String, Value>,
@@ -583,27 +601,86 @@ pub fn eval_with_provenance(
     let tokens = lexer::tokenize(src)?;
     let node = parser::parse(tokens)?;
 
-    // The real run: plain evaluation, recording only the literal
-    // `camunda.secrets.<name>` paths that surface on the executed path.
-    let (value, literal) = eval::evaluate_tracked(&node, ctx);
+    // The real run: plain evaluation, recording the literal
+    // `camunda.secrets.<name>` paths that surface on the executed path and the
+    // base-context variables actually read.
+    let (value, literal, read) = eval::evaluate_tracked(&node, ctx);
     let value = value?.into_value();
 
-    // The trusted roots that actually carry a reference. Only these justify a
-    // second (neutralised) evaluation — the common case pays for one.
-    let carriers: Vec<(String, HashSet<String>)> = trusted_roots
+    // The occurrences in the real result a caller may safely resolve.
+    let mut real_names = HashSet::new();
+    collect_secret_names_value(&value, &mut real_names);
+
+    // Literal reference paths are reported only when they REACH THE RESULT:
+    // a literal evaluates to its own reference text, so an executed path whose
+    // name is absent from the result was discarded (a function argument, a
+    // condition, a projected-away context member) and is not an occurrence the
+    // caller may resolve. Reachability is decided *per name* below, once the
+    // trusted-root neutralisations show which occurrences a trusted source
+    // explains (#1296 round-5 review).
+    let literal: HashSet<String> = literal
         .into_iter()
-        .filter_map(|name| {
-            let value = ctx.get(&name)?;
+        .filter(|n| real_names.contains(n))
+        .collect();
+    let mut referenced: HashSet<String> = HashSet::new();
+
+    // The trusted roots that actually carry a reference, split by whether the
+    // expression READ them. Only a READ carrier justifies a second
+    // (neutralised) evaluation — the common case (no read carrier, or a
+    // reference-free result) pays for exactly one evaluation, however many
+    // SECRET_REFERENCE variables are visible. An UNREAD carrier's names are
+    // untrusted occurrences in any result (the expression never surfaced
+    // them), so they explain a same-named literal's result occurrence without
+    // any re-evaluation.
+    let mut carriers: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut unread_carrier_names: HashSet<String> = HashSet::new();
+    for name in trusted_roots {
+        let Some(value) = ctx.get(&name) else {
+            continue;
+        };
+        let mut names = HashSet::new();
+        collect_secret_names_value(value, &mut names);
+        if names.is_empty() {
+            continue;
+        }
+        if read.contains(&name) {
+            carriers.push((name, names));
+        } else {
+            unread_carrier_names.extend(names);
+        }
+    }
+    // A read base variable that is NOT a trusted carrier is an untrusted
+    // source: when its value carries reference text into the result, that
+    // occurrence is untrusted, so a same-named literal's own (discarded)
+    // contribution must not be reported — the discarded literal would
+    // otherwise launder the untrusted copy into a trusted report
+    // (`fromAi(u, camunda.secrets.TOKEN)` returning the body variable `u`).
+    let mut untrusted_result_names: HashSet<String> = unread_carrier_names
+        .iter()
+        .filter(|n| real_names.contains(*n))
+        .cloned()
+        .collect();
+    for name in read
+        .iter()
+        .filter(|n| !carriers.iter().any(|(c, _)| c == *n))
+    {
+        if let Some(value) = ctx.get(name) {
             let mut names = HashSet::new();
             collect_secret_names_value(value, &mut names);
-            (!names.is_empty()).then_some((name, names))
-        })
-        .collect();
-    let mut referenced = literal;
-    if !carriers.is_empty() {
-        // The occurrences in the real result a caller may safely resolve.
-        let mut real_names = HashSet::new();
-        collect_secret_names_value(&value, &mut real_names);
+            untrusted_result_names.extend(names.into_iter().filter(|n| real_names.contains(n)));
+        }
+    }
+
+    // Neutralise each READ carrier in isolation. Two per-name observations
+    // drive attribution below:
+    //  * `removed_by_carrier` — the names at least one carrier's
+    //    neutralisation removes from the result: a trusted root accounts for
+    //    that occurrence.
+    let mut removed_by_carrier: HashSet<String> = HashSet::new();
+    // The names EACH carrier's neutralisation removes, per carrier — the
+    // same-name masking fallback below needs the per-root breakdown.
+    let mut removed_per_carrier: Vec<HashSet<String>> = Vec::new();
+    if !carriers.is_empty() && !real_names.is_empty() {
         for (root, root_names) in &carriers {
             // Neutralise this one root only, so a same-text reference from an
             // untrusted source cannot diff (structural, per-root attribution).
@@ -611,24 +688,106 @@ pub fn eval_with_provenance(
             if let Some(v) = neutral_ctx.get_mut(root) {
                 neutralise_secret_references(v);
             }
-            let neutral_names = eval::evaluate(&node, &neutral_ctx)
-                .map(|v| {
-                    let v = v.into_value();
-                    let mut names = HashSet::new();
-                    collect_secret_names_value(&v, &mut names);
-                    names
-                })
-                .unwrap_or_default();
+            let neutralised = eval::evaluate(&node, &neutral_ctx)
+                .map(value::FeelVal::into_value)
+                .unwrap_or(Value::Null);
+            let mut neutral_names = HashSet::new();
+            collect_secret_names_value(&neutralised, &mut neutral_names);
             // A name this root carries that reaches the real result but not
-            // the neutralised one came from this trusted root.
-            referenced.extend(
-                real_names
-                    .iter()
-                    .filter(|n| root_names.contains(*n) && !neutral_names.contains(*n))
-                    .cloned(),
-            );
+            // the neutralised one came from this trusted root — UNLESS
+            // neutralising the root changed the result's *shape* (a flipped
+            // branch, a different selection), in which case the disappearance
+            // is a control-flow artifact, not provenance: the reference was
+            // supplied by whatever the other branch selected.
+            let shape_changed = !same_shape(&value, &neutralised);
+            let mut removed_here: HashSet<String> = HashSet::new();
+            if !shape_changed {
+                referenced.extend(
+                    real_names
+                        .iter()
+                        .filter(|n| root_names.contains(*n) && !neutral_names.contains(*n))
+                        .cloned(),
+                );
+                removed_here.extend(
+                    real_names
+                        .iter()
+                        .filter(|n| !neutral_names.contains(*n))
+                        .cloned(),
+                );
+                removed_by_carrier.extend(removed_here.iter().cloned());
+            }
+            removed_per_carrier.push(removed_here);
         }
     }
+
+    // Same-name masking fallback: a name carried into the result by TWO OR
+    // MORE read trusted roots is removed by NEITHER root's isolated
+    // neutralisation (the other root's copy keeps it in the result), so the
+    // per-root loop above reports nothing. Neutralise ALL read carriers at
+    // once: if the name then leaves an otherwise-unchanged result, a trusted
+    // root accounts for it and it is reported. An untrusted copy cannot
+    // false-positive here — neutralising every trusted root still leaves the
+    // untrusted occurrence in the result, so the name is not removed.
+    let masked: HashSet<String> = carriers
+        .iter()
+        .zip(&removed_per_carrier)
+        .flat_map(|((_, root_names), removed)| {
+            root_names
+                .iter()
+                .filter(|n| real_names.contains(*n) && !removed.contains(*n))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|n| !removed_by_carrier.contains(n))
+        .collect();
+    if !masked.is_empty() {
+        let mut all_neutral_ctx = ctx.clone();
+        for (root, _) in &carriers {
+            if let Some(v) = all_neutral_ctx.get_mut(root) {
+                neutralise_secret_references(v);
+            }
+        }
+        let all_neutralised = eval::evaluate(&node, &all_neutral_ctx)
+            .map(value::FeelVal::into_value)
+            .unwrap_or(Value::Null);
+        if same_shape(&value, &all_neutralised) {
+            // Compare occurrence COUNTS, not set membership: an untrusted copy
+            // keeps its own occurrences in the neutralised result, so a name
+            // is trusted exactly when neutralising every read carrier removes
+            // at least one occurrence of it (`[t, u]` with untrusted `u`
+            // carrying the same text: 2 real occurrences, 1 neutralised — the
+            // trusted `t` occurrence is the one that disappeared).
+            let mut real_counts: HashMap<String, usize> = HashMap::new();
+            count_secret_names_value(&value, &mut real_counts);
+            let mut neutral_counts: HashMap<String, usize> = HashMap::new();
+            count_secret_names_value(&all_neutralised, &mut neutral_counts);
+            referenced.extend(
+                masked
+                    .iter()
+                    .filter(|n| {
+                        real_counts.get(*n).copied().unwrap_or(0)
+                            > neutral_counts.get(*n).copied().unwrap_or(0)
+                    })
+                    .cloned(),
+            );
+            removed_by_carrier.extend(masked.iter().cloned());
+        }
+    }
+
+    // A literal path's name is reported when its occurrence reaches the
+    // result as a TRUSTED occurrence: no trusted carrier's neutralisation may
+    // be what explains it (that is the carrier's value reaching the result),
+    // and no untrusted source may account for the result's occurrence —
+    // neither an unread trusted root nor a read untrusted variable carrying
+    // the same text (`fromAi(u, camunda.secrets.TOKEN)` returning the body
+    // variable `u`: the discarded literal must not launder that copy into a
+    // trusted report).
+    referenced.extend(
+        literal
+            .iter()
+            .filter(|n| !removed_by_carrier.contains(*n) && !untrusted_result_names.contains(*n))
+            .cloned(),
+    );
     let mut referenced_secrets: Vec<String> = referenced.into_iter().collect();
     referenced_secrets.sort();
     referenced_secrets.dedup();
@@ -666,6 +825,25 @@ fn neutralise_secret_references(v: &mut Value) {
     }
 }
 
+/// Counts the occurrences of every whole-string `camunda.secrets.<name>`
+/// reference in `v` (recursing into lists and maps). The same-name masking
+/// fallback compares counts, not membership: an untrusted copy keeps its own
+/// occurrences under neutralisation, so only the trusted count disappears.
+fn count_secret_names_value(v: &Value, out: &mut HashMap<String, usize>) {
+    match v {
+        Value::Str(s) => {
+            if let Some(name) = secret_reference_name(s) {
+                *out.entry(name.to_string()).or_insert(0) += 1;
+            }
+        }
+        Value::List(items) => items.iter().for_each(|i| count_secret_names_value(i, out)),
+        Value::Map(entries) => entries
+            .values()
+            .for_each(|i| count_secret_names_value(i, out)),
+        _ => {}
+    }
+}
+
 /// Collects the secret names of every whole-string `camunda.secrets.<name>`
 /// reference in `v` (recursing into lists and maps).
 fn collect_secret_names_value(v: &Value, out: &mut HashSet<String>) {
@@ -682,6 +860,32 @@ fn collect_secret_names_value(v: &Value, out: &mut HashSet<String>) {
             .values()
             .for_each(|i| collect_secret_names_value(i, out)),
         _ => {}
+    }
+}
+
+/// Whether `a` and `b` agree everywhere except on whole-string
+/// `camunda.secrets.<name>` reference occurrences: the neutralised run's
+/// result may differ from the real result only by a reference string becoming
+/// [`SECRET_NEUTRALISED`]. Any other difference — a flipped branch, a
+/// different selection, a changed length, a reference becoming `null` — means
+/// neutralising the root changed the *control flow*, so a name that
+/// disappears is a control-flow artifact, not provenance from that root
+/// (#1296 round-5 review: branch-aware attribution).
+fn same_shape(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => {
+            x == y || (secret_reference_name(x).is_some() && y == SECRET_NEUTRALISED)
+        }
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_shape(x, y))
+        }
+        (Value::Map(xs), Value::Map(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .all(|(k, x)| ys.get(k).map(|y| same_shape(x, y)).unwrap_or(false))
+        }
+        _ => a == b,
     }
 }
 
@@ -1183,6 +1387,162 @@ mod tests {
             vec!["TOKEN"]
         );
         assert!(prov("function() camunda.secrets.SKIPPED", &ctx(&[]), &[]).is_empty());
+    }
+
+    /// #1296 review (round 5): provenance must be **result-reachable** and
+    /// **branch-aware**. Three defect classes the first differential cut got
+    /// wrong, pinned red-first:
+    ///
+    /// 1. A literal `camunda.secrets.<name>` path that is *evaluated* but whose
+    ///    value never reaches the result (a discarded function argument, a
+    ///    condition-only literal, a discarded context member) is not an
+    ///    occurrence "in the result" the caller may resolve — it must not be
+    ///    reported.
+    /// 2. Attribution must follow the *returned value*, not the condition:
+    ///    neutralising a trusted root that only steers a branch must not claim
+    ///    a reference the *other* (untrusted) source supplied; and two trusted
+    ///    roots carrying the same name into the result must BOTH be attributed
+    ///    (the name is reported once, but neither root may mask the other).
+    /// 3. A trusted root the expression never reads must never trigger a
+    ///    neutralised re-evaluation (the endpoint supplies every visible
+    ///    SECRET_REFERENCE variable; N unrelated variables must not cost N+1
+    ///    executions).
+    #[test]
+    fn eval_with_provenance_is_result_reachable_and_branch_aware() {
+        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+            eval_with_provenance(
+                e,
+                c,
+                trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .referenced_secrets
+        };
+
+        // --- (1) A discarded literal reference is not reported -----------
+        // `fromAi(u, camunda.secrets.TOKEN)` returns only its first argument:
+        // the literal second argument is evaluated but discarded, so TOKEN
+        // never reaches the result and the untrusted `u` copy is not trusted.
+        let c = ctx(&[("u", Value::Str("camunda.secrets.TOKEN".into()))]);
+        let r = eval_with_provenance(r#"fromAi(u, camunda.secrets.TOKEN)"#, &c, vec![]).unwrap();
+        assert_eq!(r.value, Value::Str("camunda.secrets.TOKEN".into()));
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "a discarded literal argument must not be reported: {:?}",
+            r.referenced_secrets
+        );
+        // A condition-only literal: the reference steers the branch but the
+        // result carries no occurrence of it.
+        assert!(
+            prov(
+                r#"if camunda.secrets.TOKEN = "x" then 1 else 2"#,
+                &ctx(&[]),
+                &[]
+            )
+            .is_empty(),
+            "a literal consumed only by a condition is not reported"
+        );
+        // A discarded context member: the literal is bound into a context that
+        // is then projected away from the reference.
+        assert!(
+            prov("{a: camunda.secrets.TOKEN, b: 1}.b", &ctx(&[]), &[]).is_empty(),
+            "a context member discarded by projection is not reported"
+        );
+        // …but a literal that DOES reach the result is still reported.
+        assert_eq!(
+            prov("camunda.secrets.DIRECT", &ctx(&[]), &[]),
+            vec!["DIRECT"]
+        );
+        assert_eq!(
+            prov("[camunda.secrets.A, 1][1]", &ctx(&[]), &[]),
+            vec!["A"],
+            "a literal selected into the result is reported"
+        );
+
+        // --- (2) Branch-aware attribution --------------------------------
+        // Trusted `t` and untrusted `u` both hold the same reference text.
+        // Neutralising `t` flips the `if` branch, so the *result* changes —
+        // but the reference in the result came from `u`, not `t`. The
+        // branch-aware guard (the neutralised result must otherwise match the
+        // real one) refuses the attribution.
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert!(
+            prov(
+                r#"if t = "camunda.secrets.TOKEN" then u else null"#,
+                &c,
+                &["t"]
+            )
+            .is_empty(),
+            "neutralising the condition root must not claim the untrusted branch value"
+        );
+        // Two trusted roots carrying the SAME name into the result: the name
+        // is reported (once), and neutralising either root alone leaves the
+        // other root's copy in the result — so the naive per-root diff would
+        // report nothing. The name must still surface.
+        let c = ctx(&[
+            ("a", Value::Str("camunda.secrets.TOKEN".into())),
+            ("b", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert_eq!(
+            prov("[a, b]", &c, &["a", "b"]),
+            vec!["TOKEN"],
+            "two trusted roots carrying the same name must not mask each other"
+        );
+        // …and when only ONE trusted root carries it, attribution still works.
+        let c = ctx(&[
+            ("a", Value::Str("camunda.secrets.TOKEN".into())),
+            ("b", Value::Str("plain".into())),
+        ]);
+        assert_eq!(prov("[a, b]", &c, &["a", "b"]), vec!["TOKEN"]);
+        // A trusted carrier's occurrence is still reported when an UNTRUSTED
+        // copy of the same name also reaches the result: neutralising every
+        // trusted root removes the trusted occurrence but keeps the untrusted
+        // one, so the count diff (not set membership) attributes it.
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert_eq!(
+            prov("[t, u]", &c, &["t"]),
+            vec!["TOKEN"],
+            "an untrusted copy must not mask the trusted occurrence"
+        );
+        // A trusted root read only by the condition, with the reference
+        // supplied by an untrusted branch value, is not reported even when
+        // the branch does NOT flip (the reference text still reaches the
+        // result from `u` alone).
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert!(
+            prov(r#"if t = "other" then null else u"#, &c, &["t"]).is_empty(),
+            "the else-branch value is untrusted even when the condition root is trusted"
+        );
+
+        // --- (3) An unread trusted root costs no re-evaluation -----------
+        // `unused` is a reference-bearing trusted root the expression never
+        // reads; only `token_ref` is read. Provenance must still be correct
+        // (TOKEN reported, UNUSED not) — and the implementation must not
+        // re-evaluate for `unused` (asserted structurally by the read-set
+        // restriction: an unread carrier is skipped).
+        let c = ctx(&[
+            ("token_ref", Value::Str("camunda.secrets.TOKEN".into())),
+            ("unused", Value::Str("camunda.secrets.UNUSED".into())),
+        ]);
+        assert_eq!(
+            prov("token_ref", &c, &["token_ref", "unused"]),
+            vec!["TOKEN"]
+        );
+        // A reference-free expression over many reference-bearing roots
+        // reports nothing (and pays for exactly one evaluation).
+        assert!(
+            prov("1 + 1", &c, &["token_ref", "unused"]).is_empty(),
+            "an expression that reads no trusted root reports nothing"
+        );
     }
 
     #[test]
