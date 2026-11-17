@@ -3051,6 +3051,87 @@ fn fail_job_retry_backoff_delays_reactivation_until_elapsed() {
     assert_eq!(engine.job(job_key).unwrap().retry_backoff_until, None);
 }
 
+/// #933 (review) — a deferred job is held OUT of the hot activatable set, so a
+/// poll for ready work never scans the delayed prefix; the poll promotes only
+/// the due prefix of the deadline-ordered deferred index. This guards the
+/// defect class "activation repeatedly scans deferred jobs before applying the
+/// limit": with one ready and one deferred job of the same type, a `max_jobs=1`
+/// poll serves the ready job without touching the deferred one, and the
+/// deferred job is served only once its deadline passes.
+#[test]
+fn deferred_jobs_are_not_scanned_before_the_activation_limit() {
+    // A fork/join with two parallel `payment` tasks, so one instance holds two
+    // independent live jobs of the same type (failing one does not complete the
+    // other).
+    let def = ProcessBuilder::new("par")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "payment")
+        .service_task("b", "payment")
+        .parallel_gateway("join")
+        .end_event("end")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("par"))
+        .unwrap();
+    // Two live `payment` jobs. Activate both, then fail ONE back with a backoff
+    // (deferred) and let the other's lock expire (ready).
+    let mut both = engine.activate_jobs("payment", "w1", 10, 60_000, 0);
+    assert_eq!(both.len(), 2);
+    both.sort_by_key(|j| j.key);
+    let deferred_key = both[0].key;
+    let ready_key = both[1].key;
+    // Fail BOTH back at t=1_000: the deferred one behind a 5_000 backoff
+    // (eligible at 6_000), the ready one with no backoff (eligible at once).
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(deferred_key, 2, "flaky", 5_000),
+            1_000,
+        )
+        .unwrap();
+    engine
+        .apply_command_at(Command::fail_job(ready_key, 2, "boom"), 1_000)
+        .unwrap();
+
+    // The deferred job sits in the deferred index, NOT the activatable set; the
+    // ready job is back in the activatable set.
+    assert!(engine
+        .state()
+        .deferred_jobs
+        .iter()
+        .any(|&(_, k)| k == deferred_key));
+    let ready_set = &engine.state().activatable_jobs["payment"];
+    assert!(ready_set.iter().any(|&(_, k)| k == ready_key));
+    assert!(!ready_set.iter().any(|&(_, k)| k == deferred_key));
+
+    // A `max_jobs = 1` poll at t=2_000 (before the backoff elapses at 6_000)
+    // serves the ready job — the deferred prefix is not scanned-and-skipped
+    // ahead of it.
+    let served = engine.activate_jobs("payment", "w2", 1, 60_000, 2_000);
+    assert_eq!(
+        served.len(),
+        1,
+        "the ready job is served, not starved by the deferred one"
+    );
+    assert_eq!(served[0].key, ready_key);
+
+    // Once the backoff elapses (t=6_000), the poll promotes the deferred job
+    // and serves it.
+    let served = engine.activate_jobs("payment", "w3", 1, 60_000, 6_000);
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].key, deferred_key);
+    assert!(engine.state().deferred_jobs.is_empty());
+}
+
 /// #933 — zero, negative and absent backoffs are retryable immediately; a
 /// backoff with no retries left is dropped (the job parks with an incident).
 #[test]
@@ -3140,6 +3221,50 @@ fn fail_job_retry_backoff_survives_replay() {
             .activate_jobs("payment", "w2", 10, 60_000, 6_000)
             .len(),
         1
+    );
+}
+
+/// #933 (review) — the deferred-job index is in-memory only (serde-skipped), so
+/// a snapshot round-trip must REBUILD it from `jobs`: a deferred job restored
+/// from a snapshot has to be promoted and served once its backoff elapses, not
+/// stranded in neither index.
+#[cfg(feature = "serde")]
+#[test]
+fn fail_job_retry_backoff_deferred_index_survives_a_snapshot() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(engine
+        .state()
+        .deferred_jobs
+        .iter()
+        .any(|&(_, k)| k == job_key));
+
+    // Snapshot + restore: the deferred index is rebuilt from `jobs`.
+    let snapshot = engine.snapshot();
+    let mut restored = Engine::from_snapshot(snapshot);
+    assert!(
+        restored
+            .state()
+            .deferred_jobs
+            .iter()
+            .any(|&(_, k)| k == job_key),
+        "the deferred index is rebuilt on snapshot restore"
+    );
+    assert!(restored
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    assert_eq!(
+        restored
+            .activate_jobs("payment", "w2", 10, 60_000, 6_000)
+            .len(),
+        1,
+        "the restored deferred job is promoted and served once its backoff elapses"
     );
 }
 

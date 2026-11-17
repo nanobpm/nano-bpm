@@ -22410,6 +22410,13 @@ impl ServerImpl {
         let Some(delay) = backoff_wake_delay(retries, retry_back_off) else {
             return;
         };
+        self.signal_jobs_available_in(delay);
+    }
+
+    /// Schedules one job-availability re-signal `delay` from now (the wake half
+    /// of [`signal_jobs_available_after_backoff`](Self::signal_jobs_available_after_backoff),
+    /// split out so boot recovery can re-arm a persisted backoff deadline).
+    fn signal_jobs_available_in(&self, delay: Duration) {
         let jobs_available = self.jobs_available.clone();
         let dispatch_wake = self.dispatch_wake.clone();
         tokio::spawn(async move {
@@ -22417,6 +22424,39 @@ impl ServerImpl {
             jobs_available.notify_waiters();
             dispatch_wake.notify_one();
         });
+    }
+
+    /// Re-arms the process-local backoff wakes a restart dropped (#933 review):
+    /// a `retryBackOff` deadline is journaled on the `JobFailed` event, so it
+    /// survives replay, but the `tokio` wake task scheduled when the fail was
+    /// applied does not. Without this, a long-poll parked across a restart
+    /// during a backoff sleeps until its request timeout even though the
+    /// restored deadline has elapsed. Already-elapsed deadlines re-signal
+    /// immediately. Runs once after boot recovery, off the request path.
+    pub(crate) async fn reschedule_backoff_wakes(&self) {
+        let now = now_millis();
+        for handle in self.engine.all() {
+            let delays = handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == nanobpmn_engine_core::JobState::Created && job.retries > 0
+                        })
+                        .filter_map(|job| job.retry_backoff_until)
+                        .map(|until| {
+                            Duration::from_millis(until.saturating_sub(now).saturating_add(1))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for delay in delays {
+                self.signal_jobs_available_in(delay);
+            }
+        }
     }
 
     /// Handle to the permit-storing dispatcher wake, so the Falcon protocol can
@@ -29703,6 +29743,19 @@ async fn main() {
     // over the Falcon protocol and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
+    // #933: re-arm the process-local `retryBackOff` wakes a restart dropped.
+    // The deadline is journaled on the `JobFailed` event (so replay restores
+    // it), but the wake task scheduled when the fail was applied is not — a
+    // long-poll parked across a restart would otherwise sleep until its
+    // request timeout. The owned journals were recovered before their actors
+    // spawned, so their engine state is already authoritative here.
+    {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.reschedule_backoff_wakes().await;
+        });
+    }
+
     // #1338: post-recovery GC of orphaned cold/spill rows. Under Raft the sweep
     // runs at the END of `raft_bootstrap` (after every hosted member's durable
     // snapshot is restored — see there). On the non-Raft path there is no
@@ -35224,6 +35277,7 @@ mod clustered_startup_tests {
             retries,
             worker: None,
             error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
         };
         let server = ServerImpl::default();
         let shard = &server.store.shards()[0].1;
@@ -47640,6 +47694,68 @@ mod clustered_startup_tests {
         assert_eq!(
             backoff_wake_delay(2, 5_000),
             Some(std::time::Duration::from_millis(5_001))
+        );
+    }
+
+    /// #933 (review) — a restart during a persisted backoff restores the
+    /// deadline but drops the process-local wake task. `reschedule_backoff_wakes`
+    /// re-arms it from the replayed engine state, so a long-poll parked across
+    /// the restart is still woken when the backoff elapses (not at its request
+    /// timeout). This drives the same recovery the boot path runs, without a
+    /// real process bounce: fail with a backoff, drop the implicit wake (no
+    /// `signal_jobs_available_after_backoff` on this path), then reschedule.
+    #[tokio::test]
+    async fn restart_during_backoff_rearms_the_wake_and_serves_the_long_poll() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        // Fail with a backoff applied DIRECTLY on the engine actor — the
+        // restart analogue: the deadline is persisted on the event, but no
+        // process-local wake task is scheduled (that is what a bounce drops).
+        let backoff_ms: u64 = 1_500;
+        let (events, _commit) = server
+            .apply_job_command_direct(
+                job_key,
+                Command::fail_job_with_backoff(job_key, 2, "flaky upstream", backoff_ms as i64),
+            )
+            .await
+            .expect("the fail applies");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: Some(_),
+                ..
+            }
+        )));
+
+        let parked_at = std::time::Instant::now();
+        // Boot recovery: re-arm the wake from the replayed deadline.
+        server.reschedule_backoff_wakes().await;
+
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(10_000);
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match server.activate_jobs_impl(&req).await.expect("activate ok") {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        let waited = parked_at.elapsed();
+        assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
+        assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        assert!(
+            waited >= std::time::Duration::from_millis(backoff_ms),
+            "re-served after {waited:?}, before the {backoff_ms}ms backoff"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(9_000),
+            "the re-armed wake must serve the long-poll, not its timeout ({waited:?})"
         );
     }
 

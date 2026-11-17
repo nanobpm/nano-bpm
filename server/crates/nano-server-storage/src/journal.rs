@@ -3515,6 +3515,9 @@ impl Journal {
             return Vec::new(); // see `activate_jobs_with_fetch` (#1405)
         }
         self.rehydrate_activation_candidates(job_type, max_jobs);
+        // Promote any deferred (`retryBackOff`) jobs whose deadline has passed,
+        // so selection sees newly-eligible work (#933).
+        self.engine.promote_due_deferred_jobs(now);
         self.engine
             .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
     }
@@ -3582,13 +3585,22 @@ impl Journal {
         let candidates = cold
             .index
             .instances_for_job_type_rotated(job_type, after, budget);
+        let now = self.engine.now();
         let mut restored = 0usize;
         for key in candidates {
             if restored >= max_jobs {
                 break;
             }
             match self.rehydrate_cold(key) {
-                ColdRehydration::Restored => restored += 1,
+                ColdRehydration::Restored => {
+                    // A restored instance whose every job of this type is still
+                    // deferred by a `retryBackOff` (#933) must not consume the
+                    // rehydration limit ahead of an instance with ready work:
+                    // continue past it so eligible jobs fill the request.
+                    if self.instance_has_ready_job_of_type(key, job_type, now) {
+                        restored += 1;
+                    }
+                }
                 // Unreadable rows stay cold; their jobs are simply not offered
                 // this poll, and the next poll starts after them.
                 ColdRehydration::Unreadable => {
@@ -3597,6 +3609,26 @@ impl Journal {
                 ColdRehydration::NotCold | ColdRehydration::Absent => {}
             }
         }
+    }
+
+    /// Whether the (resident) instance `key` holds at least one job of
+    /// `job_type` that a poll at `now` could activate — i.e. `Created` and not
+    /// still deferred by a `retryBackOff` (#933). Used to keep a deferred-only
+    /// cold instance from consuming the activation rehydration limit ahead of
+    /// an instance with ready work.
+    fn instance_has_ready_job_of_type(&self, key: Key, job_type: &str, now: u64) -> bool {
+        self.engine
+            .state()
+            .jobs_by_instance
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|jk| self.engine.state().jobs.get(jk))
+            .any(|job| {
+                job.job_type == job_type
+                    && job.state == nanobpmn_engine_core::JobState::Created
+                    && job.retry_backoff_until.is_none_or(|until| until <= now)
+            })
     }
 
     /// Rehydrates the spilled variables every activated job needs (#1331), and
@@ -5584,6 +5616,57 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    /// #933 (review) — cold candidate selection must not let a deferred
+    /// (`retryBackOff`) job consume the rehydration limit ahead of an instance
+    /// with ready work. With `max_jobs = 1`, restoring a deferred-only cold
+    /// instance must not starve a later cold instance whose job is ready.
+    #[test]
+    fn deferred_cold_job_does_not_consume_the_rehydration_limit() {
+        let mut journal = cold_journal();
+        // Two parked instances, each holding one `demo-work` job.
+        let deferred_inst = deploy_and_create(&mut journal);
+        let ready_inst = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 2);
+        assert_eq!(journal.cold_count(), 2);
+
+        // Fail the OLDER instance's job back with a backoff, then re-spill it,
+        // so its only job is deferred (not eligible at the poll's `now`).
+        let deferred_job = {
+            let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+            assert_eq!(
+                jobs.len(),
+                1,
+                "the older (deferred) instance rehydrates first"
+            );
+            jobs[0].key
+        };
+        let (events, _) = journal
+            .apply_command_at(
+                Command::fail_job_with_backoff(deferred_job, 2, "flaky", 60_000),
+                1_000,
+            )
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: Some(_),
+                ..
+            }
+        )));
+        // Re-spill the deferred instance so both are cold again, the deferred
+        // one carrying a future backoff deadline.
+        journal.force_cold_spill_all();
+        assert_eq!(journal.cold_count(), 2);
+
+        // A `max_jobs = 1` poll at t=2_000 (backoff until 61_000 not yet
+        // elapsed) must reach the READY instance, not be exhausted restoring the
+        // deferred one.
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 2_000);
+        assert_eq!(jobs.len(), 1, "the ready cold job is served");
+        assert_eq!(jobs[0].instance_key, ready_inst);
+        assert_ne!(jobs[0].instance_key, deferred_inst);
     }
 
     // Copilot on #1418: modification/migration/cancel of a parent must page in

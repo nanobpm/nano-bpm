@@ -697,6 +697,15 @@ impl Engine {
         &self.state
     }
 
+    /// The clock reading of the command currently being processed (the units the
+    /// host supplies — Unix epoch ms on the server). The engine never reads a
+    /// wall clock itself; this is the logical `now` the last `apply_command_at`
+    /// set, used by hosts that need to compare a persisted deadline (e.g. a
+    /// job's `retryBackOff`, #933) against the engine's clock.
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
     /// Mutable access to the full engine state, for tests that need to simulate
     /// host-side effects the engine cannot perform on itself (e.g. aging a
     /// bounded-ledger entry out from under a live job).
@@ -3052,6 +3061,10 @@ impl Engine {
                 fetch_variables,
                 with_lease,
             } => {
+                // Promote any deferred (`retryBackOff`) jobs whose deadline has
+                // passed before selecting, so a poll serves newly-eligible work
+                // without scanning the still-deferred prefix (#933).
+                self.promote_due_deferred_jobs(now);
                 let keys = self.select_activatable_job_keys(&job_type, max_jobs, now, with_lease);
                 self.apply_activation_plan(
                     &mut log,

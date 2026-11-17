@@ -71,6 +71,22 @@ impl Engine {
         for instance in snapshot.state.instances.values_mut() {
             instance.resolve_legacy_join_scopes();
         }
+        // The deferred-job index (#933) is serde-skipped (in-memory only), so a
+        // restored snapshot carries it empty. Rebuild it from `jobs`: any
+        // `Created` job still holding a `retry_backoff_until` is deferred. The
+        // persisted `activatable_jobs` was written with such jobs EXCLUDED, so
+        // without this rebuild a deferred job restored from a snapshot would sit
+        // in NEITHER index — never activated even after its backoff elapsed.
+        let deferred: Vec<(u64, Key)> = snapshot
+            .state
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state == crate::state::JobState::Created && job.retry_backoff_until.is_some()
+            })
+            .map(|job| (job.retry_backoff_until.unwrap_or(0), job.key))
+            .collect();
+        snapshot.state.deferred_jobs = deferred.into_iter().collect();
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,

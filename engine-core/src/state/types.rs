@@ -2425,6 +2425,16 @@ pub struct State {
     /// load. It is fully derived from `jobs` and kept in lockstep by
     /// [`resync_job_index`].
     pub activatable_jobs: HashMap<String, BTreeSet<(i64, Key)>>,
+    /// Jobs deferred by a Camunda 8 v2 `retryBackOff` (#933), ordered by their
+    /// eligibility deadline (`retry_backoff_until`) then key. A job is a member
+    /// iff it is `Created` with a pending (future) backoff. Keeping deferred
+    /// jobs OUT of `activatable_jobs` means a worker poll never scans the
+    /// delayed prefix: it promotes only the due prefix of this index (O(due))
+    /// and then walks the ready set in O(max_jobs). Derived from `jobs`, kept in
+    /// lockstep by [`resync_job_index`]. In-memory only — rebuilt from `jobs` on
+    /// snapshot restore, so it needs no serde field.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub deferred_jobs: BTreeSet<(u64, Key)>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
@@ -2965,11 +2975,12 @@ impl State {
                 .sum::<usize>()
     }
 
-    /// Removes `key` from both job indices (the activatable set under
-    /// `job_type`, and the activated set), pruning an emptied per-type set.
-    /// Used when a job is dropped from `jobs` entirely (eviction), where
-    /// [`resync_job_index`] cannot run because the job is already gone. `priority`
-    /// is the dropped job's priority, needed to locate its ordering slot.
+    /// Removes `key` from all three job indices (the activatable set under
+    /// `job_type`, the deferred set, and the activated set), pruning an emptied
+    /// per-type set. Used when a job is dropped from `jobs` entirely (eviction),
+    /// where [`resync_job_index`] cannot run because the job is already gone.
+    /// `priority` is the dropped job's priority, needed to locate its ordering
+    /// slot.
     pub fn deindex_job(&mut self, job_type: &str, key: Key, priority: i32) {
         if let Some(set) = self.activatable_jobs.get_mut(job_type) {
             set.remove(&activation_order(priority, key));
@@ -2977,6 +2988,10 @@ impl State {
                 self.activatable_jobs.remove(job_type);
             }
         }
+        // The job is gone from `jobs`, so its exact deferred slot may be
+        // unknown (a prior transition could have cleared the deadline); remove
+        // by key to be safe.
+        remove_deferred_job(self, key);
         self.activated_jobs.remove(&key);
     }
 }
@@ -3110,7 +3125,12 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     let job_type = job.job_type.clone();
     let job_state = job.state;
     let order = activation_order(job.priority, job_key);
-    if job_state == JobState::Created {
+    let backoff_until = job.retry_backoff_until;
+    // A `Created` job with a pending backoff is deferred, not activatable: it
+    // leaves the hot ready set and is indexed by its eligibility deadline so a
+    // poll promotes only the due prefix instead of scanning the delayed prefix.
+    let deferred = job_state == JobState::Created && backoff_until.is_some();
+    if job_state == JobState::Created && !deferred {
         state
             .activatable_jobs
             .entry(job_type)
@@ -3122,11 +3142,28 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
             state.activatable_jobs.remove(&job_type);
         }
     }
+    if deferred {
+        state
+            .deferred_jobs
+            .insert((backoff_until.unwrap_or(0), job_key));
+    } else {
+        remove_deferred_job(state, job_key);
+    }
     if job_state == JobState::Activated {
         state.activated_jobs.insert(job_key);
     } else {
         state.activated_jobs.remove(&job_key);
     }
+}
+
+/// Removes `job_key` from the deferred index whatever its (possibly already
+/// cleared) deadline slot. The deferred index is keyed by `(deadline, key)`, but
+/// a transition out of deferred (activation, eviction, terminal settle) may
+/// clear `retry_backoff_until` before re-syncing, so the exact slot is not
+/// always known here. Deferred sets are tiny (only jobs mid-`retryBackOff`), so
+/// a key scan is cheap and always correct.
+fn remove_deferred_job(state: &mut State, job_key: Key) {
+    state.deferred_jobs.retain(|&(_, key)| key != job_key);
 }
 
 #[cfg(test)]
