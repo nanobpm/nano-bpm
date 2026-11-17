@@ -34,6 +34,7 @@ mod migration_scopes;
 mod modify_moves;
 mod modify_scopes;
 mod multi_instance;
+mod replica_agreement;
 mod retry_phases;
 mod scoped_conditions;
 mod terminal_timing;

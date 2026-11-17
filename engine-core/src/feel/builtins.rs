@@ -1090,7 +1090,11 @@ fn date_of(v: &FeelVal) -> Option<Date> {
 }
 
 fn now_datetime() -> Option<DateTime> {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    // The replicated command clock when the engine installed one (#1642).
+    let secs = match super::env::now_ms() {
+        Some(ms) => (ms / 1000) as i64,
+        None => SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64,
+    };
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -1309,7 +1313,7 @@ fn rounding_mode(name: &str) -> Result<RoundMode, FeelError> {
 }
 
 /// A dependency-free `[0, 1)` double for `random number()`, seeded from the
-/// wall clock and a monotonic counter (nondeterministic, like `now()`).
+/// replicated engine environment, or else the wall clock (see [`super::env`]).
 fn rand_unit() -> f64 {
     (next_random() >> 11) as f64 / (1u64 << 53) as f64
 }
@@ -1317,6 +1321,10 @@ fn rand_unit() -> f64 {
 /// A single 64-bit draw from a SplitMix64 generator seeded per call from the
 /// clock and a process-wide counter, so successive calls differ.
 fn next_random() -> u64 {
+    // The replicated, seeded stream when the engine installed one (#1642).
+    if let Some(v) = super::env::next_u64() {
+        return v;
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -1324,12 +1332,8 @@ fn next_random() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut z = nanos
-        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    let mut state = nanos.wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    super::env::splitmix64(&mut state)
 }
 
 /// Generates a random RFC-4122 version-4 UUID string.
