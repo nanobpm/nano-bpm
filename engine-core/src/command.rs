@@ -1038,6 +1038,13 @@ impl Command {
                     h.str(&d.id);
                 }
             }
+            // Same identity as `DeployResources`: the process ids. The other
+            // resource kinds contribute nothing, matching `DeployForms` etc.
+            Command::DeployBundle(b) => {
+                for d in &b.processes {
+                    h.str(&d.id);
+                }
+            }
             Command::DeployDecisionRequirements(_)
             | Command::DeployForms(_)
             | Command::DeployGenericResources(_)
