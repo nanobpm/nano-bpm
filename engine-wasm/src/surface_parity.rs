@@ -173,6 +173,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::ExpireJobsByDurability { .. } => Surface::NotSurfaced {
             reason: "worker-specific expiration scan; the simulation clock expires both lease modes via ExpireJobs",
         },
+        Command::EvaluateConditionalStartEvents { .. } => Surface::NotSurfaced {
+            reason: "conditional-start evaluation is a server/REST seam (POST /conditionals/evaluation); \
+                 the in-browser test engine exposes no evaluation driver yet",
+        },
         Command::OpenMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",
         },

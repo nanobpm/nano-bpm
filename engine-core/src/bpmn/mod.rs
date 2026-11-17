@@ -41,6 +41,12 @@
 //!   [`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)
 //!   carrying its trigger; the engine arms the trigger while the enclosing
 //!   scope is active (see the engine-core README for the runtime semantics).
+//! * A process-level `startEvent` with a nested `conditionalEventDefinition`/
+//!   `condition` (a **root-level conditional start event**, #932): modelled as
+//!   [`ElementKind::ConditionalStartEvent`](crate::model::ElementKind::ConditionalStartEvent).
+//!   It opens no subscription; a conditional evaluation
+//!   (`Command::EvaluateConditionalStartEvents`, `POST /v2/conditionals/evaluation`)
+//!   creates an instance for each such start whose condition holds.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`

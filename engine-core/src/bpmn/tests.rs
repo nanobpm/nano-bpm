@@ -3186,6 +3186,127 @@ fn should_parse_multi_instance_loop_characteristics() {
 }
 
 #[test]
+fn should_parse_a_root_level_conditional_start_event() {
+    // given: a process whose only start is a root-level conditional start
+    // (#932), plus a second process mixing a none start with a conditional one.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="cs">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition xsi:type="bpmn:tFormalExpression">=orderAmount &gt; 100</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+            </bpmn:process>
+            <bpmn:process id="q">
+              <bpmn:startEvent id="none" />
+              <bpmn:startEvent id="cond">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition>=go = true</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="g0" sourceRef="none" targetRef="e1" />
+              <bpmn:sequenceFlow id="g1" sourceRef="cond" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when
+    let defs = parse_bpmn(xml).unwrap();
+
+    // then: the start is a typed conditional start, never a plain none start.
+    let p = defs.iter().find(|d| d.id == "p").unwrap();
+    assert_eq!(
+        p.element("cs").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=orderAmount > 100".to_string(),
+        }
+    );
+    assert_eq!(p.start_event, "cs");
+    // and a none start alongside it stays the CreateInstance entry point.
+    let q = defs.iter().find(|d| d.id == "q").unwrap();
+    assert_eq!(q.start_event, "none");
+    assert_eq!(q.element("none").unwrap().kind, ElementKind::StartEvent);
+    assert_eq!(
+        q.element("cond").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=go = true".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_malformed_root_level_conditional_start_events() {
+    // given: every malformed root conditional-start shape (#932) — each must
+    // fail closed rather than deploy as a none start or a silently-picked
+    // single trigger.
+    let cases = [
+        ("missing condition", "<bpmn:conditionalEventDefinition />"),
+        (
+            "blank condition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>   </bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "duplicate definitions",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=b</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a message definition",
+            "<bpmn:messageEventDefinition messageRef=\"m\" />\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a signal definition and an empty condition",
+            "<bpmn:signalEventDefinition signalRef=\"sig\" />\
+             <bpmn:conditionalEventDefinition />",
+        ),
+        (
+            "mixed with a timer definition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>",
+        ),
+    ];
+    for (label, defs) in cases {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                <bpmn:message id="m" name="m" />
+                <bpmn:signal id="sig" name="sig" />
+                <bpmn:process id="p">
+                  <bpmn:startEvent id="cs">{defs}</bpmn:startEvent>
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+                </bpmn:process>
+              </bpmn:definitions>"#
+        );
+        // The same shape alongside a separate none start: surplus-start
+        // demotion must not reclassify the malformed start (e.g. as a surplus
+        // signal start) before the conditional-start validation sees it.
+        let xml_with_none_start = xml.replace(
+            r#"<bpmn:endEvent id="e" />"#,
+            r#"<bpmn:startEvent id="a_none" />
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f1" sourceRef="a_none" targetRef="e" />"#,
+        );
+
+        for (variant, doc) in [("alone", &xml), ("with a none start", &xml_with_none_start)] {
+            // when
+            let result = parse_bpmn(doc);
+
+            // then
+            assert!(
+                matches!(result, Err(ParseError::InvalidProcess { .. })),
+                "{label} ({variant}): expected InvalidProcess, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn should_parse_conditional_intermediate_catch_and_boundary_events() {
     // given: a conditional intermediate catch and a conditional boundary
     // (one interrupting, one not) whose FEEL condition lives in the nested

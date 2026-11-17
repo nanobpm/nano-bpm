@@ -75,9 +75,11 @@ pub(super) struct NodeAcc {
     ///
     /// [`EventSubProcessTrigger::Escalation`]: crate::model::EventSubProcessTrigger::Escalation
     pub(super) esp_escalation_ref: Option<Option<String>>,
-    /// For a start event nested in an event sub-process: the FEEL `condition`
-    /// of its `conditionalEventDefinition` (an
-    /// [`EventSubProcessTrigger::Conditional`]).
+    /// The FEEL `condition` of a start event's `conditionalEventDefinition`:
+    /// for a start nested in an event sub-process, an
+    /// [`EventSubProcessTrigger::Conditional`]; for a process-level start, a
+    /// root-level [`ConditionalStartEvent`](crate::model::ElementKind::ConditionalStartEvent)
+    /// (#932).
     ///
     /// [`EventSubProcessTrigger::Conditional`]: crate::model::EventSubProcessTrigger::Conditional
     pub(super) esp_condition: Option<String>,
@@ -88,6 +90,12 @@ pub(super) struct NodeAcc {
     /// Number of `*EventDefinition` child elements read on a start event
     /// (occurrences, so two same-type definitions count as two).
     pub(super) start_def_count: u32,
+    /// Whether a `conditionalEventDefinition` element was read on this start
+    /// event — tracked separately from [`Self::esp_condition`] (which is only
+    /// set for a non-blank `<condition>`), so a conditional start with a
+    /// missing or blank condition is rejected instead of silently degrading to
+    /// a none start (#932).
+    pub(super) has_conditional_def: bool,
     /// For a timer start event: the raw text of its `timeDuration`/`timeCycle`/
     /// `timeDate` when it is a static ISO-8601 literal (not a `=`-prefixed FEEL
     /// expression, which populates `timer_expr` instead). Retained so an event
@@ -463,6 +471,7 @@ impl ProcessAcc {
             esp_condition: None,
             esp_interrupting: None,
             start_def_count: 0,
+            has_conditional_def: false,
             timer_literal: None,
             timer_def_kind: None,
             adhoc_output_collection: None,
@@ -1294,11 +1303,19 @@ impl ProcessAcc {
         if proc_starts.len() > 1 {
             // A none start carries no message/timer/signal event definition.
             let is_none_start = |n: &NodeAcc| {
-                n.message_ref.is_none() && n.timer_repeating.is_none() && n.signal_ref.is_none()
+                n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.signal_ref.is_none()
+                    && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // A signal start carries a signalRef but no message/timer definition.
             let is_signal_start = |n: &NodeAcc| {
-                n.signal_ref.is_some() && n.message_ref.is_none() && n.timer_repeating.is_none()
+                n.signal_ref.is_some()
+                    && n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // Keep a single none/signal start as the process-entry `StartEvent`
             // (prefer a none start); any additional *signal* start is surplus.
@@ -1665,6 +1682,34 @@ impl ProcessAcc {
                         .is_some_and(|p| event_subprocess_ids.contains(p))
                     {
                         builder.start_event(node.id)
+                    } else if node.has_conditional_def || node.esp_condition.is_some() {
+                        // A root-level `conditionalEventDefinition` start (#932)
+                        // must declare exactly one event definition carrying a
+                        // non-blank condition. Fail closed on any other shape: a
+                        // missing/blank condition must not degrade to a none
+                        // start, and a duplicate or mixed definition must not
+                        // silently pick one trigger.
+                        let invalid = |reason: &str| ParseError::InvalidProcess {
+                            process_id: self.id.clone(),
+                            reason: format!("conditional start event {} {reason}", node.id),
+                        };
+                        if node.start_def_count > 1 {
+                            return Err(invalid(
+                                "declares more than one event definition; exactly one \
+                                 conditionalEventDefinition is supported",
+                            ));
+                        }
+                        let Some(condition) = node.esp_condition else {
+                            return Err(invalid(
+                                "has a conditionalEventDefinition without a non-blank \
+                                 <condition>",
+                            ));
+                        };
+                        // A root-level `conditionalEventDefinition` start (#932):
+                        // triggered by a conditional evaluation, not a
+                        // subscription. (Inside an event sub-process the
+                        // condition lives on the container trigger, above.)
+                        builder.conditional_start_event(node.id, condition)
                     } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
                             ParseError::InvalidMessageEvent {

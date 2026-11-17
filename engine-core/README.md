@@ -270,6 +270,15 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   (`timeDuration`) is retained with no due time (`next_due_at: None`) so it never
   fires again. Like all timers the engine stays **clock-free** and the schedule is
   durable across restarts.
+- **Conditional start events** (a process-level `startEvent` with a
+  `conditionalEventDefinition`) create instances on demand from a **conditional
+  evaluation**. They open no subscription: an `EvaluateConditionalStartEvents {
+  variables, process_definition_key }` command (the REST
+  `POST /v2/conditionals/evaluation`) evaluates every such start's FEEL condition
+  against the supplied variables — across the latest version of every deployed
+  process, or only the exact version a definition key names — and **creates a new
+  instance** (seeded with the variables) for each start whose condition is
+  `true`. A condition that errors or is non-boolean is simply not satisfied.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -395,7 +404,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **event-triggered instance creation**:
 > **message start events** (a matching message creates a new instance) and
 > **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
-> creates instances on a host clock tick), and **embedded sub-processes** (a
+> creates instances on a host clock tick), **conditional start events** (a
+> conditional evaluation whose variables satisfy the condition creates a new
+> instance), and **embedded sub-processes** (a
 > token scope whose inner flow runs to its own end before the sub-process routes
 > on, with **error, timer and message boundary events** attached to the
 > sub-process — an interrupting one terminates the whole inner scope and routes to
