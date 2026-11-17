@@ -125,6 +125,15 @@ pub struct EngineSnapshot {
     /// pre-#1405 snapshot decodes with `None`.
     #[serde(default)]
     pub raft_applied: Option<(u64, String)>,
+    /// Per-command discriminator for the FEEL random-stream seed (#1642/#1649):
+    /// the applied Raft entry index when the host journals one, else a
+    /// same-index fallback that still strictly increases per command. Snapped
+    /// so a snapshot+tail recovery derives the same seeds as a full replay.
+    /// Additive: a pre-#1649 snapshot decodes with `0`, exactly what
+    /// [`Engine::replay_partition`] derives for a journal carrying no
+    /// `RaftEntryApplied` records.
+    #[serde(default)]
+    pub command_seq: u64,
 }
 
 /// Synthetic worker name stamped on a job whose activation lease was recovered
@@ -177,6 +186,31 @@ pub struct Engine {
     /// `uuid()` agree across Raft replicas. Reseeded by every
     /// `plan_command_at`, so it is per-command scratch and never snapshotted.
     feel_env: crate::feel::EvalEnv,
+    /// Per-command discriminator mixed into the FEEL random-stream seed
+    /// (#1649 review): strictly increasing per applied command and identical on
+    /// every replica, so two commands sharing `(now, next_local)` — e.g.
+    /// same-timestamp completions of tasks with no outgoing flows, which mint
+    /// no keys — still derive distinct streams. Derived from the applied Raft
+    /// entry index when the host journals one (see [`Engine::set_raft_applied`]
+    /// / [`Event::RaftEntryApplied`]); a host that applies commands without a
+    /// Raft journal (tests, the debugger, embedded use) gets the same-index
+    /// fallback bump in [`Engine::plan_command_at`], which keeps the sequence
+    /// strictly increasing without any replication input. Carried in the
+    /// snapshot (`EngineSnapshot::command_seq`) so a snapshot+tail recovery
+    /// derives the same seeds as a full replay.
+    command_seq: u64,
+    /// The `command_seq` value the previous command was seeded with (#1649).
+    /// Lets [`Engine::plan_command_at`] tell "the journal committed an entry
+    /// since the last command" (sequence advanced on its own — use it) from
+    /// "no journal is driving this engine" (sequence unchanged — bump it), so
+    /// both hosts get a strictly increasing per-command seed. Per-command
+    /// scratch like `feel_env`: never snapshotted; a restored engine simply
+    /// re-derives it from the first command it plans after recovery.
+    last_seed_seq: u64,
+    /// The sequence value the in-flight command was seeded with (#1649), moved
+    /// into `command_seq` by [`Engine::commit_seed_seq`] only when the command
+    /// actually emits events. Per-command scratch, never snapshotted.
+    pending_seed_seq: u64,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
     /// instances across the cluster's partitions. Not derived from events (the
     /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
@@ -684,6 +718,9 @@ impl Engine {
             num_partitions: 1,
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
+            command_seq: 0,
+            last_seed_seq: 0,
+            pending_seed_seq: 0,
             start_dispatch_rr: 0,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -836,6 +873,12 @@ impl Engine {
             event.advance_allocator(partition_id, &mut next_local);
             state::apply(&mut state, &event);
         }
+        // The per-command FEEL seed discriminator (#1649): the last applied
+        // Raft entry index, matching what the journaled host's
+        // `set_raft_applied` derived. A journal with no `RaftEntryApplied`
+        // records (embedded/test drivers) leaves `0`, the same value a live
+        // engine holds until its first indexed entry.
+        let command_seq = raft_applied.as_ref().map(|(index, _)| *index).unwrap_or(0);
         Self {
             state,
             partition_id,
@@ -843,6 +886,9 @@ impl Engine {
             num_partitions: 1,
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
+            command_seq,
+            last_seed_seq: command_seq,
+            pending_seed_seq: command_seq,
             start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -876,6 +922,9 @@ impl Engine {
     /// replay.
     pub fn set_raft_applied(&mut self, index: u64, raft_state: String) {
         self.raft_applied = Some((index, raft_state));
+        // The applied entry index IS the per-command discriminator (#1649):
+        // strictly increasing per applied entry and identical on every replica.
+        self.command_seq = index;
     }
 
     fn mint_key(&mut self) -> Key {
@@ -2242,6 +2291,7 @@ impl Engine {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log);
             self.finish_command(&log);
+            self.commit_seed_seq(&log);
             log
         });
         self.operation_reference = None;
@@ -2284,14 +2334,55 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
-        // Seed the FEEL environment from replicated state only: the command's
-        // timestamp and the key counter (identical on every replica at this
-        // log position), never a wall clock or process-local entropy (#1642).
-        self.feel_env = crate::feel::EvalEnv::new(now, self.next_local);
+        // Seed the FEEL environment from replicated state only (#1642), never a
+        // wall clock or process-local entropy. Two components (#1649 review):
+        //
+        // * the per-command sequence — strictly increasing per applied command
+        //   and identical on every replica (the applied Raft entry index, or
+        //   the same-index fallback below). Two commands sharing
+        //   `(now, next_local)` — e.g. same-timestamp completions of tasks with
+        //   no outgoing flows, which mint no keys — still derive distinct
+        //   streams.
+        // * `peek_next_key()` — the partition-qualified allocator position, so
+        //   two partitions sharing `(now, seq)` derive disjoint streams, and
+        //   any command that mints a key moves its successor's stream on.
+        //
+        // The fallback bump keeps the sequence strictly increasing for a host
+        // that applies commands without a Raft journal (tests, the debugger,
+        // embedded use): when no entry commit has advanced `command_seq` since
+        // the previous command, this command still gets a fresh seed. The bump
+        // is a no-op whenever the journal already advanced the sequence.
+        //
+        // The sequence is only CONSUMED (committed back to `command_seq`) when
+        // the command actually produces events — see [`Engine::commit_seed_seq`].
+        // A rejected or no-op command leaves no events, so the next attempt
+        // must see the state it would have seen had this command never run
+        // (snapshot equality across an ineffective command is contractual).
+        let mut seq = self.command_seq;
+        if seq <= self.last_seed_seq {
+            seq = self.last_seed_seq.wrapping_add(1);
+        }
+        self.pending_seed_seq = seq;
+        let seed = seq
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(self.peek_next_key());
+        self.feel_env = crate::feel::EvalEnv::new(now, seed);
         let mut env = self.feel_env;
         let result = crate::feel::with_env(&mut env, || self.plan_command_inner(command));
         self.feel_env = env;
         result
+    }
+
+    /// Commits the per-command seed sequence once the command's full event log
+    /// is known (`apply_command_at`'s post-drain tail, and the debugger's
+    /// equivalent). A command that emitted no events — rejected upstream, or a
+    /// no-op like an activation that matched nothing — leaves `command_seq`
+    /// untouched, so the engine's snapshot is byte-identical across it.
+    fn commit_seed_seq(&mut self, log: &[Event]) {
+        if !log.is_empty() {
+            self.command_seq = self.pending_seed_seq;
+            self.last_seed_seq = self.pending_seed_seq;
+        }
     }
 
     fn plan_command_inner(

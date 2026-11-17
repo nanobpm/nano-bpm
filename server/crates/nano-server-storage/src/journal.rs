@@ -4476,6 +4476,7 @@ impl Journal {
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
             raft_applied: full.raft_applied,
+            command_seq: full.command_seq,
         };
         let cold_keys: Vec<Key> = self
             .cold

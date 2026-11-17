@@ -184,6 +184,7 @@ impl Engine {
             Some(paused) => session.paused = Some(paused),
             None => {
                 self.finish_command(&session.log);
+                self.commit_seed_seq(&session.log);
                 session.paused = None;
             }
         }
