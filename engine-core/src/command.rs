@@ -90,6 +90,18 @@ pub enum Command {
     /// does not execute generic resources; it stores them verbatim so they can be
     /// served by `GetResourceByKey` / searched by `resourceId`.
     DeployGenericResources(Vec<GenericResource>),
+    /// Atomically register one mixed deployment — processes, DRGs, forms and
+    /// generic resources submitted together (one REST `POST /deployments`) —
+    /// under ONE shared deployment key (#1193). `bindingType: deployment`
+    /// lookups (user-task forms, linked resources) resolve by exact
+    /// deployment membership, so co-deployed resources must share the key;
+    /// splitting a deployment into per-kind commands would mint one key per
+    /// kind and strand every co-deployed binding. Duplicate semantics follow
+    /// Zeebe: if EVERY resource is identical to its latest version the
+    /// deployment is a no-op (each keeps its existing identity); otherwise
+    /// every resource — unchanged ones included — is re-versioned under the new
+    /// deployment key, so the whole bundle stays mutually resolvable.
+    DeployBundle(DeploymentBundle),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
     /// deletion in the read model. `instance_key` is the owning process instance
     /// (`0` for a standalone evaluation), carried so the emitted
@@ -831,6 +843,21 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
+/// Every resource submitted in one deployment, registered atomically by
+/// [`Command::DeployBundle`] under a single shared deployment key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeploymentBundle {
+    /// BPMN process definitions.
+    pub processes: Vec<ProcessDefinition>,
+    /// DMN decision requirements graphs.
+    pub decisions: Vec<crate::dmn::DecisionRequirementsGraph>,
+    /// `form-js` forms.
+    pub forms: Vec<FormResource>,
+    /// Generic (stored-verbatim) resources.
+    pub resources: Vec<GenericResource>,
+}
+
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
 /// The engine stores it verbatim; it does not parse or execute the form beyond
 /// carrying its identity.
@@ -976,6 +1003,7 @@ impl Command {
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
             Command::DeployForms(_) => "deploy_forms",
             Command::DeployGenericResources(_) => "deploy_generic_resources",
+            Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
             Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",

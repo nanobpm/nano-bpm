@@ -109,8 +109,9 @@ pub use command::JobAttribution;
 #[cfg(feature = "serde")]
 pub use command::{form_id_of, form_version_tag_of};
 pub use command::{
-    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
-    GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
+    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference,
+    DeploymentBundle, FormResource, GenericResource, MoveInstruction, MoveSource,
+    UserTaskChangeset, VariableInstruction,
 };
 pub use command::{OrphanIncidentStamp, OrphanKind};
 #[cfg(feature = "serde")]

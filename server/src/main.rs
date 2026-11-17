@@ -16409,37 +16409,21 @@ impl ServerImpl {
             self.engine
                 .deploy_partition()
                 .with(move |engine| {
+                    // One mixed deployment = ONE command = ONE deployment key
+                    // shared by every co-deployed resource, so
+                    // `bindingType: deployment` forms / linked resources resolve
+                    // (#1193). Never split it into per-kind commands.
                     let (events, commit) = engine
-                        .apply_command(Command::DeployResources(processes))
+                        .apply_command(Command::DeployBundle(
+                            nanobpmn_engine_core::DeploymentBundle {
+                                processes,
+                                decisions,
+                                forms,
+                                resources: generic_resources,
+                            },
+                        ))
                         .map_err(|e| e.to_string())?;
-                    // Deploy any DMN decisions in the same durable batch. Their events
-                    // are appended so the whole deployment broadcasts/replicates as one.
-                    let mut all_events = (*events).clone();
-                    let mut commit = commit;
-                    if !decisions.is_empty() {
-                        let (dec_events, dec_commit) = engine
-                            .apply_command(Command::DeployDecisionRequirements(decisions))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*dec_events).iter().cloned());
-                        commit = dec_commit;
-                    }
-                    // Deploy any forms in the same durable batch so the whole
-                    // deployment broadcasts/replicates as one.
-                    if !forms.is_empty() {
-                        let (form_events, form_commit) = engine
-                            .apply_command(Command::DeployForms(forms))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*form_events).iter().cloned());
-                        commit = form_commit;
-                    }
-                    // Deploy any generic resources in the same durable batch.
-                    if !generic_resources.is_empty() {
-                        let (res_events, res_commit) = engine
-                            .apply_command(Command::DeployGenericResources(generic_resources))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*res_events).iter().cloned());
-                        commit = res_commit;
-                    }
+                    let all_events = (*events).clone();
                     let events = Arc::new(all_events);
                     let resolved: Resolved = requested_ids
                         .iter()
@@ -38822,6 +38806,80 @@ mod clustered_startup_tests {
                 .unwrap(),
             FormGet::Status404_TheFormWithTheGivenKeyWasNotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_deployment_stamps_one_deployment_key_on_every_resource() {
+        // #1193 review: one HTTP deployment (process + form + generic resource)
+        // must be ONE engine deployment. The mixed path used to issue a
+        // command per kind, each minting its own deployment key, so a
+        // co-deployed `bindingType: deployment` form incidented and a
+        // co-deployed linked resource vanished from the worker header.
+        let server = ServerImpl::default();
+        let bpmn = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bundle" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="bundle-form" bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let proc = parse_bpmn(bpmn).expect("valid BPMN").remove(0);
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("bundle".to_string(), "bundle.bpmn".to_string());
+        let (_result, events) = server
+            .deploy_resources_locally_with_forms(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "bundle-form".to_string(),
+                    resource_name: "bundle-form.form".to_string(),
+                    schema: r#"{"id":"bundle-form","components":[]}"#.to_string(),
+                    version_tag: None,
+                }],
+                vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "policy.md".to_string(),
+                    resource_name: "policy.md".to_string(),
+                    content: "# policy".to_string(),
+                    version_tag: None,
+                }],
+                "<default>",
+            )
+            .await
+            .expect("mixed deploy succeeds");
+        let keys: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::DeploymentCreated { deployment_key }
+                | Event::ProcessDeployed { deployment_key, .. }
+                | Event::FormDeployed { deployment_key, .. }
+                | Event::GenericResourceDeployed { deployment_key, .. } => Some(*deployment_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "every co-deployed resource shares one deployment key: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::DeploymentCreated { .. }))
+                .count(),
+            1,
+            "one deployment, one DeploymentCreated"
+        );
     }
 
     #[tokio::test]

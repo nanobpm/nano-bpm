@@ -1184,3 +1184,136 @@ fn form_miss_resolution_does_not_reapply_input_mappings() {
         "input mappings must not be re-applied on resolution: {resolved:?}"
     );
 }
+
+/// The `deployment_key` stamped on every deploy event in `events` (asserting
+/// they all agree — one deployment, one key).
+fn sole_deployment_key(events: &[Event]) -> Key {
+    let keys: std::collections::BTreeSet<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::DeploymentCreated { deployment_key }
+            | Event::ProcessDeployed { deployment_key, .. }
+            | Event::FormDeployed { deployment_key, .. }
+            | Event::GenericResourceDeployed { deployment_key, .. }
+            | Event::DecisionRequirementsDeployed { deployment_key, .. }
+            | Event::DecisionDeployed { deployment_key, .. } => Some(*deployment_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys.len(), 1, "one deployment key per bundle: {keys:?}");
+    keys.into_iter().next().unwrap_or_default()
+}
+
+fn linked_resource_process() -> crate::model::ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="lp">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="policy.md" bindingType="deployment"
+                                      resourceType="GenericScript" linkName="policy" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+fn policy(content: &str) -> crate::command::GenericResource {
+    crate::command::GenericResource {
+        resource_id: "policy.md".to_string(),
+        resource_name: "policy.md".to_string(),
+        content: content.to_string(),
+        version_tag: None,
+    }
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn a_mixed_bundle_shares_one_deployment_key_so_deployment_bindings_resolve() {
+    // #1193 review: one HTTP deployment (process + form + generic resource)
+    // must be ONE deployment. Per-kind commands minted a key per kind, so a
+    // co-deployed `bindingType: deployment` form incidented and a co-deployed
+    // linked resource was silently omitted from the worker header.
+    let mut engine = Engine::new();
+    let events = engine
+        .apply_command(Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![
+                form_binding_process(r#"bindingType="deployment""#),
+                linked_resource_process(),
+            ],
+            forms: vec![tagged_form("review-form", None)],
+            resources: vec![policy("# v1")],
+            ..Default::default()
+        }))
+        .unwrap();
+    sole_deployment_key(&events);
+    let form_key = form_key_of(&events, "review-form");
+
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(created_form_key(&created), Some(form_key));
+    assert!(engine.active_incidents().is_empty());
+
+    engine
+        .apply_command(Command::create_instance("lp"))
+        .unwrap();
+    let activated = engine.activate_jobs("run-agent", "w1", 10, 60_000, 0);
+    let resource_key = engine.state().resources["policy.md"].key;
+    assert_eq!(
+        activated[0].custom_headers.get("linkedResources"),
+        Some(&format!(
+            "[{{\"resourceKey\":\"{resource_key}\",\"resourceType\":\"GenericScript\",\"linkName\":\"policy\"}}]"
+        )),
+        "the co-deployed linked resource resolves"
+    );
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn a_partially_changed_bundle_reversions_its_unchanged_resources_under_the_new_key() {
+    // Reused resources (#1193 review): redeploying a bundle where only the
+    // form changed must not leave the unchanged process on the OLD deployment
+    // key (its deployment-bound form lookup would then pin the stale form, or
+    // miss outright). Zeebe re-versions every resource of a non-duplicate
+    // deployment; an all-duplicate bundle stays a no-op.
+    let bundle = |tag: Option<&str>| {
+        Command::DeployBundle(crate::command::DeploymentBundle {
+            processes: vec![form_binding_process(r#"bindingType="deployment""#)],
+            forms: vec![tagged_form("review-form", tag)],
+            ..Default::default()
+        })
+    };
+    let mut engine = Engine::new();
+    engine.apply_command(bundle(None)).unwrap();
+
+    let again = engine.apply_command(bundle(None)).unwrap();
+    assert!(
+        again.iter().all(|e| !matches!(
+            e,
+            Event::ProcessDeployed { .. } | Event::FormDeployed { .. }
+        )),
+        "an all-duplicate bundle re-versions nothing: {again:?}"
+    );
+
+    let changed = engine.apply_command(bundle(Some("v2"))).unwrap();
+    let key = sole_deployment_key(&changed);
+    assert!(
+        changed
+            .iter()
+            .any(|e| matches!(e, Event::ProcessDeployed { version: 2, .. })),
+        "the unchanged process is re-versioned with the changed form"
+    );
+    assert_eq!(engine.state().processes["p"].deployment_key, key);
+    let v2_form = form_key_of(&changed, "review-form");
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(created_form_key(&created), Some(v2_form));
+    assert!(engine.active_incidents().is_empty());
+}
