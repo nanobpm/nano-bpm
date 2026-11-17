@@ -2350,11 +2350,10 @@ fn should_accept_explicit_latest_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_deployment_binding_on_a_user_task_form() {
+fn should_parse_deployment_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring `bindingType="deployment"`.
-    // The engine does not implement the `deployment` binding; degrading it to
-    // `latest` would silently mis-bind the form (#1190), so the deploy must
-    // be rejected loudly rather than parsed.
+    // The binding is implemented (#1193): it parses into the task's
+    // `form_binding_type` and dispatches at user-task creation.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2372,22 +2371,23 @@ fn should_reject_deployment_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest form binding is rejected");
-    assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
-        }
-    );
+    // when
+    let def = &parse_bpmn(xml).expect("a deployment form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
+    assert_eq!(props.form_binding_type, crate::model::BindingType::Deployment);
+    assert_eq!(props.form_version_tag, None);
 }
 
 #[test]
-fn should_reject_version_tag_binding_on_a_user_task_form() {
-    // given: a user-task formDefinition declaring `bindingType="versionTag"`.
-    // Like `deployment`, this binding is unimplemented and must fail the
-    // deploy loudly rather than degrade to `latest` (#1190).
+fn should_parse_version_tag_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring `bindingType="versionTag"`
+    // with its `versionTag`. Both attributes parse into the task's form
+    // binding (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2406,23 +2406,24 @@ fn should_reject_version_tag_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a versionTag form binding is rejected");
-    assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "versionTag".to_string(),
-        }
-    );
+    // when
+    let def = &parse_bpmn(xml).expect("a versionTag form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
+    assert_eq!(props.form_binding_type, crate::model::BindingType::VersionTag);
+    assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
 }
 
 #[test]
 fn should_ignore_non_latest_binding_on_an_external_reference_form() {
     // given: an externalReference form that also (redundantly) carries a
     // non-latest bindingType. The externalReference suppresses `formId` and
-    // no form version is resolved, so the unimplemented binding is moot and
-    // must not trip the interim guard.
+    // no form version is resolved, so the binding is moot and unrecorded
+    // (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2453,6 +2454,8 @@ fn should_ignore_non_latest_binding_on_an_external_reference_form() {
         props.external_form_reference.as_deref(),
         Some("https://forms.example/x")
     );
+    // The moot binding is not recorded: the task keeps the default `latest`.
+    assert_eq!(props.form_binding_type, crate::model::BindingType::Latest);
 }
 
 #[test]
@@ -2460,7 +2463,7 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring an explicitly *empty*
     // `bindingType=""`. An empty attribute is a present, explicit value — not
     // an absent one — so it must not be silently treated as the `latest`
-    // default (which would reopen the silent-degradation path #1190 closes).
+    // default (the #1190 fail-loud rule, kept for a value no binding maps to).
     // Only an omitted `bindingType` defaults.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -2491,13 +2494,44 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_non_latest_binding_when_form_id_is_absent() {
-    // given: a user-task formDefinition with an unimplemented
-    // `bindingType="deployment"` but no `formId` (and no `externalReference`).
-    // Keying the guard off the raw `externalReference` — not off a resolved
-    // `formId` — closes this path: a deployed (non-external) form must carry
-    // only the default binding regardless of whether a `formId` happens to be
-    // present, so this declaration is rejected rather than silently accepted.
+fn should_reject_an_unknown_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring a `bindingType` that is none
+    // of Camunda's three bindings. An unrecognised value is rejected loudly
+    // rather than silently treated as the `latest` default (#1190/#1193).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" bindingType="pinned" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an unknown form binding is rejected");
+    assert_eq!(
+        err,
+        ParseError::UnsupportedUserTaskFormBinding {
+            task_id: "review".to_string(),
+            binding_type: "pinned".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_a_binding_without_a_form_id() {
+    // given: a user-task formDefinition carrying `bindingType="deployment"`
+    // but no `formId` (and no `externalReference`). The binding parses — with
+    // no `formId` there is nothing to resolve at task creation, so the binding
+    // is inert (a task with no form resolves no version under any binding).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2515,15 +2549,15 @@ fn should_reject_non_latest_binding_when_form_id_is_absent() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest binding without a formId is rejected");
-    assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
-        }
-    );
+    // when
+    let def = &parse_bpmn(xml).expect("a binding without a formId parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id, None);
+    assert_eq!(props.form_binding_type, crate::model::BindingType::Deployment);
 }
 
 #[test]

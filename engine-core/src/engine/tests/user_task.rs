@@ -21,6 +21,8 @@ fn should_raise_an_incident_when_a_due_date_expression_yields_a_function() {
                 follow_up_date: Some("=[1..2]".to_string()),
                 priority: None,
                 form_id: None,
+                form_binding_type: crate::model::BindingType::Latest,
+                form_version_tag: None,
                 external_form_reference: None,
             },
         )
@@ -235,6 +237,8 @@ fn should_create_a_user_task_with_resolved_attributes() {
                 follow_up_date: None,
                 priority: Some("=urgency".to_string()),
                 form_id: None,
+                form_binding_type: crate::model::BindingType::Latest,
+                form_version_tag: None,
                 external_form_reference: None,
             },
         )
@@ -305,6 +309,8 @@ fn should_raise_an_incident_when_assignee_expression_is_null() {
                 follow_up_date: Some("=maybeNull".to_string()),
                 priority: None,
                 form_id: None,
+                form_binding_type: crate::model::BindingType::Latest,
+                form_version_tag: None,
                 external_form_reference: None,
             },
         )
@@ -392,6 +398,8 @@ fn should_create_a_user_task_assigned_when_assignee_expression_is_a_string() {
                 follow_up_date: None,
                 priority: None,
                 form_id: None,
+                form_binding_type: crate::model::BindingType::Latest,
+                form_version_tag: None,
                 external_form_reference: None,
             },
         )
@@ -464,6 +472,7 @@ fn should_link_a_user_task_to_its_deployed_form_key() {
         id: id.to_string(),
         resource_name: format!("{id}.form"),
         schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+        version_tag: None,
     };
 
     let mut engine = Engine::new();
@@ -593,6 +602,7 @@ fn user_task_resolves_form_id_to_the_latest_form_key_and_carries_external_refere
         id: "feature-escalation".to_string(),
         resource_name: "feature-escalation.form".to_string(),
         schema: schema.to_string(),
+        version_tag: None,
     };
     let v1 = r#"{"id":"feature-escalation","type":"default","components":[]}"#;
 
@@ -727,6 +737,7 @@ fn user_task_with_external_reference_never_resolves_a_form_key_even_if_form_id_i
             id: "feature-escalation".to_string(),
             resource_name: "feature-escalation.form".to_string(),
             schema: r#"{"id":"feature-escalation","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
         }]))
         .unwrap();
 
@@ -805,4 +816,296 @@ fn initial_assignee_routes_through_assigning_after_creating() {
         engine.state().user_tasks[&key].assignee.as_deref(),
         Some("alice")
     );
+}
+
+// ── #1193: user-task form bindingType parity (deployment / versionTag) ──
+
+/// A process whose `review` user task binds `review-form` with the given
+/// `bindingType` (and optional `versionTag`) attributes, verbatim.
+fn form_binding_process(binding_attrs: &str) -> crate::model::ProcessDefinition {
+    let xml = format!(
+        r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:formDefinition formId="review-form" {binding_attrs} />
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#
+    );
+    crate::bpmn::parse_bpmn(&xml).unwrap().pop().unwrap()
+}
+
+fn tagged_form(id: &str, tag: Option<&str>) -> crate::command::FormResource {
+    // The tag rides the schema too so two tagged versions are never
+    // byte-identical (an identical redeploy is idempotently skipped and mints
+    // no version).
+    crate::command::FormResource {
+        id: id.to_string(),
+        resource_name: format!("{id}.form"),
+        schema: format!(
+            r#"{{"id":"{id}","type":"default","versionTag":{},"components":[]}}"#,
+            tag.map(|t| format!(r#""{t}""#))
+                .unwrap_or_else(|| "null".to_string())
+        ),
+        version_tag: tag.map(str::to_string),
+    }
+}
+
+fn form_key_of(events: &[Event], want_id: &str) -> Key {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed {
+                form_key, form_id, ..
+            } if form_id == want_id => Some(*form_key),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a FormDeployed for {want_id}"))
+}
+
+/// The `form_key` carried by the single `UserTaskCreated` event (or `None`
+/// when the events created no task — the binding-miss path).
+fn created_form_key(events: &[Event]) -> Option<Key> {
+    events.iter().find_map(|e| match e {
+        Event::UserTaskCreated { form_key, .. } => *form_key,
+        _ => None,
+    })
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn deployment_binding_pins_the_form_version_deployed_with_the_process() {
+    // A `deployment`-bound user-task form resolves the form version deployed
+    // alongside the process definition (the shared `deployment_key`), even
+    // after a newer form version is deployed — where `latest` would rebind.
+    let mut engine = Engine::new();
+    let shared = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .unwrap();
+    let shared_deployment = shared
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed { deployment_key, .. } => Some(*deployment_key),
+            _ => None,
+        })
+        .expect("a deployment key");
+    let form_key_v1 = form_key_of(&shared, "review-form");
+    // Install the process under the SAME deployment key (what the server's
+    // batched multi-resource deployment produces: one deployment key shared by
+    // every resource in the request).
+    engine.install_deployment(&[Event::ProcessDeployed {
+        deployment_key: shared_deployment,
+        process_definition_key: 9_000_001,
+        version: 1,
+        process: form_binding_process(r#"bindingType="deployment""#),
+    }]);
+    // A newer form version deployed AFTERWARDS (its own deployment) must NOT
+    // steal the binding.
+    let later = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .unwrap();
+    let form_key_v2 = form_key_of(&later, "review-form");
+    assert_ne!(form_key_v1, form_key_v2, "a changed redeploy mints a new key");
+    assert_eq!(engine.state().forms["review-form"].key, form_key_v2);
+
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(
+        created_form_key(&created),
+        Some(form_key_v1),
+        "the deployment binding pins the co-deployed version, not the latest"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn deployment_binding_miss_raises_a_resolvable_incident_and_creates_no_task() {
+    // The process deploys alone; the form exists only in OTHER deployments.
+    // Zeebe parity: a resolvable incident, no task, and resolving the incident
+    // once the form IS co-deployed (via a migrated/redeployed definition)
+    // creates the task.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", None)]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(form_binding_process(
+            r#"bindingType="deployment""#,
+        )))
+        .unwrap();
+
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(
+        created
+            .iter()
+            .all(|e| !matches!(e, Event::UserTaskCreated { .. })),
+        "no task is created on a deployment-binding miss: {created:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "one incident: {incidents:?}");
+    assert_eq!(
+        incidents[0].kind,
+        crate::state::IncidentKind::CalledElementError
+    );
+    assert!(
+        incidents[0].reason.contains("review-form"),
+        "the reason names the form id: {}",
+        incidents[0].reason
+    );
+    let incident_key = incidents[0].key;
+
+    // Co-deploy the form with a NEW version of the process (one shared
+    // deployment key) and migrate the parked instance onto it, exactly as the
+    // Camunda incident message prescribes. The tagged schema differs from the
+    // first deploy, so this mints a fresh version under a fresh deployment key.
+    let co = engine
+        .apply_command(Command::DeployForms(vec![tagged_form(
+            "review-form",
+            Some("co"),
+        )]))
+        .unwrap();
+    let co_deployment = co
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed { deployment_key, .. } => Some(*deployment_key),
+            _ => None,
+        })
+        .expect("co-deployment key");
+    let co_form_key = form_key_of(&co, "review-form");
+    let instance_key = engine
+        .state()
+        .instances
+        .keys()
+        .next()
+        .copied()
+        .expect("the parked instance");
+    engine.install_deployment(&[Event::ProcessDeployed {
+        deployment_key: co_deployment,
+        process_definition_key: 9_000_002,
+        version: 2,
+        process: form_binding_process(r#"bindingType="deployment""#),
+    }]);
+    engine
+        .apply_command(Command::migrate_instance(
+            instance_key,
+            9_000_002,
+            // The target definition renames nothing, but migration requires an
+            // explicit mapping for every active element (the parked task).
+            vec![("review".to_string(), "review".to_string())],
+        ))
+        .unwrap();
+
+    // Resolving the incident re-drives the activation, which now binds the
+    // co-deployed form version.
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert_eq!(
+        created_form_key(&resolved),
+        Some(co_form_key),
+        "resolution binds the form deployed with the migrated-to definition"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn version_tag_binding_resolves_the_tagged_form_version() {
+    let mut engine = Engine::new();
+    let v1 = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .unwrap();
+    let key_v1 = form_key_of(&v1, "review-form");
+    let v2 = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .unwrap();
+    let key_v2 = form_key_of(&v2, "review-form");
+    engine
+        .apply_command(Command::DeployProcess(form_binding_process(
+            r#"bindingType="versionTag" versionTag="v1""#,
+        )))
+        .unwrap();
+
+    // The binding pins the v1-tagged version even though v2 is the latest.
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(created_form_key(&created), Some(key_v1));
+    assert_ne!(key_v1, key_v2);
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn version_tag_binding_miss_raises_a_resolvable_incident() {
+    let mut engine = Engine::new();
+    // The form exists, but no version carries the declared tag.
+    engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v1"))]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(form_binding_process(
+            r#"bindingType="versionTag" versionTag="v9""#,
+        )))
+        .unwrap();
+
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert!(
+        created
+            .iter()
+            .all(|e| !matches!(e, Event::UserTaskCreated { .. })),
+        "no task is created on a versionTag miss: {created:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "one incident: {incidents:?}");
+    assert!(
+        incidents[0].reason.contains("v9"),
+        "the reason names the missing tag: {}",
+        incidents[0].reason
+    );
+    let incident_key = incidents[0].key;
+
+    // Deploy the tagged version, then resolve: the activation re-drive binds it.
+    let tagged = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v9"))]))
+        .unwrap();
+    let key_v9 = form_key_of(&tagged, "review-form");
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert_eq!(created_form_key(&resolved), Some(key_v9));
+    assert!(engine.active_incidents().is_empty());
+}
+
+// zeebe-cells: element:UserTask
+#[test]
+fn omitted_binding_type_still_resolves_the_latest_form_at_creation() {
+    // No `bindingType` attribute at all: the Zeebe default `latest` applies —
+    // the pre-#1193 behaviour every existing model relies on.
+    let mut engine = Engine::new();
+    let v1 = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", None)]))
+        .unwrap();
+    let _key_v1 = form_key_of(&v1, "review-form");
+    engine
+        .apply_command(Command::DeployProcess(form_binding_process("")))
+        .unwrap();
+    let v2 = engine
+        .apply_command(Command::DeployForms(vec![tagged_form("review-form", Some("v2"))]))
+        .unwrap();
+    let key_v2 = form_key_of(&v2, "review-form");
+
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    assert_eq!(
+        created_form_key(&created),
+        Some(key_v2),
+        "the default binding resolves the latest version at creation"
+    );
+    assert!(engine.active_incidents().is_empty());
 }

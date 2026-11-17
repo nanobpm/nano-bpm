@@ -15,6 +15,7 @@ pub(super) fn apply_process(state: &mut State, event: &Event) {
         }
 
         Event::ProcessDeployed {
+            deployment_key,
             process_definition_key,
             version,
             process,
@@ -25,6 +26,7 @@ pub(super) fn apply_process(state: &mut State, event: &Event) {
             let deployed = DeployedProcess {
                 key: *process_definition_key,
                 version: *version,
+                deployment_key: *deployment_key,
                 definition,
             };
             // Retain every version, keyed by its unique definition key, so a

@@ -53,7 +53,7 @@ attr-businessRuleTask-resultVariable  ::= "resultVariable" sp attr-str   # Varia
 # userTask — Native user task. A human claims and completes it via the user-task API.
 elem-userTask  ::= indent "userTask" sp id (sp string)? (sp attrs-userTask)? nl
 attrs-userTask   ::= "{" nl (indent2 attr-line-userTask nl)+ indent "}"
-attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-userTask-formId | attr-userTask-externalFormReference | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
+attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-userTask-formId | attr-userTask-formBindingType | attr-userTask-formVersionTag | attr-userTask-externalFormReference | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-property | attr-multiInstance
 attr-userTask-assignee  ::= "assignee" sp attr-str   # Raw assignee expression (literal or FEEL).
 attr-userTask-candidateGroups  ::= "candidateGroups" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
 attr-userTask-candidateUsers  ::= "candidateUsers" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
@@ -61,6 +61,8 @@ attr-userTask-dueDate  ::= "dueDate" sp attr-str   # Raw due-date expression (li
 attr-userTask-followUpDate  ::= "followUpDate" sp attr-str   # Raw follow-up-date expression (literal or FEEL).
 attr-userTask-priority  ::= "priority" sp attr-str   # Raw priority expression (literal or FEEL); default 50.
 attr-userTask-formId  ::= "formId" sp attr-str   # Embedded/deployment form id; resolved to a numeric form key at task creation.
+attr-userTask-formBindingType  ::= "formBindingType" sp attr-str   # How formId resolves at task creation: latest (default), deployment (the version deployed with the process) or versionTag.
+attr-userTask-formVersionTag  ::= "formVersionTag" sp attr-str   # The version tag matched when formBindingType is versionTag.
 attr-userTask-externalFormReference  ::= "externalFormReference" sp attr-str   # External form reference, surfaced verbatim.
 
 # exclusiveGateway — XOR gateway. Takes exactly one outgoing flow (first matching condition; default is fallback).

@@ -321,6 +321,9 @@ impl TestEngine {
             id: id.clone(),
             resource_name: resource_name.clone(),
             schema: schema.to_string(),
+            // The form-js document's optional `versionTag` is matched by a
+            // `versionTag`-bound user-task form (#1193).
+            version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
         }]))
         .map_err(|e| js_err(&format!("deploy error: {e}")))?;
         // Resolve from post-apply state rather than the emitted events: an
@@ -367,6 +370,10 @@ impl TestEngine {
             resource_id: resource_name.to_string(),
             resource_name: resource_name.to_string(),
             content: content.to_string(),
+            // The wasm deploy entry point carries no `versionTag` metadata
+            // yet, so a generic resource deploys untagged (#1193 wires the
+            // engine-side tag storage a future parameter populates).
+            version_tag: None,
         }]))
         .map_err(|e| js_err(&format!("deploy error: {e}")))?;
         // Resolve from post-apply state rather than the emitted events: an
@@ -5252,6 +5259,7 @@ mod read_channel_tests {
                 id: "greeting".into(),
                 resource_name: "greeting.form".into(),
                 schema: r#"{"components":[],"v":1}"#.into(),
+                version_tag: None,
             }]))
             .expect("deploy form v1");
         let v1_key = form_key_of(&v1);
@@ -5260,6 +5268,7 @@ mod read_channel_tests {
                 id: "greeting".into(),
                 resource_name: "greeting.form".into(),
                 schema: r#"{"components":[],"v":2}"#.into(),
+                version_tag: None,
             }]))
             .expect("deploy form v2");
         let v2_key = form_key_of(&v2);

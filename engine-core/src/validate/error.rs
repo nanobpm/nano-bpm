@@ -32,14 +32,12 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
-    /// A user task's `zeebe:formDefinition` declared a non-`latest`
-    /// `bindingType` (`deployment` or `versionTag`) on the form definition. The
-    /// engine only implements the `latest` binding — it resolves a `formId` to
-    /// the latest deployed form version at user-task creation. This is raised
-    /// for any non-`latest` binding on the form definition, whether it carries a
-    /// `formId` or not (an explicit empty `bindingType` is likewise rejected).
-    /// Rather than silently degrading a `deployment`/`versionTag` binding to
-    /// `latest` (a latent mis-binding, #1190), Nano rejects the deploy loudly.
+    /// A user task's `zeebe:formDefinition` declared a `bindingType` value that
+    /// is not one of Camunda's three bindings (`latest`, `deployment`,
+    /// `versionTag`) — including an explicitly empty `bindingType=""`, which is
+    /// a present, explicit value and must not be silently treated as the
+    /// `latest` default (the #1190 fail-loud rule). The three real bindings are
+    /// all implemented (#1193); only an *unrecognised* value is rejected.
     /// `binding_type` carries the offending attribute value.
     UnsupportedUserTaskFormBinding {
         task_id: String,
@@ -228,9 +226,8 @@ impl std::fmt::Display for ParseError {
                 binding_type,
             } => write!(
                 f,
-                "user task '{task_id}' declares an unsupported formDefinition bindingType \
-'{binding_type}': only 'latest' is supported (the engine resolves a formId to the latest \
-deployed form version at user-task creation)"
+                "user task '{task_id}' declares an unknown formDefinition bindingType \
+'{binding_type}': expected one of 'latest', 'deployment' or 'versionTag'"
             ),
             ParseError::UnresolvedReference {
                 kind,

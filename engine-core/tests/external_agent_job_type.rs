@@ -58,6 +58,7 @@ fn agent_markers_preserve_the_entire_worker_job_contract() {
                     resource_id: "prompt.md".into(),
                     resource_name: "prompt.md".into(),
                     content: content.into(),
+                    version_tag: None,
                 }]))
                 .unwrap();
         }

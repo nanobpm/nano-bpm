@@ -105,7 +105,7 @@ pub use agent::{
 };
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]
-pub use command::form_id_of;
+pub use command::{form_id_of, form_version_tag_of};
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
 pub use command::{

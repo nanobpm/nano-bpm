@@ -170,7 +170,7 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
                 }
             }
         }
-        let replayed = Engine::replay_partition(expected.partition_id, journal);
+        let replayed = Engine::replay_partition(expected.partition_id, journal.clone());
         // Load the archived snapshot the way a host does (`from_snapshot`), so
         // its load-time normalizations apply — e.g. legacy element-keyed join
         // bookkeeping is keyed by flow-scope instance (#1580).
@@ -215,6 +215,31 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // per terminal event), normalized the same way.
         expected_state.terminal_epoch = terminal_keys.len() as u64;
         expected_state.recently_terminated = terminal_keys;
+        // #1193 adds `DeployedProcess::deployment_key`, derived purely from the
+        // journal's `ProcessDeployed` frames. Archived snapshots predate the
+        // field and load it `0` via `serde(default)`, so normalize them to the
+        // deployment key the archived journal itself carries for each
+        // definition (computed from the journal, not the replayed state).
+        let deployment_key_by_definition: std::collections::HashMap<Key, Key> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessDeployed {
+                    deployment_key,
+                    process_definition_key,
+                    ..
+                } => Some((*process_definition_key, *deployment_key)),
+                _ => None,
+            })
+            .collect();
+        for deployed in expected_state
+            .processes
+            .values_mut()
+            .chain(expected_state.process_versions.values_mut())
+        {
+            if let Some(deployment_key) = deployment_key_by_definition.get(&deployed.key) {
+                deployed.deployment_key = *deployment_key;
+            }
+        }
         // Normalize each terminal instance's `terminated_epoch` (derived above
         // from the journal's own terminal events): archived snapshots predate
         // the field and load it `0`, but replay under current semantics records

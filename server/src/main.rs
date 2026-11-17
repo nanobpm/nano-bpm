@@ -3397,9 +3397,9 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         seed_versions(&state.process_versions, &state.processes, |d| d.key)
             .into_values()
             .map(|deployed| Event::ProcessDeployed {
-                // The deployment key is not used by the applier (definitions are
-                // keyed by processDefinitionKey); 0 is a harmless placeholder.
-                deployment_key: 0,
+                // The deployment key anchors `deployment`-bound form/resource
+                // resolution (#1193), so it must replicate faithfully.
+                deployment_key: deployed.deployment_key,
                 process_definition_key: deployed.key,
                 version: deployed.version,
                 process: deployed.definition.clone(),
@@ -3447,29 +3447,35 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         }
     }
     // Re-emit each deployed form version so a freshly seeded replica can serve
-    // it via GetFormByKey. Forms are independent (no sub-resources).
+    // it via GetFormByKey. Forms are independent (no sub-resources). The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // user-task form resolution (#1193), so they replicate faithfully.
     for form in seed_versions(&state.form_versions, &state.forms, |f| f.key).into_values() {
         events.push(Event::FormDeployed {
-            deployment_key: 0,
+            deployment_key: form.deployment_key,
             form_key: form.key,
             version: form.version,
             form_id: form.form_id.clone(),
             resource_name: form.resource_name.clone(),
             schema: form.schema.clone(),
+            version_tag: form.version_tag.clone(),
         });
     }
     // Re-emit each deployed generic-resource version so a freshly seeded
-    // replica can serve it via GetResourceByKey / searchResources.
+    // replica can serve it via GetResourceByKey / searchResources. The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // linked-resource resolution (#1193), so they replicate faithfully.
     for resource in
         seed_versions(&state.resource_versions, &state.resources, |r| r.key).into_values()
     {
         events.push(Event::GenericResourceDeployed {
-            deployment_key: 0,
+            deployment_key: resource.deployment_key,
             resource_key: resource.key,
             version: resource.version,
             resource_id: resource.resource_id.clone(),
             resource_name: resource.resource_name.clone(),
             content: resource.content.clone(),
+            version_tag: resource.version_tag.clone(),
         });
     }
     events
@@ -3542,6 +3548,9 @@ fn parse_deploy_resources(
                     id,
                     resource_name: resource_name.clone(),
                     schema: xml.clone(),
+                    // The form-js document's optional `versionTag` is matched by
+                    // a `versionTag`-bound user-task form (#1193).
+                    version_tag: nanobpmn_engine_core::form_version_tag_of(xml),
                 }),
                 None => {
                     return Err((
@@ -3595,6 +3604,10 @@ fn parse_deploy_resources(
             resource_id: resource_name.clone(),
             resource_name: resource_name.clone(),
             content: xml.clone(),
+            // The HTTP deploy envelope carries no per-resource `versionTag`
+            // metadata yet, so a generic resource deploys untagged (#1193
+            // wires the engine-side tag storage a future API field populates).
+            version_tag: None,
         });
     }
     Ok(ParsedDeploy {
@@ -31152,6 +31165,7 @@ mod clustered_startup_tests {
             id: "versioned-form".to_string(),
             resource_name: "versioned.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let form_v1 = form(r#"{"id":"versioned-form","type":"default","components":[]}"#);
         let form_v2 = form(
@@ -31161,6 +31175,7 @@ mod clustered_startup_tests {
             resource_id: "versioned.md".to_string(),
             resource_name: "versioned.md".to_string(),
             content: content.to_string(),
+            version_tag: None,
         };
         let resource_v1 = resource("# v1");
         let resource_v2 = resource("# v2");
@@ -31325,6 +31340,7 @@ mod clustered_startup_tests {
                 resource_id: "r.md".into(),
                 resource_name: "r.md".into(),
                 content: mib.clone(),
+                version_tag: None,
             })
             .collect();
         let total: usize = events
@@ -31385,11 +31401,13 @@ mod clustered_startup_tests {
             id: "legacy-form".to_string(),
             resource_name: "legacy.form".to_string(),
             schema: r#"{"id":"legacy-form","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
         };
         let resource = nanobpmn_engine_core::GenericResource {
             resource_id: "legacy.md".to_string(),
             resource_name: "legacy.md".to_string(),
             content: "# legacy".to_string(),
+            version_tag: None,
         };
         let mut state = node0
             .engine
@@ -38479,6 +38497,7 @@ mod clustered_startup_tests {
                             resource_id: "agent-prompt.md".to_string(),
                             resource_name: "agent-prompt.md".to_string(),
                             content: content.to_string(),
+                            version_tag: None,
                         }],
                         "<default>",
                     )
@@ -38666,6 +38685,7 @@ mod clustered_startup_tests {
             id: "greeting-form".to_string(),
             resource_name: "greeting.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let (result, _events) = server
             .deploy_resources_locally_with_forms(
@@ -38729,6 +38749,7 @@ mod clustered_startup_tests {
                     id: "greeting-form".to_string(),
                     resource_name: "greeting.form".to_string(),
                     schema: schema_v2.to_string(),
+                    version_tag: None,
                 }],
                 Vec::new(),
                 "<default>",
@@ -38819,6 +38840,7 @@ mod clustered_startup_tests {
             id: "feature-escalation".to_string(),
             resource_name: "feature-escalation.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
 
         // A process with two user tasks: one bound to the embedded form by id,
@@ -39029,6 +39051,7 @@ mod clustered_startup_tests {
             id: id.to_string(),
             resource_name: format!("{id}.form"),
             schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+            version_tag: None,
         };
 
         server

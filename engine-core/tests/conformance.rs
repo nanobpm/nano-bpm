@@ -103,6 +103,11 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         origin: "baseline",
     },
     Mapping {
+        nano: "UnsupportedUserTaskFormBinding",
+        zeebe: "INVALID_ARGUMENT (zeebe:formDefinition bindingType not in ZeebeBindingType)",
+        origin: "#1193",
+    },
+    Mapping {
         nano: "UnresolvedReference",
         zeebe: "INVALID_ARGUMENT (camunda-xml-model eager QName resolution failure)",
         origin: "#849/#851",
@@ -206,14 +211,6 @@ struct Divergence {
 /// the full [`ParseError`] surface (every category is in exactly one of the two,
 /// enforced by [`mapping_covers_every_parse_error_category`]).
 const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
-    Divergence {
-        nano: "UnsupportedUserTaskFormBinding",
-        rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
-                    bindings and ACCEPTS such a model; Nano implements only `latest` and \
-                    rejects the deploy loudly rather than silently degrading the binding \
-                    to `latest` (#1190).",
-        origin: "#1190",
-    },
     Divergence {
         nano: "UnsupportedExecutionListener",
         rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \

@@ -843,6 +843,11 @@ pub struct FormResource {
     pub resource_name: String,
     /// The verbatim form-js JSON document.
     pub schema: String,
+    /// The optional version tag this form version carries (form-js
+    /// `versionTag`), matched by a `versionTag`-bound user-task form (#1193).
+    /// `None` when the form declares no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// Extracts the form-js document `id` from a `.form` resource's JSON — the single
@@ -858,6 +863,23 @@ pub struct FormResource {
 pub fn form_id_of(schema: &str) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
     doc.get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the form-js document `versionTag` from a `.form` resource's JSON —
+/// the single canonical definition of "what counts as a form version tag"
+/// shared by every deploy boundary, mirroring [`form_id_of`]. Returns `None`
+/// when the document carries no non-empty string `versionTag` (an untagged
+/// form; Zeebe treats the tag as optional metadata matched only by a
+/// `versionTag` binding).
+///
+/// Gated behind the `serde` feature for the same reason as [`form_id_of`].
+#[cfg(feature = "serde")]
+pub fn form_version_tag_of(schema: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
+    doc.get("versionTag")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -882,6 +904,11 @@ pub struct GenericResource {
     pub resource_name: String,
     /// The verbatim resource content.
     pub content: String,
+    /// The optional version tag this resource version carries (Zeebe
+    /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+    /// `zeebe:linkedResource` (#1193). `None` when the deploy carried no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// The modification instruction shapes are persisted inside

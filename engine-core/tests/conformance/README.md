@@ -51,8 +51,8 @@ The harness is **hermetic**: it reads the checked-in corpus off disk
    Nano deliberately *rejects* because it does not implement the feature:
 
    ```xml
-   <!-- verdict: diverge | category: UnsupportedUserTaskFormBinding -->
-   <!-- oracle: Zeebe ACCEPTS this model; Nano rejects it (deliberate divergence, #1190) -->
+   <!-- verdict: diverge | category: UnsupportedExecutionListener -->
+   <!-- oracle: Zeebe ACCEPTS this model; Nano rejects it (deliberate divergence, #1197) -->
    ```
 
    The `category` **must** be one of the Nano `ParseError` category keys in the
@@ -129,6 +129,7 @@ correspond. All Zeebe deploy rejections surface as gRPC `INVALID_ARGUMENT`
 | `InvalidBoundaryEvent` | `BoundaryEvent` `attachedToRef` unresolved | baseline |
 | `InvalidMessageEvent` | unresolved `messageRef` / missing `correlationKey` | baseline |
 | `InvalidLinkedResource` | `zeebe:linkedResource` missing required attribute | baseline |
+| `UnsupportedUserTaskFormBinding` | `zeebe:formDefinition` `bindingType` not in `ZeebeBindingType` (`latest`/`deployment`/`versionTag`) | #1193 |
 | `UnresolvedReference` | camunda-xml-model eager QName resolution failure | #849 / #851 |
 | `UnsupportedElement` | element type has no Zeebe transformer | #853 |
 | `InvalidGateway` | `SequenceFlowValidator`: condition-or-default | #854 |
@@ -156,7 +157,6 @@ exercised by at least one DIVERGE corpus entry
 
 | Nano `ParseError` category | Zeebe behaviour | Nano behaviour | Origin |
 |----------------------------|-----------------|----------------|--------|
-| `UnsupportedUserTaskFormBinding` | **accepts** `deployment`/`versionTag` user-task form bindings | rejects the deploy (only `latest` implemented) rather than silently degrading | #1190 |
 | `UnsupportedExecutionListener` | **accepts** `zeebe:executionListener`s on multi-incoming parallel/inclusive joins, compensation boundary events, surplus signal start events, ad-hoc sub-process tools, and sequence flows | rejects those it cannot enact (a parallel join runs neither the activation body nor the end-listener chain, so both phases are dead; an inclusive join's `start` listener never fires — but its `end` listener IS supported and accepted, since an accepted join runs the end-listener chain before routing; a compensation boundary is a passive marker never entered by token flow; a surplus signal start is demoted to an inert throw event that is never activated; an ad-hoc tool is pruned or activated/completed with direct lifecycle events that bypass the listener gate; a sequence flow is an edge with no lifecycle) rather than silently storing or dropping a dead listener | #1197 |
 | `UnsupportedTaskListener` | **accepts** a `zeebe:taskListener` only on a user task (but does not reject a misplaced one) | rejects a task listener on any non-user-task element (e.g. a `receiveTask`, which rides the `io_stack` for its execution listeners): task-listener jobs are created only on the user-task runtime path, so it could never fire — rejected loudly rather than stored dead | #1197 |
 

@@ -2074,6 +2074,7 @@ impl Engine {
                     form_id: form.id,
                     resource_name: form.resource_name,
                     schema: form.schema,
+                    version_tag: form.version_tag,
                 },
             );
         }
@@ -2124,6 +2125,7 @@ impl Engine {
                     resource_id: resource.resource_id,
                     resource_name: resource.resource_name,
                     content: resource.content,
+                    version_tag: resource.version_tag,
                 },
             );
         }
@@ -8869,9 +8871,36 @@ impl Engine {
                 let user_task_key = self.mint_key();
                 // Resolve the form linkage, enforcing the Zeebe invariant that
                 // `formId` and `externalReference` are mutually exclusive (an
-                // external reference wins and suppresses `form_key` resolution).
+                // external reference wins and suppresses `form_key` resolution)
+                // and dispatching on the declared binding (Zeebe
+                // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
+                // `deployment`/`versionTag` miss raises a resolvable incident
+                // and creates no task: the element stays parked in ACTIVATING
+                // (the token only advances on task completion) and resolving
+                // the incident re-runs the activation body.
                 let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
+                    match self.resolve_user_task_form_linkage(instance_key, &props) {
+                        crate::engine::resolve::FormLinkage::Unbound {
+                            external_form_reference,
+                        } => (None, external_form_reference),
+                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
+                            (Some(form_key), None)
+                        }
+                        crate::engine::resolve::FormLinkage::Miss { reason } => {
+                            events.push(Event::IncidentRaised {
+                                incident_key: self.mint_key(),
+                                instance_key,
+                                element_instance_key,
+                                element_id: element_id.clone(),
+                                kind: state::IncidentKind::CalledElementError,
+                                redrive: Some(state::IoMappingRedrive::ActivationPending),
+                                reason,
+                                job_key: None,
+                                created_at: self.now,
+                            });
+                            return Ok((events, followups));
+                        }
+                    };
                 // An initial assignee (zeebe:assignmentDefinition) must fire the
                 // `assigning` listeners exactly as a runtime assign does (Zeebe
                 // parity: the assignee is stripped off the CREATED record and
@@ -11667,8 +11696,39 @@ impl Engine {
                     unreachable!("user-task tool resolved its properties above");
                 };
                 let user_task_key = self.mint_key();
+                // The form linkage dispatches on the declared binding exactly
+                // like an ordinary user-task activation (#1193). A
+                // `deployment`/`versionTag` miss raises a resolvable incident
+                // and creates no task; the tool child stays parked (its
+                // activation events are already emitted) and resolving the
+                // incident re-drives the tool activation.
                 let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
+                    match self.resolve_user_task_form_linkage(instance_key, &props) {
+                        crate::engine::resolve::FormLinkage::Unbound {
+                            external_form_reference,
+                        } => (None, external_form_reference),
+                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
+                            (Some(form_key), None)
+                        }
+                        crate::engine::resolve::FormLinkage::Miss { reason } => {
+                            events.push(Event::IncidentRaised {
+                                incident_key: self.mint_key(),
+                                instance_key,
+                                element_instance_key: child_key,
+                                element_id: element_id.clone(),
+                                kind: state::IncidentKind::CalledElementError,
+                                // The tool child is already ACTIVATED (its
+                                // activation events precede this incident), so
+                                // resolution re-runs only the activation body —
+                                // never a second `ElementActivated` (#1193).
+                                redrive: Some(state::IoMappingRedrive::ActivationBody),
+                                reason,
+                                job_key: None,
+                                created_at: self.now,
+                            });
+                            return (events, followups);
+                        }
+                    };
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
