@@ -13221,146 +13221,19 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
-        // The `variables` filter constrains results to instances whose
-        // process-scoped (root) variables match. Pre-index those variables by
-        // instance only when a variable filter is actually present, so the
-        // common (no variable-filter) path pays nothing for the extra scan.
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match filter {
-            Some(f) if f.variables.as_ref().is_some_and(|v| !v.is_empty()) => {
-                // Only the variable names referenced by the filter can affect
-                // the match, so restrict the index to that set. This keeps the
-                // scan a single pass while avoiding HashMap churn for unrelated
-                // variable names in a large store.
-                let requested: std::collections::HashSet<&str> = f
-                    .variables
-                    .as_ref()
-                    .map(|v| v.iter().map(|entry| entry.name.as_str()).collect())
-                    .unwrap_or_default();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = match filter {
-            Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
-                f,
-                &InstanceCrossEntityIndex::sources_for(f, &self.store),
-            ),
-            _ => InstanceCrossEntityIndex::default(),
-        };
-
+        // One shared matcher (the same algebra the batch-selection path uses),
+        // honouring every top-level field AND the `$or` clause list (#1293).
+        let matcher = filter.map(|f| ProcessInstanceMatcher::new(f, &self.store));
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
-            .filter(|inst| match filter {
-                None => true,
-                Some(f) => {
-                    let state_str = process_instance_state_enum(inst.state).to_string();
-                    query::match_process_instance_key(
-                        &f.process_instance_key,
-                        &inst.key.to_string(),
-                    ) && query::match_process_definition_key(
-                        &f.process_definition_key,
-                        &inst.process_definition_key,
-                    ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
-                        && query::match_integer(
-                            &f.process_definition_version,
-                            Some(i64::from(inst.version)),
-                        )
-                        && query::match_process_instance_state(&f.state, &state_str)
-                        && f.has_incident.is_none_or(|want| want == inst.has_incident)
-                        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
-                        // Nano does not yet project a process-instance completion
-                        // timestamp, so an `endDate` filter matches against an
-                        // absent value: range/equality operators correctly exclude
-                        // (honest, not silently ignored) while `$exists: false`
-                        // still matches.
-                        && query::match_date_time_ms(&f.end_date, None)
-                        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
-                        // `suspendedDate`: read straight from the read-model's
-                        // `suspended_date_ms` (the single source of truth for
-                        // suspension) — a datetime while suspended, absent otherwise.
-                        && query::match_date_time_ms(
-                            &f.suspended_date,
-                            inst.suspended_date_ms.map(|ms| ms as i64),
-                        )
-                        // Nano is single-tenant: every instance's `tenantId` is the
-                        // `<default>` constant, so honour the filter against it.
-                        && query::match_string(&f.tenant_id, "<default>")
-                        // `processDefinitionName` / `processDefinitionVersionTag` are
-                        // never projected (always null in `process_instance_result`),
-                        // so match against an absent value: equality / `$like` /
-                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
-                        // matches.
-                        && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.process_definition_version_tag, None)
-                        // Call-activity hierarchy filters (C8 parity, issue
-                        // #977): a bare parent key enumerates the direct children
-                        // of that instance; `$exists:false` selects top-level
-                        // instances. A top-level instance carries no parent, so
-                        // its parent keys match against an absent value.
-                        && query::match_process_instance_key_opt(
-                            &f.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        && query::match_element_instance_key_opt(
-                            &f.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        // The read model does not project the definition's
-                        // display name or version tag onto the instance row, so
-                        // those filters match against an absent value — value
-                        // operators exclude (honest, never silently widening)
-                        // while `$exists: false` still matches (the `endDate`
-                        // convention above).
-                        && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.process_definition_version_tag, None)
-                        // `suspendedDate` is the nullable column the read model
-                        // maintains (the single source of truth for suspension).
-                        && query::match_date_time_ms(
-                            &f.suspended_date,
-                            inst.suspended_date_ms.map(|ms| ms as i64),
-                        )
-                        // Camunda's `tags` filter is a conjunction: an instance
-                        // must carry every listed tag.
-                        && f.tags.as_ref().is_none_or(|tags| {
-                            tags.iter().all(|t| inst.tags.contains(&t.0))
-                        })
-                        && match_instance_variables(
-                            &f.variables,
-                            variables_index.get(&inst.key),
-                        )
-                        && match_instance_tags(&f.tags, &inst.tags)
-                        // Inherited element / job / incident / batch-operation
-                        // filters (C8 parity): existential predicates over the
-                        // instance's child rows, evaluated against the
-                        // pre-indexed cross-entity index.
-                        && match_instance_cross_entity_filters(f, inst.key, &cross_index)
-                }
+            .filter(|inst| {
+                matcher.as_ref().is_none_or(|m| {
+                    m.matches(
+                        inst,
+                        ProcessInstanceStatePolicy::HonourFilter,
+                        BatchHierarchyPolicy::HonourFilters,
+                    )
+                })
             })
             .collect();
 
@@ -14917,10 +14790,15 @@ impl ServerImpl {
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let tasks = self.store.user_tasks();
+        // Variable-store join for `processInstanceVariables` / `localVariables`
+        // (#1293), built only for the names the filter references.
+        let variables = filter
+            .map(|f| UserTaskVariableIndex::new(f, &self.store))
+            .unwrap_or_default();
 
         let mut matched: Vec<&readstore::UserTaskRow> = tasks
             .iter()
-            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f)))
+            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f, &variables)))
             .collect();
 
         let sort = query::sort_keys(
@@ -22431,127 +22309,20 @@ impl ServerImpl {
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
-        // Pre-index root-scope variables by instance only when the filter
-        // actually constrains on them, restricted to the variable names the
-        // filter references (same construction as `search_process_instances_impl`).
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match &filter.variables {
-            Some(entries) if !entries.is_empty() => {
-                let requested: std::collections::HashSet<&str> =
-                    entries.iter().map(|entry| entry.name.as_str()).collect();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
-            InstanceCrossEntityIndex::new(
-                filter,
-                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
-            )
-        } else {
-            InstanceCrossEntityIndex::default()
-        };
+        // The same matcher `search_process_instances_impl` uses (one algebra,
+        // including `$or` — #1293: an ignored `$or` here would silently broaden
+        // a mutating batch), with the batch-specific state/hierarchy overrides.
+        let matcher = ProcessInstanceMatcher::new(filter, &self.store);
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
             .into_iter()
             .filter(|inst| {
-                // Batch operations are ACTIVE-only by contract; `filter.state` is
-                // ignored and overridden to ACTIVE (see the doc comment above).
-                let state_matches = matches!(inst.state, ProcessInstanceState::Active);
-                let hierarchy_matches = match honour_hierarchy {
-                    // Incident-resolution / search: honour the supplied
-                    // call-activity hierarchy predicates verbatim.
-                    BatchHierarchyPolicy::HonourFilters => {
-                        query::match_process_instance_key_opt(
-                            &filter.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        ) && query::match_element_instance_key_opt(
-                            &filter.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                    }
-                    // Cancellation: ignore the supplied parent filters and target
-                    // only root instances (spec §371-375) — never active children.
-                    BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
-                };
-                query::match_process_instance_key(
-                    &filter.process_instance_key,
-                    &inst.key.to_string(),
-                ) && query::match_process_definition_key(
-                    &filter.process_definition_key,
-                    &inst.process_definition_key,
-                ) && query::match_string(&filter.process_definition_id, &inst.process_definition_id)
-                    && query::match_integer(
-                        &filter.process_definition_version,
-                        Some(i64::from(inst.version)),
-                    )
-                    && state_matches
-                    && filter
-                        .has_incident
-                        .is_none_or(|want| want == inst.has_incident)
-                    && query::match_date_time_ms(
-                        &filter.start_date,
-                        Some(inst.start_date_ms as i64),
-                    )
-                    && query::match_date_time_ms(&filter.end_date, None)
-                    && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
-                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
-                    // single source of truth. A batch is ACTIVE-only, so a matched
-                    // instance is never suspended and the value is always absent —
-                    // `$exists: true` / value operators then correctly exclude
-                    // every candidate (fail closed) instead of silently broadening.
-                    && query::match_date_time_ms(
-                        &filter.suspended_date,
-                        inst.suspended_date_ms.map(|ms| ms as i64),
-                    )
-                    // Nano is single-tenant: every instance's `tenantId` is the
-                    // `<default>` constant, so honour the filter against it.
-                    && query::match_string(&filter.tenant_id, "<default>")
-                    // `processDefinitionName` / `processDefinitionVersionTag` are
-                    // never projected (always null in `process_instance_result`), so
-                    // match against an absent value: equality / `$like` / `$in` /
-                    // `$exists: true` correctly exclude, `$exists: false` matches.
-                    && query::match_string_opt(&filter.process_definition_name, None)
-                    && query::match_string_opt(&filter.process_definition_version_tag, None)
-                    // Call-activity hierarchy filters (C8 parity, issue #977),
-                    // gated per the per-operation contract above.
-                    && hierarchy_matches
-                    && match_instance_variables(
-                        &filter.variables,
-                        variables_index.get(&inst.key),
-                    )
-                    && match_instance_tags(&filter.tags, &inst.tags)
-                    // Inherited element / job / incident / batch-operation
-                    // filters (C8 parity): existential predicates over the
-                    // instance's child rows, evaluated against the pre-indexed
-                    // cross-entity index so a nonmatching instance is excluded
-                    // from the batch instead of silently broadening it.
-                    && match_instance_cross_entity_filters(filter, inst.key, &cross_index)
+                matcher.matches(
+                    inst,
+                    ProcessInstanceStatePolicy::ActiveOnly,
+                    honour_hierarchy,
+                )
             })
             .map(|inst| inst.key)
             .collect();
@@ -23895,6 +23666,239 @@ fn match_instance_variables(
     }
 }
 
+/// How a [`ProcessInstanceMatcher`] treats the filter's `state` field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcessInstanceStatePolicy {
+    /// Search: honour the supplied `state` predicate.
+    HonourFilter,
+    /// Process-instance batch operations: `state` is ignored and overridden to
+    /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
+    ActiveOnly,
+}
+
+/// One AND-group of a process-instance filter (the top-level fields, or one
+/// `$or` clause) with the per-group indexes its predicates read.
+struct ProcessInstanceFilterGroup {
+    filter: models::ProcessInstanceFilter,
+    variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    cross: InstanceCrossEntityIndex,
+}
+
+/// The single process-instance filter predicate, shared by
+/// `searchProcessInstances` and every process-instance batch creator so the
+/// two can never drift. Honours every top-level field AND, when a non-empty
+/// `$or` list is present, requires at least one clause to match (each clause an
+/// AND of its own fields) — #1293.
+struct ProcessInstanceMatcher {
+    base: ProcessInstanceFilterGroup,
+    or_clauses: Vec<ProcessInstanceFilterGroup>,
+}
+
+impl ProcessInstanceMatcher {
+    fn new(filter: &models::ProcessInstanceFilter, store: &readstore::ReadModel) -> Self {
+        let group = |f: models::ProcessInstanceFilter| ProcessInstanceFilterGroup {
+            variables: root_variables_index(&f.variables, store),
+            cross: if InstanceCrossEntityIndex::is_needed(&f) {
+                InstanceCrossEntityIndex::new(&f, &InstanceCrossEntityIndex::sources_for(&f, store))
+            } else {
+                InstanceCrossEntityIndex::default()
+            },
+            filter: f,
+        };
+        let mut base = filter.clone();
+        let clauses = base.dollar_or.take().unwrap_or_default();
+        ProcessInstanceMatcher {
+            base: group(base),
+            or_clauses: clauses
+                .into_iter()
+                .map(|c| group(process_instance_or_clause(c)))
+                .collect(),
+        }
+    }
+
+    fn matches(
+        &self,
+        inst: &readstore::ProcessInstanceRow,
+        state_policy: ProcessInstanceStatePolicy,
+        hierarchy: BatchHierarchyPolicy,
+    ) -> bool {
+        let state_ok = match state_policy {
+            ProcessInstanceStatePolicy::HonourFilter => true,
+            ProcessInstanceStatePolicy::ActiveOnly => {
+                matches!(inst.state, ProcessInstanceState::Active)
+            }
+        };
+        let root_ok = match hierarchy {
+            BatchHierarchyPolicy::HonourFilters => true,
+            // Cancellation: only root instances, never active children.
+            BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
+        };
+        state_ok
+            && root_ok
+            && match_process_instance_group(inst, &self.base, state_policy, hierarchy)
+            && (self.or_clauses.is_empty()
+                || self
+                    .or_clauses
+                    .iter()
+                    .any(|g| match_process_instance_group(inst, g, state_policy, hierarchy)))
+    }
+}
+
+/// Lifts one `$or` clause into a `ProcessInstanceFilter` (no nested `$or`).
+/// Exhaustive destructuring: a field added to the clause schema fails to
+/// compile here instead of being silently dropped.
+fn process_instance_or_clause(
+    c: models::ProcessInstanceFilterFields,
+) -> models::ProcessInstanceFilter {
+    let models::ProcessInstanceFilterFields {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+    } = c;
+    models::ProcessInstanceFilter {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+        dollar_or: None,
+    }
+}
+
+/// Indexes process-scoped (root) variables by instance, restricted to the
+/// variable names `filter` references; empty (no scan) when there is no
+/// variable filter.
+fn root_variables_index(
+    filter: &Option<Vec<models::VariableValueFilterProperty>>,
+    store: &readstore::ReadModel,
+) -> std::collections::HashMap<u64, std::collections::HashMap<String, String>> {
+    let mut idx: std::collections::HashMap<u64, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let Some(entries) = filter.as_ref().filter(|e| !e.is_empty()) else {
+        return idx;
+    };
+    let requested: std::collections::HashSet<&str> =
+        entries.iter().map(|entry| entry.name.as_str()).collect();
+    for v in store.variables() {
+        // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
+        if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+            idx.entry(v.instance_key)
+                .or_default()
+                .insert(v.name, v.value);
+        }
+    }
+    idx
+}
+
+/// Evaluates one AND-group of process-instance filter fields.
+fn match_process_instance_group(
+    inst: &readstore::ProcessInstanceRow,
+    g: &ProcessInstanceFilterGroup,
+    state_policy: ProcessInstanceStatePolicy,
+    hierarchy: BatchHierarchyPolicy,
+) -> bool {
+    let f = &g.filter;
+    let state_ok = match state_policy {
+        ProcessInstanceStatePolicy::HonourFilter => query::match_process_instance_state(
+            &f.state,
+            &process_instance_state_enum(inst.state).to_string(),
+        ),
+        // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
+        ProcessInstanceStatePolicy::ActiveOnly => true,
+    };
+    // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
+    // enumerates direct children; `$exists:false` selects top-level instances.
+    // Cancellation (`RootOnly`) ignores them (the caller enforces root-only).
+    let hierarchy_ok = match hierarchy {
+        BatchHierarchyPolicy::HonourFilters => {
+            query::match_process_instance_key_opt(
+                &f.parent_process_instance_key,
+                inst.parent_process_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            ) && query::match_element_instance_key_opt(
+                &f.parent_element_instance_key,
+                inst.parent_element_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            )
+        }
+        BatchHierarchyPolicy::RootOnly => true,
+    };
+    state_ok
+        && hierarchy_ok
+        && query::match_process_instance_key(&f.process_instance_key, &inst.key.to_string())
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inst.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inst.process_definition_id)
+        && query::match_integer(&f.process_definition_version, Some(i64::from(inst.version)))
+        && f.has_incident.is_none_or(|want| want == inst.has_incident)
+        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
+        // No projected completion timestamp: `endDate` matches an absent value
+        // (value operators exclude, `$exists: false` matches).
+        && query::match_date_time_ms(&f.end_date, None)
+        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+        // `suspended_date_ms` is the single source of truth for suspension.
+        && query::match_date_time_ms(
+            &f.suspended_date,
+            inst.suspended_date_ms.map(|ms| ms as i64),
+        )
+        // Single-tenant: every instance's `tenantId` is `<default>`.
+        && query::match_string(&f.tenant_id, "<default>")
+        // Never projected (always null in `process_instance_result`): matched
+        // against an absent value.
+        && query::match_string_opt(&f.process_definition_name, None)
+        && query::match_string_opt(&f.process_definition_version_tag, None)
+        && match_instance_variables(&f.variables, g.variables.get(&inst.key))
+        && match_instance_tags(&f.tags, &inst.tags)
+        // Inherited element / job / incident / batch-operation filters.
+        && match_instance_cross_entity_filters(f, inst.key, &g.cross)
+}
+
 /// Matches the `tags` filter against an instance's carried tags. Every
 /// requested tag must be present on the instance (AND semantics — a tag set
 /// constrains to instances carrying the whole set, Camunda-style). An empty
@@ -24189,10 +24193,14 @@ fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilte
 /// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
 /// absent value: value operators exclude the row (honest, never silently
 /// widening the search) while `$exists: false` still matches. The variable
-/// filters (`processInstanceVariables` / `localVariables`) are NOT evaluated
-/// here — they need a variable-store join this predicate cannot see, so the
-/// MCP adapter rejects them instead of letting them widen results silently.
-fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
+/// filters match through `vars` (#1293): `processInstanceVariables` against
+/// the owning instance's root-scope variables, `localVariables` against the
+/// variables held at the task's element-instance scope.
+fn match_user_task_fields(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilterFields,
+    vars: &UserTaskVariableIndex,
+) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
     // The task's due/follow-up dates are stored as RFC 3339 strings; project
     // them to epoch millis for the date-time filter algebra. An unparseable or
@@ -24250,6 +24258,61 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
         // tag excludes the row.
         && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
         && query::match_string_opt(&f.tenant_id, None)
+        && match_instance_variables(
+            &f.process_instance_variables,
+            vars.process_instance.get(&task.instance_key),
+        )
+        && match_instance_variables(
+            &f.local_variables,
+            vars.local.get(&task.element_instance_key),
+        )
+}
+
+/// `name -> serialized value` maps keyed by instance (root scope) and by
+/// element-instance scope, restricted to the variable names a user-task filter
+/// references (empty — no scan — when it references none).
+#[derive(Default)]
+struct UserTaskVariableIndex {
+    process_instance: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    local: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+}
+
+impl UserTaskVariableIndex {
+    fn new(f: &models::UserTaskFilter, store: &readstore::ReadModel) -> Self {
+        let mut groups = vec![user_task_filter_base(f)];
+        groups.extend(f.dollar_or.iter().flatten().cloned());
+        let names = |pick: fn(
+            &models::UserTaskFilterFields,
+        ) -> &Option<Vec<models::VariableValueFilterProperty>>| {
+            groups
+                .iter()
+                .filter_map(|g| pick(g).as_ref())
+                .flatten()
+                .map(|e| e.name.clone())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let root_names = names(|g| &g.process_instance_variables);
+        let local_names = names(|g| &g.local_variables);
+        let mut idx = UserTaskVariableIndex::default();
+        if root_names.is_empty() && local_names.is_empty() {
+            return idx;
+        }
+        for v in store.variables() {
+            if v.scope_key == v.instance_key && root_names.contains(&v.name) {
+                idx.process_instance
+                    .entry(v.instance_key)
+                    .or_default()
+                    .insert(v.name.clone(), v.value.clone());
+            }
+            if local_names.contains(&v.name) {
+                idx.local
+                    .entry(v.scope_key)
+                    .or_default()
+                    .insert(v.name, v.value);
+            }
+        }
+        idx
+    }
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -24306,12 +24369,16 @@ fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFi
 
 /// Full user-task filter match: every top-level field AND, when a non-empty
 /// `$or` list is present, at least one clause (each an AND of its fields).
-fn match_user_task_filter(task: &readstore::UserTaskRow, f: &models::UserTaskFilter) -> bool {
-    match_user_task_fields(task, &user_task_filter_base(f))
+fn match_user_task_filter(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilter,
+    vars: &UserTaskVariableIndex,
+) -> bool {
+    match_user_task_fields(task, &user_task_filter_base(f), vars)
         && match &f.dollar_or {
-            Some(clauses) if !clauses.is_empty() => {
-                clauses.iter().any(|c| match_user_task_fields(task, c))
-            }
+            Some(clauses) if !clauses.is_empty() => clauses
+                .iter()
+                .any(|c| match_user_task_fields(task, c, vars)),
             _ => true,
         }
 }
@@ -34675,6 +34742,204 @@ mod clustered_startup_tests {
         // An empty $or list places no constraint.
         let empty = search(or_filter(None, vec![])).await;
         assert_eq!(empty.len(), 3);
+    }
+
+    /// Deploys a one-user-task process and starts one instance per `tier`
+    /// value (root variable `tier`), waiting until the read model has
+    /// projected every task and root variable. Returns the instance keys.
+    async fn deploy_tiered_user_task_instances(server: &ServerImpl, tiers: &[&str]) -> Vec<u64> {
+        let def = ProcessBuilder::new("tiered")
+            .start_event("s")
+            .user_task("review")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("tiered".to_string(), "tiered.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut instances = Vec::new();
+        for tier in tiers {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert(
+                "tier".to_string(),
+                nanobpmn_engine_core::Value::Str((*tier).into()),
+            );
+            let (k, _) = server
+                .create_for_stream(Some("tiered".into()), None, vars)
+                .await
+                .expect("create instance");
+            instances.push(k);
+        }
+        for _ in 0..500 {
+            let root_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key == v.instance_key)
+                .count();
+            if server.store.user_tasks().len() == tiers.len() && root_vars == tiers.len() {
+                return instances;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("read model never projected the tiered instances");
+    }
+
+    fn tier_filter(tier: &str) -> Option<Vec<models::VariableValueFilterProperty>> {
+        Some(vec![models::VariableValueFilterProperty::new(
+            "tier".to_string(),
+            models::StringFilterProperty::String(format!("\"{tier}\"")),
+        )])
+    }
+
+    /// `ProcessInstanceFilter.$or` (#1293): top-level fields AND any one clause.
+    /// Previously the clause list was silently ignored, so the search — and,
+    /// worse, a mutating batch selection sharing the same filter — returned a
+    /// superset.
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_or_clauses() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let pik = |k: u64| {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(k.to_string()),
+                ),
+            )
+        };
+        let by_key = |k: u64| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.process_instance_key = pik(k);
+            c
+        };
+        let by_tier = |t: &str| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.variables = tier_filter(t);
+            c
+        };
+        let or_filter = |top: Option<u64>, clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.process_instance_key = top.and_then(pik);
+            f.dollar_or = Some(clauses);
+            f
+        };
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        // Any one clause (a key clause, or a variable clause) → the union.
+        let either = or_filter(None, vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(
+            search(either.clone()).await,
+            vec![instances[0], instances[1]]
+        );
+        // The batch-selection path shares the matcher: same union, never all.
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::HonourFilters),
+            vec![instances[0], instances[1]]
+        );
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::RootOnly),
+            vec![instances[0], instances[1]]
+        );
+
+        // Top-level fields AND the $or: only the overlap survives.
+        let overlap = or_filter(Some(instances[1]), vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(search(overlap).await, vec![instances[1]]);
+
+        // No clause matches → nothing (not the unfiltered superset).
+        assert!(
+            search(or_filter(None, vec![by_tier("zzz")]))
+                .await
+                .is_empty()
+        );
+
+        // An empty $or list places no constraint.
+        assert_eq!(search(or_filter(None, vec![])).await.len(), 3);
+    }
+
+    /// `UserTaskFilter.processInstanceVariables` / `localVariables` (#1293):
+    /// matched via a variable-store join, at top level and inside `$or`.
+    #[tokio::test]
+    async fn user_task_search_honours_variable_filters() {
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let search = |filter: models::UserTaskFilter| {
+            let server = &server;
+            async move {
+                let q = models::UserTaskSearchQuery {
+                    sort: None,
+                    page: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheUserTaskSearchResult(r) =
+                    server.search_user_tasks_impl(&Some(q)).await.unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|t| t.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        let mut top = models::UserTaskFilter::new();
+        top.process_instance_variables = tier_filter("b");
+        assert_eq!(search(top).await, vec![instances[1]]);
+
+        let clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.process_instance_variables = tier_filter(t);
+            c
+        };
+        let mut either = models::UserTaskFilter::new();
+        either.dollar_or = Some(vec![clause("a"), clause("c")]);
+        assert_eq!(search(either).await, vec![instances[0], instances[2]]);
+
+        // `tier` is a root (process-instance) variable, not local to the task's
+        // element-instance scope, so a `localVariables` filter on it excludes
+        // every task instead of being ignored.
+        let mut local = models::UserTaskFilter::new();
+        local.local_variables = tier_filter("a");
+        assert!(search(local).await.is_empty());
     }
 
     #[tokio::test]
