@@ -14546,7 +14546,15 @@ impl ServerImpl {
                 })
                 .await
                 .map_err(|error| crate::raft::engine_error_status(&error))?;
-            commit.wait().await;
+            // `wait()` also resolves when the journal writer dies unacked;
+            // only a durable write may be acknowledged (or have its
+            // follow-ups routed), else the result vanishes on restart (#932).
+            if !commit.wait_durable().await {
+                return Err((
+                    500,
+                    "the write was not persisted durably; retry".to_string(),
+                ));
+            }
             return Ok(events);
         }
         let led: Vec<u64> = self
@@ -23336,7 +23344,13 @@ impl ServerImpl {
                 // off-partition message catch or an activatable job: route
                 // follow-ups and wake long-pollers, exactly as every other
                 // instance-creating write does.
-                server.spawn_routing_if_needed(events);
+                // Route BEFORE answering so a publish issued the moment the
+                // evaluation returns finds the subscription open (the
+                // create-then-publish ordering, #1582); a cancelled caller is
+                // fine because routing completes inside this detached task.
+                server
+                    .drive_subscription_routing(Self::routable_events(events))
+                    .await;
                 server.signal_jobs_available();
             }
             let _ = tx.send(outcome);
