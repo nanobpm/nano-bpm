@@ -3240,6 +3240,56 @@ fn should_parse_a_root_level_conditional_start_event() {
 }
 
 #[test]
+fn should_reject_malformed_root_level_conditional_start_events() {
+    // given: every malformed root conditional-start shape (#932) — each must
+    // fail closed rather than deploy as a none start or a silently-picked
+    // single trigger.
+    let cases = [
+        ("missing condition", "<bpmn:conditionalEventDefinition />"),
+        (
+            "blank condition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>   </bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "duplicate definitions",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=b</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a message definition",
+            "<bpmn:messageEventDefinition messageRef=\"m\" />\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a timer definition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>",
+        ),
+    ];
+    for (label, defs) in cases {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                <bpmn:message id="m" name="m" />
+                <bpmn:process id="p">
+                  <bpmn:startEvent id="cs">{defs}</bpmn:startEvent>
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+                </bpmn:process>
+              </bpmn:definitions>"#
+        );
+
+        // when
+        let result = parse_bpmn(&xml);
+
+        // then
+        assert!(
+            matches!(result, Err(ParseError::InvalidProcess { .. })),
+            "{label}: expected InvalidProcess, got {result:?}"
+        );
+    }
+}
+
+#[test]
 fn should_parse_conditional_intermediate_catch_and_boundary_events() {
     // given: a conditional intermediate catch and a conditional boundary
     // (one interrupting, one not) whose FEEL condition lives in the nested

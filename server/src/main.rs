@@ -6490,26 +6490,11 @@ impl ServerImpl {
         // and a ~40% tighter p90 tail vs suppressing it, at no cost (GCP 3-node
         // fresh-journal A/B; see PERFORMANCE.md 2026-07-10 / ADR 0013 Addendum). So
         // `admission` relaxes only the proactive backlog governor, not this guard.
-        if let Some(limit) = self.backpressure.current_limit() {
-            let processing = self.processing.load(Ordering::Relaxed);
-            if self.backpressure.should_shed(processing) {
-                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
-                    "RESOURCE_EXHAUSTED",
-                    503,
-                    format!(
-                        "Backpressure: {processing} creates in flight at or above the \
-                         configured limit of {limit}. Retry after a backoff."
-                    ),
-                )));
-            }
-        }
-
-        // Active-backlog admission control: independently of the concurrency gate
-        // above, shed once the standing backlog of active instances reaches the
-        // configured limit, so end-to-end latency and memory stay bounded under
-        // sustained overload instead of the create queue growing unboundedly. Off
-        // by default; a shed create is never journaled, so durability is untouched.
-        if let Some(message) = self.admission_shed() {
+        //
+        // Then the active-backlog admission control (`admission_shed`). Both
+        // rails live in [`Self::create_admission_shed`], the single create
+        // admission policy every instance-creating endpoint shares.
+        if let Some(message) = self.create_admission_shed() {
             return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                 "RESOURCE_EXHAUSTED",
                 503,
@@ -21901,6 +21886,24 @@ impl ServerImpl {
         )
     }
 
+    /// The shared create admission policy (#932): the backpressure
+    /// concurrency gate followed by the active-backlog [`Self::admission_shed`]
+    /// rails. Every endpoint that creates process instances must consult this
+    /// before submitting, so no create path bypasses overload or drain-stall
+    /// shedding. `Some(message)` means shed with a `RESOURCE_EXHAUSTED` 503.
+    pub(crate) fn create_admission_shed(&self) -> Option<String> {
+        if let Some(limit) = self.backpressure.current_limit() {
+            let processing = self.processing.load(Ordering::Relaxed);
+            if self.backpressure.should_shed(processing) {
+                return Some(format!(
+                    "Backpressure: {processing} creates in flight at or above the \
+                     configured limit of {limit}. Retry after a backoff."
+                ));
+            }
+        }
+        self.admission_shed()
+    }
+
     /// Admission gate combining several signals. Returns `Some(reason)` once any
     /// active signal is at/above its limit (the create should be shed); `None`
     /// when all have headroom. Relaxed atomic loads — no engine round-trip; an
@@ -23247,10 +23250,23 @@ impl ServerImpl {
     ) -> Result<apis::conditional::EvaluateConditionalsResponse, ()> {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
 
-        let tenant_id = body
-            .tenant_id
-            .clone()
-            .unwrap_or_else(|| "<default>".to_string());
+        // Nano is single-tenant: every definition and instance belongs to
+        // `<default>`. A request scoped to any other tenant cannot be honoured,
+        // so reject it rather than execute an unscoped create that would start
+        // instances outside the requested tenant (spec/conditionals.yaml).
+        let tenant_id = match body.tenant_id.as_deref() {
+            None | Some("<default>") => "<default>".to_string(),
+            Some(other) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    format!(
+                        "Tenant '{other}' is not supported: this engine is single-tenant \
+                         and only evaluates conditional start events for tenant '<default>'."
+                    ),
+                )));
+            }
+        };
 
         if let Some(pdk) = body.process_definition_key.as_ref() {
             // Distinguish a malformed (non-numeric) key from a well-formed but
@@ -23275,14 +23291,50 @@ impl ServerImpl {
             }
         }
 
+        // An evaluation may create instances, so it is subject to the same
+        // create admission policy as `createProcessInstance`: shed under
+        // backpressure, backlog overload or a drain halt.
+        if let Some(message) = self.create_admission_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+
+        let variables = from_object_map(&body.variables);
+        // Charge the create accounting from admission until the write has been
+        // applied, and run apply + follow-up routing in a detached owner task
+        // (#1582): a cancelled caller must neither release the charge early nor
+        // leave a persisted instance whose cross-partition follow-ups nobody
+        // routes.
+        let accounting = CreateAccounting::enter(self, engine_vars_bytes(&variables));
         let command = Command::EvaluateConditionalStartEvents {
-            variables: from_object_map(&body.variables),
+            variables,
             process_definition_key: body
                 .process_definition_key
                 .as_ref()
                 .and_then(|pdk| pdk.0.parse::<u64>().ok()),
         };
-        let events = match self.apply_create_command(command).await {
+        let server = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = server.apply_create_command(command).await;
+            drop(accounting);
+            if let Ok(events) = &outcome {
+                // A created instance may advance straight into an
+                // off-partition message catch or an activatable job: route
+                // follow-ups and wake long-pollers, exactly as every other
+                // instance-creating write does.
+                server.spawn_routing_if_needed(events);
+                server.signal_jobs_available();
+            }
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .await
+            .unwrap_or_else(|_| Err((500, "conditional evaluation task aborted".to_string())));
+        let events = match outcome {
             Ok(events) => events,
             Err((status, detail)) => {
                 return Ok(match status {
@@ -23305,11 +23357,6 @@ impl ServerImpl {
                 });
             }
         };
-        // A created instance may advance straight into an off-partition message
-        // catch or an activatable job: route follow-ups and wake long-pollers,
-        // exactly as every other instance-creating write does.
-        self.spawn_routing_if_needed(&events);
-        self.signal_jobs_available();
         let process_instances = conditional_start_instances(&events);
 
         Ok(Resp::Status200_SuccessfullyEvaluatedRoot(
@@ -49959,6 +50006,84 @@ mod expression_conditional_tests {
         );
     }
 
+    /// Nano is single-tenant: a conditional evaluation scoped to any tenant
+    /// other than `<default>` is rejected with a `400` instead of running an
+    /// unscoped evaluation that would create instances outside that tenant —
+    /// both keyed and unkeyed (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_rejects_a_non_default_tenant() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-tenant-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+        for targeted in [false, true] {
+            let body = models::ConditionalEvaluationInstruction {
+                tenant_id: Some("tenant-a".to_string()),
+                process_definition_key: targeted
+                    .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+                variables: std::collections::HashMap::new(),
+            };
+            match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+                Resp::Status400_TheProvidedDataIsNotValid(p) => assert_eq!(p.status, 400),
+                other => panic!("expected 400 (targeted={targeted}), got {other:?}"),
+            }
+        }
+        // An explicit `<default>` tenant is the engine's own tenant: accepted.
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: Some("<default>".to_string()),
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.tenant_id, "<default>");
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// A conditional evaluation creates instances, so it obeys the shared create
+    /// admission policy: with the drain-stall hard valve engaged it is shed with
+    /// a `503` and creates nothing (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_is_shed_by_create_admission() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-shed-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        deploy_and_await_definition(&srv, proc).await;
+        srv.drain_guard().publish(true, true);
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(p) => {
+                assert_eq!(p.status, 503);
+            }
+            other => panic!("expected 503 while halted, got {other:?}"),
+        }
+        // and once the valve releases, the same evaluation proceeds.
+        srv.drain_guard().publish(false, false);
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200 after release, got {other:?}"),
+        }
+    }
+
     /// A conditional evaluation with no targeted definition succeeds with a fresh
     /// evaluation key, the resolved tenant, and an empty `processInstances` list
     /// when nothing deployed has a root-level conditional start event.
@@ -49967,7 +50092,7 @@ mod expression_conditional_tests {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
         let srv = server();
         let body = models::ConditionalEvaluationInstruction {
-            tenant_id: Some("tenant-a".to_string()),
+            tenant_id: None,
             process_definition_key: None,
             variables: [(
                 "orderAmount".to_string(),
@@ -49978,7 +50103,7 @@ mod expression_conditional_tests {
         };
         match srv.evaluate_conditionals_impl(&body).await.unwrap() {
             Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
-                assert_eq!(r.tenant_id, "tenant-a");
+                assert_eq!(r.tenant_id, "<default>");
                 assert!(r.process_instances.is_empty());
                 assert!(
                     r.conditional_evaluation_key.0.parse::<u64>().is_ok(),

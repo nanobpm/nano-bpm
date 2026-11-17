@@ -265,6 +265,9 @@ pub(crate) fn parse_with_captures(
                         // an ambiguous trigger at build (#1555).
                         if let (Some(idx), true) = (cur_start, tag.ends_with("EventDefinition")) {
                             acc.nodes[idx].start_def_count += 1;
+                            if tag == "conditionalEventDefinition" {
+                                acc.nodes[idx].has_conditional_def = true;
+                            }
                         }
                         match tag {
                             "startEvent" => {

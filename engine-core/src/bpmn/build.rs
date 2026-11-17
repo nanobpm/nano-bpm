@@ -90,6 +90,12 @@ pub(super) struct NodeAcc {
     /// Number of `*EventDefinition` child elements read on a start event
     /// (occurrences, so two same-type definitions count as two).
     pub(super) start_def_count: u32,
+    /// Whether a `conditionalEventDefinition` element was read on this start
+    /// event — tracked separately from [`Self::esp_condition`] (which is only
+    /// set for a non-blank `<condition>`), so a conditional start with a
+    /// missing or blank condition is rejected instead of silently degrading to
+    /// a none start (#932).
+    pub(super) has_conditional_def: bool,
     /// For a timer start event: the raw text of its `timeDuration`/`timeCycle`/
     /// `timeDate` when it is a static ISO-8601 literal (not a `=`-prefixed FEEL
     /// expression, which populates `timer_expr` instead). Retained so an event
@@ -465,6 +471,7 @@ impl ProcessAcc {
             esp_condition: None,
             esp_interrupting: None,
             start_def_count: 0,
+            has_conditional_def: false,
             timer_literal: None,
             timer_def_kind: None,
             adhoc_output_collection: None,
@@ -1673,6 +1680,34 @@ impl ProcessAcc {
                         .is_some_and(|p| event_subprocess_ids.contains(p))
                     {
                         builder.start_event(node.id)
+                    } else if node.has_conditional_def || node.esp_condition.is_some() {
+                        // A root-level `conditionalEventDefinition` start (#932)
+                        // must declare exactly one event definition carrying a
+                        // non-blank condition. Fail closed on any other shape: a
+                        // missing/blank condition must not degrade to a none
+                        // start, and a duplicate or mixed definition must not
+                        // silently pick one trigger.
+                        let invalid = |reason: &str| ParseError::InvalidProcess {
+                            process_id: self.id.clone(),
+                            reason: format!("conditional start event {} {reason}", node.id),
+                        };
+                        if node.start_def_count > 1 {
+                            return Err(invalid(
+                                "declares more than one event definition; exactly one \
+                                 conditionalEventDefinition is supported",
+                            ));
+                        }
+                        let Some(condition) = node.esp_condition else {
+                            return Err(invalid(
+                                "has a conditionalEventDefinition without a non-blank \
+                                 <condition>",
+                            ));
+                        };
+                        // A root-level `conditionalEventDefinition` start (#932):
+                        // triggered by a conditional evaluation, not a
+                        // subscription. (Inside an event sub-process the
+                        // condition lives on the container trigger, above.)
+                        builder.conditional_start_event(node.id, condition)
                     } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
                             ParseError::InvalidMessageEvent {
@@ -1684,12 +1719,6 @@ impl ProcessAcc {
                             }
                         })?;
                         builder.message_start_event(node.id, decl.name.clone())
-                    } else if let Some(condition) = node.esp_condition {
-                        // A root-level `conditionalEventDefinition` start (#932):
-                        // triggered by a conditional evaluation, not a
-                        // subscription. (Inside an event sub-process the
-                        // condition lives on the container trigger, above.)
-                        builder.conditional_start_event(node.id, condition)
                     } else if let Some(repeating) = node.timer_repeating {
                         let interval_millis = node.duration_millis.unwrap_or(0);
                         if repeating {
