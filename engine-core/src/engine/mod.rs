@@ -2053,9 +2053,17 @@ impl Engine {
                 .state
                 .forms
                 .get(&form.id)
-                .is_some_and(|existing| existing.schema == form.schema)
+                .is_some_and(|existing| {
+                    existing.schema == form.schema && existing.version_tag == form.version_tag
+                })
             {
-                // Idempotent redeploy of the identical latest form: skip.
+                // Idempotent redeploy of the identical latest form: skip. The
+                // `version_tag` must match too (#1193 review): a schema-identical
+                // redeploy that carries a NEW tag (e.g. the first deploy to tag a
+                // form restored from a pre-#1193 snapshot, whose `version_tag` is
+                // `None`) is NOT a duplicate — skipping it would discard the tag,
+                // leaving a `versionTag`-bound task incidenting despite the form
+                // being redeployed.
                 continue;
             }
             let version = self
@@ -2104,9 +2112,15 @@ impl Engine {
                 .is_some_and(|existing| {
                     existing.resource_name == resource.resource_name
                         && existing.content == resource.content
+                        && existing.version_tag == resource.version_tag
                 })
             {
                 // Idempotent redeploy of the identical latest resource: skip.
+                // The `version_tag` must match too (#1193 review): a
+                // content-identical redeploy that carries a NEW tag is NOT a
+                // duplicate — skipping it would discard the tag, so a
+                // `versionTag`-bound link would keep resolving the untagged
+                // version (or fall back to latest) despite the redeploy.
                 continue;
             }
             let version = self
@@ -8893,7 +8907,17 @@ impl Engine {
                                 element_instance_key,
                                 element_id: element_id.clone(),
                                 kind: state::IncidentKind::CalledElementError,
-                                redrive: Some(state::IoMappingRedrive::ActivationPending),
+                                // The form lookup runs AFTER the element's input
+                                // mappings and `start` listeners already succeeded
+                                // (#1193 review): resolution must re-run ONLY the
+                                // activation body, never re-apply the (possibly
+                                // non-idempotent, e.g. `=counter + 1 -> counter`)
+                                // inputs or re-fire the completed start listeners.
+                                // `gate_activated` re-tags this
+                                // `ActivationBodyPending` and withholds
+                                // `ElementActivated` when the token is still
+                                // ACTIVATING.
+                                redrive: Some(state::IoMappingRedrive::ActivationBody),
                                 reason,
                                 job_key: None,
                                 created_at: self.now,
