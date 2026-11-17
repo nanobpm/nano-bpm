@@ -7,7 +7,7 @@
 //! canonical FEEL string form — exactly how Zeebe serialises a temporal value
 //! when it lands in a process variable.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::ast::Node;
@@ -31,21 +31,6 @@ pub enum FeelVal {
     DtDur(DtDuration),
     Range(Box<Range>),
     Function(Func),
-    /// A value carrying trusted `camunda.secrets.<name>` provenance (#1296).
-    ///
-    /// This is an *evaluation-internal* wrapper: when a trusted
-    /// (`SECRET_REFERENCE`-kind) cluster variable is read, the evaluator wraps
-    /// its value together with the secret names that value carries, so the
-    /// provenance travels with the *individual value* rather than being
-    /// recorded wholesale at the root read. A member/index/filter selection
-    /// then surfaces only the names of the value actually selected — never the
-    /// unselected siblings — and the wrapper is transparent to every FEEL
-    /// operation (it delegates to the inner value). It never escapes an
-    /// expression: [`FeelVal::into_value`] strips it.
-    SecretRef {
-        value: Box<FeelVal>,
-        names: Rc<HashSet<String>>,
-    },
 }
 
 /// A FEEL range/interval, used by interval literals and `in`/`between` tests.
@@ -86,24 +71,18 @@ impl FeelVal {
         match self {
             FeelVal::Int(i) => Some(*i as f64),
             FeelVal::Double(d) => Some(*d),
-            FeelVal::SecretRef { value, .. } => value.as_f64(),
             _ => None,
         }
     }
 
     pub fn is_number(&self) -> bool {
-        match self {
-            FeelVal::Int(_) | FeelVal::Double(_) => true,
-            FeelVal::SecretRef { value, .. } => value.is_number(),
-            _ => false,
-        }
+        matches!(self, FeelVal::Int(_) | FeelVal::Double(_))
     }
 
     /// The boolean this value holds, if it is a boolean (FEEL never coerces).
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             FeelVal::Bool(b) => Some(*b),
-            FeelVal::SecretRef { value, .. } => value.as_bool(),
             _ => None,
         }
     }
@@ -123,7 +102,6 @@ impl FeelVal {
             FeelVal::DtDur(_) => "days and time duration",
             FeelVal::Range(_) => "range",
             FeelVal::Function(_) => "function",
-            FeelVal::SecretRef { value, .. } => value.type_name(),
         }
     }
 
@@ -172,8 +150,6 @@ impl FeelVal {
             FeelVal::YmDur(d) => Value::Str(d.format()),
             FeelVal::DtDur(d) => Value::Str(d.format()),
             FeelVal::Range(_) | FeelVal::Function(_) => Value::Null,
-            // The provenance wrapper never escapes an expression (#1296).
-            FeelVal::SecretRef { value, .. } => value.into_value(),
         }
     }
 
@@ -195,67 +171,6 @@ impl FeelVal {
                 parts.map(|p| format!("[{}]", p.join(", ")))
             }
             FeelVal::Context(_) | FeelVal::Range(_) | FeelVal::Function(_) => None,
-            FeelVal::SecretRef { value, .. } => value.to_feel_string(),
         }
-    }
-
-    /// Strips the provenance wrapper, returning the plain inner value (#1296).
-    /// Applied at the function-argument boundary: a value's provenance is
-    /// surfaced when it is *selected*, and the wrapper is transparent to FEEL
-    /// operators, but a builtin that pattern-matches on the concrete variant
-    /// (e.g. `want_list`) must see the underlying value, not the wrapper.
-    pub fn strip_provenance(self) -> FeelVal {
-        match self {
-            FeelVal::SecretRef { value, .. } => *value,
-            other => other,
-        }
-    }
-}
-
-/// Re-taints `v` with the subset of `names` reachable within it (#1296). A
-/// structured value keeps only the names under the selected path; a scalar
-/// keeps the names that match its own reference text.
-pub fn taint_with(v: FeelVal, names: &Rc<HashSet<String>>) -> FeelVal {
-    if names.is_empty() {
-        return v;
-    }
-    match v {
-        FeelVal::Str(ref s) => {
-            let name = super::secret_reference_name(s).map(str::to_string);
-            match name {
-                Some(n) if names.contains(n.as_str()) => FeelVal::SecretRef {
-                    value: Box::new(v),
-                    names: Rc::new(HashSet::from([n])),
-                },
-                _ => v,
-            }
-        }
-        FeelVal::List(_) | FeelVal::Context(_) => {
-            let sub: HashSet<String> = names
-                .iter()
-                .filter(|n| reachable_in(&v, n))
-                .cloned()
-                .collect();
-            if sub.is_empty() {
-                v
-            } else {
-                FeelVal::SecretRef {
-                    value: Box::new(v),
-                    names: Rc::new(sub),
-                }
-            }
-        }
-        other => other,
-    }
-}
-
-/// `true` when the reference `camunda.secrets.<name>` is reachable in `v`.
-fn reachable_in(v: &FeelVal, name: &str) -> bool {
-    match v {
-        FeelVal::Str(s) => super::secret_reference_name(s) == Some(name),
-        FeelVal::List(items) => items.iter().any(|i| reachable_in(i, name)),
-        FeelVal::Context(entries) => entries.values().any(|i| reachable_in(i, name)),
-        FeelVal::SecretRef { value, .. } => reachable_in(value, name),
-        _ => false,
     }
 }

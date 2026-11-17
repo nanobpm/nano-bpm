@@ -41,7 +41,7 @@ mod regex;
 pub(crate) mod temporal;
 mod value;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use error::FeelError;
 
@@ -91,7 +91,6 @@ fn feel_kind(v: &value::FeelVal) -> &'static str {
         value::FeelVal::YmDur(_) => "PERIOD",
         value::FeelVal::DtDur(_) => "DURATION",
         value::FeelVal::Range(_) | value::FeelVal::Function(_) => "UNKNOWN",
-        value::FeelVal::SecretRef { value, .. } => feel_kind(value),
     }
 }
 
@@ -535,24 +534,46 @@ fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, 
 pub struct EvaluatedWithProvenance {
     /// The expression's result.
     pub value: Value,
-    /// The trusted secret names surfaced during evaluation (literal reference
-    /// paths plus references carried by trusted cluster variables read on the
-    /// executed path), sorted for a deterministic wire projection.
+    /// The trusted secret names whose references reach the result (literal
+    /// reference paths on the executed path plus references carried by trusted
+    /// cluster variables), sorted for a deterministic wire projection.
     pub referenced_secrets: Vec<String>,
 }
 
-/// Evaluates a FEEL expression, additionally tracking the trusted
-/// `camunda.secrets.<name>` references the evaluation *actually surfaces*
-/// (#1296, Camunda 8.10 `referencedSecrets`).
+/// Evaluates a FEEL expression, additionally reporting the trusted
+/// `camunda.secrets.<name>` references that *reach the result* (#1296, Camunda
+/// 8.10 `referencedSecrets`).
 ///
 /// `trusted_roots` are the base-context variable names the host trusts to carry
-/// secret references (the `SECRET_REFERENCE`-kind cluster variables). Provenance
-/// is **evaluation-driven**, not syntactic: a reference is reported only when
-/// evaluation surfaces it, so a shadowed binding, a skipped `if`/`and`/`or`
-/// branch, or an un-called function body never contributes — and a reference
-/// nested in a structured (object/list) trusted value is found when a
-/// member/index access surfaces it. A reference string arriving via an
-/// untrusted request-body variable or a JSON-kind variable is never reported.
+/// secret references (the `SECRET_REFERENCE`-kind cluster variables).
+///
+/// Provenance is **result-based**, per the spec's own contract
+/// (spec/expression.yaml): "`referencedSecrets` … Callers use this to know
+/// which `camunda.secrets.<name>` occurrences in the result they may safely
+/// resolve." A trusted value consumed only by an operator or condition
+/// (`k = "x"`, `if flag …`) puts no reference into the result, so there is
+/// nothing for the caller to resolve and nothing is reported. The mechanism is
+/// **differential**, not an in-band taint wrapper (which broke native dispatch
+/// and leaked discarded intermediates — PR #1636 review):
+///
+/// 1. The expression is evaluated **once, plainly** — the evaluator never
+///    wraps a value, so native FEEL dispatch, collection traversal and
+///    function calls behave exactly as they do without provenance.
+/// 2. Only when a trusted root's value actually contains a
+///    `camunda.secrets.` reference does a **second** evaluation run, with that
+///    one root's reference strings replaced by an inert marker
+///    ([`SECRET_NEUTRALISED`]). A reference in the real result that disappears
+///    or changes under that neutralisation came from that trusted root and is
+///    reported.
+///
+/// Neutralising **one root at a time** is what keeps attribution structural: a
+/// reference string that arrives via an *untrusted* source (a request-body or
+/// JSON-kind variable) never diffs, even when its text matches a trusted
+/// reference — and a secret name that is a prefix of another cannot be
+/// mis-attributed, because comparison is on whole strings, never substrings.
+/// Literal `camunda.secrets.<name>` paths on the executed path are recorded
+/// during the real run (a shadowed binding, skipped branch or un-called
+/// function body never contributes).
 pub fn eval_with_provenance(
     expr: &str,
     ctx: &HashMap<String, Value>,
@@ -561,28 +582,107 @@ pub fn eval_with_provenance(
     let src = strip_marker(expr);
     let tokens = lexer::tokenize(src)?;
     let node = parser::parse(tokens)?;
-    let mut provenance = eval::SecretProvenance::default();
-    for root in trusted_roots {
-        provenance.trust_root(root);
-    }
-    let mut eval_ctx = eval::Ctx::new(ctx).with_provenance(provenance);
-    let value = eval::eval_node_pub(&node, &mut eval_ctx)?;
-    // The expression's result is what the caller substitutes: surface the
-    // trusted provenance of a bare tainted result (e.g. the expression is just
-    // a trusted cluster variable), which no member/index selection surfaced.
-    eval_ctx.surface_result(&value);
-    let provenance = eval_ctx.into_provenance().unwrap_or_default();
-    let mut referenced_secrets: Vec<String> = provenance
-        .referenced
+
+    // The real run: plain evaluation, recording only the literal
+    // `camunda.secrets.<name>` paths that surface on the executed path.
+    let (value, literal) = eval::evaluate_tracked(&node, ctx);
+    let value = value?.into_value();
+
+    // The trusted roots that actually carry a reference. Only these justify a
+    // second (neutralised) evaluation — the common case pays for one.
+    let carriers: Vec<(String, HashSet<String>)> = trusted_roots
         .into_iter()
-        .chain(provenance.literal)
+        .filter_map(|name| {
+            let value = ctx.get(&name)?;
+            let mut names = HashSet::new();
+            collect_secret_names_value(value, &mut names);
+            (!names.is_empty()).then_some((name, names))
+        })
         .collect();
+    let mut referenced = literal;
+    if !carriers.is_empty() {
+        // The occurrences in the real result a caller may safely resolve.
+        let mut real_names = HashSet::new();
+        collect_secret_names_value(&value, &mut real_names);
+        for (root, root_names) in &carriers {
+            // Neutralise this one root only, so a same-text reference from an
+            // untrusted source cannot diff (structural, per-root attribution).
+            let mut neutral_ctx = ctx.clone();
+            if let Some(v) = neutral_ctx.get_mut(root) {
+                neutralise_secret_references(v);
+            }
+            let neutral_names = eval::evaluate(&node, &neutral_ctx)
+                .map(|v| {
+                    let v = v.into_value();
+                    let mut names = HashSet::new();
+                    collect_secret_names_value(&v, &mut names);
+                    names
+                })
+                .unwrap_or_default();
+            // A name this root carries that reaches the real result but not
+            // the neutralised one came from this trusted root.
+            referenced.extend(
+                real_names
+                    .iter()
+                    .filter(|n| root_names.contains(*n) && !neutral_names.contains(*n))
+                    .cloned(),
+            );
+        }
+    }
+    let mut referenced_secrets: Vec<String> = referenced.into_iter().collect();
     referenced_secrets.sort();
     referenced_secrets.dedup();
     Ok(EvaluatedWithProvenance {
-        value: value.into_value(),
+        value,
         referenced_secrets,
     })
+}
+
+/// The inert marker that replaces a trusted root's `camunda.secrets.<name>`
+/// strings in [`eval_with_provenance`]'s neutralised run. The invariants that
+/// make the diff sound: (a) it is not itself a `camunda.secrets.` reference
+/// ([`secret_reference_name`] rejects it), so the neutralised run cannot
+/// *introduce* a reportable name; (b) it is substituted *into* trusted values
+/// only, so it never equals an input value; and (c) it carries NUL bytes, so
+/// no deployed model or cluster variable would legitimately produce it.
+/// Comparison is on whole strings after substitution, never substrings, so a
+/// name that is a prefix of another cannot be mis-attributed.
+const SECRET_NEUTRALISED: &str = "\u{0}nano:secret-neutralised\u{0}";
+
+/// Replaces every exact `camunda.secrets.<name>` string in `v` (recursing into
+/// lists and maps) with [`SECRET_NEUTRALISED`]. A string that merely *contains*
+/// a reference is left untouched: only a whole-string reference is a secret
+/// pointer a caller may resolve.
+fn neutralise_secret_references(v: &mut Value) {
+    match v {
+        Value::Str(s) => {
+            if secret_reference_name(s).is_some() {
+                *s = SECRET_NEUTRALISED.to_string();
+            }
+        }
+        Value::List(items) => items.iter_mut().for_each(neutralise_secret_references),
+        Value::Map(entries) => entries.values_mut().for_each(neutralise_secret_references),
+        _ => {}
+    }
+}
+
+/// Collects the secret names of every whole-string `camunda.secrets.<name>`
+/// reference in `v` (recursing into lists and maps).
+fn collect_secret_names_value(v: &Value, out: &mut HashSet<String>) {
+    match v {
+        Value::Str(s) => {
+            if let Some(name) = secret_reference_name(s) {
+                out.insert(name.to_string());
+            }
+        }
+        Value::List(items) => items
+            .iter()
+            .for_each(|i| collect_secret_names_value(i, out)),
+        Value::Map(entries) => entries
+            .values()
+            .for_each(|i| collect_secret_names_value(i, out)),
+        _ => {}
+    }
 }
 
 fn strip_marker(expr: &str) -> &str {
@@ -774,11 +874,15 @@ mod tests {
         assert_eq!(eval("missing", &c), Ok(Value::Null));
     }
 
-    /// #1296: provenance is EVALUATION-DRIVEN, not syntactic — a trusted
-    /// reference is reported only when evaluation actually surfaces it, so a
-    /// shadowed binding, a skipped `if`/`and`/`or` branch, or an un-called
-    /// function body never contributes; and a reference nested in a structured
-    /// trusted value is found when a member access surfaces it.
+    /// #1296: provenance is EVALUATION-DRIVEN and RESULT-BASED (differential):
+    /// a trusted reference is reported only when it *reaches the result* — the
+    /// occurrences in the result a caller may safely resolve
+    /// (spec/expression.yaml `referencedSecrets`). A trusted value consumed only
+    /// by an operator or condition puts no reference into the result, so it is
+    /// not reported; a shadowed binding, a skipped `if`/`and`/`or` branch, or
+    /// an un-called function body never contributes; and a reference nested in
+    /// a structured (object/list) trusted value is found when a member access
+    /// surfaces it into the result.
     #[test]
     fn eval_with_provenance_tracks_only_surfaced_trusted_references() {
         let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
@@ -850,10 +954,15 @@ mod tests {
         assert!(prov("function() camunda.secrets.SKIPPED", &ctx(&[]), &[]).is_empty());
     }
 
-    /// #1296 review: provenance must follow the *selected* value, not the root
-    /// read — and must survive the function-call / list-projection paths.
+    /// #1296 review (round 4): provenance is RESULT-BASED — a secret is
+    /// reported exactly when its reference reaches the expression's result
+    /// (spec/expression.yaml: callers resolve "which `camunda.secrets.<name>`
+    /// occurrences in the result they may safely resolve"). This pins the
+    /// defect class the in-band taint wrapper kept leaking: native dispatch
+    /// must be untouched, discarded intermediates must not count, and
+    /// provenance must survive function arguments and returns.
     #[test]
-    fn eval_with_provenance_is_selection_scoped() {
+    fn eval_with_provenance_is_result_based() {
         let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
             eval_with_provenance(
                 e,
@@ -864,11 +973,74 @@ mod tests {
             .referenced_secrets
         };
 
-        // Finding: a root read must not record UNSELECTED descendants. `cfg`
-        // carries a reference under `token`, but `[cfg.safe, body_ref]` selects
-        // only `cfg.safe` (a number) and the untrusted `body_ref` — so the
-        // result reference came only from the request body and TOKEN is NOT
-        // reported.
+        // --- Native dispatch is untouched -------------------------------
+        // A trusted boolean condition behaves like the plain value (no wrapper
+        // is ever introduced, so `if flag then 1 else 2` sees `true`).
+        let c = ctx(&[("flag", Value::Bool(true))]);
+        let r =
+            eval_with_provenance("if flag then 1 else 2", &c, vec!["flag".to_string()]).unwrap();
+        assert_eq!(r.value, Value::Int(1));
+        assert!(r.referenced_secrets.is_empty());
+        // A trusted list indexes like a plain list.
+        let c = ctx(&[(
+            "arr",
+            Value::List(vec![
+                Value::Str("camunda.secrets.FIRST".into()),
+                Value::Str("plain".into()),
+            ]),
+        )]);
+        let r = eval_with_provenance("arr[1]", &c, vec!["arr".to_string()]).unwrap();
+        assert_eq!(r.value, Value::Str("camunda.secrets.FIRST".into()));
+        assert_eq!(r.referenced_secrets, vec!["FIRST"]);
+        let r = eval_with_provenance("arr[2]", &c, vec!["arr".to_string()]).unwrap();
+        assert_eq!(r.value, Value::Str("plain".into()));
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "selecting a non-reference element reports nothing"
+        );
+        // String equality and concatenation see the plain string.
+        let c = ctx(&[("k", Value::Str("camunda.secrets.KEY".into()))]);
+        assert_eq!(
+            eval_with_provenance(r#"k = "camunda.secrets.KEY""#, &c, vec!["k".to_string()])
+                .unwrap()
+                .value,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_with_provenance(r#"k + "!""#, &c, vec!["k".to_string()])
+                .unwrap()
+                .value,
+            Value::Str("camunda.secrets.KEY!".into())
+        );
+
+        // --- Only references that REACH THE RESULT are reported ---------
+        // A trusted value consumed only by an operator or condition puts no
+        // reference into the result, so there is nothing for the caller to
+        // resolve and nothing to report (the spec's own contract).
+        let c = ctx(&[("k", Value::Str("camunda.secrets.KEY".into()))]);
+        assert!(
+            prov(r#"k = "x""#, &c, &["k"]).is_empty(),
+            "a condition-only trusted read is not reported"
+        );
+        assert!(
+            prov("sort([2, 1], function(a, b) k = \"x\")", &c, &["k"]).is_empty(),
+            "a trusted value consumed by a comparator does not reach the result"
+        );
+        assert!(
+            prov(
+                "count(arr)",
+                &ctx(&[(
+                    "arr",
+                    Value::List(vec![Value::Str("camunda.secrets.S".into())]),
+                )]),
+                &["arr"]
+            )
+            .is_empty(),
+            "a trusted list's length carries no reference"
+        );
+
+        // An unselected trusted sibling of a structured value is not reported:
+        // `[cfg.safe, body_ref]` selects a number and an untrusted body string.
         let c = ctx(&[
             (
                 "cfg",
@@ -890,14 +1062,11 @@ mod tests {
             prov("[cfg.safe, body_ref]", &c, &["cfg"]).is_empty(),
             "an unselected trusted sibling must not be reported"
         );
-        // …but selecting the member that carries the reference DOES surface it.
         assert_eq!(prov("cfg.token", &c, &["cfg"]), vec!["TOKEN"]);
 
-        // Finding: a discarded index *probe* must not leak provenance. `flag`
-        // is a trusted reference, but as a filter predicate it is re-evaluated
-        // per item against the item's own (body-provided) `flag`, so the
-        // trusted root is never read for the selection and TOKEN is not
-        // reported.
+        // A discarded index *probe* / filter intermediate is not reported:
+        // the filter re-evaluates against each item's own (body-provided)
+        // bindings, so the trusted root never reaches the result.
         let c = ctx(&[
             ("flag", Value::Str("camunda.secrets.TOKEN".into())),
             (
@@ -919,57 +1088,101 @@ mod tests {
             prov("rows[flag].value", &c, &["flag"]).is_empty(),
             "a discarded index probe must not surface the trusted root"
         );
-        // A genuine numeric index surfaces only the selected element's names.
+
+        // --- Provenance survives function arguments and returns ---------
+        let c = ctx(&[("token_ref", Value::Str("camunda.secrets.TOKEN".into()))]);
+        assert_eq!(
+            prov("(function(x) x)(token_ref)", &c, &["token_ref"]),
+            vec!["TOKEN"],
+            "an identity lambda returns the trusted reference"
+        );
+        assert_eq!(
+            prov("fromAi(token_ref)", &c, &["token_ref"]),
+            vec!["TOKEN"],
+            "fromAi returns its value argument verbatim"
+        );
+        let c = ctx(&[(
+            "cfg",
+            Value::Map(
+                [(
+                    "token".to_string(),
+                    Value::Str("camunda.secrets.TOKEN".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        )]);
+        assert_eq!(
+            prov(r#"get value(cfg, "token")"#, &c, &["cfg"]),
+            vec!["TOKEN"],
+            "a selector builtin surfaces the selected reference"
+        );
         let c = ctx(&[(
             "arr",
-            Value::List(vec![
-                Value::Str("camunda.secrets.FIRST".into()),
-                Value::Str("plain".into()),
-            ]),
+            Value::List(vec![Value::Str("camunda.secrets.TOKEN".into())]),
         )]);
-        assert_eq!(prov("arr[1]", &c, &["arr"]), vec!["FIRST"]);
-        assert!(
-            prov("arr[2]", &c, &["arr"]).is_empty(),
-            "selecting a non-reference element reports nothing"
+        assert_eq!(
+            prov("reverse(arr)", &c, &["arr"]),
+            vec!["TOKEN"],
+            "a collection builtin keeps the reference it returns"
         );
 
-        // Finding: a literal reference reached through a LIST projection is
-        // recorded just like the scalar path.
+        // --- Structural, per-root attribution ---------------------------
+        // An UNTRUSTED source whose text matches a trusted reference is never
+        // reported: the trusted root is neutralised in isolation, so a copy
+        // carried by a body variable cannot diff.
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        assert!(
+            prov("u", &c, &["t"]).is_empty(),
+            "an untrusted copy of a trusted reference text is not reported"
+        );
+        assert!(
+            prov("[t, u][2]", &c, &["t"]).is_empty(),
+            "selecting the untrusted element reports nothing"
+        );
+        assert_eq!(
+            prov("[t, u][1]", &c, &["t"]),
+            vec!["TOKEN"],
+            "selecting the trusted element reports it"
+        );
+        // A secret name that is a prefix of another cannot be mis-attributed:
+        // the comparison is on whole strings, never substrings.
+        let c = ctx(&[
+            ("a", Value::Str("camunda.secrets.a".into())),
+            ("ab", Value::Str("camunda.secrets.ab".into())),
+        ]);
+        assert_eq!(prov("a", &c, &["a"]), vec!["a"]);
+        assert!(prov("a", &c, &["ab"]).is_empty());
+        assert_eq!(prov("[a, ab]", &c, &["a", "ab"]), vec!["a", "ab"]);
+
+        // The neutralisation marker is inert: it is not itself a reference,
+        // so the neutralised run can never *introduce* a reportable name.
+        assert_eq!(secret_reference_name(SECRET_NEUTRALISED), None);
+
+        // A trusted value transformed past recognition (concatenation) is no
+        // longer a resolvable occurrence, so it is not reported.
+        let c = ctx(&[("k", Value::Str("camunda.secrets.KEY".into()))]);
+        assert!(
+            prov(r#"k + "!""#, &c, &["k"]).is_empty(),
+            "a transformed reference is not an occurrence the caller can resolve"
+        );
+
+        // A literal reference reached through a LIST projection is recorded
+        // just like the scalar path.
         assert_eq!(
             prov("[camunda.secrets].TOKEN", &ctx(&[]), &[]),
             vec!["TOKEN"]
         );
-
-        // Finding: an EXECUTED function body surfaces its reference (a literal
-        // path, or a trusted cluster variable read) — while an un-called body
-        // still does not.
+        // An EXECUTED function body surfaces its literal reference — while an
+        // un-called body still does not.
         assert_eq!(
             prov("(function() camunda.secrets.TOKEN)()", &ctx(&[]), &[]),
             vec!["TOKEN"]
         );
-        let c = ctx(&[("token_ref", Value::Str("camunda.secrets.TOKEN".into()))]);
-        assert_eq!(
-            prov("(function() token_ref)()", &c, &["token_ref"]),
-            vec!["TOKEN"]
-        );
         assert!(prov("function() camunda.secrets.SKIPPED", &ctx(&[]), &[]).is_empty());
-
-        // A trusted value *consumed* by an operator (here the comparator of a
-        // `sort` callback) is a genuine read: its provenance surfaces even
-        // though the comparison's boolean result is not itself a reference.
-        let c = ctx(&[("k", Value::Str("camunda.secrets.KEY".into()))]);
-        assert_eq!(
-            prov("sort([2, 1], function(a, b) k = \"x\")", &c, &["k"]),
-            vec!["KEY"]
-        );
-        // A trusted value passed THROUGH a builtin is not re-reported (it was
-        // not selected), but the builtin must still see the underlying value —
-        // `count` on a trusted list returns its length, not an error.
-        let c = ctx(&[(
-            "arr",
-            Value::List(vec![Value::Str("camunda.secrets.S".into())]),
-        )]);
-        assert!(prov("count(arr)", &c, &["arr"]).is_empty());
     }
 
     #[test]
