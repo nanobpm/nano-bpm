@@ -23267,7 +23267,7 @@ impl ServerImpl {
                 // create-then-publish ordering, #1582); a cancelled caller is
                 // fine because routing completes inside this detached task.
                 server
-                    .drive_subscription_routing(Self::routable_events(events))
+                    .drive_subscription_routing(Self::routable_events(events), None)
                     .await;
                 server.signal_jobs_available();
             }
