@@ -835,7 +835,7 @@ ProcessInstanceCreationInstructionByKey.variables
 ProcessInstanceCreationStartInstruction.elementId
 ProcessInstanceCreationTerminateInstruction.afterElementId
 ProcessInstanceCreationTerminateInstruction.type
-ProcessInstanceFilter.$or unhonoured #1293
+ProcessInstanceFilter.$or
 ProcessInstanceFilterFields.processDefinitionId
 ProcessInstanceFilterFields.processDefinitionKey
 ProcessInstanceFilterFields.processDefinitionName
@@ -926,25 +926,25 @@ UserTaskCompletionRequest.action
 UserTaskCompletionRequest.variables
 UserTaskFilter.$or
 UserTaskFilterFields.assignee
-UserTaskFilterFields.businessId unhonoured #1293
-UserTaskFilterFields.candidateGroup unhonoured #1293
-UserTaskFilterFields.candidateUser unhonoured #1293
-UserTaskFilterFields.completionDate unhonoured #1293
-UserTaskFilterFields.creationDate unhonoured #1293
-UserTaskFilterFields.dueDate unhonoured #1293
+UserTaskFilterFields.businessId
+UserTaskFilterFields.candidateGroup
+UserTaskFilterFields.candidateUser
+UserTaskFilterFields.completionDate
+UserTaskFilterFields.creationDate
+UserTaskFilterFields.dueDate
 UserTaskFilterFields.elementId
-UserTaskFilterFields.elementInstanceKey unhonoured #1293
-UserTaskFilterFields.followUpDate unhonoured #1293
-UserTaskFilterFields.localVariables unhonoured #1293
-UserTaskFilterFields.name unhonoured #1293
-UserTaskFilterFields.priority unhonoured #1293
-UserTaskFilterFields.processDefinitionId unhonoured #1293
+UserTaskFilterFields.elementInstanceKey
+UserTaskFilterFields.followUpDate
+UserTaskFilterFields.localVariables
+UserTaskFilterFields.name
+UserTaskFilterFields.priority
+UserTaskFilterFields.processDefinitionId
 UserTaskFilterFields.processDefinitionKey
 UserTaskFilterFields.processInstanceKey
-UserTaskFilterFields.processInstanceVariables unhonoured #1293
+UserTaskFilterFields.processInstanceVariables
 UserTaskFilterFields.state
-UserTaskFilterFields.tags unhonoured #1293
-UserTaskFilterFields.tenantId unhonoured #1293
+UserTaskFilterFields.tags
+UserTaskFilterFields.tenantId
 UserTaskFilterFields.userTaskKey
 UserTaskSearchQuery.filter
 UserTaskSearchQuery.sort
