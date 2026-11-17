@@ -1116,6 +1116,19 @@ impl Ord for SortVal {
     }
 }
 
+/// Sort value for a string-typed entity key (decimal `u64` rendered as a
+/// string): numeric when it parses, so keys order numerically rather than
+/// lexicographically; otherwise the raw string (sorts after every number).
+pub fn key_sort_val(key: &str) -> SortVal {
+    key.parse::<i64>()
+        .map_or_else(|_| SortVal::Str(key.to_string()), SortVal::Num)
+}
+
+/// Sort value for an optional timestamp/number: absent sorts first (`-1`).
+pub fn opt_num_sort_val(v: Option<i64>) -> SortVal {
+    SortVal::Num(v.unwrap_or(-1))
+}
+
 /// Stably sorts `items` by the given sort keys, breaking ties by entity key so
 /// the order is fully deterministic (and stable for cursor paging). `project`
 /// returns the [`SortVal`] for a given `(item, field)`; `key` returns the
@@ -1355,6 +1368,14 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_keys_sort_numerically_and_absent_values_first() {
+        // "9" < "10" numerically, though not lexicographically (#1298).
+        assert!(key_sort_val("9") < key_sort_val("10"));
+        assert!(key_sort_val("10") < key_sort_val("not-a-key"));
+        assert!(opt_num_sort_val(None) < opt_num_sort_val(Some(0)));
+    }
 
     #[test]
     fn cursor_round_trips_and_is_padding_free() {

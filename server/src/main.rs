@@ -12136,6 +12136,12 @@ impl ServerImpl {
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
                 "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i64),
+                "jobKey" => query::SortVal::Num(inc.job_key.map_or(-1, |k| k as i64)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(inc.key as i64),
             },
             |inc| inc.key,
@@ -12251,6 +12257,12 @@ impl ServerImpl {
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
                 "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i64),
+                "jobKey" => query::SortVal::Num(inc.job_key.map_or(-1, |k| k as i64)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(inc.key as i64),
             },
             |inc| inc.key,
@@ -12560,6 +12572,7 @@ impl ServerImpl {
                     roots.root_process_instance_key(ws.process_instance_key) as i64,
                 ),
                 "elementId" => query::SortVal::Str(ws.element_id.clone()),
+                "elementInstanceKey" => query::SortVal::Num(ws.element_instance_key as i64),
                 _ => query::SortVal::Num(ws.element_instance_key as i64),
             },
             |ws| (ws.element_instance_key, ws.source_key),
@@ -12806,6 +12819,13 @@ impl ServerImpl {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
                 "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
+                "decisionEvaluationKey" => query::SortVal::Num(row.decision_evaluation_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(row.element_instance_key as i64),
+                "evaluationFailure" => {
+                    query::SortVal::Str(row.evaluation_failure.clone().unwrap_or_default())
+                }
+                "processDefinitionKey" => query::key_sort_val(&row.process_definition_key),
+                "rootDecisionDefinitionKey" => query::SortVal::Num(row.root_decision_key as i64),
                 // Default (key) sort: by evaluation key, then the within-
                 // evaluation index via the composite tiebreak below.
                 _ => query::SortVal::Num(row.decision_evaluation_key as i64),
@@ -13305,6 +13325,11 @@ impl ServerImpl {
                 "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
                 "resourceKey" => query::SortVal::Num(row.resource_key as i64),
                 "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+                // Nano allocates a deployment's key and its resources' keys from
+                // one monotonic key space in the same deploy, so resource-key
+                // order IS deployment-key order (resources of one deployment
+                // tie on deploymentKey and fall to the resource-key tiebreak).
+                "deploymentKey" => query::SortVal::Num(row.resource_key as i64),
                 _ => query::SortVal::Num(row.resource_key as i64),
             },
             |row| row.resource_key,
@@ -13361,6 +13386,26 @@ impl ServerImpl {
                 }
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
                 "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
+                "startDate" => query::SortVal::Num(inst.start_date_ms as i64),
+                "suspendedDate" => {
+                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i64))
+                }
+                "hasIncident" => query::SortVal::Num(i64::from(inst.has_incident)),
+                "parentProcessInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i64))
+                }
+                "parentElementInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i64))
+                }
+                "processDefinitionVersion" => query::SortVal::Num(i64::from(inst.version)),
+                // Constant in Nano: the result always projects these as null
+                // (`process_instance_result`), so every row ties and the
+                // entity-key tiebreak orders them.
+                "endDate" | "processDefinitionName" | "processDefinitionVersionTag" => {
+                    query::SortVal::Num(0)
+                }
+                "processInstanceKey" => query::SortVal::Num(inst.key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(inst.key as i64),
             },
             |inst| inst.key,
@@ -13607,6 +13652,14 @@ impl ServerImpl {
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
                 "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
+                // Constant in Nano: every retained subscription is `CREATED`
+                // (`state_str`), and `processDefinitionName` /
+                // `inboundConnectorType` are never projected (null), so all
+                // rows tie and the subscription-key tiebreak orders them.
+                "messageSubscriptionState" => query::SortVal::Str(state_str.clone()),
+                "processDefinitionName" | "inboundConnectorType" => query::SortVal::Num(0),
+                "messageSubscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -13824,6 +13877,7 @@ impl ServerImpl {
                 "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
+                "messageKey" => query::SortVal::Num(e.message_key as i64),
                 _ => query::SortVal::Num(e.message_key as i64),
             },
             // A single published message can fan out to multiple subscriptions,
@@ -14025,6 +14079,9 @@ impl ServerImpl {
                 "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
                 "startDate" => query::SortVal::Num(ei.start_date_ms as i64),
                 "endDate" => query::SortVal::Num(ei.end_date_ms.unwrap_or(0) as i64),
+                "incidentKey" => query::opt_num_sort_val(ei.incident_key.map(|k| k as i64)),
+                "elementInstanceKey" => query::SortVal::Num(ei.element_instance_key as i64),
+                "tenantId" => query::SortVal::Str(ei.tenant_id.clone()),
                 _ => query::SortVal::Num(ei.element_instance_key as i64),
             },
             |ei| ei.element_instance_key,
@@ -14924,6 +14981,17 @@ impl ServerImpl {
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
                 "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
                 "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
+                "priority" => query::SortVal::Num(i64::from(task.priority)),
+                // Sort on the instant, not the stored string, so differing
+                // offsets/precision still order chronologically.
+                "dueDate" => query::opt_num_sort_val(rfc3339_ms(task.due_date.as_deref())),
+                "followUpDate" => {
+                    query::opt_num_sort_val(rfc3339_ms(task.follow_up_date.as_deref()))
+                }
+                // Constant in Nano: `user_task_result` always projects `name` and
+                // `completionDate` as null, so every row ties and the task-key
+                // tiebreak orders them.
+                "name" | "completionDate" => query::SortVal::Num(0),
                 _ => query::SortVal::Num(task.key as i64),
             },
             |task| task.key,
@@ -15642,6 +15710,7 @@ impl ServerImpl {
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
                 "scopeKey" => query::SortVal::Num(v.scope_key as i64),
                 "processInstanceKey" => query::SortVal::Num(v.instance_key as i64),
+                "variableKey" => query::SortVal::Num(v.key as i64),
                 _ => query::SortVal::Num(v.key as i64),
             },
             |v| v.key,
@@ -15795,6 +15864,13 @@ impl ServerImpl {
                     query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
                 }
                 "version" => query::SortVal::Num(d.version as i64),
+                // Derived exactly as `process_definition_result` projects it.
+                "resourceName" => query::SortVal::Str(resource_name(&d.process_id)),
+                // Constant in Nano: `versionTag` is always projected null, so
+                // every row ties and the definition-key tiebreak orders them.
+                "versionTag" => query::SortVal::Num(0),
+                "processDefinitionKey" => query::SortVal::Num(d.key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(d.key as i64),
             },
             |d| d.key,
@@ -22806,6 +22882,11 @@ impl ServerImpl {
                 "operationType" => query::SortVal::Str(rec.op_type.to_string()),
                 "startDate" => query::SortVal::Num(rec.start_date_ms as i64),
                 "endDate" => query::SortVal::Num(rec.end_date_ms.unwrap_or(0) as i64),
+                // Constant in Nano: `batch_operation_response` always projects
+                // `actorId` / `actorType` as null (no identity layer), so every
+                // row ties and the batch-key tiebreak orders them.
+                "actorId" | "actorType" => query::SortVal::Num(0),
+                "batchOperationKey" => query::SortVal::Num(rec.key as i64),
                 _ => query::SortVal::Num(rec.key as i64),
             },
             |rec| rec.key,
@@ -22874,12 +22955,17 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |(_, op_type, item), field| match field {
+            |(batch_key, op_type, item), field| match field {
                 "state" => query::SortVal::Str(item.state.to_string()),
+                "batchOperationKey" => query::SortVal::Num(*batch_key as i64),
+                "processedDate" => {
+                    query::opt_num_sort_val(item.processed_date_ms.map(|ms| ms as i64))
+                }
                 "operationType" => query::SortVal::Str(op_type.to_string()),
                 "processInstanceKey" => {
                     query::SortVal::Num(item.process_instance_key.unwrap_or(0) as i64)
                 }
+                "itemKey" => query::SortVal::Num(item.item_key as i64),
                 _ => query::SortVal::Num(item.item_key as i64),
             },
             // No single column is unique (the same instance can appear in two
@@ -25336,6 +25422,7 @@ fn agent_instance_sort_val(row: &readstore::AgentInstanceRow, field: &str) -> qu
         "creationDate" => query::SortVal::Num(row.creation_date_ms as i64),
         "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i64),
         "completionDate" => query::SortVal::Num(row.completion_date_ms.unwrap_or(0) as i64),
+        "agentInstanceKey" => query::SortVal::Num(row.agent_instance_key as i64),
         _ => query::SortVal::Num(row.agent_instance_key as i64),
     }
 }
@@ -25345,6 +25432,7 @@ fn agent_history_sort_val(row: &readstore::AgentHistoryRow, field: &str) -> quer
     match field {
         "producedAt" => query::SortVal::Num(row.produced_at_ms as i64),
         "loopIteration" => query::SortVal::Num(row.loop_iteration as i64),
+        "historyItemKey" => query::SortVal::Num(row.agent_history_key as i64),
         _ => query::SortVal::Num(row.agent_history_key as i64),
     }
 }
@@ -25590,6 +25678,29 @@ fn job_kind_enums(
 /// `job.key` tiebreak. Extracted from the handler so the ordering contract is
 /// unit-testable without a full deploy (the search harness can only mint
 /// same-length definition keys, which hide the numeric-vs-lexicographic bug).
+/// Epoch millis of an optional RFC 3339 timestamp string (`None` when absent
+/// or unparseable) — the sort projection for string-stored dates.
+fn rfc3339_ms(s: Option<&str>) -> Option<i64> {
+    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp_millis())
+}
+
+#[cfg(test)]
+mod sort_projection_tests {
+    use super::rfc3339_ms;
+
+    #[test]
+    fn rfc3339_ms_orders_by_instant_not_string() {
+        // Lexicographically "…T10:00:00+02:00" > "…T09:00:00Z", but it is the
+        // earlier instant; sorting must follow the instant (#1298).
+        let a = rfc3339_ms(Some("2026-01-01T10:00:00+02:00"));
+        let b = rfc3339_ms(Some("2026-01-01T09:00:00Z"));
+        assert!(a < b);
+        assert_eq!(rfc3339_ms(None), None);
+        assert_eq!(rfc3339_ms(Some("garbage")), None);
+    }
+}
+
 fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
     match field {
         "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
@@ -25611,6 +25722,17 @@ fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
         "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
         "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
         "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
+        "hasFailedWithRetriesLeft" => {
+            query::SortVal::Num(i64::from(job.has_failed_with_retries_left))
+        }
+        "kind" => query::SortVal::Str(job_kind_enums(&job.kind).0.to_string()),
+        "listenerEventType" => query::SortVal::Str(job_kind_enums(&job.kind).1.to_string()),
+        // Constant in Nano: `job_search_result` always projects `priority: 0`
+        // and null `isDenied` / `deniedReason`, so every row ties and the
+        // job-key tiebreak orders them.
+        "priority" | "isDenied" | "deniedReason" => query::SortVal::Num(0),
+        "jobKey" => query::SortVal::Num(job.key as i64),
+        "tenantId" => query::SortVal::Str("<default>".to_string()),
         _ => query::SortVal::Num(job.key as i64),
     }
 }
