@@ -2727,11 +2727,25 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 out.push_str("        <zeebe:formDefinition");
                 // Zeebe treats `formId` and `externalReference` as mutually
                 // exclusive; an external reference wins so a round-tripped model
-                // never carries both.
+                // never carries both. The binding attributes (#1193) belong to a
+                // deployed form, so they emit only on the `formId` arm — and only
+                // off the default, so a pre-#1193 model (which never carries
+                // them) round-trips byte-identically.
                 if let Some(r) = &props.external_form_reference {
                     out.push_str(&format!(" externalReference=\"{}\"", xml_escape(r)));
                 } else if let Some(f) = &props.form_id {
                     out.push_str(&format!(" formId=\"{}\"", xml_escape(f)));
+                    if props.form_binding_type != BindingType::Latest {
+                        let binding = match props.form_binding_type {
+                            BindingType::Deployment => "deployment",
+                            BindingType::Latest => unreachable!("guarded above"),
+                            BindingType::VersionTag => "versionTag",
+                        };
+                        out.push_str(&format!(" bindingType=\"{binding}\""));
+                    }
+                    if let Some(t) = &props.form_version_tag {
+                        out.push_str(&format!(" versionTag=\"{}\"", xml_escape(t)));
+                    }
                 }
                 out.push_str("/>\n");
             }
@@ -7534,5 +7548,80 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             props.external_form_reference.as_deref(),
             Some("https://forms.example/x")
         );
+    }
+
+    #[test]
+    fn form_definition_binding_attributes_round_trip_through_xml() {
+        // #1193: a user-task formDefinition's `bindingType`/`versionTag` must
+        // serialize to BPMN XML and reparse losslessly (as `linkedResource`'s
+        // already do), so a model edited through ProcessOS keeps its binding.
+        use nanobpmn_engine_core::{BindingType, ProcessBuilder, UserTaskProps};
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("review-form".into()),
+                    form_binding_type: BindingType::VersionTag,
+                    form_version_tag: Some("v2".into()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("build");
+
+        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        assert!(
+            xml.contains(
+                r#"<zeebe:formDefinition formId="review-form" bindingType="versionTag" versionTag="v2"/>"#
+            ),
+            "the binding attributes are emitted:\n{xml}"
+        );
+
+        let round = &parse_bpmn(&xml).unwrap()[0];
+        let ElementKind::UserTask(props) = &round.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_id.as_deref(), Some("review-form"));
+        assert_eq!(props.form_binding_type, BindingType::VersionTag);
+        assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn form_definition_default_binding_emits_no_binding_attributes() {
+        // The default `latest` binding (and a pre-#1193 model, which carries no
+        // binding fields) must emit no `bindingType`/`versionTag`, so a
+        // round-tripped legacy model stays byte-identical.
+        use nanobpmn_engine_core::{BindingType, ProcessBuilder, UserTaskProps};
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("review-form".into()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("build");
+
+        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        assert!(
+            xml.contains(r#"<zeebe:formDefinition formId="review-form"/>"#),
+            "no binding attributes on the default binding:\n{xml}"
+        );
+
+        let round = &parse_bpmn(&xml).unwrap()[0];
+        let ElementKind::UserTask(props) = &round.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_binding_type, BindingType::Latest);
+        assert_eq!(props.form_version_tag, None);
     }
 }

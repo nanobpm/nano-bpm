@@ -380,7 +380,12 @@ impl Engine {
                     // author-supplied `linkedResources` header. If nothing
                     // resolves we insert nothing, so we neither emit a
                     // surprising empty `[]` nor clobber the author's value.
-                    if let Some(resolved) = self.resolve_linked_resources(linked_resources) {
+                    // The process definition's `deployment_key` anchors a
+                    // `deployment` binding (#1193).
+                    let deployment_key = deployed.map(|d| d.deployment_key).unwrap_or(0);
+                    if let Some(resolved) =
+                        self.resolve_linked_resources(linked_resources, deployment_key)
+                    {
                         headers.insert(LINKED_RESOURCES_HEADER.to_string(), resolved);
                     }
                     headers
@@ -417,24 +422,53 @@ impl Engine {
     /// `{ resourceKey, resourceType, linkName }`, one per resolvable entry.
     ///
     /// Each entry's `resource_id` is looked up against the deployed generic
-    /// resources. Nano's read model retains the latest version per `resource_id`,
-    /// so every binding type currently resolves to that latest version;
-    /// deployment-pinned and version-tag bindings degrade to `latest` until the
-    /// engine tracks per-deployment/per-tag resource membership. An id with no
-    /// deployed resource is skipped (the resulting header simply omits it),
-    /// mirroring a worker that finds no key for that link. JSON is written by
+    /// resources, dispatched on its declared binding (#1193): `latest` binds the
+    /// newest deployed version; `deployment` binds the version deployed
+    /// alongside the process definition (the same `deployment_key` — `0` for a
+    /// definition whose membership is unknown, which matches nothing); and
+    /// `versionTag` binds the version carrying the declared tag, falling back to
+    /// the latest when no version carries it (a worker-side link must not
+    /// strand the job on a missing tag). An id whose binding resolves nothing
+    /// is skipped (the resulting header simply omits it), mirroring a worker
+    /// that finds no key for that link. JSON is written by
     /// hand to keep engine-core dependency-free and its output deterministic.
     ///
     /// Returns `None` when nothing resolves so the caller emits no header at all
     /// rather than a surprising empty `[]`.
-    fn resolve_linked_resources(&self, linked: &[crate::model::LinkedResource]) -> Option<String> {
+    fn resolve_linked_resources(
+        &self,
+        linked: &[crate::model::LinkedResource],
+        deployment_key: crate::state::Key,
+    ) -> Option<String> {
         let mut json = String::from("[");
         let mut first = true;
         for link in linked {
-            let Some(resource) = self.state.resources.get(&link.resource_id) else {
+            let resolved = match link.binding_type {
+                crate::model::BindingType::Latest => self.state.resources.get(&link.resource_id),
+                crate::model::BindingType::Deployment => self
+                    .state
+                    .resource_versions
+                    .values()
+                    .filter(|r| r.resource_id == link.resource_id)
+                    .filter(|r| deployment_key != 0 && r.deployment_key == deployment_key)
+                    .max_by_key(|r| r.version),
+                crate::model::BindingType::VersionTag => {
+                    let tag = link.version_tag.as_deref().unwrap_or_default();
+                    self.state
+                        .resource_versions
+                        .values()
+                        .filter(|r| r.resource_id == link.resource_id)
+                        .filter(|r| !tag.is_empty() && r.version_tag.as_deref() == Some(tag))
+                        .max_by_key(|r| r.version)
+                        // A missing tag degrades to the latest version: the
+                        // worker-facing link must not strand the job (unlike a
+                        // user-task form, whose miss is an incident).
+                        .or_else(|| self.state.resources.get(&link.resource_id))
+                }
+            };
+            let Some(resource) = resolved else {
                 continue;
             };
-            let _ = &link.binding_type; // All bindings resolve to the latest (see doc).
             if !first {
                 json.push(',');
             }

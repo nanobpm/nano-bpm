@@ -1,7 +1,7 @@
 //! The FEEL builtin function library (feel-scala standard library plus the
 //! Camunda extensions used by Zeebe), implemented dependency-free.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::error::FeelError;
@@ -9,7 +9,6 @@ use super::eval::compare;
 use super::regex::Regex;
 use super::temporal::{civil_from_days, Date, DateTime, DtDuration, Time, YmDuration};
 use super::value::{FeelVal, Range};
-use crate::model::Value;
 
 /// The canonical names of every builtin we recognise.
 const BUILTINS: &[&str] = &[
@@ -218,7 +217,7 @@ fn list_or_varargs(args: &[FeelVal]) -> Vec<FeelVal> {
 pub fn call(
     name: &str,
     args: Vec<FeelVal>,
-    base: &HashMap<String, Value>,
+    ctx: &mut super::eval::Ctx,
 ) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
     match name {
@@ -465,7 +464,7 @@ pub fn call(
             flatten(&arg(&args, 0), &mut out);
             Ok(List(out))
         }
-        "sort" => sort(&args, base),
+        "sort" => sort(&args, ctx),
         "is empty" => Ok(Bool(want_list(&arg(&args, 0), "is empty")?.is_empty())),
         "partition" => partition(&args),
 
@@ -788,18 +787,29 @@ fn string_join(args: &[FeelVal]) -> Result<FeelVal, FeelError> {
     Ok(FeelVal::Str(parts.join(&sep)))
 }
 
-fn sort(args: &[FeelVal], base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+fn sort(args: &[FeelVal], ctx: &mut super::eval::Ctx) -> Result<FeelVal, FeelError> {
     let mut list = want_list(&arg(args, 0), "sort")?;
     match args.get(1) {
         Some(FeelVal::Function(f)) => {
             let f = f.clone();
-            list.sort_by(
-                |a, b| match super::eval::apply(&f, vec![a.clone(), b.clone()], base) {
+            let mut cmp_err = None;
+            list.sort_by(|a, b| {
+                if cmp_err.is_some() {
+                    return std::cmp::Ordering::Equal;
+                }
+                match super::eval::apply(&f, vec![a.clone(), b.clone()], ctx) {
                     Ok(FeelVal::Bool(true)) => std::cmp::Ordering::Less,
                     Ok(FeelVal::Bool(false)) => std::cmp::Ordering::Greater,
-                    _ => std::cmp::Ordering::Equal,
-                },
-            );
+                    Ok(_) => std::cmp::Ordering::Equal,
+                    Err(e) => {
+                        cmp_err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
         }
         _ => {
             list.sort_by(|a, b| super::eval::compare(a, b).unwrap_or(std::cmp::Ordering::Equal));

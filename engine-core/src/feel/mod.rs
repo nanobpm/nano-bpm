@@ -42,7 +42,7 @@ mod regex;
 pub(crate) mod temporal;
 mod value;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use env::{with_env, EvalEnv};
 pub use error::FeelError;
@@ -162,6 +162,129 @@ pub fn variable_reference_root(expr: &str) -> Option<String> {
     }
     let node = parser::parse(lexer::tokenize(strip_marker(expr)).ok()?).ok()?;
     root(&node).map(str::to_owned)
+}
+
+/// The prefix of a Camunda secret reference path: `camunda.secrets.<name>`.
+pub const SECRET_REFERENCE_PREFIX: &str = "camunda.secrets.";
+
+/// The secret name of a `camunda.secrets.<name>` reference string (the value a
+/// `SECRET_REFERENCE` cluster variable carries, or the text a trusted reference
+/// evaluates to); `None` when `s` is not exactly that shape.
+pub fn secret_reference_name(s: &str) -> Option<&str> {
+    let name = s.strip_prefix(SECRET_REFERENCE_PREFIX)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// The secret names of the literal `camunda.secrets.<name>` paths an expression
+/// uses directly (`=camunda.secrets.token` → `{token}`). Per Camunda 8.10
+/// `referencedSecrets` semantics a literal reference in the expression is a
+/// TRUSTED source; a reference string arriving via a request-body variable or a
+/// JSON-kind cluster variable is not (the caller distinguishes those — this
+/// helper only sees the expression text). An unparseable expression yields an
+/// empty set.
+pub fn literal_secret_references(expr: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let src = strip_marker(expr);
+    if let Ok(tokens) = lexer::tokenize(src) {
+        if let Ok(node) = parser::parse(tokens) {
+            collect_secret_paths(&node, &mut out);
+        }
+    }
+    out
+}
+
+/// Walks a FEEL AST collecting the secret name of every maximal
+/// `Var/Member` chain that spells `camunda.secrets.<name>`. The helper returns
+/// the chain a `Var`/`Member` subtree spells (e.g. `["camunda", "secrets",
+/// "token"]`); the caller records `<name>` only when the chain is EXACTLY
+/// `camunda.secrets.<name>` and is not extended further (`camunda.secrets.a.b`
+/// is not a reference to `a`). Any non-chain node recurses with a fresh
+/// accumulator, so `camunda.secrets.x + 1` still finds `x` while
+/// `f(camunda.secrets)` does not (the chain is not a full reference).
+fn collect_secret_paths(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+    if let Some(chain) = member_chain(node) {
+        if chain.len() == 3 && chain[0] == "camunda" && chain[1] == "secrets" {
+            out.insert(chain[2].clone());
+        }
+        return;
+    }
+    // A `Member` whose base is not itself a pure variable/member chain (e.g.
+    // `({token: camunda.secrets.TOKEN}).token`) still has a base worth walking:
+    // the member access does not extend a reference chain, it projects a value
+    // that may CARRY one. Recurse into the base so the reference is found. A
+    // pure chain was already handled (and excluded) above, so this only adds
+    // the non-chain case.
+    if let ast::Node::Member(base, _) = node {
+        collect_secret_paths(base, out);
+        return;
+    }
+    collect_vars_shallow(node, out);
+}
+
+/// The dotted path a pure `Var`/`Member` subtree spells (`a.b.c` →
+/// `["a", "b", "c"]`); `None` when the subtree contains anything else.
+fn member_chain(node: &ast::Node) -> Option<Vec<String>> {
+    match node {
+        ast::Node::Var(name) => Some(vec![name.clone()]),
+        ast::Node::Member(base, name) => {
+            let mut chain = member_chain(base)?;
+            chain.push(name.clone());
+            Some(chain)
+        }
+        _ => None,
+    }
+}
+
+/// Recurses into every child of `node`, for the non-chain nodes of
+/// [`collect_secret_paths`].
+fn collect_vars_shallow(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+    use ast::Node;
+    let mut recur = |n: &ast::Node| collect_secret_paths(n, out);
+    match node {
+        Node::Null
+        | Node::BoolLit(_)
+        | Node::NumLit(..)
+        | Node::StrLit(_)
+        | Node::AtLit(_)
+        | Node::Var(_)
+        | Node::Member(..) => {}
+        Node::Index(a, b) | Node::Bin(_, a, b) | Node::In(a, b) => {
+            recur(a);
+            recur(b);
+        }
+        Node::Neg(inner) | Node::Not(inner) | Node::InstanceOf(inner, _) => recur(inner),
+        Node::List(items) => items.iter().for_each(&mut recur),
+        Node::Context(entries) => entries.iter().for_each(|(_, n)| recur(n)),
+        Node::If(a, b, c) | Node::Between(a, b, c) => {
+            recur(a);
+            recur(b);
+            recur(c);
+        }
+        Node::For(clauses, body) | Node::Quant(_, clauses, body) => {
+            clauses.iter().for_each(|(_, n)| recur(n));
+            recur(body);
+        }
+        Node::FuncDef(_, body) => recur(body),
+        Node::Call(callee, args) => {
+            recur(callee);
+            match args {
+                ast::CallArgs::Positional(ns) => ns.iter().for_each(&mut recur),
+                ast::CallArgs::Named(ns) => ns.iter().for_each(|(_, n)| recur(n)),
+            }
+        }
+        Node::Range(r) => {
+            if let Some(s) = &r.start {
+                recur(s);
+            }
+            if let Some(e) = &r.end {
+                recur(e);
+            }
+        }
+    }
 }
 
 /// Walks a FEEL AST, collecting the name of every [`ast::Node::Var`] it contains.
@@ -408,6 +531,202 @@ fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, 
     eval::evaluate(&node, ctx)
 }
 
+/// The result of [`eval_with_provenance`]: the evaluated [`Value`] plus the
+/// trusted `camunda.secrets.<name>` secret names the evaluation surfaced.
+pub struct EvaluatedWithProvenance {
+    /// The expression's result.
+    pub value: Value,
+    /// The trusted secret names whose references reach the result, sorted for
+    /// a deterministic wire projection.
+    pub referenced_secrets: Vec<String>,
+}
+
+/// Evaluates a FEEL expression, additionally reporting the trusted
+/// `camunda.secrets.<name>` references the result carries (#1296, Camunda 8.10
+/// `referencedSecrets`).
+///
+/// `trusted_roots` are the base-context variable names the host trusts to carry
+/// secret references (the `SECRET_REFERENCE`-kind cluster variables).
+///
+/// Attribution is **structural and fail-closed** (PR #1636 round-8 review,
+/// human-approved): a secret is reported ONLY when the expression's result is
+/// structurally a trusted reference, per the expression's own shape —
+///
+/// 1. a bare `camunda.secrets.<name>` literal path as the whole result;
+/// 2. a direct read (a name, member path, or numeric index chain) of a
+///    TRUSTED variable whose selected value carries the reference;
+/// 3. a list or context literal whose elements/entries are each (1) or (2),
+///    composed recursively.
+///
+/// Anything else — a conditional, a function call, an operator, a filter, a
+/// concatenation — reports **nothing**, even when its result happens to be a
+/// trusted variable's reference text. This is a deliberate security choice of
+/// false negatives over false positives: an unreported reference stays
+/// unresolved (visible and safe), while an untrusted request-body value
+/// reported as trusted would let caller-side resolution be steered by
+/// attacker-controlled input (an exfiltration vector). Post-hoc attribution
+/// (the differential re-evaluation this replaced) leaked trust across control
+/// flow twice — a condition on a trusted variable flips branches between runs
+/// (`if t = "camunda.secrets.TOKEN" then u else t`), and a computed or
+/// discarded string is indistinguishable from a trusted one by value alone —
+/// so provenance is never inferred across control flow. Full value-level
+/// origin tagging is tracked as a follow-up.
+pub fn eval_with_provenance(
+    expr: &str,
+    ctx: &HashMap<String, Value>,
+    trusted_roots: impl IntoIterator<Item = String>,
+) -> Result<EvaluatedWithProvenance, FeelError> {
+    let src = strip_marker(expr);
+    let tokens = lexer::tokenize(src)?;
+    let node = parser::parse(tokens)?;
+    let value = eval::evaluate(&node, ctx)?.into_value();
+
+    let trusted: HashSet<String> = trusted_roots.into_iter().collect();
+    // Trusted attribution is an occurrence MULTISET, reconciled against the
+    // occurrences the result actually carries: a name is reported only when
+    // every occurrence of it in the result is structurally attributed. Any
+    // extra occurrence (a computed child, an untrusted variable holding the
+    // same text) or any attributed occurrence that did not survive (an
+    // overwritten key) fails the name closed — `referencedSecrets` is keyed by
+    // name, so one untrusted occurrence must taint the name (round-9 review).
+    let mut attributed = HashMap::new();
+    structural_secret_names(&node, ctx, &trusted, &HashSet::new(), &mut attributed);
+    let mut actual = HashMap::new();
+    count_secret_names_value(&value, &mut actual);
+    let mut referenced_secrets: Vec<String> = attributed
+        .into_iter()
+        .filter(|(name, n)| actual.get(name) == Some(n))
+        .map(|(name, _)| name)
+        .collect();
+    referenced_secrets.sort();
+    Ok(EvaluatedWithProvenance {
+        value,
+        referenced_secrets,
+    })
+}
+
+/// One step of a direct-read chain: a member (map key) or a FEEL (1-based)
+/// list index. Kept distinct so `cfg[2]` never reads the map key `"2"`.
+enum ReadStep {
+    Key(String),
+    Index(usize),
+}
+
+/// A direct-read chain rooted at a variable: `x`, `x.a`, `x[1]`, `x.a[2].b`.
+/// `None` for any other shape (a filter, a computed base, a non-positive or
+/// fractional subscript).
+fn read_chain(node: &ast::Node) -> Option<(String, Vec<ReadStep>)> {
+    match node {
+        ast::Node::Var(name) => Some((name.clone(), Vec::new())),
+        ast::Node::Member(base, key) => {
+            let (root, mut steps) = read_chain(base)?;
+            steps.push(ReadStep::Key(key.clone()));
+            Some((root, steps))
+        }
+        ast::Node::Index(base, index) => match index.as_ref() {
+            ast::Node::NumLit(n, true) if *n >= 1.0 && n.fract() == 0.0 => {
+                let (root, mut steps) = read_chain(base)?;
+                steps.push(ReadStep::Index(*n as usize));
+                Some((root, steps))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The trusted secret-name occurrences of an expression whose result is
+/// *structurally* a trusted reference — the fail-closed shapes
+/// [`eval_with_provenance`] documents. Anything else contributes nothing.
+/// `shadowed` holds the names bound by enclosing context literals (FEEL
+/// context entries see the preceding keys), which are never the base
+/// context's variables.
+fn structural_secret_names(
+    node: &ast::Node,
+    ctx: &HashMap<String, Value>,
+    trusted: &HashSet<String>,
+    shadowed: &HashSet<String>,
+    out: &mut HashMap<String, usize>,
+) {
+    match node {
+        ast::Node::Var(_) | ast::Node::Member(..) | ast::Node::Index(..) => {
+            let Some((root, steps)) = read_chain(node) else {
+                return;
+            };
+            // (1) A bare `camunda.secrets.<name>` literal path — only while
+            // `camunda` is UNBOUND (neither a base-context variable nor a
+            // local key), else it is an ordinary read of that binding.
+            if root == "camunda" && !ctx.contains_key("camunda") && !shadowed.contains("camunda") {
+                if let [ReadStep::Key(s), ReadStep::Key(name)] = steps.as_slice() {
+                    if s == "secrets" {
+                        *out.entry(name.clone()).or_default() += 1;
+                    }
+                }
+                return;
+            }
+            // (2) A direct read of a TRUSTED base-context variable.
+            if trusted.contains(&root) && !shadowed.contains(&root) {
+                if let Some(v) = direct_read_value(&root, &steps, ctx) {
+                    count_secret_names_value(v, out);
+                }
+            }
+        }
+        // (3) List / context literals compose their children's shapes.
+        ast::Node::List(items) => items
+            .iter()
+            .for_each(|n| structural_secret_names(n, ctx, trusted, shadowed, out)),
+        ast::Node::Context(entries) => {
+            // Duplicate keys overwrite: fail the whole literal closed.
+            let mut keys = HashSet::new();
+            if !entries.iter().all(|(k, _)| keys.insert(k.as_str())) {
+                return;
+            }
+            let mut scope = shadowed.clone();
+            for (k, n) in entries {
+                structural_secret_names(n, ctx, trusted, &scope, out);
+                scope.insert(k.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The value a direct-read chain selects from the base context; `None` when
+/// any step is absent or mismatches the value's shape (a key into a list, an
+/// index into a map).
+fn direct_read_value<'v>(
+    root: &str,
+    steps: &[ReadStep],
+    ctx: &'v HashMap<String, Value>,
+) -> Option<&'v Value> {
+    let mut v = ctx.get(root)?;
+    for step in steps {
+        v = match (v, step) {
+            (Value::Map(entries), ReadStep::Key(k)) => entries.get(k)?,
+            (Value::List(items), ReadStep::Index(i)) => items.get(i.checked_sub(1)?)?,
+            _ => return None,
+        };
+    }
+    Some(v)
+}
+
+/// Counts every whole-string `camunda.secrets.<name>` reference occurrence in
+/// `v` (recursing into lists and maps).
+fn count_secret_names_value(v: &Value, out: &mut HashMap<String, usize>) {
+    match v {
+        Value::Str(s) => {
+            if let Some(name) = secret_reference_name(s) {
+                *out.entry(name.to_string()).or_default() += 1;
+            }
+        }
+        Value::List(items) => items.iter().for_each(|i| count_secret_names_value(i, out)),
+        Value::Map(entries) => entries
+            .values()
+            .for_each(|i| count_secret_names_value(i, out)),
+        _ => {}
+    }
+}
+
 fn strip_marker(expr: &str) -> &str {
     let trimmed = expr.trim();
     // A single leading `=` marks a FEEL expression; `==` is the equality
@@ -465,6 +784,58 @@ mod tests {
         assert_eq!(vars("=orders[1] > amount"), vec!["amount", "orders"]);
         // Literals reference nothing.
         assert!(vars("=1 > 0").is_empty());
+    }
+
+    /// #1296: the literal `camunda.secrets.<name>` paths of an expression (the
+    /// trusted direct-reference half of Camunda 8.10 `referencedSecrets`).
+    #[test]
+    fn literal_secret_references_finds_direct_paths() {
+        let refs = |e: &str| {
+            let mut v: Vec<String> = literal_secret_references(e).into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(refs("=camunda.secrets.token"), vec!["token"]);
+        assert_eq!(refs("camunda.secrets.token"), vec!["token"]);
+        // Inside a larger expression.
+        assert_eq!(
+            refs(r#"=camunda.secrets.a + camunda.secrets.b"#),
+            vec!["a", "b"]
+        );
+        // A reference-shaped STRING literal is not a path.
+        assert!(refs(r#"="camunda.secrets.token""#).is_empty());
+        // An incomplete chain is not a reference.
+        assert!(refs("=camunda.secrets").is_empty());
+        assert!(refs("=camunda.other.token").is_empty());
+        // A chain extended past the name is not a reference.
+        assert!(refs("=camunda.secrets.a.b").is_empty());
+        // An unparseable expression has no known reference.
+        assert!(refs("=for in").is_empty());
+        // No false positives on ordinary variables.
+        assert!(refs("=secrets.token").is_empty());
+        assert!(refs("=x + 1").is_empty());
+        // #1296 finding: a member access whose base is NOT a pure chain still
+        // walks the base, so a reference carried by a context literal is found.
+        assert_eq!(
+            refs(r#"=({token: camunda.secrets.TOKEN}).token"#),
+            vec!["TOKEN"]
+        );
+        assert_eq!(
+            refs(r#"=({a: camunda.secrets.A, b: camunda.secrets.B}).a"#),
+            vec!["A", "B"]
+        );
+    }
+
+    #[test]
+    fn secret_reference_name_parses_the_reference_shape() {
+        assert_eq!(
+            secret_reference_name("camunda.secrets.TOKEN"),
+            Some("TOKEN")
+        );
+        assert_eq!(secret_reference_name("camunda.secrets."), None);
+        assert_eq!(secret_reference_name("camunda.secrets"), None);
+        assert_eq!(secret_reference_name("TOKEN"), None);
+        assert_eq!(secret_reference_name("x camunda.secrets.TOKEN"), None);
     }
 
     #[test]
@@ -543,6 +914,225 @@ mod tests {
         assert_eq!(eval("=amount", &c), Ok(Value::Int(42)));
         assert_eq!(eval("amount + 8", &c), Ok(Value::Int(50)));
         assert_eq!(eval("missing", &c), Ok(Value::Null));
+    }
+
+    /// #1296 review (round 8, human-approved fail-closed redesign): a secret
+    /// is reported ONLY when the expression's result is *structurally* a
+    /// trusted reference — post-hoc attribution never infers provenance across
+    /// control flow, operators, or calls. The allowed shapes, pinned red-first:
+    ///
+    /// 1. a bare `camunda.secrets.<name>` literal path as the whole result;
+    /// 2. a direct read (name or member path) of a TRUSTED variable whose
+    ///    selected value carries the reference;
+    /// 3. a list or context literal whose elements/entries are each (1) or
+    ///    (2), composed recursively.
+    ///
+    /// Anything else — a conditional, a call, an operator, a filter, a
+    /// concatenation — reports nothing (false negatives over false positives:
+    /// an unreported reference is visible and safe; an untrusted value
+    /// reported as trusted is an exfiltration vector).
+    /// PR #1636 round-9 findings: overridden `camunda` root, index vs key,
+    /// equal-text untrusted occurrence, context shadowing / duplicate keys.
+    #[test]
+    fn eval_with_provenance_round9_fail_closed() {
+        let r = |s: &str| Value::Str(s.into());
+        let tok = "camunda.secrets.TOKEN";
+        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+            eval_with_provenance(
+                e,
+                c,
+                trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        // Untrusted base binding of `camunda` is not the literal path.
+        let body_camunda = Value::Map(
+            [(
+                "secrets".to_string(),
+                Value::Map([("TOKEN".to_string(), r(tok))].into_iter().collect()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let c = ctx(&[("camunda", body_camunda)]);
+        assert!(prov("camunda.secrets.TOKEN", &c, &[])
+            .referenced_secrets
+            .is_empty());
+        // Index into a map is not the string key "2".
+        let c = ctx(&[
+            (
+                "cfg",
+                Value::Map([("2".to_string(), r(tok))].into_iter().collect()),
+            ),
+            ("u", r(tok)),
+        ]);
+        let out = prov("[cfg[2], u]", &c, &["cfg"]);
+        assert!(out.referenced_secrets.is_empty());
+        // Equal text from an untrusted variable taints the name.
+        let c = ctx(&[("t", r(tok)), ("u", r(tok))]);
+        assert!(prov("[t, u]", &c, &["t"]).referenced_secrets.is_empty());
+        assert!(prov("{a: t, b: u}", &c, &["t"])
+            .referenced_secrets
+            .is_empty());
+        assert!(prov("[t, u + \"\"]", &c, &["t"])
+            .referenced_secrets
+            .is_empty());
+        // Sequential context binding shadows the trusted root.
+        assert!(prov("{t: u, result: t}", &c, &["t"])
+            .referenced_secrets
+            .is_empty());
+        // Duplicate key overwritten by an untrusted value.
+        assert!(prov("{a: camunda.secrets.TOKEN, a: u}", &c, &["t"])
+            .referenced_secrets
+            .is_empty());
+        // Sanity: all-trusted composition still reports.
+        assert_eq!(
+            prov("[t, camunda.secrets.TOKEN]", &c, &["t"]).referenced_secrets,
+            vec!["TOKEN"]
+        );
+    }
+
+    #[test]
+    fn eval_with_provenance_fail_closed_structural_shapes() {
+        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+            eval_with_provenance(
+                e,
+                c,
+                trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .referenced_secrets
+        };
+        let t = ctx(&[("t", Value::Str("camunda.secrets.TOKEN".into()))]);
+
+        // --- (1) A bare literal path as the whole result ----------------
+        assert_eq!(
+            prov("camunda.secrets.DIRECT", &ctx(&[]), &[]),
+            vec!["DIRECT"]
+        );
+
+        // --- (2) A direct trusted-variable read --------------------------
+        assert_eq!(prov("t", &t, &["t"]), vec!["TOKEN"]);
+        // A member path into a structured trusted value.
+        let c = ctx(&[(
+            "cfg",
+            Value::Map(
+                [(
+                    "token".to_string(),
+                    Value::Str("camunda.secrets.NESTED".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        )]);
+        assert_eq!(prov("cfg.token", &c, &["cfg"]), vec!["NESTED"]);
+        // A numeric index into a trusted list is a direct read of the element.
+        let c = ctx(&[(
+            "arr",
+            Value::List(vec![Value::Str("camunda.secrets.FIRST".into())]),
+        )]);
+        assert_eq!(prov("arr[1]", &c, &["arr"]), vec!["FIRST"]);
+        // An UNtrusted variable's reference text is never reported.
+        assert!(prov("t", &t, &[]).is_empty());
+        // A trusted variable whose value carries no reference reports nothing.
+        let c = ctx(&[("flag", Value::Bool(true))]);
+        assert!(prov("flag", &c, &["flag"]).is_empty());
+
+        // --- (3) List/context literals composed of allowed shapes --------
+        assert_eq!(
+            prov("[camunda.secrets.A, camunda.secrets.B]", &ctx(&[]), &[]),
+            vec!["A", "B"]
+        );
+        // Repeated literals keep their names.
+        assert_eq!(
+            prov(
+                "[camunda.secrets.TOKEN, camunda.secrets.TOKEN]",
+                &ctx(&[]),
+                &[]
+            ),
+            vec!["TOKEN"]
+        );
+        // Trusted reads compose with literals in one literal.
+        assert_eq!(
+            prov("[t, camunda.secrets.OTHER]", &t, &["t"]),
+            vec!["OTHER", "TOKEN"]
+        );
+        // A context literal's entries compose the same way.
+        assert_eq!(
+            prov(r#"{a: t, b: camunda.secrets.B}"#, &t, &["t"]),
+            vec!["B", "TOKEN"]
+        );
+        // Nesting composes recursively.
+        assert_eq!(
+            prov("[[camunda.secrets.NESTED]]", &ctx(&[]), &[]),
+            vec!["NESTED"]
+        );
+        // An untrusted element in a literal is skipped, not trusted.
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.U_COPY".into())),
+        ]);
+        assert_eq!(
+            prov("[t, u]", &c, &["t"]),
+            vec!["TOKEN"],
+            "the untrusted element reports nothing; the trusted one still surfaces"
+        );
+        // A trusted root named `camunda` does not confuse the literal-path
+        // shape with a variable read (the sentinel normally shadows it, but a
+        // base binding wins if one exists): the literal is still reported as
+        // a literal, and the variable's own reference-valued entry is not
+        // double-counted through the trusted-read path.
+        let c = ctx(&[(
+            "camunda",
+            Value::Map(
+                [(
+                    "secrets".to_string(),
+                    Value::Map(
+                        [(
+                            "TOKEN".to_string(),
+                            Value::Str("camunda.secrets.TOKEN".into()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        )]);
+        assert_eq!(
+            prov("camunda.secrets.TOKEN", &c, &["camunda"]),
+            vec!["TOKEN"]
+        );
+
+        // --- Everything else reports nothing -----------------------------
+        let c = ctx(&[
+            ("t", Value::Str("camunda.secrets.TOKEN".into())),
+            ("u", Value::Str("camunda.secrets.TOKEN".into())),
+        ]);
+        // The branch-flip leak (round-7 review): the trusted condition must
+        // not launder the untrusted branch value.
+        assert!(
+            prov(
+                r#"if t = "camunda.secrets.TOKEN" then u else t"#,
+                &c,
+                &["t"]
+            )
+            .is_empty(),
+            "a conditional reports nothing, even when it returns a trusted variable"
+        );
+        // An untrusted value with the same text as a trusted reference.
+        assert!(prov("u", &c, &["t"]).is_empty());
+        assert!(prov("fromAi(camunda.secrets.TOKEN, u)", &c, &["t"]).is_empty());
+        // Operators, concatenation, filters, calls, conditionals: nothing.
+        assert!(prov(r#"t + "!""#, &c, &["t"]).is_empty());
+        assert!(prov(r#"t = "camunda.secrets.TOKEN""#, &c, &["t"]).is_empty());
+        assert!(
+            prov("[t][1]", &c, &["t"]).is_empty(),
+            "an index into a literal is not a literal"
+        );
+        assert!(prov("(function(x) x)(t)", &c, &["t"]).is_empty());
+        assert!(prov("if true then t else null", &c, &["t"]).is_empty());
     }
 
     #[test]

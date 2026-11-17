@@ -1007,6 +1007,21 @@ pub(crate) fn parse_with_captures(
                                     .filter(|s| !s.is_empty())
                                     .map(str::to_string);
                                 if let Some(idx) = cur_user_task {
+                                    // Zeebe requires exactly one of `formId` /
+                                    // `externalReference` on a user task's
+                                    // formDefinition and rejects the deployment
+                                    // otherwise: with neither there is no form
+                                    // to resolve under any binding, so the task
+                                    // would be created form-less with no
+                                    // incident — a silently accepted dead
+                                    // declaration (#1193 review). Reject it
+                                    // loudly, like the other required-attribute
+                                    // rules.
+                                    if form_id.is_none() && external_reference.is_none() {
+                                        return Err(ParseError::MissingUserTaskFormId {
+                                            task_id: acc.nodes[idx].id.clone(),
+                                        });
+                                    }
                                     let props = &mut acc.nodes[idx].user_task;
                                     props.external_form_reference = external_reference;
                                     props.form_id = if props.external_form_reference.is_some() {
@@ -1014,35 +1029,42 @@ pub(crate) fn parse_with_captures(
                                     } else {
                                         form_id
                                     };
-                                    // Interim guard (#1190): the engine resolves
-                                    // a user-task deployed form to the *latest*
-                                    // deployed form version at task creation. The
-                                    // other two Camunda bindings (`deployment`,
-                                    // `versionTag`) are not implemented; rather
-                                    // than silently degrading them to `latest` (a
-                                    // latent mis-binding), reject the deploy
-                                    // loudly. The guard keys off the *raw*
+                                    // The form binding (#1193): an absent
+                                    // `bindingType` defaults to `latest` (Zeebe's
+                                    // default). The guard keys off the *raw*
                                     // `externalReference`: an external form
                                     // resolves no deployed version, so its binding
-                                    // is moot and unaffected; every *other*
-                                    // (deployed) form must carry only the default
-                                    // binding. Only an **absent** `bindingType`
-                                    // defaults — any present value other than the
-                                    // literal `latest`, including an explicitly
-                                    // empty `bindingType=""`, is an explicit
-                                    // unimplemented binding and is rejected rather
-                                    // than silently treated as the default.
+                                    // is moot and unrecorded; every *other*
+                                    // (deployed) form's binding is dispatched at
+                                    // user-task creation. An explicitly empty
+                                    // `bindingType=""` is a present, explicit
+                                    // value — not an absent one — so it is
+                                    // rejected rather than silently treated as the
+                                    // `latest` default (the #1190 fail-loud rule,
+                                    // kept for a value no binding maps to).
                                     if acc.nodes[idx].user_task.external_form_reference.is_none() {
-                                        if let Some(binding) =
-                                            attr(attrs, "bindingType").filter(|s| *s != "latest")
-                                        {
-                                            return Err(
-                                                ParseError::UnsupportedUserTaskFormBinding {
-                                                    task_id: acc.nodes[idx].id.clone(),
-                                                    binding_type: binding.to_string(),
-                                                },
-                                            );
-                                        }
+                                        let binding = match attr(attrs, "bindingType") {
+                                            None | Some("latest") => {
+                                                crate::model::BindingType::Latest
+                                            }
+                                            Some("deployment") => {
+                                                crate::model::BindingType::Deployment
+                                            }
+                                            Some("versionTag") => {
+                                                crate::model::BindingType::VersionTag
+                                            }
+                                            Some(other) => {
+                                                return Err(
+                                                    ParseError::UnsupportedUserTaskFormBinding {
+                                                        task_id: acc.nodes[idx].id.clone(),
+                                                        binding_type: other.to_string(),
+                                                    },
+                                                );
+                                            }
+                                        };
+                                        acc.nodes[idx].user_task.form_binding_type = binding;
+                                        acc.nodes[idx].user_task.form_version_tag =
+                                            attr(attrs, "versionTag").map(str::to_string);
                                     }
                                 } else if let Some(idx) = cur_start {
                                     // Start forms are formId-only by design: the

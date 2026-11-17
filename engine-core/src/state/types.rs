@@ -2120,6 +2120,14 @@ pub struct DeployedProcess {
     pub key: Key,
     /// Version number, incremented per process id across deployments (starts 1).
     pub version: i32,
+    /// The deployment this definition was registered under (Zeebe
+    /// `deploymentKey`): the membership handle a `deployment`-bound form or
+    /// linked resource resolves against (#1193). `0` for a definition restored
+    /// from a pre-#1193 snapshot (or seeded from one), whose deployment
+    /// membership is unknown — such a definition matches no `deployment`
+    /// binding and surfaces a resolvable incident instead of a mis-binding.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub deployment_key: Key,
     /// The static, executable definition.
     pub definition: ProcessDefinition,
 }
@@ -2705,6 +2713,18 @@ pub struct DeployedForm {
     pub resource_name: String,
     /// The verbatim form-js JSON document.
     pub schema: String,
+    /// The deployment this form version was registered under (Zeebe
+    /// `deploymentKey`): the membership handle a `deployment`-bound user-task
+    /// form resolves against (#1193). `0` for a form restored from a pre-#1193
+    /// snapshot (or seeded from one), whose membership is unknown — it never
+    /// matches a `deployment` binding.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub deployment_key: Key,
+    /// The optional version tag this form version carries (form-js
+    /// `versionTag`), matched by a `versionTag`-bound user-task form (#1193).
+    /// `None` when the form declares no tag (or predates tag tracking).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// A deployed generic resource together with the identity the engine assigned it
@@ -2723,6 +2743,19 @@ pub struct DeployedResource {
     pub resource_name: String,
     /// The verbatim resource content.
     pub content: String,
+    /// The deployment this resource version was registered under (Zeebe
+    /// `deploymentKey`): the membership handle a `deployment`-bound
+    /// `zeebe:linkedResource` resolves against (#1193). `0` for a resource
+    /// restored from a pre-#1193 snapshot (or seeded from one), whose
+    /// membership is unknown — it never matches a `deployment` binding.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub deployment_key: Key,
+    /// The optional version tag this resource version carries (Zeebe
+    /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+    /// `zeebe:linkedResource` (#1193). `None` when the deploy carried no tag
+    /// (or predates tag tracking).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// A self-contained snapshot of one process instance and every entity it owns
@@ -3231,6 +3264,7 @@ mod version_lookup_tests {
         DeployedProcess {
             key,
             version,
+            deployment_key: 0,
             definition,
         }
     }

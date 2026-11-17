@@ -154,6 +154,8 @@ def Kind.schema : Kind → List AttrDecl
       , { key := "followUpDate", required := false, ty := .str }
       , { key := "priority", required := false, ty := .str }
       , { key := "formId", required := false, ty := .str }
+      , { key := "formBindingType", required := false, ty := .str }
+      , { key := "formVersionTag", required := false, ty := .str }
       , { key := "externalFormReference", required := false, ty := .str } ]
   | .exclusiveGateway => []
   | .parallelGateway => []
