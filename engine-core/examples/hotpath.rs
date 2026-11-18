@@ -13,6 +13,10 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
+)]
 use std::collections::HashMap;
 use std::time::Instant;
 

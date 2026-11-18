@@ -44,7 +44,7 @@ mod value;
 
 use std::collections::{HashMap, HashSet};
 
-pub use env::{with_env, EvalEnv};
+pub use env::{with_env, with_host_env, EvalEnv};
 pub use error::FeelError;
 
 use crate::model::Value;
@@ -1599,7 +1599,7 @@ mod tests {
             Ok(Value::Str("FEEL".into()))
         );
         // uuid() round-trips through base64 shape: 36 chars with dashes.
-        match eval("uuid()", &c) {
+        match with_host_env(|| eval("uuid()", &c)) {
             Ok(Value::Str(s)) => {
                 assert_eq!(s.len(), 36);
                 assert_eq!(s.chars().filter(|&ch| ch == '-').count(), 4);
@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(eval(r#"decimal(1.5, 0, "HALF_UP")"#, &c), Ok(Value::Int(2)));
         assert_eq!(eval(r#"decimal(1.5, 0, "DOWN")"#, &c), Ok(Value::Int(1)));
         assert_eq!(eval(r#"decimal(-1.5, 0, "FLOOR")"#, &c), Ok(Value::Int(-2)));
-        match eval("random number()", &c) {
+        match with_host_env(|| eval("random number()", &c)) {
             Ok(Value::Double(d)) => assert!((0.0..1.0).contains(&d)),
             other => panic!("random number() returned {other:?}"),
         }

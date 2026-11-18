@@ -539,7 +539,7 @@ fn eval_binary(op: BinOp, lhs: &Node, rhs: &Node, ctx: &mut Ctx) -> Result<FeelV
         BinOp::Mul => mul(&l, &r),
         BinOp::Div => div(&l, &r),
         BinOp::Exp => match (l.as_f64(), r.as_f64()) {
-            (Some(a), Some(b)) => Some(FeelVal::num(a.powf(b))),
+            (Some(a), Some(b)) => Some(FeelVal::num(libm::pow(a, b))),
             _ => None,
         },
         BinOp::Eq => Some(eq_op(&l, &r)),
