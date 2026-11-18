@@ -625,11 +625,26 @@ impl ServerImpl {
     /// so an operator can re-issue the write — a create retries as 409 and a
     /// delete as 404, so the recovery write is an UPDATE (or a re-create after
     /// a delete).
+    ///
+    /// Untagged legacy journal (ADR 0066): with `NANOBPMN_JOURNAL_SEGMENTED=0`
+    /// and more than one partition the journal records no producing
+    /// partition, so an interrupted fan-out could not be told apart on restart
+    /// (broadcasting would install a copy that never committed; key routing
+    /// would lose it). There the rule is FAIL CLOSED, not "re-issue the write":
+    /// every create/update/delete is rejected with 503 before any partition is
+    /// touched ([`check_cluster_variable_journal_mode`], warned once at
+    /// startup), and recovery refuses any such record
+    /// ([`seglog::check_cluster_variable_attribution`]). Remedy: segmented
+    /// journals, or a single partition.
     async fn cluster_variable_mutate(
         &self,
         command: Command,
     ) -> Result<Option<StoredClusterVariable>, (u16, String)> {
         let _serialized = self.cluster_variable_writes.lock().await;
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
         for node in self.engine.peer_nodes() {
             let link = self.peer_link(node).await.map_err(|(_, m)| {
                 (
@@ -4791,11 +4806,15 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
 ///   cluster-wide from a single durable copy (see
 ///   `Journal::install_deployment_durable`). Start subscriptions / timers keep
 ///   their partition-0 keys and demux normally.
-/// * A **cluster-variable lifecycle** event ([`Event::is_cluster_variable_lifecycle`]) is
-///   likewise broadcast to every owned partition: the fan-out replicates it
-///   cluster-wide, and the legacy format records no producing partition, so a
-///   key-based route would rebuild the variables only on partition 0 and lose
-///   them everywhere else on restart (#1657, PR #1670 review).
+/// * A **cluster-variable lifecycle** event ([`Event::is_cluster_variable_lifecycle`])
+///   is NEVER routed: the legacy format records no producing partition, so a
+///   broadcast would install a value into partitions whose fan-out copy never
+///   committed, and a key route would lose it everywhere but partition 0. With
+///   more than one partition the demux fails closed with the typed
+///   [`seglog::UnattributedClusterVariableError`] (#1657, ADR 0066 — the
+///   #1473 rule); writes are refused in that mode
+///   ([`check_cluster_variable_journal_mode`]), so such a record only exists if
+///   an unguarded build wrote it. Single-partition journals are unaffected.
 /// * Every other event goes to its [`Event::owning_partition`]. A key whose
 ///   partition is out of range (e.g. a log from a larger partition layout)
 ///   falls back to the lowest owned partition so replay never panics and no
@@ -4805,11 +4824,12 @@ fn demux_legacy_shared_log(
     events: Vec<Event>,
     owned: Vec<u64>,
     partitions: u64,
-) -> std::collections::HashMap<u64, Vec<Event>> {
+) -> std::io::Result<std::collections::HashMap<u64, Vec<Event>>> {
     let mut per_partition: std::collections::HashMap<u64, Vec<Event>> =
         owned.iter().map(|p| (*p, Vec::new())).collect();
     let fallback = owned.first().copied();
     for event in events {
+        seglog::check_cluster_variable_attribution(&event, false, partitions as usize)?;
         if matches!(
             event,
             Event::ProcessDeployed { .. }
@@ -4817,8 +4837,7 @@ fn demux_legacy_shared_log(
                 | Event::DecisionDeployed { .. }
                 | Event::FormDeployed { .. }
                 | Event::GenericResourceDeployed { .. }
-        ) || event.is_cluster_variable_lifecycle()
-        {
+        ) {
             for bucket in per_partition.values_mut() {
                 bucket.push(event.clone());
             }
@@ -4839,7 +4858,7 @@ fn demux_legacy_shared_log(
         // else: a valid partition this node does not own — dropped; its owner
         // replays it from its own journal.
     }
-    per_partition
+    Ok(per_partition)
 }
 
 #[cfg(test)]
@@ -4856,24 +4875,35 @@ mod legacy_demux_tests {
         }
     }
 
-    /// PR #1670 review (F1): with `NANOBPMN_JOURNAL_SEGMENTED=0` the legacy
-    /// demux routed the keyless cluster-variable events by `owning_partition`
-    /// (partition 0), so a multi-partition restart lost every other partition's
-    /// variables. They must broadcast to EVERY partition.
+    fn is_unattributed(err: &std::io::Error) -> bool {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<seglog::UnattributedClusterVariableError>())
+            .is_some()
+    }
+
+    /// PR #1670 review (#1657, ADR 0066): an untagged cluster-variable record
+    /// in a multi-partition legacy journal has no producing partition. The
+    /// demux must fail closed with the typed error — never broadcast it into
+    /// partitions whose fan-out copy may never have committed — in BOTH the
+    /// single-node (every partition owned) and clustered (subset) layouts.
     #[test]
-    fn legacy_demux_broadcasts_cluster_variables_to_every_partition() {
-        let demuxed = demux_legacy_shared_log(vec![cv_created("x")], vec![0, 1, 2], 3);
-        for p in 0..3 {
-            assert_eq!(
-                demuxed.get(&p).map(Vec::len),
-                Some(1),
-                "partition {p} replays the cluster-variable record"
-            );
+    fn legacy_demux_fails_closed_on_multi_partition_cluster_variables() {
+        for owned in [vec![0, 1, 2], vec![0, 2]] {
+            let err = demux_legacy_shared_log(vec![cv_created("x")], owned, 3)
+                .expect_err("unattributable cluster-variable record must fail closed");
+            assert!(is_unattributed(&err), "{err}");
         }
     }
 
-    /// The broadcast must not swallow keyed events: an instance-keyed event
-    /// still routes to its owning partition only.
+    /// Single-partition legacy is unaffected: every record is partition 0's.
+    #[test]
+    fn legacy_demux_single_partition_keeps_cluster_variables() {
+        let demuxed = demux_legacy_shared_log(vec![cv_created("x")], vec![0], 1)
+            .expect("single-partition legacy is attributable");
+        assert_eq!(demuxed[&0].len(), 1);
+    }
+
+    /// An instance-keyed event routes to its owning partition only.
     #[test]
     fn legacy_demux_routes_keyed_events_to_their_owning_partition() {
         let keyed = Event::ProcessInstanceCreated {
@@ -4888,16 +4918,15 @@ mod legacy_demux_tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
         };
-        let demuxed = demux_legacy_shared_log(vec![keyed], vec![0, 1, 2], 3);
+        let demuxed = demux_legacy_shared_log(vec![keyed], vec![0, 1, 2], 3).expect("demux");
         assert!(demuxed[&0].is_empty() && demuxed[&1].is_empty());
         assert_eq!(demuxed[&2].len(), 1);
     }
 
-    /// Clustered layout: a node owning only a subset still receives the
-    /// broadcast into each of ITS partitions, and a keyed event for a partition
-    /// it does not own is dropped (its owner replays it).
+    /// Clustered layout: a keyed event for a partition this node does not own
+    /// is dropped (its owner replays it from its own journal).
     #[test]
-    fn legacy_demux_clustered_broadcasts_to_owned_and_drops_unowned() {
+    fn legacy_demux_clustered_drops_unowned() {
         let keyed_unowned = Event::ProcessInstanceCreated {
             instance_key: nanobpmn_engine_core::compose_key(1, 9),
             process_id: "p".to_string(),
@@ -4910,17 +4939,10 @@ mod legacy_demux_tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
         };
-        let demuxed = demux_legacy_shared_log(vec![cv_created("x"), keyed_unowned], vec![0, 2], 3);
-        assert_eq!(demuxed[&0].len(), 1, "owned partition 0 gets the broadcast");
-        assert_eq!(demuxed[&2].len(), 1, "owned partition 2 gets the broadcast");
+        let demuxed = demux_legacy_shared_log(vec![keyed_unowned], vec![0, 2], 3).expect("demux");
         assert!(
-            demuxed.values().flatten().all(|e| matches!(
-                e,
-                Event::ClusterVariableCreated { .. }
-                    | Event::ClusterVariableUpdated { .. }
-                    | Event::ClusterVariableDeleted { .. }
-            )),
-            "the unowned partition's keyed event is dropped, not broadcast"
+            demuxed.values().all(Vec::is_empty),
+            "the unowned partition's keyed event is dropped"
         );
     }
 
@@ -4949,9 +4971,9 @@ mod legacy_demux_tests {
             parent_element_instance_key: None,
         };
         let partitions = 4u64;
-        let events = vec![keyed(3), cv_created("x"), keyed(0), keyed(2), keyed(1)];
+        let events = vec![keyed(3), keyed(0), keyed(2), keyed(1)];
         let mut per_partition =
-            demux_legacy_shared_log(events, (0..partitions).collect(), partitions);
+            demux_legacy_shared_log(events, (0..partitions).collect(), partitions).expect("demux");
         // The exact construction the boot path performs: index i must hold
         // partition i's events.
         let journals: Vec<(u64, Vec<Event>)> = (0..partitions)
@@ -4967,11 +4989,6 @@ mod legacy_demux_tests {
                 keyed_count, 1,
                 "partition {i} replays exactly its own keyed event"
             );
-            let broadcast_count = evs
-                .iter()
-                .filter(|e| matches!(e, Event::ClusterVariableCreated { .. }))
-                .count();
-            assert_eq!(broadcast_count, 1, "partition {i} replays the broadcast");
         }
     }
 }
@@ -29426,6 +29443,47 @@ fn boot_backoff_rearm_at_spawn(raft: bool) -> bool {
 /// (`partition_of(max_key)`) and cannot attribute that record to its
 /// partition, so a Raft node on them would lose or cross-apply its applied
 /// index. Fail at startup with an operator-actionable error instead.
+/// Logs and exits with an operator-actionable message when boot-time recovery
+/// fails closed (e.g. [`seglog::UnattributedClusterVariableError`]).
+fn refuse_to_start(e: &dyn std::fmt::Display) -> ! {
+    tracing::error!("{e}");
+    eprintln!("nanobpm: refusing to start: {e}");
+    std::process::exit(2);
+}
+
+/// `true` when this process persists to the untagged legacy journal: a
+/// durable journal is configured AND `NANOBPMN_JOURNAL_SEGMENTED=0`.
+fn legacy_journal_in_use() -> bool {
+    resolve_data_paths().0.is_some() && !seglog::segmented_enabled()
+}
+
+/// Cluster variables are unavailable on the untagged legacy journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`) with more than one partition (#1657, ADR
+/// 0066): that format records no producing partition, so recovery could not
+/// tell which partitions committed an (possibly interrupted) fan-out copy.
+/// Writes fail closed with 503 naming the mode and the remedy (the same status
+/// as the other "cluster variables unavailable" gates); recovery fails closed
+/// via [`seglog::check_cluster_variable_attribution`]. Single-partition legacy,
+/// segmented and in-memory runs are unaffected.
+fn check_cluster_variable_journal_mode(
+    legacy_journal: bool,
+    partitions: u64,
+) -> Result<(), (u16, String)> {
+    if legacy_journal && partitions > 1 {
+        return Err((
+            503,
+            format!(
+                "cluster variables unavailable: the journal is unsegmented \
+                 (NANOBPMN_JOURNAL_SEGMENTED=0) with {partitions} partitions, and that legacy \
+                 format cannot attribute a replicated cluster-variable record to the partition \
+                 that committed it — enable segmented journals (unset \
+                 NANOBPMN_JOURNAL_SEGMENTED or set it to 1) or run single-partition"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn check_raft_journal_mode(raft: bool, segmented: bool) -> Result<(), String> {
     if raft && !segmented {
         return Err("NANOBPMN_RAFT is enabled but the journal is unsegmented \
@@ -30627,6 +30685,11 @@ async fn main() {
             // serving. Each branch opens its shards (file-backed under `db_path`)
             // and yields the assembled `ReadModel`.
             let partitions = partition_count_from_env();
+            if let Err((_, msg)) =
+                check_cluster_variable_journal_mode(legacy_journal_in_use(), partitions as u64)
+            {
+                tracing::warn!("{msg}");
+            }
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
             // Bounded-disk state for the single-node multi-partition segmented
@@ -30799,7 +30862,8 @@ async fn main() {
                         events,
                         (0..partitions as u64).collect(),
                         partitions as u64,
-                    );
+                    )
+                    .unwrap_or_else(|e| refuse_to_start(&e));
 
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
@@ -30906,7 +30970,8 @@ async fn main() {
                     // a re-sharded layout — is dropped: its owner replays it from
                     // its own journal).
                     let mut per_owned =
-                        demux_legacy_shared_log(events, owned.clone(), partitions as u64);
+                        demux_legacy_shared_log(events, owned.clone(), partitions as u64)
+                            .unwrap_or_else(|e| refuse_to_start(&e));
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
                             "failed to open shared journal {}: {e}",
@@ -43377,6 +43442,20 @@ mod clustered_startup_tests {
         if let Some(p) = node1.raft_registry().get(0) {
             p.raft.shutdown().await.ok();
         }
+    }
+
+    /// #1657 / ADR 0066: cluster-variable writes fail closed on the untagged
+    /// multi-partition legacy journal with a 503 naming the mode and remedy;
+    /// single-partition legacy, segmented and in-memory runs are unaffected.
+    #[test]
+    fn cluster_variable_writes_refused_on_untagged_multi_partition_journal() {
+        let (status, msg) = check_cluster_variable_journal_mode(true, 3)
+            .expect_err("untagged multi-partition refused");
+        assert_eq!(status, 503);
+        assert!(msg.contains("NANOBPMN_JOURNAL_SEGMENTED=0"), "{msg}");
+        assert!(msg.contains("single-partition"), "{msg}");
+        check_cluster_variable_journal_mode(true, 1).expect("single-partition legacy ok");
+        check_cluster_variable_journal_mode(false, 3).expect("segmented / in-memory ok");
     }
 
     #[test]
