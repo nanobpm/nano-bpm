@@ -19,6 +19,8 @@ import {
   corpusProblems,
   judgeCase,
   caseRunnable,
+  shorterRepro,
+  executionNamer,
   loadCorpus,
   caseRecord,
   unexplained,
@@ -186,6 +188,30 @@ test('judgeCase: open cases must reproduce, fixed cases must agree (regression g
 test('caseRunnable: a Camunda-only case is skipped when Camunda did not run', () => {
   assert.ok(caseRunnable({ kind: 'nano' }, new Set(['nano'])))
   assert.ok(!caseRunnable({ kind: 'differential' }, new Set(['nano'])))
+})
+
+test('caseRunnable: a FIXED Camunda case is still replayed on Nano as a regression guard', () => {
+  assert.ok(caseRunnable({ kind: 'differential', fixed: true }, new Set(['nano'])))
+  assert.ok(caseRunnable({ kind: 'camunda', fixed: true }, new Set(['nano'])))
+  assert.ok(!caseRunnable({ kind: 'camunda', fixed: false }, new Set(['nano'])))
+})
+
+test('shorterRepro keeps the known shorter reproducer over a longer sampled one', () => {
+  const d = (n) => ({ scenario: { steps: new Array(n).fill({}) } })
+  const known = d(2)
+  assert.equal(shorterRepro(known, d(5)), known)
+  assert.equal(shorterRepro(known, null), known)
+  const better = d(1)
+  assert.equal(shorterRepro(known, better), better)
+  assert.equal(shorterRepro(known, d(2)), known, 'a tie keeps the known one')
+})
+
+test('executionNamer gives every execution a distinct scenario name (correlation namespace)', () => {
+  const next = executionNamer('r7')
+  const names = [next('replay'), next('shrink'), next('shrink'), next('shrink')]
+  assert.equal(new Set(names).size, names.length)
+  const again = executionNamer('r7')
+  assert.equal(again('replay'), names[0], 'deterministic per run')
 })
 
 test('the committed fuzz corpus is well-formed', () => {

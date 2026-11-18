@@ -286,8 +286,27 @@ export function unexplained (divergences, openSignatures) {
   return divergences.filter((d) => !openSignatures.has(d.signature))
 }
 
-/** The phase a committed case needs: a camunda/differential case needs Camunda. */
-export const caseRunnable = (c, phasesRan) => phasesRan.has(c.kind)
+/**
+ * Whether a committed case is replayed this run. A FIXED case is a regression
+ * guard checked on whatever backends ran (Nano always does): it must show no
+ * divergence anywhere. Only an OPEN case needs its own phase, since its
+ * reproduction / staleness verdict is about that phase's signature.
+ */
+export const caseRunnable = (c, phasesRan) => c.fixed === true || phasesRan.has(c.kind)
+
+/** The fewer-step of two divergences (the first on a tie; null-tolerant). */
+export const shorterRepro = (a, b) => (!a ? b : !b ? a : b.scenario.steps.length < a.scenario.steps.length ? b : a)
+
+/**
+ * A per-run execution namespace: every replay / shrink execution gets a fresh
+ * deterministic scenario name (and so correlation key), so a repeated graph
+ * can never interact with messages or instances an earlier attempt left on a
+ * backend.
+ */
+export function executionNamer (tag) {
+  let n = 0
+  return (kind) => `${kind}${tag}x${++n}`
+}
 
 function fileIssue (c) {
   const body = [
@@ -322,8 +341,9 @@ async function main () {
   const known = new Set(cases.filter((c) => !c.fixed).map((c) => c.signature))
   // A completed minimum is persisted at once, so a later scenario error or a
   // failing backend close can never discard it.
+  const nextName = executionNamer(`r${args.seed ?? 'replay'}`)
   const found = async (seed, skel, d) => {
-    const min = { seed, ...(await shrink(backends, skel, d)) }
+    const min = { seed, ...(await shrink(backends, skel, d, nextName)) }
     fresh.set(d.signature, min)
     if (args.record) record(min)
   }
@@ -332,7 +352,7 @@ async function main () {
     // 1. Replay the permanent corpus.
     for (const c of cases) {
       if (!c.skeleton || !c.scenario || !caseRunnable(c, backends.phasesRan)) continue
-      const entry = entryFor(c.skeleton, () => [], 'replay')
+      const entry = entryFor(c.skeleton, () => [], nextName('replay'))
       const divs = await checkScenario(backends, entry, c.scenario)
       const verdict = judgeCase(c, divs)
       if (verdict) failures.push(verdict)
@@ -386,16 +406,25 @@ async function main () {
   function record ({ seed, skel, d }) {
     const file = JSON.parse(fs.readFileSync(CORPUS_PATH, 'utf8'))
     const rec = caseRecord(seed, skel, d)
-    if (args.fileIssues) rec.issue = fileIssue(rec)
     file.cases.push(rec)
+    // Persist the reproducer BEFORE asking GitHub for an issue: a failing
+    // `gh issue create` must never discard it.
+    fs.writeFileSync(CORPUS_PATH, JSON.stringify(file, null, 2) + '\n')
+    if (!args.fileIssues) return
+    try {
+      rec.issue = fileIssue(rec)
+    } catch (err) {
+      failures.push(`could not file an issue for ${rec.signature} (reproducer recorded with "issue": null): ${err.message}`)
+      return
+    }
     fs.writeFileSync(CORPUS_PATH, JSON.stringify(file, null, 2) + '\n')
   }
 }
 
-async function shrink (backends, skel, d) {
+async function shrink (backends, skel, d, nextName) {
   const reproduce = async (cand) => {
     let best = null
-    const entry = entryFor(cand, shrinkRuns, 'shrink')
+    const entry = entryFor(cand, shrinkRuns, nextName('shrink'))
     for (const sc of entry.artifacts.scenarios) {
       if (best && stepCount(sc) >= stepCount(best.scenario)) continue
       const hit = (await checkScenario(backends, entry, sc)).find((x) => x.signature === d.signature)
@@ -404,7 +433,9 @@ async function shrink (backends, skel, d) {
     return best
   }
   // The original graph's own fewest-step reproducer is the starting point.
-  const start = (await reproduce(skel)) ?? d
+  // The original graph's known reproducer `d` is kept when the bounded
+  // shrink sample only finds longer ones.
+  const start = shorterRepro(d, await reproduce(skel))
   const { skel: minSkel, d: minD } = await shrinkGraph(skel, reproduce, start)
   return { skel: minSkel, d: minD }
 }
