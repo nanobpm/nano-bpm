@@ -119,17 +119,6 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "resolve.rs",
-        contains: "crate::feel::eval_with_provenance(m.source.trim(), vars,",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Zeebe(
-            "#1640 secret provenance: the cfg(test) provenance-only \
-             secret_provenance_of used by the focused provenance tests; a failure \
-             records no provenance, so the reference is never resolved (fail closed)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
         contains: "match crate::feel::eval_with_provenance(",
         rule: Rule::DirectFeel,
         count: 1,

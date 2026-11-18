@@ -2415,6 +2415,20 @@ pub struct State {
         serde(default, skip_serializing_if = "RoutedDeliveries::is_empty")
     )]
     pub routed_deliveries: RoutedDeliveries,
+    /// The **cluster variables** (#1657): global + per-tenant configuration
+    /// values FEEL resolves beneath instance variables. Replicated engine state,
+    /// derived only from the `ClusterVariableCreated` / `Updated` / `Deleted`
+    /// events, so every replica and every replay reads the same values (and
+    /// `SECRET_REFERENCE` kinds) at the same log position. `serde(default)`:
+    /// snapshots written before #1657 load with none.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "crate::cluster_vars::ClusterVariableState::is_unused"
+        )
+    )]
+    pub cluster_variables: crate::cluster_vars::ClusterVariableState,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.

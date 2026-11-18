@@ -37,6 +37,7 @@ mod multi_instance;
 mod replica_agreement;
 mod retry_phases;
 mod scoped_conditions;
+mod cluster_variables;
 mod secret_provenance;
 mod terminal_timing;
 mod timer_cycle_bounds;

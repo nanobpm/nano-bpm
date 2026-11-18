@@ -148,6 +148,36 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             // Audit/projection-only: the read model deletes the retracted decision
             // instance rows. No core engine state to mutate.
         }
+
+        // Cluster variables (#1657): replicated configuration state, folded
+        // from the log so every replica and every replay reads the same set.
+        Event::ClusterVariableCreated {
+            tenant_id,
+            name,
+            value,
+            kind,
+            metadata,
+        } => state.cluster_variables.insert(
+            tenant_id.as_deref(),
+            name,
+            value.clone(),
+            *kind,
+            metadata.clone(),
+        ),
+        Event::ClusterVariableUpdated {
+            tenant_id,
+            name,
+            value,
+            metadata,
+        } => state.cluster_variables.update(
+            tenant_id.as_deref(),
+            name,
+            value.clone(),
+            metadata.clone(),
+        ),
+        Event::ClusterVariableDeleted { tenant_id, name } => {
+            state.cluster_variables.remove(tenant_id.as_deref(), name)
+        }
         _ => unreachable!(),
     }
 }

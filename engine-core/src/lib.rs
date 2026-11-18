@@ -103,7 +103,9 @@ pub use agent::{
     AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceMetricsDelta, AgentInstanceStatus,
     AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
-pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
+pub use cluster_vars::{
+    ClusterVariable, ClusterVariableKind, ClusterVariableState, DEFAULT_TENANT,
+};
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
 #[cfg(feature = "serde")]

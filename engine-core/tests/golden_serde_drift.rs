@@ -844,6 +844,27 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     );
     journal.extend(correlated);
 
+    // #1657: cluster variables are replicated engine state — pin the
+    // command-produced events AND their snapshot shape (kind + metadata).
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: Some("<default>".to_string()),
+                    name: "apiCfg".to_string(),
+                    value: Value::Str("camunda.secrets.TOKEN".to_string()),
+                    kind: nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+                    metadata: std::collections::BTreeMap::from([(
+                        "owner".to_string(),
+                        Value::Str("ops".to_string()),
+                    )]),
+                    distributed: false,
+                },
+                T0 + 27,
+            )
+            .expect("create cluster variable"),
+    );
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }
@@ -1049,6 +1070,31 @@ fn build_event_witnesses() -> Vec<Event> {
         Event::OrphanStampSuperseded {
             instance_key: 27,
             episode: 26,
+        },
+        // #1657 cluster-variable lifecycle (additive variants, no version
+        // bump): replicated configuration state, every field non-default.
+        Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: "region".to_string(),
+            value: Value::Str("EMEA".to_string()),
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+            metadata: std::collections::BTreeMap::from([(
+                "k".to_string(),
+                Value::Int(1),
+            )]),
+        },
+        Event::ClusterVariableUpdated {
+            tenant_id: Some("t1".to_string()),
+            name: "region".to_string(),
+            value: Value::Str("APAC".to_string()),
+            metadata: std::collections::BTreeMap::from([(
+                "k".to_string(),
+                Value::Int(2),
+            )]),
+        },
+        Event::ClusterVariableDeleted {
+            tenant_id: Some("t1".to_string()),
+            name: "region".to_string(),
         },
     ]
 }

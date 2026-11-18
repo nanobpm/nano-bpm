@@ -7,10 +7,8 @@
 //! mapping; per-path (sibling) isolation; mutation of the cluster variables
 //! after the mapping ran; and that no plaintext ever reaches the journal or
 //! snapshot.
-use std::sync::{Arc as StdArc, RwLock};
-
 use super::*;
-use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
+use crate::cluster_vars::{ClusterVariableKind, DEFAULT_TENANT};
 use crate::model::{IoMapping, Mapping};
 use crate::state::SecretProvenance;
 
@@ -25,17 +23,26 @@ fn m(source: &str, target: &str) -> Mapping {
 
 /// An engine whose cluster variables hold a SECRET_REFERENCE `apiCfg` and a
 /// JSON-kind `jsonCfg`, both carrying `camunda.secrets.TOKEN`.
-fn engine_with_cluster_vars() -> (Engine, crate::cluster_vars::ClusterVariables) {
-    let mut snap = ClusterVariableSnapshot::default();
-    snap.global
-        .insert("apiCfg".to_string(), Value::Str(REF.to_string()));
-    snap.global
-        .insert("jsonCfg".to_string(), Value::Str(REF.to_string()));
-    snap.global_secret_references.insert("apiCfg".to_string());
-    let handle = StdArc::new(RwLock::new(StdArc::new(snap)));
+fn engine_with_cluster_vars() -> Engine {
     let mut engine = Engine::new();
-    engine.set_cluster_variables(StdArc::clone(&handle));
-    (engine, handle)
+    put_cluster_var(&mut engine, None, "apiCfg", ClusterVariableKind::SecretReference);
+    put_cluster_var(&mut engine, None, "jsonCfg", ClusterVariableKind::Json);
+    engine
+}
+
+/// Creates a cluster variable holding [`REF`] through the replicated command
+/// (#1657) — the only way cluster-variable state changes.
+fn put_cluster_var(engine: &mut Engine, tenant: Option<&str>, name: &str, kind: ClusterVariableKind) {
+    engine
+        .apply_command(Command::CreateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value: Value::Str(REF.to_string()),
+            kind,
+            metadata: Default::default(),
+            distributed: false,
+        })
+        .unwrap();
 }
 
 fn task(inputs: Vec<Mapping>) -> ProcessDefinition {
@@ -91,7 +98,7 @@ fn site(path: &str) -> SecretProvenance {
 
 #[test]
 fn trusted_sources_are_recorded_untrusted_are_not() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (prov, _) = run(
         &mut engine,
         task(vec![
@@ -112,7 +119,7 @@ fn trusted_sources_are_recorded_untrusted_are_not() {
 
 #[test]
 fn a_process_variable_shadowing_a_trusted_root_is_untrusted() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     // Same name as the trusted root AND the same reference text: still
     // untrusted, because the mapping read the process variable.
     let (prov, _) = run(
@@ -125,7 +132,7 @@ fn a_process_variable_shadowing_a_trusted_root_is_untrusted() {
 
 #[test]
 fn a_parent_scope_variable_shadowing_a_trusted_root_is_untrusted() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let def = ProcessBuilder::new("nested")
         .start_event("start")
         .sub_process("sub", "sub_start")
@@ -166,7 +173,7 @@ fn a_parent_scope_variable_shadowing_a_trusted_root_is_untrusted() {
 
 #[test]
 fn a_later_untrusted_mapping_overwrites_provenance() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (prov, _) = run(
         &mut engine,
         task(vec![
@@ -191,12 +198,13 @@ fn a_later_untrusted_mapping_overwrites_provenance() {
 
 #[test]
 fn a_jsonkind_tenant_variable_shadowing_a_trusted_global_is_untrusted() {
-    let (mut engine, handle) = engine_with_cluster_vars();
-    StdArc::make_mut(&mut *handle.write().unwrap())
-        .tenants
-        .entry(DEFAULT_TENANT.to_string())
-        .or_default()
-        .insert("apiCfg".to_string(), Value::Str(REF.to_string()));
+    let mut engine = engine_with_cluster_vars();
+    put_cluster_var(
+        &mut engine,
+        Some(DEFAULT_TENANT),
+        "apiCfg",
+        ClusterVariableKind::Json,
+    );
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
@@ -207,7 +215,7 @@ fn a_jsonkind_tenant_variable_shadowing_a_trusted_global_is_untrusted() {
 
 #[test]
 fn provenance_is_fixed_at_mapping_time() {
-    let (mut engine, handle) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
@@ -216,7 +224,13 @@ fn provenance_is_fixed_at_mapping_time() {
     assert_eq!(prov, vec![site("token")]);
     // Deleting / retyping the cluster variable afterwards changes nothing
     // recorded: activation never re-derives trust.
-    *handle.write().unwrap() = StdArc::new(ClusterVariableSnapshot::default());
+    engine
+        .apply_command(Command::DeleteClusterVariable {
+            tenant_id: None,
+            name: "apiCfg".to_string(),
+            distributed: false,
+        })
+        .unwrap();
     let job = engine.state.jobs.values().next().unwrap();
     assert_eq!(job.secret_provenance, vec![site("token")]);
 }
@@ -226,7 +240,7 @@ fn provenance_is_fixed_at_mapping_time() {
 #[cfg(feature = "serde")]
 #[test]
 fn journal_and_snapshot_hold_no_plaintext() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (_, log) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
@@ -260,7 +274,7 @@ fn journal_and_snapshot_hold_no_plaintext() {
 #[test]
 fn an_aliased_target_overwrites_provenance() {
     for alias in ["payload..auth", ".payload.auth", "payload.auth.", "payload"] {
-        let (mut engine, _) = engine_with_cluster_vars();
+        let mut engine = engine_with_cluster_vars();
         let (prov, _) = run(
             &mut engine,
             task(vec![m("=apiCfg", "payload.auth"), m("=bodyRef", alias)]),
@@ -269,7 +283,7 @@ fn an_aliased_target_overwrites_provenance() {
         assert!(prov.is_empty(), "alias {alias}: {prov:?}");
     }
     // A trusted write through an aliased spelling is recorded canonically.
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "payload..auth")]),
@@ -284,7 +298,7 @@ fn an_aliased_target_overwrites_provenance() {
 #[test]
 fn a_post_creation_variable_write_revokes_provenance() {
     for local in [true, false] {
-        let (mut engine, _) = engine_with_cluster_vars();
+        let mut engine = engine_with_cluster_vars();
         let (prov, _) = run(
             &mut engine,
             task(vec![m("=apiCfg", "payload.auth")]),
@@ -316,7 +330,7 @@ fn a_post_creation_variable_write_revokes_provenance() {
 /// keep the job's provenance; a write to an ancestor scope still revokes it.
 #[test]
 fn a_sibling_scope_write_preserves_provenance() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "payload.auth")]),
@@ -339,63 +353,43 @@ fn a_sibling_scope_write_preserves_provenance() {
     assert!(engine.state.jobs[&job.key].secret_provenance.is_empty());
 }
 
-/// #1640 check-then-use race: the FEEL overlay (`vars`) and the trusted-root
-/// kinds must come from ONE cluster-variable snapshot. A JSON-kind variable
-/// retyped to SECRET_REFERENCE (same text) between the two reads must not be
-/// trusted for an evaluation whose view was built from the JSON-kind state.
+/// #1640 check-then-use race, closed structurally by #1657: cluster-variable
+/// values and kinds are engine state changed only by their own commands, so
+/// there is no second read that a concurrent retype could land between. A
+/// retype is itself a replicated command, ordered against the evaluation.
 #[test]
-fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
-    let (mut engine, handle) = engine_with_cluster_vars();
-    let (_, log) = run(
+fn a_retype_is_a_command_ordered_against_evaluation() {
+    let mut engine = engine_with_cluster_vars();
+    // Retype `jsonCfg` -> SECRET_REFERENCE through the (distributed upsert)
+    // command: only evaluations AFTER it in the log observe the new kind.
+    let (before, _) = run(
         &mut engine,
-        task(vec![m("=apiCfg", "token")]),
+        task(vec![m("=jsonCfg", "t")]),
         HashMap::new(),
     );
-    let inst = log
-        .iter()
-        .find_map(|e| match e {
-            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-            _ => None,
+    assert!(before.is_empty(), "{before:?}");
+    engine
+        .apply_command(Command::CreateClusterVariable {
+            tenant_id: None,
+            name: "jsonCfg".to_string(),
+            value: Value::Str(REF.to_string()),
+            kind: ClusterVariableKind::SecretReference,
+            metadata: Default::default(),
+            distributed: true,
         })
         .unwrap();
-    let mappings = vec![m("=jsonCfg", "t")];
-
-    // Pin exactly as a command does, then read the overlay (jsonCfg is JSON).
-    engine.pinned_cluster_variables = Some(engine.read_cluster_snapshot());
-    let vars = engine.variables_for_element(inst, 0);
-    // Inject the retype between the two reads.
-    let retyped = ClusterVariableSnapshot {
-        global: handle.read().unwrap().global.clone(),
-        global_secret_references: ["apiCfg", "jsonCfg"].map(String::from).into(),
-        ..ClusterVariableSnapshot::default()
-    };
-    *handle.write().unwrap() = StdArc::new(retyped);
-
-    // Pinned: trust is read from the snapshot `vars` came from -> untrusted.
-    assert!(engine
-        .secret_provenance_of(inst, 0, &vars, &mappings)
-        .is_empty());
-    // The pre-fix behaviour (a fresh read of kinds) WOULD have trusted it —
-    // proving the injected retype is real.
-    engine.pinned_cluster_variables = None;
-    assert_eq!(
-        engine.secret_provenance_of(inst, 0, &vars, &mappings),
-        vec![SecretProvenance {
-            path: "t".to_string(),
-            secrets: vec!["TOKEN".to_string()],
-        }]
-    );
-}
-
-#[test]
-fn apply_command_unpins_the_cluster_snapshot() {
-    let (mut engine, _) = engine_with_cluster_vars();
-    run(
-        &mut engine,
-        task(vec![m("=apiCfg", "token")]),
-        HashMap::new(),
-    );
-    assert!(engine.pinned_cluster_variables.is_none());
+    let after = engine
+        .apply_command(Command::create_instance_with("p", HashMap::new()))
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            Event::JobCreated {
+                secret_provenance, ..
+            } => Some(secret_provenance),
+            _ => None,
+        })
+        .expect("a JobCreated");
+    assert_eq!(after, vec![site("t")]);
 }
 
 /// A trusted root is shadowed only by a binding on the mapping's OWN visible
@@ -407,7 +401,7 @@ fn apply_command_unpins_the_cluster_snapshot() {
 /// local `apiCfg` stripped the sibling's trust (#1652 round-5 review).
 #[test]
 fn a_sibling_branch_local_does_not_shadow_a_trusted_root() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     // fork -> (a, b) -> join. `a` maps an untrusted bodyRef onto a LOCAL
     // `apiCfg`; `b` reads the trusted cluster `apiCfg`.
     let def = ProcessBuilder::new("par")
@@ -491,7 +485,7 @@ fn a_sibling_branch_local_does_not_shadow_a_trusted_root() {
 /// never trust a target whose journaled value carries the untrusted text.
 #[test]
 fn provenance_matches_the_single_evaluated_value_under_nondeterminism() {
-    let (mut engine, _) = engine_with_cluster_vars();
+    let mut engine = engine_with_cluster_vars();
     let inst = {
         let def = task(vec![m(
             "={auth: camunda.secrets.TOKEN, other: if random number() < 0.5 then bodyRef else null}",

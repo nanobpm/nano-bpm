@@ -1,6 +1,6 @@
 {
   "next_local": 108,
-  "now": 1700000000026,
+  "now": 1700000000027,
   "num_partitions": 1,
   "partition_id": 0,
   "raft_applied": null,
@@ -47,6 +47,25 @@
       ]
     },
     "activated_jobs": [],
+    "cluster_variables": {
+      "next_id": 1,
+      "tenants": {
+        "<default>": {
+          "apiCfg": {
+            "id": 1,
+            "kind": "SECRET_REFERENCE",
+            "metadata": {
+              "owner": {
+                "Str": "ops"
+              }
+            },
+            "value": {
+              "Str": "camunda.secrets.TOKEN"
+            }
+          }
+        }
+      }
+    },
     "conditional_subscriptions": {},
     "created_by_process": {
       "decide": 2,

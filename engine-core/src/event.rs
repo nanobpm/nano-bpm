@@ -425,6 +425,37 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
+    /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
+    /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
+    /// configuration state: carries no key; a shared journal tags it with the
+    /// partition that wrote it.
+    ClusterVariableCreated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+
+    /// A cluster variable's value and metadata were replaced (#1657; Zeebe
+    /// `ClusterVariableIntent.UPDATED`). Its id and kind are preserved.
+    ClusterVariableUpdated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+
+    /// A cluster variable was deleted (#1657; Zeebe `ClusterVariableIntent.DELETED`).
+    ClusterVariableDeleted {
+        tenant_id: Option<String>,
+        name: String,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -2133,6 +2164,9 @@ impl Event {
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
             | Event::RoutedDeliveryRecorded { .. }
+            | Event::ClusterVariableCreated { .. }
+            | Event::ClusterVariableUpdated { .. }
+            | Event::ClusterVariableDeleted { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }

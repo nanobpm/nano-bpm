@@ -37,7 +37,10 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::FormDeployed { .. }
         | Event::GenericResourceDeployed { .. }
         | Event::DecisionEvaluated { .. }
-        | Event::DecisionInstanceDeleted { .. } => resource::apply_resource(state, event),
+        | Event::DecisionInstanceDeleted { .. }
+        | Event::ClusterVariableCreated { .. }
+        | Event::ClusterVariableUpdated { .. }
+        | Event::ClusterVariableDeleted { .. } => resource::apply_resource(state, event),
         Event::ProcessInstanceCreated { .. }
         | Event::VariablesUpdated { .. }
         | Event::ScopedVariablesUpdated { .. }

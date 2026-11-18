@@ -112,6 +112,42 @@ pub enum Command {
         instance_key: Key,
         decision_evaluation_key: Key,
     },
+    /// Create a **cluster variable** (#1657; Zeebe `ClusterVariableIntent.CREATE`).
+    /// `tenant_id` `None` is the global scope. Rejected with
+    /// [`crate::EngineError::ClusterVariableAlreadyExists`] when one already
+    /// exists for `(tenant_id, name)` — unless `distributed`, which marks a
+    /// fan-out copy of a create/update already validated on the authoritative
+    /// partition: it then upserts the full record (value, kind, metadata),
+    /// preserving an existing id — idempotent under re-delivery, and a
+    /// partition that missed an earlier copy converges.
+    CreateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        kind: crate::cluster_vars::ClusterVariableKind,
+        metadata: std::collections::BTreeMap<String, Value>,
+        distributed: bool,
+    },
+    /// Replace an existing cluster variable's value and metadata (its id and
+    /// kind are preserved). Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent. Only ever
+    /// processed on the authoritative partition: the fan-out to the other
+    /// partitions carries the resulting full record as a `distributed`
+    /// [`Command::CreateClusterVariable`] upsert.
+    UpdateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+    /// Delete a cluster variable. Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent — unless
+    /// `distributed` (a fan-out copy), which is then an idempotent no-op.
+    DeleteClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        distributed: bool,
+    },
     /// Evaluate a deployed decision on demand — the standalone EvaluateDecision
     /// API (Zeebe `DecisionEvaluation:EVALUATE`). Resolves the decision, evaluates
     /// it against `variables`, and records the evaluation as an
@@ -1063,6 +1099,18 @@ impl Command {
                 h.key(*instance_key);
                 h.key(*decision_evaluation_key);
             }
+            Command::CreateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => {
+                h.str(tenant_id.as_deref().unwrap_or(""));
+                h.str(name);
+            }
             Command::EvaluateDecision { decision, .. } => match decision {
                 DecisionReference::Id(id) => h.str(id),
                 DecisionReference::Key(key) => h.key(*key),
@@ -1212,6 +1260,9 @@ impl Command {
             Command::DeployGenericResources(_) => "deploy_generic_resources",
             Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
+            Command::CreateClusterVariable { .. } => "create_cluster_variable",
+            Command::UpdateClusterVariable { .. } => "update_cluster_variable",
+            Command::DeleteClusterVariable { .. } => "delete_cluster_variable",
             Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
