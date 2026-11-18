@@ -99,10 +99,11 @@ Activation is excluded (leader-local per ADR 0002 in both models; see the option
 | 5-task process | 2473 | 2567 |
 
 Scope of the measurement: this is an **uncompressed, payload-only** comparison. The per-entry
-`ReplicatedBatch` wrapper, the OpenRaft entry framing (`raft_logstore.rs:783`) and the log
-store's optional disk compression are per-*entry* costs — identical in both models under ADR
-0003's group commit (one entry per batch) — so the *ratios* above are unaffected by them, but
-the absolute byte counts are payload bytes, not physical log or wire bytes. An absolute
+`ReplicatedBatch` wrapper and the OpenRaft entry framing (`raft_logstore.rs:783`) are not
+counted, and the log store's optional disk compression is not applied. Fixed framing would dilute
+the ratios, and compression savings depend on entry contents (repetitive event JSON may compress
+differently from command JSON), so the ratios above hold **only for uncompressed payload bytes**,
+not physical log or wire bytes. An absolute
 bandwidth conclusion needs a full-frame measurement with an explicit batching/compression
 policy; none is claimed here.
 
@@ -165,7 +166,12 @@ with this ADR as the decision of record.
    followers use — exactly once, so events are never applied twice. Job activation, queries,
    lease digests and snapshots read committed state only (a snapshot's `last_applied` therefore
    always matches its contents); a failed proposal simply discards the overlay. Keys come only
-   from the leader; the fold advances the key generator from observed keys.
+   from the leader; the fold advances the key generator from observed keys. The entry must carry
+   **record metadata, not just domain events**: `operation_reference` lives on `Record`, not
+   `Event` (`engine-core/src/event.rs`), and today's journal re-derives it from each replicated
+   command (`journal.rs`). `Events` therefore replicates the per-command metadata (at minimum
+   each command's `operation_reference`, mapped to the records it produced) so follower journals
+   and a post-failover leader retain callers' operation references.
 4. **Cutover.** Flip the flag only once every voter **and every learner** (ADR 0003 learners
    receive the same log) runs ≥ slice 3, i.e. can decode *and* apply `Events` entries; the
    membership/version check refuses the flip otherwise, and keeps refusing any later membership

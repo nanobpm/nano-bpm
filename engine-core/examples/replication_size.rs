@@ -8,11 +8,11 @@
 //! (`{command, now, operation_reference}`, `raft.rs:106`) — the terminal
 //! attribution stamped by `stamp_for_proposal` (`raft.rs:2836`) included — not
 //! a bare `Command`. It is still a **payload-only, uncompressed** comparison:
-//! the per-entry `ReplicatedBatch` wrapper, OpenRaft entry framing
-//! (`raft_logstore.rs:783`) and the log store's optional disk compression are
-//! per-entry (not per-command) costs, identical in both models, and are not
-//! counted. The ratios below therefore compare payload bytes, not physical
-//! log or bandwidth bytes; absolute bandwidth conclusions need a full-frame
+//! the per-entry `ReplicatedBatch` wrapper and OpenRaft entry framing
+//! (`raft_logstore.rs:783`) are not counted and disk compression is not
+//! applied. Framing would dilute the ratios and compression depends on entry
+//! contents, so the ratios below hold only for uncompressed payload bytes,
+//! not physical log or bandwidth bytes; absolute bandwidth conclusions need a full-frame
 //! measurement with an explicit batching/compression policy.
 //! Run with:
 //!   cargo run --release --features serde --example replication_size
