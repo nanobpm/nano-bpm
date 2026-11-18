@@ -57,6 +57,9 @@ pub fn env() -> Option<String> { std::env::var("X").ok() }
 pub fn ln(x: f64) -> f64 { x.ln() }
 pub fn exp(x: f64) -> f64 { x.exp() }
 pub fn pow(a: f64, b: f64) -> f64 { a.powf(b) }
+pub fn asinh(x: f64) -> f64 { x.asinh() }
+pub fn sin32(x: f32) -> f32 { x.sin() }
+pub fn log2_32(x: f32) -> f32 { x.log2() }
 "#,
     );
     let (ok, stderr) = clippy(&dir);
@@ -68,6 +71,9 @@ pub fn pow(a: f64, b: f64) -> f64 { a.powf(b) }
         "f64::ln",
         "f64::exp",
         "f64::powf",
+        "f64::asinh",
+        "f32::sin",
+        "f32::log2",
     ] {
         assert!(
             stderr.contains(&format!("use of a disallowed method `{banned}`")),
