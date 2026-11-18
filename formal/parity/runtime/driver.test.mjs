@@ -16,7 +16,7 @@ import {
   incidentsFromSnapshot,
   rootVariablesFromSearch,
 } from "./nano-backend.mjs";
-import { CamundaBackend } from "./camunda-backend.mjs";
+import { CamundaBackend, BackendCleanupError } from "./camunda-backend.mjs";
 import { runScenario } from "./driver.mjs";
 import { discoverScenarios, installSignalCleanup, backendEligible } from "./run.mjs";
 import { EventEmitter } from "node:events";
@@ -427,6 +427,10 @@ test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset 
     assert.equal(backend.pinnedClockMs, null);
     mode = "fail";
     await assert.rejects(() => backend.reset(), /reset clock failed: HTTP 500/);
+    // A cleanup failure is a BackendCleanupError so the runner ABORTS the phase
+    // instead of recording a false divergence and continuing on a non-isolated
+    // backend (#1246 review).
+    await assert.rejects(() => backend.reset(), (err) => err instanceof BackendCleanupError);
   } finally {
     server.close();
     await once(server, "close");

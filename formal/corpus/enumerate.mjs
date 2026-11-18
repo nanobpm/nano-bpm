@@ -774,7 +774,19 @@ export function scenariosFor (graph) {
         // relies on the awaitCompletion create settling as the barrier.
         const createdByCorrelation = (b) => b && (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0)
         const barrier = after.barrierJob()
-        if (createdByCorrelation(barrier)) step.settled = { jobType: barrier }
+        if (createdByCorrelation(barrier)) {
+          step.settled = { jobType: barrier }
+        } else if (!after.completed) {
+          // The correlation created no job but the instance SURVIVES (a
+          // parallel branch is still running): there is no correlation-created
+          // job to barrier on and no completion to await, so without an
+          // acknowledgement the driver advances while the buffered message is
+          // in flight and Camunda can run the next command (complete the
+          // still-waiting task) BEFORE the message correlates — inverting the
+          // scripted order (#1246 review). Ask the backend to acknowledge the
+          // correlation before advancing.
+          step.settled = { ack: true }
+        }
         steps.push(step)
       }
       state = state.apply(c)

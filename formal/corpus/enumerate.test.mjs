@@ -278,6 +278,38 @@ test('a routed join reads its OWN activation choice, not the next one (#1246 rev
   assert.equal(ref.takenFlows.f5, undefined, 'firing#1 route entry (index 1) was NOT consumed early')
 })
 
+test('a correlation into a SURVIVING instance (parallel branch still running) asks for a correlation acknowledgement (#1246 review)', () => {
+  // S -> AND -> {XOR, T1 -> XOR}; XOR -> {EVT, E}; EVT -> {M1 -> E, M2 -> E}.
+  // A message-first scenario that correlates M1 while the T1 branch is still
+  // running creates NO job (M1 -> E) and the instance does NOT complete (T1 is
+  // still active). With no barrier the driver would advance and complete T1
+  // BEFORE the buffered message correlates — inverting the scripted order. The
+  // step must carry `settled.ack` so the backend acknowledges the correlation
+  // (a synchronous /messages/correlation) before advancing.
+  const g = graphOf(['and', 'xor', 'evt'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'task'], [2, 4, 'direct'], [2, 3, 'direct'], [3, 4, 'msg'], [3, 4, 'msg']])
+  const { scenarios } = scenariosFor(g)
+  let acked = 0
+  for (const s of scenarios) {
+    s.steps.forEach((st, i) => {
+      if (st.op !== 'publishMessage') return
+      const laterJob = s.steps.slice(i + 1).some((x) => x.op === 'completeOneJob')
+      if (st.settled?.ack) {
+        acked++
+        // An ack'd correlation must not also carry a job barrier.
+        assert.equal(st.settled.jobType, undefined, `${s.name}: ack and jobType are mutually exclusive`)
+      } else if (st.settled?.jobType) {
+        // a correlation-created job barrier: fine
+      } else {
+        // No barrier at all is only acceptable when the correlation COMPLETES
+        // the instance (the awaitCompletion create settling is the barrier) —
+        // i.e. no job step follows.
+        assert.ok(!laterJob, `${s.name}: an unbarriered correlation into a surviving instance inverts the order`)
+      }
+    })
+  }
+  assert.ok(acked > 0, 'the graph produces a correlation into a surviving instance that needs an ack')
+})
+
 test('a correlation whose catch leads straight to the end event gets NO job barrier (#1246 review)', () => {
   // S -> AND -> {T1 -> E, EVT -> {M1 -> E, M2 -> E}}: correlating M1 (or M2)
   // resumes the catch straight into the end event — it creates NO job. The

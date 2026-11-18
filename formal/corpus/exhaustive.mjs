@@ -145,14 +145,13 @@ function runTlc (jar, work, module, tla, cfg) {
   return new Promise((resolve) => {
     fs.writeFileSync(path.join(dir, `${module}.cfg`), cfg)
     const p = spawn('java', [
-      // Each model is tiny: a small serial-GC, C1-only JVM starts fastest and lets
-      // many run side by side.
-      '-XX:+UseSerialGC', '-Xmx256m', '-XX:TieredStopAtLevel=1', `-Djava.io.tmpdir=${path.join(dir, 'tmp')}`, '-cp', jar, 'tlc2.TLC', '-workers', '1', '-cleanup',
-      // `-nowarning` silences TLC's benign "use a throughput-optimised GC" notice
-      // (we deliberately run a serial-GC, C1-only JVM for fast startup). The
-      // verdict parser treats any `Warning:` line as a hard error, so the notice
-      // must not reach the log — genuinely actionable warnings still fail closed.
-      '-nowarning',
+      // Each model is tiny: a C1-only JVM starts fastest and lets many run side
+      // by side. Use a PARALLEL GC (as formal/tla/check.sh does) so TLC does not
+      // emit its "use a throughput-optimised GC" advisory — WITHOUT `-nowarning`,
+      // which would set TLCGlobals.warn = false and silence EVERY warning,
+      // defeating the fail-closed `Warning:` gate in verdictFromLog (#1246
+      // review). Warnings stay visible; any that remain fail the run.
+      '-XX:+UseParallelGC', '-Xmx256m', '-XX:TieredStopAtLevel=1', `-Djava.io.tmpdir=${path.join(dir, 'tmp')}`, '-cp', jar, 'tlc2.TLC', '-workers', '1', '-cleanup',
       '-continue', '-deadlock', '-lncheck', 'final', '-metadir', path.join(dir, `${module}.meta`), '-config', `${module}.cfg`, `${module}.tla`],
     { cwd: dir })
     let log = ''
@@ -241,8 +240,10 @@ async function runtimePhase (entries, args, log) {
   const { NanoBackend } = await import('../parity/runtime/nano-backend.mjs')
   const nano = wantNano ? await new NanoBackend().init() : null
   let camunda = null
+  let CleanupError = null
   if (wantCamunda) {
-    const { CamundaBackend } = await import('../parity/runtime/camunda-backend.mjs')
+    const { CamundaBackend, BackendCleanupError } = await import('../parity/runtime/camunda-backend.mjs')
+    CleanupError = BackendCleanupError
     const address = process.env.CAMUNDA_REST_ADDRESS
     if (address) camunda = new CamundaBackend({ address, token: process.env.CAMUNDA_AUTH_TOKEN, basicAuth: process.env.CAMUNDA_BASIC_AUTH })
     if (camunda && !(await camunda.ping())) camunda = null
@@ -290,6 +291,12 @@ async function runtimePhase (entries, args, log) {
               if (!diff.ok) divergences.push({ kind: 'differential', signature: `differential:${fieldsSig(diff.mismatches)}`, detail: diff.mismatches, entry, scenario: sc })
             }
           } catch (err) {
+            // A backend CLEANUP failure (reset()'s cancellation/clock reset) is
+            // not a scenario divergence: isolation was not restored, so every
+            // later scenario's observation is untrustworthy. Abort the phase
+            // rather than record a misleading `camunda:error` and continue
+            // (#1246 review).
+            if (CleanupError && err instanceof CleanupError) throw err
             divergences.push({ kind: 'camunda', signature: `camunda:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
           }
         }

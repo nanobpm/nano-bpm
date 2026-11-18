@@ -24,6 +24,25 @@
 
 import { emptyObservation, MAX_JOBS_TO_ACTIVATE } from "./observation.mjs";
 
+/**
+ * A backend CLEANUP failure (a process-instance cancellation or the clock reset
+ * inside `reset()`), distinguished from a scenario divergence. A reset that
+ * fails has NOT restored isolation — an uncancelled instance's reused job types
+ * stay activatable and would corrupt later scenarios' observations and any
+ * minimal reproduction shrunk from them — so the runner must ABORT the Camunda
+ * phase on this, not record one more `camunda:error` divergence and continue
+ * (#1246 review). `exhaustive.mjs`'s runtimePhase rethrows on `instanceof
+ * BackendCleanupError` instead of swallowing it as a per-scenario divergence;
+ * run.mjs's per-scenario loop has no such catch, so a cleanup failure already
+ * propagates out of `runScenario` and aborts the run there.
+ */
+export class BackendCleanupError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "BackendCleanupError";
+  }
+}
+
 const DEFAULT_ACTIVATE_TIMEOUT_MS = 60_000;
 const DEFAULT_LONG_POLL_MS = 30_000;
 // The `awaitCompletion` create call blocks until the instance completes. A
@@ -387,6 +406,19 @@ export class CamundaBackend {
   // leads straight to the end event has no job to barrier on; there the
   // awaitCompletion create settling IS the barrier, and the driver waits it
   // via `observe`.
+  //
+  // `settled.ack` (#1246 review): the correlation creates NO job but the
+  // instance SURVIVES (a parallel branch keeps running), so there is no
+  // correlation-created job to barrier on and no completion to await. Without
+  // an acknowledgement the driver advances to the next command while the
+  // buffered message is still in flight, and Camunda can run that command
+  // (e.g. complete the still-waiting T1) BEFORE the message correlates —
+  // inverting the scripted order. Acknowledge the correlation with a
+  // SYNCHRONOUS `/messages/correlation` of the same name/key: it is not
+  // buffered (timeToLive 0) and returns 200 only once a subscription has
+  // correlated, which the buffered publication has by then already done. (On a
+  // runtime too old for `/messages/correlation` this 404s; the runner is
+  // skip-tolerant on reachability, and the ack only runs on a live backend.)
   async publishMessage(handle, name, correlationKey, variables, settled) {
     await this.#json(
       "POST",
@@ -411,6 +443,13 @@ export class CamundaBackend {
         // rejects the fail-back — stalling the barrier mid-scenario (#1246).
         { retries: 1, retryBackOff: 0 },
         "fail back barrier job",
+      );
+    } else if (settled?.ack) {
+      await this.#json(
+        "POST",
+        "/messages/correlation",
+        { name, correlationKey, variables: variables ?? {} },
+        "acknowledge message correlation",
       );
     }
   }
@@ -493,8 +532,15 @@ export class CamundaBackend {
           );
         } catch (err) {
           // 404: the instance finished in the meantime — nothing left to cancel.
-          // Any other failure is loud, like the clock reset below.
-          if (!/HTTP 404/.test(String(err?.message))) throw err;
+          // Any other failure means the instance may STILL be live: its reused
+          // job types stay activatable and would corrupt later scenarios, so
+          // surface it as a cleanup failure the runner aborts on (#1246 review).
+          if (!/HTTP 404/.test(String(err?.message))) {
+            throw new BackendCleanupError(
+              `cancel process instance ${key} failed: ${err?.message ?? err}`,
+              { cause: err },
+            );
+          }
         }
       }
     }
@@ -517,8 +563,16 @@ export class CamundaBackend {
     // clock — which is exactly what we rewind. That failure must be loud too: a
     // swallowed `/clock/reset` (401/500/503) could leave the global clock pinned
     // while the runner reports success, so — unlike the transport-only skip in
-    // `ping()` — it is NOT caught (#1260 review).
-    await this.#json("POST", "/clock/reset", undefined, "reset clock");
+    // `ping()` — it is NOT caught (#1260 review). Surface it as a cleanup
+    // failure so the runner aborts the phase rather than record a divergence
+    // (#1246 review).
+    try {
+      await this.#json("POST", "/clock/reset", undefined, "reset clock");
+    } catch (err) {
+      throw new BackendCleanupError(`reset clock failed: ${err?.message ?? err}`, {
+        cause: err,
+      });
+    }
     this.pinnedClockMs = null;
   }
 
