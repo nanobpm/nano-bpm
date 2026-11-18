@@ -888,6 +888,7 @@ impl PeerLink {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::FailJob {
             corr,
@@ -896,6 +897,8 @@ impl PeerLink {
             job_lease_token: None,
             retries: Some(retries),
             error_message: Some(error_message),
+            // Off the wire when zero: keeps backoff-less forwards byte-identical.
+            retry_back_off: (retry_back_off != 0).then_some(retry_back_off),
         })
         .await
     }

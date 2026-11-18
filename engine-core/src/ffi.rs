@@ -557,6 +557,7 @@ pub unsafe extern "C" fn nbpmn_fail_job(
         lease_token: None,
         retries,
         error_message,
+        retry_back_off: 0,
     };
     match engine.apply_command(cmd) {
         Ok(_) => 0,

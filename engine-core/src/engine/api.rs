@@ -217,22 +217,48 @@ impl Engine {
         now: u64,
         with_lease: bool,
     ) -> Vec<Key> {
-        self.state
+        let eligible = |key: &Key| {
+            self.state.jobs.get(key).is_some_and(|job| {
+                job.job_type == job_type
+                    && super::job_activatable(job, now)
+                    && (with_lease || job.lease_token.is_none())
+                    // A suspended instance makes no progress: its jobs are
+                    // not activatable until it is resumed (Camunda parity).
+                    && !self.instance_is_suspended(job.instance_key)
+            })
+        };
+        // Ready set: already in activation order, so its first `max_jobs`
+        // eligible entries are the only ones that can win.
+        let mut candidates: Vec<(i64, Key)> = self
+            .state
             .activatable_jobs
             .get(job_type)
             .into_iter()
-            .flat_map(|set| set.iter())
-            .map(|&(_, key)| key)
-            .filter(|key| {
-                self.state.jobs.get(key).is_some_and(|job| {
-                    super::job_activatable(job, now)
-                        && (with_lease || job.lease_token.is_none())
-                        // A suspended instance makes no progress: its jobs are
-                        // not activatable until it is resumed (Camunda parity).
-                        && !self.instance_is_suspended(job.instance_key)
-                })
-            })
+            .flat_map(|set| set.iter().copied())
+            .filter(|(_, key)| eligible(key))
             .take(max_jobs)
+            .collect();
+        // Deferred (`retryBackOff`, #933) jobs whose deadline has been reached
+        // are activatable too. They stay in the deadline-ordered deferred index
+        // (their durable `retry_backoff_until` is untouched until
+        // `JobActivated` clears it, so live state never diverges from replay);
+        // only the due prefix is walked, never the still-deferred tail.
+        for &(until, key) in &self.state.deferred_jobs {
+            if until > now {
+                break;
+            }
+            if eligible(&key) {
+                if let Some(job) = self.state.jobs.get(&key) {
+                    candidates.push(crate::state::activation_order(job.priority, key));
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .into_iter()
+            .take(max_jobs)
+            .map(|(_, key)| key)
             .collect()
     }
 

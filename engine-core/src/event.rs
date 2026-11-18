@@ -788,6 +788,18 @@ pub enum Event {
         /// for events serialized before this field existed.
         #[cfg_attr(feature = "serde", serde(default))]
         error_message: Option<String>,
+        /// Camunda 8 v2 `retryBackOff` (#933): the absolute logical instant
+        /// (ms) before which the job, returned to the pool with retries left,
+        /// must not be re-activated (`now + retryBackOff` at fail time).
+        /// `None` when no backoff was requested (retryable immediately), when
+        /// no retries remain, and for events serialized before this field
+        /// existed. Skipped when `None`, so backoff-less fails stay
+        /// byte-identical.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        retry_backoff_until: Option<u64>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an
