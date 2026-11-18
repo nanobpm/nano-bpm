@@ -460,24 +460,32 @@ impl RaftTransport for PeerTransport {
 /// The replicated-command features a peer must advertise to decode `req`
 /// (#1661). Single canonical mapping from log content to wire requirement.
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
-    use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION;
+    use nano_falcon_protocol::cluster_join::{
+        FEATURE_CLUSTER_VARIABLES, FEATURE_REPLICATED_LENIENT_COMPLETION,
+    };
+    use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
         return Vec::new();
     };
-    let lenient = r.entries.iter().any(|entry| match &entry.payload {
-        openraft::EntryPayload::Normal(batch) => batch.items.iter().any(|item| {
-            matches!(
-                item.command,
-                nanobpmn_engine_core::Command::SetLenientCompletion { .. }
-            )
-        }),
-        _ => false,
-    });
-    if lenient {
-        vec![FEATURE_REPLICATED_LENIENT_COMPLETION]
-    } else {
-        Vec::new()
+    let mut required = Vec::new();
+    for entry in &r.entries {
+        let openraft::EntryPayload::Normal(batch) = &entry.payload else {
+            continue;
+        };
+        for item in &batch.items {
+            let feature = match item.command {
+                Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
+                Command::CreateClusterVariable { .. }
+                | Command::UpdateClusterVariable { .. }
+                | Command::DeleteClusterVariable { .. } => FEATURE_CLUSTER_VARIABLES,
+                _ => continue,
+            };
+            if !required.contains(&feature) {
+                required.push(feature);
+            }
+        }
     }
+    required
 }
 
 #[cfg(test)]
@@ -516,6 +524,33 @@ mod codec_tests {
             vec![nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION]
         );
         assert!(required_features_for(&req(vec![])).is_empty());
+        // #1657: every cluster-variable command requires cluster-variables-v1.
+        for command in [
+            Command::CreateClusterVariable {
+                tenant_id: None,
+                name: "x".into(),
+                value: nanobpmn_engine_core::Value::Int(1),
+                kind: Default::default(),
+                metadata: Default::default(),
+                distributed: false,
+            },
+            Command::UpdateClusterVariable {
+                tenant_id: None,
+                name: "x".into(),
+                value: nanobpmn_engine_core::Value::Int(2),
+                metadata: Default::default(),
+            },
+            Command::DeleteClusterVariable {
+                tenant_id: None,
+                name: "x".into(),
+                distributed: true,
+            },
+        ] {
+            assert_eq!(
+                required_features_for(&req(vec![entry(command)])),
+                vec![nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES]
+            );
+        }
         assert!(
             required_features_for(&req(vec![Entry::<RaftConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),

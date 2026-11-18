@@ -7122,6 +7122,11 @@ fn project_event(
         // Engine-internal routed-delivery dedup / close-tombstone ledger
         // (#1497): no read-model projection.
         | Event::RoutedDeliveryRecorded { .. }
+        // Cluster variables (#1657) are served from replicated engine state
+        // (the one source of truth), not projected into the read model.
+        | Event::ClusterVariableCreated { .. }
+        | Event::ClusterVariableUpdated { .. }
+        | Event::ClusterVariableDeleted { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }

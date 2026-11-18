@@ -259,20 +259,6 @@ pub struct Engine {
     /// container instance (durable from then on). Cleared per command, like
     /// [`torn_down_scopes`](Self::torn_down_scopes).
     esp_start_payloads: HashMap<(Key, Key, String), HashMap<String, Value>>,
-    /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
-    /// mutable snapshot of global + per-tenant configuration values that FEEL
-    /// expressions resolve at runtime. External configuration, not journaled
-    /// state: it is never part of a snapshot and never affects replay determinism
-    /// (the host re-installs the shared handle on every engine rebuild via
-    /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
-    /// in which case variable resolution keeps its zero-copy fast path.
-    cluster_variables: crate::cluster_vars::ClusterVariables,
-    /// The cluster-variable snapshot pinned for the command being applied
-    /// (#1640): taken once at command entry so every read during the command —
-    /// the FEEL overlay and SECRET_REFERENCE trust attribution — observes ONE
-    /// immutable state. `None` outside a command (reads then take a fresh
-    /// snapshot). Cleared on every exit, like `operation_reference`.
-    pinned_cluster_variables: Option<std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -696,8 +682,6 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
-            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
-            pinned_cluster_variables: None,
             raft_applied: None,
         }
     }
@@ -772,47 +756,19 @@ impl Engine {
         self.legacy_lenient_completion = lenient;
     }
 
-    /// Installs the shared [`ClusterVariables`](crate::cluster_vars::ClusterVariables)
-    /// handle the engine reads while assembling a FEEL evaluation context. The host
-    /// (the gateway) owns the write side and mutates the snapshot as REST create /
-    /// update / delete requests land; the engine observes the live set. Cluster
-    /// variables are external configuration, so this is host-side wiring that never
-    /// affects replay/snapshot determinism — the host re-installs the handle after
-    /// every engine rebuild (replay / snapshot restore) so the link survives.
-    pub fn set_cluster_variables(
-        &mut self,
-        cluster_variables: crate::cluster_vars::ClusterVariables,
-    ) {
-        self.cluster_variables = cluster_variables;
+    /// The replicated cluster-variable state (#1657) every FEEL evaluation
+    /// reads: engine state, changed only by the cluster-variable commands, so
+    /// it is the value at the log position being applied.
+    pub fn cluster_variables(&self) -> &crate::cluster_vars::ClusterVariableState {
+        &self.state.cluster_variables
     }
 
-    /// A fresh read of the shared cluster-variable handle: one immutable
-    /// snapshot (a refcount bump under a brief read lock).
-    fn read_cluster_snapshot(
-        &self,
-    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
-        let guard = self
-            .cluster_variables
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        std::sync::Arc::clone(&guard)
-    }
-
-    /// The cluster-variable snapshot every evaluation must read through: the
-    /// one pinned for the current command, or a fresh read outside a command.
-    /// The single accessor, so no two reads within a command can diverge.
-    pub(crate) fn cluster_snapshot(
-        &self,
-    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
-        match &self.pinned_cluster_variables {
-            Some(pinned) => std::sync::Arc::clone(pinned),
-            None => self.read_cluster_snapshot(),
-        }
-    }
-
-    /// The shared cluster-variable handle (see [`Self::set_cluster_variables`]).
-    pub fn cluster_variables(&self) -> &crate::cluster_vars::ClusterVariables {
-        &self.cluster_variables
+    /// Whether this partition has EVER applied a cluster-variable create
+    /// (#1657). One-way: the id cursor is never reset, so this stays `true`
+    /// after every variable is deleted and across snapshot recovery — the
+    /// retained log/snapshot still depends on `cluster-variables-v1`.
+    pub fn cluster_variables_ever_used(&self) -> bool {
+        !self.state.cluster_variables.is_unused()
     }
 
     /// The cluster-wide partition count this engine is configured with.
@@ -896,8 +852,6 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
-            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
-            pinned_cluster_variables: None,
             raft_applied,
         }
     }
@@ -2524,7 +2478,6 @@ impl Engine {
         // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
         // a reference can never leak into a later command.
         self.operation_reference = operation_reference;
-        self.pinned_cluster_variables = Some(self.read_cluster_snapshot());
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log);
@@ -2532,7 +2485,6 @@ impl Engine {
             log
         });
         self.operation_reference = None;
-        self.pinned_cluster_variables = None;
         result
     }
 
@@ -2703,6 +2655,88 @@ impl Engine {
                         decision_evaluation_key,
                     },
                 );
+            }
+
+            Command::CreateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                kind,
+                metadata,
+                distributed,
+            } => {
+                // Zeebe `ClusterVariableCreateProcessor`: a duplicate is
+                // rejected on the authoritative partition; a distributed copy
+                // upserts the already-validated record.
+                if !distributed
+                    && self
+                        .state
+                        .cluster_variables
+                        .get(tenant_id.as_deref(), &name)
+                        .is_some()
+                {
+                    return Err(EngineError::ClusterVariableAlreadyExists { tenant_id, name });
+                }
+                self.emit(
+                    &mut log,
+                    Event::ClusterVariableCreated {
+                        tenant_id,
+                        name,
+                        value,
+                        kind,
+                        metadata,
+                    },
+                );
+            }
+
+            Command::UpdateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+            } => {
+                // Capture the preserved kind in the same turn that validates
+                // and commits the update, so the event carries the complete
+                // post-mutation record (bar the id): a consumer deriving the
+                // response from the proposal's own events then never re-reads
+                // live state, where a concurrent delete/recreate could swap
+                // the kind under it (PR #1670 review).
+                let Some(existing) = self
+                    .state
+                    .cluster_variables
+                    .get(tenant_id.as_deref(), &name)
+                else {
+                    return Err(EngineError::ClusterVariableNotFound { tenant_id, name });
+                };
+                let kind = existing.kind;
+                self.emit(
+                    &mut log,
+                    Event::ClusterVariableUpdated {
+                        tenant_id,
+                        name,
+                        value,
+                        metadata,
+                        kind,
+                    },
+                );
+            }
+
+            Command::DeleteClusterVariable {
+                tenant_id,
+                name,
+                distributed,
+            } => {
+                let exists = self
+                    .state
+                    .cluster_variables
+                    .get(tenant_id.as_deref(), &name)
+                    .is_some();
+                if exists {
+                    self.emit(&mut log, Event::ClusterVariableDeleted { tenant_id, name });
+                } else if !distributed {
+                    return Err(EngineError::ClusterVariableNotFound { tenant_id, name });
+                }
+                // else: an idempotent fan-out copy, already absent here.
             }
 
             Command::EvaluateDecision {
@@ -18201,6 +18235,18 @@ pub enum EngineError {
     /// `EvaluateDecision` referenced a decision (by id or key) that was never
     /// deployed. `reference` describes it (`id 'x'` / `key 123`).
     DecisionNotFound { reference: String },
+    /// `CreateClusterVariable` named a `(tenant, name)` that already exists
+    /// (#1657). `tenant_id` `None` is the global scope.
+    ClusterVariableAlreadyExists {
+        tenant_id: Option<String>,
+        name: String,
+    },
+    /// `UpdateClusterVariable` / `DeleteClusterVariable` named a
+    /// `(tenant, name)` that does not exist (#1657).
+    ClusterVariableNotFound {
+        tenant_id: Option<String>,
+        name: String,
+    },
     /// `DeployProcess` was given a definition whose `start_event` is not among
     /// its elements.
     NoStartEvent { process_id: String },
@@ -18831,6 +18877,17 @@ impl std::fmt::Display for EngineError {
             EngineError::DecisionNotFound { reference } => {
                 write!(f, "no deployed decision with {reference}")
             }
+            EngineError::ClusterVariableAlreadyExists { tenant_id, name } => match tenant_id {
+                None => write!(f, "a global cluster variable named '{name}' already exists"),
+                Some(t) => write!(
+                    f,
+                    "a cluster variable named '{name}' already exists for tenant '{t}'"
+                ),
+            },
+            EngineError::ClusterVariableNotFound { tenant_id, name } => match tenant_id {
+                None => write!(f, "no global cluster variable named '{name}'"),
+                Some(t) => write!(f, "no cluster variable named '{name}' for tenant '{t}'"),
+            },
             EngineError::StartEventExpressionInvalid {
                 process_id,
                 element_id,
@@ -19244,6 +19301,8 @@ impl EngineError {
             // replicated truth.
             EngineError::ProcessNotFound { .. }
             | EngineError::DecisionNotFound { .. }
+            | EngineError::ClusterVariableAlreadyExists { .. }
+            | EngineError::ClusterVariableNotFound { .. }
             | EngineError::NoStartEvent { .. }
             | EngineError::StartEventExpressionInvalid { .. }
             | EngineError::InvalidProcessModel { .. }

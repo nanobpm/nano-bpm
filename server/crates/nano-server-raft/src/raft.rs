@@ -484,6 +484,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
         // A structurally invalid process handed straight to deploy.
         E::InvalidProcessModel { .. } => (400, e.to_string()),
+        // Replicated cluster-variable mutations (#1657).
+        E::ClusterVariableAlreadyExists { .. } => (409, e.to_string()),
+        E::ClusterVariableNotFound { .. } => (404, e.to_string()),
         other => (500, other.to_string()),
     }
 }

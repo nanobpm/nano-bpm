@@ -1529,18 +1529,81 @@ fn read_segment_events_tagged_with(
     num_partitions: usize,
     tail: TailPolicy,
 ) -> io::Result<Vec<(u64, Event)>> {
-    read_segment_with(path, tail, |line| {
+    // The attribution check runs after the read so a fail-closed rejection is
+    // never mistaken for (and dropped as) a torn tail by `read_segment_with`.
+    let mut unattributed: Option<io::Error> = None;
+    let events = read_segment_with(path, tail, |line| {
         let (tag, json) = match line.split_once('\t') {
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
         let event = decode_journal_event(json)?;
+        if unattributed.is_none()
+            && let Err(e) =
+                check_cluster_variable_attribution(&event, tag.is_some(), num_partitions)
+        {
+            unattributed = Some(e);
+        }
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         Ok((tag, event))
     })
-    .map(|(events, _)| events)
+    .map(|(events, _)| events)?;
+    match unattributed {
+        Some(e) => Err(e),
+        None => Ok(events),
+    }
+}
+
+/// An UNTAGGED (legacy, `NANOBPMN_JOURNAL_SEGMENTED=0`) cluster-variable
+/// lifecycle record found in a journal shared by more than one partition
+/// (#1657, ADR 0066). The legacy format records no producing partition, and a
+/// cluster variable is replicated per partition by a fan-out that may have
+/// been interrupted — so neither routing is faithful: broadcasting installs a
+/// value into partitions whose own copy never committed, and the key fallback
+/// loses it everywhere but partition 0. Recovery therefore fails closed (the
+/// #1473 / #1066 rule) instead of guessing. The server refuses cluster-variable
+/// writes in that mode, so such a record only exists if written by a build
+/// without that guard. Downcastable from the returned `io::Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattributedClusterVariableError {
+    /// Partitions sharing the journal (always `> 1`).
+    pub num_partitions: usize,
+}
+
+impl std::fmt::Display for UnattributedClusterVariableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to recover: the journal holds an untagged (NANOBPMN_JOURNAL_SEGMENTED=0) \
+             cluster-variable record shared by {} partitions; the legacy format records no \
+             producing partition, so it cannot be replayed without guessing which partitions \
+             committed it (#1657, ADR 0066 — fail closed per #1066/#1473). Operator action: \
+             remove the record from the journal (or restore a backup) and re-create the \
+             variable with segmented journals enabled, or run single-partition.",
+            self.num_partitions
+        )
+    }
+}
+
+impl std::error::Error for UnattributedClusterVariableError {}
+
+/// The single canonical cluster-variable attribution guard (#1657): `Err`
+/// ([`UnattributedClusterVariableError`]) iff `event` is a cluster-variable
+/// lifecycle record WITHOUT a producing-partition tag in a journal shared by
+/// more than one partition. Single-partition journals are always attributable.
+pub fn check_cluster_variable_attribution(
+    event: &Event,
+    tagged: bool,
+    num_partitions: usize,
+) -> io::Result<()> {
+    if !tagged && num_partitions > 1 && event.is_cluster_variable_lifecycle() {
+        return Err(io::Error::other(UnattributedClusterVariableError {
+            num_partitions,
+        }));
+    }
+    Ok(())
 }
 
 /// Loads the latest persisted snapshot in `dir`.
@@ -2211,6 +2274,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
         };
         let event = decode_journal_event(json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        check_cluster_variable_attribution(&event, tag.is_some(), num_partitions)?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
@@ -6917,6 +6981,98 @@ mod tests {
     /// The tagged multi-partition reader applies the same discipline: an unknown
     /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
     /// dropped record.
+    fn cluster_var_created_json(name: &str) -> String {
+        serde_json::to_string(&Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: name.to_string(),
+            value: nanobpmn_engine_core::Value::Int(1),
+            kind: Default::default(),
+            metadata: Default::default(),
+        })
+        .unwrap()
+    }
+
+    fn is_unattributed_cluster_variable(err: &io::Error) -> bool {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<UnattributedClusterVariableError>())
+            .is_some()
+    }
+
+    /// PR #1670 review (#1657, ADR 0066): an UNTAGGED cluster-variable record
+    /// in a multi-partition journal has no producing partition, so segmented
+    /// recovery must fail closed with the typed error — never broadcast it into
+    /// partitions whose fan-out copy may never have committed.
+    #[test]
+    fn segmented_recovery_fails_closed_on_untagged_cluster_variable() {
+        let dir = temp_dir("untagged-cluster-vars");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!("{}\n", cluster_var_created_json("legacy")),
+        )
+        .unwrap();
+        let err = recover_multi(&dir, &[0, 1, 2], 3, None)
+            .err()
+            .expect("an unattributable cluster-variable record must fail closed");
+        assert!(is_unattributed_cluster_variable(&err), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same guard covers the cold archive reader.
+    #[test]
+    fn parse_cold_file_tagged_fails_closed_on_untagged_cluster_variable() {
+        let dir = temp_dir("cold-untagged-cluster-var");
+        fs::create_dir_all(&dir).unwrap();
+        let path = cold_name(&dir, 0, 1);
+        let plaintext = format!("{}\n", cluster_var_created_json("legacy"));
+        fs::write(&path, deflate_all(plaintext.as_bytes()).unwrap()).unwrap();
+        let err = parse_cold_file_tagged(&path, 2).expect_err("must fail closed");
+        assert!(is_unattributed_cluster_variable(&err), "{err}");
+        // Single-partition: every record is attributable to partition 0.
+        let ok = parse_cold_file_tagged(&path, 1).expect("single-partition is attributable");
+        assert_eq!(ok.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unaffected paths: a TAGGED cluster-variable record stays routed by its
+    /// write tag, and a single-partition journal recovers untagged records.
+    #[test]
+    fn tagged_and_single_partition_cluster_variables_still_recover() {
+        let dir = temp_dir("tagged-cluster-vars");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!(
+                "0\t{}\n2\t{}\n",
+                cluster_var_created_json("a"),
+                cluster_var_created_json("a")
+            ),
+        )
+        .unwrap();
+        let recovery = recover_multi(&dir, &[0, 1, 2], 3, None).expect("recover");
+        for (p, engine) in &recovery.engines {
+            assert_eq!(
+                engine.cluster_variables().get(None, "a").is_some(),
+                *p != 1,
+                "tagged record routed by its write tag (p={p})"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("single-untagged-cluster-var");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!("{}\n", cluster_var_created_json("solo")),
+        )
+        .unwrap();
+        let recovery = recover_multi(&dir, &[0], 1, None).expect("single-partition recovers");
+        for (_, engine) in &recovery.engines {
+            assert!(engine.cluster_variables().get(None, "solo").is_some());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn read_segment_events_tagged_rejects_unknown_variant() {
         let dir = temp_dir("unknown-variant-tagged");

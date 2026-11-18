@@ -11,6 +11,7 @@ use crate::ActivateElementInstruction;
 mod adhoc;
 mod boundary;
 mod call_activity;
+mod cluster_variables;
 mod compensation_escalation;
 mod conditional_start;
 mod error_end_event;

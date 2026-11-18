@@ -947,6 +947,19 @@ pub enum ClientFrame {
         joint_suspected: bool,
         reason: String,
     },
+    /// **Intra-cluster only.** Applies a cluster-variable command (#1657 —
+    /// `Create`/`Update`/`DeleteClusterVariable`) on global partition
+    /// `partition`, which the receiving node leads, through its replicated
+    /// funnel. Sent only once every peer advertises
+    /// [`cluster_join::FEATURE_CLUSTER_VARIABLES`] (ADR 0066 rolling-upgrade gate). Answered
+    /// by a `CommandResult`: 200 carrying the post-apply variable record (JSON,
+    /// or `null` once deleted), or the engine rejection's status (409 / 404).
+    #[serde(rename_all = "camelCase")]
+    ApplyClusterVariable {
+        corr: u64,
+        partition: u64,
+        command: nanobpmn_engine_core::Command,
+    },
 }
 
 impl ClientFrame {

@@ -871,6 +871,7 @@ async fn handle_client_frame(
         ClientFrame::UpdateJob { .. } => "update_job",
         ClientFrame::ForwardAgentInstance { .. } => "forward_agent_instance",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
+        ClientFrame::ApplyClusterVariable { .. } => "apply_cluster_variable",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
         ClientFrame::GetByKey { .. } => "get_by_key",
@@ -1648,6 +1649,28 @@ async fn handle_client_frame(
                     .await
             })
             .await;
+        }
+        ClientFrame::ApplyClusterVariable {
+            corr,
+            partition,
+            command,
+        } => {
+            let reply = match server
+                .apply_cluster_variable_local(partition, command)
+                .await
+            {
+                Ok(record) => ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(serde_json::to_value(record).unwrap_or(Value::Null)),
+                },
+                Err((status, message)) => ServerFrame::CommandResult {
+                    corr,
+                    status,
+                    body: Some(Value::String(message)),
+                },
+            };
+            conn.send(reply);
         }
         ClientFrame::SetVariables {
             corr,

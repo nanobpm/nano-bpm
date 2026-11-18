@@ -4386,5 +4386,20 @@
       "retries": 3,
       "scope": 0
     }
+  },
+  {
+    "ClusterVariableCreated": {
+      "kind": "SECRET_REFERENCE",
+      "metadata": {
+        "owner": {
+          "Str": "ops"
+        }
+      },
+      "name": "apiCfg",
+      "tenant_id": "<default>",
+      "value": {
+        "Str": "camunda.secrets.TOKEN"
+      }
+    }
   }
 ]

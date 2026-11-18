@@ -328,6 +328,15 @@ the loss on restart, and replay against today's values.
   mutation is itself a log entry; the removed handle can no longer be reintroduced because apply's
   input type has no place for it and the lint bans the lock types in the apply crates. If a host
   input ever slips in anyway, the divergence digest fail-stops the affected follower.
+- **Untagged legacy journal** (`NANOBPMN_JOURNAL_SEGMENTED=0`) with more than one partition:
+  each partition commits its own fan-out copy, but that format records no producing partition, so
+  recovery cannot tell which partitions committed an interrupted fan-out (a broadcast would install
+  a copy that never committed; a key route would lose it). Cluster variables **fail closed** there:
+  create/update/delete are rejected with 503 naming the mode and the remedy (segmented journals, or
+  a single partition), a startup warning says they are unavailable, and recovery refuses any
+  untagged cluster-variable record in a multi-partition journal with the typed
+  `UnattributedClusterVariableError` (the #1473 attribution rule). Single-partition legacy and
+  segmented journals are unaffected.
 
 ## Consequences
 

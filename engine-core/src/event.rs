@@ -425,6 +425,48 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
+    /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
+    /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
+    /// configuration state: carries no key; a shared journal tags it with the
+    /// partition that wrote it.
+    ClusterVariableCreated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+
+    /// A cluster variable's value and metadata were replaced (#1657; Zeebe
+    /// `ClusterVariableIntent.UPDATED`). Its id and kind are preserved.
+    ///
+    /// `kind` is the variable's preserved kind, captured by the applying
+    /// engine in the same turn that commits the update. Carrying it on the
+    /// event lets a gateway derive the response/fan-out record entirely from
+    /// the proposal's own events — a live-state re-read runs in a separate
+    /// actor turn, so a concurrent delete/recreate could otherwise combine
+    /// the new value with a replacement's kind (PR #1670 review). Additive
+    /// (`serde(default)`): records written before this field decode with the
+    /// `Json` default, which only the (unused) response projection ever read.
+    ClusterVariableUpdated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+    },
+
+    /// A cluster variable was deleted (#1657; Zeebe `ClusterVariableIntent.DELETED`).
+    ClusterVariableDeleted {
+        tenant_id: Option<String>,
+        name: String,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -2142,8 +2184,26 @@ impl Event {
             | Event::RaftEntryApplied { .. }
             | Event::LenientCompletionSet { .. }
             | Event::RoutedDeliveryRecorded { .. }
+            | Event::ClusterVariableCreated { .. }
+            | Event::ClusterVariableUpdated { .. }
+            | Event::ClusterVariableDeleted { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
+    }
+
+    /// `true` for the cluster-variable lifecycle events (#1657): keyless and
+    /// partition-agnostic, replicated to EVERY partition by the fan-out. Any
+    /// recovery path reading an untagged (legacy) journal must broadcast them
+    /// to every partition rather than route them by [`Event::owning_partition`]
+    /// (which assigns the keyless record to partition 0). The single canonical
+    /// predicate shared by the legacy demux and segmented recovery.
+    pub fn is_cluster_variable_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::ClusterVariableCreated { .. }
+                | Event::ClusterVariableUpdated { .. }
+                | Event::ClusterVariableDeleted { .. }
+        )
     }
 
     /// The decision evaluation an [`Event::DecisionEvaluated`] records — Zeebe's

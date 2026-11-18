@@ -151,79 +151,6 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Mapping-time **secret-reference provenance** of an element's input
-    /// mappings (#1640): for each `=`-FEEL mapping, the secret names
-    /// [`crate::feel::eval_with_provenance`] (the single, fail-closed
-    /// structural attribution of #1636) attributes to a trusted source when
-    /// the source is evaluated against `vars` — the exact view the mappings
-    /// run against — keyed by the mapping's target path.
-    ///
-    /// Trusted roots are the `SECRET_REFERENCE`-kind cluster variables that
-    /// are actually what `vars` resolves for that name from `view_scope` — the
-    /// scope the mappings evaluate against. A root bound by a variable on
-    /// `view_scope`'s OWN visible chain (the root or an ENCLOSING scope — the
-    /// bindings that genuinely shadow the cluster variable for this element),
-    /// or whose visible value differs from the cluster value, is untrusted
-    /// (fail closed). A binding in a scope OFF that chain (a sibling parallel
-    /// branch's local) is invisible to the mapping's evaluation, so it must
-    /// not revoke trust — checking every scope of the instance would let one
-    /// branch's local `apiCfg` strip a sibling's trust and bypass its
-    /// missing-secret incident handling (#1652 round-5 review).
-    ///
-    /// Overwrite: mappings apply in order, so a later mapping writing a path
-    /// drops the provenance of that path, its ancestors and its descendants,
-    /// and re-records it only when its own value is attributable. Static
-    /// (non-`=`) sources and unevaluable sources record nothing.
-    ///
-    /// Test-only: production captures value and provenance in ONE evaluation
-    /// via [`eval_input_mappings_with_provenance`](Self::eval_input_mappings_with_provenance)
-    /// (a re-evaluation could diverge for a nondeterministic source); this
-    /// provenance-only form survives for the focused provenance tests.
-    #[cfg(test)]
-    pub(crate) fn secret_provenance_of(
-        &self,
-        instance_key: Key,
-        view_scope: Key,
-        vars: &HashMap<String, Value>,
-        mappings: &[crate::model::Mapping],
-    ) -> Vec<crate::state::SecretProvenance> {
-        if mappings.is_empty() {
-            return Vec::new();
-        }
-        let trusted = self.trusted_secret_roots(instance_key, view_scope, vars);
-        // Fast path: nothing can be attributed without a trusted root or a
-        // literal `camunda.secrets.<name>` path.
-        if trusted.is_empty() && !mappings.iter().any(|m| m.source.contains("camunda")) {
-            return Vec::new();
-        }
-        let mut out: Vec<crate::state::SecretProvenance> = Vec::new();
-        for m in mappings {
-            // The SAME segmentation `assign_io_target` writes with, so an
-            // aliased spelling (`payload..auth`) overwrites the provenance of
-            // the field it actually overwrites.
-            let path = io_target_segments(&m.target).join(".");
-            out.retain(|p| !paths_overlap(&p.path, &path));
-            if path.is_empty() {
-                continue;
-            }
-            if !m.source.trim_start().starts_with('=') {
-                continue;
-            }
-            let Ok(evaluated) =
-                crate::feel::eval_with_provenance(m.source.trim(), vars, trusted.iter().cloned())
-            else {
-                continue;
-            };
-            if !evaluated.referenced_secrets.is_empty() {
-                out.push(crate::state::SecretProvenance {
-                    path,
-                    secrets: evaluated.referenced_secrets,
-                });
-            }
-        }
-        out
-    }
-
     /// The trusted secret-reference roots for an evaluation against `vars`
     /// from `view_scope` (#1640): the `SECRET_REFERENCE`-kind cluster
     /// variables that no binding ON `view_scope`'s visible chain shadows and
@@ -234,13 +161,13 @@ impl Engine {
         view_scope: Key,
         vars: &HashMap<String, Value>,
     ) -> Vec<String> {
-        // The SAME pinned snapshot `vars` was overlaid from (#1640): reading
-        // kinds from a fresh snapshot would let a JSON -> SECRET_REFERENCE
-        // retype between the two reads mint trust. Cluster variables are
-        // node-local, not replicated state, so replicas can still disagree on
-        // this attribution — tracked in #1657.
+        // The SAME replicated state `vars` was overlaid from (#1640, #1657):
+        // cluster variables are engine state changed only by their own
+        // commands, so values and kinds are one consistent view for the whole
+        // command, and every replica attributes trust identically.
         let cluster_roots = self
-            .cluster_snapshot()
+            .state
+            .cluster_variables
             .trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT);
         let instance = self.state.instances.get(&instance_key);
         // Only bindings on `view_scope`'s OWN chain shadow what the mapping
@@ -637,7 +564,7 @@ impl Engine {
         self.overlay_cluster_variables(Arc::new(merged))
     }
 
-    /// Layers the host-injected [cluster variables](crate::cluster_vars) *beneath*
+    /// Layers the replicated [cluster variables](crate::cluster_vars) *beneath*
     /// an instance's own visible variables, so a FEEL expression evaluated against
     /// the result reads a cluster variable whenever the instance does not define a
     /// same-named local (instance/scope variables always shadow cluster ones).
@@ -652,7 +579,7 @@ impl Engine {
         &self,
         base: Arc<HashMap<String, Value>>,
     ) -> Arc<HashMap<String, Value>> {
-        let guard = self.cluster_snapshot();
+        let guard = &self.state.cluster_variables;
         if guard.is_empty() {
             return base;
         }
@@ -1338,30 +1265,42 @@ mod tests {
         assert!(Arc::ptr_eq(&base, &out), "empty snapshot must not clone");
     }
 
+    /// Creates a cluster variable through the replicated command (#1657).
+    fn put(engine: &mut Engine, tenant: Option<&str>, name: &str, value: Value) {
+        engine
+            .apply_command(crate::Command::CreateClusterVariable {
+                tenant_id: tenant.map(str::to_string),
+                name: name.to_string(),
+                value,
+                kind: crate::cluster_vars::ClusterVariableKind::Json,
+                metadata: Default::default(),
+                distributed: false,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn cluster_variable_overlay_layers_under_instance_variables() {
-        use std::sync::{Arc as StdArc, RwLock};
-
-        use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
+        use crate::cluster_vars::DEFAULT_TENANT;
 
         let mut engine = Engine::new();
-        let mut snap = ClusterVariableSnapshot::default();
         // A global var, and a same-named var the instance will shadow.
-        snap.global
-            .insert("region".to_string(), Value::Str("EMEA".to_string()));
-        snap.global
-            .insert("shared".to_string(), Value::Str("from-global".to_string()));
+        put(&mut engine, None, "region", Value::Str("EMEA".to_string()));
+        put(
+            &mut engine,
+            None,
+            "shared",
+            Value::Str("from-global".to_string()),
+        );
         // A default-tenant var (visible to the single-tenant engine).
-        snap.tenants
-            .entry(DEFAULT_TENANT.to_string())
-            .or_default()
-            .insert("tier".to_string(), Value::Int(2));
+        put(&mut engine, Some(DEFAULT_TENANT), "tier", Value::Int(2));
         // A var scoped to some other tenant must NOT be visible.
-        snap.tenants
-            .entry("other".to_string())
-            .or_default()
-            .insert("secret".to_string(), Value::Str("nope".to_string()));
-        engine.set_cluster_variables(StdArc::new(RwLock::new(StdArc::new(snap))));
+        put(
+            &mut engine,
+            Some("other"),
+            "secret",
+            Value::Str("nope".to_string()),
+        );
 
         let mut base = HashMap::new();
         base.insert(
@@ -1388,20 +1327,16 @@ mod tests {
     /// that may carry `camunda.secrets.<name>` reference text. The engine NEVER
     /// resolves it — the overlay hands the reference text through unchanged, so
     /// nothing resolved can ever reach the journal or a snapshot. (Resolution
-    /// happens at job activation, host-side; see the issue's follow-up.)
+    /// happens at job activation, host-side.)
     #[test]
     fn cluster_variable_overlay_passes_secret_reference_text_through() {
-        use std::sync::{Arc as StdArc, RwLock};
-
-        use crate::cluster_vars::ClusterVariableSnapshot;
-
         let mut engine = Engine::new();
-        let mut snap = ClusterVariableSnapshot::default();
-        snap.global.insert(
-            "api_token".to_string(),
+        put(
+            &mut engine,
+            None,
+            "api_token",
             Value::Str("camunda.secrets.API_TOKEN".to_string()),
         );
-        engine.set_cluster_variables(StdArc::new(RwLock::new(StdArc::new(snap))));
 
         let out = engine.overlay_cluster_variables(Arc::new(HashMap::new()));
         assert_eq!(

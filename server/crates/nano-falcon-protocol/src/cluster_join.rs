@@ -31,9 +31,17 @@ pub const CLUSTER_FEATURES_HEADER: &str = "x-nano-cluster-features";
 /// `Command::SetLenientCompletion` / `Event::LenientCompletionSet` (#1661).
 pub const FEATURE_REPLICATED_LENIENT_COMPLETION: &str = "replicated-lenient-completion";
 
+/// Replicated cluster-variable commands and events (#1657). Those Raft
+/// entries are not decodable by an older binary, so a gateway emits them only
+/// when every voter and learner advertises this (ADR 0066 rolling-upgrade gate).
+pub const FEATURE_CLUSTER_VARIABLES: &str = "cluster-variables-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
-pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[FEATURE_REPLICATED_LENIENT_COMPLETION];
+pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
+    FEATURE_REPLICATED_LENIENT_COMPLETION,
+    FEATURE_CLUSTER_VARIABLES,
+];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.
 pub fn local_features_header() -> String {

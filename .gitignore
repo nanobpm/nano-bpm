@@ -49,3 +49,7 @@ nohup.out
 
 # Generated nanobpm.io Pages site (built by website/build.mjs)
 website/_site/
+
+# Python bytecode caches from the codegen helper scripts (machine-local).
+__pycache__/
+*.pyc

@@ -112,6 +112,42 @@ pub enum Command {
         instance_key: Key,
         decision_evaluation_key: Key,
     },
+    /// Create a **cluster variable** (#1657; Zeebe `ClusterVariableIntent.CREATE`).
+    /// `tenant_id` `None` is the global scope. Rejected with
+    /// [`crate::EngineError::ClusterVariableAlreadyExists`] when one already
+    /// exists for `(tenant_id, name)` — unless `distributed`, which marks a
+    /// fan-out copy of a create/update already validated on the authoritative
+    /// partition: it then upserts the full record (value, kind, metadata),
+    /// preserving an existing id — idempotent under re-delivery, and a
+    /// partition that missed an earlier copy converges.
+    CreateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        kind: crate::cluster_vars::ClusterVariableKind,
+        metadata: std::collections::BTreeMap<String, Value>,
+        distributed: bool,
+    },
+    /// Replace an existing cluster variable's value and metadata (its id and
+    /// kind are preserved). Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent. Only ever
+    /// processed on the authoritative partition: the fan-out to the other
+    /// partitions carries the resulting full record as a `distributed`
+    /// [`Command::CreateClusterVariable`] upsert.
+    UpdateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+    /// Delete a cluster variable. Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent — unless
+    /// `distributed` (a fan-out copy), which is then an idempotent no-op.
+    DeleteClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        distributed: bool,
+    },
     /// Evaluate a deployed decision on demand — the standalone EvaluateDecision
     /// API (Zeebe `DecisionEvaluation:EVALUATE`). Resolves the decision, evaluates
     /// it against `variables`, and records the evaluation as an
@@ -1071,6 +1107,18 @@ impl Command {
                 h.key(*instance_key);
                 h.key(*decision_evaluation_key);
             }
+            Command::CreateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => {
+                h.str(tenant_id.as_deref().unwrap_or(""));
+                h.str(name);
+            }
             Command::EvaluateDecision { decision, .. } => match decision {
                 DecisionReference::Id(id) => h.str(id),
                 DecisionReference::Key(key) => h.key(*key),
@@ -1221,6 +1269,9 @@ impl Command {
             Command::DeployGenericResources(_) => "deploy_generic_resources",
             Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
+            Command::CreateClusterVariable { .. } => "create_cluster_variable",
+            Command::UpdateClusterVariable { .. } => "update_cluster_variable",
+            Command::DeleteClusterVariable { .. } => "delete_cluster_variable",
             Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
@@ -1355,6 +1406,33 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // Cluster-variable writes carry an arbitrary value and metadata map
+            // (#1657 review): count them so the Raft batcher's byte budget sees
+            // the real proposal size instead of the fixed base.
+            Command::CreateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+                ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+            } => {
+                tenant_id.as_ref().map_or(0, |t| t.len() as u64)
+                    + name.len() as u64
+                    + value.approx_bytes()
+                    + metadata
+                        .iter()
+                        .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+                        .sum::<u64>()
+            }
+            Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => tenant_id.as_ref().map_or(0, |t| t.len() as u64) + name.len() as u64,
             // The stamp's strings are leader-resolved metadata of unbounded
             // length (#1574 review): count them so the batcher's byte budget
             // sees the real proposal size.
@@ -1908,6 +1986,45 @@ mod kind_tests {
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
         );
+    }
+
+    // #1657 review: cluster-variable create/update (incl. distributed fan-out
+    // copies) and delete must count their payload, not the fixed base.
+    #[test]
+    fn approx_bytes_counts_cluster_variable_payloads() {
+        use std::collections::BTreeMap;
+        let big = "x".repeat(50_000);
+        let mut meta = BTreeMap::new();
+        meta.insert("m".to_string(), Value::Str("y".repeat(10_000)));
+        let tenant = Some("t".repeat(1_000));
+        let name = "n".repeat(1_000);
+        for distributed in [false, true] {
+            let c = Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: Value::Str(big.clone()),
+                kind: crate::cluster_vars::ClusterVariableKind::default(),
+                metadata: meta.clone(),
+                distributed,
+            };
+            assert!(
+                c.approx_bytes() >= 62_000,
+                "create distributed={distributed}"
+            );
+        }
+        let u = Command::UpdateClusterVariable {
+            tenant_id: tenant.clone(),
+            name: name.clone(),
+            value: Value::Str(big),
+            metadata: meta,
+        };
+        assert!(u.approx_bytes() >= 62_000);
+        let d = Command::DeleteClusterVariable {
+            tenant_id: tenant,
+            name,
+            distributed: false,
+        };
+        assert!(d.approx_bytes() >= 2_000);
     }
 
     // #1574 review: a stamped orphan quarantine carries leader-resolved strings;

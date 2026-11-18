@@ -1194,6 +1194,23 @@ impl PeerLink {
         .await
     }
 
+    /// Applies a cluster-variable command (#1657) on global `partition`, which
+    /// the peer leads, through the peer's replicated funnel.
+    pub async fn apply_cluster_variable(
+        &self,
+        partition: u64,
+        command: nanobpmn_engine_core::Command,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ApplyClusterVariable {
+                corr,
+                partition,
+                command,
+            }
+        })
+        .await
+    }
+
     /// Forwards a by-key variable merge to the peer that owns the scope.
     pub async fn set_variables(
         &self,
