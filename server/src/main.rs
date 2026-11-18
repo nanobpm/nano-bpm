@@ -2177,10 +2177,32 @@ struct JobErrorEntry {
 /// errors). `created` counts come from the read model. Shared across
 /// `ServerImpl` clones via `Arc`, like the other interior-mutable state on the
 /// struct.
-#[derive(Clone, Default)]
+///
+/// The logs are ephemeral (lost on restart) and bounded (oldest evicted past
+/// `capacity`), so an aggregation can under-report. `isIncomplete` (#934) is
+/// derived from two boundaries tracked here: `recording_since_ms` (when this
+/// process began recording — anything earlier was never seen by this log) and
+/// the eviction high-water mark (the latest `at_ms` ever evicted). A window
+/// `[from, to]` is complete iff `from` is at/after the recording start and
+/// strictly after every evicted entry.
+#[derive(Clone)]
 pub struct JobStatisticsState {
     metrics: Arc<std::sync::Mutex<std::collections::VecDeque<JobMetricEntry>>>,
     errors: Arc<std::sync::Mutex<std::collections::VecDeque<JobErrorEntry>>>,
+    /// Epoch ms this process started recording (restart boundary).
+    recording_since_ms: u64,
+    /// Latest `at_ms` evicted from `metrics`, `None` if nothing was evicted.
+    metrics_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Latest `at_ms` evicted from `errors`, `None` if nothing was evicted.
+    errors_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Per-log entry ceiling (`MAX_JOB_STAT_ENTRIES` in production).
+    capacity: usize,
+}
+
+impl Default for JobStatisticsState {
+    fn default() -> Self {
+        Self::with_limits(now_millis(), MAX_JOB_STAT_ENTRIES)
+    }
 }
 
 /// Safety ceiling on each in-memory job-statistics log so a long-running gateway
@@ -2204,11 +2226,48 @@ impl JobStatisticsState {
         self.errors.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn with_limits(recording_since_ms: u64, capacity: usize) -> Self {
+        Self {
+            metrics: Arc::default(),
+            errors: Arc::default(),
+            recording_since_ms,
+            metrics_evicted_through_ms: Arc::default(),
+            errors_evicted_through_ms: Arc::default(),
+            capacity,
+        }
+    }
+
+    /// Raise an eviction high-water mark to cover an evicted entry at `at_ms`.
+    fn note_evicted(mark: &std::sync::Mutex<Option<u64>>, at_ms: u64) {
+        let mut m = mark.lock().unwrap_or_else(|e| e.into_inner());
+        *m = Some(m.map_or(at_ms, |prev| prev.max(at_ms)));
+    }
+
+    /// Whether a `[from_ms, ..]` window may be missing entries given the
+    /// restart boundary and an eviction high-water mark (#934).
+    fn window_truncated(&self, mark: &std::sync::Mutex<Option<u64>>, from_ms: u64) -> bool {
+        let evicted = *mark.lock().unwrap_or_else(|e| e.into_inner());
+        from_ms < self.recording_since_ms || evicted.is_some_and(|m| from_ms <= m)
+    }
+
+    /// `isIncomplete` for a completed/failed aggregation starting at `from_ms`.
+    fn metrics_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.metrics_evicted_through_ms, from_ms)
+    }
+
+    /// `isIncomplete` for an error aggregation starting at `from_ms`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn errors_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.errors_evicted_through_ms, from_ms)
+    }
+
     fn record(&self, entry: JobMetricEntry) {
         let mut g = self.lock_metrics();
         g.push_back(entry);
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.metrics_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -2246,8 +2305,10 @@ impl JobStatisticsState {
             error_code,
             error_message,
         });
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.errors_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -8228,7 +8289,7 @@ impl ServerImpl {
                 status_metric(created),
                 status_metric(completed),
                 status_metric(failed),
-                false,
+                self.job_statistics.metrics_incomplete(from_ms),
             ),
         ))
     }
@@ -48059,6 +48120,105 @@ mod clustered_startup_tests {
             1,
             "a replayed throw-error is not recounted in error statistics"
         );
+    }
+
+    /// #934: forcing eviction past the ring capacity must surface
+    /// `isIncomplete == true` for any window reaching back into the evicted
+    /// range, while a window strictly after the eviction high-water mark (and
+    /// after the recording start) stays complete.
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_after_eviction() {
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(1_000_000_000_000, 2),
+            ..Default::default()
+        };
+        let base: u64 = 1_000_000_000_000;
+        let global = |from_ms: u64| models::GetGlobalJobStatisticsQueryParams {
+            from: ms_to_dt(from_ms).unwrap(),
+            to: ms_to_dt(base + 10_000).unwrap(),
+            job_type: None,
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let incomplete = |r: GResp| match r {
+            GResp::Status200_GlobalJobMetrics(g) => g.is_incomplete,
+            _ => panic!("expected 200 from global stats"),
+        };
+
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 1_000);
+        server
+            .job_statistics
+            .record_failed("t".into(), None, base + 2_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(!incomplete(r), "nothing evicted yet: complete");
+
+        // Third entry overflows capacity 2 → evicts the entry at base+1000.
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 3_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(
+            incomplete(r),
+            "window covering an evicted entry is incomplete"
+        );
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_000))
+            .await
+            .unwrap();
+        assert!(incomplete(r), "eviction high-water mark is inclusive");
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_001))
+            .await
+            .unwrap();
+        assert!(
+            !incomplete(r),
+            "window after every evicted entry is complete"
+        );
+    }
+
+    /// #934: a window that starts before this process began recording reaches
+    /// across the restart boundary (the ephemeral log lost that history).
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_across_restart_boundary() {
+        let since: u64 = 1_000_000_000_000;
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(since, 10),
+            ..Default::default()
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        for (from_ms, want) in [(since - 1, true), (since, false)] {
+            let r = server
+                .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                    from: ms_to_dt(from_ms).unwrap(),
+                    to: ms_to_dt(since + 1).unwrap(),
+                    job_type: None,
+                })
+                .await
+                .unwrap();
+            let GResp::Status200_GlobalJobMetrics(g) = r else {
+                panic!("expected 200");
+            };
+            assert_eq!(g.is_incomplete, want, "from={from_ms}");
+        }
+    }
+
+    /// #934: the error log tracks its own eviction high-water mark.
+    #[test]
+    fn job_error_log_eviction_marks_incomplete() {
+        let s = JobStatisticsState::with_limits(0, 1);
+        s.record_error("t".into(), None, "E".into(), "m".into(), 5);
+        assert!(!s.errors_incomplete(0));
+        s.record_error("t".into(), None, "E".into(), "m".into(), 9);
+        assert!(s.errors_incomplete(5));
+        assert!(!s.errors_incomplete(6));
+        assert!(!s.metrics_incomplete(0), "metrics log is independent");
     }
 
     #[tokio::test]
