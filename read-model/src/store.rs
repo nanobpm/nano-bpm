@@ -8367,6 +8367,7 @@ mod writability_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -8444,6 +8445,7 @@ mod writability_tests {
                     at: 600,
                     deadline: None,
                 }),
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -8530,6 +8532,7 @@ mod writability_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         apply_at(&store, &created, 9_000);
         let row = job_row(&store, 12);
@@ -8943,6 +8946,7 @@ mod definition_xml_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -9004,6 +9008,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             100,
         );
@@ -9215,6 +9220,7 @@ mod definition_xml_tests {
                     at: 600,
                     deadline: Some(70_000),
                 }),
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -9259,6 +9265,7 @@ mod definition_xml_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -9764,6 +9771,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobFailed {
                 job_key: 8_950,
@@ -9819,6 +9827,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobActivated {
                 job_key: 8_900,
@@ -11731,6 +11740,7 @@ mod decision_deletion_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let task = |user_task_key| Event::UserTaskCreated {
             user_task_key,
@@ -12578,6 +12588,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 7001,
@@ -12597,6 +12608,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 7002,
@@ -12662,6 +12674,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8001,
@@ -12691,6 +12704,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8002,
@@ -12719,6 +12733,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 2,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8003,
@@ -12781,6 +12796,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9001,
@@ -12800,6 +12816,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9002,
@@ -12846,6 +12863,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9101,
@@ -12866,6 +12884,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9102,
@@ -12914,6 +12933,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9201,
@@ -12933,6 +12953,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9202,
@@ -12951,6 +12972,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9203,
@@ -13002,6 +13024,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 // Durable activation with an explicitly-empty worker: the
                 // projection must land NULL, not `""`.
@@ -13077,6 +13100,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -13147,6 +13171,7 @@ mod element_instance_tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
             retry_backoff_until: None,
         };
         let mut state = State::default();
@@ -13330,6 +13355,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activate = |key, deadline| Event::JobActivated {
             job_key: key,
@@ -13457,6 +13483,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -13576,6 +13603,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -13694,6 +13722,7 @@ mod element_instance_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13799,6 +13828,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -13833,6 +13863,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13883,6 +13914,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -13970,6 +14002,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -14108,6 +14141,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7001,
@@ -14129,6 +14163,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7002,
@@ -14777,6 +14812,7 @@ mod read_surface_tests {
                 created_at: 0,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
         assert_ne!(
@@ -14801,6 +14837,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -14884,6 +14921,7 @@ mod read_surface_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // First delivery stamps the batch-time fallback for both timestamps.
         apply_at(&store, &legacy, 1_000);
@@ -14952,6 +14990,7 @@ mod read_surface_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
                 9_000,
             );
@@ -15039,6 +15078,7 @@ mod read_surface_tests {
                         created_at: 1_000,
                         priority: 0,
                         retries: 3,
+                        secret_provenance: Vec::new(),
                     },
                     1_000,
                 );
@@ -15117,6 +15157,7 @@ mod read_surface_tests {
                 created_at: 123,
                 priority: 0,
                 retries: 0,
+                secret_provenance: Vec::new(),
             };
             apply_at(&store, &created, 1_000);
             apply_at(&store, &terminal, 2_000);
@@ -15178,6 +15219,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8600,
@@ -15267,6 +15309,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8601,
@@ -15341,6 +15384,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8602,
@@ -15404,6 +15448,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8620,
@@ -15468,6 +15513,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8605,
@@ -15525,6 +15571,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = |at: u64, worker: &str| Event::JobActivated {
             job_key: 8610,
@@ -15584,6 +15631,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // Same-tick activation: `activated_at == created_at` (both from the
         // engine's per-command `self.now`).
@@ -15654,6 +15702,7 @@ mod read_surface_tests {
             created_at: 123,
             priority: 0,
             retries: 1,
+            secret_provenance: Vec::new(),
         };
         let fail = Event::JobFailed {
             job_key: 8500,
@@ -15709,6 +15758,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -16695,6 +16745,7 @@ mod job_position_gate_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         }
     }
 

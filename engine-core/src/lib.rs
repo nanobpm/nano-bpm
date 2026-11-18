@@ -151,8 +151,8 @@ pub use state::{
     IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
     JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
-    ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
-    UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES,
-    LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS, ROUTED_DELIVERY_LEDGER_CAP,
-    SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
+    ProcessInstanceState, SecretProvenance, SignalSubscription, StartTimer, State, Timer,
+    TimerKind, TimerState, UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY,
+    DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,
+    ROUTED_DELIVERY_LEDGER_CAP, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

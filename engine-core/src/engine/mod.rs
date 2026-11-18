@@ -271,6 +271,12 @@ pub struct Engine {
     /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
     /// in which case variable resolution keeps its zero-copy fast path.
     cluster_variables: crate::cluster_vars::ClusterVariables,
+    /// The cluster-variable snapshot pinned for the command being applied
+    /// (#1640): taken once at command entry so every read during the command —
+    /// the FEEL overlay and SECRET_REFERENCE trust attribution — observes ONE
+    /// immutable state. `None` outside a command (reads then take a fresh
+    /// snapshot). Cleared on every exit, like `operation_reference`.
+    pinned_cluster_variables: Option<std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -695,6 +701,7 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            pinned_cluster_variables: None,
             raft_applied: None,
         }
     }
@@ -774,6 +781,30 @@ impl Engine {
         cluster_variables: crate::cluster_vars::ClusterVariables,
     ) {
         self.cluster_variables = cluster_variables;
+    }
+
+    /// A fresh read of the shared cluster-variable handle: one immutable
+    /// snapshot (a refcount bump under a brief read lock).
+    fn read_cluster_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
+        let guard = self
+            .cluster_variables
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        std::sync::Arc::clone(&guard)
+    }
+
+    /// The cluster-variable snapshot every evaluation must read through: the
+    /// one pinned for the current command, or a fresh read outside a command.
+    /// The single accessor, so no two reads within a command can diverge.
+    pub(crate) fn cluster_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
+        match &self.pinned_cluster_variables {
+            Some(pinned) => std::sync::Arc::clone(pinned),
+            None => self.read_cluster_snapshot(),
+        }
     }
 
     /// The shared cluster-variable handle (see [`Self::set_cluster_variables`]).
@@ -863,6 +894,7 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            pinned_cluster_variables: None,
             raft_applied,
         }
     }
@@ -2489,6 +2521,7 @@ impl Engine {
         // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
         // a reference can never leak into a later command.
         self.operation_reference = operation_reference;
+        self.pinned_cluster_variables = Some(self.read_cluster_snapshot());
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log);
@@ -2496,6 +2529,7 @@ impl Engine {
             log
         });
         self.operation_reference = None;
+        self.pinned_cluster_variables = None;
         result
     }
 
@@ -7857,6 +7891,9 @@ impl Engine {
                     element_instance_key,
                     scope,
                     vars,
+                    // A re-driven body never sees the mapping-time view:
+                    // no secret provenance (fail closed, #1640).
+                    Vec::new(),
                 );
                 if pending {
                     (gate_activated(events, activated, 0), followups)
@@ -8307,6 +8344,7 @@ impl Engine {
                     element_id.clone(),
                     element_instance_key,
                     scope,
+                    scope,
                     Arc::new(vars),
                     true,
                 )
@@ -8382,6 +8420,7 @@ impl Engine {
             element_id,
             element_instance_key,
             scope,
+            view_scope,
             element_vars,
             false,
         )
@@ -8411,13 +8450,19 @@ impl Engine {
         }
     }
 
-    /// [`activate_body_in`] against an explicit variable view.
+    /// [`activate_body_in`] against an explicit variable view. `view_scope` is
+    /// the scope that view was built from (the mapping's evaluation scope): it
+    /// decides which bindings shadow a trusted cluster-variable root for
+    /// secret-reference provenance — only bindings on `view_scope`'s own
+    /// visible chain, never a sibling branch's locals (#1652 round-5 review).
+    #[allow(clippy::too_many_arguments)]
     fn activate_body_with_vars(
         &mut self,
         instance_key: Key,
         element_id: String,
         element_instance_key: Key,
         scope: Key,
+        view_scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
         scope_pre_registered: bool,
     ) -> (Vec<Event>, Vec<Step>) {
@@ -8481,11 +8526,25 @@ impl Engine {
         // A source expression that fails to evaluate raises an `IO_MAPPING_ERROR`
         // incident and halts the element (no scope write, no behaviour) — the
         // resolution re-drives this body (#939).
-        let input_updates = if inputs.is_empty() {
-            HashMap::new()
+        //
+        // Value AND secret-reference provenance (#1640) are captured in ONE
+        // evaluation per mapping (`eval_input_mappings_with_provenance`): a
+        // nondeterministic source (`random number()`, `now()`) re-evaluated
+        // for provenance after the value was computed could take a different
+        // branch, decoupling the journaled value from its recorded trust
+        // (#1652 round-5 review). The provenance is taken from the exact view
+        // the mappings evaluated against — never re-derived later — and
+        // journaled on the element's `JobCreated`.
+        let (input_updates, secret_provenance) = if inputs.is_empty() {
+            (HashMap::new(), Vec::new())
         } else {
-            match self.eval_io_mappings_in(&element_vars, &inputs) {
-                Ok(updates) => updates,
+            match self.eval_input_mappings_with_provenance(
+                instance_key,
+                view_scope,
+                &element_vars,
+                &inputs,
+            ) {
+                Ok(evaluated) => evaluated,
                 Err(failure) => {
                     return (
                         vec![self.io_mapping_incident(
@@ -8602,6 +8661,7 @@ impl Engine {
             element_instance_key,
             scope,
             activation_vars,
+            secret_provenance,
         );
         events.extend(kind_events);
         (events, kind_followups)
@@ -9021,6 +9081,7 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         match self.try_activation_body(
@@ -9029,6 +9090,7 @@ impl Engine {
             element_instance_key,
             scope,
             element_vars,
+            secret_provenance,
         ) {
             Ok(planned) => planned,
             Err(failure) => {
@@ -9120,6 +9182,7 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
@@ -9226,6 +9289,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: secret_provenance.clone(),
                 });
                 // An ad-hoc container: register its runtime state alongside the
                 // agent job. The container element instance is the ad-hoc scope
@@ -10420,6 +10484,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
                 // A multi-instance child that is a JOB_WORKER ad-hoc container
                 // (`adHocSubProcess` with a `zeebe:taskDefinition`) registers its
@@ -12195,6 +12260,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             return (events, followups);
@@ -12223,6 +12289,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             // A user-task tool parks the child on a real user task, resolving its
@@ -13109,6 +13176,7 @@ impl Engine {
             created_at: self.now,
             priority,
             retries,
+            secret_provenance: Vec::new(),
         }]
     }
 
@@ -15599,6 +15667,10 @@ impl Engine {
                         element_instance_key,
                         scope,
                         vars,
+                        // Listeners ran between the mappings and the body and
+                        // may have rewritten the scope: no secret provenance
+                        // (fail closed, #1640).
+                        Vec::new(),
                     );
                     if owed {
                         (gate_activated(events, activated, 0), followups)
@@ -16105,6 +16177,7 @@ impl Engine {
                         created_at: self.now,
                         priority,
                         retries,
+                        secret_provenance: Vec::new(),
                     }],
                     Vec::new(),
                 )

@@ -12,7 +12,7 @@
 //! snapshot/replay determinism; a host re-installs the shared handle on every
 //! engine rebuild so the engine keeps observing the live set.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::model::Value;
@@ -27,12 +27,17 @@ pub const DEFAULT_TENANT: &str = "<default>";
 /// every process instance; a tenant's variables are visible only to instances
 /// running under that tenant. Instance/local variables always shadow cluster
 /// variables when both define the same name.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ClusterVariableSnapshot {
     /// Global-scoped cluster variables, keyed by name.
     pub global: HashMap<String, Value>,
     /// Tenant-scoped cluster variables, keyed by tenant id then name.
     pub tenants: HashMap<String, HashMap<String, Value>>,
+    /// Names of the `global` variables whose kind is `SECRET_REFERENCE` — the
+    /// host-trusted carriers of `camunda.secrets.<name>` reference text (#1640).
+    pub global_secret_references: HashSet<String>,
+    /// Per-tenant names of the `SECRET_REFERENCE`-kind variables.
+    pub tenant_secret_references: HashMap<String, HashSet<String>>,
 }
 
 impl ClusterVariableSnapshot {
@@ -54,10 +59,42 @@ impl ClusterVariableSnapshot {
             .iter()
             .chain(self.tenants.get(tenant).into_iter().flatten())
     }
+
+    /// The `SECRET_REFERENCE`-kind cluster variables an instance running under
+    /// `tenant` resolves, with their values: a name is trusted only when the
+    /// binding that WINS the overlay (a tenant variable shadows a same-named
+    /// global) is itself of kind `SECRET_REFERENCE` — a JSON-kind tenant
+    /// variable shadowing a trusted global is untrusted (fail closed).
+    pub fn trusted_secret_roots_for(&self, tenant: &str) -> HashMap<String, Value> {
+        let mut out: HashMap<String, Value> = HashMap::new();
+        for (name, value) in &self.global {
+            if self.global_secret_references.contains(name) {
+                out.insert(name.clone(), value.clone());
+            }
+        }
+        if let Some(scoped) = self.tenants.get(tenant) {
+            let trusted = self.tenant_secret_references.get(tenant);
+            for (name, value) in scoped {
+                if trusted.is_some_and(|t| t.contains(name)) {
+                    out.insert(name.clone(), value.clone());
+                } else {
+                    out.remove(name);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A shared, host-mutable handle to the cluster-variable snapshot. The gateway
 /// owns the write side (REST create / update / delete); the engine holds a clone
 /// and reads it while building a FEEL evaluation context. Empty by default, in
 /// which case the engine's variable-resolution fast path is unaffected.
-pub type ClusterVariables = Arc<RwLock<ClusterVariableSnapshot>>;
+///
+/// The lock guards an `Arc` to an **immutable** snapshot: a writer replaces the
+/// whole snapshot (never mutates one in place), so a reader that clones the inner
+/// `Arc` holds one self-consistent view (values *and* kinds) for as long as it
+/// needs. The engine pins one such view per command, so every read inside an
+/// evaluation — the FEEL overlay and secret-reference trust attribution — sees
+/// the same state (#1640: no value/kind check-then-use race).
+pub type ClusterVariables = Arc<RwLock<Arc<ClusterVariableSnapshot>>>;

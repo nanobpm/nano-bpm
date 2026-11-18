@@ -387,6 +387,7 @@ mod tests {
             retry_backoff_until: None,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
         }
     }
 

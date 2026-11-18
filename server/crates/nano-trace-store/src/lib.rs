@@ -1608,6 +1608,7 @@ mod tests {
             created_at: 0,
             priority: 50,
             retries: 3,
+            secret_provenance: Vec::new(),
         }
     }
 

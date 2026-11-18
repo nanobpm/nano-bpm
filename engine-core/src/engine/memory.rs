@@ -107,6 +107,7 @@ impl Engine {
             torn_down_scopes: std::collections::HashSet::new(),
             esp_start_payloads: std::collections::HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            pinned_cluster_variables: None,
             raft_applied: snapshot.raft_applied,
         }
     }
