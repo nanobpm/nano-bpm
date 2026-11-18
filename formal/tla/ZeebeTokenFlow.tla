@@ -254,6 +254,31 @@ DrainVia(f, S) ==
 
 Drain(f) == \E S \in Choices(Target(f)) : DrainVia(f, S)
 
+\* A drain choice that is a stuttering step in EVERY state: a pass-through
+\* (non-join, non-wait, non-end) element routing straight back onto its own
+\* incoming flow `f` takes and re-adds the same token and records nothing.
+\* Every other choice changes `queue` (or `fired`), so `<<DrainVia(f, S)>>_vars` is
+\* enabled exactly when `Drain(f)` is.
+StuttersVia(f, S) ==
+    LET n == Target(f) IN
+    /\ Kind[n] \notin {"task", "evt", "end"}
+    /\ ~IsJoin(n)
+    /\ S = {f}
+
+\* Strong fairness on every routing choice of `f`, factored. Because
+\* `ENABLED <<DrainVia(f, S)>>_vars` is the same for every non-stuttering choice
+\* S (it is `ENABLED <<Drain(f)>>_vars`), and a stuttering choice's SF is vacuous,
+\*     \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
+\* is EQUIVALENT to this single implication. Stated per choice, TLC expands each
+\* SF disjunction into its DNF tableau — 2^|Choices| branches, which runs out of
+\* memory on an inclusive split with four outgoing flows (#1246). Factored, it is
+\* one disjunction per flow.
+DrainFair(f) ==
+    []<>(ENABLED <<Drain(f)>>_vars)
+        => \A S \in Choices(Target(f)) :
+               ~StuttersVia(f, S) => []<><<DrainVia(f, S)>>_vars
+
+
 \* Job completion (a COMPLETE command): an activated task takes its outgoing
 \* flows once the previous record has settled.
 CompleteTask(t) ==
@@ -295,7 +320,7 @@ Next ==
     \/ Done
 
 Fairness ==
-    /\ \A f \in AllFlows : \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
+    /\ \A f \in AllFlows : DrainFair(f)
     /\ \A t \in Tasks    : SF_vars(CompleteTask(t))
     /\ \A n \in EvtGateways : \A g \in Out(n) : SF_vars(CorrelateEvent(n, g))
     /\ WF_vars(CompleteInstance)
