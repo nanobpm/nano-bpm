@@ -513,16 +513,26 @@ impl ServerImpl {
             .await
     }
 
-    /// Returns the variable for `(tenant, name)`, if any.
+    /// Returns the variable for `(tenant, name)`, if any. The lookup runs
+    /// INSIDE the engine actor turn and clones only the matching record —
+    /// cloning the whole state here would make a single-variable GET cost
+    /// grow with the entire configuration store and block the actor on the
+    /// copy (PR #1670 review). The full-state clone is reserved for search
+    /// and expression snapshots ([`Self::cluster_variable_state`]).
     async fn cluster_variable_get(
         &self,
         tenant: Option<&str>,
         name: &str,
     ) -> Option<StoredClusterVariable> {
-        let state = self.cluster_variable_state().await;
-        state
-            .get(tenant, name)
-            .map(|v| StoredClusterVariable::from_engine(tenant, name, v))
+        let (t, n) = (tenant.map(str::to_string), name.to_string());
+        self.cluster_variable_read_handle()
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(t.as_deref(), &n)
+                    .map(|v| StoredClusterVariable::from_engine(t.as_deref(), &n, v))
+            })
+            .await
     }
 
     /// Every cluster variable (for search).
@@ -701,17 +711,19 @@ impl ServerImpl {
     ///
     /// The returned record is the one THIS proposal committed: it is derived
     /// from the proposal's own events (a create/update event carries the full
-    /// post-mutation record; a delete event carries none), never from a
-    /// re-read of live state — a re-read runs in a separate actor turn, so a
-    /// concurrent mutation from another gateway could land in between and the
-    /// response (and the fan-out copy built from it) would carry the OTHER
-    /// write's value. The record's `id` is the one field the events do not
-    /// carry; it is read back best-effort through [`Self::engine_handle_for`]
-    /// — which also reaches a partition this node only LEADS after a failover
-    /// (its Raft replica actor), where `local_for_partition` would report the
-    /// committed write as an error — and defaults to `0` when the partition is
-    /// not hosted here (the fan-out copy does not use the id; the REST `id`
-    /// is a search-pagination cursor only).
+    /// post-mutation record — value, kind, and metadata; a delete event
+    /// carries none), never from a re-read of live state — a re-read runs in
+    /// a separate actor turn, so a concurrent mutation from another gateway
+    /// could land in between and the response (and the fan-out copy built
+    /// from it) would carry the OTHER write's value, or combine this write's
+    /// value with a delete/recreate's replacement kind (PR #1670 review). The
+    /// record's `id` is the one field the events do not carry; it is read
+    /// back best-effort through [`Self::engine_handle_for`] — which also
+    /// reaches a partition this node only LEADS after a failover (its Raft
+    /// replica actor), where `local_for_partition` would report the committed
+    /// write as an error — and defaults to `0` when the partition is not
+    /// hosted here (the fan-out copy does not use the id; the REST `id` is a
+    /// search-pagination cursor only).
     pub(crate) async fn apply_cluster_variable_local(
         &self,
         p: u64,
@@ -722,7 +734,11 @@ impl ServerImpl {
         let key = nanobpmn_engine_core::compose_key(p, 0);
         let (events, _commit) = self.apply_partition_command(key, command).await?;
         // At most one lifecycle event per applied command (an idempotent
-        // distributed delete of an already-absent variable emits none).
+        // distributed delete of an already-absent variable emits none). Both
+        // create and update events carry the complete post-mutation record
+        // (an update's `kind` is the preserved kind, captured by the engine
+        // in the committing turn), so the response record below is exactly
+        // what THIS proposal committed.
         let mut applied: Option<nanobpmn_engine_core::ClusterVariable> = None;
         let mut deleted = false;
         for e in events.iter() {
@@ -732,23 +748,17 @@ impl ServerImpl {
                     kind,
                     metadata,
                     ..
+                }
+                | Event::ClusterVariableUpdated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
                 } => {
                     applied = Some(nanobpmn_engine_core::ClusterVariable {
                         id: 0,
                         value: value.clone(),
                         kind: *kind,
-                        metadata: metadata.clone(),
-                    });
-                }
-                // An update preserves the kind (it is fixed at creation); the
-                // record's kind is filled in by the read-back below.
-                Event::ClusterVariableUpdated {
-                    value, metadata, ..
-                } => {
-                    applied = Some(nanobpmn_engine_core::ClusterVariable {
-                        id: 0,
-                        value: value.clone(),
-                        kind: nanobpmn_engine_core::ClusterVariableKind::Json,
                         metadata: metadata.clone(),
                     });
                 }
@@ -762,14 +772,17 @@ impl ServerImpl {
         let Some(mut record) = applied else {
             return Ok(None);
         };
-        // Fill in the id (and, for an update, the preserved kind) from the
+        // Fill in the id — the one field the events do not carry — from the
         // applying partition's state. Reaching that state must use
         // [`Self::engine_handle_for`] — which also reaches a partition this
         // node only LEADS after a failover (its Raft replica actor) — never
         // `local_for_partition`, which returns `None` for a promoted partition
         // and would report the committed write as an error (PR #1670 review).
         // A partition this node neither owns nor replicates is unreachable:
-        // fail the read-back rather than return a placeholder id.
+        // fail the read-back rather than return a placeholder id. A concurrent
+        // delete landing before this turn only loses the (cursor-only) id —
+        // the record's value/kind/metadata above are already the committed
+        // ones, never re-read.
         let Some(handle) = self.engine_handle_for(p) else {
             return Err((
                 503,
@@ -777,17 +790,16 @@ impl ServerImpl {
             ));
         };
         let (t, n) = (tenant.clone(), name.clone());
-        let stored = handle
+        let id = handle
             .with(move |j| {
                 j.engine()
                     .cluster_variables()
                     .get(t.as_deref(), &n)
-                    .map(|v| (v.id, v.kind))
+                    .map(|v| v.id)
             })
             .await;
-        if let Some((id, kind)) = stored {
+        if let Some(id) = id {
             record.id = id;
-            record.kind = kind;
         }
         Ok(Some(record))
     }
@@ -1851,6 +1863,78 @@ mod cluster_variable_tests {
             Some(val(json!("camunda.secrets.API_TOKEN"))),
             "the engine state sees the reference text verbatim"
         );
+    }
+
+    /// PR #1670 review: an update's response (and the fan-out copy built from
+    /// it) must carry the variable's PRESERVED kind from the proposal's own
+    /// commit — never a live-state re-read, which a concurrent delete/recreate
+    /// could swap under it (combining the new value with a replacement's
+    /// kind). Pin the observable contract: updating a SECRET_REFERENCE
+    /// variable returns `kind: SECRET_REFERENCE` with the new value, and a
+    /// delete-then-recreate as JSON leaves the PRIOR update's response kind
+    /// untouched.
+    #[tokio::test]
+    async fn update_response_preserves_the_committed_kind() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Delete;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let mut req = create_req("api_token", None);
+        req.value = types::Object(json!("camunda.secrets.API_TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        let Create::Status200_ClusterVariableCreated(_) = server
+            .create_global_cluster_variable_impl(&req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a SECRET_REFERENCE create");
+        };
+
+        // The update response carries the preserved SECRET_REFERENCE kind with
+        // the new value — derived from the update's own commit, not re-read.
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let mut update = update_req(None);
+        update.value = types::Object(json!("camunda.secrets.ROTATED"));
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(&upd, &update)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the update");
+        };
+        assert_eq!(
+            r.kind,
+            models::ClusterVariableKindEnum::SecretReference,
+            "an update preserves the stored kind"
+        );
+        assert_eq!(r.value, "\"camunda.secrets.ROTATED\"");
+
+        // A delete/recreate as JSON changes the STORED kind, but the already
+        // returned update response above is immutable — and the new state is
+        // what later reads see.
+        let del = models::DeleteGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let Delete::Status204_ClusterVariableDeletedSuccessfully = server
+            .delete_global_cluster_variable_impl(&del)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 204 for the delete");
+        };
+        let mut recreate = create_req("api_token", None);
+        recreate.value = types::Object(json!({"endpoint": "https://api"}));
+        let Create::Status200_ClusterVariableCreated(r) = server
+            .create_global_cluster_variable_impl(&recreate)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the recreate");
+        };
+        assert_eq!(r.kind, models::ClusterVariableKindEnum::Json);
+        assert_eq!(r.value, "{\"endpoint\":\"https://api\"}");
     }
 
     /// #1640 harness: a server with an in-memory secret store, a
@@ -4853,6 +4937,57 @@ mod legacy_demux_tests {
             )),
             "the unowned partition's keyed event is dropped, not broadcast"
         );
+    }
+
+    /// PR #1670 review (journal ordering): the legacy single-node
+    /// multi-partition boot must emit its journals in ASCENDING partition-id
+    /// order — `Partitions::new` requires `handles[i]` to own partition `i`,
+    /// and the engine actors spawn from that vector in order. Collecting the
+    /// demux HashMap directly orders the journals arbitrarily, so a restart
+    /// could route every keyed command to the wrong engine. This pins the
+    /// ordering contract the boot loop relies on: mapping partition ids
+    /// `0..partitions` through the demuxed map yields each partition's own
+    /// events at its own index, for every partition, regardless of map
+    /// iteration order.
+    #[test]
+    fn legacy_recovery_journals_are_indexed_by_partition_id() {
+        let keyed = |p: u64| Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(p, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let partitions = 4u64;
+        let events = vec![keyed(3), cv_created("x"), keyed(0), keyed(2), keyed(1)];
+        let mut per_partition =
+            demux_legacy_shared_log(events, (0..partitions).collect(), partitions);
+        // The exact construction the boot path performs: index i must hold
+        // partition i's events.
+        let journals: Vec<(u64, Vec<Event>)> = (0..partitions)
+            .map(|p| (p, per_partition.remove(&p).unwrap_or_default()))
+            .collect();
+        for (i, (p, evs)) in journals.iter().enumerate() {
+            assert_eq!(*p, i as u64, "handles[{i}] must own partition {i}");
+            let keyed_count = evs
+                .iter()
+                .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+                .count();
+            assert_eq!(
+                keyed_count, 1,
+                "partition {i} replays exactly its own keyed event"
+            );
+            let broadcast_count = evs
+                .iter()
+                .filter(|e| matches!(e, Event::ClusterVariableCreated { .. }))
+                .count();
+            assert_eq!(broadcast_count, 1, "partition {i} replays the broadcast");
+        }
     }
 }
 
@@ -30675,7 +30810,7 @@ async fn main() {
 
                     // Split the shared log into each partition's own events (see
                     // [`demux_legacy_shared_log`] for the routing contract).
-                    let per_partition = demux_legacy_shared_log(
+                    let mut per_partition = demux_legacy_shared_log(
                         events,
                         (0..partitions as u64).collect(),
                         partitions as u64,
@@ -30688,9 +30823,18 @@ async fn main() {
                         )
                     });
                     let recovered = per_partition.values().any(|evs| !evs.is_empty());
-                    let journals: Vec<Journal> = per_partition
-                        .into_iter()
-                        .map(|(p, evs)| Journal::from_events_shared(p, evs, &shared))
+                    // Emit the journals in ASCENDING partition-id order:
+                    // `Partitions::new` requires `handles[i]` to own partition
+                    // `i` (`partition.rs`), and the engine actors are spawned
+                    // from this vector in order. Collecting the demux HashMap
+                    // directly would order the journals arbitrarily and route
+                    // every keyed command to the wrong engine (PR #1670
+                    // review).
+                    let journals: Vec<Journal> = (0..partitions as u64)
+                        .map(|p| {
+                            let evs = per_partition.remove(&p).unwrap_or_default();
+                            Journal::from_events_shared(p, evs, &shared)
+                        })
                         .collect();
                     (journals, recovered, read_model)
                 }

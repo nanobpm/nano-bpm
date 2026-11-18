@@ -271,6 +271,7 @@
   },
   {
     "ClusterVariableUpdated": {
+      "kind": "SECRET_REFERENCE",
       "metadata": {
         "k": {
           "Int": 2

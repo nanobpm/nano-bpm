@@ -169,6 +169,10 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             name,
             value,
             metadata,
+            // The kind is preserved by an update (it is fixed at creation);
+            // the event carries it for the response/fan-out projection, but
+            // the state fold leaves the stored kind untouched.
+            kind: _,
         } => state.cluster_variables.update(
             tenant_id.as_deref(),
             name,

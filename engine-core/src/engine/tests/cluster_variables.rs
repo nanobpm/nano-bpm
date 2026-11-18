@@ -273,13 +273,21 @@ fn lifecycle_events_carry_the_full_post_mutation_record() {
         .unwrap();
     assert_eq!(events.len(), 1);
     let Event::ClusterVariableUpdated {
-        value, metadata, ..
+        value,
+        kind,
+        metadata,
+        ..
     } = &events[0]
     else {
         panic!("an update emits exactly its ClusterVariableUpdated record");
     };
     assert_eq!(value, &Value::Int(2));
     assert_eq!(metadata.get("owner"), Some(&Value::Str("ops".into())));
+    assert_eq!(
+        kind,
+        &ClusterVariableKind::Json,
+        "an update event carries the variable's preserved kind, captured in the committing turn"
+    );
 
     let events = engine
         .apply_command(Command::DeleteClusterVariable {
@@ -293,4 +301,46 @@ fn lifecycle_events_carry_the_full_post_mutation_record() {
         matches!(&events[0], Event::ClusterVariableDeleted { .. }),
         "a delete emits exactly its ClusterVariableDeleted record"
     );
+}
+
+/// The update event's `kind` is the variable's PRESERVED kind (fixed at
+/// creation), captured in the same turn that validates and commits the
+/// update — never a placeholder. A SECRET_REFERENCE variable updated with a
+/// new value must emit `kind: SecretReference`, so a gateway deriving the
+/// response/fan-out record from the proposal's own events never mixes the
+/// new value with a wrong (e.g. re-created replacement's) kind (PR #1670
+/// review).
+#[test]
+fn update_event_carries_the_preserved_kind() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::CreateClusterVariable {
+            tenant_id: None,
+            name: "api_token".into(),
+            value: Value::Str("camunda.secrets.TOKEN".into()),
+            kind: ClusterVariableKind::SecretReference,
+            metadata: BTreeMap::new(),
+            distributed: false,
+        })
+        .unwrap();
+    let events = engine
+        .apply_command(Command::UpdateClusterVariable {
+            tenant_id: None,
+            name: "api_token".into(),
+            value: Value::Str("camunda.secrets.ROTATED".into()),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap();
+    let Event::ClusterVariableUpdated { kind, value, .. } = &events[0] else {
+        panic!("an update emits exactly its ClusterVariableUpdated record");
+    };
+    assert_eq!(kind, &ClusterVariableKind::SecretReference);
+    assert_eq!(value, &Value::Str("camunda.secrets.ROTATED".into()));
+    // The stored record keeps its kind and id across the update.
+    let stored = engine
+        .state()
+        .cluster_variables
+        .get(None, "api_token")
+        .expect("stored");
+    assert_eq!(stored.kind, ClusterVariableKind::SecretReference);
 }

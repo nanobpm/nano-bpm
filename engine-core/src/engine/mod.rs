@@ -2684,14 +2684,20 @@ impl Engine {
                 value,
                 metadata,
             } => {
-                if self
+                // Capture the preserved kind in the same turn that validates
+                // and commits the update, so the event carries the complete
+                // post-mutation record (bar the id): a consumer deriving the
+                // response from the proposal's own events then never re-reads
+                // live state, where a concurrent delete/recreate could swap
+                // the kind under it (PR #1670 review).
+                let Some(existing) = self
                     .state
                     .cluster_variables
                     .get(tenant_id.as_deref(), &name)
-                    .is_none()
-                {
+                else {
                     return Err(EngineError::ClusterVariableNotFound { tenant_id, name });
-                }
+                };
+                let kind = existing.kind;
                 self.emit(
                     &mut log,
                     Event::ClusterVariableUpdated {
@@ -2699,6 +2705,7 @@ impl Engine {
                         name,
                         value,
                         metadata,
+                        kind,
                     },
                 );
             }

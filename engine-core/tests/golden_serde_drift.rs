@@ -1085,6 +1085,7 @@ fn build_event_witnesses() -> Vec<Event> {
             name: "region".to_string(),
             value: Value::Str("APAC".to_string()),
             metadata: std::collections::BTreeMap::from([("k".to_string(), Value::Int(2))]),
+            kind: nanobpmn_engine_core::ClusterVariableKind::SecretReference,
         },
         Event::ClusterVariableDeleted {
             tenant_id: Some("t1".to_string()),
@@ -1116,6 +1117,25 @@ fn pre_1300_start_instance_dispatched_decodes_with_defaults() {
         decoded,
         Event::StartInstanceDispatched {
             message_start: None,
+            ..
+        }
+    ));
+}
+
+/// The #1657 additive `kind` field on `ClusterVariableUpdated` defaults to
+/// `Json` when absent: a record journaled before the field existed still
+/// decodes (no format bump). The field exists so a gateway derives the
+/// update response from the proposal's own events instead of re-reading live
+/// state (PR #1670 review); the state fold ignores it (an update preserves
+/// the stored kind), so the default is replay-inert.
+#[test]
+fn pre_kind_cluster_variable_updated_decodes_with_default() {
+    let old = r#"{"ClusterVariableUpdated":{"tenant_id":null,"name":"region","value":{"Str":"APAC"},"metadata":{}}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old).expect("decode old record");
+    assert!(matches!(
+        decoded,
+        Event::ClusterVariableUpdated {
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
             ..
         }
     ));

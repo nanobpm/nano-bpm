@@ -442,12 +442,23 @@ pub enum Event {
 
     /// A cluster variable's value and metadata were replaced (#1657; Zeebe
     /// `ClusterVariableIntent.UPDATED`). Its id and kind are preserved.
+    ///
+    /// `kind` is the variable's preserved kind, captured by the applying
+    /// engine in the same turn that commits the update. Carrying it on the
+    /// event lets a gateway derive the response/fan-out record entirely from
+    /// the proposal's own events — a live-state re-read runs in a separate
+    /// actor turn, so a concurrent delete/recreate could otherwise combine
+    /// the new value with a replacement's kind (PR #1670 review). Additive
+    /// (`serde(default)`): records written before this field decode with the
+    /// `Json` default, which only the (unused) response projection ever read.
     ClusterVariableUpdated {
         tenant_id: Option<String>,
         name: String,
         value: Value,
         #[cfg_attr(feature = "serde", serde(default))]
         metadata: std::collections::BTreeMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
     },
 
     /// A cluster variable was deleted (#1657; Zeebe `ClusterVariableIntent.DELETED`).
