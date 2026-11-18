@@ -39,6 +39,7 @@ const SURFACE_PATH = path.join(here, "zeebe-surface.json");
 const COVERAGE_PATH = path.join(here, "coverage.json");
 const CORPUS_GRAPHS = path.join(here, "..", "corpus", "graphs");
 const CORPUS_BPMN = path.join(here, "..", "corpus", "bpmn");
+const RUNTIME_CORPUS = path.join(here, "runtime", "corpus");
 const ALLOWLIST_PATH = path.join(here, "..", "traces", "allowlist.json");
 
 /** `*` matches any run of characters; everything else is literal. */
@@ -67,16 +68,21 @@ export function surfaceCellIds(surfaceFile = SURFACE_PATH) {
 
 /**
  * The cell ids a `coverage.json` rule claims (its `match`, expanded over the
- * surface). A rule's `match` is a glob; a registered extension id must not be
- * claimed by ANY rule (whatever its status — even `gap`/`out-of-scope` means
- * the surface is Zeebe's, not a Nano extension).
+ * surface AND over the registered extension ids). A rule's `match` is a glob; a
+ * registered extension id must not be claimed by ANY rule (whatever its status
+ * — even `gap`/`out-of-scope` means the surface is Zeebe's, not a Nano
+ * extension). Expanding over the surface alone misses a wildcard overlap with
+ * an extension id the surface does not list: `element:*` must claim an
+ * extension named `element:NanoOnlyWidget` even when `zeebe-surface.json` has
+ * no such cell, so `extensionIds` are tested against every glob too.
  */
-export function coverageClaims(coverageFile, surfaceIds) {
+export function coverageClaims(coverageFile, surfaceIds, extensionIds = []) {
   const coverage = JSON.parse(fs.readFileSync(coverageFile, "utf8"));
   const claimed = new Set();
   for (const rule of coverage.rules ?? []) {
     const re = globToRegExp(rule.match);
     for (const id of surfaceIds) if (re.test(id)) claimed.add(id);
+    for (const id of extensionIds) if (re.test(id)) claimed.add(id);
     // An exact (wildcard-free) rule also claims its literal id even when the
     // surface does not list it (a forward reference to a cell a pin bump adds).
     if (!rule.match.includes("*")) claimed.add(rule.match);
@@ -168,6 +174,62 @@ export function parityCorpusExtensions(extensions, graphsDir = CORPUS_GRAPHS, bp
 }
 
 /**
+ * The runtime parity-corpus scenarios whose BPMN model uses a registered
+ * extension. The live two-backend workflow (`runtime/run.mjs`) deploys every
+ * `runtime/corpus/<scenario>/` model to BOTH backends, so a registered
+ * extension in one of those models is deployed to Camunda with no parity
+ * skip — invisible to the flat-corpus scan above. Each scenario's model is the
+ * `bpmn` field of its `scenario.json` (default `process.bpmn`). Returns
+ * `{ hits, invalid }` — `hits` the `{ scenario, extensionId }` pairs, `invalid`
+ * the scenarios whose `scenario.json` could not be parsed (the caller fails
+ * closed on those: a scenario the guard cannot read cannot be scanned).
+ */
+export function runtimeCorpusExtensions(extensions, runtimeCorpusDir = RUNTIME_CORPUS) {
+  const hits = [];
+  const invalid = [];
+  let scenarioDirs = [];
+  try {
+    scenarioDirs = fs
+      .readdirSync(runtimeCorpusDir)
+      .map((name) => path.join(runtimeCorpusDir, name))
+      .filter((p) => {
+        try {
+          return fs.statSync(path.join(p, "scenario.json")).isFile();
+        } catch {
+          return false;
+        }
+      });
+  } catch {
+    return { hits, invalid }; // no runtime corpus — nothing deployed to scan
+  }
+  for (const dir of scenarioDirs) {
+    let scenario;
+    try {
+      scenario = JSON.parse(fs.readFileSync(path.join(dir, "scenario.json"), "utf8"));
+    } catch (err) {
+      // A scenario the guard cannot READ cannot be scanned — fail closed with
+      // an actionable problem rather than crashing the guard (or skipping it).
+      invalid.push(`${path.basename(dir)}: unreadable scenario.json (${err?.message ?? err})`);
+      continue;
+    }
+    const bpmnFile = typeof scenario.bpmn === "string" && scenario.bpmn.length > 0 ? scenario.bpmn : "process.bpmn";
+    let xml;
+    try {
+      xml = fs.readFileSync(path.join(dir, bpmnFile), "utf8");
+    } catch {
+      continue; // a scenario whose model is absent is the runtime runner's problem, not this guard's
+    }
+    const name = scenario.name ?? path.basename(dir);
+    for (const entry of extensions) {
+      if (modelUsesExtension(xml, entry)) {
+        hits.push({ scenario: name, extensionId: entry.id });
+      }
+    }
+  }
+  return { hits, invalid };
+}
+
+/**
  * Run every register guard. Returns a list of problem strings; an empty list
  * passes. Pure over its inputs (dependency-injected file paths for tests).
  */
@@ -177,6 +239,7 @@ export function checkExtensions({
   coverageFile = COVERAGE_PATH,
   graphsDir = CORPUS_GRAPHS,
   bpmnDir = CORPUS_BPMN,
+  runtimeCorpusDir = RUNTIME_CORPUS,
   allowlistFile = ALLOWLIST_PATH,
 } = {}) {
   const problems = [];
@@ -203,9 +266,16 @@ export function checkExtensions({
   }
 
   // Rule 2 — never a Camunda-surface difference. No extension id may be a cell
-  // of the derived Zeebe surface, nor be claimed by a coverage.json rule.
+  // of the derived Zeebe surface, nor be claimed by a coverage.json rule
+  // (a wildcard rule is expanded over the extension ids too, so `element:*`
+  // claims an extension named `element:NanoOnlyWidget` even when the surface
+  // does not list that cell).
   const surfaceIds = surfaceCellIds(surfaceFile);
-  const claimed = coverageClaims(coverageFile, surfaceIds);
+  const claimed = coverageClaims(
+    coverageFile,
+    surfaceIds,
+    extensions.map((e) => e?.id).filter((id) => typeof id === "string"),
+  );
   for (const e of extensions) {
     if (typeof e.id !== "string") continue;
     if (surfaceIds.has(e.id)) {
@@ -225,6 +295,19 @@ export function checkExtensions({
     problems.push(
       `parity-checked corpus model ${JSON.stringify(hit.graphId)} uses registered extension ${JSON.stringify(hit.extensionId)}: the corpus generator emits only Camunda-expressible models, so an extension here means the corpus drifted off the shared surface`,
     );
+  }
+
+  // Rule 4 — no RUNTIME parity-corpus model may use a registered extension
+  // either: `runtime/run.mjs` deploys those models to BOTH backends with no
+  // extension check, so one here is silently deployed to Camunda.
+  const runtime = runtimeCorpusExtensions(extensions, runtimeCorpusDir);
+  for (const hit of runtime.hits) {
+    problems.push(
+      `runtime parity-corpus scenario ${JSON.stringify(hit.scenario)} uses registered extension ${JSON.stringify(hit.extensionId)}: the two-backend runner deploys it to Camunda with no parity skip, so an extension here must fail the register guard`,
+    );
+  }
+  for (const bad of runtime.invalid) {
+    problems.push(`runtime parity-corpus scenario ${bad}: the guard cannot scan an unreadable scenario, so it fails closed`);
   }
 
   // Rule 5 — the three lists stay RECONCILED (separate, never overlapping). An

@@ -19,12 +19,12 @@ import {
   globToRegExp,
   EXTENSIONS_PATH,
 } from "./extensions.mjs";
-import { classifyDeployFailure } from "./runtime/extension-acceptance.mjs";
+import { classifyDeployFailure, probeModel } from "./runtime/extension-acceptance.mjs";
 import { CamundaHttpError } from "./runtime/camunda-backend.mjs";
 
 // A scratch directory holding a synthetic register + surface + coverage + corpus,
 // so each rule can be tripped in isolation without touching the committed files.
-function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {} }) {
+function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {}, runtimeScenarios = {} }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nano-ext-"));
   const write = (name, obj) =>
     fs.writeFileSync(path.join(dir, name), typeof obj === "string" ? obj : JSON.stringify(obj));
@@ -38,12 +38,21 @@ function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {} 
   for (const [id, xml] of Object.entries(bpmn)) {
     fs.writeFileSync(path.join(bpmnDir, `${id}.bpmn`), xml);
   }
+  const runtimeCorpusDir = path.join(dir, "runtime-corpus");
+  fs.mkdirSync(runtimeCorpusDir);
+  for (const [name, { bpmnFile = "process.bpmn", xml }] of Object.entries(runtimeScenarios)) {
+    const scenarioDir = path.join(runtimeCorpusDir, name);
+    fs.mkdirSync(scenarioDir);
+    fs.writeFileSync(path.join(scenarioDir, "scenario.json"), JSON.stringify({ name, bpmn: bpmnFile }));
+    fs.writeFileSync(path.join(scenarioDir, bpmnFile), xml);
+  }
   return {
     extensionsFile: path.join(dir, "extensions.json"),
     surfaceFile: path.join(dir, "zeebe-surface.json"),
     coverageFile: path.join(dir, "coverage.json"),
     graphsDir,
     bpmnDir,
+    runtimeCorpusDir,
   };
 }
 
@@ -202,4 +211,117 @@ test("Red/Green: only an extension-specific 400 counts as a Camunda rejection", 
   }
   assert.equal(classifyDeployFailure(costEntry, new Error("fetch failed")), "error");
   assert.equal(classifyDeployFailure(costEntry, Object.assign(new Error("timeout"), { name: "TimeoutError" })), "error");
+});
+
+test("Red/Green: a 400 naming the extension only via the generated process id is NOT a rejection", () => {
+  const err = (body) => new CamundaHttpError("x", { status: 400, body });
+  // The probe model embeds the local name in `probe_<local>` / `Defs_<local>`;
+  // an unrelated validation failure citing the PROCESS id must not confirm the
+  // extension (the name appears only in the process id).
+  assert.equal(
+    classifyDeployFailure(costEntry, err({ detail: "Process 'probe_cost': invalid process configuration" })),
+    "error",
+  );
+  assert.equal(
+    classifyDeployFailure(costEntry, err("Deployment of Defs_cost failed: no executable process")),
+    "error",
+  );
+  // Extension-specific diagnostics DO count: the namespaced tag or the quoted
+  // local name, even alongside the process id.
+  assert.equal(
+    classifyDeployFailure(costEntry, err({ detail: "Process 'probe_cost': unknown extension element nano:cost" })),
+    "rejected",
+  );
+  assert.equal(
+    classifyDeployFailure(costEntry, err({ detail: "Process 'probe_cost': unknown element 'cost' in extensionElements" })),
+    "rejected",
+  );
+  assert.equal(
+    classifyDeployFailure(costEntry, err({ detail: 'unsupported element "cost"' })),
+    "rejected",
+  );
+});
+
+test("Red/Green: probeModel places a sequenceFlow-only extension on a flow, others on the task", () => {
+  const flowClassEntry = {
+    ...costEntry,
+    id: "bpmn:nano:flowClass",
+    match: { xmlLocalName: "flowClass", xmlNamespace: NANO_NS, on: "sequenceFlow" },
+  };
+  const flowProbe = probeModel(flowClassEntry);
+  assert.ok(flowProbe.includes(`<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t">`), `flow probe opens the flow: ${flowProbe}`);
+  assert.ok(flowProbe.includes("<nano:flowClass"), `flow probe carries the extension: ${flowProbe}`);
+  assert.ok(!flowProbe.includes("<nano:flowClass probe=\"true\" />\n      </bpmn:extensionElements>\n    </bpmn:serviceTask"), "not on the task");
+  // The default (no `match.on`) keeps the extension on the service task and
+  // the flows self-closed.
+  const taskProbe = probeModel(costEntry);
+  assert.ok(taskProbe.includes("<nano:cost probe=\"true\" />"), `task probe carries the extension: ${taskProbe}`);
+  assert.ok(taskProbe.includes(`<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />`), `task probe's flow is self-closed: ${taskProbe}`);
+});
+
+test("the register covers every canonical nano-moddle annotation type", () => {
+  // processos/assets/bpmn/nano-moddle.json is the canonical descriptor of the
+  // `nano:*` annotation family the Workbench round-trips; every type it
+  // declares must be registered (and therefore probed/scanned), or a model
+  // using the unregistered type passes the guard invisibly.
+  const moddle = JSON.parse(
+    fs.readFileSync(path.join(path.dirname(EXTENSIONS_PATH), "..", "..", "processos", "assets", "bpmn", "nano-moddle.json"), "utf8"),
+  );
+  const registered = new Set(loadExtensions().map((e) => e.match?.xmlLocalName));
+  for (const type of moddle.types ?? []) {
+    const local = type.name.charAt(0).toLowerCase() + type.name.slice(1);
+    assert.ok(registered.has(local), `nano-moddle type ${type.name} (nano:${local}) is not in the extension register`);
+  }
+  // And the sequence-flow-restricted type declares its probe placement.
+  const flowClass = loadExtensions().find((e) => e.match?.xmlLocalName === "flowClass");
+  assert.equal(flowClass?.match?.on, "sequenceFlow", "flowClass's descriptor restricts it to bpmn:SequenceFlow — the probe must place it there");
+});
+
+test("Red/Green: a wildcard coverage rule claims an extension id absent from the surface", () => {
+  // `element:NanoOnlyWidget` is NOT a zeebe-surface cell; expanding `element:*`
+  // over the surface alone would miss the overlap, letting the guard accept an
+  // extension rule 2 must reject.
+  const f = fixture({
+    extensions: [{ ...costEntry, id: "element:NanoOnlyWidget" }],
+    surfaceCells: ["element:ServiceTask"],
+    coverageRules: [{ match: "element:*", status: "parity", evidence: ["traces:x"] }],
+  });
+  const problems = checkExtensions(f);
+  assert.ok(
+    problems.some((p) => p.includes("claimed by a coverage.json rule") && p.includes("element:NanoOnlyWidget")),
+    `wildcard-over-extension-id must fail: ${problems}`,
+  );
+});
+
+test("Red/Green: a runtime parity-corpus scenario using an extension fails", () => {
+  const f = fixture({
+    extensions: [costEntry],
+    runtimeScenarios: { "nano-scenario": { xml: nanoModel } },
+  });
+  const problems = checkExtensions(f);
+  assert.ok(
+    problems.some((p) => p.includes("runtime parity-corpus scenario") && p.includes("nano-scenario")),
+    `a runtime-corpus model using an extension must fail: ${problems}`,
+  );
+});
+
+test("a runtime parity corpus with NO extension passes rule 4", () => {
+  const f = fixture({
+    extensions: [costEntry],
+    runtimeScenarios: { "plain-scenario": { xml: plainModel } },
+  });
+  const problems = checkExtensions(f);
+  assert.deepEqual(problems, [], `clean runtime corpus must pass: ${problems}`);
+});
+
+test("Red/Green: an unreadable runtime scenario.json fails closed (not a crash, not a skip)", () => {
+  const f = fixture({ extensions: [costEntry] });
+  const scenarioDir = path.join(f.runtimeCorpusDir, "broken");
+  fs.mkdirSync(scenarioDir);
+  fs.writeFileSync(path.join(scenarioDir, "scenario.json"), "{ not json");
+  const problems = checkExtensions(f);
+  assert.ok(
+    problems.some((p) => p.includes("broken") && p.includes("fails closed")),
+    `an unreadable scenario must fail closed: ${problems}`,
+  );
 });

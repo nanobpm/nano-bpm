@@ -44,6 +44,18 @@
         "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0"
       },
       "inert": true
+    },
+    {
+      "id": "bpmn:nano:flowClass",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Sequence-flow classification annotation (`<nano:flowClass>…</nano:flowClass>`), the fourth type of the nano-moddle descriptor (processos/assets/bpmn/nano-moddle.json) — its descriptor restricts it to `bpmn:SequenceFlow`, so the acceptance probe carries it on a flow, not a task (`match.on: \"sequenceFlow\"`). Inert to the engine; Camunda 8 lacks it.",
+      "match": {
+        "xmlLocalName": "flowClass",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0",
+        "on": "sequenceFlow"
+      },
+      "inert": true
     }
   ]
 }

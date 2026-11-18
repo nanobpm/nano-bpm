@@ -28,14 +28,25 @@ const NANO_NS = "http://nano.camunda.io/schema/semantic/1.0";
 
 /**
  * A minimal deployable model carrying one registered extension, so Camunda's
- * validator decides whether the surface is accepted. The extension is placed on
- * a service task inside `<bpmn:extensionElements>`, exactly where Nano's own
- * models carry it. `xmlns:nano` is bound so the tag parses as the namespaced
- * extension.
+ * validator decides whether the surface is accepted. By default the extension
+ * is placed on a service task inside `<bpmn:extensionElements>`, exactly where
+ * Nano's own models carry it; an entry whose descriptor restricts it to
+ * another element declares `match.on` (e.g. `"sequenceFlow"` for
+ * `nano:flowClass`, whose nano-moddle type has `allowedIn: ["bpmn:SequenceFlow"]`)
+ * and the probe carries it there instead, so the probe exercises the extension
+ * where real models use it. `xmlns:nano` is bound so the tag parses as the
+ * namespaced extension.
  */
 export function probeModel(entry) {
   const local = entry.match.xmlLocalName;
   const ns = entry.match.xmlNamespace ?? NANO_NS;
+  const onTask = entry.match.on !== "sequenceFlow";
+  const taskExt = onTask ? `\n        <nano:${local} probe="true" />` : "";
+  const flowExt = onTask ? " />" : `>
+      <bpmn:extensionElements>
+        <nano:${local} probe="true" />
+      </bpmn:extensionElements>
+    </bpmn:sequenceFlow>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions
   xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -48,12 +59,11 @@ export function probeModel(entry) {
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
       <bpmn:extensionElements>
-        <zeebe:taskDefinition type="w" />
-        <nano:${local} probe="true" />
+        <zeebe:taskDefinition type="w" />${taskExt}
       </bpmn:extensionElements>
     </bpmn:serviceTask>
     <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t"${flowExt}
     <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
   </bpmn:process>
 </bpmn:definitions>`;
@@ -61,16 +71,41 @@ export function probeModel(entry) {
 
 /**
  * Classify a failed probe deployment. Only a model-validation rejection
- * (HTTP 400) whose body names the probed extension counts as the expected,
- * extension-confirming outcome. Anything else — auth (401/403), 5xx, timeouts,
- * transport failures, or a 400 about something unrelated — is an OPERATIONAL
- * failure that proves nothing about the extension, so it is returned as
- * `"error"` and the caller fails the run (fail closed).
+ * (HTTP 400) whose diagnostic names the probed EXTENSION — not merely the
+ * probe's own identifiers — counts as the expected, extension-confirming
+ * outcome. The probe model embeds the local name in generated ids
+ * (`probe_<local>`, `Defs_<local>`), so a bare substring match would count an
+ * UNRELATED validation failure (`Process 'probe_cost': invalid process
+ * configuration`) as the extension being rejected. We therefore require the
+ * extension-specific forms — the namespaced tag `nano:<local>` or the quoted
+ * local name `'<local>'` / `"<local>"` (how validators cite an offending
+ * element) — and strip the generated ids before matching, so a name that
+ * appears ONLY in the process/definitions id cannot confirm the extension.
+ * Anything else — auth (401/403), 5xx, timeouts, transport failures, or a 400
+ * about something unrelated — is an OPERATIONAL failure that proves nothing
+ * about the extension, so it is returned as `"error"` and the caller fails the
+ * run (fail closed).
  */
 export function classifyDeployFailure(entry, err) {
   if (!(err instanceof CamundaHttpError) || err.status !== 400) return "error";
-  const text = typeof err.body === "string" ? err.body : JSON.stringify(err.body ?? "");
-  return text.includes(entry.match.xmlLocalName) ? "rejected" : "error";
+  const local = entry.match.xmlLocalName;
+  // Strip the probe's generated ids — including a quoting delimiter glued to
+  // them (`'probe_cost'` / `Defs_cost"`) — so the name appearing ONLY in the
+  // process/definitions id cannot confirm the extension, and the strip cannot
+  // leave a stray quote that fabricates a quoted-local-name match. A
+  // non-string body is JSON.stringify'd, which escapes quotes (`\"`); those
+  // are unescaped first so the strip and the quoted-name match see the real
+  // delimiters.
+  const text = (typeof err.body === "string" ? err.body : JSON.stringify(err.body ?? ""))
+    .replace(/\\(["'])/g, "$1")
+    .replace(new RegExp(`probe_${local}['"]?`, "g"), " ")
+    .replace(new RegExp(`Defs_${local}['"]?`, "g"), " ");
+  const extensionSpecific =
+    text.includes(`nano:${local}`) ||
+    text.includes(`'${local}'`) ||
+    text.includes(`"${local}"`) ||
+    text.includes(`<${local}>`);
+  return extensionSpecific ? "rejected" : "error";
 }
 
 function parseArgs(argv) {
