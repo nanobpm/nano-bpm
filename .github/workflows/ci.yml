@@ -785,7 +785,9 @@ jobs:
           path: ~/.cache/nanobpm-formal
           key: tla2tools-${{ steps.tla.outputs.version }}
       - name: Model-check
-        run: formal/tla/check.sh
+        # Keep every model's TLC log (with its -coverage statistics) for the
+        # action-coverage gate below (#1248).
+        run: FORMAL_LOG_DIR="$RUNNER_TEMP/tlc-logs" formal/tla/check.sh
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
@@ -796,7 +798,13 @@ jobs:
         # workflow (parity-exhaustive-nightly.yml) runs the larger `nightly` one.
         # Any divergence not committed (with a filed issue) to
         # formal/corpus/divergences.json fails the job.
-        run: node formal/corpus/exhaustive.mjs --bound ci --tlc
+        run: node formal/corpus/exhaustive.mjs --bound ci --tlc --coverage-dir "$RUNNER_TEMP/tlc-exhaustive-logs"
+      - name: TLC action coverage (#1248) — every spec action and disjunct fires in some model
+        run: |
+          set -o pipefail
+          node --test formal/tla/coverage.test.mjs
+          node formal/tla/coverage.mjs "$RUNNER_TEMP/tlc-logs" --extra "$RUNNER_TEMP/tlc-exhaustive-logs" | tee "$RUNNER_TEMP/coverage.txt"
+          { echo '### TLC action coverage'; echo '```'; cat "$RUNNER_TEMP/coverage.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         with:
           path: ~/.cache/nanobpm-parity
