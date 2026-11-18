@@ -312,3 +312,31 @@ fn a_post_creation_variable_write_revokes_provenance() {
         assert!(job.secret_provenance.is_empty(), "local={local}");
     }
 }
+
+/// A write to a scope the job cannot see (a sibling branch, e.g. a parallel
+/// task's own input-mapping scope) cannot replace the job's inputs, so it must
+/// keep the job's provenance; a write to an ancestor scope still revokes it.
+#[test]
+fn a_sibling_scope_write_preserves_provenance() {
+    let (mut engine, _) = engine_with_cluster_vars();
+    let (prov, _) = run(
+        &mut engine,
+        task(vec![m("=apiCfg", "payload.auth")]),
+        HashMap::new(),
+    );
+    assert_eq!(prov, vec![site("payload.auth")]);
+    let job = engine.state.jobs.values().next().unwrap().clone();
+    let sibling = job.element_instance_key + 1_000_000;
+    let write = |scope_key| crate::event::Event::ScopedVariablesUpdated {
+        instance_key: job.instance_key,
+        scope_key,
+        variables: HashMap::from([("payload".to_string(), Value::Str(REF.to_string()))]),
+    };
+    crate::state::apply(&mut engine.state, &write(sibling));
+    assert_eq!(
+        engine.state.jobs[&job.key].secret_provenance,
+        vec![site("payload.auth")]
+    );
+    crate::state::apply(&mut engine.state, &write(job.element_instance_key));
+    assert!(engine.state.jobs[&job.key].secret_provenance.is_empty());
+}

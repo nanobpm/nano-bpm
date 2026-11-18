@@ -26,19 +26,58 @@ fn non_terminal_process_id(state: &State, instance_key: &Key) -> Option<String> 
 }
 
 /// Drops the mapping-time secret provenance (#1640) of every job of
-/// `instance_key`. Provenance attests the value a trusted input mapping wrote;
-/// any later variable write to the instance may replace that value (even with
-/// equal reference text from an untrusted source), so trust is revoked — fail
-/// closed: the reference text then passes through unresolved.
-fn revoke_secret_provenance(state: &mut State, instance_key: &Key) {
+/// `instance_key` whose variable view the write to `scope_key` can change.
+/// Provenance attests the value a trusted input mapping wrote; a later write
+/// visible to the job may replace that value (even with equal reference text
+/// from an untrusted source), so trust is revoked — fail closed: the reference
+/// text then passes through unresolved.
+///
+/// A job sees its own element-instance scope and every ancestor scope up to the
+/// root, so a write is relevant iff it targets the root (`None`, `0` or the
+/// instance key) or one of those scopes. A write to a sibling branch (e.g. a
+/// parallel task's own input mappings) cannot reach the job and keeps its
+/// trust. Jobs without provenance are skipped before any scope walk.
+fn revoke_secret_provenance(state: &mut State, instance_key: &Key, scope_key: Option<Key>) {
     let Some(keys) = state.jobs_by_instance.get(instance_key) else {
         return;
     };
+    let scope = scope_key.filter(|s| *s != 0 && s != instance_key);
+    let scopes = state.instances.get(instance_key).map(|i| &i.scopes);
     for key in keys {
-        if let Some(job) = state.jobs.get_mut(key) {
+        let Some(job) = state.jobs.get_mut(key) else {
+            continue;
+        };
+        if job.secret_provenance.is_empty() {
+            continue;
+        }
+        let visible = match scope {
+            None => true,
+            Some(target) => sees_scope(scopes, job.element_instance_key, target),
+        };
+        if visible {
             job.secret_provenance.clear();
         }
     }
+}
+
+/// Whether `target` is `element_instance_key` itself or one of its ancestor
+/// scopes in the instance's element-instance tree. Cycle-safe; an unknown tree
+/// answers `true` (fail closed).
+fn sees_scope(scopes: Option<&HashMap<Key, Key>>, element_instance_key: Key, target: Key) -> bool {
+    let Some(scopes) = scopes else {
+        return true;
+    };
+    let mut current = element_instance_key;
+    for _ in 0..=scopes.len() {
+        if current == target {
+            return true;
+        }
+        match scopes.get(&current) {
+            Some(&parent) if parent != 0 => current = parent,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Decrements a definition's in-flight instance count on a terminal transition,
@@ -132,7 +171,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     map.insert(k.clone(), v.clone());
                 }
             }
-            revoke_secret_provenance(state, instance_key);
+            revoke_secret_provenance(state, instance_key, None);
         }
 
         Event::ScopedVariablesUpdated {
@@ -155,7 +194,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     }
                 }
             }
-            revoke_secret_provenance(state, instance_key);
+            revoke_secret_provenance(state, instance_key, Some(*scope_key));
         }
 
         Event::VariableScopeCreated {
