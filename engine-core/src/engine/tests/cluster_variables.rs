@@ -235,3 +235,62 @@ fn distributed_copies_are_idempotent_upserts() {
         "a re-delivered distributed delete is a no-op"
     );
 }
+
+/// The REST funnel builds its response (and the fan-out copy) from the
+/// applying command's OWN events — never a re-read of live state, which a
+/// concurrent mutation could change in between (PR #1670 review). Pin the
+/// contract that makes that possible: a create/update emits exactly one
+/// lifecycle event carrying the full post-mutation record, and a delete
+/// emits exactly one carrying none.
+#[test]
+fn lifecycle_events_carry_the_full_post_mutation_record() {
+    let mut engine = Engine::new();
+    let events = engine
+        .apply_command(create(None, "x", Value::Int(1), false))
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let Event::ClusterVariableCreated {
+        value,
+        kind,
+        metadata,
+        ..
+    } = &events[0]
+    else {
+        panic!("a create emits exactly its ClusterVariableCreated record");
+    };
+    assert_eq!(
+        (value, kind, metadata.is_empty()),
+        (&Value::Int(1), &ClusterVariableKind::Json, true)
+    );
+
+    let events = engine
+        .apply_command(Command::UpdateClusterVariable {
+            tenant_id: None,
+            name: "x".into(),
+            value: Value::Int(2),
+            metadata: BTreeMap::from([("owner".to_string(), Value::Str("ops".into()))]),
+        })
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let Event::ClusterVariableUpdated {
+        value, metadata, ..
+    } = &events[0]
+    else {
+        panic!("an update emits exactly its ClusterVariableUpdated record");
+    };
+    assert_eq!(value, &Value::Int(2));
+    assert_eq!(metadata.get("owner"), Some(&Value::Str("ops".into())));
+
+    let events = engine
+        .apply_command(Command::DeleteClusterVariable {
+            tenant_id: None,
+            name: "x".into(),
+            distributed: false,
+        })
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], Event::ClusterVariableDeleted { .. }),
+        "a delete emits exactly its ClusterVariableDeleted record"
+    );
+}

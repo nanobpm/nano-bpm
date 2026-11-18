@@ -600,6 +600,21 @@ impl ServerImpl {
     /// every peer advertises [`falcon::FEATURE_CLUSTER_VARIABLES`]; otherwise
     /// the write fails closed with 503 and no partition is touched. Writes from
     /// this gateway are serialized so its fan-outs never interleave.
+    ///
+    /// Consistency contract (slice 1 — Zeebe parity): partition 0 is the sole
+    /// authority — every mutation validates and commits there first, and the
+    /// fan-out copies carry the full resulting record, so concurrent writes
+    /// (possibly through different gateways) converge **last-writer-wins by
+    /// authoritative commit order**: a stale copy can only overwrite a newer
+    /// value on a follower partition when its own authoritative commit was
+    /// later, in which case it IS the newest value. Revisions/tombstones and a
+    /// durable, restart-resuming distributor (so a fan-out interrupted by a
+    /// gateway failure is retried to completion independently of the REST
+    /// request) are follow-up slices; an interrupted fan-out surfaces as the
+    /// request's error and is logged (`cluster variable fan-out incomplete`)
+    /// so an operator can re-issue the write — a create retries as 409 and a
+    /// delete as 404, so the recovery write is an UPDATE (or a re-create after
+    /// a delete).
     async fn cluster_variable_mutate(
         &self,
         command: Command,
@@ -640,8 +655,22 @@ impl ServerImpl {
                 distributed: true,
             },
         };
-        for p in 1..self.engine.partition_count() as u64 {
-            self.apply_cluster_variable_on(p, copy.clone()).await?;
+        let partition_count = self.engine.partition_count() as u64;
+        for p in 1..partition_count {
+            if let Err(e) = self.apply_cluster_variable_on(p, copy.clone()).await {
+                // Partition 0 has already committed; the remaining copies are
+                // best-effort (slice 1 — see the consistency contract above).
+                // Log loudly so an interrupted fan-out is diagnosable, then
+                // surface the failure to the caller.
+                tracing::error!(
+                    partition = p,
+                    error = %e.1,
+                    "cluster variable fan-out incomplete: partition {p} did not receive \
+                     the copy of {tenant:?}/{name}; re-issue the write to converge it \
+                     (a create retries as 409, a delete as 404 — re-issue as an update)"
+                );
+                return Err(e);
+            }
         }
         Ok(record.map(|v| StoredClusterVariable::from_engine(tenant.as_deref(), &name, &v)))
     }
@@ -669,6 +698,20 @@ impl ServerImpl {
     /// Applies a cluster-variable command on local partition `p` through its
     /// replicated funnel and returns the post-apply record. Also the handler
     /// behind the intra-cluster `ApplyClusterVariable` frame.
+    ///
+    /// The returned record is the one THIS proposal committed: it is derived
+    /// from the proposal's own events (a create/update event carries the full
+    /// post-mutation record; a delete event carries none), never from a
+    /// re-read of live state — a re-read runs in a separate actor turn, so a
+    /// concurrent mutation from another gateway could land in between and the
+    /// response (and the fan-out copy built from it) would carry the OTHER
+    /// write's value. The record's `id` is the one field the events do not
+    /// carry; it is read back best-effort through [`Self::engine_handle_for`]
+    /// — which also reaches a partition this node only LEADS after a failover
+    /// (its Raft replica actor), where `local_for_partition` would report the
+    /// committed write as an error — and defaults to `0` when the partition is
+    /// not hosted here (the fan-out copy does not use the id; the REST `id`
+    /// is a search-pagination cursor only).
     pub(crate) async fn apply_cluster_variable_local(
         &self,
         p: u64,
@@ -677,19 +720,76 @@ impl ServerImpl {
         let (tenant, name) = cluster_variable_target(&command)
             .ok_or_else(|| (400, "not a cluster-variable command".to_string()))?;
         let key = nanobpmn_engine_core::compose_key(p, 0);
-        let _ = self.apply_partition_command(key, command).await?;
-        let handle = self
-            .engine
-            .local_for_partition(p)
-            .ok_or_else(|| (503, format!("partition {p} is not hosted here")))?;
-        Ok(handle
+        let (events, _commit) = self.apply_partition_command(key, command).await?;
+        // At most one lifecycle event per applied command (an idempotent
+        // distributed delete of an already-absent variable emits none).
+        let mut applied: Option<nanobpmn_engine_core::ClusterVariable> = None;
+        let mut deleted = false;
+        for e in events.iter() {
+            match e {
+                Event::ClusterVariableCreated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
+                } => {
+                    applied = Some(nanobpmn_engine_core::ClusterVariable {
+                        id: 0,
+                        value: value.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                    });
+                }
+                // An update preserves the kind (it is fixed at creation); the
+                // record's kind is filled in by the read-back below.
+                Event::ClusterVariableUpdated {
+                    value, metadata, ..
+                } => {
+                    applied = Some(nanobpmn_engine_core::ClusterVariable {
+                        id: 0,
+                        value: value.clone(),
+                        kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+                        metadata: metadata.clone(),
+                    });
+                }
+                Event::ClusterVariableDeleted { .. } => deleted = true,
+                _ => {}
+            }
+        }
+        if deleted {
+            return Ok(None);
+        }
+        let Some(mut record) = applied else {
+            return Ok(None);
+        };
+        // Fill in the id (and, for an update, the preserved kind) from the
+        // applying partition's state. Reaching that state must use
+        // [`Self::engine_handle_for`] — which also reaches a partition this
+        // node only LEADS after a failover (its Raft replica actor) — never
+        // `local_for_partition`, which returns `None` for a promoted partition
+        // and would report the committed write as an error (PR #1670 review).
+        // A partition this node neither owns nor replicates is unreachable:
+        // fail the read-back rather than return a placeholder id.
+        let Some(handle) = self.engine_handle_for(p) else {
+            return Err((
+                503,
+                format!("partition {p} committed but is not hosted here for the read-back"),
+            ));
+        };
+        let (t, n) = (tenant.clone(), name.clone());
+        let stored = handle
             .with(move |j| {
                 j.engine()
                     .cluster_variables()
-                    .get(tenant.as_deref(), &name)
-                    .cloned()
+                    .get(t.as_deref(), &n)
+                    .map(|v| (v.id, v.kind))
             })
-            .await)
+            .await;
+        if let Some((id, kind)) = stored {
+            record.id = id;
+            record.kind = kind;
+        }
+        Ok(Some(record))
     }
 }
 
@@ -2339,6 +2439,125 @@ mod cluster_variable_tests {
         )
         .await;
         assert_eq!(names(&page2_again), names(&page2));
+    }
+
+    /// PR #1670 review: the mutation response must be the record THIS command
+    /// committed, derived from its own events — not a re-read of live state a
+    /// concurrent mutation could have changed in between.
+    #[tokio::test]
+    async fn mutation_returns_the_committed_record_from_its_own_events() {
+        let s = store();
+        let created = s
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .expect("create succeeds");
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+        assert_eq!(created.kind, models::ClusterVariableKindEnum::Json);
+        assert_ne!(created.id, 0, "the id is filled in from the apply");
+
+        let mut metadata = ClusterVariableMetadata::new();
+        metadata.insert(
+            "owner".to_string(),
+            models::ClusterVariableResultBaseMetadataValue::String("ops".to_string()),
+        );
+        let updated = s
+            .cluster_variable_update(None, "region", val(json!("APAC")), metadata)
+            .await
+            .expect("update succeeds");
+        assert_eq!(cluster_variable_value_string(&updated.value), "\"APAC\"");
+        assert_eq!(
+            updated.id, created.id,
+            "an update preserves the id (and the response carries it)"
+        );
+
+        // A delete commits and reports `None` without any post-commit lookup.
+        s.cluster_variable_delete(None, "region")
+            .await
+            .expect("delete succeeds");
+        assert!(s.cluster_variable_get(None, "region").await.is_none());
+    }
+
+    /// PR #1670 review: after a failover this node can LEAD a partition it does
+    /// not statically own, and the post-apply read-back must reach that
+    /// partition's Raft replica actor via `engine_handle_for` — not
+    /// `local_for_partition`, which returns `None` for a promoted partition and
+    /// would report the committed write as an error. The non-Raft apply funnel
+    /// cannot target a non-owned partition in a test (its `by_key` falls back to
+    /// an owned actor), so this pins the accessor contract the fix relies on:
+    /// `engine_handle_for` serves a led-but-not-owned partition from its replica
+    /// actor where `local_for_partition` does not.
+    #[tokio::test]
+    async fn engine_handle_for_reaches_a_promoted_partitions_replica_actor() {
+        // This node owns partition 0 and merely REPLICATES partition 1.
+        let owned = Journal::in_memory_partition(0);
+        let mut replica = Journal::in_memory_partition(1);
+        // Seed the replica (as its replicated apply would) with the variable the
+        // promoted partition holds, so the read-back has something to find.
+        let (_events, seed_commit) = replica
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "promoted".to_string(),
+                    value: val(json!(42)),
+                    kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+                    metadata: Default::default(),
+                    distributed: true,
+                },
+                1,
+            )
+            .expect("seed the replica's cluster variable");
+        seed_commit.blocking_wait();
+        let replica_id = replica
+            .engine()
+            .cluster_variables()
+            .get(None, "promoted")
+            .map(|v| v.id);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![owned], topology);
+        // As raft_bootstrap would: host the follower replica engine for p1.
+        let replica_handle = DeepthiHandle::spawn(replica, 1, None);
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1, replica_handle);
+
+        // The pre-fix accessor finds nothing for the non-owned partition…
+        assert!(
+            server.engine.local_for_partition(1).is_none(),
+            "partition 1 is not statically owned here"
+        );
+        // …but the F5 accessor reaches its replica actor and reads the value.
+        let handle = server
+            .engine_handle_for(1)
+            .expect("engine_handle_for serves a led-but-not-owned partition");
+        let read = handle
+            .with(|j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(None, "promoted")
+                    .map(|v| (v.id, cluster_variable_value_string(&v.value)))
+            })
+            .await;
+        assert_eq!(
+            read,
+            replica_id.map(|id| (id, "42".to_string())),
+            "the replica actor serves partition 1's cluster variable"
+        );
     }
 }
 
@@ -4471,6 +4690,169 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
         if let Err(e) = seglog::catch_up_shard(shard, base_p, &p_events, reseed_state) {
             panic!("failed to catch up read-model shard {pid} from the segmented journal: {e}");
         }
+    }
+}
+
+/// `true` for the cluster-variable lifecycle events (#1657): keyless and
+/// partition-agnostic, replicated to EVERY partition by the fan-out, so a
+/// legacy (untagged) journal's recovery demux must broadcast them to every
+/// (owned) partition rather than route them by [`Event::owning_partition`]
+/// (which would assign the keyless record to partition 0 and lose every other
+/// partition's variables on restart).
+fn cluster_variable_broadcast(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ClusterVariableCreated { .. }
+            | Event::ClusterVariableUpdated { .. }
+            | Event::ClusterVariableDeleted { .. }
+    )
+}
+
+/// Demultiplexes a legacy (non-segmented, untagged) shared journal into the
+/// events each of `owned` partitions replays on recovery — the single canonical
+/// demux for every legacy multi-partition boot path (single-node, where `owned`
+/// is every partition, and clustered, where it is this node's subset).
+///
+/// Routing contract:
+///
+/// * A **partition-agnostic definition** event (`ProcessDeployed` and the other
+///   resource deployments) mints no instance state and its key belongs to the
+///   deployment partition (0), which a clustered peer may not own — so it is
+///   replayed into *every* owned partition, reconstructing the definition
+///   cluster-wide from a single durable copy (see
+///   `Journal::install_deployment_durable`). Start subscriptions / timers keep
+///   their partition-0 keys and demux normally.
+/// * A **cluster-variable lifecycle** event ([`cluster_variable_broadcast`]) is
+///   likewise broadcast to every owned partition: the fan-out replicates it
+///   cluster-wide, and the legacy format records no producing partition, so a
+///   key-based route would rebuild the variables only on partition 0 and lose
+///   them everywhere else on restart (#1657, PR #1670 review).
+/// * Every other event goes to its [`Event::owning_partition`]. A key whose
+///   partition is out of range (e.g. a log from a larger partition layout)
+///   falls back to the lowest owned partition so replay never panics and no
+///   durable record is dropped; in the clustered layout a partition id this
+///   node does not own is dropped — its owner replays it from its own journal.
+fn demux_legacy_shared_log(
+    events: Vec<Event>,
+    owned: Vec<u64>,
+    partitions: u64,
+) -> std::collections::HashMap<u64, Vec<Event>> {
+    let mut per_partition: std::collections::HashMap<u64, Vec<Event>> =
+        owned.iter().map(|p| (*p, Vec::new())).collect();
+    let fallback = owned.first().copied();
+    for event in events {
+        if matches!(
+            event,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
+        ) || cluster_variable_broadcast(&event)
+        {
+            for bucket in per_partition.values_mut() {
+                bucket.push(event.clone());
+            }
+            continue;
+        }
+        let p = event.owning_partition();
+        if let Some(bucket) = per_partition.get_mut(&p) {
+            bucket.push(event);
+        } else if p >= partitions
+            && let Some(fallback) = fallback
+            && let Some(bucket) = per_partition.get_mut(&fallback)
+        {
+            // Genuinely out of range (a log from a larger partition layout):
+            // keep the record on the lowest owned partition rather than
+            // dropping durable state.
+            bucket.push(event);
+        }
+        // else: a valid partition this node does not own — dropped; its owner
+        // replays it from its own journal.
+    }
+    per_partition
+}
+
+#[cfg(test)]
+mod legacy_demux_tests {
+    use super::*;
+
+    fn cv_created(name: &str) -> Event {
+        Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: name.to_string(),
+            value: Value::Int(1),
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+            metadata: Default::default(),
+        }
+    }
+
+    /// PR #1670 review (F1): with `NANOBPMN_JOURNAL_SEGMENTED=0` the legacy
+    /// demux routed the keyless cluster-variable events by `owning_partition`
+    /// (partition 0), so a multi-partition restart lost every other partition's
+    /// variables. They must broadcast to EVERY partition.
+    #[test]
+    fn legacy_demux_broadcasts_cluster_variables_to_every_partition() {
+        let demuxed = demux_legacy_shared_log(vec![cv_created("x")], vec![0, 1, 2], 3);
+        for p in 0..3 {
+            assert_eq!(
+                demuxed.get(&p).map(Vec::len),
+                Some(1),
+                "partition {p} replays the cluster-variable record"
+            );
+        }
+    }
+
+    /// The broadcast must not swallow keyed events: an instance-keyed event
+    /// still routes to its owning partition only.
+    #[test]
+    fn legacy_demux_routes_keyed_events_to_their_owning_partition() {
+        let keyed = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(2, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![keyed], vec![0, 1, 2], 3);
+        assert!(demuxed[&0].is_empty() && demuxed[&1].is_empty());
+        assert_eq!(demuxed[&2].len(), 1);
+    }
+
+    /// Clustered layout: a node owning only a subset still receives the
+    /// broadcast into each of ITS partitions, and a keyed event for a partition
+    /// it does not own is dropped (its owner replays it).
+    #[test]
+    fn legacy_demux_clustered_broadcasts_to_owned_and_drops_unowned() {
+        let keyed_unowned = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(1, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![cv_created("x"), keyed_unowned], vec![0, 2], 3);
+        assert_eq!(demuxed[&0].len(), 1, "owned partition 0 gets the broadcast");
+        assert_eq!(demuxed[&2].len(), 1, "owned partition 2 gets the broadcast");
+        assert!(
+            demuxed.values().flatten().all(|e| matches!(
+                e,
+                Event::ClusterVariableCreated { .. }
+                    | Event::ClusterVariableUpdated { .. }
+                    | Event::ClusterVariableDeleted { .. }
+            )),
+            "the unowned partition's keyed event is dropped, not broadcast"
+        );
     }
 }
 
@@ -30291,16 +30673,13 @@ async fn main() {
                         open_sharded_read_model(db_path.as_deref(), &owned, false);
                     rebuild_read_model_legacy(&shards, &events, partitions);
 
-                    // Split the shared log into each partition's own events by the
-                    // owning partition encoded in every event's key. A key whose
-                    // partition is out of range (e.g. a log from a larger partition
-                    // layout) falls back to partition 0 so replay never panics.
-                    let mut per_partition: Vec<Vec<Event>> =
-                        (0..partitions).map(|_| Vec::new()).collect();
-                    for event in events {
-                        let p = event.owning_partition() as usize;
-                        per_partition[p.min(partitions - 1)].push(event);
-                    }
+                    // Split the shared log into each partition's own events (see
+                    // [`demux_legacy_shared_log`] for the routing contract).
+                    let per_partition = demux_legacy_shared_log(
+                        events,
+                        (0..partitions as u64).collect(),
+                        partitions as u64,
+                    );
 
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
@@ -30308,11 +30687,10 @@ async fn main() {
                             journal_path.display()
                         )
                     });
-                    let recovered = per_partition.iter().any(|evs| !evs.is_empty());
+                    let recovered = per_partition.values().any(|evs| !evs.is_empty());
                     let journals: Vec<Journal> = per_partition
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
+                        .map(|(p, evs)| Journal::from_events_shared(p, evs, &shared))
                         .collect();
                     (journals, recovered, read_model)
                 }
@@ -30393,41 +30771,13 @@ async fn main() {
                     // partition a peer may not own) into every owned shard; other
                     // events to `partition_of(key)`'s shard.
                     rebuild_read_model_legacy(&shards, &events, partitions);
-                    // Demultiplex the node's log into its owned partitions by the
-                    // partition id encoded in every key. Any event for a partition
-                    // this node does not own (a stray from a re-sharded layout) is
-                    // dropped — its owner replays it from its own journal.
-                    //
-                    // `ProcessDeployed` is the exception: a deployment definition is
-                    // partition-agnostic (it mints no instance state and arms no
-                    // subscriptions) and its key belongs to the deployment partition
-                    // (0), which a peer node does not own. So every `ProcessDeployed`
-                    // is replayed into *every* owned partition, reconstructing the
-                    // definition cluster-wide from a single durable copy (see
-                    // `Journal::install_deployment_durable`). Start subscriptions /
-                    // timers keep their partition-0 keys and demux normally, so they
-                    // are only ever rebuilt on the deployment partition's owner.
-                    let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
-                        owned.iter().map(|p| (*p, Vec::new())).collect();
-                    for event in events {
-                        if matches!(
-                            event,
-                            Event::ProcessDeployed { .. }
-                                | Event::DecisionRequirementsDeployed { .. }
-                                | Event::DecisionDeployed { .. }
-                                | Event::FormDeployed { .. }
-                                | Event::GenericResourceDeployed { .. }
-                        ) {
-                            for bucket in per_owned.values_mut() {
-                                bucket.push(event.clone());
-                            }
-                            continue;
-                        }
-                        let p = event.owning_partition();
-                        if let Some(bucket) = per_owned.get_mut(&p) {
-                            bucket.push(event);
-                        }
-                    }
+                    // Demultiplex the node's log into its owned partitions (see
+                    // [`demux_legacy_shared_log`] for the routing contract; an
+                    // event for a partition this node does not own — a stray from
+                    // a re-sharded layout — is dropped: its owner replays it from
+                    // its own journal).
+                    let mut per_owned =
+                        demux_legacy_shared_log(events, owned.clone(), partitions as u64);
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
                             "failed to open shared journal {}: {e}",
