@@ -265,6 +265,12 @@ pub struct Engine {
     /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
     /// in which case variable resolution keeps its zero-copy fast path.
     cluster_variables: crate::cluster_vars::ClusterVariables,
+    /// The cluster-variable snapshot pinned for the command being applied
+    /// (#1640): taken once at command entry so every read during the command —
+    /// the FEEL overlay and SECRET_REFERENCE trust attribution — observes ONE
+    /// immutable state. `None` outside a command (reads then take a fresh
+    /// snapshot). Cleared on every exit, like `operation_reference`.
+    pinned_cluster_variables: Option<std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -688,6 +694,7 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            pinned_cluster_variables: None,
             raft_applied: None,
         }
     }
@@ -758,6 +765,30 @@ impl Engine {
         cluster_variables: crate::cluster_vars::ClusterVariables,
     ) {
         self.cluster_variables = cluster_variables;
+    }
+
+    /// A fresh read of the shared cluster-variable handle: one immutable
+    /// snapshot (a refcount bump under a brief read lock).
+    fn read_cluster_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
+        let guard = self
+            .cluster_variables
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        std::sync::Arc::clone(&guard)
+    }
+
+    /// The cluster-variable snapshot every evaluation must read through: the
+    /// one pinned for the current command, or a fresh read outside a command.
+    /// The single accessor, so no two reads within a command can diverge.
+    pub(crate) fn cluster_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::cluster_vars::ClusterVariableSnapshot> {
+        match &self.pinned_cluster_variables {
+            Some(pinned) => std::sync::Arc::clone(pinned),
+            None => self.read_cluster_snapshot(),
+        }
     }
 
     /// The shared cluster-variable handle (see [`Self::set_cluster_variables`]).
@@ -846,6 +877,7 @@ impl Engine {
             torn_down_scopes: HashSet::new(),
             esp_start_payloads: HashMap::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            pinned_cluster_variables: None,
             raft_applied,
         }
     }
@@ -2230,6 +2262,7 @@ impl Engine {
         // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
         // a reference can never leak into a later command.
         self.operation_reference = operation_reference;
+        self.pinned_cluster_variables = Some(self.read_cluster_snapshot());
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log);
@@ -2237,6 +2270,7 @@ impl Engine {
             log
         });
         self.operation_reference = None;
+        self.pinned_cluster_variables = None;
         result
     }
 

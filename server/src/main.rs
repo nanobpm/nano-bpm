@@ -572,7 +572,7 @@ impl ClusterVariableStore {
             }
         }
         let mut guard = self.runtime.write().unwrap_or_else(|p| p.into_inner());
-        *guard = snap;
+        *guard = std::sync::Arc::new(snap);
     }
 }
 

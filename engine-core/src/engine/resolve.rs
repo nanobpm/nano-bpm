@@ -160,13 +160,14 @@ impl Engine {
         if mappings.is_empty() {
             return Vec::new();
         }
-        let cluster_roots = {
-            let guard = match self.cluster_variables.read() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT)
-        };
+        // The SAME pinned snapshot `vars` was overlaid from (#1640): reading
+        // kinds from a fresh snapshot would let a JSON -> SECRET_REFERENCE
+        // retype between the two reads mint trust. Cluster variables are
+        // node-local, not replicated state, so replicas can still disagree on
+        // this attribution — tracked in #1657.
+        let cluster_roots = self
+            .cluster_snapshot()
+            .trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT);
         let instance = self.state.instances.get(&instance_key);
         let bound_by_instance = |name: &str| {
             instance.is_some_and(|i| {
@@ -506,10 +507,7 @@ impl Engine {
         &self,
         base: Arc<HashMap<String, Value>>,
     ) -> Arc<HashMap<String, Value>> {
-        let guard = match self.cluster_variables.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = self.cluster_snapshot();
         if guard.is_empty() {
             return base;
         }
@@ -1153,7 +1151,7 @@ mod tests {
             .entry("other".to_string())
             .or_default()
             .insert("secret".to_string(), Value::Str("nope".to_string()));
-        engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
+        engine.set_cluster_variables(StdArc::new(RwLock::new(StdArc::new(snap))));
 
         let mut base = HashMap::new();
         base.insert(
@@ -1193,7 +1191,7 @@ mod tests {
             "api_token".to_string(),
             Value::Str("camunda.secrets.API_TOKEN".to_string()),
         );
-        engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
+        engine.set_cluster_variables(StdArc::new(RwLock::new(StdArc::new(snap))));
 
         let out = engine.overlay_cluster_variables(Arc::new(HashMap::new()));
         assert_eq!(

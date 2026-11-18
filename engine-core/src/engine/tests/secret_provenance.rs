@@ -32,7 +32,7 @@ fn engine_with_cluster_vars() -> (Engine, crate::cluster_vars::ClusterVariables)
     snap.global
         .insert("jsonCfg".to_string(), Value::Str(REF.to_string()));
     snap.global_secret_references.insert("apiCfg".to_string());
-    let handle = StdArc::new(RwLock::new(snap));
+    let handle = StdArc::new(RwLock::new(StdArc::new(snap)));
     let mut engine = Engine::new();
     engine.set_cluster_variables(StdArc::clone(&handle));
     (engine, handle)
@@ -192,9 +192,7 @@ fn a_later_untrusted_mapping_overwrites_provenance() {
 #[test]
 fn a_jsonkind_tenant_variable_shadowing_a_trusted_global_is_untrusted() {
     let (mut engine, handle) = engine_with_cluster_vars();
-    handle
-        .write()
-        .unwrap()
+    StdArc::make_mut(&mut *handle.write().unwrap())
         .tenants
         .entry(DEFAULT_TENANT.to_string())
         .or_default()
@@ -218,7 +216,7 @@ fn provenance_is_fixed_at_mapping_time() {
     assert_eq!(prov, vec![site("token")]);
     // Deleting / retyping the cluster variable afterwards changes nothing
     // recorded: activation never re-derives trust.
-    *handle.write().unwrap() = ClusterVariableSnapshot::default();
+    *handle.write().unwrap() = StdArc::new(ClusterVariableSnapshot::default());
     let job = engine.state.jobs.values().next().unwrap();
     assert_eq!(job.secret_provenance, vec![site("token")]);
 }
@@ -339,4 +337,51 @@ fn a_sibling_scope_write_preserves_provenance() {
     );
     crate::state::apply(&mut engine.state, &write(job.element_instance_key));
     assert!(engine.state.jobs[&job.key].secret_provenance.is_empty());
+}
+
+/// #1640 check-then-use race: the FEEL overlay (`vars`) and the trusted-root
+/// kinds must come from ONE cluster-variable snapshot. A JSON-kind variable
+/// retyped to SECRET_REFERENCE (same text) between the two reads must not be
+/// trusted for an evaluation whose view was built from the JSON-kind state.
+#[test]
+fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
+    let (mut engine, handle) = engine_with_cluster_vars();
+    let (_, log) = run(&mut engine, task(vec![m("=apiCfg", "token")]), HashMap::new());
+    let inst = log
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .unwrap();
+    let mappings = vec![m("=jsonCfg", "t")];
+
+    // Pin exactly as a command does, then read the overlay (jsonCfg is JSON).
+    engine.pinned_cluster_variables = Some(engine.read_cluster_snapshot());
+    let vars = engine.variables_for_element(inst, 0);
+    // Inject the retype between the two reads.
+    let mut retyped = ClusterVariableSnapshot::default();
+    retyped.global = handle.read().unwrap().global.clone();
+    retyped.global_secret_references = ["apiCfg", "jsonCfg"].map(String::from).into();
+    *handle.write().unwrap() = StdArc::new(retyped);
+
+    // Pinned: trust is read from the snapshot `vars` came from -> untrusted.
+    assert!(engine.secret_provenance_of(inst, &vars, &mappings).is_empty());
+    // The pre-fix behaviour (a fresh read of kinds) WOULD have trusted it —
+    // proving the injected retype is real.
+    engine.pinned_cluster_variables = None;
+    assert_eq!(
+        engine.secret_provenance_of(inst, &vars, &mappings),
+        vec![SecretProvenance {
+            path: "t".to_string(),
+            secrets: vec!["TOKEN".to_string()],
+        }]
+    );
+}
+
+#[test]
+fn apply_command_unpins_the_cluster_snapshot() {
+    let (mut engine, _) = engine_with_cluster_vars();
+    run(&mut engine, task(vec![m("=apiCfg", "token")]), HashMap::new());
+    assert!(engine.pinned_cluster_variables.is_none());
 }

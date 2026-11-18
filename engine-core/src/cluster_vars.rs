@@ -27,7 +27,7 @@ pub const DEFAULT_TENANT: &str = "<default>";
 /// every process instance; a tenant's variables are visible only to instances
 /// running under that tenant. Instance/local variables always shadow cluster
 /// variables when both define the same name.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ClusterVariableSnapshot {
     /// Global-scoped cluster variables, keyed by name.
     pub global: HashMap<String, Value>,
@@ -90,4 +90,11 @@ impl ClusterVariableSnapshot {
 /// owns the write side (REST create / update / delete); the engine holds a clone
 /// and reads it while building a FEEL evaluation context. Empty by default, in
 /// which case the engine's variable-resolution fast path is unaffected.
-pub type ClusterVariables = Arc<RwLock<ClusterVariableSnapshot>>;
+///
+/// The lock guards an `Arc` to an **immutable** snapshot: a writer replaces the
+/// whole snapshot (never mutates one in place), so a reader that clones the inner
+/// `Arc` holds one self-consistent view (values *and* kinds) for as long as it
+/// needs. The engine pins one such view per command, so every read inside an
+/// evaluation — the FEEL overlay and secret-reference trust attribution — sees
+/// the same state (#1640: no value/kind check-then-use race).
+pub type ClusterVariables = Arc<RwLock<Arc<ClusterVariableSnapshot>>>;
