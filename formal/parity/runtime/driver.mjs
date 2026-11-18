@@ -21,6 +21,7 @@ import { join } from "node:path";
  *     "steps": [                      // ordered, serialised
  *       { "op": "activateAndComplete", "jobType": "a", "variables": { "a": 1 } },
  *       { "op": "correlateMessage", "name": "M", "correlationKey": "k", "variables": {} },
+ *       { "op": "publishMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "broadcastSignal", "name": "S", "variables": {} },
  *       { "op": "advanceTime", "ms": 1000 }
  *     ],
@@ -40,6 +41,13 @@ async function dispatchStep(backend, handle, step) {
       return backend.activateAndComplete(handle, step.jobType, step.variables ?? {});
     case "correlateMessage":
       return backend.correlateMessage(
+        handle,
+        step.name,
+        step.correlationKey,
+        step.variables ?? {},
+      );
+    case "publishMessage":
+      return backend.publishMessage(
         handle,
         step.name,
         step.correlationKey,

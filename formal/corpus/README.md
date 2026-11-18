@@ -93,3 +93,67 @@ divergence. This is the same drift discipline as `formal/parity` and
    verdict — the generator does not touch the registry, so a new model without an
    `SPEC_EXPECTED` row fails `check.sh` (that is the intended registration gate).
 4. Run `formal/tla/check.sh` to model-check and to run the drift guard.
+
+## Bounded-exhaustive enumeration (#1246)
+
+The hand-written graphs above found #1233 and #1241 by luck. `enumerate.mjs`
+replaces luck with a bound: it enumerates **every** well-formed graph up to *N*
+gateways (exclusive, parallel, inclusive, event-based) and *M* sequence flows,
+with tasks (and message catch events) as wait states, reduced by isomorphism
+(one graph per class, numbered canonically, id `Gen_<hash of the canonical
+key>` — stable across bounds). Well-formedness and the reduction are documented
+at the top of `enumerate.mjs`.
+
+Every graph goes through the **same emitters** as the hand-written corpus — one
+source, three artifacts:
+
+- `tlaFor` → `MCGen_*` (TokenFlow) and `ZMCGen_*` (ZeebeTokenFlow);
+- `bpmnFor(graph, { routing: 'variables' })` → BPMN with DI, whose diverging
+  exclusive / inclusive gateways read their route from a start variable
+  (`route_<gateway>`), and whose catch events subscribe to
+  `<graph>_<node>` keyed by the `correlationKey` start variable;
+- `scenariosFor` → runtime scenario scripts (formal/parity/runtime format): one
+  per **route × command order**. A command-level executor of `TokenFlow.tla`
+  (`Reference`) derives, after each settled step, every possible next command
+  (complete a job, correlate a message), as TLC explores every interleaving;
+  its outcome is the scenario's `expect`.
+
+`exhaustive.mjs` runs them:
+
+```bash
+node formal/corpus/exhaustive.mjs --bound ci --tlc                 # formal (tlc) job
+node formal/corpus/exhaustive.mjs --bound ci --backend nano        # parity-runtime job
+node formal/corpus/exhaustive.mjs --bound nightly --tlc --backend both --require-camunda   # nightly
+node formal/corpus/exhaustive.mjs --gateways 3 --flows 8 --kinds and,or --tlc   # any bound
+node formal/corpus/exhaustive.mjs --bound ci --out /tmp/gen        # just write the artifacts
+```
+
+The bound is configurable; the named bounds live in `bounds.json` (`ci` for the
+PR gate, `nightly` for `.github/workflows/parity-exhaustive-nightly.yml`, which
+also takes a manual dispatch with overrides). Checks per graph:
+
+| phase | divergence |
+| --- | --- |
+| `tlc` | `RefinesZeebe` violated, or the nano spec's verdict ≠ the Zeebe reference's verdict (`tlc-refines`, `tlc-verdict`); a reference run that gets stuck where TLC reports no stuck state (`reference-vs-tlc`) |
+| `nano` | the engine-wasm TestEngine's outcome (completion, jobs created, variables) ≠ the reference outcome |
+| `camunda` | live Camunda 8 ≠ the reference, or ≠ nano on the fields both expose (`differential`) — completing scenarios only (the bare-gateway backend observes an instance through completion) |
+
+Command orders that put two tokens on one wait state (not 1-safe) are left to
+TLC: the driver addresses a job by type and a message by name, so it cannot
+single one of them out. Message steps use the driver's `publishMessage` op (a
+buffered correlation: Camunda publishes with a TTL, so no race with the
+subscription the previous step opens; nano's RTC makes it immediate).
+
+**Any divergence fails the run and is shrunk.** Graphs are enumerated
+smallest-first (flows, then gateways), so the first graph showing a divergence
+class (its `signature`) is a minimal one within the bound; of its failing
+scenarios the shortest is kept. `--record` appends these minimal cases to
+`divergences.json`, the committed corpus of known divergences. Each committed
+case needs a filed `issue` (an unfiled case fails the run and the unit tests);
+a committed case that stops reproducing inside the bound fails as stale, so a
+fix deletes it. Nano divergences are filed as their own issues and fixed
+there, never inside the generator.
+
+The generated scenarios are deterministic command scripts (fixed ids, fixed
+order, unique correlation keys), so the same `--out` corpus can feed the
+determinism CI command corpus (#1665).

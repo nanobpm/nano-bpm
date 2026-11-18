@@ -65,10 +65,34 @@ const KIND = {
   task: { el: 'serviceTask', w: 110, h: 80 },
   and: { el: 'parallelGateway', w: 50, h: 50 },
   or: { el: 'inclusiveGateway', w: 50, h: 50 },
-  xor: { el: 'exclusiveGateway', w: 50, h: 50 }
+  xor: { el: 'exclusiveGateway', w: 50, h: 50 },
+  // Event-based routing (#1246). `evt` is an eventBasedGateway (a wait state
+  // resumed by a message correlation), `msg` the intermediateCatchEvent with a
+  // messageEventDefinition each of its outgoing flows leads to. They are emitted
+  // only for VARIABLE-routed graphs (the bounded-exhaustive enumeration,
+  // enumerate.mjs), whose scenarios drive the correlation as a command; the
+  // hand-written graph sources stay deterministic-route only (validateGraphs).
+  evt: { el: 'eventBasedGateway', w: 50, h: 50 },
+  msg: { el: 'intermediateCatchEvent', w: 36, h: 36 }
 }
+// The node kinds the hand-written, deterministic-route corpus (graphs/*.json)
+// may use. evt/msg need a correlation command per route, which only the
+// variable-routed enumeration (enumerate.mjs) schedules.
+const DETERMINISTIC_KINDS = new Set(['start', 'end', 'task', 'and', 'or', 'xor'])
+
+// Variable routing (#1246): the single naming source for the route variable a
+// diverging exclusive/inclusive gateway reads, the message a catch event
+// subscribes to, and its (constant) correlation key. bpmnFor emits them and
+// enumerate.mjs's scenarios set / correlate them, so the pair cannot drift.
+export const routeVariable = (gatewayId) => `route_${gatewayId}`
+export const messageName = (graphId, nodeId) => `${graphId}_${nodeId}`
+export const messageId = (nodeId) => `Message_${nodeId}`
+// The start variable a catch event's correlationKey expression reads. A scenario
+// sets it to a value unique to that scenario, so a buffered (TTL) message can
+// never correlate a different scenario's instance on a shared Camunda runtime.
+export const CORRELATION_KEY_VARIABLE = 'correlationKey'
 // CASE arm order for MCKind; `task` is the OTHER fallback.
-const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor']
+const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor', 'evt', 'msg']
 
 // The one grammar every corpus identifier must obey. Graph ids, family module
 // names, node ids and flow (edge) ids all flow verbatim into generated
@@ -186,8 +210,8 @@ export function validateGraphs (graphs) {
       // `OTHER -> "task"` arm while bpmnFor dereferences KIND[kind].el and
       // throws `Cannot read properties of undefined`, so a typo like "xorr" is
       // neither rejected nor generated. Reject it here (#1258 review).
-      if (!KIND[g.nodes[n]]) {
-        bad(`graph ${g.id} node ${JSON.stringify(n)} has unknown kind ${JSON.stringify(g.nodes[n])} (known: ${Object.keys(KIND).join(', ')})`)
+      if (!DETERMINISTIC_KINDS.has(g.nodes[n])) {
+        bad(`graph ${g.id} node ${JSON.stringify(n)} has unknown kind ${JSON.stringify(g.nodes[n])} (known: ${[...DETERMINISTIC_KINDS].join(', ')}; evt/msg are generated only by the variable-routed enumeration, enumerate.mjs)`)
       }
     }
     checkId(`graph ${g.id} start node`, g.start)
@@ -564,7 +588,16 @@ export function reachableNodes (graph) {
 
 // ---------------------------------------------------------------------------
 // BPMN 2.0 XML + BPMNDI
-export function bpmnFor (graph) {
+//
+// `opts.routing`: 'deterministic' (default) conditions every diverging gateway
+// from `takenFlows` (one fixed route, the hand-written corpus). 'variables'
+// (#1246, the bounded-exhaustive enumeration) makes each split read its route
+// from a start variable instead (`routeVariable`): an exclusive split takes the
+// flow whose id equals the variable, an inclusive split every flow whose id the
+// variable's list contains. One BPMN then covers EVERY routing choice — the
+// scenario picks the route, as TLC picks a branch.
+export function bpmnFor (graph, opts = {}) {
+  const variableRouting = opts.routing === 'variables'
   const nodes = Object.keys(graph.nodes)
   const outFlows = Object.create(null); const inFlows = Object.create(null)
   for (const e of graph.edges) {
@@ -583,6 +616,13 @@ export function bpmnFor (graph) {
   L.push('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"')
   L.push('    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"')
   L.push(`    id="${xmlEscape(definitionsId(graph.id))}" targetNamespace="http://nanobpm.io/corpus">`)
+  for (const id of nodes.filter((n) => graph.nodes[n] === 'msg')) {
+    L.push(`  <bpmn:message id="${xmlEscape(messageId(id))}" name="${xmlEscape(messageName(graph.id, id))}">`)
+    L.push('    <bpmn:extensionElements>')
+    L.push(`      <zeebe:subscription correlationKey="=${CORRELATION_KEY_VARIABLE}"/>`)
+    L.push('    </bpmn:extensionElements>')
+    L.push('  </bpmn:message>')
+  }
   L.push(`  <bpmn:process id="${xmlEscape(graph.id)}" isExecutable="true">`)
 
   for (const id of nodes) {
@@ -599,6 +639,9 @@ export function bpmnFor (graph) {
     const kids = []
     for (const e of inFlows[id] ?? []) kids.push(`      <bpmn:incoming>${xmlEscape(e.id)}</bpmn:incoming>`)
     for (const e of outFlows[id] ?? []) kids.push(`      <bpmn:outgoing>${xmlEscape(e.id)}</bpmn:outgoing>`)
+    if (kind === 'msg') {
+      kids.push(`      <bpmn:messageEventDefinition messageRef="${xmlEscape(messageId(id))}"/>`)
+    }
     if (kind === 'task') {
       kids.unshift(
         '      <bpmn:extensionElements>',
@@ -627,7 +670,12 @@ export function bpmnFor (graph) {
     // scheduled for a job the BPMN cannot create. A non-split flow carries no
     // condition.
     let cond = null
-    if (isSplit(e.from)) {
+    if (isSplit(e.from) && variableRouting) {
+      const v = routeVariable(e.from)
+      cond = graph.nodes[e.from] === 'xor'
+        ? `=${v} = &quot;${xmlEscape(e.id)}&quot;`
+        : `=list contains(${v}, &quot;${xmlEscape(e.id)}&quot;)`
+    } else if (isSplit(e.from)) {
       cond = taken.has(e.id) ? '=true' : '=false'
     }
     if (cond) {

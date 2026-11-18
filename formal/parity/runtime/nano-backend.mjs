@@ -118,6 +118,15 @@ export class NanoBackend {
     this.engine.correlateMessage(name, correlationKey, JSON.stringify(variables ?? {}));
   }
 
+  // A BUFFERED correlation (#1246): the message reaches the subscription that the
+  // previous step opens, however late it opens. Nano runs every command to RTC
+  // quiescence synchronously, so that subscription is already open when this
+  // step runs and an immediate correlation is the same thing. (The Camunda
+  // adapter has no such barrier and publishes with a TTL instead.)
+  async publishMessage(handle, name, correlationKey, variables) {
+    return this.correlateMessage(handle, name, correlationKey, variables);
+  }
+
   async broadcastSignal(_handle, name, variables) {
     this.engine.broadcastSignal(name, JSON.stringify(variables ?? {}));
   }

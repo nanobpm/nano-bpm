@@ -32,6 +32,10 @@ const DEFAULT_LONG_POLL_MS = 30_000;
 // scenario, not Camunda's short default (5s here) — otherwise the create times
 // out (504) before `observe()` can read the final result (#1260 review).
 const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
+// How long a `publishMessage` step keeps its message buffered for a subscription
+// still being opened (#1246). Bounded by the instance completion deadline: a
+// message nobody consumed by then belongs to a scenario that already failed.
+const PUBLISH_TTL_MS = DEFAULT_COMPLETION_TIMEOUT_MS;
 // The liveness probe must have a deadline. A reachable-but-wedged endpoint (a
 // provisioned service that accepts the TCP connection but never answers
 // `/topology`, or a network path that blackholes the request) would otherwise
@@ -303,6 +307,28 @@ export class CamundaBackend {
       "/messages/correlation",
       { name, correlationKey, variables: variables ?? {} },
       "correlate message",
+    );
+  }
+
+  // A BUFFERED correlation (#1246). v2 `/messages/correlation` never buffers,
+  // and a bare gateway exposes no barrier for "the previous step's subscription
+  // is open" (see `start`), so correlating right after a job completion races
+  // the subscription. Publishing with a time-to-live closes the race without a
+  // sleep or a retry: the broker keeps the message until the subscription opens
+  // and correlates it then. A scenario using this op must give every scenario
+  // its own correlation key, so a buffered message can never reach another
+  // scenario's instance on the shared runtime.
+  async publishMessage(_handle, name, correlationKey, variables) {
+    await this.#json(
+      "POST",
+      "/messages/publication",
+      {
+        name,
+        correlationKey,
+        timeToLive: PUBLISH_TTL_MS,
+        variables: variables ?? {},
+      },
+      "publish message",
     );
   }
 
