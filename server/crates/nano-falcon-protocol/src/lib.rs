@@ -378,6 +378,11 @@ pub enum ClientFrame {
         retries: Option<i32>,
         #[serde(default)]
         error_message: Option<String>,
+        /// Camunda 8 v2 `retryBackOff` in ms (#933): the job is not
+        /// re-activatable before now + this. Absent/`0`/negative = immediately.
+        /// Skipped when absent so backoff-less frames stay byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_back_off: Option<i64>,
     },
     /// Throw a BPMN error from an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]

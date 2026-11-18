@@ -8444,6 +8444,7 @@ mod writability_tests {
                     at: 600,
                     deadline: None,
                 }),
+                retry_backoff_until: None,
             },
         );
         store.seed_from_engine_state(&state).unwrap();
@@ -8942,6 +8943,7 @@ mod definition_xml_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                retry_backoff_until: None,
             },
         );
 
@@ -9213,6 +9215,7 @@ mod definition_xml_tests {
                     at: 600,
                     deadline: Some(70_000),
                 }),
+                retry_backoff_until: None,
             },
         );
 
@@ -9768,6 +9771,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobCanceled {
                 job_key: 8_950,
@@ -9832,6 +9836,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: Some("w1".to_string()),
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobRetriesUpdated {
                 job_key: 8_900,
@@ -12580,6 +12585,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A terminal errored job on the same source element.
                 &Event::JobCreated {
@@ -12673,6 +12679,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("w1".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A job that throws a terminal (uncaught) error after activation by `w2`.
                 &Event::JobCreated {
@@ -12729,6 +12736,7 @@ mod element_instance_tests {
                     retries: 1,
                     worker: Some("w3".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ])
             .unwrap();
@@ -12780,6 +12788,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("host-a-senior".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // Errored terminally — again no JobActivated projection.
                 &Event::JobCreated {
@@ -12931,6 +12940,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some(String::new()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 &Event::JobCreated {
                     job_key: 9203,
@@ -13067,6 +13077,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                retry_backoff_until: None,
             },
         );
 
@@ -13136,6 +13147,7 @@ mod element_instance_tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            retry_backoff_until: None,
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -13246,6 +13258,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ),
             (
@@ -13405,6 +13418,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         let failed = get(7003);
@@ -13474,6 +13488,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("late".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8001,
@@ -13531,6 +13546,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -13574,6 +13590,7 @@ mod element_instance_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
         store.export(&[&fail(8201)]).unwrap();
         let failed = get(8201);
@@ -13628,6 +13645,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("stray".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8202,
@@ -13781,6 +13799,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                retry_backoff_until: None,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -13879,6 +13898,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("upstream 503".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13895,6 +13915,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -13908,6 +13929,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13969,6 +13991,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7001).has_failed_with_retries_left);
@@ -13993,6 +14016,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(!row(&store, 7002).has_failed_with_retries_left);
@@ -14017,6 +14041,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7003).has_failed_with_retries_left);
@@ -14043,6 +14068,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7004).has_failed_with_retries_left);
@@ -15071,6 +15097,7 @@ mod read_surface_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("boom".to_string()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8400,
@@ -15257,6 +15284,7 @@ mod read_surface_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
         };
 
         let p_created = apply_at(&store, &created, 1_000);
@@ -15633,6 +15661,7 @@ mod read_surface_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
 
         apply_at(&store, &created, 1_000);
@@ -16702,6 +16731,7 @@ mod job_position_gate_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: None,
+            retry_backoff_until: None,
         };
         store
             .export(&[
