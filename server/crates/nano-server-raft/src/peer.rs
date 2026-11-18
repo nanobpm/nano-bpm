@@ -157,6 +157,10 @@ pub struct PeerLink {
     /// touching the independent Raft socket (#1582). The Raft lane is never
     /// aborted here: it self-terminates when the last sender clone drops.
     app_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// The replicated-command features the peer advertised on the `/cluster`
+    /// handshake (#1661, [`nano_falcon_protocol::cluster_join`]). Empty for a
+    /// pre-#1661 peer, which never advertises any.
+    remote_features: Arc<Vec<String>>,
 }
 
 /// Body of the synthetic reply delivered to a waiter whose lane closed (or was
@@ -214,6 +218,14 @@ impl PeerLink {
     /// socket closes, at which point the link is marked disconnected and every
     /// outstanding request fails with [`PeerError::Closed`].
     pub async fn connect(base_url: &str) -> Result<Self, PeerError> {
+        Self::connect_as(base_url, None).await
+    }
+
+    /// [`connect`](Self::connect), presenting this node's cluster-wide partition
+    /// count on the join handshake (#1661): both sides refuse a link whose
+    /// `NANOBPMN_PARTITIONS` differs. `None` skips the check (tests / tools
+    /// dialing without a topology).
+    pub async fn connect_as(base_url: &str, num_partitions: Option<u64>) -> Result<Self, PeerError> {
         let app_connected = Arc::new(AtomicBool::new(true));
         let raft_connected = Arc::new(AtomicBool::new(true));
         let pending_app: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -224,11 +236,12 @@ impl PeerLink {
         // App-forwarding traffic and Raft RPCs ride separate sockets so a backlog
         // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
         // election deadline (head-of-line isolation for the replication transport).
-        let (out_app, app_tasks) = Self::dial(
+        let (out_app, app_tasks, remote_features) = Self::dial(
             &ws_url(base_url),
             pending_app.clone(),
             app_connected.clone(),
             secret.as_deref(),
+            num_partitions,
         )
         .await?;
         // Until ownership transfers to the returned `PeerLink`, the app lane's
@@ -238,11 +251,12 @@ impl PeerLink {
         let app_guard = AbortOnDrop(Some(app_tasks.to_vec()));
         // Raft-lane abort handles are deliberately dropped (not tracked): the
         // lane is never torn down by an app-lane retirement (#1582).
-        let (out_raft, _raft_tasks) = Self::dial(
+        let (out_raft, _raft_tasks, _) = Self::dial(
             &raft_ws_url(base_url),
             pending_raft.clone(),
             raft_connected.clone(),
             secret.as_deref(),
+            num_partitions,
         )
         .await?;
 
@@ -255,7 +269,15 @@ impl PeerLink {
             app_connected,
             raft_connected,
             app_tasks: Arc::new(std::sync::Mutex::new(app_guard.disarm())),
+            remote_features: Arc::new(remote_features),
         })
+    }
+
+    /// Whether the peer advertised replicated-command `feature` on its
+    /// handshake (#1661). A leader emits a new command variant only once every
+    /// member supports it.
+    pub fn supports(&self, feature: &str) -> bool {
+        self.remote_features.iter().any(|f| f == feature)
     }
 
     /// Opens one falcon socket to `ws_url`, spawning its writer and reader
@@ -267,7 +289,9 @@ impl PeerLink {
         pending: Pending,
         connected: Arc<AtomicBool>,
         secret: Option<&str>,
-    ) -> Result<(mpsc::Sender<Message>, [tokio::task::AbortHandle; 2]), PeerError> {
+        num_partitions: Option<u64>,
+    ) -> Result<(mpsc::Sender<Message>, [tokio::task::AbortHandle; 2], Vec<String>), PeerError> {
+        use nano_falcon_protocol::cluster_join;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = ws_url
             .into_client_request()
@@ -282,7 +306,25 @@ impl PeerLink {
                 value,
             );
         }
-        let (ws, _resp) = match tokio::time::timeout(
+        // Join handshake (#1661): advertise our replicated-command features and
+        // (when known) our partition count, so the peer can refuse a mismatch.
+        {
+            use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+            let headers = request.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&cluster_join::local_features_header()) {
+                headers.insert(
+                    HeaderName::from_static(cluster_join::CLUSTER_FEATURES_HEADER),
+                    value,
+                );
+            }
+            if let Some(n) = num_partitions {
+                headers.insert(
+                    HeaderName::from_static(cluster_join::CLUSTER_PARTITIONS_HEADER),
+                    HeaderValue::from(n),
+                );
+            }
+        }
+        let (ws, resp) = match tokio::time::timeout(
             connect_timeout(),
             tokio_tungstenite::connect_async(request),
         )
@@ -296,6 +338,26 @@ impl PeerLink {
                 )));
             }
         };
+        // The peer answers with its own partition count + features: refuse the
+        // link from this side too when the counts differ (#1661).
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let remote_features = cluster_join::parse_features(
+            header(cluster_join::CLUSTER_FEATURES_HEADER).as_deref(),
+        );
+        if let Some(local) = num_partitions {
+            cluster_join::check_join(
+                local,
+                header(cluster_join::CLUSTER_PARTITIONS_HEADER).as_deref(),
+                None,
+                &[],
+            )
+            .map_err(|e| PeerError::Connect(e.to_string()))?;
+        }
         // Disable Nagle on the peer socket: the Falcon protocol carries small,
         // latency-sensitive request/response frames (notably Raft AppendEntries),
         // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
@@ -347,7 +409,11 @@ impl PeerLink {
             }
         });
 
-        Ok((out, [writer.abort_handle(), reader.abort_handle()]))
+        Ok((
+            out,
+            [writer.abort_handle(), reader.abort_handle()],
+            remote_features,
+        ))
     }
 
     /// Whether BOTH lanes are still up (the link is fully usable for app
@@ -1285,6 +1351,26 @@ impl PeerSet {
         !self.topology.is_single_node()
     }
 
+    /// Whether EVERY other cluster member is reachable and advertised
+    /// replicated-command `feature` on its join handshake (#1661, ADR 0066
+    /// "Rolling upgrade"). Gates the first emission of a command variant an
+    /// older binary cannot decode: a leader proposes it only once this holds.
+    /// Conservative by construction — it checks the whole static topology (a
+    /// superset of every partition's voters and learners), and an unreachable
+    /// peer counts as unsupported. Trivially `true` on a single node.
+    pub async fn all_peers_support(&self, feature: &str) -> bool {
+        for node_id in 0..self.topology.num_nodes() as u32 {
+            if node_id == self.topology.node_id {
+                continue;
+            }
+            match self.link(node_id).await {
+                Ok(link) if link.supports(feature) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Fault injection (tests only): mark `node_id` unreachable, dropping any
     /// cached link so subsequent `link`/reachability probes fail as if the peer
     /// had died. Production code never calls this.
@@ -1421,7 +1507,7 @@ impl PeerSet {
             .ok_or_else(|| PeerError::Connect(format!("no address for node {node_id}")))?;
         // Onset-diagnosis instrument: count every dial to a peer, split by outcome.
         // A survivor's redial rate to a *dead* peer is the "wasted send work" signal.
-        let dial = PeerLink::connect(addr).await;
+        let dial = PeerLink::connect_as(addr, Some(self.topology.num_partitions)).await;
         crate::metrics::record_peer_connect_attempt(node_id, dial.is_ok());
         match dial {
             Ok(link) => {
@@ -1607,6 +1693,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            remote_features: Arc::default(),
         };
         // The stalled peer never answers; the inner deadline is far away, so
         // only the drop of the outer future can clean the entry up.
@@ -1653,6 +1740,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            remote_features: Arc::default(),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1729,6 +1817,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            remote_features: Arc::default(),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1786,6 +1875,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            remote_features: Arc::default(),
         }
     }
 
