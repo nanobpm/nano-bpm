@@ -82,7 +82,9 @@ async fn peer_set_dials_lazily_and_forwards() {
     let topology = crate::cluster::Topology {
         node_id: 0,
         peers: vec!["http://self-unused".to_string(), peer_base],
-        num_partitions: 4,
+        // Must match the served peer's partition count: a mismatch is refused
+        // at the join handshake (#1661).
+        num_partitions: 1,
         replication_factor: 1,
     };
     let peers = PeerSet::new(topology);
@@ -372,10 +374,20 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Serves a peer whose single partition's REPLICATED lenient-completion flag
-/// is `lenient` (#1661), set through the journaled command.
+/// Serves node 0 of a two-node, one-partition cluster whose partition's
+/// REPLICATED lenient-completion flag is `lenient` (#1661), set through the
+/// journaled command. (A single node never requires peer features: it
+/// replicates its log to no one.)
 async fn serve_peer_lenient(lenient: bool) -> String {
-    let server = crate::ServerImpl::default();
+    let server = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory()],
+        crate::cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://self-unused".into(), "http://other-unused".into()],
+            num_partitions: 1,
+            replication_factor: 1,
+        },
+    );
     for handle in server.engine.all() {
         handle
             .with(move |journal| {

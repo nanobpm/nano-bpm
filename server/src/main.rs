@@ -19949,6 +19949,11 @@ impl ServerImpl {
     /// partition (owned or replica) has applied `LenientCompletionSet { true }`
     /// — an older binary could not decode that command in the log.
     async fn required_cluster_features(&self) -> Vec<&'static str> {
+        // A single node never replicates its log to anyone, so its local flag
+        // places no requirement on a peer.
+        if self.engine.topology().is_single_node() {
+            return Vec::new();
+        }
         for p in 0..self.engine.topology().num_partitions {
             if let Some(handle) = self.engine_handle_for(p)
                 && handle
@@ -43857,6 +43862,22 @@ mod clustered_startup_tests {
             ok,
             "every partition must have its owning node as leader before creates"
         );
+        // A leader-local policy needs the partition's REPLICATED lenient flag
+        // before any leader-local lock is granted (#1661). In production the
+        // first clock tick proposes it; run that tick here so the cluster starts
+        // in the steady state the activation-policy tests exercise.
+        if node0.activation_policy.may_be_leader_local() {
+            for node in nodes {
+                for p in 0..3u64 {
+                    node.tick_partition_via_raft(p, now_millis(), true).await;
+                }
+            }
+            let flags = await_lenient_flags(nodes, true).await;
+            assert!(
+                flags.iter().all(|f| *f),
+                "every replica applied the replicated lenient flag: {flags:?}"
+            );
+        }
         (node0, node1, node2, serve_handles)
     }
 
@@ -43954,21 +43975,25 @@ mod clustered_startup_tests {
         let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
             false,
             false,
-            Some(ActivationPolicy::LeaderLocal),
+            Some(ActivationPolicy::Always),
             None,
             Vec::new(),
         )
         .await;
-        // Booting a leader-local cluster sets nothing locally: the flag only
-        // ever arrives through the log.
         let before = lenient_flags([&n0, &n1, &n2]).await;
         assert_eq!(before.len(), 9, "3 partitions x RF3 replicas");
         assert!(
             before.iter().all(|f| !f),
-            "no host-config lenient flag: {before:?}"
+            "strict under `always`: {before:?}"
         );
 
-        // One replicated tick: each partition leader proposes the flag.
+        // Switching to a leader-local policy configures nothing locally: the
+        // flag only arrives through the log, proposed by each partition leader
+        // on its tick, and then holds on EVERY replica.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+        }
+        assert!(lenient_flags([&n0, &n1, &n2]).await.iter().all(|f| !f));
         parity_tick([&n0, &n1, &n2], now_millis()).await;
         let after = await_lenient_flags([&n0, &n1, &n2], true).await;
         assert!(
@@ -43976,7 +44001,7 @@ mod clustered_startup_tests {
             "every replica applied the flag: {after:?}"
         );
 
-        // A policy flip (to fully-replicated activation) is replicated too.
+        // Flipping back is replicated the same way.
         for node in [&mut n0, &mut n1, &mut n2] {
             node.activation_policy = ActivationPolicy::Always;
         }
@@ -57472,6 +57497,11 @@ mod no_direct_engine_apply_guard {
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
         "ServerImpl::apply_partition_command_ref",
+        // #1661: reconciles the lenient-completion flag on a journal that is its
+        // partition's ONLY replica — called solely on a single node (boot) and
+        // from the non-Raft tick branch; the Raft path proposes the same command
+        // through the log (`reconcile_lenient_completion_via_raft`).
+        "reconcile_lenient_completion_local",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -57735,7 +57765,11 @@ mod no_direct_engine_apply_guard {
         // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
-        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
+        const BARE_FREE_FNS: &[&str] = &[
+            "main",
+            "apply_create_instance_direct",
+            "reconcile_lenient_completion_local",
+        ];
         for entry in ALLOWED {
             if BARE_FREE_FNS.contains(entry) {
                 continue;

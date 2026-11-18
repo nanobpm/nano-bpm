@@ -1368,7 +1368,7 @@ impl PeerSet {
     /// superset of every partition's voters and learners), and an unreachable
     /// peer counts as unsupported. Trivially `true` on a single node.
     pub async fn all_peers_support(&self, feature: &str) -> bool {
-        for node_id in 0..self.topology.num_nodes() as u32 {
+        for node_id in 0..self.topology.num_nodes() {
             if node_id == self.topology.node_id {
                 continue;
             }
