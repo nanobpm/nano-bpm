@@ -69,3 +69,11 @@ warnings = "deny"
 # `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
 unwrap_used = "deny"
 expect_used = "deny"
+
+[[example]]
+name = "replication_size"
+required-features = ["serde"]
+
+[[example]]
+name = "divergence_digest"
+required-features = ["serde"]
