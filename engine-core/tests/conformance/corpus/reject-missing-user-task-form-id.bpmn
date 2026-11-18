@@ -1,0 +1,23 @@
+<!-- verdict: reject | category: MissingUserTaskFormId -->
+<!-- oracle: Zeebe-parity rejection. A user-task formDefinition declaring
+     neither a non-empty `formId` nor an `externalReference` has no form to
+     resolve under any binding, so Zeebe requires exactly one of the two and
+     rejects the model; Nano rejects it loudly too rather than silently
+     creating a form-less task with no incident (#1193 review). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="reject_missing_user_task_form_id" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:userTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition bindingType="deployment" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="task" />
+    <bpmn:sequenceFlow id="f1" sourceRef="task" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

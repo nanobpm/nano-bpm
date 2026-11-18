@@ -103,6 +103,16 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         origin: "baseline",
     },
     Mapping {
+        nano: "UnsupportedUserTaskFormBinding",
+        zeebe: "INVALID_ARGUMENT (zeebe:formDefinition bindingType not in ZeebeBindingType)",
+        origin: "#1193",
+    },
+    Mapping {
+        nano: "MissingUserTaskFormId",
+        zeebe: "INVALID_ARGUMENT (zeebe:formDefinition requires exactly one of formId / externalReference)",
+        origin: "#1193 review",
+    },
+    Mapping {
         nano: "UnresolvedReference",
         zeebe: "INVALID_ARGUMENT (camunda-xml-model eager QName resolution failure)",
         origin: "#849/#851",
@@ -161,6 +171,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::InvalidMessageEvent { .. } => "InvalidMessageEvent",
         ParseError::InvalidLinkedResource { .. } => "InvalidLinkedResource",
         ParseError::UnsupportedUserTaskFormBinding { .. } => "UnsupportedUserTaskFormBinding",
+        ParseError::MissingUserTaskFormId { .. } => "MissingUserTaskFormId",
         ParseError::UnresolvedReference { .. } => "UnresolvedReference",
         ParseError::UnsupportedElement { .. } => "UnsupportedElement",
         ParseError::InvalidGateway { .. } => "InvalidGateway",
@@ -206,14 +217,6 @@ struct Divergence {
 /// the full [`ParseError`] surface (every category is in exactly one of the two,
 /// enforced by [`mapping_covers_every_parse_error_category`]).
 const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
-    Divergence {
-        nano: "UnsupportedUserTaskFormBinding",
-        rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
-                    bindings and ACCEPTS such a model; Nano implements only `latest` and \
-                    rejects the deploy loudly rather than silently degrading the binding \
-                    to `latest` (#1190).",
-        origin: "#1190",
-    },
     Divergence {
         nano: "UnsupportedExecutionListener",
         rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \
@@ -623,6 +626,9 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             task_id: String::new(),
             binding_type: String::new(),
         },
+        ParseError::MissingUserTaskFormId {
+            task_id: String::new(),
+        },
         ParseError::UnresolvedReference {
             kind: String::new(),
             id: String::new(),
@@ -690,6 +696,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::InvalidMessageEvent { .. }
             | ParseError::InvalidLinkedResource { .. }
             | ParseError::UnsupportedUserTaskFormBinding { .. }
+            | ParseError::MissingUserTaskFormId { .. }
             | ParseError::UnresolvedReference { .. }
             | ParseError::UnsupportedElement { .. }
             | ParseError::InvalidGateway { .. }

@@ -1,18 +1,18 @@
-<!-- verdict: diverge | category: UnsupportedUserTaskFormBinding -->
-<!-- oracle: INTENTIONAL Nano/Zeebe divergence, not parity. Zeebe implements the
-     `deployment` and `versionTag` user-task form bindings and ACCEPTS this model;
-     Nano implements only `latest` and rejects the deploy loudly rather than
-     silently degrading the binding to `latest` (#1190). Tagged `diverge` (not
-     `reject`) so the conformance oracle never falsely claims Zeebe rejected a
-     model it accepts. -->
+<!-- verdict: reject | category: UnsupportedUserTaskFormBinding -->
+<!-- oracle: Zeebe-parity rejection. A user-task formDefinition `bindingType`
+     that is none of Camunda's three bindings (`latest`, `deployment`,
+     `versionTag`) is not a value Zeebe's `ZeebeBindingType` enum can hold, so
+     Zeebe rejects the model; Nano rejects it loudly too rather than silently
+     treating the unknown value as the `latest` default (#1190 fail-loud rule,
+     kept after the three real bindings were implemented in #1193). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-  <bpmn:process id="diverge_unsupported_user_task_form_binding" isExecutable="true">
+  <bpmn:process id="reject_unsupported_user_task_form_binding" isExecutable="true">
     <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
     <bpmn:userTask id="task">
       <bpmn:extensionElements>
         <zeebe:userTask />
-        <zeebe:formDefinition formId="review-form" bindingType="deployment" />
+        <zeebe:formDefinition formId="review-form" bindingType="pinned" />
       </bpmn:extensionElements>
       <bpmn:incoming>f0</bpmn:incoming>
       <bpmn:outgoing>f1</bpmn:outgoing>

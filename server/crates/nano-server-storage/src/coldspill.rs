@@ -384,6 +384,7 @@ mod tests {
             error_message: None,
             error_code: None,
             has_failed_with_retries_left: false,
+            retry_backoff_until: None,
             settled_tokens: Vec::new(),
             terminal_end: None,
             secret_provenance: Vec::new(),

@@ -938,12 +938,12 @@ impl ServerImpl {
             |v, field| match field {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(cluster_variable_value_string(&v.value)),
-                "tenantId" => query::SortVal::Str(v.tenant_id.clone().unwrap_or_default()),
+                "tenantId" => query::opt_str_sort_val(v.tenant_id.as_deref()),
                 "scope" => {
                     let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
                     query::SortVal::Str(scope_enum.to_string())
                 }
-                _ => query::SortVal::Num(v.id as i64),
+                _ => query::SortVal::Num(v.id as i128),
             },
             |v| v.id,
         );
@@ -2405,10 +2405,32 @@ struct JobErrorEntry {
 /// errors). `created` counts come from the read model. Shared across
 /// `ServerImpl` clones via `Arc`, like the other interior-mutable state on the
 /// struct.
-#[derive(Clone, Default)]
+///
+/// The logs are ephemeral (lost on restart) and bounded (oldest evicted past
+/// `capacity`), so an aggregation can under-report. `isIncomplete` (#934) is
+/// derived from two boundaries tracked here: `recording_since_ms` (when this
+/// process began recording — anything earlier was never seen by this log) and
+/// the eviction high-water mark (the latest `at_ms` ever evicted). A window
+/// `[from, to]` is complete iff `from` is at/after the recording start and
+/// strictly after every evicted entry.
+#[derive(Clone)]
 pub struct JobStatisticsState {
     metrics: Arc<std::sync::Mutex<std::collections::VecDeque<JobMetricEntry>>>,
     errors: Arc<std::sync::Mutex<std::collections::VecDeque<JobErrorEntry>>>,
+    /// Epoch ms this process started recording (restart boundary).
+    recording_since_ms: u64,
+    /// Latest `at_ms` evicted from `metrics`, `None` if nothing was evicted.
+    metrics_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Latest `at_ms` evicted from `errors`, `None` if nothing was evicted.
+    errors_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Per-log entry ceiling (`MAX_JOB_STAT_ENTRIES` in production).
+    capacity: usize,
+}
+
+impl Default for JobStatisticsState {
+    fn default() -> Self {
+        Self::with_limits(now_millis(), MAX_JOB_STAT_ENTRIES)
+    }
 }
 
 /// Safety ceiling on each in-memory job-statistics log so a long-running gateway
@@ -2432,11 +2454,48 @@ impl JobStatisticsState {
         self.errors.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn with_limits(recording_since_ms: u64, capacity: usize) -> Self {
+        Self {
+            metrics: Arc::default(),
+            errors: Arc::default(),
+            recording_since_ms,
+            metrics_evicted_through_ms: Arc::default(),
+            errors_evicted_through_ms: Arc::default(),
+            capacity,
+        }
+    }
+
+    /// Raise an eviction high-water mark to cover an evicted entry at `at_ms`.
+    fn note_evicted(mark: &std::sync::Mutex<Option<u64>>, at_ms: u64) {
+        let mut m = mark.lock().unwrap_or_else(|e| e.into_inner());
+        *m = Some(m.map_or(at_ms, |prev| prev.max(at_ms)));
+    }
+
+    /// Whether a `[from_ms, ..]` window may be missing entries given the
+    /// restart boundary and an eviction high-water mark (#934).
+    fn window_truncated(&self, mark: &std::sync::Mutex<Option<u64>>, from_ms: u64) -> bool {
+        let evicted = *mark.lock().unwrap_or_else(|e| e.into_inner());
+        from_ms < self.recording_since_ms || evicted.is_some_and(|m| from_ms <= m)
+    }
+
+    /// `isIncomplete` for a completed/failed aggregation starting at `from_ms`.
+    fn metrics_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.metrics_evicted_through_ms, from_ms)
+    }
+
+    /// `isIncomplete` for an error aggregation starting at `from_ms`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn errors_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.errors_evicted_through_ms, from_ms)
+    }
+
     fn record(&self, entry: JobMetricEntry) {
         let mut g = self.lock_metrics();
         g.push_back(entry);
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.metrics_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -2474,8 +2533,10 @@ impl JobStatisticsState {
             error_code,
             error_message,
         });
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.errors_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -3787,9 +3848,9 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         seed_versions(&state.process_versions, &state.processes, |d| d.key)
             .into_values()
             .map(|deployed| Event::ProcessDeployed {
-                // The deployment key is not used by the applier (definitions are
-                // keyed by processDefinitionKey); 0 is a harmless placeholder.
-                deployment_key: 0,
+                // The deployment key anchors `deployment`-bound form/resource
+                // resolution (#1193), so it must replicate faithfully.
+                deployment_key: deployed.deployment_key,
                 process_definition_key: deployed.key,
                 version: deployed.version,
                 process: deployed.definition.clone(),
@@ -3837,29 +3898,35 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         }
     }
     // Re-emit each deployed form version so a freshly seeded replica can serve
-    // it via GetFormByKey. Forms are independent (no sub-resources).
+    // it via GetFormByKey. Forms are independent (no sub-resources). The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // user-task form resolution (#1193), so they replicate faithfully.
     for form in seed_versions(&state.form_versions, &state.forms, |f| f.key).into_values() {
         events.push(Event::FormDeployed {
-            deployment_key: 0,
+            deployment_key: form.deployment_key,
             form_key: form.key,
             version: form.version,
             form_id: form.form_id.clone(),
             resource_name: form.resource_name.clone(),
             schema: form.schema.clone(),
+            version_tag: form.version_tag.clone(),
         });
     }
     // Re-emit each deployed generic-resource version so a freshly seeded
-    // replica can serve it via GetResourceByKey / searchResources.
+    // replica can serve it via GetResourceByKey / searchResources. The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // linked-resource resolution (#1193), so they replicate faithfully.
     for resource in
         seed_versions(&state.resource_versions, &state.resources, |r| r.key).into_values()
     {
         events.push(Event::GenericResourceDeployed {
-            deployment_key: 0,
+            deployment_key: resource.deployment_key,
             resource_key: resource.key,
             version: resource.version,
             resource_id: resource.resource_id.clone(),
             resource_name: resource.resource_name.clone(),
             content: resource.content.clone(),
+            version_tag: resource.version_tag.clone(),
         });
     }
     events
@@ -3932,6 +3999,9 @@ fn parse_deploy_resources(
                     id,
                     resource_name: resource_name.clone(),
                     schema: xml.clone(),
+                    // The form-js document's optional `versionTag` is matched by
+                    // a `versionTag`-bound user-task form (#1193).
+                    version_tag: nanobpmn_engine_core::form_version_tag_of(xml),
                 }),
                 None => {
                     return Err((
@@ -3985,6 +4055,10 @@ fn parse_deploy_resources(
             resource_id: resource_name.clone(),
             resource_name: resource_name.clone(),
             content: xml.clone(),
+            // The HTTP deploy envelope carries no per-resource `versionTag`
+            // metadata yet, so a generic resource deploys untagged (#1193
+            // wires the engine-side tag storage a future API field populates).
+            version_tag: None,
         });
     }
     Ok(ParsedDeploy {
@@ -7964,16 +8038,26 @@ impl ServerImpl {
             .as_ref()
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
+        // Camunda 8 v2 `retryBackOff` (#933): absent = 0 (retryable now);
+        // negatives are clamped to 0 by `Command::fail_job_with_backoff`.
+        let retry_back_off = body.as_ref().and_then(|b| b.retry_back_off).unwrap_or(0);
 
         if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self
-                .forward_fail_job(node, job_key, lease_token, retries, error_message)
+                .forward_fail_job(
+                    node,
+                    job_key,
+                    lease_token,
+                    retries,
+                    error_message,
+                    retry_back_off,
+                )
                 .await);
         }
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
             let command = job_command_with_lease(
-                Command::fail_job(job_key, retries, error_message),
+                Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
                 lease_token,
             );
             // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
@@ -7993,6 +8077,7 @@ impl ServerImpl {
                                 .record_failed(job_type, worker, now_millis());
                         }
                         self.signal_jobs_available();
+                        self.signal_jobs_available_after_backoff(retries, retry_back_off);
                         Resp::Status204_TheJobIsFailed
                     }
                     Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
@@ -8021,7 +8106,7 @@ impl ServerImpl {
             .apply_job_command_direct_with(
                 job_key,
                 job_command_with_lease(
-                    Command::fail_job(job_key, retries, error_message),
+                    Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
                     lease_token,
                 ),
                 None,
@@ -8055,8 +8140,10 @@ impl ServerImpl {
                 }
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
-                // pool, so wake any long-pollers.
+                // pool, so wake any long-pollers — again once a `retryBackOff`
+                // has elapsed (#933).
                 self.signal_jobs_available();
+                self.signal_jobs_available_after_backoff(retries, retry_back_off);
                 Ok(Resp::Status204_TheJobIsFailed)
             }
             Err(EngineError::JobNotFound { job_key }) => {
@@ -8434,7 +8521,7 @@ impl ServerImpl {
                 status_metric(created),
                 status_metric(completed),
                 status_metric(failed),
-                false,
+                self.job_statistics.metrics_incomplete(from_ms),
             ),
         ))
     }
@@ -11459,13 +11546,20 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> apis::job::FailJobResponse {
         use apis::job::FailJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.fail_job(job_key.to_string(), lease_token, retries, error_message)
-                        .await
+                    link.fail_job(
+                        job_key.to_string(),
+                        lease_token,
+                        retries,
+                        error_message,
+                        retry_back_off,
+                    )
+                    .await
                 }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
@@ -11613,10 +11707,17 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .fail_job(job_key.to_string(), lease_token, retries, error_message)
+                .fail_job(
+                    job_key.to_string(),
+                    lease_token,
+                    retries,
+                    error_message,
+                    retry_back_off,
+                )
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -12506,12 +12607,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                _ => query::SortVal::Num(inc.key as i64),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -12621,12 +12728,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                _ => query::SortVal::Num(inc.key as i64),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -12930,12 +13043,13 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ws, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i128),
                 "rootProcessInstanceKey" => query::SortVal::Num(
-                    roots.root_process_instance_key(ws.process_instance_key) as i64,
+                    roots.root_process_instance_key(ws.process_instance_key) as i128,
                 ),
                 "elementId" => query::SortVal::Str(ws.element_id.clone()),
-                _ => query::SortVal::Num(ws.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(ws.element_instance_key as i128),
+                _ => query::SortVal::Num(ws.element_instance_key as i128),
             },
             |ws| (ws.element_instance_key, ws.source_key),
         );
@@ -13168,22 +13282,27 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |row, field| match field {
-                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i64),
+                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i128),
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
                 "decisionDefinitionName" => query::SortVal::Str(row.decision_name.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
-                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
+                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i128),
                 "decisionDefinitionType" => query::SortVal::Str(row.decision_type.clone()),
-                "processInstanceKey" => query::SortVal::Num(row.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(row.instance_key as i128),
                 "state" => query::SortVal::Str(row.state.clone()),
                 "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
                 "decisionEvaluationInstanceKey" => {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
-                "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
+                "businessId" => query::opt_str_sort_val(row.business_id.as_deref()),
+                "decisionEvaluationKey" => query::SortVal::Num(row.decision_evaluation_key as i128),
+                "elementInstanceKey" => query::SortVal::Num(row.element_instance_key as i128),
+                "evaluationFailure" => query::opt_str_sort_val(row.evaluation_failure.as_deref()),
+                "processDefinitionKey" => query::key_sort_val(&row.process_definition_key),
+                "rootDecisionDefinitionKey" => query::SortVal::Num(row.root_decision_key as i128),
                 // Default (key) sort: by evaluation key, then the within-
                 // evaluation index via the composite tiebreak below.
-                _ => query::SortVal::Num(row.decision_evaluation_key as i64),
+                _ => query::SortVal::Num(row.decision_evaluation_key as i128),
             },
             |row| entity_key(row),
         );
@@ -13352,23 +13471,23 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
                 "name" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "decisionRequirementsId" => {
                     query::SortVal::Str(row.decision_requirements_id.clone())
                 }
                 "decisionRequirementsKey" => {
-                    query::SortVal::Num(row.decision_requirements_key as i64)
+                    query::SortVal::Num(row.decision_requirements_key as i128)
                 }
                 "decisionRequirementsName" => {
                     query::SortVal::Str(row.decision_requirements_name.clone())
                 }
                 "decisionRequirementsVersion" => {
-                    query::SortVal::Num(row.decision_requirements_version as i64)
+                    query::SortVal::Num(row.decision_requirements_version as i128)
                 }
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.decision_key as i64),
+                _ => query::SortVal::Num(row.decision_key as i128),
             },
             |row| row.decision_key,
         );
@@ -13500,12 +13619,12 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionRequirementsId" => query::SortVal::Str(row.drg_id.clone()),
-                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i64),
+                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i128),
                 "decisionRequirementsName" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "resourceName" => query::SortVal::Str(row.resource_name.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.drg_key as i64),
+                _ => query::SortVal::Num(row.drg_key as i128),
             },
             |row| row.drg_key,
         );
@@ -13670,18 +13789,7 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |row, field| match field {
-                "resourceId" => query::SortVal::Str(row.resource_id.clone()),
-                "resourceName" => query::SortVal::Str(row.resource_name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
-                // `versionTag` is nullable; a null tag sorts as the empty string
-                // (before any present tag ascending), matching how the read model
-                // projects `versionTag: null`.
-                "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
-                "resourceKey" => query::SortVal::Num(row.resource_key as i64),
-                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-                _ => query::SortVal::Num(row.resource_key as i64),
-            },
+            |row, field| resource_sort_val(row, field),
             |row| row.resource_key,
         );
 
@@ -13731,12 +13839,30 @@ impl ServerImpl {
             &sort,
             |inst, field| match field {
                 "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
-                }
+                "processDefinitionKey" => query::key_sort_val(&inst.process_definition_key),
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
-                "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(inst.key as i64),
+                "businessId" => query::opt_str_sort_val(inst.business_id.as_deref()),
+                "startDate" => query::SortVal::Num(inst.start_date_ms as i128),
+                "suspendedDate" => {
+                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i128))
+                }
+                "hasIncident" => query::SortVal::Num(i128::from(inst.has_incident)),
+                "parentProcessInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i128))
+                }
+                "parentElementInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i128))
+                }
+                "processDefinitionVersion" => query::SortVal::Num(i128::from(inst.version)),
+                // Constant in Nano: the result always projects these as null
+                // (`process_instance_result`), so every row ties and the
+                // entity-key tiebreak orders them.
+                "endDate" | "processDefinitionName" | "processDefinitionVersionTag" => {
+                    query::SortVal::Num(0)
+                }
+                "processInstanceKey" => query::SortVal::Num(inst.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inst.key as i128),
             },
             |inst| inst.key,
         );
@@ -13958,31 +14084,34 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
+                }
                 "processDefinitionVersion" => {
-                    query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.process_definition_version.map(|v| v as i128))
                 }
                 "processInstanceKey" => {
-                    query::SortVal::Num(e.process_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.process_instance_key.map(|v| v as i128))
                 }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
                 "elementInstanceKey" => {
-                    query::SortVal::Num(e.element_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(e.element_instance_key.map(|v| v as i128))
                 }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => {
-                    query::SortVal::Str(e.correlation_key.clone().unwrap_or_default())
-                }
-                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                "toolName" => query::SortVal::Str(e.tool_name.clone().unwrap_or_default()),
+                "correlationKey" => query::opt_str_sort_val(e.correlation_key.as_deref()),
+                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i128),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "toolName" => query::opt_str_sort_val(e.tool_name.as_deref()),
                 "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
-                _ => query::SortVal::Num(e.subscription_key as i64),
+                // Constant in Nano: every retained subscription is `CREATED`
+                // (`state_str`), and `processDefinitionName` /
+                // `inboundConnectorType` are never projected (null), so all
+                // rows tie and the subscription-key tiebreak orders them.
+                "messageSubscriptionState" => query::SortVal::Str(state_str.clone()),
+                "processDefinitionName" | "inboundConnectorType" => query::SortVal::Num(0),
+                "messageSubscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(e.subscription_key as i128),
             },
             |e| e.subscription_key,
         );
@@ -14183,23 +14312,21 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
-                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i64),
+                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i128),
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i128),
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "partitionId" => query::SortVal::Num(e.partition_id as i64),
+                "partitionId" => query::SortVal::Num(e.partition_id as i128),
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
-                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
+                }
+                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i128),
+                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(e.message_key as i64),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "messageKey" => query::SortVal::Num(e.message_key as i128),
+                _ => query::SortVal::Num(e.message_key as i128),
             },
             // A single published message can fan out to multiple subscriptions,
             // and a non-interrupting boundary subscription correlates repeatedly,
@@ -14385,10 +14512,8 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ei, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i64),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(ei.process_definition_key.parse().unwrap_or(0))
-                }
+                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i128),
+                "processDefinitionKey" => query::key_sort_val(&ei.process_definition_key),
                 "processDefinitionId" => query::SortVal::Str(ei.process_definition_id.clone()),
                 "elementId" => query::SortVal::Str(ei.element_id.clone()),
                 "elementName" => query::SortVal::Str(
@@ -14398,9 +14523,12 @@ impl ServerImpl {
                 ),
                 "type" => query::SortVal::Str(ei.element_type.clone()),
                 "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
-                "startDate" => query::SortVal::Num(ei.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(ei.end_date_ms.unwrap_or(0) as i64),
-                _ => query::SortVal::Num(ei.element_instance_key as i64),
+                "startDate" => query::SortVal::Num(ei.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(ei.end_date_ms.map(|v| v as i128)),
+                "incidentKey" => query::opt_num_sort_val(ei.incident_key.map(|k| k as i128)),
+                "elementInstanceKey" => query::SortVal::Num(ei.element_instance_key as i128),
+                "tenantId" => query::SortVal::Str(ei.tenant_id.clone()),
+                _ => query::SortVal::Num(ei.element_instance_key as i128),
             },
             |ei| ei.element_instance_key,
         );
@@ -15312,12 +15440,25 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |task, field| match field {
-                "processInstanceKey" => query::SortVal::Num(task.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(task.instance_key as i128),
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
-                "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
-                "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(task.key as i64),
+                "creationDate" => query::SortVal::Num(task.created_at_ms as i128),
+                "businessId" => query::opt_str_sort_val(task.business_id.as_deref()),
+                // Sort on the value `user_task_result` returns (clamped to
+                // 0..=100) so rows reporting equal priorities tie.
+                "priority" => query::SortVal::Num(i128::from(user_task_priority(task.priority))),
+                // Sort on the instant, not the stored string, so differing
+                // offsets/precision still order chronologically.
+                "dueDate" => query::opt_num_sort_val(rfc3339_ns(task.due_date.as_deref())),
+                "followUpDate" => {
+                    query::opt_num_sort_val(rfc3339_ns(task.follow_up_date.as_deref()))
+                }
+                // Constant in Nano: `user_task_result` always projects `name` and
+                // `completionDate` as null, so every row ties and the task-key
+                // tiebreak orders them.
+                "name" | "completionDate" => query::SortVal::Num(0),
+                _ => query::SortVal::Num(task.key as i128),
             },
             |task| task.key,
         );
@@ -16033,9 +16174,10 @@ impl ServerImpl {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(v.value.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "scopeKey" => query::SortVal::Num(v.scope_key as i64),
-                "processInstanceKey" => query::SortVal::Num(v.instance_key as i64),
-                _ => query::SortVal::Num(v.key as i64),
+                "scopeKey" => query::SortVal::Num(v.scope_key as i128),
+                "processInstanceKey" => query::SortVal::Num(v.instance_key as i128),
+                "variableKey" => query::SortVal::Num(v.key as i128),
+                _ => query::SortVal::Num(v.key as i128),
             },
             |v| v.key,
         );
@@ -16187,8 +16329,15 @@ impl ServerImpl {
                 "name" => {
                     query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
                 }
-                "version" => query::SortVal::Num(d.version as i64),
-                _ => query::SortVal::Num(d.key as i64),
+                "version" => query::SortVal::Num(d.version as i128),
+                // Derived exactly as `process_definition_result` projects it.
+                "resourceName" => query::SortVal::Str(resource_name(&d.process_id)),
+                // Constant in Nano: `versionTag` is always projected null, so
+                // every row ties and the definition-key tiebreak orders them.
+                "versionTag" => query::SortVal::Num(0),
+                "processDefinitionKey" => query::SortVal::Num(d.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(d.key as i128),
             },
             |d| d.key,
         );
@@ -16667,37 +16816,21 @@ impl ServerImpl {
             self.engine
                 .deploy_partition()
                 .with(move |engine| {
+                    // One mixed deployment = ONE command = ONE deployment key
+                    // shared by every co-deployed resource, so
+                    // `bindingType: deployment` forms / linked resources resolve
+                    // (#1193). Never split it into per-kind commands.
                     let (events, commit) = engine
-                        .apply_command(Command::DeployResources(processes))
+                        .apply_command(Command::DeployBundle(
+                            nanobpmn_engine_core::DeploymentBundle {
+                                processes,
+                                decisions,
+                                forms,
+                                resources: generic_resources,
+                            },
+                        ))
                         .map_err(|e| e.to_string())?;
-                    // Deploy any DMN decisions in the same durable batch. Their events
-                    // are appended so the whole deployment broadcasts/replicates as one.
-                    let mut all_events = (*events).clone();
-                    let mut commit = commit;
-                    if !decisions.is_empty() {
-                        let (dec_events, dec_commit) = engine
-                            .apply_command(Command::DeployDecisionRequirements(decisions))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*dec_events).iter().cloned());
-                        commit = dec_commit;
-                    }
-                    // Deploy any forms in the same durable batch so the whole
-                    // deployment broadcasts/replicates as one.
-                    if !forms.is_empty() {
-                        let (form_events, form_commit) = engine
-                            .apply_command(Command::DeployForms(forms))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*form_events).iter().cloned());
-                        commit = form_commit;
-                    }
-                    // Deploy any generic resources in the same durable batch.
-                    if !generic_resources.is_empty() {
-                        let (res_events, res_commit) = engine
-                            .apply_command(Command::DeployGenericResources(generic_resources))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*res_events).iter().cloned());
-                        commit = res_commit;
-                    }
+                    let all_events = (*events).clone();
                     let events = Arc::new(all_events);
                     let resolved: Resolved = requested_ids
                         .iter()
@@ -17553,6 +17686,12 @@ impl ServerImpl {
             // reaped mid-`put` — and the whole sweep skips itself when any
             // member failed to host (its live set would not be authoritative).
             server.gc_offheap_orphans_once().await;
+
+            // #933: re-arm the process-local `retryBackOff` wakes only NOW,
+            // after every hosted member restored its durable Raft snapshot — a
+            // scan at spawn time races this bootstrap and would miss deadlines
+            // the snapshot restore introduces (see `boot_backoff_rearm_at_spawn`).
+            server.reschedule_backoff_wakes().await;
         }
     }
 
@@ -21989,7 +22128,7 @@ impl ServerImpl {
         retries: i32,
         error_message: String,
     ) -> Result<Commit, (u16, String)> {
-        self.fail_job_for_stream_with_lease(job_key, None, retries, error_message)
+        self.fail_job_for_stream_with_lease(job_key, None, retries, error_message, 0)
             .await
             .map(|(_, commit)| commit)
     }
@@ -22000,32 +22139,29 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> JobStreamOutcome {
-        if !self.raft.is_empty() {
-            return self
-                .propose_partition_command(
-                    job_key,
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    // `stream_complete_outcome_total` is a CompleteJob-only
-                    // diagnostic (metrics.rs); a FailJob outcome must not be
-                    // recorded as a CompleteJob outcome. #1306.
-                    false,
-                )
-                .await;
-        }
-        let result = self
-            .apply_job_command_direct(
-                job_key,
-                job_command_with_lease(
-                    Command::fail_job(job_key, retries, error_message),
-                    lease_token,
-                ),
+        let command = job_command_with_lease(
+            Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
+            lease_token,
+        );
+        let outcome = if !self.raft.is_empty() {
+            self.propose_partition_command(
+                job_key, command,
+                // `stream_complete_outcome_total` is a CompleteJob-only
+                // diagnostic (metrics.rs); a FailJob outcome must not be
+                // recorded as a CompleteJob outcome. #1306.
+                false,
             )
-            .await;
-        Self::map_job_events(self.gate_stream_routing(result))
+            .await
+        } else {
+            let result = self.apply_job_command_direct(job_key, command).await;
+            Self::map_job_events(self.gate_stream_routing(result))
+        };
+        if outcome.is_ok() {
+            self.signal_jobs_available_after_backoff(retries, retry_back_off);
+        }
+        outcome
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -22840,6 +22976,65 @@ impl ServerImpl {
         self.dispatch_wake.notify_one();
     }
 
+    /// Re-signals job availability once a failed job's Camunda 8 v2
+    /// `retryBackOff` (#933) has elapsed. The engine defers re-activation by the
+    /// backoff, but nothing journals a "backoff elapsed" event, so a long-poller
+    /// parked on [`jobs_available`](Self::jobs_available) would otherwise sleep
+    /// past it. A no-op when no backoff applies (no retries left, or a
+    /// non-positive backoff — those were already signalled immediately).
+    pub(crate) fn signal_jobs_available_after_backoff(&self, retries: i32, retry_back_off: i64) {
+        let Some(delay) = backoff_wake_delay(retries, retry_back_off) else {
+            return;
+        };
+        self.signal_jobs_available_in(delay);
+    }
+
+    /// Schedules one job-availability re-signal `delay` from now (the wake half
+    /// of [`signal_jobs_available_after_backoff`](Self::signal_jobs_available_after_backoff),
+    /// split out so boot recovery can re-arm a persisted backoff deadline).
+    fn signal_jobs_available_in(&self, delay: Duration) {
+        let jobs_available = self.jobs_available.clone();
+        let dispatch_wake = self.dispatch_wake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            jobs_available.notify_waiters();
+            dispatch_wake.notify_one();
+        });
+    }
+
+    /// Re-arms the process-local backoff wakes a restart dropped (#933 review):
+    /// a `retryBackOff` deadline is journaled on the `JobFailed` event, so it
+    /// survives replay, but the `tokio` wake task scheduled when the fail was
+    /// applied does not. Without this, a long-poll parked across a restart
+    /// during a backoff sleeps until its request timeout even though the
+    /// restored deadline has elapsed. Already-elapsed deadlines re-signal
+    /// immediately. Runs once after boot recovery, off the request path.
+    pub(crate) async fn reschedule_backoff_wakes(&self) {
+        let now = now_millis();
+        for handle in self.engine.all() {
+            let delays = handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == nanobpmn_engine_core::JobState::Created && job.retries > 0
+                        })
+                        .filter_map(|job| job.retry_backoff_until)
+                        .map(|until| {
+                            Duration::from_millis(until.saturating_sub(now).saturating_add(1))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for delay in delays {
+                self.signal_jobs_available_in(delay);
+            }
+        }
+    }
+
     /// Handle to the permit-storing dispatcher wake, so the Falcon protocol can
     /// wake the dispatcher after a new subscription or credit grant without the
     /// signal being lost mid-pass.
@@ -23268,9 +23463,14 @@ impl ServerImpl {
             |rec, field| match field {
                 "state" => query::SortVal::Str(rec.state.to_string()),
                 "operationType" => query::SortVal::Str(rec.op_type.to_string()),
-                "startDate" => query::SortVal::Num(rec.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(rec.end_date_ms.unwrap_or(0) as i64),
-                _ => query::SortVal::Num(rec.key as i64),
+                "startDate" => query::SortVal::Num(rec.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(rec.end_date_ms.map(|v| v as i128)),
+                // Constant in Nano: `batch_operation_response` always projects
+                // `actorId` / `actorType` as null (no identity layer), so every
+                // row ties and the batch-key tiebreak orders them.
+                "actorId" | "actorType" => query::SortVal::Num(0),
+                "batchOperationKey" => query::SortVal::Num(rec.key as i128),
+                _ => query::SortVal::Num(rec.key as i128),
             },
             |rec| rec.key,
         );
@@ -23338,13 +23538,18 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |(_, op_type, item), field| match field {
+            |(batch_key, op_type, item), field| match field {
                 "state" => query::SortVal::Str(item.state.to_string()),
+                "batchOperationKey" => query::SortVal::Num(*batch_key as i128),
+                "processedDate" => {
+                    query::opt_num_sort_val(item.processed_date_ms.map(|ms| ms as i128))
+                }
                 "operationType" => query::SortVal::Str(op_type.to_string()),
                 "processInstanceKey" => {
-                    query::SortVal::Num(item.process_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(item.process_instance_key.map(|v| v as i128))
                 }
-                _ => query::SortVal::Num(item.item_key as i64),
+                "itemKey" => query::SortVal::Num(item.item_key as i128),
+                _ => query::SortVal::Num(item.item_key as i128),
             },
             // No single column is unique (the same instance can appear in two
             // batches), so the cursor key is the composite (batchKey, itemKey).
@@ -24062,6 +24267,26 @@ fn decision_requirements_result(
         "<default>".to_string(),
         row.version,
     )
+}
+
+/// The `searchResources` sort projection: every spec sort field explicitly
+/// (#1298). Shared by the handler and its regression tests.
+fn resource_sort_val(row: &readstore::ResourceMetaRow, field: &str) -> query::SortVal {
+    match field {
+        "resourceId" => query::SortVal::Str(row.resource_id.clone()),
+        "resourceName" => query::SortVal::Str(row.resource_name.clone()),
+        "version" => query::SortVal::Num(row.version as i128),
+        // `versionTag` is nullable; a null tag is absent (sorts before
+        // every present tag ascending).
+        "versionTag" => query::opt_str_sort_val(row.version_tag.as_deref()),
+        "resourceKey" => query::SortVal::Num(row.resource_key as i128),
+        "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+        // The creating deployment's key, projected from the event:
+        // resources of one deployment genuinely tie here, so a
+        // secondary sort (or the resource-key tiebreak) orders them.
+        "deploymentKey" => query::opt_num_sort_val(row.deployment_key),
+        _ => query::SortVal::Num(row.resource_key as i128),
+    }
 }
 
 fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
@@ -26001,26 +26226,28 @@ fn validate_agent_history(items: &[models::AgentInstanceHistoryItem]) -> Result<
 /// The [`query::SortVal`] for an agent-instance row on the given REST sort field.
 fn agent_instance_sort_val(row: &readstore::AgentInstanceRow, field: &str) -> query::SortVal {
     match field {
-        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i64),
+        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i128),
         "status" => query::SortVal::Str(row.status.as_str().to_string()),
         "elementId" => query::SortVal::Str(row.element_id.clone()),
-        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i64),
-        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i64),
-        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i64),
+        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i128),
+        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i128),
+        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i128),
         "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-        "creationDate" => query::SortVal::Num(row.creation_date_ms as i64),
-        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i64),
-        "completionDate" => query::SortVal::Num(row.completion_date_ms.unwrap_or(0) as i64),
-        _ => query::SortVal::Num(row.agent_instance_key as i64),
+        "creationDate" => query::SortVal::Num(row.creation_date_ms as i128),
+        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i128),
+        "completionDate" => query::opt_num_sort_val(row.completion_date_ms.map(|v| v as i128)),
+        "agentInstanceKey" => query::SortVal::Num(row.agent_instance_key as i128),
+        _ => query::SortVal::Num(row.agent_instance_key as i128),
     }
 }
 
 /// The [`query::SortVal`] for an agent-history row on the given REST sort field.
 fn agent_history_sort_val(row: &readstore::AgentHistoryRow, field: &str) -> query::SortVal {
     match field {
-        "producedAt" => query::SortVal::Num(row.produced_at_ms as i64),
-        "loopIteration" => query::SortVal::Num(row.loop_iteration as i64),
-        _ => query::SortVal::Num(row.agent_history_key as i64),
+        "producedAt" => query::SortVal::Num(row.produced_at_ms as i128),
+        "loopIteration" => query::SortVal::Num(row.loop_iteration as i128),
+        "historyItemKey" => query::SortVal::Num(row.agent_history_key as i128),
+        _ => query::SortVal::Num(row.agent_history_key as i128),
     }
 }
 
@@ -26257,37 +26484,103 @@ fn job_kind_enums(
     }
 }
 
-/// Maps a [`JobRow`] field name to its sort key for `/v2/jobs/search`. Numeric
-/// keys (including `processDefinitionKey`, a numeric key stored as its decimal
-/// string) sort as [`query::SortVal::Num`] so `"2"` precedes `"10"` instead of
-/// lexicographically; timing fields project their millisecond columns with a
-/// missing value sorting as `0` (#1344). Unknown fields fall back to the stable
-/// `job.key` tiebreak. Extracted from the handler so the ordering contract is
-/// unit-testable without a full deploy (the search harness can only mint
-/// same-length definition keys, which hide the numeric-vs-lexicographic bug).
+/// Epoch nanoseconds of an optional RFC 3339 timestamp string (`None` when
+/// absent or unparseable) — the sort projection for string-stored dates. Full
+/// precision (not millis) so sub-millisecond instants the REST surface
+/// returns verbatim still order correctly; `i128` cannot overflow.
+fn rfc3339_ns(s: Option<&str>) -> Option<i128> {
+    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| i128::from(d.timestamp()) * 1_000_000_000 + i128::from(d.timestamp_subsec_nanos()))
+}
+
+/// The user-task priority as exposed by REST (clamped to `0..=100`): the single
+/// source for both the response projection and the sort projection.
+fn user_task_priority(stored: i32) -> u8 {
+    stored.clamp(0, 100) as u8
+}
+
+#[cfg(test)]
+mod sort_projection_tests {
+    use super::{rfc3339_ns, user_task_priority};
+
+    #[test]
+    fn priority_sort_projection_matches_the_returned_clamped_value() {
+        // Stored 100 and 101 both return priority 100, so they must tie in
+        // the sort (letting the secondary sort / key tiebreak decide).
+        assert_eq!(user_task_priority(100), user_task_priority(101));
+        assert_eq!(user_task_priority(i32::MAX), 100);
+        assert_eq!(user_task_priority(-5), 0);
+        assert_eq!(user_task_priority(42), 42);
+    }
+
+    #[test]
+    fn rfc3339_ns_orders_by_instant_not_string() {
+        // Lexicographically "…T10:00:00+02:00" > "…T09:00:00Z", but it is the
+        // earlier instant; sorting must follow the instant (#1298).
+        let a = rfc3339_ns(Some("2026-01-01T10:00:00+02:00"));
+        let b = rfc3339_ns(Some("2026-01-01T09:00:00Z"));
+        assert!(a < b);
+        assert_eq!(rfc3339_ns(None), None);
+        assert_eq!(rfc3339_ns(Some("garbage")), None);
+    }
+
+    #[test]
+    fn rfc3339_ns_keeps_sub_millisecond_precision() {
+        let early = rfc3339_ns(Some("2026-01-01T00:00:00.000100Z"));
+        let late = rfc3339_ns(Some("2026-01-01T00:00:00.000900Z"));
+        assert!(early < late, "same-millisecond instants must not tie");
+        // Pre-epoch instants stay ordered too.
+        assert!(
+            rfc3339_ns(Some("1969-12-31T23:59:59.5Z")) < rfc3339_ns(Some("1970-01-01T00:00:00Z"))
+        );
+    }
+}
+
+/// Sort projection for job search: string-encoded definition keys sort
+/// numerically (so `"2"` precedes `"10"`), optional fields sort as
+/// [`query::SortVal::Null`] (before every present value), and unknown fields
+/// fall back to the stable `job.key` tiebreak (#1344). Extracted from the
+/// handler so the ordering contract is unit-testable without a full deploy.
 fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
     match field {
-        "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+        "processInstanceKey" => query::SortVal::Num(job.instance_key as i128),
         "elementId" => query::SortVal::Str(job.element_id.clone()),
-        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
+        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i128),
         "type" => query::SortVal::Str(job.job_type.clone()),
         "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
-        "retries" => query::SortVal::Num(job.retries as i64),
-        "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+        "retries" => query::SortVal::Num(job.retries as i128),
+        // Sort the projected response value: `job_search_result` returns `""`
+        // for both `None` and a legacy `Some("")`, so they must tie here too.
+        "worker" => query::SortVal::Str(job_worker(job)),
         "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
-        "processDefinitionKey" => {
-            query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
+        "processDefinitionKey" => query::key_sort_val(&job.process_definition_key),
+        "errorCode" => query::opt_str_sort_val(job.error_code.as_deref()),
+        "errorMessage" => query::opt_str_sort_val(job.error_message.as_deref()),
+        // Camunda-parity timing sort fields (#1344). Missing values sort as
+        // `SortVal::Null`, before every present timestamp ascending.
+        "creationTime" => query::SortVal::Num(job.created_at_ms as i128),
+        "lastUpdateTime" => query::opt_num_sort_val(job.last_update_ms.map(|v| v as i128)),
+        "endTime" => query::opt_num_sort_val(job.end_ms.map(|v| v as i128)),
+        "deadline" => query::opt_num_sort_val(job.deadline_ms.map(|v| v as i128)),
+        "hasFailedWithRetriesLeft" => {
+            query::SortVal::Num(i128::from(job.has_failed_with_retries_left))
         }
-        "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
-        "errorMessage" => query::SortVal::Str(job.error_message.clone().unwrap_or_default()),
-        // Camunda-parity timing sort fields (#1344). Missing values sort as 0
-        // (epoch), so jobs lacking a timestamp group first ascending.
-        "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
-        "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
-        "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
-        "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
-        _ => query::SortVal::Num(job.key as i64),
+        "kind" => query::SortVal::Str(job_kind_enums(&job.kind).0.to_string()),
+        "listenerEventType" => query::SortVal::Str(job_kind_enums(&job.kind).1.to_string()),
+        // Constant in Nano: `job_search_result` always projects `priority: 0`
+        // and null `isDenied` / `deniedReason`, so every row ties and the
+        // job-key tiebreak orders them.
+        "priority" | "isDenied" | "deniedReason" => query::SortVal::Num(0),
+        "jobKey" => query::SortVal::Num(job.key as i128),
+        "tenantId" => query::SortVal::Str("<default>".to_string()),
+        _ => query::SortVal::Num(job.key as i128),
     }
+}
+
+/// The `worker` value REST returns for a job: absent and legacy-empty both
+/// project as `""`. Single source for the response and the sort projection.
+fn job_worker(job: &readstore::JobRow) -> String {
+    job.worker.clone().unwrap_or_default()
 }
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
@@ -26354,7 +26647,7 @@ fn job_search_result(
         state: job_state_enum(job.state),
         tenant_id: "<default>".to_string(),
         r_type: job.job_type.clone(),
-        worker: job.worker.clone().unwrap_or_default(),
+        worker: job_worker(job),
         creation_time,
         last_update_time,
         priority: 0,
@@ -26430,7 +26723,7 @@ fn user_task_result(
         },
         process_definition_version: task.process_definition_version,
         custom_headers: std::collections::HashMap::new(),
-        priority: task.priority.clamp(0, 100) as u8,
+        priority: user_task_priority(task.priority),
         user_task_key: models::UserTaskKey(task.key.to_string()),
         element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
         process_name: types::Nullable::Null,
@@ -26565,6 +26858,15 @@ fn optional_lease_token(token: &Option<types::Nullable<String>>) -> Option<Strin
         Some(types::Nullable::Present(token)) => Some(token.clone()),
         _ => None,
     }
+}
+
+/// When a failed job's `retryBackOff` (#933) defers its re-activation, the
+/// delay after which job availability must be re-signalled. `None` when the
+/// job is retryable immediately (non-positive backoff) or parks (no retries).
+fn backoff_wake_delay(retries: i32, retry_back_off: i64) -> Option<Duration> {
+    let ms = u64::try_from(retry_back_off).ok().filter(|&ms| ms > 0)?;
+    // A millisecond of slack so the woken poll's clock is past the deadline.
+    (retries > 0).then(|| Duration::from_millis(ms.saturating_add(1)))
 }
 
 fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Command {
@@ -28296,6 +28598,14 @@ fn debug_rest_enabled() -> bool {
 /// Raft, an unresolved spilled orphan must stay flagged so strict capture fails
 /// closed instead of publishing incomplete state.
 fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
+    !raft
+}
+
+/// Whether the #933 `retryBackOff` wake re-arm runs at server spawn. Only on the
+/// non-Raft path, where the owned journals are fully recovered before their
+/// actors spawn; under Raft, `raft_bootstrap` restores durable snapshots
+/// asynchronously, so the re-arm runs at the end of the bootstrap instead.
+fn boot_backoff_rearm_at_spawn(raft: bool) -> bool {
     !raft
 }
 
@@ -30340,6 +30650,22 @@ async fn main() {
     // over the Falcon protocol and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
+    // #933: re-arm the process-local `retryBackOff` wakes a restart dropped.
+    // The deadline is journaled on the `JobFailed` event (so replay restores
+    // it), but the wake task scheduled when the fail was applied is not — a
+    // long-poll parked across a restart would otherwise sleep until its
+    // request timeout. The owned journals were recovered before their actors
+    // spawned, so their engine state is already authoritative here.
+    // Under Raft the re-arm runs at the END of `raft_bootstrap` instead, after
+    // every hosted member's durable snapshot is restored (a scan here would race
+    // that restore and miss the deadlines it introduces).
+    if boot_backoff_rearm_at_spawn(raft_enabled()) {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.reschedule_backoff_wakes().await;
+        });
+    }
+
     // #1338: post-recovery GC of orphaned cold/spill rows. Under Raft the sweep
     // runs at the END of `raft_bootstrap` (after every hosted member's durable
     // snapshot is restored — see there). On the non-Raft path there is no
@@ -31968,6 +32294,7 @@ mod clustered_startup_tests {
             id: "versioned-form".to_string(),
             resource_name: "versioned.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let form_v1 = form(r#"{"id":"versioned-form","type":"default","components":[]}"#);
         let form_v2 = form(
@@ -31977,6 +32304,7 @@ mod clustered_startup_tests {
             resource_id: "versioned.md".to_string(),
             resource_name: "versioned.md".to_string(),
             content: content.to_string(),
+            version_tag: None,
         };
         let resource_v1 = resource("# v1");
         let resource_v2 = resource("# v2");
@@ -32141,6 +32469,7 @@ mod clustered_startup_tests {
                 resource_id: "r.md".into(),
                 resource_name: "r.md".into(),
                 content: mib.clone(),
+                version_tag: None,
             })
             .collect();
         let total: usize = events
@@ -32201,11 +32530,13 @@ mod clustered_startup_tests {
             id: "legacy-form".to_string(),
             resource_name: "legacy.form".to_string(),
             schema: r#"{"id":"legacy-form","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
         };
         let resource = nanobpmn_engine_core::GenericResource {
             resource_id: "legacy.md".to_string(),
             resource_name: "legacy.md".to_string(),
             content: "# legacy".to_string(),
+            version_tag: None,
         };
         let mut state = node0
             .engine
@@ -35862,6 +36193,7 @@ mod clustered_startup_tests {
             retries,
             worker: None,
             error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
         };
         let server = ServerImpl::default();
         let shard = &server.store.shards()[0].1;
@@ -39693,6 +40025,7 @@ mod clustered_startup_tests {
                             resource_id: "agent-prompt.md".to_string(),
                             resource_name: "agent-prompt.md".to_string(),
                             content: content.to_string(),
+                            version_tag: None,
                         }],
                         "<default>",
                     )
@@ -39880,6 +40213,7 @@ mod clustered_startup_tests {
             id: "greeting-form".to_string(),
             resource_name: "greeting.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let (result, _events) = server
             .deploy_resources_locally_with_forms(
@@ -39943,6 +40277,7 @@ mod clustered_startup_tests {
                     id: "greeting-form".to_string(),
                     resource_name: "greeting.form".to_string(),
                     schema: schema_v2.to_string(),
+                    version_tag: None,
                 }],
                 Vec::new(),
                 "<default>",
@@ -40018,6 +40353,80 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn a_mixed_deployment_stamps_one_deployment_key_on_every_resource() {
+        // #1193 review: one HTTP deployment (process + form + generic resource)
+        // must be ONE engine deployment. The mixed path used to issue a
+        // command per kind, each minting its own deployment key, so a
+        // co-deployed `bindingType: deployment` form incidented and a
+        // co-deployed linked resource vanished from the worker header.
+        let server = ServerImpl::default();
+        let bpmn = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bundle" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="bundle-form" bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let proc = parse_bpmn(bpmn).expect("valid BPMN").remove(0);
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("bundle".to_string(), "bundle.bpmn".to_string());
+        let (_result, events) = server
+            .deploy_resources_locally_with_forms(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "bundle-form".to_string(),
+                    resource_name: "bundle-form.form".to_string(),
+                    schema: r#"{"id":"bundle-form","components":[]}"#.to_string(),
+                    version_tag: None,
+                }],
+                vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "policy.md".to_string(),
+                    resource_name: "policy.md".to_string(),
+                    content: "# policy".to_string(),
+                    version_tag: None,
+                }],
+                "<default>",
+            )
+            .await
+            .expect("mixed deploy succeeds");
+        let keys: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::DeploymentCreated { deployment_key }
+                | Event::ProcessDeployed { deployment_key, .. }
+                | Event::FormDeployed { deployment_key, .. }
+                | Event::GenericResourceDeployed { deployment_key, .. } => Some(*deployment_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "every co-deployed resource shares one deployment key: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::DeploymentCreated { .. }))
+                .count(),
+            1,
+            "one deployment, one DeploymentCreated"
+        );
+    }
+
+    #[tokio::test]
     async fn a_user_task_form_definition_surfaces_form_key_and_external_reference_in_v2_search() {
         // End-to-end form linkage (issue #795): a `userTask` declaring a
         // `<zeebe:formDefinition formId="…"/>` must resolve that id to the
@@ -40033,6 +40442,7 @@ mod clustered_startup_tests {
             id: "feature-escalation".to_string(),
             resource_name: "feature-escalation.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
 
         // A process with two user tasks: one bound to the embedded form by id,
@@ -40243,6 +40653,7 @@ mod clustered_startup_tests {
             id: id.to_string(),
             resource_name: format!("{id}.form"),
             schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+            version_tag: None,
         };
 
         server
@@ -42196,6 +42607,14 @@ mod clustered_startup_tests {
         // #1387: Raft startup must leave unresolved spilled orphans flagged.
         assert!(!boot_offheap_reconcile_allowed(true));
         assert!(boot_offheap_reconcile_allowed(false));
+    }
+
+    #[test]
+    fn boot_backoff_rearm_waits_for_raft_recovery() {
+        // #933 review: under Raft the spawn-time scan would race the snapshot
+        // restore in `raft_bootstrap`, which re-arms the wakes itself instead.
+        assert!(!boot_backoff_rearm_at_spawn(true));
+        assert!(boot_backoff_rearm_at_spawn(false));
     }
 
     #[tokio::test]
@@ -45558,7 +45977,7 @@ mod clustered_startup_tests {
                 }
                 "fail" => {
                     node0
-                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
                         .await
                 }
                 _ => {
@@ -45662,7 +46081,7 @@ mod clustered_startup_tests {
         new_leader.run_lease_digest(recover_now).await;
 
         let (leader_events, _) = new_leader
-            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
             .await
             .expect("the fail commits on the new leader");
         let on_leader =
@@ -48003,6 +48422,105 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #934: forcing eviction past the ring capacity must surface
+    /// `isIncomplete == true` for any window reaching back into the evicted
+    /// range, while a window strictly after the eviction high-water mark (and
+    /// after the recording start) stays complete.
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_after_eviction() {
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(1_000_000_000_000, 2),
+            ..Default::default()
+        };
+        let base: u64 = 1_000_000_000_000;
+        let global = |from_ms: u64| models::GetGlobalJobStatisticsQueryParams {
+            from: ms_to_dt(from_ms).unwrap(),
+            to: ms_to_dt(base + 10_000).unwrap(),
+            job_type: None,
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let incomplete = |r: GResp| match r {
+            GResp::Status200_GlobalJobMetrics(g) => g.is_incomplete,
+            _ => panic!("expected 200 from global stats"),
+        };
+
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 1_000);
+        server
+            .job_statistics
+            .record_failed("t".into(), None, base + 2_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(!incomplete(r), "nothing evicted yet: complete");
+
+        // Third entry overflows capacity 2 → evicts the entry at base+1000.
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 3_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(
+            incomplete(r),
+            "window covering an evicted entry is incomplete"
+        );
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_000))
+            .await
+            .unwrap();
+        assert!(incomplete(r), "eviction high-water mark is inclusive");
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_001))
+            .await
+            .unwrap();
+        assert!(
+            !incomplete(r),
+            "window after every evicted entry is complete"
+        );
+    }
+
+    /// #934: a window that starts before this process began recording reaches
+    /// across the restart boundary (the ephemeral log lost that history).
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_across_restart_boundary() {
+        let since: u64 = 1_000_000_000_000;
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(since, 10),
+            ..Default::default()
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        for (from_ms, want) in [(since - 1, true), (since, false)] {
+            let r = server
+                .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                    from: ms_to_dt(from_ms).unwrap(),
+                    to: ms_to_dt(since + 1).unwrap(),
+                    job_type: None,
+                })
+                .await
+                .unwrap();
+            let GResp::Status200_GlobalJobMetrics(g) = r else {
+                panic!("expected 200");
+            };
+            assert_eq!(g.is_incomplete, want, "from={from_ms}");
+        }
+    }
+
+    /// #934: the error log tracks its own eviction high-water mark.
+    #[test]
+    fn job_error_log_eviction_marks_incomplete() {
+        let s = JobStatisticsState::with_limits(0, 1);
+        s.record_error("t".into(), None, "E".into(), "m".into(), 5);
+        assert!(!s.errors_incomplete(0));
+        s.record_error("t".into(), None, "E".into(), "m".into(), 9);
+        assert!(s.errors_incomplete(5));
+        assert!(!s.errors_incomplete(6));
+        assert!(!s.metrics_incomplete(0), "metrics log is independent");
+    }
+
     #[tokio::test]
     async fn rest_job_statistics_count_a_completed_job() {
         let server = ServerImpl::default();
@@ -48171,6 +48689,188 @@ mod clustered_startup_tests {
             panic!("expected 200 from global stats");
         };
         assert_eq!(g.failed.count, 1, "one failed job recorded");
+    }
+
+    /// #933 — Camunda 8 v2 `retryBackOff`: a REST fail with retries left and
+    /// a backoff is NOT immediately re-activatable, and a long-poll parked on
+    /// the job type is woken and served once the backoff elapses (there is no
+    /// journaled "backoff elapsed" event to wake it otherwise).
+    #[tokio::test]
+    async fn rest_fail_job_retry_backoff_delays_reactivation_and_wakes_long_poll() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        use apis::job::FailJobResponse as FResp;
+        let backoff_ms: u64 = 1_500;
+        let mut fail = models::JobFailRequest::new();
+        fail.retries = Some(2);
+        fail.retry_back_off = Some(backoff_ms as i64);
+        let failed_at = std::time::Instant::now();
+        // Lower bound on the persisted deadline: the server stamps
+        // `retry_backoff_until` no earlier than this wall-clock instant plus
+        // the backoff, so a serve at/after the deadline is at/after this too.
+        let backoff_until = now_millis() + backoff_ms;
+        let failed = server
+            .fail_job_impl(
+                &models::FailJobPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &Some(fail),
+            )
+            .await
+            .expect("failure runs");
+        assert!(matches!(failed, FResp::Status204_TheJobIsFailed));
+
+        let immediate = server
+            .activate_for_stream("demo-work", "worker-g", 10, 60_000, None)
+            .await;
+        assert!(
+            immediate.is_empty(),
+            "a backed-off job must not be re-served before retryBackOff elapses"
+        );
+
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(10_000);
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match server.activate_jobs_impl(&req).await.expect("activate ok") {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        let waited = failed_at.elapsed();
+        assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
+        assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        let served_at = now_millis();
+        assert!(
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the backoff deadline lower bound {backoff_until}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(9_000),
+            "the long-poll must be woken by the backoff expiry, not its timeout ({waited:?})"
+        );
+    }
+
+    /// #933 — zero / negative / absent `retryBackOff` are retryable at once.
+    #[tokio::test]
+    async fn rest_fail_job_non_positive_retry_backoff_is_immediately_retryable() {
+        for backoff in [None, Some(0_i64), Some(-1_000)] {
+            let server = ServerImpl::default();
+            server
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .expect("create the demo instance");
+            let job_key = await_job_key(&server, "demo-work").await;
+            server
+                .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+                .await;
+            let mut fail = models::JobFailRequest::new();
+            fail.retries = Some(2);
+            fail.retry_back_off = backoff;
+            let failed = server
+                .fail_job_impl(
+                    &models::FailJobPathParams {
+                        job_key: job_key.to_string(),
+                    },
+                    &Some(fail),
+                )
+                .await
+                .expect("failure runs");
+            assert!(matches!(
+                failed,
+                apis::job::FailJobResponse::Status204_TheJobIsFailed
+            ));
+            let again = server
+                .activate_for_stream("demo-work", "worker-g", 10, 60_000, None)
+                .await;
+            assert_eq!(again.len(), 1, "retryBackOff {backoff:?} is immediate");
+        }
+    }
+
+    #[test]
+    fn backoff_wake_delay_only_for_positive_backoff_with_retries_left() {
+        assert_eq!(backoff_wake_delay(1, 0), None);
+        assert_eq!(backoff_wake_delay(1, -5), None);
+        assert_eq!(backoff_wake_delay(0, 5_000), None);
+        assert_eq!(
+            backoff_wake_delay(2, 5_000),
+            Some(std::time::Duration::from_millis(5_001))
+        );
+    }
+
+    /// #933 (review) — a restart during a persisted backoff restores the
+    /// deadline but drops the process-local wake task. `reschedule_backoff_wakes`
+    /// re-arms it from the replayed engine state, so a long-poll parked across
+    /// the restart is still woken when the backoff elapses (not at its request
+    /// timeout). This drives the same recovery the boot path runs, without a
+    /// real process bounce: fail with a backoff, drop the implicit wake (no
+    /// `signal_jobs_available_after_backoff` on this path), then reschedule.
+    #[tokio::test]
+    async fn restart_during_backoff_rearms_the_wake_and_serves_the_long_poll() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        // Fail with a backoff applied DIRECTLY on the engine actor — the
+        // restart analogue: the deadline is persisted on the event, but no
+        // process-local wake task is scheduled (that is what a bounce drops).
+        let backoff_ms: u64 = 1_500;
+        let (events, _commit) = server
+            .apply_job_command_direct(
+                job_key,
+                Command::fail_job_with_backoff(job_key, 2, "flaky upstream", backoff_ms as i64),
+            )
+            .await
+            .expect("the fail applies");
+        let backoff_until = events
+            .iter()
+            .find_map(|e| match e {
+                Event::JobFailed {
+                    retry_backoff_until: Some(until),
+                    ..
+                } => Some(*until),
+                _ => None,
+            })
+            .expect("the fail persists a backoff deadline");
+
+        let parked_at = std::time::Instant::now();
+        // Boot recovery: re-arm the wake from the replayed deadline.
+        server.reschedule_backoff_wakes().await;
+
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(10_000);
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match server.activate_jobs_impl(&req).await.expect("activate ok") {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        let waited = parked_at.elapsed();
+        assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
+        assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        // Compare the server clock against the PERSISTED deadline: the backoff
+        // began inside `apply_job_command_direct`, before `parked_at`, so the
+        // wait measured from `parked_at` may legitimately be shorter.
+        let served_at = now_millis();
+        assert!(
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the persisted deadline {backoff_until}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(9_000),
+            "the re-armed wake must serve the long-poll, not its timeout ({waited:?})"
+        );
     }
 
     /// #1327 — Zeebe parity: a fail with retries LEFT records the worker's
@@ -48463,6 +49163,29 @@ mod clustered_startup_tests {
             }
         }
 
+        // Worker sorts on the projected response value: `None` and a legacy
+        // `Some("")` both return `""`, so they tie and the key tiebreak orders them.
+        let mut no_worker = job_row_with_def_key(300, "1");
+        no_worker.worker = None;
+        let mut empty_worker = job_row_with_def_key(301, "1");
+        empty_worker.worker = Some(String::new());
+        for descending in [false, true] {
+            let mut rows: Vec<&readstore::JobRow> = vec![&empty_worker, &no_worker];
+            query::sort_items(
+                &mut rows,
+                &[query::SortKey {
+                    field: "worker".to_string(),
+                    descending,
+                }],
+                |job, field| job_sort_val(job, field),
+                |job| job.key,
+            );
+            assert_eq!(
+                rows.iter().map(|j| j.key).collect::<Vec<_>>(),
+                vec![300, 301]
+            );
+        }
+
         let two = job_row_with_def_key(100, "2");
         let ten = job_row_with_def_key(200, "10");
 
@@ -48500,6 +49223,60 @@ mod clustered_startup_tests {
             sorted(true),
             vec![200, 100],
             "descending numeric sort: processDefinitionKey 10 before 2"
+        );
+    }
+
+    /// #1298 — `searchResources` sorts `deploymentKey` on the creating
+    /// deployment's key, not the per-resource key: resources of one deployment
+    /// tie, so a secondary sort orders them, and DESC reverses deployments
+    /// while keeping the ascending resource-key tiebreak within one.
+    #[test]
+    fn resource_sort_deployment_key_ties_within_a_deployment() {
+        fn row(
+            resource_key: u64,
+            deployment_key: Option<u64>,
+            name: &str,
+        ) -> readstore::ResourceMetaRow {
+            readstore::ResourceMetaRow {
+                resource_key,
+                resource_id: name.to_string(),
+                resource_name: name.to_string(),
+                version: 1,
+                version_tag: None,
+                tenant_id: "<default>".to_string(),
+                deployment_key,
+            }
+        }
+        // Deployment 10 owns resources 11 ("z") and 12 ("a"); deployment 20
+        // owns 21 ("m"); 5 is a legacy row with no recorded deployment.
+        let rows = [
+            row(11, Some(10), "z"),
+            row(12, Some(10), "a"),
+            row(21, Some(20), "m"),
+            row(5, None, "legacy"),
+        ];
+        let sorted = |keys: &[(&str, bool)]| {
+            let mut refs: Vec<&readstore::ResourceMetaRow> = rows.iter().collect();
+            let keys: Vec<query::SortKey> = keys
+                .iter()
+                .map(|(f, d)| query::SortKey {
+                    field: (*f).to_string(),
+                    descending: *d,
+                })
+                .collect();
+            query::sort_items(
+                &mut refs,
+                &keys,
+                |r, f| resource_sort_val(r, f),
+                |r| r.resource_key,
+            );
+            refs.iter().map(|r| r.resource_key).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&[("deploymentKey", false)]), vec![5, 11, 12, 21]);
+        assert_eq!(sorted(&[("deploymentKey", true)]), vec![21, 11, 12, 5]);
+        assert_eq!(
+            sorted(&[("deploymentKey", false), ("resourceName", false)]),
+            vec![5, 12, 11, 21]
         );
     }
 
@@ -56840,6 +57617,11 @@ pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
     "errorType",
     "processInstanceKey",
     "elementId",
+    "elementInstanceKey",
+    "jobKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "tenantId",
 ];
 pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
     "processInstanceKey",
@@ -56847,6 +57629,16 @@ pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
     "processDefinitionKey",
     "state",
     "businessId",
+    "startDate",
+    "suspendedDate",
+    "hasIncident",
+    "parentProcessInstanceKey",
+    "parentElementInstanceKey",
+    "processDefinitionVersion",
+    "endDate",
+    "processDefinitionName",
+    "processDefinitionVersionTag",
+    "tenantId",
 ];
 pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
     "userTaskKey",
@@ -56855,10 +57647,18 @@ pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
     "state",
     "creationDate",
     "businessId",
+    "priority",
+    "dueDate",
+    "followUpDate",
+    "name",
+    "completionDate",
 ];
 pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "processDefinitionKey",
     "processDefinitionId",
     "name",
     "version",
+    "resourceName",
+    "versionTag",
+    "tenantId",
 ];

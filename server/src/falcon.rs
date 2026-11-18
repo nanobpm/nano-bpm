@@ -1229,7 +1229,9 @@ async fn handle_client_frame(
             job_lease_token,
             retries,
             error_message,
+            retry_back_off,
         } => {
+            let retry_back_off = retry_back_off.unwrap_or(0);
             let Some(lease_token) =
                 reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
             else {
@@ -1244,7 +1246,14 @@ async fn handle_client_frame(
                 let error_message = error_message.unwrap_or_default();
                 spawn_forward_stream_reply(conn, corr, async move {
                     server
-                        .forward_fail_job_stream(node, key, lease_token, retries, error_message)
+                        .forward_fail_job_stream(
+                            node,
+                            key,
+                            lease_token,
+                            retries,
+                            error_message,
+                            retry_back_off,
+                        )
                         .await
                 });
             } else {
@@ -1252,7 +1261,13 @@ async fn handle_client_frame(
                 let error_message = error_message.unwrap_or_default();
                 if server.raft_registry().is_empty() {
                     let outcome = server
-                        .fail_job_for_stream_with_lease(key, lease_token, retries, error_message)
+                        .fail_job_for_stream_with_lease(
+                            key,
+                            lease_token,
+                            retries,
+                            error_message,
+                            retry_back_off,
+                        )
                         .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
@@ -1265,6 +1280,7 @@ async fn handle_client_frame(
                                 lease_token,
                                 retries,
                                 error_message,
+                                retry_back_off,
                             )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);

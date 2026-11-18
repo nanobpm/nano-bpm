@@ -104,13 +104,14 @@ pub use agent::{
     AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
-#[cfg(feature = "serde")]
-pub use command::form_id_of;
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
+#[cfg(feature = "serde")]
+pub use command::{form_id_of, form_version_tag_of};
 pub use command::{
-    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
-    GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
+    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference,
+    DeploymentBundle, FormResource, GenericResource, MoveInstruction, MoveSource,
+    UserTaskChangeset, VariableInstruction,
 };
 pub use command::{OrphanIncidentStamp, OrphanKind};
 #[cfg(feature = "serde")]
@@ -146,8 +147,8 @@ pub use model::{
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
-    subscription_partition, ConditionalSubscription, DeployedProcess, Incident, IncidentKind,
-    IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
+    subscription_partition, ConditionalSubscription, DeployedProcess, DeployedResource, Incident,
+    IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
     JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
     ProcessInstanceState, SecretProvenance, SignalSubscription, StartTimer, State, Timer,

@@ -75,12 +75,13 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
         }
 
         Event::FormDeployed {
+            deployment_key,
             form_key,
             version,
             form_id,
             resource_name,
             schema,
-            ..
+            version_tag,
         } => {
             let deployed = DeployedForm {
                 key: *form_key,
@@ -88,6 +89,8 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
                 form_id: form_id.clone(),
                 resource_name: resource_name.clone(),
                 schema: schema.clone(),
+                deployment_key: *deployment_key,
+                version_tag: version_tag.clone(),
             };
             // Retain every version by its unique key so a form binding pinned to
             // a specific version resolves.
@@ -103,12 +106,13 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
         }
 
         Event::GenericResourceDeployed {
+            deployment_key,
             resource_key,
             version,
             resource_id,
             resource_name,
             content,
-            ..
+            version_tag,
         } => {
             let deployed = DeployedResource {
                 key: *resource_key,
@@ -116,6 +120,8 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
                 resource_id: resource_id.clone(),
                 resource_name: resource_name.clone(),
                 content: content.clone(),
+                deployment_key: *deployment_key,
+                version_tag: version_tag.clone(),
             };
             // Retain every version by its unique key so a linked-resource binding
             // pinned to a specific version (or an older key) resolves.

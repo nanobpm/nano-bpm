@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -88,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 5936058379013217281;
+const SCHEMA_FINGERPRINT: i64 = 5885629061888775070;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -398,7 +398,8 @@ CREATE TABLE resources (
     version        INTEGER NOT NULL,
     version_tag    TEXT,
     content        TEXT NOT NULL,
-    tenant_id      TEXT NOT NULL DEFAULT '<default>'
+    tenant_id      TEXT NOT NULL DEFAULT '<default>',
+    deployment_key INTEGER
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
 CREATE TABLE agent_instances (
@@ -1829,6 +1830,10 @@ pub struct ResourceMetaRow {
     pub version: i32,
     pub version_tag: Option<String>,
     pub tenant_id: String,
+    /// The key of the deployment that created this resource version, when
+    /// known. `None` only for a row projected before schema v17 (or seeded from
+    /// a legacy engine snapshot whose `deployment_key` is `0`) — sorts as absent.
+    pub deployment_key: Option<Key>,
 }
 
 /// Minimum `-wal` sidecar size (bytes) before the adaptive pruner spends a
@@ -3837,7 +3842,7 @@ fn map_resource(r: &rusqlite::Row) -> rusqlite::Result<ResourceRow> {
 }
 
 const RESOURCE_META_COLS: &str =
-    "resource_key, resource_id, resource_name, version, version_tag, tenant_id";
+    "resource_key, resource_id, resource_name, version, version_tag, tenant_id, deployment_key";
 
 fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
     Ok(ResourceMetaRow {
@@ -3847,6 +3852,7 @@ fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
         version: r.get(3)?,
         version_tag: r.get(4)?,
         tenant_id: r.get(5)?,
+        deployment_key: r.get::<_, Option<i64>>(6)?.map(|k| k as Key),
     })
 }
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
@@ -4319,20 +4325,24 @@ fn project_engine_state(
     for res in state.resources.values() {
         tx.cexecute(
             "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-             version_tag, content, tenant_id) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+             version_tag, content, tenant_id, deployment_key) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
              ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
              resource_name = excluded.resource_name, version = excluded.version, \
              version_tag = excluded.version_tag, content = excluded.content, \
-             tenant_id = excluded.tenant_id",
+             tenant_id = excluded.tenant_id, \
+             deployment_key = COALESCE(excluded.deployment_key, resources.deployment_key)",
             // `tenant_id` is not modeled in engine state; default to '<default>'.
+            // `deployment_key` is carried by the snapshot; only the legacy `0`
+            // means unknown, which binds NULL and preserves any existing value.
             params![
                 res.key as i64,
                 res.resource_id,
                 res.resource_name,
                 res.version,
                 res.content,
-                "<default>"
+                "<default>",
+                (res.deployment_key != 0).then_some(res.deployment_key as i64),
             ],
         )?;
     }
@@ -6616,6 +6626,7 @@ fn project_event(
         }
 
         Event::GenericResourceDeployed {
+            deployment_key,
             resource_key,
             version,
             resource_id,
@@ -6628,12 +6639,12 @@ fn project_event(
             // is idempotent on a journal replay.
             tx.cexecute(
                 "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-                 version_tag, content, tenant_id) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+                 version_tag, content, tenant_id, deployment_key) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
                  ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
                  resource_name = excluded.resource_name, version = excluded.version, \
                  version_tag = excluded.version_tag, content = excluded.content, \
-                 tenant_id = excluded.tenant_id",
+                 tenant_id = excluded.tenant_id, deployment_key = excluded.deployment_key",
                 params![
                     *resource_key as i64,
                     resource_id,
@@ -6641,6 +6652,7 @@ fn project_event(
                     version,
                     content,
                     "<default>",
+                    *deployment_key as i64,
                 ],
             )?;
         }
@@ -8434,6 +8446,7 @@ mod writability_tests {
                     deadline: None,
                 }),
                 secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
         store.seed_from_engine_state(&state).unwrap();
@@ -8738,6 +8751,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key,
                 version,
+                deployment_key: 0,
                 definition: def,
             }
         };
@@ -8777,6 +8791,40 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn seed_from_engine_state_carries_resource_deployment_key() {
+        use nanobpmn_engine_core::{DeployedResource, State};
+
+        let mk = |key, deployment_key| DeployedResource {
+            key,
+            version: 1,
+            resource_id: format!("r{key}.txt"),
+            resource_name: format!("r{key}.txt"),
+            content: "c".to_string(),
+            deployment_key,
+            version_tag: None,
+        };
+        let mut state = State::default();
+        state.resources.insert("r7.txt".to_string(), mk(7, 99));
+        state.resources.insert("r8.txt".to_string(), mk(8, 0));
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
+        );
+        assert_eq!(store.resource_by_key_meta(8).unwrap().deployment_key, None);
+
+        // A legacy (0) snapshot value must not clobber a known key.
+        state.resources.insert("r7.txt".to_string(), mk(7, 0));
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
+        );
+    }
+
+    #[test]
     fn seed_from_engine_state_falls_back_to_latest_index_for_legacy_snapshots() {
         use nanobpmn_engine_core::{DeployedProcess, State};
 
@@ -8797,6 +8845,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key: 42,
                 version: 3,
+                deployment_key: 0,
                 definition: def,
             },
         );
@@ -8898,6 +8947,7 @@ mod definition_xml_tests {
                 settled_tokens: Vec::new(),
                 terminal_end: None,
                 secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -9171,6 +9221,7 @@ mod definition_xml_tests {
                     deadline: Some(70_000),
                 }),
                 secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -9728,6 +9779,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobCanceled {
                 job_key: 8_950,
@@ -9793,6 +9845,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: Some("w1".to_string()),
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobRetriesUpdated {
                 job_key: 8_900,
@@ -12543,6 +12596,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A terminal errored job on the same source element.
                 &Event::JobCreated {
@@ -12638,6 +12692,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("w1".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A job that throws a terminal (uncaught) error after activation by `w2`.
                 &Event::JobCreated {
@@ -12696,6 +12751,7 @@ mod element_instance_tests {
                     retries: 1,
                     worker: Some("w3".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ])
             .unwrap();
@@ -12748,6 +12804,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("host-a-senior".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // Errored terminally — again no JobActivated projection.
                 &Event::JobCreated {
@@ -12904,6 +12961,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some(String::new()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 &Event::JobCreated {
                     job_key: 9203,
@@ -13043,6 +13101,7 @@ mod element_instance_tests {
                 settled_tokens: Vec::new(),
                 terminal_end: None,
                 secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -13113,6 +13172,7 @@ mod element_instance_tests {
             settled_tokens: Vec::new(),
             terminal_end: None,
             secret_provenance: Vec::new(),
+            retry_backoff_until: None,
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -13223,6 +13283,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ),
             (
@@ -13383,6 +13444,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         let failed = get(7003);
@@ -13453,6 +13515,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("late".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8001,
@@ -13510,6 +13573,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -13554,6 +13618,7 @@ mod element_instance_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
         store.export(&[&fail(8201)]).unwrap();
         let failed = get(8201);
@@ -13608,6 +13673,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("stray".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8202,
@@ -13763,6 +13829,7 @@ mod element_instance_tests {
                 settled_tokens: Vec::new(),
                 terminal_end: None,
                 secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -13863,6 +13930,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("upstream 503".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13879,6 +13947,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -13892,6 +13961,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13954,6 +14024,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7001).has_failed_with_retries_left);
@@ -13978,6 +14049,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(!row(&store, 7002).has_failed_with_retries_left);
@@ -14002,6 +14074,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7003).has_failed_with_retries_left);
@@ -14028,6 +14101,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7004).has_failed_with_retries_left);
@@ -14545,6 +14619,7 @@ mod read_surface_tests {
             form_id: form_id.to_string(),
             resource_name: format!("{form_id}.form"),
             schema: schema.to_string(),
+            version_tag: None,
         }
     }
 
@@ -15062,6 +15137,7 @@ mod read_surface_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("boom".to_string()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8400,
@@ -15251,6 +15327,7 @@ mod read_surface_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
         };
 
         let p_created = apply_at(&store, &created, 1_000);
@@ -15633,6 +15710,7 @@ mod read_surface_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
 
         apply_at(&store, &created, 1_000);
@@ -15807,6 +15885,33 @@ mod agent_projection_tests {
         let refs: Vec<&Event> = events.iter().collect();
         store.export(&refs).unwrap();
         store
+    }
+
+    /// Issue #1298: `searchResources` sorts on `deploymentKey`, so the resource
+    /// projection must retain the creating deployment's key (resources of one
+    /// deployment share it), not substitute the per-resource key.
+    #[test]
+    fn generic_resource_projection_retains_deployment_key() {
+        let deployed = |deployment_key, resource_key, id: &str| Event::GenericResourceDeployed {
+            deployment_key,
+            resource_key,
+            version: 1,
+            resource_id: id.to_string(),
+            resource_name: id.to_string(),
+            content: String::new(),
+            version_tag: None,
+        };
+        let store = store_with(&[
+            deployed(10, 11, "a.txt"),
+            deployed(10, 12, "b.txt"),
+            deployed(20, 21, "c.txt"),
+        ]);
+        let got: Vec<(Key, Option<Key>)> = store
+            .resources_meta()
+            .into_iter()
+            .map(|r| (r.resource_key, r.deployment_key))
+            .collect();
+        assert_eq!(got, vec![(11, Some(10)), (12, Some(10)), (21, Some(20))]);
     }
 
     #[test]
@@ -16677,6 +16782,7 @@ mod job_position_gate_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: None,
+            retry_backoff_until: None,
         };
         store
             .export(&[

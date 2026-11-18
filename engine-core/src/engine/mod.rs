@@ -171,6 +171,12 @@ pub struct Engine {
     /// never reads a wall clock itself; replay is unaffected because the
     /// timestamp is carried on the event.
     now: u64,
+    /// Per-command FEEL evaluation environment (#1642): the command's `now`
+    /// plus an RNG seeded from replicated engine state, installed around
+    /// planning and draining so FEEL's `now()`/`today()`/`random number()`/
+    /// `uuid()` agree across Raft replicas. Reseeded by every
+    /// `plan_command_at`, so it is per-command scratch and never snapshotted.
+    feel_env: crate::feel::EvalEnv,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
     /// instances across the cluster's partitions. Not derived from events (the
     /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
@@ -683,6 +689,7 @@ impl Engine {
             next_local: 0,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -702,6 +709,15 @@ impl Engine {
     /// Read-only access to the full engine state (useful for queries and tests).
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The clock reading of the command currently being processed (the units the
+    /// host supplies — Unix epoch ms on the server). The engine never reads a
+    /// wall clock itself; this is the logical `now` the last `apply_command_at`
+    /// set, used by hosts that need to compare a persisted deadline (e.g. a
+    /// job's `retryBackOff`, #933) against the engine's clock.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// Mutable access to the full engine state, for tests that need to simulate
@@ -866,6 +882,7 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
             lenient_completion: false,
             terminal_deadline_stamp: None,
@@ -1764,13 +1781,281 @@ impl Engine {
         }
     }
 
+    /// Registers one deployment bundle under a single shared deployment key
+    /// (see [`Command::DeployBundle`]). Processes are preflighted (and may be
+    /// rejected) before anything is emitted, so the bundle stays atomic; the
+    /// other kinds cannot fail.
+    fn deploy_bundle(
+        &mut self,
+        log: &mut Vec<Event>,
+        mut bundle: crate::command::DeploymentBundle,
+    ) -> Result<(), EngineError> {
+        for process in &mut bundle.processes {
+            process.normalize_legacy_agent_tasks();
+        }
+        // Zeebe: an all-duplicate deployment is a no-op; otherwise every
+        // resource is re-versioned under the new deployment key so the bundle
+        // stays mutually resolvable for `bindingType: deployment`.
+        //
+        // …with one membership refinement (#1193 review): content equality does
+        // not imply SHARED deployment membership. A duplicate process may be
+        // reused only while the bundle's submitted `deployment` bindings still
+        // resolve against the deployment the reuse pins — otherwise the bundle
+        // is re-versioned together. Deploying a process and its form separately
+        // and then resubmitting them unchanged together must not leave the
+        // process pinned to a deployment without the form (an incident on every
+        // instance).
+        //
+        // `force` is computed DIRECTLY from the two checks — never by mutating
+        // the submitted XML and recursing (#1193 review): rewriting
+        // `bindingType="deployment"` to `latest` to break byte-equality both
+        // fails to terminate (single-quoted / whitespace-separated attributes,
+        // or a programmatic definition with empty `xml`, never rewrite, so the
+        // recursion never progresses and exhausts the host stack) and, when it
+        // does rewrite, persists XML whose binding semantics differ from what
+        // executes. Forcing re-versioning of the verbatim bundle avoids both.
+        let all_duplicates = self.bundle_is_all_duplicates(&bundle);
+        let force =
+            !all_duplicates || !self.bundle_membership_satisfies_submitted_bindings(&bundle);
+        let crate::command::DeploymentBundle {
+            processes,
+            decisions,
+            forms,
+            resources,
+        } = bundle;
+        let deployment_key = self.deploy(log, processes, force)?;
+        self.deploy_decisions(log, decisions, deployment_key, force);
+        self.deploy_forms(log, forms, deployment_key, force);
+        self.deploy_generic_resources(log, resources, deployment_key, force);
+        Ok(())
+    }
+
+    /// Whether every resource in `bundle` is identical to its latest deployed
+    /// version (the per-kind duplicate rules below, in one place).
+    fn bundle_is_all_duplicates(&self, bundle: &crate::command::DeploymentBundle) -> bool {
+        bundle
+            .processes
+            .iter()
+            .all(|p| self.is_duplicate_process(p))
+            && bundle.decisions.iter().all(|d| self.is_duplicate_drg(d))
+            && bundle.forms.iter().all(|f| self.is_duplicate_form(f))
+            && bundle
+                .resources
+                .iter()
+                .all(|r| self.is_duplicate_resource(r))
+    }
+
+    /// Whether reusing every duplicate resource's existing version (the
+    /// all-duplicates no-op) keeps the bundle's submitted `deployment` bindings
+    /// resolvable (#1193 review): for each `deployment`-bound form / linked
+    /// resource a bundle process declares AND the bundle itself carries, the
+    /// bound id must already be versioned under the deployment the process's
+    /// reuse pins — at the SUBMITTED content, not merely by id. Merely being
+    /// submitted in the same bundle is NOT sufficient — an unchanged submission
+    /// is itself skipped, so it would not join the process's deployment. A
+    /// bundle that fails this is re-versioned together instead of skipping, so
+    /// the bindings become satisfiable.
+    ///
+    /// Only dependencies the bundle CARRIES constrain reuse (#1193 review): a
+    /// binding whose form / linked resource is NOT in the submission cannot be
+    /// repaired by re-versioning this bundle — the process-only resubmission
+    /// contains nothing that would co-deploy the missing dependency, so forcing
+    /// a new version would mint one on EVERY identical resubmission and reset
+    /// timer starts without ever making the binding resolvable. Such a binding
+    /// is left to its runtime resolution (a resolvable incident), and the
+    /// unchanged redeployment stays the idempotent no-op Zeebe specifies.
+    fn bundle_membership_satisfies_submitted_bindings(
+        &self,
+        bundle: &crate::command::DeploymentBundle,
+    ) -> bool {
+        bundle.processes.iter().all(|process| {
+            // Every `deployment`-bound form id and linked resource id the
+            // process declares — across both the executable graph
+            // (`process.elements`) and the ad-hoc tool catalog
+            // (`process.adhoc[*].tools`, whose pruned user-task tools still
+            // carry a form binding, #1193 review) — INTERSECTED with the ids
+            // this bundle actually carries. A binding to a dependency outside
+            // the bundle is unrepairable here, so it does not force reuse.
+            let mut bound_form_ids: Vec<&str> = Vec::new();
+            let mut bound_resource_ids: Vec<&str> = Vec::new();
+            for element in process.elements.values() {
+                Self::collect_deployment_bindings(
+                    &element.kind,
+                    &mut bound_form_ids,
+                    &mut bound_resource_ids,
+                );
+            }
+            for adhoc in &process.adhoc {
+                for tool in &adhoc.tools {
+                    if let crate::model::AdHocToolKind::UserTask(props) = &tool.kind {
+                        // As above, an external form reference makes the binding
+                        // moot — it resolves no deployed version (#1193 review).
+                        if props.form_binding_type == crate::model::BindingType::Deployment
+                            && props.external_form_reference.is_none()
+                        {
+                            if let Some(form_id) = props.form_id.as_deref() {
+                                bound_form_ids.push(form_id);
+                            }
+                        }
+                    }
+                }
+            }
+            bound_form_ids.retain(|id| bundle.forms.iter().any(|f| f.id == *id));
+            bound_resource_ids.retain(|id| bundle.resources.iter().any(|r| r.resource_id == *id));
+
+            let deployment_key = self
+                .state
+                .processes
+                .get(&process.id)
+                .map(|existing| existing.deployment_key)
+                .unwrap_or(0);
+            if deployment_key == 0 {
+                // The process predates deployment tracking (a legacy-snapshot
+                // restore) or is new. A NEW process is not a reusable duplicate,
+                // so this gate is moot for it; but a legacy-restored process IS
+                // a duplicate (the definition compares equal) whose deployment
+                // membership is UNKNOWN — and key 0 never resolves a
+                // `deployment` binding. Treat unknown membership as unsatisfied
+                // whenever the bundle carries a repairable deployment binding,
+                // so the bundle is re-versioned together under a real key (#1193
+                // review). With no bundle-carried deployment binding there is
+                // nothing this redeployment can repair, so reuse stays a no-op.
+                return bound_form_ids.is_empty() && bound_resource_ids.is_empty();
+            }
+
+            // Each bundle-carried bound id must be versioned under the pinned
+            // deployment at the SUBMITTED content — otherwise reuse would bind
+            // the STALE co-deployed version (e.g. P+F(v1) deployed together, F
+            // updated to v2 separately, then P+F(v2) resubmitted: an id-only
+            // check finds v1 and binds it, not the submitted v2, #1193 review).
+            bound_form_ids.iter().all(|form_id| {
+                self.form_versioned_under(
+                    form_id,
+                    deployment_key,
+                    bundle.forms.iter().find(|f| f.id == *form_id),
+                )
+            }) && bound_resource_ids.iter().all(|resource_id| {
+                self.resource_versioned_under(
+                    resource_id,
+                    deployment_key,
+                    bundle
+                        .resources
+                        .iter()
+                        .find(|r| r.resource_id == *resource_id),
+                )
+            })
+        })
+    }
+
+    /// Collects the `deployment`-bound form ids and linked resource ids one
+    /// executable-graph element declares (#1193 review).
+    fn collect_deployment_bindings<'a>(
+        kind: &'a ElementKind,
+        bound_form_ids: &mut Vec<&'a str>,
+        bound_resource_ids: &mut Vec<&'a str>,
+    ) {
+        match kind {
+            // An external form reference wins over `form_id` at runtime and
+            // resolves no deployed version (the binding is moot, #1193 review),
+            // so only a task WITHOUT one constrains bundle membership.
+            ElementKind::UserTask(props)
+                if props.form_binding_type == crate::model::BindingType::Deployment
+                    && props.external_form_reference.is_none() =>
+            {
+                if let Some(form_id) = props.form_id.as_deref() {
+                    bound_form_ids.push(form_id);
+                }
+            }
+            ElementKind::ServiceTask {
+                linked_resources, ..
+            } => {
+                for link in linked_resources {
+                    if link.binding_type == crate::model::BindingType::Deployment {
+                        bound_resource_ids.push(link.resource_id.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a deployed version of `form_id` is pinned to `deployment_key` —
+    /// at the submitted schema/tag when `submitted` carries it (#1193 review).
+    fn form_versioned_under(
+        &self,
+        form_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::FormResource>,
+    ) -> bool {
+        self.state.form_versions.values().any(|f| {
+            f.form_id == form_id
+                && f.deployment_key == deployment_key
+                && submitted.is_none_or(|s| f.schema == s.schema && f.version_tag == s.version_tag)
+        })
+    }
+
+    /// Whether a deployed version of `resource_id` is pinned to `deployment_key`
+    /// — at the submitted name/content/tag when `submitted` carries it (#1193
+    /// review).
+    fn resource_versioned_under(
+        &self,
+        resource_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::GenericResource>,
+    ) -> bool {
+        self.state.resource_versions.values().any(|r| {
+            r.resource_id == resource_id
+                && r.deployment_key == deployment_key
+                && submitted.is_none_or(|s| {
+                    r.resource_name == s.resource_name
+                        && r.content == s.content
+                        && r.version_tag == s.version_tag
+                })
+        })
+    }
+
+    fn is_duplicate_process(&self, process: &ProcessDefinition) -> bool {
+        self.state
+            .processes
+            .get(&process.id)
+            .is_some_and(|existing| existing.definition == *process)
+    }
+
+    fn is_duplicate_drg(&self, drg: &crate::dmn::DecisionRequirementsGraph) -> bool {
+        self.state
+            .decision_requirements
+            .get(&drg.id)
+            .is_some_and(|existing| existing.drg == *drg)
+    }
+
+    /// The `version_tag` must match too (#1193 review): a schema-identical
+    /// redeploy that carries a NEW tag is not a duplicate.
+    fn is_duplicate_form(&self, form: &crate::command::FormResource) -> bool {
+        self.state.forms.get(&form.id).is_some_and(|existing| {
+            existing.schema == form.schema && existing.version_tag == form.version_tag
+        })
+    }
+
+    /// Zeebe's name+checksum duplicate rule, plus the `version_tag` (#1193).
+    fn is_duplicate_resource(&self, resource: &crate::command::GenericResource) -> bool {
+        self.state
+            .resources
+            .get(&resource.resource_id)
+            .is_some_and(|existing| {
+                existing.resource_name == resource.resource_name
+                    && existing.content == resource.content
+                    && existing.version_tag == resource.version_tag
+            })
+    }
+
     /// Validates and registers a batch of process definitions as one deployment.
     ///
     /// All processes are validated first, so the deployment is atomic: if any is
     /// invalid, none are emitted. Each *new or changed* process is assigned a
     /// unique process-definition key and a per-id version (latest known + 1).
     ///
-    /// Deployment is idempotent: a process that is byte-for-byte identical to the
+    /// Deployment is idempotent (within a non-forced bundle — see
+    /// [`Self::deploy_bundle`]): a process that is byte-for-byte identical to the
     /// current latest version of the same id (`existing.definition == process`,
     /// which includes the verbatim BPMN [`ProcessDefinition::xml`]) reuses that
     /// version's identity and emits **nothing** — no new key, no version bump, no
@@ -1779,11 +2064,16 @@ impl Engine {
     /// deploys (e.g. on every app startup) from growing the journal. Keys are
     /// minted only for emitted events so replay (which derives the key counter
     /// from the max key seen in the log) stays in lock-step with the live engine.
+    ///
+    /// Preflights and registers `processes`, then mints the deployment key
+    /// (emitting [`Event::DeploymentCreated`]) and returns it. A duplicate of
+    /// the latest version is skipped unless `force` (see [`Self::deploy_bundle`]).
     fn deploy(
         &mut self,
         log: &mut Vec<Event>,
         mut processes: Vec<ProcessDefinition>,
-    ) -> Result<(), EngineError> {
+        force: bool,
+    ) -> Result<Key, EngineError> {
         for process in &mut processes {
             process.normalize_legacy_agent_tasks();
         }
@@ -1922,12 +2212,7 @@ impl Engine {
         self.emit(log, Event::DeploymentCreated { deployment_key });
 
         for (process, resolved_starts) in processes.into_iter().zip(preflight) {
-            if self
-                .state
-                .processes
-                .get(&process.id)
-                .is_some_and(|existing| existing.definition == process)
-            {
+            if !force && self.is_duplicate_process(&process) {
                 // Idempotent redeploy of the latest version: reuse its identity
                 // and skip it entirely (no event, no new subscription/timer).
                 continue;
@@ -1987,7 +2272,7 @@ impl Engine {
                 }
             }
         }
-        Ok(())
+        Ok(deployment_key)
     }
 
     /// The version that the next deployment of `process_id` will receive.
@@ -1999,26 +2284,20 @@ impl Engine {
             .unwrap_or(1)
     }
 
-    /// Registers one or more decision requirements graphs as a deployment,
-    /// mirroring [`Engine::deploy`]: a shared deployment key, one
+    /// Registers decision requirements graphs under `deployment_key` (minted by
+    /// [`Engine::deploy_bundle`]): one
     /// [`Event::DecisionRequirementsDeployed`] per DRG, and one
     /// [`Event::DecisionDeployed`] per decision it contains (indexed by id).
-    /// An idempotent redeploy of the identical latest DRG is skipped.
+    /// An identical latest DRG is skipped unless `force`.
     fn deploy_decisions(
         &mut self,
         log: &mut Vec<Event>,
         graphs: Vec<crate::dmn::DecisionRequirementsGraph>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for drg in graphs {
-            if self
-                .state
-                .decision_requirements
-                .get(&drg.id)
-                .is_some_and(|existing| existing.drg == drg)
-            {
+            if !force && self.is_duplicate_drg(&drg) {
                 // Idempotent redeploy of the identical latest DRG: skip.
                 continue;
             }
@@ -2064,29 +2343,21 @@ impl Engine {
                 );
             }
         }
-        Ok(())
     }
 
-    /// Registers one or more forms as a deployment, mirroring
-    /// [`Engine::deploy_decisions`]: a shared deployment key and one
-    /// [`Event::FormDeployed`] per form (versioned per form id). An idempotent
-    /// redeploy of the identical latest form is skipped. The engine does not
+    /// Registers forms under `deployment_key`: one [`Event::FormDeployed`] per
+    /// form (versioned per form id). An identical latest form is skipped unless
+    /// `force`. The engine does not
     /// execute forms; it stores them so `GetFormByKey` can serve the schema.
     fn deploy_forms(
         &mut self,
         log: &mut Vec<Event>,
         forms: Vec<crate::command::FormResource>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for form in forms {
-            if self
-                .state
-                .forms
-                .get(&form.id)
-                .is_some_and(|existing| existing.schema == form.schema)
-            {
+            if !force && self.is_duplicate_form(&form) {
                 // Idempotent redeploy of the identical latest form: skip.
                 continue;
             }
@@ -2106,37 +2377,25 @@ impl Engine {
                     form_id: form.id,
                     resource_name: form.resource_name,
                     schema: form.schema,
+                    version_tag: form.version_tag,
                 },
             );
         }
-        Ok(())
     }
 
-    /// Registers one or more generic resources as a deployment, mirroring
-    /// [`Engine::deploy_forms`]: a shared deployment key and one
+    /// Registers generic resources under `deployment_key`: one
     /// [`Event::GenericResourceDeployed`] per resource (versioned per
-    /// `resource_id`). An idempotent redeploy of the identical latest resource
-    /// (same `resource_name` and content — Zeebe's name+checksum duplicate rule)
-    /// is skipped. The engine does not execute generic resources; it stores them
+    /// `resource_id`). An identical latest resource is skipped unless `force`. The engine does not execute generic resources; it stores them
     /// so `GetResourceByKey` / `searchResources` can serve the content.
     fn deploy_generic_resources(
         &mut self,
         log: &mut Vec<Event>,
         resources: Vec<crate::command::GenericResource>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for resource in resources {
-            if self
-                .state
-                .resources
-                .get(&resource.resource_id)
-                .is_some_and(|existing| {
-                    existing.resource_name == resource.resource_name
-                        && existing.content == resource.content
-                })
-            {
+            if !force && self.is_duplicate_resource(&resource) {
                 // Idempotent redeploy of the identical latest resource: skip.
                 continue;
             }
@@ -2156,10 +2415,10 @@ impl Engine {
                     resource_id: resource.resource_id,
                     resource_name: resource.resource_name,
                     content: resource.content,
+                    version_tag: resource.version_tag,
                 },
             );
         }
-        Ok(())
     }
 
     /// Records one decision evaluation as an [`Event::DecisionEvaluated`]: the
@@ -2310,6 +2569,36 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
+        // Seed the FEEL environment from replicated inputs only (#1642), never
+        // a wall clock or process-local entropy. The seed is a PURE function of
+        // (a) the partition-qualified allocator position `peek_next_key()` —
+        // so partitions sharing `(now, next_local)` get disjoint streams and
+        // any key-minting command moves its successor's stream on — and (b)
+        // the command's own identity `Command::seed_fingerprint()` — so two
+        // same-timestamp commands that mint no keys (e.g. completing two
+        // sink tasks) still differ by their target key (#1649 review).
+        //
+        // Deliberately NO engine-held counter: hidden seed state must be
+        // snapshotted, replayed from events, kept in step across batched Raft
+        // entries and kept out of leader-local lease operations — each a
+        // replica/recovery divergence surface. Deriving from the replicated
+        // command + replicated state removes that whole class.
+        let seed = command
+            .seed_fingerprint()
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ self.peek_next_key();
+        self.feel_env = crate::feel::EvalEnv::new(now, seed);
+        let mut env = self.feel_env;
+        let result = crate::feel::with_env(&mut env, || self.plan_command_inner(command));
+        self.feel_env = env;
+        result
+    }
+
+    fn plan_command_inner(
+        &mut self,
+        command: Command,
+    ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
+        let now = self.now;
         // Clear the per-command scratch of sub-process scopes torn down mid-drain
         // (see [`torn_down_scopes`]): each command drains independently, so a
         // scope invalidated by a previous command's terminate must not leak into
@@ -2340,24 +2629,61 @@ impl Engine {
         let mut queue: VecDeque<Step> = VecDeque::new();
 
         match command {
+            // Every deploy command is one bundle: the single canonical deploy
+            // path, so a per-kind command and a mixed deployment cannot drift
+            // in key minting or duplicate semantics (#1193).
             Command::DeployProcess(process) => {
-                self.deploy(&mut log, vec![process])?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        processes: vec![process],
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployResources(processes) => {
-                self.deploy(&mut log, processes)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        processes,
+                        ..Default::default()
+                    },
+                )?;
             }
 
-            Command::DeployDecisionRequirements(graphs) => {
-                self.deploy_decisions(&mut log, graphs)?;
+            Command::DeployDecisionRequirements(decisions) => {
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        decisions,
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployForms(forms) => {
-                self.deploy_forms(&mut log, forms)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        forms,
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployGenericResources(resources) => {
-                self.deploy_generic_resources(&mut log, resources)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        resources,
+                        ..Default::default()
+                    },
+                )?;
+            }
+
+            Command::DeployBundle(bundle) => {
+                self.deploy_bundle(&mut log, bundle)?;
             }
 
             Command::DeleteDecisionInstance {
@@ -3325,6 +3651,7 @@ impl Engine {
                 lease_token,
                 retries,
                 error_message,
+                retry_back_off,
             } => {
                 // Idempotent replay (#1181): the same fence re-asserting the
                 // outcome it already recorded is a no-op success on any replica.
@@ -3375,6 +3702,13 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let worker = Self::terminal_worker(job, attribution.as_ref());
                 let retries = retries.max(0);
+                // Camunda 8 v2 `retryBackOff` (#933): a positive backoff with
+                // retries left defers re-activation until `now + backoff`;
+                // zero/absent (negatives are clamped to zero at the boundary)
+                // is retryable immediately; with no retries left the job parks
+                // with an incident, so a backoff is meaningless and dropped.
+                let retry_backoff_until = (retries > 0 && retry_back_off > 0)
+                    .then(|| self.now.saturating_add(retry_back_off));
 
                 self.record_settlement(
                     &mut log,
@@ -3390,6 +3724,7 @@ impl Engine {
                         retries,
                         worker,
                         error_message: Some(limit_error_message(error_message.clone())),
+                        retry_backoff_until,
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -6220,6 +6555,23 @@ impl Engine {
     fn run_with<D: StepDriver>(
         &mut self,
         log: &mut Vec<Event>,
+        queue: VecDeque<Step>,
+        cursor: usize,
+        driver: &mut D,
+    ) -> Option<Paused> {
+        // Every FEEL evaluation while draining sees the command's replicated
+        // environment (#1642); the advanced RNG state is carried back so a
+        // paused debug session resumes the same stream.
+        let mut env = self.feel_env;
+        let result =
+            crate::feel::with_env(&mut env, || self.run_with_inner(log, queue, cursor, driver));
+        self.feel_env = env;
+        result
+    }
+
+    fn run_with_inner<D: StepDriver>(
+        &mut self,
+        log: &mut Vec<Event>,
         mut queue: VecDeque<Step>,
         mut cursor: usize,
         driver: &mut D,
@@ -7513,6 +7865,14 @@ impl Engine {
                 element_id,
                 pending,
             } => {
+                // A parked user-task ad-hoc TOOL lives only in its container's
+                // catalog, not the executable graph: resume it via the
+                // catalog-aware retry (#1193 review).
+                if let Some(events) =
+                    self.adhoc_user_task_tool_retry(instance_key, element_instance_key, &element_id)
+                {
+                    return (events, Vec::new());
+                }
                 // The catch element instance is already ACTIVATED (its token is
                 // parked on the resolved incident); reconstruct its enclosing
                 // scope (absent from `scopes` ⇒ root) and re-derive only the
@@ -8976,9 +9336,46 @@ impl Engine {
                 let user_task_key = self.mint_key();
                 // Resolve the form linkage, enforcing the Zeebe invariant that
                 // `formId` and `externalReference` are mutually exclusive (an
-                // external reference wins and suppresses `form_key` resolution).
+                // external reference wins and suppresses `form_key` resolution)
+                // and dispatching on the declared binding (Zeebe
+                // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
+                // `deployment`/`versionTag` miss raises a resolvable incident
+                // and creates no task: the element stays parked in ACTIVATING
+                // (the token only advances on task completion) and resolving
+                // the incident re-runs the activation body.
                 let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
+                    match self.resolve_user_task_form_linkage(instance_key, &props) {
+                        crate::engine::resolve::FormLinkage::Unbound {
+                            external_form_reference,
+                        } => (None, external_form_reference),
+                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
+                            (Some(form_key), None)
+                        }
+                        crate::engine::resolve::FormLinkage::Miss { reason } => {
+                            events.push(Event::IncidentRaised {
+                                incident_key: self.mint_key(),
+                                instance_key,
+                                element_instance_key,
+                                element_id: element_id.clone(),
+                                kind: state::IncidentKind::CalledElementError,
+                                // The form lookup runs AFTER the element's input
+                                // mappings and `start` listeners already succeeded
+                                // (#1193 review): resolution must re-run ONLY the
+                                // activation body, never re-apply the (possibly
+                                // non-idempotent, e.g. `=counter + 1 -> counter`)
+                                // inputs or re-fire the completed start listeners.
+                                // `gate_activated` re-tags this
+                                // `ActivationBodyPending` and withholds
+                                // `ElementActivated` when the token is still
+                                // ACTIVATING.
+                                redrive: Some(state::IoMappingRedrive::ActivationBody),
+                                reason,
+                                job_key: None,
+                                created_at: self.now,
+                            });
+                            return Ok((events, followups));
+                        }
+                    };
                 // An initial assignee (zeebe:assignmentDefinition) must fire the
                 // `assigning` listeners exactly as a runtime assign does (Zeebe
                 // parity: the assignee is stripped off the CREATED record and
@@ -11406,6 +11803,129 @@ impl Engine {
         (vec![event], Vec::new())
     }
 
+    /// The task-creation step of a user-task ad-hoc tool, shared by the first
+    /// activation and the incident retry so they cannot drift (#1193): the
+    /// form linkage dispatches on the declared binding exactly like an
+    /// ordinary user-task activation. Returns the event and whether it is the
+    /// `UserTaskCreated` (`true`) or the resolvable form-miss incident (redrive `ActivationBody`: the tool
+    /// child is already ACTIVATED, so resolution re-runs only this step).
+    fn adhoc_user_task_event(
+        &mut self,
+        instance_key: Key,
+        child_key: Key,
+        element_id: String,
+        props: &crate::model::UserTaskProps,
+        resolved: ResolvedUserTask,
+    ) -> (Event, bool) {
+        let (form_key, external_form_reference) = match self
+            .resolve_user_task_form_linkage(instance_key, props)
+        {
+            crate::engine::resolve::FormLinkage::Unbound {
+                external_form_reference,
+            } => (None, external_form_reference),
+            crate::engine::resolve::FormLinkage::Resolved { form_key } => (Some(form_key), None),
+            crate::engine::resolve::FormLinkage::Miss { reason } => {
+                return (
+                    Event::IncidentRaised {
+                        incident_key: self.mint_key(),
+                        instance_key,
+                        element_instance_key: child_key,
+                        element_id,
+                        kind: state::IncidentKind::CalledElementError,
+                        redrive: Some(state::IoMappingRedrive::ActivationBody),
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    },
+                    false,
+                );
+            }
+        };
+        let ResolvedUserTask {
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+        } = resolved;
+        (
+            Event::UserTaskCreated {
+                user_task_key: self.mint_key(),
+                instance_key,
+                element_instance_key: child_key,
+                element_id,
+                created_at: self.now,
+                assignee,
+                candidate_groups,
+                candidate_users,
+                due_date,
+                follow_up_date,
+                priority,
+                form_key,
+                external_form_reference,
+            },
+            true,
+        )
+    }
+
+    /// The incident retry of a parked user-task ad-hoc TOOL child, or `None`
+    /// when `child_key` is not one. Leaf tools exist only in their container's
+    /// ad-hoc catalog (pruned from the executable graph), so the generic
+    /// activation-body rerun cannot see them; this resumes the existing child
+    /// by re-running only its task-creation step (#1193 review).
+    fn adhoc_user_task_tool_retry(
+        &mut self,
+        instance_key: Key,
+        child_key: Key,
+        element_id: &str,
+    ) -> Option<Vec<Event>> {
+        let container_element_id = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .adhoc_instances
+            .values()
+            .find(|a| a.active.contains(&child_key))?
+            .element_id
+            .clone();
+        let props = self
+            .adhoc_def_of(instance_key, &container_element_id)?
+            .tools
+            .iter()
+            .find(|t| t.element_id == element_id)
+            .and_then(|t| match &t.kind {
+                crate::model::AdHocToolKind::UserTask(props) => Some(props.clone()),
+                _ => None,
+            })?;
+        // A nested ad-hoc container shares the user-task shape only by id;
+        // it never parks on a form, so it is not this retry's concern.
+        if self.adhoc_def_of(instance_key, element_id).is_some() {
+            return None;
+        }
+        let vars = self.variables_for_element(instance_key, child_key);
+        let event = match self.resolve_user_task_props(&vars, &props) {
+            Ok(resolved) => {
+                self.adhoc_user_task_event(
+                    instance_key,
+                    child_key,
+                    element_id.to_string(),
+                    &props,
+                    resolved,
+                )
+                .0
+            }
+            Err(failure) => self.expression_incident(
+                instance_key,
+                child_key,
+                element_id.to_string(),
+                failure,
+                Some(state::IoMappingRedrive::ActivationBody),
+            ),
+        };
+        Some(vec![event])
+    }
+
     /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
     /// `element_id` inside the container scope, seeding the agent's
     /// activate-element `variables` as the child's local overlay, and marks it
@@ -11765,35 +12285,27 @@ impl Engine {
             // Task listeners declared on the tool are pruned with it, so v1 emits
             // the plain CREATED record without a listener chain.
             Some(crate::model::AdHocToolKind::UserTask(props)) => {
-                let Some(ResolvedUserTask {
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                }) = resolved_user_task
-                else {
+                let Some(resolved) = resolved_user_task else {
                     unreachable!("user-task tool resolved its properties above");
                 };
-                let user_task_key = self.mint_key();
-                let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
-                events.push(Event::UserTaskCreated {
-                    user_task_key,
+                // A `deployment`/`versionTag` form miss raises a resolvable
+                // incident and creates no task; the tool child stays parked
+                // (its activation events are already emitted) and resolving
+                // the incident re-creates only the task
+                // (`adhoc_user_task_tool_retry`, #1193).
+                match self.adhoc_user_task_event(
                     instance_key,
-                    element_instance_key: child_key,
+                    child_key,
                     element_id,
-                    created_at: self.now,
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                    form_key,
-                    external_form_reference,
-                });
+                    &props,
+                    resolved,
+                ) {
+                    (created, true) => events.push(created),
+                    (incident, false) => {
+                        events.push(incident);
+                        return (events, followups);
+                    }
+                }
             }
             // An embedded `subProcess` tool (#872): run its multi-element body by
             // ordinary token flow within the tool's scope. The tool child (the
@@ -17235,7 +17747,8 @@ impl Engine {
             let Some(job) = self.state.jobs.get(&job_key) else {
                 continue;
             };
-            let activatable = job.state == state::JobState::Created
+            let activatable = (job.state == state::JobState::Created
+                && job_backoff_elapsed(job, now))
                 || (job.state == state::JobState::Activated
                     && !self.job_requires_durable_activation(job_key));
             if !activatable || (!options.with_lease && job.lease_token.is_some()) {
@@ -18838,9 +19351,16 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
         | state::JobState::Failed
         | state::JobState::Errored
         | state::JobState::Canceled => false,
-        state::JobState::Created => true,
+        // A failed-with-backoff job (#933) waits out its `retryBackOff`.
+        state::JobState::Created => job_backoff_elapsed(job, now),
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
+}
+
+/// Whether a job's Camunda 8 v2 `retryBackOff` (#933) has elapsed at `now`:
+/// true when no backoff is pending or its instant has been reached.
+fn job_backoff_elapsed(job: &state::Job, now: u64) -> bool {
+    job.retry_backoff_until.is_none_or(|until| until <= now)
 }
 
 #[cfg(test)]

@@ -339,6 +339,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim form-js JSON document.
         schema: String,
+        /// The optional version tag this form version carries (form-js
+        /// `versionTag`), matched by a `versionTag`-bound user-task form
+        /// (#1193). Additive: `serde(default)` so journals written before the
+        /// field existed decode with `None` (no tag).
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A generic resource (any deployed file that is not a BPMN/DMN/form — e.g. a
@@ -357,6 +363,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim resource content.
         content: String,
+        /// The optional version tag this resource version carries (Zeebe
+        /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+        /// `zeebe:linkedResource` (#1193). Additive: `serde(default)` so
+        /// journals written before the field existed decode with `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
@@ -786,6 +798,18 @@ pub enum Event {
         /// for events serialized before this field existed.
         #[cfg_attr(feature = "serde", serde(default))]
         error_message: Option<String>,
+        /// Camunda 8 v2 `retryBackOff` (#933): the absolute logical instant
+        /// (ms) before which the job, returned to the pool with retries left,
+        /// must not be re-activated (`now + retryBackOff` at fail time).
+        /// `None` when no backoff was requested (retryable immediately), when
+        /// no retries remain, and for events serialized before this field
+        /// existed. Skipped when `None`, so backoff-less fails stay
+        /// byte-identical.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        retry_backoff_until: Option<u64>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an

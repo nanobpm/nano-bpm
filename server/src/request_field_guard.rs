@@ -373,3 +373,74 @@ fn request_fields_of_served_operations_are_all_triaged() {
         }
     }
 }
+
+/// The source text of every sort dispatcher for `schema` in `main.rs`: from
+/// each `models::<schema>| (r.field…` extractor up to the following
+/// `query::paginate(` call, plus the body of any named accessor fn the window
+/// delegates to (e.g. `job_sort_val`).
+fn sort_dispatcher_sources(main_rs: &str, schema: &str) -> Vec<String> {
+    let needle = format!("models::{schema}|");
+    main_rs
+        .match_indices(&needle)
+        .map(|(at, _)| {
+            let rest = &main_rs[at..];
+            let end = rest.find("query::paginate(").unwrap_or(rest.len());
+            let mut window = rest[..end].to_string();
+            // Follow named `*_sort_val(` accessors the closure delegates to.
+            let accessors: BTreeSet<String> = window
+                .match_indices("_sort_val(")
+                .map(|(i, _)| {
+                    let head = &window[..i];
+                    let start = head
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(0, |p| p + 1);
+                    format!("{}_sort_val", &head[start..])
+                })
+                .collect();
+            for accessor in accessors {
+                if let Some(start) = main_rs.find(&format!("fn {accessor}(")) {
+                    let body = &main_rs[start..];
+                    let stop = body.find("\n}\n").unwrap_or(body.len());
+                    window.push_str(&body[..stop]);
+                }
+            }
+            window
+        })
+        .collect()
+}
+
+/// Defect-class guard (#1298): a sort `field` value that the manifest marks as
+/// honoured (no `unhonoured #N` note) must have an explicit arm in its
+/// endpoint's sort dispatcher. The dispatchers are stringly
+/// `match field { … _ => key }` closures, so an unhandled value silently falls
+/// through to entity-key order with a 200 — exactly the bug #1298 fixed for 60+
+/// values. This makes a forgotten arm (or a dropped `unhonoured` marker without
+/// an implementation) fail CI instead.
+#[test]
+fn honoured_sort_field_values_have_an_explicit_dispatcher_arm() {
+    let main_rs = std::fs::read_to_string(repo_root().join("server/src/main.rs"))
+        .expect("read server/src/main.rs");
+    let mut unhandled = Vec::new();
+    for (entry, note) in read_manifest() {
+        if note.is_some() {
+            continue;
+        }
+        let Some((schema, value)) = entry
+            .split_once(".field=")
+            .filter(|(s, _)| s.ends_with("SortRequest"))
+        else {
+            continue;
+        };
+        let sources = sort_dispatcher_sources(&main_rs, schema);
+        let quoted = format!("\"{value}\"");
+        if sources.is_empty() || sources.iter().any(|src| !src.contains(&quoted)) {
+            unhandled.push(entry);
+        }
+    }
+    assert!(
+        unhandled.is_empty(),
+        "sort values with no explicit dispatcher arm (they would silently sort \
+         by entity key) - implement them, or mark `unhonoured #<issue>` in \
+         spec-patches/request-fields.txt: {unhandled:#?}"
+    );
+}

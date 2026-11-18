@@ -4586,6 +4586,7 @@ fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
         id: "greeting-form".to_string(),
         resource_name: "greeting.form".to_string(),
         schema: schema.to_string(),
+        version_tag: None,
     };
     let v1 = r#"{"id":"greeting-form","type":"default","components":[]}"#;
 
@@ -4651,6 +4652,7 @@ fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempote
         resource_id: "agent-prompt.md".to_string(),
         resource_name: "agent-prompt.md".to_string(),
         content: content.to_string(),
+        version_tag: None,
     };
     let v1 = "# Reviewer\n\nReview the PR.";
 
@@ -4725,6 +4727,7 @@ fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempote
             resource_id: "other-prompt.md".to_string(),
             resource_name: "other-prompt.md".to_string(),
             content: "# Other".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     let other_v = other
@@ -4749,6 +4752,7 @@ fn deploying_multiple_form_versions_retains_every_version_by_key() {
         id: "f".to_string(),
         resource_name: "f.form".to_string(),
         schema: schema.to_string(),
+        version_tag: None,
     };
     let deploy = |engine: &mut Engine, schema: &str| -> (Key, i32) {
         engine
@@ -4794,6 +4798,7 @@ fn deploying_multiple_resource_versions_retains_every_version_by_key() {
                 resource_id: "p.md".to_string(),
                 resource_name: "p.md".to_string(),
                 content: content.to_string(),
+                version_tag: None,
             }]))
             .unwrap()
             .iter()
@@ -4944,6 +4949,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             id: "f".to_string(),
             resource_name: "f.form".to_string(),
             schema: r#"{"id":"f","components":[]}"#.to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4951,6 +4957,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             id: "f".to_string(),
             resource_name: "f.form".to_string(),
             schema: r#"{"id":"f","components":[{"key":"a"}]}"#.to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4958,6 +4965,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             resource_id: "p.md".to_string(),
             resource_name: "p.md".to_string(),
             content: "v1".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4965,6 +4973,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             resource_id: "p.md".to_string(),
             resource_name: "p.md".to_string(),
             content: "v2".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
 
@@ -8314,5 +8323,66 @@ fn routed_delivery_ledger_round_trips_with_indexes() {
     assert_eq!(
         back.iter().map(|e| e.delivery_key).collect::<Vec<_>>(),
         vec![9, 3, 7]
+    );
+}
+
+#[test]
+fn tag_only_form_and_resource_redeploys_are_not_skipped_as_duplicates() {
+    // #1193 review: an identical-content redeploy that carries a NEW
+    // `version_tag` must mint a version so the tag reaches state; only a
+    // content- AND tag-identical redeploy is idempotent.
+    use crate::command::{FormResource, GenericResource};
+    let mut engine = Engine::new();
+    let form = |tag: Option<&str>| FormResource {
+        id: "f".to_string(),
+        resource_name: "f.form".to_string(),
+        schema: r#"{"id":"f","components":[]}"#.to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let res = |tag: Option<&str>| GenericResource {
+        resource_id: "p.md".to_string(),
+        resource_name: "p.md".to_string(),
+        content: "same".to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let forms = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::FormDeployed { .. }))
+            .count()
+    };
+    let resources = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::GenericResourceDeployed { .. }))
+            .count()
+    };
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(None)]))
+        .unwrap();
+    assert_eq!(forms(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(engine.state().forms["f"].version_tag.as_deref(), Some("v1"));
+
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(None)]))
+        .unwrap();
+    assert_eq!(resources(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(
+        engine.state().resources["p.md"].version_tag.as_deref(),
+        Some("v1")
     );
 }

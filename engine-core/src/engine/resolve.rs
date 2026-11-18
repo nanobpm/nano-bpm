@@ -25,6 +25,23 @@ pub(crate) struct JobProps {
     pub(crate) priority: i32,
 }
 
+/// The outcome of resolving a user task's form linkage
+/// ([`Engine::resolve_user_task_form_linkage`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FormLinkage {
+    /// The task carries an external form reference (surfaced verbatim; no
+    /// deployed form version is resolved) or no form at all.
+    Unbound {
+        external_form_reference: Option<String>,
+    },
+    /// The `formId` resolved to a concrete deployed form version.
+    Resolved { form_key: Key },
+    /// A `deployment`/`versionTag` binding found no matching form version:
+    /// the task is not created and the element parks on a resolvable
+    /// incident carrying this reason (Zeebe `BpmnUserTaskBehavior` parity).
+    Miss { reason: String },
+}
+
 impl JobProps {
     /// A job with no retries / priority expressions: the engine defaults.
     pub(crate) fn defaults(job_type: String) -> Self {
@@ -791,27 +808,92 @@ impl Engine {
     /// enforcing the Zeebe invariant that `formId` and `externalReference` are
     /// mutually exclusive. An `externalReference` wins: it is surfaced verbatim
     /// and suppresses numeric `form_key` resolution, so a task never surfaces
-    /// both a `formKey` and an `externalFormReference`. When no external
-    /// reference is present, `formId` binds to the latest deployed form version
-    /// (Zeebe `latest` binding), stamped as a numeric `form_key`; an unmatched
-    /// `formId` leaves the key unset.
+    /// both a `formKey` and an `externalFormReference` (its binding is moot).
     ///
-    /// Returns `(form_key, external_form_reference)`.
+    /// A `formId` dispatches on its declared binding (Zeebe
+    /// `BpmnUserTaskBehavior.findLinkedForm`):
+    ///
+    /// * `latest` (the default) binds the latest deployed form version;
+    /// * `deployment` binds the version deployed **alongside the process
+    ///   definition** (the same `deployment_key` — `deployment_key` is `0` for
+    ///   a definition restored from a pre-#1193 snapshot, which matches no
+    ///   deployment and therefore misses rather than mis-binding);
+    /// * `versionTag` binds the version carrying the declared tag.
+    ///
+    /// A `deployment`/`versionTag` miss is a [`FormLinkage::Miss`] (the caller
+    /// raises a resolvable incident and creates no task); an unmatched `latest`
+    /// `formId` leaves the key unset, exactly as before #1193.
     pub(crate) fn resolve_user_task_form_linkage(
         &self,
+        instance_key: Key,
         props: &crate::model::UserTaskProps,
-    ) -> (Option<Key>, Option<String>) {
-        let external_form_reference = props.external_form_reference.clone();
-        let form_key = if external_form_reference.is_some() {
-            None
-        } else {
-            props
-                .form_id
-                .as_deref()
-                .and_then(|id| self.state.forms.get(id))
-                .map(|f| f.key)
+    ) -> FormLinkage {
+        if let Some(external) = &props.external_form_reference {
+            return FormLinkage::Unbound {
+                external_form_reference: Some(external.clone()),
+            };
+        }
+        let Some(form_id) = props.form_id.as_deref() else {
+            return FormLinkage::Unbound {
+                external_form_reference: None,
+            };
         };
-        (form_key, external_form_reference)
+        match props.form_binding_type {
+            crate::model::BindingType::Latest => match self.state.forms.get(form_id) {
+                Some(form) => FormLinkage::Resolved { form_key: form.key },
+                None => FormLinkage::Unbound {
+                    external_form_reference: None,
+                },
+            },
+            crate::model::BindingType::Deployment => {
+                let deployment_key = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|instance| self.state.definition_for(instance))
+                    .map(|definition| definition.deployment_key)
+                    .unwrap_or(0);
+                let resolved = self
+                    .state
+                    .form_versions
+                    .values()
+                    .filter(|form| form.form_id == form_id)
+                    .filter(|form| deployment_key != 0 && form.deployment_key == deployment_key)
+                    .max_by_key(|form| form.version);
+                match resolved {
+                    Some(form) => FormLinkage::Resolved { form_key: form.key },
+                    None => FormLinkage::Miss {
+                        reason: format!(
+                            "Expected to find a form with id '{form_id}' in the same deployment \
+                             as the process, but no such form was found. Deploy the form together \
+                             with the process (or migrate the process instance to a process \
+                             definition deployed together with the intended form) and resolve \
+                             the incident."
+                        ),
+                    },
+                }
+            }
+            crate::model::BindingType::VersionTag => {
+                let tag = props.form_version_tag.as_deref().unwrap_or_default();
+                let resolved = self
+                    .state
+                    .form_versions
+                    .values()
+                    .filter(|form| form.form_id == form_id)
+                    .filter(|form| !tag.is_empty() && form.version_tag.as_deref() == Some(tag))
+                    .max_by_key(|form| form.version);
+                match resolved {
+                    Some(form) => FormLinkage::Resolved { form_key: form.key },
+                    None => FormLinkage::Miss {
+                        reason: format!(
+                            "Expected to find a form with id '{form_id}' and version tag '{tag}', \
+                             but no such form was found. Deploy a form version carrying that tag \
+                             and resolve the incident."
+                        ),
+                    },
+                }
+            }
+        }
     }
 
     /// Resolves a timer's due time (and, for a cycle, its re-arm interval) at
