@@ -72,6 +72,13 @@ const costEntry = {
   note: "per-element cost annotation",
   match: { xmlLocalName: "cost", xmlNamespace: NANO_NS },
 };
+const costEntry2 = {
+  id: "bpmn:nano:cost2",
+  kind: "bpmn-attribute",
+  issue: 1240,
+  note: "unicode-local-name annotation",
+  match: { xmlLocalName: "cöst", xmlNamespace: NANO_NS },
+};
 const nanoModel = `<bpmn:definitions xmlns:nano="${NANO_NS}"><bpmn:process><bpmn:serviceTask id="t"><bpmn:extensionElements><nano:cost value="1"/></bpmn:extensionElements></bpmn:serviceTask></bpmn:process></bpmn:definitions>`;
 const plainModel = `<bpmn:definitions><bpmn:process><bpmn:serviceTask id="t"/></bpmn:process></bpmn:definitions>`;
 
@@ -196,6 +203,18 @@ test("Red/Green: modelUsesExtension decodes XML references in namespace declarat
   assert.ok(modelUsesExtension(`<d xmlns:nano="${amp}"><nano:cost/></d>`, costEntry));
   // A reference decoding to a DIFFERENT namespace is still not the extension.
   assert.ok(!modelUsesExtension(`<d xmlns:nano="${ns}&amp;x"><nano:cost/></d>`, costEntry));
+});
+
+test("Red/Green: modelUsesExtension sees Unicode-named elements (XML NameStartChar)", () => {
+  // XML names may start with any Unicode letter (NameStartChar), not just
+  // ASCII: `<π:cost xmlns:π="…nano…"/>` is a well-formed use of the registered
+  // extension, and a scanner whose tag matcher is ASCII-only silently skips it
+  // — a fail-open hole (Copilot review 5966450741).
+  assert.ok(modelUsesExtension(`<d xmlns:π="${NANO_NS}"><π:cost/></d>`, costEntry));
+  // A Unicode local name under an ASCII prefix bound to the namespace.
+  assert.ok(modelUsesExtension(`<d xmlns:nano="${NANO_NS}"><nano:cöst/></d>`, costEntry2));
+  // A Unicode-named element under a DIFFERENT namespace is still not the extension.
+  assert.ok(!modelUsesExtension(`<d xmlns:π="http://other.example/"><π:cost/></d>`, costEntry));
 });
 
 test("Red/Green: modelUsesExtension resolves default namespaces, shadowing and spaced `=`", () => {

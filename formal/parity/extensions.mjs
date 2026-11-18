@@ -134,10 +134,18 @@ export function decodeXmlAttr(raw) {
  * `{ local, ns }` for every start/empty element, resolving its prefix (or the
  * default namespace) against the in-scope declarations. Comments, CDATA,
  * processing instructions and DOCTYPE are skipped.
+ *
+ * The tag-name matcher accepts ANY run of non-whitespace, non-`/`/`>`
+ * characters rather than an ASCII-only `[A-Za-z_][\w.:-]*`: XML NameStartChar
+ * includes most Unicode letters, so `<π:cost xmlns:π="…"/>` is a well-formed
+ * element an ASCII-only matcher would silently skip — a fail-open hole for a
+ * guard whose job is to notice every use of a registered namespace. Quoted
+ * attribute values cannot contain `>`, so the permissive class never overruns
+ * the tag.
  */
 export function* scanElements(xml) {
   const tokenRe =
-    /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/\s*([^\s>]+)\s*>|<([A-Za-z_][\w.:-]*)((?:\s+[^\s=/>]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
+    /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/\s*([^\s>]+)\s*>|<([^\s/>]+)((?:\s+[^\s=/>]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
   const attrRe = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
   const stack = [new Map([["xml", "http://www.w3.org/XML/1998/namespace"]])];
   let m;
