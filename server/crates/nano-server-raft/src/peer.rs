@@ -1404,6 +1404,17 @@ impl PeerSet {
             .retain(|_, link| link.supports(feature));
     }
 
+    /// Whether `link`'s peer advertised every currently required feature.
+    /// Checked on EVERY cache admission and publication, so a link can never
+    /// be handed out against a stale requirement list (#1661).
+    fn meets_requirements(&self, link: &PeerLink) -> bool {
+        self.required_features
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|f| link.supports(f))
+    }
+
     /// Whether [`require_feature`](Self::require_feature) recorded `feature`.
     pub fn requires_feature(&self, feature: &str) -> bool {
         self.required_features
@@ -1514,14 +1525,14 @@ impl PeerSet {
             .lock()
             .await
             .get(&node_id)
-            .filter(|l| l.is_raft_connected())
+            .filter(|l| l.is_raft_connected() && self.meets_requirements(l))
         {
             return Ok(link.clone());
         }
         {
             let mut retired = self.retired_raft.lock().await;
             if let Some(link) = retired.get(&node_id) {
-                if link.is_raft_connected() {
+                if link.is_raft_connected() && self.meets_requirements(link) {
                     return Ok(link.clone());
                 }
                 retired.remove(&node_id);
@@ -1584,7 +1595,22 @@ impl PeerSet {
         match dial {
             Ok(link) => {
                 self.breaker_clear(node_id).await;
-                self.links.lock().await.insert(node_id, link.clone());
+                // Publish under the `links` lock and re-validate against the
+                // CURRENT requirements there (#1661): `require_feature` records
+                // the requirement before pruning under this same lock, so a
+                // requirement added while this dial awaited its handshakes is
+                // either seen here (refused) or prunes the link right after.
+                {
+                    let mut links = self.links.lock().await;
+                    if !self.meets_requirements(&link) {
+                        drop(links);
+                        link.retire_app_lane().await;
+                        return Err(PeerError::Connect(format!(
+                            "node {node_id} does not advertise a required cluster feature"
+                        )));
+                    }
+                    links.insert(node_id, link.clone());
+                }
                 // A fresh link carries its own Raft lane; release the retired one.
                 self.retired_raft.lock().await.remove(&node_id);
                 Ok(link)
@@ -1601,6 +1627,10 @@ impl PeerSet {
     async fn cached_live_link(&self, node_id: u32) -> Option<PeerLink> {
         let mut links = self.links.lock().await;
         if let Some(existing) = links.get(&node_id) {
+            if !self.meets_requirements(existing) {
+                links.remove(&node_id);
+                return None;
+            }
             if existing.is_connected() {
                 return Some(existing.clone());
             }
@@ -2087,6 +2117,62 @@ mod tests {
             peers.link(0).await.is_err(),
             "single node has no peer to dial"
         );
+    }
+
+    /// A connected link whose peer advertised `features` (no real socket).
+    fn fake_link(features: &[&str]) -> PeerLink {
+        let (out_app, _) = mpsc::channel::<Message>(1);
+        let (out_raft, _) = mpsc::channel::<Message>(1);
+        PeerLink {
+            out_app,
+            pending_app: Arc::new(Mutex::new(HashMap::new())),
+            out_raft,
+            pending_raft: Arc::new(Mutex::new(HashMap::new())),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            app_connected: Arc::new(AtomicBool::new(true)),
+            raft_connected: Arc::new(AtomicBool::new(true)),
+            app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            remote_features: Arc::new(features.iter().map(|f| f.to_string()).collect()),
+        }
+    }
+
+    /// #1661: a legacy link published into the caches by a dial that raced a
+    /// requirement update (so the prune in `require_feature` missed it) must
+    /// never be handed out — every cache admission (app `link`, Raft
+    /// `raft_link`, retired-Raft fallback) revalidates against the CURRENT
+    /// requirements, so the stale-requirement publication window is closed.
+    #[tokio::test]
+    async fn cached_legacy_link_is_never_admitted_after_requirement_race() {
+        const F: &str = nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION;
+        for retired in [false, true] {
+            let peers = peers_with_dead_peer();
+            if retired {
+                peers.retired_raft.lock().await.insert(1, fake_link(&[]));
+            } else {
+                peers.links.lock().await.insert(1, fake_link(&[]));
+            }
+            // The racing dial's publication landed AFTER the prune: model it
+            // by recording the requirement without pruning.
+            peers
+                .required_features
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(F);
+            assert!(
+                peers.raft_link(1).await.is_err(),
+                "raft_link must not admit a legacy link (retired={retired})"
+            );
+            assert!(
+                peers.link(1).await.is_err(),
+                "link must not admit a legacy link (retired={retired})"
+            );
+        }
+        // A supporting cached link is still admitted.
+        let peers = peers_with_dead_peer();
+        peers.links.lock().await.insert(1, fake_link(&[F]));
+        peers.require_feature(F).await;
+        assert!(peers.raft_link(1).await.is_ok());
+        assert!(peers.link(1).await.is_ok());
     }
 
     /// Two-node topology whose peer node 1 points at a dead port, for exercising

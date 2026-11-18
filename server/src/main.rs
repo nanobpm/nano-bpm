@@ -26890,6 +26890,15 @@ enum PreparedActivation {
 /// flag by applying the journaled `Command::SetLenientCompletion` (#1661). A
 /// no-op once the replicated flag is set, so it journals at most one event.
 /// ONE-WAY: a policy that does not need lenience never clears it.
+/// Whether the non-Raft tick may journal the irreversible replicated lenient
+/// flag directly (#1661). Only a genuinely single-node deployment: an empty
+/// Raft registry is also what a multi-node node looks like mid-bootstrap, and
+/// a multi-node non-Raft deployment has no peer-compatibility gate on that
+/// path — both keep the per-node legacy host flag instead.
+fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolicy) -> bool {
+    topology.is_single_node() && policy.may_be_leader_local()
+}
+
 fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
     if !lenient || journal.engine().replicated_lenient_completion() {
         return;
@@ -31260,7 +31269,15 @@ async fn main() {
                     )
                     .await
                 } else {
-                    let lenient = tick_server.activation_policy.may_be_leader_local();
+                    // Only a genuinely single-node deployment may journal the
+                    // irreversible flag locally (#1661): an empty Raft registry
+                    // is also what a multi-node node looks like mid-bootstrap,
+                    // and a multi-node non-Raft deployment has no compatibility
+                    // gate here — both keep the legacy host flag instead.
+                    let lenient = local_lenient_reconcile(
+                        tick_server.engine.topology(),
+                        tick_server.activation_policy,
+                    );
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             // Without Raft this journal is the partition's only
@@ -44165,6 +44182,32 @@ mod clustered_startup_tests {
     /// #1661: `prepare_activation` grants a leader-local (soft, unjournaled)
     /// lock only once the partition's REPLICATED state is lenient; before that
     /// the activation is forced through the log even under a leader-local policy.
+    /// #1661: the non-Raft tick may journal the irreversible replicated flag
+    /// only on a genuinely single-node deployment — never on a multi-node node
+    /// (mid-bootstrap with an empty Raft registry, or explicit non-Raft), where
+    /// it would diverge replicas / bypass the peer-compatibility gate.
+    #[test]
+    fn local_lenient_reconcile_only_on_single_node() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://a".into(), "http://b".into()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        for policy in [
+            ActivationPolicy::LeaderLocal,
+            ActivationPolicy::Digest,
+            ActivationPolicy::Auto,
+            ActivationPolicy::Always,
+        ] {
+            assert!(!local_lenient_reconcile(&multi, policy), "{policy:?}");
+            assert_eq!(
+                local_lenient_reconcile(&cluster::Topology::single(1), policy),
+                policy.may_be_leader_local()
+            );
+        }
+    }
+
     #[test]
     fn soft_activation_requires_replicated_lenient_completion() {
         let mut journal = Journal::in_memory();

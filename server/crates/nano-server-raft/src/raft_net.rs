@@ -422,6 +422,16 @@ impl RaftTransport for PeerTransport {
             // Serialize the request straight to a JSON string (no intermediate
             // `serde_json::Value` DOM), then compress it for the wire when the
             // payload is large (big variable blobs); small control RPCs stay raw.
+            // Derive the outbound feature requirement from the bytes we are
+            // about to ship (#1661), not from a polled view of applied state:
+            // an AppendEntries carrying an entry only a feature-aware binary can
+            // decode makes that feature required BEFORE the link is chosen. This
+            // covers recovery (retained, not-yet-applied entries replicated
+            // before any tick), snapshot-restored state and every other path,
+            // so a legacy peer can never be sent an undecodable entry.
+            for feature in required_features_for(&req) {
+                self.peers.require_feature(feature).await;
+            }
             let json = serde_json::to_string(&req).map_err(|e| TransportError(e.to_string()))?;
             let (rpc, compressed) = encode_rpc_payload(json);
             let link = self
@@ -447,9 +457,73 @@ impl RaftTransport for PeerTransport {
     }
 }
 
+/// The replicated-command features a peer must advertise to decode `req`
+/// (#1661). Single canonical mapping from log content to wire requirement.
+pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
+    use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION;
+    let RaftRpcRequest::AppendEntries(r) = req else {
+        return Vec::new();
+    };
+    let lenient = r.entries.iter().any(|entry| match &entry.payload {
+        openraft::EntryPayload::Normal(batch) => batch.items.iter().any(|item| {
+            matches!(
+                item.command,
+                nanobpmn_engine_core::Command::SetLenientCompletion { .. }
+            )
+        }),
+        _ => false,
+    });
+    if lenient {
+        vec![FEATURE_REPLICATED_LENIENT_COMPLETION]
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    /// #1661: the outbound requirement is derived from the entries actually
+    /// shipped, so recovery / snapshot paths that replicate a retained
+    /// `SetLenientCompletion` before any tick still refuse legacy peers.
+    #[test]
+    fn append_entries_carrying_lenient_command_requires_the_feature() {
+        use nanobpmn_engine_core::Command;
+        use openraft::{Entry, EntryPayload, LogId, Vote};
+        let entry = |command: Command| Entry::<RaftConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+            payload: EntryPayload::Normal(crate::raft::ReplicatedBatch::new(vec![
+                crate::raft::ReplicatedCommand {
+                    command,
+                    now: 0,
+                    operation_reference: None,
+                },
+            ])),
+        };
+        let req = |entries| {
+            RaftRpcRequest::AppendEntries(AppendEntriesRequest {
+                vote: Vote::new_committed(1, 0),
+                prev_log_id: None,
+                entries,
+                leader_commit: None,
+            })
+        };
+        assert_eq!(
+            required_features_for(&req(vec![entry(Command::SetLenientCompletion {
+                lenient: true
+            })])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION]
+        );
+        assert!(required_features_for(&req(vec![])).is_empty());
+        assert!(
+            required_features_for(&req(vec![Entry::<RaftConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+                payload: EntryPayload::Blank,
+            }]))
+            .is_empty()
+        );
+    }
 
     #[test]
     fn small_payloads_ride_raw_and_round_trip() {
