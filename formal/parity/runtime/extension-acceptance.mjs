@@ -22,7 +22,7 @@
 
 import { fileURLToPath } from "node:url";
 import { loadExtensions } from "../extensions.mjs";
-import { CamundaBackend } from "./camunda-backend.mjs";
+import { CamundaBackend, CamundaHttpError } from "./camunda-backend.mjs";
 
 const NANO_NS = "http://nano.camunda.io/schema/semantic/1.0";
 
@@ -59,6 +59,20 @@ export function probeModel(entry) {
 </bpmn:definitions>`;
 }
 
+/**
+ * Classify a failed probe deployment. Only a model-validation rejection
+ * (HTTP 400) whose body names the probed extension counts as the expected,
+ * extension-confirming outcome. Anything else — auth (401/403), 5xx, timeouts,
+ * transport failures, or a 400 about something unrelated — is an OPERATIONAL
+ * failure that proves nothing about the extension, so it is returned as
+ * `"error"` and the caller fails the run (fail closed).
+ */
+export function classifyDeployFailure(entry, err) {
+  if (!(err instanceof CamundaHttpError) || err.status !== 400) return "error";
+  const text = typeof err.body === "string" ? err.body : JSON.stringify(err.body ?? "");
+  return text.includes(entry.match.xmlLocalName) ? "rejected" : "error";
+}
+
 function parseArgs(argv) {
   const a = { requireCamunda: false };
   for (const x of argv) {
@@ -70,7 +84,7 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const extensions = loadExtensions().filter((e) => e?.match?.xmlLocalName);
+  const extensions = loadExtensions().filter((e) => e?.match?.xmlLocalName?.trim());
   if (extensions.length === 0) {
     console.log("ok    no deployable extensions to probe");
     return;
@@ -108,8 +122,14 @@ async function main() {
       try {
         await camunda.deploy(probeModel(entry));
         accepted = true;
-      } catch {
-        accepted = false; // a deploy rejection is the expected, extension-confirming outcome
+      } catch (err) {
+        if (classifyDeployFailure(entry, err) !== "rejected") {
+          // Not an extension-specific rejection: the probe tested nothing.
+          failures++;
+          console.error(`FAIL ${entry.id}: probe deployment failed operationally — ${err?.message ?? err}`);
+          continue;
+        }
+        accepted = false; // an extension-specific validation rejection confirms the entry
       }
       if (accepted) {
         // Deployment succeeded. That alone is not proof Camunda HONOURS the

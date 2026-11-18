@@ -19,6 +19,8 @@ import {
   globToRegExp,
   EXTENSIONS_PATH,
 } from "./extensions.mjs";
+import { classifyDeployFailure } from "./runtime/extension-acceptance.mjs";
+import { CamundaHttpError } from "./runtime/camunda-backend.mjs";
 
 // A scratch directory holding a synthetic register + surface + coverage + corpus,
 // so each rule can be tripped in isolation without touching the committed files.
@@ -160,4 +162,44 @@ test("Red/Green: an extension also named in the divergence allowlist fails (reco
     problems.some((p) => p.includes("also named in the divergence allowlist")),
     `register/allowlist overlap must fail: ${problems}`,
   );
+});
+
+test("Red/Green: modelUsesExtension resolves default namespaces, shadowing and spaced `=`", () => {
+  // Default-namespace form of the registered extension IS the extension.
+  const dflt = `<bpmn:definitions xmlns:bpmn="b"><bpmn:extensionElements><cost xmlns="${NANO_NS}" value="1"/></bpmn:extensionElements></bpmn:definitions>`;
+  assert.ok(modelUsesExtension(dflt, costEntry));
+  // Whitespace around `=` in the prefix declaration.
+  const spaced = `<bpmn:definitions xmlns:nano = "${NANO_NS}"><nano:cost value="1"/></bpmn:definitions>`;
+  assert.ok(modelUsesExtension(spaced, costEntry));
+  // A nested redeclaration shadows the outer binding: not the extension.
+  const shadowed = `<d xmlns:nano="${NANO_NS}"><x xmlns:nano="http://other.example/"><nano:cost/></x></d>`;
+  assert.ok(!modelUsesExtension(shadowed, costEntry));
+  // A binding declared in a sibling subtree is out of scope.
+  const sibling = `<d><a xmlns:nano="${NANO_NS}"/><nano:cost/></d>`;
+  assert.ok(!modelUsesExtension(sibling, costEntry));
+  // Unprefixed tag with no default namespace is not the extension.
+  assert.ok(!modelUsesExtension(`<d><cost/></d>`, costEntry));
+  // Commented-out usage does not count.
+  assert.ok(!modelUsesExtension(`<d xmlns:nano="${NANO_NS}"><!-- <nano:cost/> --></d>`, costEntry));
+});
+
+test("Red/Green: an empty or whitespace-only xmlLocalName is rejected", () => {
+  for (const local of ["", "   "]) {
+    const f = fixture({
+      extensions: [{ ...costEntry, match: { xmlLocalName: local, xmlNamespace: NANO_NS } }],
+    });
+    const problems = checkExtensions(f);
+    assert.ok(problems.some((p) => p.includes("xmlLocalName must be a non-empty string")), `${JSON.stringify(local)}: ${problems}`);
+  }
+});
+
+test("Red/Green: only an extension-specific 400 counts as a Camunda rejection", () => {
+  const err = (status, body) => new CamundaHttpError("x", { status, body });
+  assert.equal(classifyDeployFailure(costEntry, err(400, { detail: "unknown element 'cost'" })), "rejected");
+  assert.equal(classifyDeployFailure(costEntry, err(400, { detail: "missing job type" })), "error");
+  for (const s of [401, 403, 500, 503]) {
+    assert.equal(classifyDeployFailure(costEntry, err(s, { detail: "cost" })), "error", `HTTP ${s}`);
+  }
+  assert.equal(classifyDeployFailure(costEntry, new Error("fetch failed")), "error");
+  assert.equal(classifyDeployFailure(costEntry, Object.assign(new Error("timeout"), { name: "TimeoutError" })), "error");
 });

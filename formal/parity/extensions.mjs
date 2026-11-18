@@ -86,32 +86,57 @@ export function coverageClaims(coverageFile, surfaceIds) {
 
 /**
  * Whether one BPMN model's XML uses a registered extension. An extension's
- * `match.xmlLocalName` (+ optional `xmlNamespace`) matches a `<ns:localName>`
- * or `<localName>` tag in the model's `<bpmn:extensionElements>`. The match is
- * namespace-aware when the entry pins one: a `nano:` tag matches only the nano
- * semantic-annotation namespace, so a same-named tag in another namespace is
- * not the extension.
+ * `match.xmlLocalName` (+ optional `xmlNamespace`) matches an element with that
+ * local name. When the entry pins a namespace the match resolves each element's
+ * IN-SCOPE namespace — prefixed or default (`xmlns="…"`), honouring shadowing by
+ * nested declarations and whitespace around `=` — so `<cost xmlns="nano-ns"/>`
+ * is the extension while a same-named tag in another namespace is not.
  */
 export function modelUsesExtension(xml, entry) {
   const local = entry?.match?.xmlLocalName;
-  if (!local) return false;
-  // Match `<prefix:localName` or `<localName` as an opening/empty tag. When the
-  // entry pins a namespace, require the tag's prefix to be bound to it.
-  const tagRe = new RegExp(`<(?:([A-Za-z_][\\w.-]*):)?${local}[\\s>/]`, "g");
-  let m;
-  while ((m = tagRe.exec(xml)) !== null) {
-    const prefix = m[1];
-    if (!entry.match.xmlNamespace) return true;
-    if (!prefix) continue; // an unprefixed tag is not the namespaced extension
-    // The prefix must be bound to the pinned namespace somewhere in the doc.
-    const nsRe = new RegExp(`xmlns:${prefix}=["']${escapeRe(entry.match.xmlNamespace)}["']`);
-    if (nsRe.test(xml)) return true;
+  if (typeof local !== "string" || local.trim().length === 0) return false;
+  const pinned = entry.match.xmlNamespace;
+  for (const el of scanElements(String(xml))) {
+    if (el.local !== local) continue;
+    if (!pinned) return true;
+    if (el.ns === pinned) return true;
   }
   return false;
 }
 
-function escapeRe(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * A minimal namespace-resolving XML element scanner (no dependency). Yields
+ * `{ local, ns }` for every start/empty element, resolving its prefix (or the
+ * default namespace) against the in-scope declarations. Comments, CDATA,
+ * processing instructions and DOCTYPE are skipped.
+ */
+export function* scanElements(xml) {
+  const tokenRe =
+    /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/\s*([^\s>]+)\s*>|<([A-Za-z_][\w.:-]*)((?:\s+[^\s=/>]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
+  const attrRe = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  const stack = [new Map([["xml", "http://www.w3.org/XML/1998/namespace"]])];
+  let m;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    if (m[1] !== undefined) {
+      if (stack.length > 1) stack.pop();
+      continue;
+    }
+    if (m[2] === undefined) continue; // comment / CDATA / PI / doctype
+    const scope = new Map(stack[stack.length - 1]);
+    let a;
+    attrRe.lastIndex = 0;
+    while ((a = attrRe.exec(m[3] ?? "")) !== null) {
+      const value = a[2] ?? a[3] ?? "";
+      if (a[1] === "xmlns") scope.set("", value);
+      else if (a[1].startsWith("xmlns:")) scope.set(a[1].slice(6), value);
+    }
+    const name = m[2];
+    const colon = name.indexOf(":");
+    const prefix = colon >= 0 ? name.slice(0, colon) : "";
+    const local = colon >= 0 ? name.slice(colon + 1) : name;
+    yield { local, ns: scope.get(prefix) ?? null };
+    if (m[4] !== "/") stack.push(scope);
+  }
 }
 
 /**
@@ -172,7 +197,7 @@ export function checkExtensions({
     if (!Number.isInteger(e.issue) || e.issue <= 0) problems.push(`${where}: needs a filed issue number`);
     if (typeof e.note !== "string" || e.note.trim().length === 0) problems.push(`${where}: needs a note`);
     if (e.inert !== undefined && typeof e.inert !== "boolean") problems.push(`${where}: inert must be a boolean when present`);
-    if (e.match === null || typeof e.match !== "object" || typeof e.match.xmlLocalName !== "string") {
+    if (e.match === null || typeof e.match !== "object" || typeof e.match.xmlLocalName !== "string" || e.match.xmlLocalName.trim().length === 0) {
       problems.push(`${where}: match.xmlLocalName must be a non-empty string`);
     }
   }

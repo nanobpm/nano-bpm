@@ -106,6 +106,14 @@ export function observationMilestones(obs) {
  * pinned by the `expect` block and the differential oracle, not the token-flow
  * spec. A non-empty `mismatches` means the backend's trace is NOT a behaviour
  * of `ZeebeTokenFlow` — a parity defect, no tolerance, no retry.
+ *
+ * SCOPE: this is a necessary-condition (count-projection) check, not a full
+ * ordered refinement check. The two-backend observation vocabulary is a
+ * multiset and carries no ordering, so a trace that reorders milestones while
+ * preserving totals is NOT caught here. ORDERED validation of the record stream
+ * against `ZeebeTokenFlow`'s transition relation is the job of the Rust
+ * trace-validation harness (`engine-core/tests/trace_validation/zeebe_token_flow.rs`),
+ * which replays each step against the spec's guards.
  */
 export function checkSpecOracle(graph, run, observation) {
   const expected = referenceMilestones(graph, run);
