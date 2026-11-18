@@ -4123,6 +4123,17 @@ impl ServerImpl {
         Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
     }
 
+    /// [`Self::raft_transport`] for a Raft group about to START replicating
+    /// (#1661): first installs the outbound feature requirement derived from
+    /// this node's recovered / snapshot-restored state, so a restarted leader
+    /// whose enabling `SetLenientCompletion` entry was compacted into a snapshot
+    /// can never stream that snapshot to a legacy peer before the periodic
+    /// requirement sync. Every production Raft start path goes through here.
+    async fn raft_transport_for_start(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
+        let _required = self.required_cluster_features().await;
+        self.raft_transport()
+    }
+
     /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
     /// replica of `partition`, and return its serialized response. `Err((status,
     /// message))` maps to the falcon `CommandResult` status (400 malformed,
@@ -4145,9 +4156,22 @@ impl ServerImpl {
                 format!("no raft group for partition {partition} on this node"),
             )
         })?;
+        // #1661: lenient state can reach this node over the wire, and a later
+        // leadership change could ship it onward (AppendEntries or, once the
+        // enabling entry is compacted, InstallSnapshot) before the periodic
+        // requirement sync. Record the requirement on receipt: inbound entries
+        // by their payload, an inbound snapshot by the state it restored.
+        let inbound_requirements = crate::raft_net::required_features_for(&req);
+        let is_snapshot = matches!(req, crate::raft_net::RaftRpcRequest::InstallSnapshot(_));
+        for feature in inbound_requirements {
+            self.peers.require_feature(feature).await;
+        }
         let resp = crate::raft_net::dispatch(&part.raft, req)
             .await
             .map_err(|e| (500u16, format!("raft dispatch failed: {e}")))?;
+        if is_snapshot {
+            let _required = self.required_cluster_features().await;
+        }
         serde_json::to_value(resp).map_err(|e| (500u16, format!("encode raft response: {e}")))
     }
 }
@@ -17336,7 +17360,7 @@ impl ServerImpl {
         tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
-            let transport = server.raft_transport();
+            let transport = server.raft_transport_for_start().await;
             // ADR 0003 replication tier: in `leader-durable` mode a non-owned
             // replica is a NON-VOTING async learner (the leader's on-disk log is
             // the sole durability point); in `quorum` mode it is a voter whose
@@ -18390,7 +18414,7 @@ impl ServerImpl {
         // own journal remains the local durability source). Initialize with this
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // No local exporter unless this node statically owns `p`; a promoted
         // replica must evict terminal shells itself (see bootstrap_member).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -19685,7 +19709,7 @@ impl ServerImpl {
             );
             return false;
         };
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -19773,7 +19797,7 @@ impl ServerImpl {
             return false;
         }
 
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
         // leak guard); an owned partition keeps shells for its read path.
@@ -32897,6 +32921,40 @@ mod clustered_startup_tests {
         assert!(
             store.try_get_cold(replica_live).unwrap().is_some(),
             "the replica partition's live row survives (the sweep ran after its engine was hosted)"
+        );
+    }
+
+    /// #1661: a restarted multi-node leader whose enabling `SetLenientCompletion`
+    /// entry was compacted into its snapshot holds the replicated flag ONLY in
+    /// recovered state. Starting Raft must install the outbound requirement from
+    /// that state before any transfer, so the snapshot can never be streamed to
+    /// a legacy peer ahead of the periodic requirement sync.
+    #[tokio::test]
+    async fn raft_start_installs_feature_requirement_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let mut journal = Journal::in_memory();
+        let _applied = journal
+            .apply_command_at(Command::SetLenientCompletion { lenient: true }, 1)
+            .expect("apply");
+        assert!(journal.engine().replicated_lenient_completion());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(
+            !server.peers.requires_feature(F),
+            "precondition: no tick has synced the requirement yet"
+        );
+        let _transport = server.raft_transport_for_start().await;
+        assert!(
+            server.peers.requires_feature(F),
+            "Raft start must derive the requirement from recovered state"
         );
     }
 
