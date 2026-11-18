@@ -186,8 +186,14 @@ impl Engine {
         }
         let mut out: Vec<crate::state::SecretProvenance> = Vec::new();
         for m in mappings {
-            let path = m.target.trim();
-            out.retain(|p| !paths_overlap(&p.path, path));
+            // The SAME segmentation `assign_io_target` writes with, so an
+            // aliased spelling (`payload..auth`) overwrites the provenance of
+            // the field it actually overwrites.
+            let path = io_target_segments(&m.target).join(".");
+            out.retain(|p| !paths_overlap(&p.path, &path));
+            if path.is_empty() {
+                continue;
+            }
             if !m.source.trim_start().starts_with('=') {
                 continue;
             }
@@ -198,7 +204,7 @@ impl Engine {
             };
             if !evaluated.referenced_secrets.is_empty() {
                 out.push(crate::state::SecretProvenance {
-                    path: path.to_string(),
+                    path,
                     secrets: evaluated.referenced_secrets,
                 });
             }
@@ -931,7 +937,7 @@ impl Engine {
         target: &str,
         value: Value,
     ) {
-        let parts: Vec<&str> = target.split('.').filter(|p| !p.is_empty()).collect();
+        let parts = io_target_segments(target);
         match parts.as_slice() {
             [] => {}
             [single] => {
@@ -994,8 +1000,16 @@ impl Engine {
 
 /// `true` when writing dotted path `b` replaces (part of) the value at `a`, or
 /// vice versa: equal paths, or one is a dotted ancestor of the other.
+/// The canonical segmentation of an io-mapping target path: the single
+/// interpretation shared by assignment and secret provenance (#1640).
+pub(crate) fn io_target_segments(target: &str) -> Vec<&str> {
+    target.split('.').filter(|p| !p.is_empty()).collect()
+}
+
 fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b
+    a.is_empty()
+        || b.is_empty()
+        || a == b
         || a.strip_prefix(b).is_some_and(|r| r.starts_with('.'))
         || b.strip_prefix(a).is_some_and(|r| r.starts_with('.'))
 }

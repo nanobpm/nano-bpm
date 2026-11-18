@@ -256,3 +256,59 @@ fn journal_and_snapshot_hold_no_plaintext() {
         vec![site("token")]
     );
 }
+
+/// Aliased spellings of the same field (`payload..auth`, `.payload.auth`)
+/// write what `payload.auth` writes, so they must overwrite its provenance.
+#[test]
+fn an_aliased_target_overwrites_provenance() {
+    for alias in ["payload..auth", ".payload.auth", "payload.auth.", "payload"] {
+        let (mut engine, _) = engine_with_cluster_vars();
+        let (prov, _) = run(
+            &mut engine,
+            task(vec![m("=apiCfg", "payload.auth"), m("=bodyRef", alias)]),
+            HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+        );
+        assert!(prov.is_empty(), "alias {alias}: {prov:?}");
+    }
+    // A trusted write through an aliased spelling is recorded canonically.
+    let (mut engine, _) = engine_with_cluster_vars();
+    let (prov, _) = run(
+        &mut engine,
+        task(vec![m("=apiCfg", "payload..auth")]),
+        HashMap::new(),
+    );
+    assert_eq!(prov, vec![site("payload.auth")]);
+}
+
+/// Any variable write to the instance after `JobCreated` may replace the
+/// trusted value (even with equal reference text), so it revokes the job's
+/// provenance — local element-scope and propagating root writes alike.
+#[test]
+fn a_post_creation_variable_write_revokes_provenance() {
+    for local in [true, false] {
+        let (mut engine, _) = engine_with_cluster_vars();
+        let (prov, _) = run(
+            &mut engine,
+            task(vec![m("=apiCfg", "payload.auth")]),
+            HashMap::new(),
+        );
+        assert_eq!(prov, vec![site("payload.auth")]);
+        let job = engine.state.jobs.values().next().unwrap().clone();
+        let scope = if local {
+            job.element_instance_key
+        } else {
+            job.instance_key
+        };
+        let mut other = std::collections::BTreeMap::new();
+        other.insert("other".to_string(), Value::Str(REF.to_string()));
+        engine
+            .apply_command(Command::set_variables_scoped(
+                scope,
+                HashMap::from([("payload".to_string(), Value::Map(other))]),
+                local,
+            ))
+            .unwrap();
+        let job = engine.state.jobs.values().next().unwrap();
+        assert!(job.secret_provenance.is_empty(), "local={local}");
+    }
+}

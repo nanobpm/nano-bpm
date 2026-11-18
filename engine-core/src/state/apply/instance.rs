@@ -25,6 +25,22 @@ fn non_terminal_process_id(state: &State, instance_key: &Key) -> Option<String> 
     }
 }
 
+/// Drops the mapping-time secret provenance (#1640) of every job of
+/// `instance_key`. Provenance attests the value a trusted input mapping wrote;
+/// any later variable write to the instance may replace that value (even with
+/// equal reference text from an untrusted source), so trust is revoked — fail
+/// closed: the reference text then passes through unresolved.
+fn revoke_secret_provenance(state: &mut State, instance_key: &Key) {
+    let Some(keys) = state.jobs_by_instance.get(instance_key) else {
+        return;
+    };
+    for key in keys {
+        if let Some(job) = state.jobs.get_mut(key) {
+            job.secret_provenance.clear();
+        }
+    }
+}
+
 /// Decrements a definition's in-flight instance count on a terminal transition,
 /// dropping the entry when it reaches zero (keeps the map bounded by the set of
 /// definitions with live instances). `None` = the transition was a no-op (already
@@ -116,6 +132,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     map.insert(k.clone(), v.clone());
                 }
             }
+            revoke_secret_provenance(state, instance_key);
         }
 
         Event::ScopedVariablesUpdated {
@@ -138,6 +155,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     }
                 }
             }
+            revoke_secret_provenance(state, instance_key);
         }
 
         Event::VariableScopeCreated {
