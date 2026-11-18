@@ -232,13 +232,17 @@ async function tlcPhase (entries, log) {
 // ---------------------------------------------------------------------------
 // Runtime backends
 
-async function runtimePhase (entries, args, log) {
-  const { runScenario } = await import('../parity/runtime/driver.mjs')
-  const { checkExpectations, diffObservations } = await import('../parity/runtime/observation.mjs')
-  const wantNano = true
+/**
+ * Open the runtime backends a run asks for: nano always, Camunda for
+ * `--backend camunda|both` (skip-tolerant unless `--require-camunda`). Returns
+ * `{ nano, camunda, CleanupError, phasesRan, close }`; shared with the
+ * differential fuzzer (fuzz.mjs, #1250) so both runners check scenarios the
+ * same way.
+ */
+export async function openBackends (args, log) {
   const wantCamunda = args.backend === 'camunda' || args.backend === 'both'
   const { NanoBackend } = await import('../parity/runtime/nano-backend.mjs')
-  const nano = wantNano ? await new NanoBackend().init() : null
+  const nano = await new NanoBackend().init()
   let camunda = null
   let CleanupError = null
   if (wantCamunda) {
@@ -252,63 +256,83 @@ async function runtimePhase (entries, args, log) {
       log('::notice::no reachable Camunda 8 (CAMUNDA_REST_ADDRESS) — SKIPPING the Camunda backend (skip-tolerant)')
     }
   }
-  // Interrupting a manual exhaustive run (SIGINT/SIGTERM) must not leave the
-  // shared Camunda cluster clock pinned at epoch zero or instances in flight:
-  // Node's default signal handling exits WITHOUT running the `finally` below,
-  // so install the same cleanup the parity runner uses (#1246 review).
-  installSignalCleanup(async () => {
-    if (nano) await nano.close()
+  const close = async () => {
+    await nano.close()
     if (camunda) await camunda.close()
-  })
+  }
+  // Interrupting a manual run (SIGINT/SIGTERM) must not leave the shared
+  // Camunda cluster clock pinned at epoch zero or instances in flight: Node's
+  // default signal handling exits WITHOUT running a `finally`, so install the
+  // same cleanup the parity runner uses (#1246 review).
+  installSignalCleanup(close)
   // The phases that ACTUALLY run — a skipped Camunda backend (unset/unreachable
   // address) means no camunda/differential case can reproduce, so the stale
   // check must not ask for one (#1246 review).
   const phasesRan = new Set(['nano', ...(camunda ? ['camunda', 'differential'] : [])])
+  return { nano, camunda, CleanupError, phasesRan, close }
+}
+
+const fieldsSig = (ms) => ms.map((m) => m.field).sort().join(',')
+
+/**
+ * Run ONE scenario of `entry` (`{ graph, artifacts }`) through the open
+ * backends and return its divergences (empty when every backend agrees with
+ * the reference outcome and with each other).
+ */
+export async function checkScenario (backends, entry, sc) {
+  const { runScenario } = await import('../parity/runtime/driver.mjs')
+  const { checkExpectations, diffObservations } = await import('../parity/runtime/observation.mjs')
+  const { nano, camunda, CleanupError } = backends
+  const divergences = []
+  const scenario = { ...sc, xml: entry.artifacts.bpmn }
+  let nanoObs = null
+  try {
+    nanoObs = await runScenario(nano, scenario)
+    const check = checkExpectations(nanoObs, scenario.expect)
+    if (!check.ok) {
+      divergences.push({ kind: 'nano', signature: `nano:${fieldsSig(check.mismatches)}:completed=${nanoObs.completed}/${scenario.expect.completed}`, detail: check.mismatches, entry, scenario: sc })
+    }
+  } catch (err) {
+    divergences.push({ kind: 'nano', signature: `nano:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
+  }
+  if (camunda && backendEligible(sc, 'camunda')) {
+    try {
+      const obs = await runScenario(camunda, scenario)
+      const check = checkExpectations(obs, { completed: scenario.expect.completed, variables: scenario.expect.variables })
+      if (!check.ok) divergences.push({ kind: 'camunda', signature: `camunda:${fieldsSig(check.mismatches)}`, detail: check.mismatches, entry, scenario: sc })
+      if (nanoObs) {
+        const diff = diffObservations(nanoObs, obs, nano.provides, camunda.provides)
+        if (!diff.ok) divergences.push({ kind: 'differential', signature: `differential:${fieldsSig(diff.mismatches)}`, detail: diff.mismatches, entry, scenario: sc })
+      }
+    } catch (err) {
+      // A backend CLEANUP failure (reset()'s cancellation/clock reset) is
+      // not a scenario divergence: isolation was not restored, so every
+      // later scenario's observation is untrustworthy. Abort the phase
+      // rather than record a misleading `camunda:error` and continue
+      // (#1246 review).
+      if (CleanupError && err instanceof CleanupError) throw err
+      divergences.push({ kind: 'camunda', signature: `camunda:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
+    }
+  }
+  return divergences
+}
+
+async function runtimePhase (entries, args, log) {
+  const backends = await openBackends(args, log)
   const divergences = []
   let ran = 0
-  const fieldsSig = (ms) => ms.map((m) => m.field).sort().join(',')
   try {
     for (const entry of entries) {
       for (const sc of entry.artifacts.scenarios) {
-        const scenario = { ...sc, xml: entry.artifacts.bpmn }
-        let nanoObs = null
-        try {
-          nanoObs = await runScenario(nano, scenario)
-          const check = checkExpectations(nanoObs, scenario.expect)
-          if (!check.ok) {
-            divergences.push({ kind: 'nano', signature: `nano:${fieldsSig(check.mismatches)}:completed=${nanoObs.completed}/${scenario.expect.completed}`, detail: check.mismatches, entry, scenario: sc })
-          }
-        } catch (err) {
-          divergences.push({ kind: 'nano', signature: `nano:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
-        }
-        if (camunda && backendEligible(sc, 'camunda')) {
-          try {
-            const obs = await runScenario(camunda, scenario)
-            const check = checkExpectations(obs, { completed: scenario.expect.completed, variables: scenario.expect.variables })
-            if (!check.ok) divergences.push({ kind: 'camunda', signature: `camunda:${fieldsSig(check.mismatches)}`, detail: check.mismatches, entry, scenario: sc })
-            if (nanoObs) {
-              const diff = diffObservations(nanoObs, obs, nano.provides, camunda.provides)
-              if (!diff.ok) divergences.push({ kind: 'differential', signature: `differential:${fieldsSig(diff.mismatches)}`, detail: diff.mismatches, entry, scenario: sc })
-            }
-          } catch (err) {
-            // A backend CLEANUP failure (reset()'s cancellation/clock reset) is
-            // not a scenario divergence: isolation was not restored, so every
-            // later scenario's observation is untrustworthy. Abort the phase
-            // rather than record a misleading `camunda:error` and continue
-            // (#1246 review).
-            if (CleanupError && err instanceof CleanupError) throw err
-            divergences.push({ kind: 'camunda', signature: `camunda:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
-          }
-        }
+        divergences.push(...await checkScenario(backends, entry, sc))
         if (++ran % 500 === 0) log(`  runtime ${ran} scenarios`)
       }
     }
   } finally {
-    if (nano) await nano.close()
-    if (camunda) await camunda.close()
+    await backends.close()
   }
-  log(`  runtime: ${ran} scenario(s) on nano${camunda ? ' + camunda' : ''}`)
-  return { divergences, phasesRan }
+  log(`  runtime: ${ran} scenario(s) on nano${backends.camunda ? ' + camunda' : ''}`)
+  return { divergences, phasesRan: backends.phasesRan }
 }
 
 // A stable class for an error message: its first line with ids and numbers

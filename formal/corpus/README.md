@@ -181,3 +181,44 @@ issues and fixed there, never inside the generator.
 The generated scenarios are deterministic command scripts (fixed ids, fixed
 order, unique correlation keys), so the same `--out` corpus can feed the
 determinism CI command corpus (#1665).
+
+## Differential fuzzing with shrinking (#1250)
+
+The bounded-exhaustive run stops at a small bound. `fuzz.mjs` reaches beyond
+it: **seeded random** well-formed graphs (the same skeleton vocabulary and
+`wellFormed` rules as `enumerate.mjs` — exclusive, parallel, inclusive and
+event-based gateways, service tasks, message catch events — but with more
+gateways and flows than the nightly bound), each driven by a **seeded random
+command order** (`randomRun`: a random walk through the reference's
+(routing choice × command) tree — job completions in any order, message
+correlations, per-activation gateway routing). Every scenario goes through the
+same oracle as the exhaustive run (`exhaustive.mjs` `checkScenario`): the
+reference outcome, nano, and live Camunda 8 when reachable.
+
+```bash
+node formal/corpus/fuzz.mjs --seed 42 --cases 200                        # nano only
+node formal/corpus/fuzz.mjs --seed 42 --backend both --require-camunda   # + live Camunda 8
+node formal/corpus/fuzz.mjs --seed 42 --max-gateways 7 --kinds and,or     # shape the generator
+node formal/corpus/fuzz.mjs --replay-only                                # the committed corpus only
+```
+
+- **Deterministic from its seed.** Case *i* draws from its own PRNG seeded by
+  `caseSeed(seed, i)`; the same seed produces byte-identical graphs, BPMN (with
+  DI) and scenarios. No retries anywhere.
+- **Shrinking.** A divergence is greedily reduced (`reductions`: drop a gateway,
+  drop a flow, turn a task flow into a direct one — always staying well-formed)
+  while some command order of the smaller graph (`shrinkRuns`: the first DFS
+  orders plus fixed random walks) still shows the **same signature**; the result
+  is 1-minimal, and its fewest-step reproducing scenario is kept.
+- **Permanent corpus.** `--record` appends each minimal reproducer to
+  `fuzz-corpus.json` (`--file-issues` also files a parity issue per case with
+  `gh` and stamps it in). Every run — and the PR gate's `parity-runtime` job via
+  `--replay-only` — replays the corpus first: a case with `"fixed": false` must
+  still reproduce its signature (otherwise it fails as stale: flip it to
+  `"fixed": true`), a case with `"fixed": true` must show no divergence at all,
+  so a fixed reproducer is a regression guard forever. A case without a filed
+  `issue` fails.
+- **Nightly, never required.** `.github/workflows/parity-fuzz-nightly.yml` runs
+  it against nano and a throwaway Camunda 8 container (seed = run number, or a
+  dispatched seed); on a new divergence it files the issue and opens a PR
+  committing the reproducer.

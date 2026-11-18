@@ -1,0 +1,108 @@
+# Nightly differential fuzzing with shrinking (#1250).
+#
+# Reaches beyond the bounded-exhaustive limit (parity-exhaustive-nightly.yml):
+# seeded random well-formed process graphs larger than the bound, driven by a
+# seeded random command order, run against the nano backend and a dedicated
+# throwaway live Camunda 8 container, checked by the same differential oracle
+# (formal/corpus/fuzz.mjs). The run is deterministic from its seed: a scheduled
+# run uses the run number as the seed, a manual dispatch may pin one.
+#
+# Every divergence is shrunk to a minimal reproducer. On failure the job files a
+# parity issue per new divergence, records the reproducer in the PERMANENT
+# corpus (formal/corpus/fuzz-corpus.json) and opens a PR committing it.
+# Not a PR gate — never a required check. No retries: a red run is a defect.
+
+name: Parity (differential fuzz, nightly)
+
+on:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Seed (empty = the run number)'
+        default: ''
+      cases:
+        description: 'Random cases to run'
+        default: '400'
+      max_gateways:
+        description: 'Max gateways per random graph (<= 7)'
+        default: '6'
+  # Validate changes to this harness before they reach the nightly run (small
+  # budget, no recording). Non-required (not in branch protection / .mergify.yml).
+  pull_request:
+    paths:
+      - '.github/workflows/parity-fuzz-nightly.yml'
+      - 'formal/corpus/fuzz.mjs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-fuzz-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: parity (differential fuzz, nano + live Camunda 8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Build engine-wasm/pkg (the nano backend's read-model wasm)
+        uses: ./.github/actions/engine-wasm-pkg
+      - name: Start Camunda 8 (version derived from the Zeebe pin)
+        run: formal/parity/runtime/start-camunda.sh "" 8080
+      - name: Differential fuzz
+        id: fuzz
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:8080
+          GH_TOKEN: ${{ github.token }}
+          SEED: ${{ github.event.inputs.seed || github.run_number }}
+          CASES: ${{ github.event.inputs.cases || '400' }}
+          MAX_GATEWAYS: ${{ github.event.inputs.max_gateways || '6' }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+          args=(--seed "$SEED" --backend both --require-camunda)
+          if [[ "$IS_PR" == true ]]; then
+            args+=(--cases 25)
+          else
+            args+=(--cases "$CASES" --max-gateways "$MAX_GATEWAYS" --record --file-issues)
+          fi
+          node formal/corpus/fuzz.mjs "${args[@]}"
+      - name: Commit the minimal reproducers (PR)
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: ${{ steps.fuzz.outputs.seed }}
+        run: |
+          if git diff --quiet -- formal/corpus/fuzz-corpus.json; then
+            echo "no new reproducer recorded (a replay failure needs a human)"; exit 0
+          fi
+          branch="fuzz/seed-$SEED-${{ github.run_id }}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add formal/corpus/fuzz-corpus.json
+          git commit -s -m "parity(fuzz): minimal reproducers from seed $SEED"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "parity(fuzz): minimal reproducers from seed $SEED" \
+            --body "Recorded by the nightly differential fuzz (run ${{ github.run_id }}, seed $SEED). Each case links its filed parity issue. Part of #1240."
+      - name: Upload the fuzz corpus
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: formal/corpus/fuzz-corpus.json
+      - name: Camunda logs
+        if: failure()
+        run: docker logs parity-camunda 2>&1 | tail -300
