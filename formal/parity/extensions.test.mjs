@@ -347,3 +347,22 @@ test("a trace corpus with NO extension passes rule 4b", () => {
   const f = fixture({ extensions: [costEntry], traceScenarios: { "plain-trace": plainModel } });
   assert.deepEqual(checkExtensions(f), []);
 });
+
+// Defect class: probe XML violating the BPMN 2.0 XSD child order. Camunda
+// schema-validates, so a mis-ordered probe is rejected for the WRONG reason
+// (ordering, not the extension) and the acceptance check fails operationally.
+// tBaseElement's `extensionElements` must precede tFlowNode's incoming/outgoing.
+test("Red/Green: probeModel emits extensionElements before incoming/outgoing (XSD order)", () => {
+  for (const entry of loadExtensions()) {
+    if (!entry.match?.xmlLocalName) continue;
+    const xml = probeModel(entry);
+    for (const [, body] of xml.matchAll(/<bpmn:(?:serviceTask|sequenceFlow)\b[^>]*?>([\s\S]*?)<\/bpmn:(?:serviceTask|sequenceFlow)>/g)) {
+      const ext = body.indexOf("<bpmn:extensionElements>");
+      if (ext < 0) continue;
+      for (const tag of ["<bpmn:incoming>", "<bpmn:outgoing>"]) {
+        const i = body.indexOf(tag);
+        assert.ok(i < 0 || ext < i, `${entry.match.xmlLocalName}: ${tag} precedes extensionElements`);
+      }
+    }
+  }
+});
