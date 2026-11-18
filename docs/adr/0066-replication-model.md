@@ -18,8 +18,10 @@ The Raft log carries **commands**, and every replica re-runs the engine on them:
 
 - `server/crates/nano-server-raft/src/raft.rs:106` — `pub struct ReplicatedCommand { command: Command,
   now: u64, operation_reference: Option<i64> }`. `ReplicatedBatch { items: Vec<ReplicatedCommand> }`
-  (`raft.rs:286`) is the entry payload. The leader's clock reading (`now`) is the only
-  non-command input carried in the entry.
+  (`raft.rs:286`) is the entry payload. The leader's clock reading (`now`) and the terminal
+  attribution the leader stamps at proposal time (`stamp_for_proposal`, `raft.rs:2836` — worker
+  and lock deadline resolved from leader state) are the only non-command inputs carried in the
+  entry.
 - `raft.rs:1906` — `RaftStateMachine::apply` for `PartitionStateMachine` runs on **every** replica.
   For each committed batch it calls `journal.apply_command_ref_at(command, now, operation_reference)`
   (`raft.rs:1997`): FEEL evaluation, key allocation, gateway branching and variable merging all
@@ -71,38 +73,49 @@ latent split-brain found in production.
   controllable stream clock for testing/clock control, not replica agreement, and
   `random number()` is simply random.
 
-### Measured: log size and bandwidth
+### Measured: payload size (uncompressed, pre-batching)
 
 `engine-core/examples/replication_size.rs` (added with this ADR) runs representative lifecycles
 through the engine and serializes, with the same `serde_json` encoding the Raft log store uses
-(`raft_logstore.rs:457`), the commands each step replicates today versus the events those commands
-produced. Activation is excluded (leader-local per ADR 0002 in both models).
+(`raft_logstore.rs:457`), the command frame each step replicates today versus the events those
+commands produced. The command side counts the full `ReplicatedCommand` frame (`{command, now,
+operation_reference}`, `raft.rs:106`) including the terminal attribution the leader stamps at
+proposal time (`stamp_for_proposal`, `raft.rs:2836`) — the worker/deadline every replica carries.
+Activation is excluded (leader-local per ADR 0002 in both models; see the options table).
 `cargo run --release --features serde --example replication_size`:
 
 | workload (one instance lifecycle) | commands (B) | events (B) | events/commands | events |
 |---|---:|---:|---:|---:|
-| 1 task, no vars | 125 | 1758 | 14.06x | 18 |
-| 1 task, 1 KB create | 1166 | 2799 | 2.40x | 18 |
-| 1 task, 50 KB create (the existing benchmark payload) | 51342 | 52975 | 1.03x | 18 |
-| 1 task, 50 KB create + 50 KB complete | 102559 | 104247 | 1.02x | 19 |
-| 5 tasks, no vars | 304 | 4514 | 14.85x | 46 |
-| 5 tasks, 1 KB create + 1 KB per complete | 6550 | 11035 | 1.68x | 51 |
+| 1 task, no vars | 217 | 1775 | 8.18x | 18 |
+| 1 task, 1 KB create | 1258 | 2816 | 2.24x | 18 |
+| 1 task, 50 KB create (the existing benchmark payload) | 51434 | 52992 | 1.03x | 18 |
+| 1 task, 50 KB create + 50 KB complete | 102651 | 104264 | 1.02x | 19 |
+| 5 tasks, no vars | 672 | 4599 | 6.84x | 46 |
+| 5 tasks, 1 KB create + 1 KB per complete | 6918 | 11120 | 1.61x | 51 |
 
 | deploy | command (B) | events (B) |
 |---|---:|---:|
-| 1-task process | 1002 | 1119 |
-| 5-task process | 2450 | 2567 |
+| 1-task process | 1025 | 1119 |
+| 5-task process | 2473 | 2567 |
+
+Scope of the measurement: this is an **uncompressed, payload-only** comparison. The per-entry
+`ReplicatedBatch` wrapper, the OpenRaft entry framing (`raft_logstore.rs:783`) and the log
+store's optional disk compression are per-*entry* costs — identical in both models under ADR
+0003's group commit (one entry per batch) — so the *ratios* above are unaffected by them, but
+the absolute byte counts are payload bytes, not physical log or wire bytes. An absolute
+bandwidth conclusion needs a full-frame measurement with an explicit batching/compression
+policy; none is claimed here.
 
 Reading: the event form costs a fixed ~1.6 KB of structural events per lifecycle (~95 B/event at
 ~18 events for a one-task instance) plus the payload once. Payload-dominated workloads (the 50 KB
-benchmark) are within **3 %**; deploys within **~12 %**. Tiny-payload workloads grow **~14x** — but
-from ~125 B to ~1.8 KB per lifecycle, i.e. ~18 MB/s of replication per 10k lifecycles/s per
-follower, well inside a LAN link; the per-entry overhead (one entry per batch, ADR 0003's group
-commit) is unchanged. Notably, **the journal already persists exactly these events on every
-replica today**, so *journal* write volume does not change. Total local disk volume does grow,
-however: `RaftLogStore::append_entries` (`raft_logstore.rs`) persists its own copy of each entry,
-so the larger Raft entries are written to disk a second time alongside the journal (and sent over
-the network) until the two stores are merged — which is explicitly deferred. Structural compaction of the event encoding (dropping redundant fields, binary
+benchmark) are within **3 %**; deploys within **~12 %**. Tiny-payload workloads grow **~7–8x** —
+but from ~217 B to ~1.8 KB per lifecycle, i.e. ~18 MB/s of replication per 10k lifecycles/s per
+follower, well inside a LAN link. Notably, **the journal already persists exactly these events on
+every replica today**, so *journal* write volume does not change. Total local disk volume does
+grow, however: `RaftLogStore::append_entries` (`raft_logstore.rs:774`) persists its own copy of
+each entry, so the larger Raft entries are written to disk a second time alongside the journal
+(and sent over the network) until the two stores are merged — which is explicitly deferred.
+Structural compaction of the event encoding (dropping redundant fields, binary
 framing) is an optimization available later and is not needed for the decision.
 
 ## Options
@@ -118,11 +131,11 @@ framing) is an optimization available later and is not needed for the decision.
 | dimension | 1. events | 2. commands |
 |---|---|---|
 | Determinism surface | Followers are a pure fold over events; FEEL, iteration order, floats, dependency upgrades cannot diverge replicas. Leader-only non-determinism is acceptable (it is recorded). | Every apply code path, forever. Guards catch only exercised paths; host state (#1657) is a design-level violation that tests did not catch. |
-| Log size / bandwidth | Measured above: +2–3 % at benchmark payloads, ~14x on tiny instances (~1.6 KB/lifecycle absolute). | Smallest entries. |
-| Leader-only processing / activation (ADR 0001, 0002) | Natural fit: activation and lease digest are already leader-local; `JobActivated` becomes an event like any other. | Works today; activation commands are re-executed on followers. |
+| Log size / bandwidth | Measured above (payload-only, uncompressed): +2–3 % at benchmark payloads, ~7–8x on tiny instances (~1.6 KB/lifecycle absolute). | Smallest entries. |
+| Leader-only processing / activation (ADR 0001, 0002) | Natural fit, and the ADR 0002 split is **preserved, not superseded**: soft activation grants/expiry (`prepare_activation`, `main.rs:26481`) stay leader-local and unreplicated — never journaled in either model, so the measurement above is untouched. Only *durable* activations (`ActivateJobsByKey`, for leased/locked jobs) enter the log, and under event replication they enter as their resulting events (`JobActivated` et al.), not as a re-executed command. | Works today; activation commands are re-executed on followers. |
 | Leases | Lease grant/expiry is decided on the leader and recorded; followers never evaluate a deadline. | Followers must agree on `now` (carried in the entry) — fine until a new clock read slips in. |
 | Timers, `ExpireJobs`, routing pump | Remain leader-proposed *commands to the leader's processor*; only their resulting events replicate. Removes the hand-hoisting needed for orphans. | Leader proposes ticks; every replica re-evaluates them. |
-| Durability tiers (ADR 0003) | Unchanged semantics: `quorum` = events committed before ack; `leader-durable` (`acks=1`) = leader journal fsync before ack, events then replicate asynchronously — a failover can lose the unreplicated tail exactly as today. Simpler to reason about: the leader's journal *is* the entry. | Unchanged. |
+| Durability tiers (ADR 0003) | Unchanged semantics — and replication acknowledgment stays **separate** from local durability: `quorum` = events committed on a quorum before ack; `leader-durable` (`acks=1`) = leader-local journal commit before ack, events then replicate asynchronously — a failover can lose the unreplicated tail exactly as today. The local commit's power-loss strength is governed independently by `NANOBPMN_DURABILITY`: fsynced in `sync` mode, but acknowledged at the page-cache point in `async` mode (`journal.rs:129–132`; `raft_logstore.rs:853–861`), so `acks=1` is not by itself an fsync guarantee in either model. Simpler to reason about: the leader's journal *is* the entry. | Unchanged. |
 | Snapshot / replay / #1071 | Aligns: migration-by-replay already replays **event** journals (`decode_event_json`); the Raft log and the journal become one shape. `golden_serde_drift` / `golden_replay` now guard the replication frame too (one guard, not two). | Two persisted shapes to keep compatible: the command wire (`ReplicatedCommandWire` legacy promotion) and the event journal. |
 | Rolling upgrade / cutover | Requires an entry-format version (see plan). Mixed old/new cluster cannot share a log in both directions; needs a gated cutover. | None. |
 | Effort | Medium-large: entry type, leader/follower apply split, response plumbing, event-apply path in engine-core (most exists: replay already folds events), cutover. | Small doc change plus #1657 fix, then perpetual vigilance. |
@@ -184,9 +197,9 @@ recorded in events, so a follower can never re-evaluate it against different val
 - Replica consistency no longer depends on engine determinism; FEEL may stay naturally
   non-deterministic on the leader (matching Zeebe). Determinism is still wanted for *replay
   parity tests*, not for correctness of replication.
-- Raft entries grow (measured above); journal volume is unchanged since the journal already
-  stores these events, but total disk volume grows because the Raft log store keeps its own copy
-  of each (larger) entry until the stores are merged (deferred).
+- Raft entries grow (measured above, payload-only); journal volume is unchanged since the journal
+  already stores these events, but total disk volume grows because the Raft log store keeps its
+  own copy of each (larger) entry until the stores are merged (deferred).
 - The command wire format (`ReplicatedCommandWire`) becomes legacy-read-only (reject-explicitly) after slice 5.
 - One persisted, replay-guarded shape (events) for journal, Raft log and migration-by-replay.
 

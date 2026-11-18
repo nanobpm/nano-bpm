@@ -1,8 +1,19 @@
 //! Replication-entry size probe for ADR 0066 (replicate events vs commands,
 //! #1655). For representative workloads it serializes, with the same
-//! `serde_json` encoding the Raft log store uses, (a) the command each
+//! `serde_json` encoding the Raft log store uses, (a) the command frame each
 //! lifecycle step would replicate under command replication and (b) the events
 //! that command produced, which event replication would replicate instead.
+//!
+//! The command side counts the full `ReplicatedCommand` frame
+//! (`{command, now, operation_reference}`, `raft.rs:106`) — the terminal
+//! attribution stamped by `stamp_for_proposal` (`raft.rs:2836`) included — not
+//! a bare `Command`. It is still a **payload-only, uncompressed** comparison:
+//! the per-entry `ReplicatedBatch` wrapper, OpenRaft entry framing
+//! (`raft_logstore.rs:783`) and the log store's optional disk compression are
+//! per-entry (not per-command) costs, identical in both models, and are not
+//! counted. The ratios below therefore compare payload bytes, not physical
+//! log or bandwidth bytes; absolute bandwidth conclusions need a full-frame
+//! measurement with an explicit batching/compression policy.
 //! Run with:
 //!   cargo run --release --features serde --example replication_size
 
@@ -32,6 +43,27 @@ fn json_len<T: serde::Serialize>(v: &T) -> usize {
     serde_json::to_vec(v).unwrap().len()
 }
 
+/// The replicated command frame (`ReplicatedCommand`, `raft.rs:106`): the
+/// command plus the leader's clock reading and caller `operation_reference`
+/// stamped into the entry envelope. Mirroring the wire shape here keeps the
+/// command-side byte count honest about the framing fields every replicated
+/// command carries.
+#[derive(serde::Serialize)]
+struct CommandFrame<'a> {
+    command: &'a Command,
+    now: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_reference: Option<i64>,
+}
+
+fn command_frame_len(command: &Command) -> usize {
+    json_len(&CommandFrame {
+        command,
+        now: 1_000,
+        operation_reference: None,
+    })
+}
+
 #[derive(Default)]
 struct Tally {
     command: usize,
@@ -41,7 +73,7 @@ struct Tally {
 
 impl Tally {
     fn add(&mut self, command: &Command, events: &[Event]) {
-        self.command += json_len(command);
+        self.command += command_frame_len(command);
         self.events += json_len(&events);
         self.event_count += events.len();
     }
@@ -50,7 +82,11 @@ impl Tally {
 /// One instance lifecycle of a `tasks`-long sequential service-task chain:
 /// create (with `create_kb` payload) then complete each job (with
 /// `complete_kb` payload). Activation is leader-local (ADR 0002) and is not a
-/// replicated command in either model, so it is not counted.
+/// replicated command in either model, so it is not counted. Terminal commands
+/// are stamped with the authoritative attribution exactly as the real proposal
+/// path does (`stamp_for_proposal`, `raft.rs:2836`) before they are applied
+/// and counted, so the command-side bytes include the worker/deadline the
+/// leader resolves and every replica carries.
 fn lifecycle(tasks: usize, create_kb: usize, complete_kb: usize) -> (Tally, (usize, usize)) {
     let mut b = ProcessBuilder::new("p").start_event("start");
     for i in 0..tasks {
@@ -67,7 +103,7 @@ fn lifecycle(tasks: usize, create_kb: usize, complete_kb: usize) -> (Tally, (usi
     let mut engine = Engine::new();
     let deploy = Command::DeployProcess(def);
     let deploy_events = engine.apply_command_at(deploy.clone(), 1_000).unwrap();
-    let deploy_sizes = (json_len(&deploy), json_len(&deploy_events));
+    let deploy_sizes = (command_frame_len(&deploy), json_len(&deploy_events));
 
     let mut t = Tally::default();
     let create = Command::create_instance_with("p", payload(create_kb));
@@ -79,7 +115,8 @@ fn lifecycle(tasks: usize, create_kb: usize, complete_kb: usize) -> (Tally, (usi
             .into_iter()
             .next()
             .unwrap();
-        let complete = Command::complete_job_with(job.key, payload(complete_kb));
+        let mut complete = Command::complete_job_with(job.key, payload(complete_kb));
+        engine.stamp_terminal_attribution(&mut complete);
         let ev = engine.apply_command_at(complete.clone(), 1_000).unwrap();
         t.add(&complete, &ev);
     }
