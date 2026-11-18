@@ -660,21 +660,36 @@ export function scenariosFor (graph) {
     // `setVariables` step — or, only before the FIRST command is queued, into
     // the start variables. Skips a suffix identical to what the instance holds.
     const held = Object.create(null)
+    // A delivery that is due while NO job has completed yet cannot be a
+    // `setVariables` step: Camunda's `setVariables` needs the instance key,
+    // which only a job ACTIVATION exposes, and a message-first scenario
+    // (publishMessage before any job) activates none — the update would
+    // deterministically fail on a valid process (#1246 review). The route is
+    // due before the next gateway activation, and the first job completion
+    // precedes it, so fold the suffix into that completion's `variables` (a
+    // job completion carries variables and runs before the token drains to the
+    // gateway). Buffer it here; the first `completeOneJob` picks it up.
+    let pendingCompletionVars = null
     const deliver = (k, remaining, asStart) => {
       if (JSON.stringify(held[k]) === JSON.stringify(remaining)) return
       held[k] = remaining
       if (asStart) Object.assign(variables, { [k]: remaining })
-      else steps.push({ op: 'setVariables', variables: { [k]: remaining } })
+      else if (steps.some((s) => s.op === 'completeOneJob')) steps.push({ op: 'setVariables', variables: { [k]: remaining } })
+      else (pendingCompletionVars ??= {})[k] = remaining
     }
+    // The lowest activation index each gateway had a pending decision at: the
+    // suffix the BPMN holds starts there, so a later delivery for the same
+    // gateway must start at min(this, the about-to-be-consumed index) — never
+    // drop the entries between them (#1246 review).
+    const pendingFrom = Object.create(null)
     const emitPendingDecisions = () => {
-      const pendingIdx = Object.create(null)
       let pending = state.pendingChoices()
       const decided = []
       while (pending.length > 0) {
         const p = pending[0]
         // Keep the LOWEST pending index per gateway: the suffix the BPMN needs
         // starts at the first not-yet-drained choice.
-        if (pendingIdx[p.node] === undefined) pendingIdx[p.node] = p.activation
+        if (pendingFrom[p.node] === undefined) pendingFrom[p.node] = p.activation
         decided.push(p.node)
         state = state.decide(p.node, p.activation, run.route[routeVariable(p.node)][p.activation])
         pending = state.pendingChoices()
@@ -687,7 +702,7 @@ export function scenariosFor (graph) {
       for (const node of new Set(decided)) {
         const k = routeVariable(node)
         const seq = state.route[k]
-        const from = Math.min(pendingIdx[node], seq.length)
+        const from = Math.min(pendingFrom[node], seq.length)
         deliver(k, seq.slice(from), steps.length === 0)
       }
     }
@@ -713,16 +728,38 @@ export function scenariosFor (graph) {
         const seq = run.route[k]
         if (!seq) continue
         if (after.activations[n] > seeded.activations[n]) {
+          // Deliver the suffix from the activation THIS command is about to
+          // consume — never a later one. The BPMN reads the HEAD `route[1]` at
+          // every activation, so the head must be the choice of the FIRST
+          // activation that reads it after this delivery. Starting the slice at
+          // `seeded.activations[n]` (the about-to-be-consumed index) is wrong
+          // whenever an earlier pending decision already delivered the suffix
+          // from a LOWER index: the re-delivery would drop the entries between
+          // that index and this one, so the first activation reads what should
+          // be a LATER activation's choice (Gen_de3a1f331f-o2: the create-time
+          // activation must take f6, but slicing from index 1 delivers [f5], so
+          // the BPMN takes f5 and creates T2 twice — a false divergence,
+          // #1246 review). Take the lowest index any pending decision for this
+          // gateway already delivered from, when it is lower.
+          const from = Math.min(pendingFrom[n] ?? seeded.activations[n], seeded.activations[n])
           // No command is queued yet when the FIRST command itself activates
           // this gateway: its route suffix must ride the start variables, not a
           // leading `setVariables` step — Camunda's `setVariables` needs the
           // instance key, which only a job activation exposes, so a pre-first-
           // command update step is rejected before any job runs (#1246 review).
-          deliver(k, seq.slice(seeded.activations[n]), steps.length === 0)
+          deliver(k, seq.slice(from), steps.length === 0)
         }
       }
       if (c.op === 'complete') {
-        steps.push({ op: 'completeOneJob', jobType: c.node })
+        const step = { op: 'completeOneJob', jobType: c.node }
+        // A route suffix buffered while no job had completed rides THIS
+        // completion's variables: the completion carries them into the instance
+        // before the token drains to the gateway that reads them (#1246 review).
+        if (pendingCompletionVars) {
+          step.variables = pendingCompletionVars
+          pendingCompletionVars = null
+        }
+        steps.push(step)
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
         // The barrier must be a job THIS correlation creates, not a task that

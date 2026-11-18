@@ -18,7 +18,7 @@ import {
 } from "./nano-backend.mjs";
 import { CamundaBackend } from "./camunda-backend.mjs";
 import { runScenario } from "./driver.mjs";
-import { discoverScenarios, installSignalCleanup } from "./run.mjs";
+import { discoverScenarios, installSignalCleanup, backendEligible } from "./run.mjs";
 import { EventEmitter } from "node:events";
 import {
   checkExpectations,
@@ -63,6 +63,24 @@ test("nano runs are deterministic — a re-run reproduces byte-identical observa
     await a.close();
     await b.close();
   }
+});
+
+test("backendEligible honors a scenario's backends restriction (#1246 review)", () => {
+  // The bounded-exhaustive corpus marks non-completing scenarios
+  // `backends: ["nano"]`: the bare-gateway Camunda backend only observes an
+  // instance through completion, so running one on Camunda would time out in
+  // `awaitCompletion` even when both engines behave correctly. The shared
+  // runner must skip it on camunda (and the differential) but still run nano.
+  const nanoOnly = { name: "stuck", backends: ["nano"] };
+  assert.equal(backendEligible(nanoOnly, "nano"), true);
+  assert.equal(backendEligible(nanoOnly, "camunda"), false);
+  // A scenario with no restriction runs on every backend.
+  assert.equal(backendEligible({ name: "plain" }, "camunda"), true);
+  assert.equal(backendEligible({ name: "plain" }, "nano"), true);
+  // An explicit both-backends list is eligible on both.
+  const both = { name: "both", backends: ["nano", "camunda"] };
+  assert.equal(backendEligible(both, "camunda"), true);
+  assert.equal(backendEligible(both, "nano"), true);
 });
 
 test("diffObservations only compares fields BOTH backends provide", () => {

@@ -209,6 +209,60 @@ test('a gateway the FIRST command activates routes via start variables, not a le
   }
 })
 
+test('a two-activation route delivers the FULL suffix from the first pending index, not the about-to-be-consumed one (#1246 review)', () => {
+  // Gen_de3a1f331f: S -> AND -> {XOR, T1 -> XOR}; XOR -> {E, T2 -> E}. The
+  // create settle activates XOR (activation 0) and leaves T1 waiting; completing
+  // T1 activates XOR again (activation 1). The scenario that routes activation 0
+  // to T2 (f6) and activation 1 to E (f5) must deliver the FULL suffix
+  // [[f6],[f5]] — the BPMN reads the head `route[1]` at activation 0, so the
+  // head must be f6. Slicing from the about-to-be-consumed index (1) drops f6
+  // and delivers [[f5]], so activation 0 takes f5 (no T2) and the run reports a
+  // false divergence. The delivered head must be activation 0's own choice.
+  const g = graphOf(['and', 'xor'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'task'], [2, 3, 'direct'], [2, 3, 'task']])
+  const rv = routeVariable('G2')
+  const { scenarios } = scenariosFor(g)
+  // The runs that create exactly one T2 (route one XOR activation to f6, the
+  // other to f5) carry a two-entry route. The head MUST be activation 0's own
+  // choice: the run whose activation 0 takes f6 (T2) starts with [f6]; slicing
+  // from the about-to-be-consumed index would drop it and deliver [f5] first.
+  const twoStep = scenarios.filter((s) => s.expect.jobsCreated.T2 === 1
+    && s.steps.length === 2 && s.steps.every((st) => st.op === 'completeOneJob'))
+  assert.equal(twoStep.length, 2, 'the T2-first and E-first runs both exist')
+  const byHead = new Map(twoStep.map((s) => [s.variables[rv][0][0], s]))
+  assert.deepEqual(byHead.get('f6').variables[rv], [['f6'], ['f5']],
+    'activation 0 -> f6 reads the head [f6]; the suffix carries [f5] for activation 1')
+  assert.deepEqual(byHead.get('f5').variables[rv], [['f5'], ['f6']],
+    'activation 0 -> f5 reads the head [f5]; the suffix carries [f6] for activation 1')
+})
+
+test('a message-first scenario delivers a pre-first-job route suffix through the first job completion, not a setVariables step (#1246 review)', () => {
+  // S -> AND -> {XOR, T1 -> XOR}; XOR -> {EVT, E}; EVT -> {M1 -> E, M2 -> E}.
+  // A message-first command order (publishMessage before any job completion)
+  // that must re-route XOR's second activation has NO job activation before the
+  // publish — so a `setVariables` step there has no instance key and is
+  // rejected by Camunda on a valid process. The suffix must ride the FIRST job
+  // completion's `variables` instead (a job completion carries variables and
+  // runs before the token drains to the gateway).
+  const g = graphOf(['and', 'xor', 'evt'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'task'], [2, 4, 'direct'], [2, 3, 'direct'], [3, 4, 'msg'], [3, 4, 'msg']])
+  const { scenarios } = scenariosFor(g)
+  let msgFirstReRoute = 0
+  for (const s of scenarios) {
+    const firstJob = s.steps.findIndex((st) => st.op === 'completeOneJob')
+    const earlySet = s.steps.findIndex((st) => st.op === 'setVariables')
+    const msgFirst = s.steps[0]?.op === 'publishMessage'
+    if (msgFirst) {
+      // No setVariables may precede the first job completion (no instance key).
+      assert.ok(earlySet < 0 || firstJob >= 0 && firstJob < earlySet,
+        `${s.name}: no setVariables before the first job activation`)
+    }
+    if (msgFirst && firstJob >= 0 && s.steps[firstJob].variables) {
+      msgFirstReRoute++
+      assert.ok(s.steps[firstJob].variables[routeVariable('G3')], `${s.name}: the route suffix rides the first completion`)
+    }
+  }
+  assert.ok(msgFirstReRoute > 0, 'the graph produces a message-first re-route scenario')
+})
+
 test('a routed join reads its OWN activation choice, not the next one (#1246 review)', () => {
   // S -> AND -2x-> OR-join -> {E, E}: the inclusive gateway G2 is BOTH a join
   // (two incoming flows) and a split (two outgoing). `choice()` indexes

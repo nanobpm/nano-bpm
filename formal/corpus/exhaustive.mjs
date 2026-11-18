@@ -41,7 +41,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { enumerateGraphs, artifactsFor, exploreOrders, routesFor, GATEWAY_KINDS } from './enumerate.mjs'
-import { installSignalCleanup } from '../parity/runtime/run.mjs'
+import { installSignalCleanup, backendEligible } from '../parity/runtime/run.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const tlaDir = path.join(here, '..', 'tla')
@@ -280,7 +280,7 @@ async function runtimePhase (entries, args, log) {
         } catch (err) {
           divergences.push({ kind: 'nano', signature: `nano:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
         }
-        if (camunda && !(sc.backends && !sc.backends.includes('camunda'))) {
+        if (camunda && backendEligible(sc, 'camunda')) {
           try {
             const obs = await runScenario(camunda, scenario)
             const check = checkExpectations(obs, { completed: scenario.expect.completed, variables: scenario.expect.variables })
