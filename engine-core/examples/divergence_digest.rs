@@ -10,8 +10,13 @@
 //!   state is the fold of its events (migration-by-replay, #1071), equal event
 //!   chains imply equal state under a deterministic fold.
 //! * **full** — a periodic hash of the whole `EngineSnapshot`, canonicalised
-//!   through `serde_json::Value` (sorted object keys) so `HashMap` iteration
-//!   order cannot leak into the digest.
+//!   through `serde_json::Value` (sorted object keys) with every array also
+//!   sorted, so neither `HashMap` key order nor serialized `HashSet` element
+//!   order can leak into the digest. Sorting *all* arrays also discards the
+//!   order of genuine vectors, so this is a **cost stand-in**, not a correct
+//!   production canonicalisation: the ADR requires ordered collections
+//!   (`BTreeMap`/`BTreeSet`) in engine state so the snapshot encoding is
+//!   canonical without any re-sorting.
 //!
 //! `DefaultHasher` stands in for the production hash (a stable, versioned one
 //! such as xxh3/BLAKE3 would be pinned in the server); only the relative cost
@@ -39,7 +44,7 @@ fn engine() -> Engine {
     let def = ProcessBuilder::new("p")
         .start_event("start")
         .service_task("t0", "job")
-        .service_task("t1", "job")
+        .service_task("t1", "parked")
         .end_event("end")
         .connect("start", "t0")
         .connect("t0", "t1")
@@ -61,7 +66,8 @@ struct Probe {
 }
 
 /// Drives `n` instances (create + complete the first task, leaving each
-/// instance live at `t1`) and times apply against each digest variant.
+/// instance live at `t1`, whose `parked` job type is never activated) and
+/// times apply against each digest variant.
 fn drive(engine: &mut Engine, n: usize) -> Probe {
     let (mut apply, mut digest, mut hash_only) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut chain = DefaultHasher::new();
@@ -118,8 +124,24 @@ fn canonical<T: serde::Serialize>(v: &T) -> Vec<u8> {
     serde_json::to_vec(&serde_json::to_value(v).unwrap()).unwrap()
 }
 
+/// Recursively sorts every array (by its canonical encoding). Cost stand-in
+/// for set canonicalisation; see the module doc for why this is not the
+/// production shape.
+fn sort_arrays(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(sort_arrays);
+            items.sort_by_cached_key(|i| serde_json::to_vec(i).unwrap());
+        }
+        serde_json::Value::Object(map) => map.values_mut().for_each(sort_arrays),
+        _ => {}
+    }
+}
+
 fn full_digest(engine: &Engine) -> (u64, usize) {
-    let bytes = canonical(&engine.snapshot());
+    let mut value = serde_json::to_value(engine.snapshot()).unwrap();
+    sort_arrays(&mut value);
+    let bytes = serde_json::to_vec(&value).unwrap();
     let mut h = DefaultHasher::new();
     h.write(&bytes);
     (h.finish(), bytes.len())
@@ -137,6 +159,14 @@ fn main() {
         let (d, bytes) = full_digest(&e);
         let full = t.elapsed();
         std::hint::black_box(d);
+        // Every instance must still be live at `t1`: activation of `job` must
+        // only ever have picked up the newest instance's `t0`.
+        assert_eq!(
+            e.activate_jobs("parked", "probe", n + 1, 60_000, 1_000)
+                .len(),
+            n,
+            "all instances must remain active at t1"
+        );
         let per = |d: Duration| d.as_nanos() as f64 / p.commands as f64 / 1_000.0;
         println!(
             "| {n} | {:.2} µs | {:.2} µs | {:.0} % | {:.2} µs | {:.1} ms | {bytes} |",

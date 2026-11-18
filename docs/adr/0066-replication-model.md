@@ -138,7 +138,7 @@ each hit. Line numbers are at this ADR's commit.
 | 3 | **`lenient_completion` flag** (host config) | `engine/mod.rs:741`; set from activation policy at `server/src/main.rs:3078` and **changed at runtime** at `main.rs:43375` | Leak during a policy flip: each node flips at its own wall-clock moment, not at a log index, so one committed `CompleteJob` can be accepted on one replica and rejected on another | Leader-only decision, recorded as events | Becomes engine state set by a replicated command (flips at a log index on every replica) |
 | 4 | **`num_partitions`** (host config, `NANOBPMN_PARTITIONS`) | `engine/mod.rs:731`; set at `main.rs:3071` | Documented "must be identical on every node" but not checked | Leader-only routing decision, recorded | Engine state from a replicated command, or verified at join (refuse a mismatching member) |
 | 5 | **Leader-local activation state** (ADR 0002) | soft grants `main.rs` `prepare_activation`; apply reads job state (with #3 papering over it) | By design followers do not hold the leader's locks | Unchanged (leader-local in both) | Unchanged; apply must not read it: the apply-input type excludes it, and #3 stops being a toggle |
-| 6 | **`HashMap` iteration order** (std `RandomState`, per-process random seed) | engine state maps `state/types.rs:2352-2407` (`instances`, `jobs`, `timers`, `message_subscriptions`, …) | Kept safe **by hand**: event-emitting walks sort first (`engine/mod.rs:17337`, `:17351`; `engine/event_subprocess.rs:460`; 97 `sort*` calls in `engine/`); unique-key lookups (`engine/mod.rs:971`) are order-independent. Nothing enforces it, and the JSON journal encoding of these maps is **not canonical** (bytes differ between replicas holding equal state) | Cannot diverge followers; leader order only has to be self-consistent | Replace the hasher with a fixed-seed `BuildHasher` alias (or `BTreeMap`) in engine state; `clippy::disallowed_types` bans `std::collections::HashMap/HashSet` in the apply crates. Also makes the encoding canonical, which the digest below relies on |
+| 6 | **`HashMap` iteration order** (std `RandomState`, per-process random seed) | engine state maps `state/types.rs:2352-2407` (`instances`, `jobs`, `timers`, `message_subscriptions`, …) | Kept safe **by hand**: event-emitting walks sort first (`engine/mod.rs:17337`, `:17351`; `engine/event_subprocess.rs:460`; 97 `sort*` calls in `engine/`); unique-key lookups (`engine/mod.rs:971`) are order-independent. Nothing enforces it, and the JSON journal encoding of these maps is **not canonical** (bytes differ between replicas holding equal state) | Cannot diverge followers; leader order only has to be self-consistent | Replace engine-state `HashMap`/`HashSet` with ordered collections (`BTreeMap`/`BTreeSet`, or an insertion-ordered map whose order is itself a deterministic function of the applied log); `clippy::disallowed_types` bans `std::collections::HashMap/HashSet` in the apply crates. A fixed-seed `BuildHasher` is **not** enough: equal maps can still iterate differently after different capacity or mutation histories (e.g. a snapshot-restored replica vs. one that applied the log). Ordered collections make both iteration and the encoding canonical, which the digest below relies on |
 | 7 | **Platform `libm` transcendental floats** | `feel/builtins.rs:525-526` (`ln`, `exp`), `feel/eval.rs:542` (`powf`) | Can differ by an ulp across OS/arch (glibc vs. Apple libm); same-binary clusters agree. `sqrt` is IEEE-exact; float formatting is Rust's own shortest-repr (deterministic) | Cannot diverge followers | Route through a pure-Rust `libm` (or the FEEL decimal type) so the result is platform-independent |
 | 8 | **Node-local residency / cold-store I/O** | `journal.rs:2327` `ensure_resident_for_command` | An unreadable local row **fails closed** under replicated apply (#1470), so it fail-stops rather than diverges | Folding events still needs residency; same behaviour | Same; the digest (below) is a second line of defence |
 | 9 | **Orphan sink / leadership** | `journal.rs:1703`, `:1719` | Decides which node *proposes* a stamped quarantine; the stamp travels in the command | Unchanged | Unchanged (already in the envelope) |
@@ -178,12 +178,17 @@ pervasive case in which A's "cannot diverge by construction" earns its migration
      resolves on the leader (worker, lock deadline), plus orphan stamps. Nothing else the leader
      samples reaches apply once #1/#3/#4 become state; the lint keeps it that way.
   3. **Runtime divergence detection.** See the digest specification below.
-  4. **Determinism CI.** A job replays the same recorded journals (the `golden_replay` corpus plus a
-     generated randomized workload) under (a) several `HashMap` seeds — run before #6 lands, it
-     flushes out any unsorted walk; after it, a guard — (b) debug and release profiles and
-     Linux/macOS × x86_64/aarch64 (#7), and (c) the previous release's binary, then compares
-     digests at every checkpoint. This exercises paths no unit test targets, which is where B's
-     tests are blind.
+  4. **Determinism CI.** A job **re-executes a recorded command-envelope corpus** (the
+     `ReplicatedCommandWire` entries with their `now`/seed/attribution, captured from a generated
+     randomized workload plus scenario suites) through `apply_command_ref_at` under (a) several
+     `HashMap` seeds — run before #6 lands, it flushes out any unsorted walk; after it, a guard —
+     (b) debug and release profiles and Linux/macOS × x86_64/aarch64 (#7), and (c) the previous
+     release's binary, then compares the generated records and the canonical durable-state digest
+     at every checkpoint. Replaying the `golden_replay` *event* corpus is not enough for this gate:
+     `Engine::replay_partition` feeds events straight to `state::apply`, bypassing FEEL, gateway
+     selection and command processing, so it cannot expose command-path non-determinism. Event
+     replay stays as a separate recovery/fold check. This exercises paths no unit test targets,
+     which is where B's tests are blind.
 
 ### Divergence digest (option C)
 
@@ -193,7 +198,9 @@ pervasive case in which A's "cannot diverge by construction" earns its migration
   (so the digest never delays the entry it covers); followers compare at that index. `H` is a
   stable, versioned hash (xxh3-128 or BLAKE3) pinned in the server, not std's `DefaultHasher`.
 - **Precondition: canonical bytes.** Today's journal JSON is **not** canonical — `HashMap` fields
-  serialize in `RandomState` order — so the chain needs audit item #6 first. Without it, a replica
+  serialize in table-layout order and `HashSet`s (e.g. `State::jobs_by_instance`,
+  `state/types.rs:2466`) as arrays in table order — so the chain needs audit item #6 first
+  (ordered collections, not merely a fixed hash seed, since layout depends on history). Without it, a replica
   would have to re-encode canonically, which is far more expensive (measured below).
 - **Periodic full hash, at snapshot time only.** The snapshot already serializes the whole state;
   its digest (over the canonical snapshot bytes) is recorded with the snapshot and checked on
@@ -201,10 +208,14 @@ pervasive case in which A's "cannot diverge by construction" earns its migration
 - **On mismatch:** the follower fails stop (stops applying, like the #1405 fenced
   journal), reports both digests and the index, and resyncs by installing the leader's snapshot.
   The divergent journal segment is kept for forensics. A leader never adopts a follower's state.
-- **Snapshots and #1071.** A snapshot records `(last_applied, chain digest, full digest)`;
-  a restored replica resumes the chain from the recorded value. Migration-by-replay re-derives the
-  chain from the replayed journal and must reproduce the recorded digest at each snapshot index —
-  a migration that changes the fold now fails loudly instead of silently. A deliberate encoding
+- **Snapshots and #1071.** A snapshot records `(last_applied, chain digest, full digest, key
+  allocator high-water)`, where the full digest is a **versioned canonical digest of durable
+  state**; a restored replica resumes the chain from the recorded value. The chain only proves
+  *event-byte integrity*: replaying identical event bytes reproduces it even if `state::apply` or
+  allocator advancement reconstructs different state. So migration-by-replay checks two things
+  separately at each snapshot checkpoint: the re-derived chain (integrity of the journal) **and**
+  the canonical full digest plus allocator high-water of the replayed state (correctness of the
+  fold). A migration that changes the fold now fails loudly instead of silently. A deliberate encoding
   change (a `SNAPSHOT_FORMAT_VERSION` bump) re-bases the chain at the migration point.
 
 Measured cost (`engine-core/examples/divergence_digest.rs`, added with this ADR;
@@ -214,14 +225,18 @@ hash):
 
 | live instances | apply / cmd | canonical re-encode + hash / cmd | overhead | hash of already-encoded journal bytes / cmd | full digest | snapshot bytes |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 39 µs | 30 µs | 77 % | 1.2 µs | 64 ms | 1.3 MB |
-| 10,000 | 63 µs | 31 µs | 49 % | 1.3 µs | 1.19 s | 13.3 MB |
-| 50,000 | 265 µs | 36 µs | 13 % | 1.4 µs | 6.9 s | 67 MB |
+| 1,000 | 34 µs | 29 µs | 84 % | 1.1 µs | 84 ms | 1.5 MB |
+| 10,000 | 32 µs | 24 µs | 76 % | 1.0 µs | 1.67 s | 15.2 MB |
+| 50,000 | 38 µs | 29 µs | 77 % | 1.2 µs | 9.2 s | 76 MB |
 
-Reading: once item #6 makes the journal bytes canonical, the per-entry chain costs **~1–1.4 µs per
-command (~2–3 % of apply)**, because it only hashes bytes that are written anyway. Re-encoding
-canonically through a sorted DOM instead costs 30–36 µs (13–77 %), which is why #6 is a
-precondition rather than an option. A full-state hash is O(state) (≈ 140 ms per 1,000 live
+(The probe asserts every instance is still live at `t1`, whose job type is never activated. The
+full digest sorts every array as a cost stand-in for set canonicalisation; production instead
+gets canonical bytes from ordered collections, #6.)
+
+Reading: once item #6 makes the journal bytes canonical, the per-entry chain costs **~1–1.2 µs per
+command (~3 % of apply)**, because it only hashes bytes that are written anyway. Re-encoding
+canonically through a sorted DOM instead costs 24–29 µs (76–84 %), which is why #6 is a
+precondition rather than an option. A full-state hash is O(state) (≈ 85–185 ms per 1,000 live
 instances), so it belongs at snapshot time only.
 
 ## Comparison
@@ -231,19 +246,19 @@ instances), so it belongs at snapshot time only.
 | Determinism surface | Followers are a pure fold over events; FEEL, iteration order, floats and upgrades cannot diverge them. Leader-only non-determinism is acceptable (it is recorded). | Every apply path, forever; guards see only exercised paths; #1657 shipped undetected. | The audited inputs (12 items), closed by type boundary + lint; anything missed is **detected** at the next digest instead of silently persisting. |
 | Failure mode on a missed input | None for replica agreement (leader just records its result). | Silent split-brain. | Fail-stop of the divergent follower + snapshot resync; alert. |
 | Log size / bandwidth | Measured above (payload-only, uncompressed): +2–3 % at benchmark payloads, ~7–8x on tiny instances (~1.6 KB/lifecycle). Raft log store keeps its own copy, so disk volume grows until the stores merge. | Smallest entries. | Smallest entries + 16–32 B digest every k entries. |
-| CPU | Followers fold (cheaper than processing); leader unchanged. | Every replica processes. | Every replica processes + ~1–1.4 µs/cmd chain hash. |
+| CPU | Followers fold (cheaper than processing); leader unchanged. | Every replica processes. | Every replica processes + ~1–1.2 µs/cmd chain hash. |
 | Leader-side complexity | **Substantial and new.** Speculative processing ahead of commit against a copy-on-write overlay of committed state (engine-core has no such overlay today); discard the overlay on failed proposal or failover; hold every client response until commit; activation, queries, lease digests and snapshots must read committed state only; key allocation is leader-only and the fold must advance the generator from observed keys; per-command record metadata (`operation_reference` lives on `Record`) has to ride in the entry. | None new. | None new: leader and followers run the same code path. |
 | Activation / leases (ADR 0001, 0002) | ADR 0002 split preserved: soft grants stay leader-local; durable activations replicate as `JobActivated` events. | Activation commands re-executed on followers. | As B; the runtime `lenient_completion` toggle (#3) becomes replicated state. |
 | Timers, `ExpireJobs`, pump | Leader-proposed commands to the leader's processor; only results replicate. | Re-evaluated everywhere with replicated `now`. | As B (`now` already in the envelope). |
 | Durability tiers (ADR 0003) | Semantics unchanged; replication acknowledgment stays separate from local durability (`NANOBPMN_DURABILITY`, `journal.rs:129–132`; `raft_logstore.rs:853–861`). | Unchanged. | Unchanged. |
 | Snapshot / replay / #1071 | One persisted, replay-guarded shape (events) for log and journal. | Two shapes: command wire (`ReplicatedCommandWire`) and event journal. | Two shapes as B, but migration-by-replay is now *checked* against recorded digests. |
-| Rolling upgrade | Entry-format version; gated cutover; mixed old/new clusters cannot share a log in both directions. | None. | None for the log format. A determinism-affecting change (e.g. #7's libm swap, a hasher change) is gated on the previous-release replay CI. The digest entry field is additive. |
-| Migration + effort | **Large**: 6 slices (below); about 2–3 engineer-months, with a running-system Raft log format change and a cutover that cannot be cleanly rolled back once events are emitted. | Doc change + #1657. | **Medium**: #1657 + #3/#4 to state (needed anyway), hasher swap (#6, mechanical but touches every state map), libm wrapper (#7), lint, digest field + fail-stop/resync path, determinism CI. About 3–5 engineer-weeks; no log format break, each slice independently revertible. |
+| Rolling upgrade | Entry-format version; gated cutover; mixed old/new clusters cannot share a log in both directions. | None. | None for the log format. A determinism-affecting change (e.g. #7's libm swap, a collection-type change) is gated on the previous-release replay CI. The digest entry field is additive, but new command variants (cluster-variable and config commands, #1/#3/#4) are **not** decodable by older replicas: they are emitted only once every voter and learner advertises support (a cluster feature flag), later joins of an incompatible binary are rejected, and once such an entry is persisted the downgrade boundary is that release. |
+| Migration + effort | **Large**: 6 slices (below); about 2–3 engineer-months, with a running-system Raft log format change and a cutover that cannot be cleanly rolled back once events are emitted. | Doc change + #1657. | **Medium**: #1657 + #3/#4 to state (needed anyway), hasher swap (#6, mechanical but touches every state map), libm wrapper (#7), lint, digest field + fail-stop/resync path, determinism CI. About 3–5 engineer-weeks; no log format break; slices are independently revertible until the first new command variant is persisted (after that, downgrade is bounded at that release, see Rolling upgrade). |
 
 ## Decision (proposed)
 
 **Adopt option C** — command replication with enforced determinism — because the audit shows the
-apply-input leaks are few and closable, and C closes them for ~2–3 % apply CPU with no Raft log
+apply-input leaks are few and closable, and C closes them for ~3 % apply CPU with no Raft log
 format change. B is rejected: #1657 is the proof that hoping is not enough. A is **not**
 rejected on principle; it is deferred with an explicit trigger: if, after C ships, the divergence
 digest fires in production for a cause the type boundary and lint cannot express, or the audit
@@ -257,9 +272,11 @@ enforced determinism, per this ADR.
 1. **#1657: cluster variables become engine state** (see below). Removes audit item #1.
 2. **Host config into state.** `lenient_completion` and `num_partitions` become engine state set by
    replicated commands (or verified at join); `set_*` hooks deleted from `Engine` (#3, #4).
-3. **Deterministic hasher.** Type alias over a fixed-seed `BuildHasher` for every engine-state map;
-   `disallowed-types` lint for std `HashMap`/`HashSet`. Journal encoding becomes canonical (#6).
-   Not a format change: the same JSON shape, only key order becomes stable.
+3. **Ordered collections.** `BTreeMap`/`BTreeSet` (or a log-ordered map) for every engine-state
+   map and set; `disallowed-types` lint for std `HashMap`/`HashSet`. A fixed-seed hasher is not
+   sufficient (layout depends on capacity and mutation history). Journal and snapshot encoding
+   become canonical (#6). Not a format change: the same JSON shape, only element order becomes
+   stable.
 4. **Purity lint + fail-closed FEEL env.** `disallowed-methods` for clocks, env, std float
    transcendental intrinsics; pure-Rust `libm` wrapper (#7); FEEL fallback unreachable in apply (#2).
 5. **Divergence digest.** Chain digest per entry, leader digest carried additively in the entry,
@@ -302,12 +319,12 @@ the loss on restart, and replay against today's values.
 - (C) Replica consistency still depends on engine determinism, but determinism is now enforced
   (type boundary + lint), tested beyond exercised paths (determinism CI), and **detected** at
   runtime (digest) with a fail-stop rather than silent split-brain.
-- (C) Raft entries stay small; apply cost grows ~2–3 % for the digest chain; snapshotting gains a
+- (C) Raft entries stay small; apply cost grows ~3 % for the digest chain; snapshotting gains a
   full-state hash over bytes it already produces.
 - (C) Two persisted shapes remain (command wire + event journal); both stay under the golden drift
   guards.
 - (C) A non-Rust or cross-platform follower (e.g. a wasm replica) must reproduce the same digest;
-  the libm and hasher slices are what make that possible.
+  the libm and ordered-collection slices are what make that possible.
 - If the re-open trigger fires, A's plan above applies unchanged.
 
 ## Open questions
