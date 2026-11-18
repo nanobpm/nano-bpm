@@ -746,6 +746,16 @@ impl ServerImpl {
     ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
         let (tenant, name) = cluster_variable_target(&command)
             .ok_or_else(|| (400, "not a cluster-variable command".to_string()))?;
+        // The journal-mode guard must hold on the node that PERSISTS the
+        // record, not only on the originating gateway: a forwarded
+        // `ApplyClusterVariable` from a segmented peer lands here, and a
+        // legacy multi-partition node must refuse it rather than journal an
+        // untagged record it could never recover (PR #1670 review). This is
+        // the single funnel for local and forwarded applies.
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
         let key = nanobpmn_engine_core::compose_key(p, 0);
         let (events, _commit) = self.apply_partition_command(key, command).await?;
         // At most one lifecycle event per applied command (an idempotent
