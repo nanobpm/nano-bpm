@@ -71,6 +71,7 @@ jobs:
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       formal: ${{ steps.filter.outputs.formal }}
       parityruntime: ${{ steps.filter.outputs.parityruntime }}
+      paritycoverage: ${{ steps.filter.outputs.paritycoverage }}
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
@@ -183,6 +184,18 @@ jobs:
             # so a skipped or absent-runtime run never blocks a sibling PR. The
             # runner drives the engine-wasm read-model build, so a change to the
             # sources it is built from must re-run it.
+            # Nano half of the parity-corpus coverage ratchet (#1247): the
+            # engine it measures, the corpus it replays, and the report/ratchet.
+            paritycoverage:
+              - 'formal/parity/coverage/**'
+              - 'formal/parity/runtime/corpus/**'
+              - 'formal/corpus/**'
+              - 'formal/parity/check.mjs'
+              - 'formal/parity/coverage.json'
+              - 'formal/parity/zeebe-surface.json'
+              - 'engine-core/**'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
             parityruntime:
               - 'formal/parity/runtime/**'
               # The bounded-exhaustive generator (#1246) feeds the same runner.
@@ -973,6 +986,43 @@ jobs:
           CAMUNDA_AUTH_TOKEN: ${{ secrets.CAMUNDA_AUTH_TOKEN }}
           CAMUNDA_BASIC_AUTH: ${{ secrets.CAMUNDA_BASIC_AUTH }}
         run: node formal/parity/runtime/run.mjs --backend both
+
+  # Nano half of the dual-engine parity-corpus coverage (#1247): replay the
+  # seed + bounded-exhaustive corpus natively over engine-core under
+  # `cargo llvm-cov` and ratchet the region coverage against
+  # formal/parity/coverage/baseline.json (a drop fails). The Camunda/JaCoCo
+  # half needs a live broker and runs in parity-camunda-daily.yml. Not a
+  # required check (not in the merge protocol). No retries.
+  parity-coverage-nano:
+    name: parity-coverage (nano llvm-cov)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.paritycoverage == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Report + ratchet unit tests
+        run: node --test formal/parity/coverage/*.test.mjs
+      - name: Measure engine-core coverage while the corpus replays
+        run: formal/parity/coverage/nano-coverage.sh "$RUNNER_TEMP/nano-llvm-cov.json" ci
+      - name: Report (tagged) + ratchet
+        run: node formal/parity/coverage/report.mjs --nano "$RUNNER_TEMP/nano-llvm-cov.json" --out "$RUNNER_TEMP/nano-coverage-report.json" --check
+      - name: Upload the tagged uncovered-site report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parity-coverage-nano
+          path: ${{ runner.temp }}/nano-coverage-report.json
+          if-no-files-found: ignore
 
   processos:
     name: processos (clippy + test)

@@ -31,6 +31,9 @@ on:
       - '.github/actions/engine-wasm-pkg/**'
       - '.github/actions/wasm-pack-cache/**'
       - 'formal/parity/zeebe-surface.json'
+      # The JaCoCo coverage job (#1247): report, ratchet, matrix it tags against.
+      - 'formal/parity/coverage/**'
+      - 'formal/parity/coverage.json'
 
 permissions:
   contents: read
@@ -60,3 +63,38 @@ jobs:
       - name: Camunda logs
         if: failure()
         run: docker logs parity-camunda 2>&1 | tail -300
+
+  # Camunda half of the dual-engine parity-corpus coverage (#1247): the same
+  # corpus on a live Camunda 8 with the JaCoCo agent attached to the broker,
+  # zeebe/engine branch coverage tagged against the coverage matrix, and the
+  # ratchet (formal/parity/coverage/baseline.json) failing on a drop.
+  zeebe-coverage:
+    name: parity-coverage (zeebe JaCoCo)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build engine-wasm/pkg (the runner's nano reference backend)
+        uses: ./.github/actions/engine-wasm-pkg
+      - name: Report + ratchet unit tests
+        run: node --test formal/parity/coverage/*.test.mjs
+      - name: Measure zeebe/engine coverage while the corpus runs
+        run: formal/parity/coverage/zeebe-coverage.sh "$RUNNER_TEMP/zeebe-jacoco.xml" ci
+      - name: Report (tagged against the coverage matrix) + ratchet
+        run: node formal/parity/coverage/report.mjs --zeebe "$RUNNER_TEMP/zeebe-jacoco.xml" --out "$RUNNER_TEMP/zeebe-coverage-report.json" --check
+      - name: Upload the tagged uncovered-branch report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parity-coverage-zeebe
+          path: |
+            ${{ runner.temp }}/zeebe-coverage-report.json
+            ${{ runner.temp }}/zeebe-jacoco.xml
+          if-no-files-found: ignore

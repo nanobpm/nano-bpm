@@ -1,0 +1,12 @@
+{
+  "$comment": "Ratchet floors for the dual-engine parity-corpus coverage (#1247). Derived by `node formal/parity/coverage/report.mjs --nano … --zeebe … --update` (floors only rise; lowering needs --allow-lower and review). nano = engine-core LLVM code regions while engine-core/tests/parity_corpus.rs replays the corpus (deterministic). zeebe = zeebe/engine JaCoCo branches on a live Camunda 8; slackPercent absorbs residual broker-scheduling variance tracked in #1679.",
+  "nano": {
+    "unit": "region",
+    "floorPercent": 16.1
+  },
+  "zeebe": {
+    "unit": "branch",
+    "floorPercent": 12.5,
+    "slackPercent": 0.1
+  }
+}
