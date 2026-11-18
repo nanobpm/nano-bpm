@@ -23888,11 +23888,12 @@ impl ServerImpl {
             .map(|(name, _)| name.clone())
             .collect();
 
-        match nanobpmn_engine_core::feel::eval_with_provenance(
-            &body.expression,
-            &ctx,
-            trusted_roots,
-        ) {
+        // Ad-hoc evaluation is off the replicated apply path, so it opts into
+        // the host clock/entropy explicitly (#1663); the builtins fail closed
+        // without an installed environment.
+        match nanobpmn_engine_core::feel::with_host_env(|| {
+            nanobpmn_engine_core::feel::eval_with_provenance(&body.expression, &ctx, trusted_roots)
+        }) {
             Ok(evaluated) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
                 models::ExpressionEvaluationResult {
                     expression: body.expression.clone(),

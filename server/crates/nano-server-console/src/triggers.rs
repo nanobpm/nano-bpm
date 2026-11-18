@@ -656,8 +656,12 @@ pub(crate) fn plan_call(action: &Action, body: &Json) -> Result<EngineCall, Trig
             variables,
         } => {
             let correlation_key = match correlation_key.as_deref() {
-                Some(expr) => nanobpmn_engine_core::feel::eval_string(expr, &ctx)
-                    .map_err(|e| TriggerError::Feel(e.to_string()))?,
+                // Host-side trigger evaluation is off the replicated apply
+                // path, so it opts into the host clock explicitly (#1663).
+                Some(expr) => nanobpmn_engine_core::feel::with_host_env(|| {
+                    nanobpmn_engine_core::feel::eval_string(expr, &ctx)
+                })
+                .map_err(|e| TriggerError::Feel(e.to_string()))?,
                 None => String::new(),
             };
             Ok(EngineCall::Message {
@@ -679,8 +683,10 @@ fn eval_variables(
     let Some(expr) = expr else {
         return Ok(json!({}));
     };
-    let v = nanobpmn_engine_core::feel::eval(expr, ctx)
-        .map_err(|e| TriggerError::Feel(e.to_string()))?;
+    // Off the replicated apply path: explicit host-clock opt-in (#1663).
+    let v =
+        nanobpmn_engine_core::feel::with_host_env(|| nanobpmn_engine_core::feel::eval(expr, ctx))
+            .map_err(|e| TriggerError::Feel(e.to_string()))?;
     match nanobpmn_read_model::value_to_json(&v) {
         Json::Null => Ok(json!({})),
         obj @ Json::Object(_) => Ok(obj),

@@ -25,6 +25,14 @@ serde = { version = "1", optional = true, features = ["derive", "rc"] }
 # materializing a full JSON DOM per journal line (#1556 review).
 serde_json = { version = "1", optional = true, features = ["raw_value"] }
 
+# Pure-Rust libm (#1663, ADR 0066 audit #7): FEEL float transcendentals
+# (`log`, `exp`, `**`, decimal scaling) route through this instead of the
+# platform libm, which can differ by one ulp across OS/arch (glibc vs Apple
+# libm) and make Raft replicas diverge. Pinned exactly so a crate bump cannot
+# silently change results; `tests/feel_libm_golden.rs` guards the bits.
+# Zero dependencies, `no_std`, so the embeddable/wasm build is unaffected.
+libm = "=0.2.16"
+
 [dev-dependencies]
 # Used by the golden serde-drift guard test (`tests/golden_serde_drift.rs`,
 # issue #1069) to (de)serialize the checked-in golden fixtures. The guard only
