@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
     ProcessInstance, State, Value, encode_record_json,
 };
 use tokio::sync::oneshot;
@@ -416,13 +416,6 @@ pub struct Journal {
     /// resident set drops back within budget so the next overflow is caught
     /// immediately.
     spill_check_skip: u32,
-    /// Host-injected [`ClusterVariables`] handle shared with this journal's
-    /// engine. Held here (in addition to being installed on the engine) so it can
-    /// be re-installed whenever the engine is rebuilt from a snapshot — cluster
-    /// variables are external configuration, so a `from_snapshot`/replay engine
-    /// starts with an empty set and must be re-linked to the live host handle,
-    /// exactly as `lenient_completion` is preserved across a snapshot load.
-    cluster_variables: ClusterVariables,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -1253,7 +1246,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -1291,7 +1283,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -1328,10 +1319,6 @@ impl Journal {
         let lenient = self.engine.lenient_completion();
         self.engine = Engine::from_snapshot(snapshot);
         self.engine.set_lenient_completion(lenient);
-        // Cluster variables are host-injected external config, absent from the
-        // snapshot body: re-link the fresh engine to the live shared handle.
-        self.engine
-            .set_cluster_variables(self.cluster_variables.clone());
         // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
         // fresh engine and re-seed the dirty set so the next checkpoint rewrites
         // the full resident variable state into the authoritative store
@@ -1375,8 +1362,6 @@ impl Journal {
         let lenient = self.engine.lenient_completion();
         self.engine = engine;
         self.engine.set_lenient_completion(lenient);
-        self.engine
-            .set_cluster_variables(self.cluster_variables.clone());
         if self.varstore.is_some() {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
@@ -1460,7 +1445,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         })
     }
 
@@ -1502,7 +1486,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         };
         Ok((journal, recovery))
     }
@@ -1549,7 +1532,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -1591,7 +1573,6 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -3871,16 +3852,6 @@ impl Journal {
     /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
     pub fn set_lenient_completion(&mut self, lenient: bool) {
         self.engine.set_lenient_completion(lenient);
-    }
-
-    /// Installs the shared [`ClusterVariables`] handle on this journal and its
-    /// engine, so FEEL expressions evaluated during command processing resolve the
-    /// host's live global + per-tenant cluster variables. The handle is retained so
-    /// it can be re-installed after a snapshot restore (see
-    /// [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot)).
-    pub fn set_cluster_variables(&mut self, cluster_variables: ClusterVariables) {
-        self.cluster_variables = cluster_variables.clone();
-        self.engine.set_cluster_variables(cluster_variables);
     }
 
     /// The currently-held activation leases `(job_key, deadline)` on the
@@ -9317,6 +9288,60 @@ mod tests {
                 start + i
             );
         }
+    }
+
+    /// #1657: cluster variables are replicated engine state — a restart over
+    /// snapshot + journal tail recovers exactly the pre-restart set, kinds and
+    /// metadata included, with no host handle to re-link.
+    #[test]
+    fn cluster_variables_survive_snapshot_and_tail_recovery() {
+        use nanobpmn_engine_core::ClusterVariableKind;
+        let create = |name: &str, kind| Command::CreateClusterVariable {
+            tenant_id: None,
+            name: name.to_string(),
+            value: Value::Str("camunda.secrets.TOKEN".to_string()),
+            kind,
+            metadata: Default::default(),
+            distributed: false,
+        };
+        let dir = temp_dir_1556("cluster-vars");
+        let before = {
+            let (mut j, _) = Journal::open_segmented(&dir).unwrap();
+            let (_, c) = j
+                .apply_command_ref_at(create("inSnapshot", ClusterVariableKind::SecretReference), 1, None)
+                .unwrap();
+            c.blocking_wait();
+            let (snap, covered) = j.snapshot_and_rotate().unwrap();
+            crate::seglog::write_snapshot(&dir, snap, covered).unwrap();
+            // The tail: one more create and an update, after the snapshot.
+            let (_, c) = j
+                .apply_command_ref_at(create("inTail", ClusterVariableKind::Json), 2, None)
+                .unwrap();
+            c.blocking_wait();
+            let (_, c) = j
+                .apply_command_ref_at(
+                    Command::UpdateClusterVariable {
+                        tenant_id: None,
+                        name: "inSnapshot".to_string(),
+                        value: Value::Int(2),
+                        metadata: Default::default(),
+                    },
+                    3,
+                    None,
+                )
+                .unwrap();
+            c.blocking_wait();
+            j.engine().cluster_variables().clone()
+        };
+        assert_eq!(
+            before.get(None, "inSnapshot").map(|v| v.kind),
+            Some(ClusterVariableKind::SecretReference)
+        );
+
+        let (j, _) = Journal::open_segmented(&dir).unwrap();
+        assert_eq!(j.engine().cluster_variables(), &before);
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Untagged single-partition segmented log: a referenced direct command,

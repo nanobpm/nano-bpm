@@ -157,6 +157,10 @@ pub struct PeerLink {
     /// touching the independent Raft socket (#1582). The Raft lane is never
     /// aborted here: it self-terminates when the last sender clone drops.
     app_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// The capabilities the peer advertised in its `Welcome` on the app lane
+    /// (#1657): `None` until the frame arrives, then the advertised set (empty
+    /// for a peer predating capability advertisement).
+    features: Arc<tokio::sync::watch::Sender<Option<Vec<String>>>>,
 }
 
 /// Body of the synthetic reply delivered to a waiter whose lane closed (or was
@@ -221,6 +225,7 @@ impl PeerLink {
         // Present the shared cluster secret (ADR 0039) on the intra-cluster
         // handshake so the peer's authenticated `/cluster` channel admits us.
         let secret = nano_falcon_protocol::cluster_secret_from_env();
+        let features = Arc::new(tokio::sync::watch::channel(None).0);
         // App-forwarding traffic and Raft RPCs ride separate sockets so a backlog
         // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
         // election deadline (head-of-line isolation for the replication transport).
@@ -229,6 +234,7 @@ impl PeerLink {
             pending_app.clone(),
             app_connected.clone(),
             secret.as_deref(),
+            Some(features.clone()),
         )
         .await?;
         // Until ownership transfers to the returned `PeerLink`, the app lane's
@@ -243,6 +249,7 @@ impl PeerLink {
             pending_raft.clone(),
             raft_connected.clone(),
             secret.as_deref(),
+            None,
         )
         .await?;
 
@@ -255,6 +262,7 @@ impl PeerLink {
             app_connected,
             raft_connected,
             app_tasks: Arc::new(std::sync::Mutex::new(app_guard.disarm())),
+            features,
         })
     }
 
@@ -267,6 +275,7 @@ impl PeerLink {
         pending: Pending,
         connected: Arc<AtomicBool>,
         secret: Option<&str>,
+        features: Option<Arc<tokio::sync::watch::Sender<Option<Vec<String>>>>>,
     ) -> Result<(mpsc::Sender<Message>, [tokio::task::AbortHandle; 2]), PeerError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = ws_url
@@ -326,12 +335,12 @@ impl PeerLink {
                 match frame {
                     Ok(Message::Text(txt)) => {
                         if let Ok(sf) = serde_json::from_str::<ServerFrame>(&txt) {
-                            route_server_frame(sf, &reader_pending).await;
+                            route_server_frame(sf, &reader_pending, features.as_deref()).await;
                         }
                     }
                     Ok(Message::Binary(bin)) => {
                         if let Ok(sf) = serde_json::from_slice::<ServerFrame>(&bin) {
-                            route_server_frame(sf, &reader_pending).await;
+                            route_server_frame(sf, &reader_pending, features.as_deref()).await;
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
@@ -1101,6 +1110,40 @@ impl PeerLink {
         .await
     }
 
+    /// Whether the peer advertised `feature` in its `Welcome` (#1657). Waits
+    /// briefly for the `Welcome` of a freshly-dialed link; a peer that has not
+    /// announced within the window — or that predates capability
+    /// advertisement — is treated as NOT supporting it (fail closed).
+    pub async fn supports(&self, feature: &str) -> bool {
+        let mut rx = self.features.subscribe();
+        let announced = tokio::time::timeout(
+            fast_forward_timeout(),
+            rx.wait_for(|f| f.is_some()),
+        )
+        .await;
+        match announced {
+            Ok(Ok(f)) => f.as_ref().is_some_and(|f| f.iter().any(|x| x == feature)),
+            _ => false,
+        }
+    }
+
+    /// Applies a cluster-variable command (#1657) on global `partition`, which
+    /// the peer leads, through the peer's replicated funnel.
+    pub async fn apply_cluster_variable(
+        &self,
+        partition: u64,
+        command: nanobpmn_engine_core::Command,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ApplyClusterVariable {
+                corr,
+                partition,
+                command,
+            }
+        })
+        .await
+    }
+
     /// Forwards a by-key variable merge to the peer that owns the scope.
     pub async fn set_variables(
         &self,
@@ -1186,8 +1229,22 @@ impl PeerLink {
 
 /// Resolves a `CommandResult`/`InstanceCompleted` to its waiting request; other
 /// frames (job pushes, credits, heartbeats) are not used by the unary uplink.
-async fn route_server_frame(frame: ServerFrame, pending: &Pending) {
+async fn route_server_frame(
+    frame: ServerFrame,
+    pending: &Pending,
+    features: Option<&tokio::sync::watch::Sender<Option<Vec<String>>>>,
+) {
     match frame {
+        // The peer's capability advertisement (#1657): recorded so a gateway
+        // can gate feature-dependent frames/commands on it.
+        ServerFrame::Welcome {
+            features: advertised,
+            ..
+        } => {
+            if let Some(tx) = features {
+                tx.send_replace(Some(advertised));
+            }
+        }
         ServerFrame::CommandResult { corr, status, body } => {
             if let Some(tx) = pending.lock().await.remove(&corr) {
                 let _ = tx.send(PeerResult { status, body });
@@ -1607,6 +1664,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            features: Arc::new(tokio::sync::watch::channel(None).0),
         };
         // The stalled peer never answers; the inner deadline is far away, so
         // only the drop of the outer future can clean the entry up.
@@ -1653,6 +1711,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            features: Arc::new(tokio::sync::watch::channel(None).0),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1729,6 +1788,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            features: Arc::new(tokio::sync::watch::channel(None).0),
         };
         let frame = |corr| ClientFrame::RouteSubscription {
             corr,
@@ -1786,6 +1846,7 @@ mod tests {
             app_connected: Arc::new(AtomicBool::new(true)),
             raft_connected: Arc::new(AtomicBool::new(true)),
             app_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            features: Arc::new(tokio::sync::watch::channel(None).0),
         }
     }
 

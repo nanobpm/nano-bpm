@@ -520,6 +520,15 @@ components:
           type: integer
           format: int64
           description: Server heartbeat cadence in milliseconds.
+        features:
+          type: array
+          items:
+            type: string
+          description: >-
+            Capabilities this node supports (e.g. `cluster-variables-v1`).
+            Omitted when empty; a client may ignore it. Cluster peers use it
+            to gate feature-dependent intra-cluster frames during a rolling
+            upgrade.
 
     Job:
       type: object

@@ -650,6 +650,7 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
     conn.send(ServerFrame::Welcome {
         submission_credits: submission_window,
         heartbeat_ms: HEARTBEAT_MS,
+        features: LOCAL_FEATURES.iter().map(|f| f.to_string()).collect(),
     });
     conn.send(ServerFrame::SubmissionCredits {
         n: submission_window,
@@ -825,6 +826,7 @@ async fn handle_client_frame(
         ClientFrame::UpdateJob { .. } => "update_job",
         ClientFrame::ForwardAgentInstance { .. } => "forward_agent_instance",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
+        ClientFrame::ApplyClusterVariable { .. } => "apply_cluster_variable",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
         ClientFrame::GetByKey { .. } => "get_by_key",
@@ -1602,6 +1604,25 @@ async fn handle_client_frame(
                     .await
             })
             .await;
+        }
+        ClientFrame::ApplyClusterVariable {
+            corr,
+            partition,
+            command,
+        } => {
+            let reply = match server.apply_cluster_variable_local(partition, command).await {
+                Ok(record) => ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(serde_json::to_value(record).unwrap_or(Value::Null)),
+                },
+                Err((status, message)) => ServerFrame::CommandResult {
+                    corr,
+                    status,
+                    body: Some(Value::String(message)),
+                },
+            };
+            conn.send(reply);
         }
         ClientFrame::SetVariables {
             corr,
@@ -3949,6 +3970,7 @@ mod asyncapi_spec_guard {
             ServerFrame::Welcome {
                 submission_credits: 1,
                 heartbeat_ms: 1,
+                features: Vec::new(),
             },
             ServerFrame::Job {
                 job: serde_json::value::to_raw_value(&json!({})).unwrap(),

@@ -74,7 +74,7 @@ use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, AdHocActivateElement, AdHocJobResult, ClusterVariableSnapshot, ClusterVariables,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult,
     Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
     ProcessBuilder, ProcessDefinition, ProcessInstanceState, TaskListenerJobResult,
     UserTaskCorrections, Value, partition_of,
@@ -379,36 +379,19 @@ impl BatchOperationStore {
     }
 }
 
-/// #906 cluster-variables state (epic #903).
+/// #906 cluster-variables REST surface (epic #903), backed by REPLICATED engine
+/// state since #1657 (ADR 0066 option C).
 ///
 /// A cluster variable is an operator-managed value resolvable from FEEL at
 /// runtime. It is either **global** (visible to every tenant) or bound to a
-/// specific **tenant**; a global and a tenant variable may share a name without
-/// clashing, so the store keys each entry by `(tenant, name)` where `tenant` is
-/// `None` for global scope.
-///
-/// The store is the source of truth for the v2 `/cluster-variables` REST
-/// surface. Every mutation also refreshes `runtime` — the shared
-/// [`ClusterVariables`] snapshot the embedded engine overlays *underneath*
-/// instance variables during FEEL evaluation (see `engine-core`
-/// `overlay_cluster_variables`) — so REST state and runtime resolution never
-/// drift. The value is stored as an engine [`Value`] (not the JSON wire string),
-/// which is exactly what both the FEEL overlay and the REST projection need.
-#[derive(Clone)]
-pub struct ClusterVariableStore {
-    entries: Arc<std::sync::RwLock<ClusterVariableEntries>>,
-    runtime: ClusterVariables,
-}
-
-/// The stored entries plus a monotonic id counter. `by_key` is keyed by
-/// `(tenant, name)` (`None` tenant = global); `next_id` hands each entry a
-/// unique, stable id used as the search pagination cursor.
-#[derive(Default)]
-struct ClusterVariableEntries {
-    by_key: std::collections::HashMap<(Option<String>, String), StoredClusterVariable>,
-    next_id: u64,
-}
-
+/// specific **tenant**. The single source of truth is the engine's
+/// [`nanobpmn_engine_core::ClusterVariableState`], mutated only by the
+/// replicated `Create`/`Update`/`DeleteClusterVariable` commands: partition 0
+/// is authoritative (it validates — 409 / 404) and the resulting record is then
+/// fanned out to every other partition as an idempotent `distributed` copy, so
+/// each partition's FEEL resolution reads its own log-derived state and every
+/// replica of a partition agrees at every log position. There is no host-side
+/// store; the REST reads below project the engine state.
 /// A cluster variable's Camunda 8.10 metadata bag: string/number values keyed by
 /// name. Opaque to the engine (never overlaid into FEEL); stored and projected
 /// verbatim for the REST surface.
@@ -437,142 +420,277 @@ struct StoredClusterVariable {
     metadata: ClusterVariableMetadata,
 }
 
-impl ClusterVariableStore {
-    /// Builds a store backed by the shared runtime snapshot the engine reads for
-    /// FEEL resolution. The two stay in lock-step: every mutation rebuilds the
-    /// snapshot from the current entries.
-    fn new(runtime: ClusterVariables) -> Self {
+impl StoredClusterVariable {
+    /// Projects one engine-state cluster variable into the REST record.
+    fn from_engine(
+        tenant_id: Option<&str>,
+        name: &str,
+        v: &nanobpmn_engine_core::ClusterVariable,
+    ) -> Self {
         Self {
-            entries: Arc::new(std::sync::RwLock::new(ClusterVariableEntries::default())),
-            runtime,
+            id: v.id,
+            name: name.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            value: v.value.clone(),
+            kind: match v.kind {
+                nanobpmn_engine_core::ClusterVariableKind::Json => {
+                    models::ClusterVariableKindEnum::Json
+                }
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference => {
+                    models::ClusterVariableKindEnum::SecretReference
+                }
+            },
+            metadata: v
+                .metadata
+                .iter()
+                .filter_map(|(k, val)| {
+                    serde_json::from_value(value_to_json(val))
+                        .ok()
+                        .map(|m| (k.clone(), m))
+                })
+                .collect(),
         }
     }
+}
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, ClusterVariableEntries> {
-        self.entries.read().unwrap_or_else(|p| p.into_inner())
+/// The engine kind for a REST kind (`JSON` when the request omits it — Camunda
+/// 8.10: "Defaults to JSON if not specified").
+fn cluster_variable_engine_kind(
+    kind: Option<models::ClusterVariableKindEnum>,
+) -> nanobpmn_engine_core::ClusterVariableKind {
+    match kind {
+        Some(models::ClusterVariableKindEnum::SecretReference) => {
+            nanobpmn_engine_core::ClusterVariableKind::SecretReference
+        }
+        _ => nanobpmn_engine_core::ClusterVariableKind::Json,
+    }
+}
+
+/// The engine metadata bag for a REST metadata bag (string/number scalars).
+fn cluster_variable_engine_metadata(
+    metadata: &ClusterVariableMetadata,
+) -> std::collections::BTreeMap<String, Value> {
+    metadata
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                json_to_value(&serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
+            )
+        })
+        .collect()
+}
+
+/// The `(tenant, name)` a cluster-variable command addresses.
+fn cluster_variable_target(command: &Command) -> Option<(Option<String>, String)> {
+    match command {
+        Command::CreateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::UpdateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::DeleteClusterVariable {
+            tenant_id, name, ..
+        } => Some((tenant_id.clone(), name.clone())),
+        _ => None,
+    }
+}
+
+impl ServerImpl {
+    /// The local engine actor whose replicated state serves cluster-variable
+    /// reads: the authoritative partition 0 when hosted here, else any local
+    /// partition (each holds the fanned-out copy).
+    fn cluster_variable_read_handle(&self) -> &DeepthiHandle {
+        self.engine
+            .local_for_partition(0)
+            .unwrap_or_else(|| &self.engine.all()[0])
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, ClusterVariableEntries> {
-        self.entries.write().unwrap_or_else(|p| p.into_inner())
+    /// A clone of the replicated cluster-variable state (the REST read source).
+    async fn cluster_variable_state(&self) -> nanobpmn_engine_core::ClusterVariableState {
+        self.cluster_variable_read_handle()
+            .with(|j| j.engine().cluster_variables().clone())
+            .await
     }
 
-    /// Returns the stored variable for `(tenant, name)`, if any.
-    fn get(&self, tenant: Option<&str>, name: &str) -> Option<StoredClusterVariable> {
-        self.read()
-            .by_key
-            .get(&(tenant.map(str::to_string), name.to_string()))
-            .cloned()
+    /// Returns the variable for `(tenant, name)`, if any.
+    async fn cluster_variable_get(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> Option<StoredClusterVariable> {
+        let state = self.cluster_variable_state().await;
+        state
+            .get(tenant, name)
+            .map(|v| StoredClusterVariable::from_engine(tenant, name, v))
     }
 
-    /// Creates a new variable, returning a snapshot of the stored record taken
-    /// while the write lock is still held. Returns `None` (creating nothing)
-    /// when one already exists for `(tenant, name)` — the caller maps that to
-    /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
-    /// is race-free: a concurrent DELETE cannot make the caller's response
-    /// construction observe a missing record. `kind` defaults to `JSON` when the
-    /// request omits it (Camunda 8.10: "Defaults to JSON if not specified").
-    fn create(
+    /// Every cluster variable (for search).
+    async fn cluster_variable_all(&self) -> Vec<StoredClusterVariable> {
+        let state = self.cluster_variable_state().await;
+        state
+            .iter()
+            .map(|(t, n, v)| StoredClusterVariable::from_engine(t, n, v))
+            .collect()
+    }
+
+    /// Creates a variable: 409 when `(tenant, name)` already exists.
+    async fn cluster_variable_create(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         kind: Option<models::ClusterVariableKindEnum>,
         metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            if e.by_key.contains_key(&key) {
-                return None;
-            }
-            e.next_id += 1;
-            let id = e.next_id;
-            let stored = StoredClusterVariable {
-                id,
-                name: name.to_string(),
-                tenant_id: tenant.map(str::to_string),
-                value,
-                kind: kind.unwrap_or(models::ClusterVariableKindEnum::Json),
-                metadata,
-            };
-            e.by_key.insert(key, stored.clone());
-            stored
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::CreateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            kind: cluster_variable_engine_kind(kind),
+            metadata: cluster_variable_engine_metadata(&metadata),
+            distributed: false,
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after create".to_string()))
     }
 
-    /// Updates an existing variable's value and metadata in place, preserving
-    /// its id, and returns a snapshot of the updated record taken while the
-    /// write lock is still held. The metadata bag is REPLACED, not merged
-    /// (Camunda: an update that omits it clears it). Returns `None` when none
-    /// exists for `(tenant, name)` — the caller maps that to 404. Returning the
-    /// snapshot (rather than a separate post-mutation `get`) is race-free: a
-    /// concurrent DELETE cannot make the caller's response construction observe
-    /// a missing record.
-    fn update(
+    /// Replaces a variable's value and metadata (id and kind preserved): 404
+    /// when absent. An omitted metadata bag clears it (Camunda parity).
+    async fn cluster_variable_update(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            let entry = e.by_key.get_mut(&key)?;
-            entry.value = value;
-            entry.metadata = metadata;
-            entry.clone()
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::UpdateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            metadata: cluster_variable_engine_metadata(&metadata),
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after update".to_string()))
     }
 
-    /// Deletes a variable. Returns `false` when none exists — the caller maps
-    /// that to 404.
-    fn delete(&self, tenant: Option<&str>, name: &str) -> bool {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let removed = self.write().by_key.remove(&key).is_some();
-        if removed {
-            self.sync_runtime();
-        }
-        removed
+    /// Deletes a variable: 404 when absent.
+    async fn cluster_variable_delete(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> Result<(), (u16, String)> {
+        self.cluster_variable_mutate(Command::DeleteClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            distributed: false,
+        })
+        .await
+        .map(|_| ())
     }
 
-    /// Snapshots every stored variable (for search).
-    fn all(&self) -> Vec<StoredClusterVariable> {
-        self.read().by_key.values().cloned().collect()
-    }
-
-    /// Rebuilds the shared runtime snapshot from the current entries so the
-    /// engine's FEEL overlay reflects the latest state after every mutation.
-    fn sync_runtime(&self) {
-        let mut snap = ClusterVariableSnapshot::default();
-        for entry in self.read().by_key.values() {
-            match &entry.tenant_id {
-                None => {
-                    snap.global.insert(entry.name.clone(), entry.value.clone());
-                    if entry.kind == models::ClusterVariableKindEnum::SecretReference {
-                        snap.global_secret_references.insert(entry.name.clone());
-                    }
-                }
-                Some(tenant) => {
-                    snap.tenants
-                        .entry(tenant.clone())
-                        .or_default()
-                        .insert(entry.name.clone(), entry.value.clone());
-                    if entry.kind == models::ClusterVariableKindEnum::SecretReference {
-                        snap.tenant_secret_references
-                            .entry(tenant.clone())
-                            .or_default()
-                            .insert(entry.name.clone());
-                    }
-                }
+    /// The single cluster-variable write funnel (#1657). Applies `command` on
+    /// the authoritative partition 0 (which validates), then fans the
+    /// resulting record out to every other partition as an idempotent
+    /// `distributed` upsert / delete, each through that partition's replicated
+    /// command path. Returns the post-apply record (`None` once deleted).
+    ///
+    /// Rolling-upgrade gate (ADR 0066): the new command variants are Raft
+    /// entries an older binary cannot decode, so nothing is emitted unless
+    /// every peer advertises [`falcon::FEATURE_CLUSTER_VARIABLES`]; otherwise
+    /// the write fails closed with 503 and no partition is touched. Writes from
+    /// this gateway are serialized so its fan-outs never interleave.
+    async fn cluster_variable_mutate(
+        &self,
+        command: Command,
+    ) -> Result<Option<StoredClusterVariable>, (u16, String)> {
+        let _serialized = self.cluster_variable_writes.lock().await;
+        for node in self.engine.peer_nodes() {
+            let link = self.peer_link(node).await.map_err(|(_, m)| {
+                (
+                    503,
+                    format!("cluster variables unavailable: peer {node} unreachable: {m}"),
+                )
+            })?;
+            if !link.supports(falcon::FEATURE_CLUSTER_VARIABLES).await {
+                return Err((
+                    503,
+                    format!(
+                        "cluster variables unavailable: peer {node} does not support \
+                         replicated cluster variables yet (rolling upgrade in progress)"
+                    ),
+                ));
             }
         }
-        let mut guard = self.runtime.write().unwrap_or_else(|p| p.into_inner());
-        *guard = std::sync::Arc::new(snap);
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (500, "not a cluster-variable command".to_string()))?;
+        let record = self.apply_cluster_variable_on(0, command).await?;
+        let copy = match &record {
+            Some(v) => Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: v.value.clone(),
+                kind: v.kind,
+                metadata: v.metadata.clone(),
+                distributed: true,
+            },
+            None => Command::DeleteClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                distributed: true,
+            },
+        };
+        for p in 1..self.engine.partition_count() as u64 {
+            self.apply_cluster_variable_on(p, copy.clone()).await?;
+        }
+        Ok(record.map(|v| StoredClusterVariable::from_engine(tenant.as_deref(), &name, &v)))
+    }
+
+    /// Applies a cluster-variable command on global partition `p`: locally
+    /// when this node leads it, else forwarded to the leader.
+    async fn apply_cluster_variable_on(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let Some(node) = self.route_by_leader(key) else {
+            return self.apply_cluster_variable_local(p, command).await;
+        };
+        let link = self.peer_link(node).await?;
+        match link.apply_cluster_variable(p, command).await {
+            Ok(r) if r.status == 200 => serde_json::from_value(r.body.unwrap_or_default())
+                .map_err(|e| (502, format!("malformed cluster-variable reply: {e}"))),
+            Ok(r) => Err((r.status, peer_detail(&r))),
+            Err(e) => Err((503, e.to_string())),
+        }
+    }
+
+    /// Applies a cluster-variable command on local partition `p` through its
+    /// replicated funnel and returns the post-apply record. Also the handler
+    /// behind the intra-cluster `ApplyClusterVariable` frame.
+    pub(crate) async fn apply_cluster_variable_local(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (400, "not a cluster-variable command".to_string()))?;
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let _ = self.apply_partition_command(key, command).await?;
+        let handle = self
+            .engine
+            .local_for_partition(p)
+            .ok_or_else(|| (503, format!("partition {p} is not hosted here")))?;
+        Ok(handle
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(tenant.as_deref(), &name)
+                    .cloned()
+            })
+            .await)
     }
 }
 
@@ -640,6 +758,18 @@ fn cluster_variable_kind(v: &StoredClusterVariable) -> models::ClusterVariableKi
     v.kind
 }
 
+/// The 500 `ProblemDetail` for a cluster-variable write that failed for a
+/// reason other than its documented 404 / 409 (e.g. a peer that cannot yet take
+/// the replicated commands during a rolling upgrade, or a quorum loss). The
+/// underlying status is kept in the detail.
+fn cluster_variable_internal((status, detail): (u16, String)) -> models::ProblemDetail {
+    problem(
+        "Cluster variable write failed",
+        500,
+        format!("({status}) {detail}"),
+    )
+}
+
 /// Validates a create/update metadata bag against the serialized-size cap
 /// ([`CLUSTER_VARIABLE_MAX_METADATA_BYTES`]); the 100-entry cap is enforced by
 /// the generated `maxProperties` validator before the handler runs. An omitted
@@ -681,15 +811,14 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) = self
-            .cluster_variables
-            .create(None, &body.name, value, body.kind, metadata)
+        match self
+            .cluster_variable_create(None, &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
+            )),
+            Err((409, _)) => Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
                 problem(
                     "Cluster variable already exists",
                     409,
@@ -698,7 +827,10 @@ impl ServerImpl {
                         body.name
                     ),
                 ),
-            ))
+            )),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -717,15 +849,14 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .create(Some(tenant), &body.name, value, body.kind, metadata)
+        match self
+            .cluster_variable_create(Some(tenant), &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(
+            )),
+            Err((409, _)) => Ok(
                 Resp::Status409_AClusterVariableWithThisNameAlreadyExistsForTheGivenTenant(
                     problem(
                         "Cluster variable already exists",
@@ -736,7 +867,10 @@ impl ServerImpl {
                         ),
                     ),
                 ),
-            )
+            ),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -753,19 +887,21 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(None, &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(None, &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -784,22 +920,24 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(Some(tenant), &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(Some(tenant), &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -810,7 +948,7 @@ impl ServerImpl {
         path_params: &models::GetGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::GetGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::GetGlobalClusterVariableResponse as Resp;
-        match self.cluster_variables.get(None, &path_params.name) {
+        match self.cluster_variable_get(None, &path_params.name).await {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -830,7 +968,10 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::GetTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::GetTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        match self.cluster_variables.get(Some(tenant), &path_params.name) {
+        match self
+            .cluster_variable_get(Some(tenant), &path_params.name)
+            .await
+        {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -852,14 +993,16 @@ impl ServerImpl {
         path_params: &models::DeleteGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::DeleteGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Resp;
-        if self.cluster_variables.delete(None, &path_params.name) {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+        match self.cluster_variable_delete(None, &path_params.name).await {
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -871,20 +1014,22 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::DeleteTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        if self
-            .cluster_variables
-            .delete(Some(tenant), &path_params.name)
+        match self
+            .cluster_variable_delete(Some(tenant), &path_params.name)
+            .await
         {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                cluster_variable_internal(e),
+            )),
         }
     }
 
@@ -905,8 +1050,8 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
 
         let mut matched: Vec<StoredClusterVariable> = self
-            .cluster_variables
-            .all()
+            .cluster_variable_all()
+            .await
             .into_iter()
             .filter(|v| match filter {
                 None => true,
@@ -970,47 +1115,47 @@ mod cluster_variable_tests {
 
     use super::*;
 
-    fn store() -> ClusterVariableStore {
-        ClusterVariableStore::new(ClusterVariables::default())
+    fn store() -> ServerImpl {
+        ServerImpl::default()
     }
 
     fn val(j: serde_json::Value) -> Value {
         json_to_value(&j)
     }
 
-    #[test]
-    fn create_rejects_a_duplicate_scope_and_name() {
+    #[tokio::test]
+    async fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
         // Same (scope, name) again -> false, which the handler maps to 409.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("APAC")),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_none()
         );
         // The rejected create left the stored value untouched.
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(&s.cluster_variable_get(None, "region").await.unwrap().value),
             "\"EMEA\""
         );
     }
 
-    #[test]
-    fn create_and_update_return_a_race_free_snapshot() {
+    #[tokio::test]
+    async fn create_and_update_return_a_race_free_snapshot() {
         // Regression: the create/update handlers used to re-`get` the record
         // after releasing the mutation lock, so a concurrent DELETE between the
         // mutation and the lookup made `expect("just created"/"just updated")`
@@ -1019,14 +1164,13 @@ mod cluster_variable_tests {
         // second lookup that a delete could lose.
         let s = store();
 
-        let created = s
-            .create(
+        let created = s.cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new(),
-            )
+            ).await.ok()
             .expect("create of a fresh (scope, name) returns the stored snapshot");
         assert_eq!(created.name, "region");
         assert_eq!(created.tenant_id.as_deref(), Some("acme"));
@@ -1034,203 +1178,264 @@ mod cluster_variable_tests {
 
         // A delete landing right after the mutation cannot invalidate the
         // snapshot already returned to the handler.
-        assert!(s.delete(Some("acme"), "region"));
-        assert!(s.get(Some("acme"), "region").is_none());
+        assert!(s.cluster_variable_delete(Some("acme"), "region").await.is_ok());
+        assert!(s.cluster_variable_get(Some("acme"), "region").await.is_none());
         assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
 
         // Update returns its own post-mutation snapshot the same way.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "flag",
                 val(json!(false)),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
-        let updated = s
-            .update(
+        let updated = s.cluster_variable_update(
                 None,
                 "flag",
                 val(json!(true)),
                 ClusterVariableMetadata::new(),
-            )
+            ).await.ok()
             .expect("update of an existing (scope, name) returns the stored snapshot");
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
-        assert!(s.delete(None, "flag"));
+        assert!(s.cluster_variable_delete(None, "flag").await.is_ok());
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
     }
 
-    #[test]
-    fn global_and_tenant_scopes_are_isolated() {
+    #[tokio::test]
+    async fn global_and_tenant_scopes_are_isolated() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("global")),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("acme")),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
-        assert_eq!(s.all().len(), 2);
+        assert_eq!(s.cluster_variable_all().await.len(), 2);
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(&s.cluster_variable_get(None, "region").await.unwrap().value),
             "\"global\""
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(Some("acme"), "region").unwrap().value),
+            cluster_variable_value_string(&s.cluster_variable_get(Some("acme"), "region").await.unwrap().value),
             "\"acme\""
         );
         // A lookup never crosses scopes.
-        assert!(s.get(Some("other"), "region").is_none());
+        assert!(s.cluster_variable_get(Some("other"), "region").await.is_none());
     }
 
-    #[test]
-    fn update_requires_an_existing_entry() {
+    #[tokio::test]
+    async fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
         assert!(
-            s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()).await.ok()
                 .is_none()
         );
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "ghost",
                 val(json!(1)),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
         assert!(
-            s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()).await.ok()
                 .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
+            cluster_variable_value_string(&s.cluster_variable_get(None, "ghost").await.unwrap().value),
             "2"
         );
     }
 
-    #[test]
-    fn delete_reports_absence() {
+    #[tokio::test]
+    async fn delete_reports_absence() {
         let s = store();
-        assert!(!s.delete(None, "nope"));
+        assert!(!s.cluster_variable_delete(None, "nope").await.is_ok());
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "nope",
                 val(json!(true)),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
-        assert!(s.delete(None, "nope"));
-        assert!(s.get(None, "nope").is_none());
+        assert!(s.cluster_variable_delete(None, "nope").await.is_ok());
+        assert!(s.cluster_variable_get(None, "nope").await.is_none());
     }
 
-    #[test]
-    fn empty_object_value_round_trips() {
+    #[tokio::test]
+    async fn empty_object_value_round_trips() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "cfg",
                 val(json!({})),
                 None,
                 ClusterVariableMetadata::new()
-            )
+            ).await.ok()
             .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
+            cluster_variable_value_string(&s.cluster_variable_get(None, "cfg").await.unwrap().value),
             "{}"
         );
     }
 
-    #[test]
-    fn mutations_sync_the_shared_runtime_snapshot() {
-        let runtime = ClusterVariables::default();
-        let s = ClusterVariableStore::new(runtime.clone());
-        s.create(
-            None,
-            "region",
-            val(json!("EMEA")),
-            None,
-            ClusterVariableMetadata::new(),
+    /// #1657: a REST mutation is a replicated command on EVERY partition —
+    /// the authoritative partition 0 plus an idempotent copy on each other one
+    /// — so each partition's FEEL resolution reads the same log-derived state
+    /// (no node-local host store), and a delete clears every copy.
+    #[tokio::test]
+    async fn mutations_land_in_every_partition_engine_state() {
+        let s = build_server_in_memory(
+            vec![Journal::in_memory_partition(0), Journal::in_memory_partition(1)],
+            cluster::Topology::single(2),
         );
-        s.create(
-            Some(DEFAULT_TENANT),
-            "tier",
-            val(json!(2)),
-            None,
-            ClusterVariableMetadata::new(),
+        assert!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
         );
-        {
-            let snap = runtime.read().unwrap();
-            assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
+        assert!(
+            s.cluster_variable_create(
+                Some(DEFAULT_TENANT),
+                "tier",
+                val(json!(2)),
+                Some(models::ClusterVariableKindEnum::SecretReference),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            s.cluster_variable_update(
+                None,
+                "region",
+                val(json!("APAC")),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        let states: Vec<_> = futures_util::future::join_all(
+            s.engine
+                .all()
+                .iter()
+                .map(|h| h.with(|j| j.engine().cluster_variables().clone())),
+        )
+        .await;
+        assert_eq!(states.len(), 2);
+        for state in &states {
             assert_eq!(
-                snap.tenants.get(DEFAULT_TENANT).and_then(|m| m.get("tier")),
-                Some(&val(json!(2)))
+                state.get(None, "region").map(|v| v.value.clone()),
+                Some(val(json!("APAC")))
+            );
+            let tier = state.get(Some(DEFAULT_TENANT), "tier").expect("fanned out");
+            assert_eq!(tier.value, val(json!(2)));
+            assert_eq!(
+                tier.kind,
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+                "the kind is replicated with the value"
             );
         }
-        s.delete(None, "region");
-        assert!(!runtime.read().unwrap().global.contains_key("region"));
+        // The fanned-out copy is never a 409 source: a second create is
+        // validated only on the authoritative partition.
+        assert_eq!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .0,
+            409
+        );
+        assert!(s.cluster_variable_delete(None, "region").await.is_ok());
+        for h in s.engine.all() {
+            assert!(
+                h.with(|j| j.engine().cluster_variables().get(None, "region").is_none())
+                    .await
+            );
+        }
+        assert_eq!(
+            s.cluster_variable_delete(None, "region").await.unwrap_err().0,
+            404
+        );
     }
 
-    #[test]
-    fn result_projection_reports_scope_and_tenant() {
+    #[tokio::test]
+    async fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(
+        s.cluster_variable_create(
             None,
             "g",
             val(json!("x")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        s.create(
+        ).await.ok();
+        s.cluster_variable_create(
             Some("acme"),
             "t",
             val(json!("y")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        let g = cluster_variable_result(&s.get(None, "g").unwrap());
+        ).await.ok();
+        let g = cluster_variable_result(&s.cluster_variable_get(None, "g").await.unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
         assert_eq!(g.value, "\"x\"");
-        let t = cluster_variable_result(&s.get(Some("acme"), "t").unwrap());
+        let t = cluster_variable_result(&s.cluster_variable_get(Some("acme"), "t").await.unwrap());
         assert_eq!(t.scope, models::ClusterVariableScopeEnum::Tenant);
         assert_eq!(t.tenant_id, types::Nullable::Present("acme".to_string()));
     }
 
-    #[test]
-    fn search_result_truncates_long_values() {
+    #[tokio::test]
+    async fn search_result_truncates_long_values() {
         let s = store();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        s.create(
+        s.cluster_variable_create(
             None,
             "big",
             val(json!(long)),
             None,
             ClusterVariableMetadata::new(),
-        );
-        let stored = s.get(None, "big").unwrap();
+        ).await.ok();
+        let stored = s.cluster_variable_get(None, "big").await.unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
     }
@@ -1375,7 +1580,7 @@ mod cluster_variable_tests {
             Create::Status400_TheProvidedDataIsNotValid(_)
         ));
         assert!(
-            server.cluster_variables.get(None, "big").is_none(),
+            server.cluster_variable_get(None, "big").await.is_none(),
             "nothing stored"
         );
         assert!(matches!(
@@ -1397,7 +1602,7 @@ mod cluster_variable_tests {
         ));
         assert_eq!(
             cluster_variable_value_string(
-                &server.cluster_variables.get(None, "small").unwrap().value
+                &server.cluster_variable_get(None, "small").await.unwrap().value
             ),
             "\"v\"",
             "a rejected update leaves the variable untouched"
@@ -1462,13 +1667,13 @@ mod cluster_variable_tests {
             models::ClusterVariableKindEnum::SecretReference
         );
 
-        // The runtime FEEL overlay carries the reference text through
+        // The replicated engine state carries the reference text through
         // unchanged — nothing resolved is ever handed to the engine.
-        let snap = server.cluster_variables.runtime.read().unwrap();
+        let state = server.cluster_variable_state().await;
         assert_eq!(
-            snap.global.get("api_token"),
-            Some(&val(json!("camunda.secrets.API_TOKEN"))),
-            "the engine overlay sees the reference text verbatim"
+            state.get(None, "api_token").map(|v| v.value.clone()),
+            Some(val(json!("camunda.secrets.API_TOKEN"))),
+            "the engine state sees the reference text verbatim"
         );
     }
 
@@ -1635,7 +1840,7 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn job_activation_uses_mapping_time_provenance_not_live_cluster_variables() {
         let server = secret_job_server("DIRECT").await;
-        assert!(server.cluster_variables.delete(None, "apiCfg"));
+        assert!(server.cluster_variable_delete(None, "apiCfg").await.is_ok());
         let jobs = activate_secret_jobs(&server).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].variables["token"].0, json!("s3cr3t"));
@@ -1696,13 +1901,13 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_kind_filter_distinguishes_secret_references() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
+        server.cluster_variable_create(
             None,
             "plain",
             val(json!(1)),
             None,
             ClusterVariableMetadata::new(),
-        );
+        ).await.ok();
         let mut req = create_req("token", None);
         req.value = types::Object(json!("camunda.secrets.TOKEN"));
         req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
@@ -1746,27 +1951,27 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_kind_and_metadata() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
+        server.cluster_variable_create(
             None,
             "a",
             val(json!(1)),
             None,
             meta(json!({"owner": "team-a", "ttl": 30})),
-        );
-        server.cluster_variables.create(
+        ).await.ok();
+        server.cluster_variable_create(
             None,
             "b",
             val(json!(2)),
             None,
             meta(json!({"owner": "team-b", "ttl": "30"})),
-        );
-        server.cluster_variables.create(
+        ).await.ok();
+        server.cluster_variable_create(
             None,
             "c",
             val(json!(3)),
             None,
             ClusterVariableMetadata::new(),
-        );
+        ).await.ok();
 
         let kind =
             |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
@@ -1834,27 +2039,27 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
+        server.cluster_variable_create(
             None,
             "region",
             val(json!("global")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
+        ).await.ok();
+        server.cluster_variable_create(
             Some("acme"),
             "region",
             val(json!("acme")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
+        ).await.ok();
+        server.cluster_variable_create(
             Some("beta"),
             "tier",
             val(json!(2)),
             None,
             ClusterVariableMetadata::new(),
-        );
+        ).await.ok();
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -1903,20 +2108,20 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server.cluster_variables.create(
+        server.cluster_variable_create(
             None,
             "big",
             val(json!(long)),
             None,
             ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
+        ).await.ok();
+        server.cluster_variable_create(
             None,
             "small",
             val(json!("x")),
             None,
             ClusterVariableMetadata::new(),
-        );
+        ).await.ok();
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -1964,13 +2169,13 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server.cluster_variables.create(
+            server.cluster_variable_create(
                 None,
                 n,
                 val(json!(n)),
                 None,
                 ClusterVariableMetadata::new(),
-            );
+            ).await.ok();
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -3188,9 +3393,10 @@ pub struct ServerImpl {
     /// Batch-operations read model (#905). Empty until that slice fills it.
     #[allow(dead_code)]
     batch_operations: BatchOperationStore,
-    /// Cluster-variables store, global + per-tenant (#906). Empty until that slice fills it.
-    #[allow(dead_code)]
-    cluster_variables: ClusterVariableStore,
+    /// Serializes this gateway's cluster-variable writes (#1657) so the
+    /// authoritative apply and its per-partition fan-out of one write never
+    /// interleave with another's. The state itself lives in the engine.
+    cluster_variable_writes: Arc<tokio::sync::Mutex<()>>,
     /// The secret provider trusted `camunda.secrets.<name>` references resolve
     /// against at job activation (#1640, env-pointer store — ADR 0027 §5).
     secret_store: Arc<dyn secrets::SecretStore>,
@@ -3653,18 +3859,12 @@ impl ServerImpl {
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
         let owned_count = journals.len();
-        // Shared cluster-variable handle: one snapshot the gateway's REST layer
-        // mutates and every owned engine reads while resolving FEEL expressions.
-        // Installed on each journal before it is moved onto its engine thread; the
-        // same handle backs `ServerImpl.cluster_variables` below.
-        let cluster_variables = ClusterVariables::default();
         let handles: Vec<DeepthiHandle> = journals
             .into_iter()
             .enumerate()
-            .map(|(i, mut journal)| {
+            .map(|(i, journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
                 let partition = journal.partition_id();
-                journal.set_cluster_variables(cluster_variables.clone());
                 DeepthiHandle::spawn(journal, partition, ctrl)
             })
             .collect();
@@ -3763,7 +3963,7 @@ impl ServerImpl {
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
             batch_operations: BatchOperationStore::default(),
-            cluster_variables: ClusterVariableStore::new(cluster_variables),
+            cluster_variable_writes: Arc::new(tokio::sync::Mutex::new(())),
             secret_store: Arc::new(secrets::EnvSecretStore::from_env()),
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
@@ -23778,20 +23978,20 @@ fn next_stateless_key() -> u64 {
 /// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
 /// durable keys.
 impl ServerImpl {
-    /// One immutable snapshot of every cluster variable, captured under a single
-    /// lock acquisition so the values an expression evaluates against and the
-    /// kinds its provenance is derived from are always consistent (#1296). The
-    /// overlay for a tenant layers globals first, then that tenant's variables
-    /// (which shadow a same-named global), matching the engine's resolution.
+    /// One immutable snapshot of every cluster variable, read from the
+    /// replicated engine state in a single actor turn (#1657), so the values an
+    /// expression evaluates against and the kinds its provenance is derived
+    /// from are always consistent (#1296). The overlay for a tenant layers
+    /// globals first, then that tenant's variables (which shadow a same-named
+    /// global), matching the engine's resolution.
     #[allow(clippy::type_complexity)]
-    fn cluster_variable_snapshot(
+    async fn cluster_variable_snapshot(
         &self,
     ) -> (
         std::collections::HashMap<String, Value>,
         std::collections::HashMap<String, models::ClusterVariableKindEnum>,
         std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
     ) {
-        let entries = self.cluster_variables.read();
         let mut globals: std::collections::HashMap<String, Value> = Default::default();
         let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
             Default::default();
@@ -23799,7 +23999,7 @@ impl ServerImpl {
             String,
             Vec<(String, Value, models::ClusterVariableKindEnum)>,
         > = Default::default();
-        for v in entries.by_key.values() {
+        for v in self.cluster_variable_all().await {
             match &v.tenant_id {
                 None => {
                     globals.insert(v.name.clone(), v.value.clone());
@@ -23829,7 +24029,7 @@ impl ServerImpl {
         // kinds together, under a single lock) so the evaluated values and the
         // provenance derived from them can never race a concurrent
         // create/update/delete (#1296).
-        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot();
+        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot().await;
 
         // The request body's `variables` are the topmost context: these
         // endpoints are stateless, so no process-instance / element-instance
@@ -52240,13 +52440,15 @@ mod expression_conditional_tests {
         let srv = server();
         // A JSON-kind cluster variable carrying a reference-shaped string is
         // NOT a trusted source.
-        srv.cluster_variables.create(
+        srv.cluster_variable_create(
             None,
             "plain_ref",
             super::json_to_value(&serde_json::json!("camunda.secrets.UNTRUSTED")),
             None,
             super::ClusterVariableMetadata::new(),
-        );
+        )
+        .await
+        .expect("create plain_ref");
         // A SECRET_REFERENCE-kind cluster variable IS trusted when read.
         let mut req = models::CreateClusterVariableRequest {
             name: "token_ref".to_string(),

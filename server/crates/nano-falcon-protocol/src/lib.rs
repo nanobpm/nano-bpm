@@ -945,7 +945,31 @@ pub enum ClientFrame {
         joint_suspected: bool,
         reason: String,
     },
+    /// **Intra-cluster only.** Applies a cluster-variable command (#1657 —
+    /// `Create`/`Update`/`DeleteClusterVariable`) on global partition
+    /// `partition`, which the receiving node leads, through its replicated
+    /// funnel. Sent only once every peer advertises
+    /// [`FEATURE_CLUSTER_VARIABLES`] (ADR 0066 rolling-upgrade gate). Answered
+    /// by a `CommandResult`: 200 carrying the post-apply variable record (JSON,
+    /// or `null` once deleted), or the engine rejection's status (409 / 404).
+    #[serde(rename_all = "camelCase")]
+    ApplyClusterVariable {
+        corr: u64,
+        partition: u64,
+        command: nanobpmn_engine_core::Command,
+    },
 }
+
+/// The capability a node advertises (in [`ServerFrame::Welcome`]) once it can
+/// decode and apply the replicated cluster-variable commands and events
+/// (#1657). Those Raft entries are not decodable by an older binary, so a
+/// gateway emits them only when every peer advertises this (ADR 0066,
+/// rolling-upgrade row).
+pub const FEATURE_CLUSTER_VARIABLES: &str = "cluster-variables-v1";
+
+/// Every capability this build advertises on connect — the single source the
+/// `Welcome` frame and the gate both read.
+pub const LOCAL_FEATURES: &[&str] = &[FEATURE_CLUSTER_VARIABLES];
 
 impl ClientFrame {
     /// Whether this frame belongs to the **public client protocol** (the surface
@@ -1046,6 +1070,11 @@ pub enum ServerFrame {
     Welcome {
         submission_credits: i64,
         heartbeat_ms: u64,
+        /// Capabilities this node supports ([`LOCAL_FEATURES`]). Additive: a
+        /// peer predating the field decodes as empty — i.e. advertises none,
+        /// which keeps every feature-gated frame/command off the wire to it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// A pushed activated job (consumes one job-delivery credit). `job` is the
     /// same shape as a REST `ActivatedJobResult`, carried as a pre-serialized raw
