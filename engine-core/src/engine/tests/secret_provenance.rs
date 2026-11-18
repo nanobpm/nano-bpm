@@ -346,7 +346,11 @@ fn a_sibling_scope_write_preserves_provenance() {
 #[test]
 fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
     let (mut engine, handle) = engine_with_cluster_vars();
-    let (_, log) = run(&mut engine, task(vec![m("=apiCfg", "token")]), HashMap::new());
+    let (_, log) = run(
+        &mut engine,
+        task(vec![m("=apiCfg", "token")]),
+        HashMap::new(),
+    );
     let inst = log
         .iter()
         .find_map(|e| match e {
@@ -360,13 +364,17 @@ fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
     engine.pinned_cluster_variables = Some(engine.read_cluster_snapshot());
     let vars = engine.variables_for_element(inst, 0);
     // Inject the retype between the two reads.
-    let mut retyped = ClusterVariableSnapshot::default();
-    retyped.global = handle.read().unwrap().global.clone();
-    retyped.global_secret_references = ["apiCfg", "jsonCfg"].map(String::from).into();
+    let retyped = ClusterVariableSnapshot {
+        global: handle.read().unwrap().global.clone(),
+        global_secret_references: ["apiCfg", "jsonCfg"].map(String::from).into(),
+        ..ClusterVariableSnapshot::default()
+    };
     *handle.write().unwrap() = StdArc::new(retyped);
 
     // Pinned: trust is read from the snapshot `vars` came from -> untrusted.
-    assert!(engine.secret_provenance_of(inst, &vars, &mappings).is_empty());
+    assert!(engine
+        .secret_provenance_of(inst, &vars, &mappings)
+        .is_empty());
     // The pre-fix behaviour (a fresh read of kinds) WOULD have trusted it —
     // proving the injected retype is real.
     engine.pinned_cluster_variables = None;
@@ -382,6 +390,10 @@ fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
 #[test]
 fn apply_command_unpins_the_cluster_snapshot() {
     let (mut engine, _) = engine_with_cluster_vars();
-    run(&mut engine, task(vec![m("=apiCfg", "token")]), HashMap::new());
+    run(
+        &mut engine,
+        task(vec![m("=apiCfg", "token")]),
+        HashMap::new(),
+    );
     assert!(engine.pinned_cluster_variables.is_none());
 }

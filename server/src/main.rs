@@ -20766,6 +20766,7 @@ impl ServerImpl {
                             a.job.lease_token.clone(),
                             0,
                             missing.incident_message(),
+                            0,
                         )
                         .await
                     {
