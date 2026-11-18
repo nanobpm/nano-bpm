@@ -1092,10 +1092,26 @@ pub fn sort_keys<S>(
 /// A value to sort by: numeric keys sort numerically, everything else
 /// lexicographically. Numbers always sort before strings (they never mix in
 /// practice).
-#[derive(PartialEq, Eq)]
+/// A projected sort value. Ordering (ascending): [`SortVal::Null`] (an absent
+/// value) first, then numbers, then strings. `Num` is `i128` so every `u64`
+/// entity key (the full key space, incl. keys above `i64::MAX`) and every `i64`
+/// timestamp — pre-epoch included — orders numerically without wrapping, and
+/// absence never collides with a real value (#1298).
+#[derive(PartialEq, Eq, Debug)]
 pub enum SortVal {
-    Num(i64),
+    Null,
+    Num(i128),
     Str(String),
+}
+
+impl SortVal {
+    fn rank(&self) -> u8 {
+        match self {
+            SortVal::Null => 0,
+            SortVal::Num(_) => 1,
+            SortVal::Str(_) => 2,
+        }
+    }
 }
 
 impl PartialOrd for SortVal {
@@ -1106,14 +1122,39 @@ impl PartialOrd for SortVal {
 
 impl Ord for SortVal {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
         match (self, other) {
             (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
             (SortVal::Str(a), SortVal::Str(b)) => a.cmp(b),
-            (SortVal::Num(_), SortVal::Str(_)) => Ordering::Less,
-            (SortVal::Str(_), SortVal::Num(_)) => Ordering::Greater,
+            _ => self.rank().cmp(&other.rank()),
         }
     }
+}
+
+/// Sort value for a string-typed entity key (decimal `u64` rendered as a
+/// string): numeric over the full `u64` range when it parses, so keys order
+/// numerically rather than lexicographically; an empty key is absent
+/// ([`SortVal::Null`]); any other string sorts after every number.
+pub fn key_sort_val(key: &str) -> SortVal {
+    if key.is_empty() {
+        return SortVal::Null;
+    }
+    key.parse::<u64>().map_or_else(
+        |_| SortVal::Str(key.to_string()),
+        |k| SortVal::Num(i128::from(k)),
+    )
+}
+
+/// Sort value for an optional timestamp/number/key: absent is
+/// [`SortVal::Null`] (before every present value ascending, including negative
+/// / pre-epoch values).
+pub fn opt_num_sort_val<T: Into<i128>>(v: Option<T>) -> SortVal {
+    v.map_or(SortVal::Null, |n| SortVal::Num(n.into()))
+}
+
+/// Sort value for an optional string: absent is [`SortVal::Null`] (before
+/// every present string ascending, including the empty string).
+pub fn opt_str_sort_val(v: Option<&str>) -> SortVal {
+    v.map_or(SortVal::Null, |s| SortVal::Str(s.to_string()))
 }
 
 /// Stably sorts `items` by the given sort keys, breaking ties by entity key so
@@ -1355,6 +1396,30 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_keys_sort_numerically_and_absent_values_first() {
+        // "9" < "10" numerically, though not lexicographically (#1298).
+        assert!(key_sort_val("9") < key_sort_val("10"));
+        assert!(key_sort_val("10") < key_sort_val("not-a-key"));
+        assert!(opt_num_sort_val::<i64>(None) < opt_num_sort_val(Some(0)));
+        // Full u64 key space: across the i64 signed boundary and with unequal
+        // lengths in the upper half, keys still order numerically (#1298).
+        let max_i64 = i64::MAX.to_string();
+        assert!(key_sort_val(&max_i64) < key_sort_val("9223372036854775808"));
+        assert!(key_sort_val("9223372036854775809") < key_sort_val("10000000000000000000"));
+        assert!(key_sort_val("10000000000000000000") < key_sort_val(&u64::MAX.to_string()));
+        assert!(key_sort_val(&u64::MAX.to_string()) < key_sort_val("not-a-key"));
+        // Absence is distinct from every value: an empty key sorts before any
+        // numeric key, and a missing date sorts before a pre-epoch date.
+        assert_eq!(key_sort_val(""), SortVal::Null);
+        assert!(key_sort_val("") < key_sort_val("0"));
+        assert!(opt_num_sort_val::<i64>(None) < opt_num_sort_val(Some(-1)));
+        assert!(opt_num_sort_val::<i64>(None) < opt_num_sort_val(Some(i64::MIN)));
+        assert!(opt_num_sort_val(Some(-86_400_000)) < opt_num_sort_val(Some(0)));
+        assert!(opt_str_sort_val(None) < opt_str_sort_val(Some("")));
+        assert!(opt_str_sort_val(None) < key_sort_val("0"));
+    }
 
     #[test]
     fn cursor_round_trips_and_is_padding_free() {

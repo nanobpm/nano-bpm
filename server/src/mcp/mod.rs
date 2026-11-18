@@ -1156,13 +1156,49 @@ mod tests {
     }
 
     /// Sort fields the shared REST sorter has no projection for are rejected
-    /// (the sorter would silently fall back to key order and page wrongly).
+    /// (the sorter would silently fall back to key order and page wrongly),
+    /// and every field it does project is admitted.
     #[tokio::test]
     async fn search_rejects_unsupported_sort_fields() {
         let server = ServerImpl::default();
         for (tool, field) in [
-            ("searchIncidents", "processDefinitionId"),
+            ("searchIncidents", "noSuchField"),
+            ("searchProcessDefinitions", "noSuchField"),
+            ("searchProcessInstances", "noSuchField"),
+            ("searchUserTasks", "noSuchField"),
+        ] {
+            let args = json!({ "sort": [{ "field": field, "order": "DESC" }] });
+            let result = call(&server, tool, args).await;
+            assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(field), "{field} named in error: {text}");
+        }
+        for (tool, fields) in [
+            ("searchIncidents", crate::INCIDENT_SORT_FIELDS),
+            (
+                "searchProcessDefinitions",
+                crate::PROCESS_DEFINITION_SORT_FIELDS,
+            ),
+            (
+                "searchProcessInstances",
+                crate::PROCESS_INSTANCE_SORT_FIELDS,
+            ),
+            ("searchUserTasks", crate::USER_TASK_SORT_FIELDS),
+        ] {
+            for field in fields {
+                let args = json!({ "sort": [{ "field": field, "order": "ASC" }] });
+                let result = call(&server, tool, args).await;
+                assert_eq!(
+                    result["isError"].as_bool(),
+                    Some(false),
+                    "{tool}/{field}: {result}"
+                );
+            }
+        }
+        // The newly projected fields (#1298) must be admitted, not rejected.
+        for (tool, field) in [
             ("searchIncidents", "jobKey"),
+            ("searchIncidents", "processDefinitionId"),
             ("searchProcessDefinitions", "resourceName"),
             ("searchProcessInstances", "startDate"),
             ("searchProcessInstances", "processDefinitionVersion"),
@@ -1172,19 +1208,11 @@ mod tests {
         ] {
             let args = json!({ "sort": [{ "field": field, "order": "DESC" }] });
             let result = call(&server, tool, args).await;
-            assert_eq!(result["isError"].as_bool(), Some(true), "{tool}: {result}");
-            let text = result["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains(field), "{field} named in error: {text}");
-        }
-        for (tool, field) in [
-            ("searchIncidents", "creationTime"),
-            ("searchProcessDefinitions", "version"),
-            ("searchProcessInstances", "processDefinitionId"),
-            ("searchUserTasks", "creationDate"),
-        ] {
-            let args = json!({ "sort": [{ "field": field, "order": "ASC" }] });
-            let result = call(&server, tool, args).await;
-            assert_eq!(result["isError"].as_bool(), Some(false), "{tool}: {result}");
+            assert_eq!(
+                result["isError"].as_bool(),
+                Some(false),
+                "{tool}/{field}: {result}"
+            );
         }
     }
 
