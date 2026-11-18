@@ -185,18 +185,6 @@ pub struct Engine {
     /// restores — a replica seeded from the journal then routes the next
     /// round-robin start exactly like a peer that never restarted.
     start_dispatch_rr: u64,
-    /// When `true`, a `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a
-    /// job that has never been activated (the `activated` latch is not required).
-    /// This supports a clustered mode where the activation lock is *leader-local*
-    /// (not replicated through Raft): a follower's engine never observes the
-    /// `JobActivated` event, so a replicated completion would otherwise fail the
-    /// `JobNotActivated` check and diverge from the leader. Possession of the job
-    /// key *is* the capability (keys are only handed out by activation), so this
-    /// stays within the at-least-once contract. Runtime config (set identically on
-    /// every replica from `NANOBPMN_REPLICATE_ACTIVATION`); NOT part of the
-    /// snapshot, so it never affects replay/snapshot determinism. Defaults to
-    /// `false` — the strict single-node/RF=1 behaviour is unchanged.
-    lenient_completion: bool,
     /// The current command's proposer-stamped terminal deadline (#1494):
     /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
     /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
@@ -691,7 +679,6 @@ impl Engine {
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
-            lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
@@ -739,16 +726,6 @@ impl Engine {
         self.num_partitions = num_partitions.max(1);
     }
 
-    /// Enables (or disables) lenient completion: when `true`, `CompleteJob` /
-    /// `FailJob` / `ThrowJobError` no longer require the job to have been activated
-    /// first. A clustered host sets this from `NANOBPMN_REPLICATE_ACTIVATION=0` so
-    /// the activation lock can stay leader-local (un-replicated) while replicated
-    /// completions still apply cleanly on followers that never saw the activation.
-    /// See the `lenient_completion` field. Must be set identically on every replica.
-    pub fn set_lenient_completion(&mut self, lenient: bool) {
-        self.lenient_completion = lenient;
-    }
-
     /// The worker a terminal job event attributes (#963): the replicated
     /// command's stamp when present (authoritative on every replica, including
     /// a "resolved absent" `worker: None`), else the live job's attribution for
@@ -764,9 +741,10 @@ impl Engine {
         }
     }
 
-    /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
+    /// Whether lenient completion is enabled: replicated engine state set by
+    /// [`Command::SetLenientCompletion`] (see [`State::lenient_completion`]).
     pub fn lenient_completion(&self) -> bool {
-        self.lenient_completion
+        self.state.lenient_completion
     }
 
     /// Installs the shared [`ClusterVariables`](crate::cluster_vars::ClusterVariables)
@@ -884,7 +862,6 @@ impl Engine {
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
-            lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
@@ -2838,7 +2815,7 @@ impl Engine {
                 // completion (leader-local locks; see `lenient_completion`) the
                 // activation may not have been replicated to this engine, so the
                 // latch is not required.
-                if !self.lenient_completion && !job.activated {
+                if !self.state.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3694,7 +3671,7 @@ impl Engine {
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // Like completion, failing a job requires that it was activated
                 // (unless lenient completion allows leader-local activation).
-                if !self.lenient_completion && !job.activated {
+                if !self.state.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3794,7 +3771,7 @@ impl Engine {
                 if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                if !self.lenient_completion && !job.activated {
+                if !self.state.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -6520,6 +6497,9 @@ impl Engine {
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
+            }
+            Command::SetLenientCompletion { lenient } => {
+                self.emit(&mut log, Event::LenientCompletionSet { lenient });
             }
         }
 

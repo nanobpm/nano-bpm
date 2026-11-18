@@ -1122,7 +1122,8 @@ fn lenient_completion_accepts_a_job_that_was_never_activated() {
     // given a replica engine in lenient-completion mode (leader-local
     // activation: this replica never saw the job activated)
     let mut engine = Engine::new();
-    engine.set_lenient_completion(true);
+    engine.apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
     assert!(engine.lenient_completion());
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
@@ -3764,4 +3765,97 @@ fn deferred_job_is_selectable_at_expiry_and_poll_keeps_durable_deadline() {
         1
     );
     assert!(engine.state().deferred_jobs.is_empty());
+}
+
+/// #1661 (ADR 0066 slice 2): lenient completion is replicated engine state,
+/// flipped by a command at a log index — never host config a node changes on
+/// its own clock. Two replicas applying the same committed log, with the
+/// policy flip racing a `CompleteJob` (the completion ordered BEFORE the flip
+/// in the log, a second one AFTER it), produce byte-identical events: both
+/// reject the early completion and both accept the late one.
+#[test]
+fn replicas_agree_on_a_completion_racing_a_lenient_policy_flip() {
+    let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+    for replica in &mut replicas {
+        replica
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        for _ in 0..2 {
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+        }
+    }
+    let mut jobs: Vec<Key> = replicas[0].pending_jobs().iter().map(|j| j.key).collect();
+    jobs.sort_unstable();
+    let (early, late) = (jobs[0], jobs[1]);
+
+    let committed = [
+        Command::complete_job(early),
+        Command::SetLenientCompletion { lenient: true },
+        Command::complete_job(late),
+    ];
+    let outcomes: Vec<Vec<Result<Vec<Event>, EngineError>>> = replicas
+        .iter_mut()
+        .map(|replica| {
+            committed
+                .iter()
+                .cloned()
+                .map(|c| replica.apply_command(c))
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(outcomes[0], outcomes[1], "replicas must agree on every entry");
+    assert_eq!(
+        outcomes[0][0],
+        Err(EngineError::JobNotActivated { job_key: early }),
+        "a completion committed before the flip is strict everywhere"
+    );
+    assert_eq!(
+        outcomes[0][1],
+        Ok(vec![Event::LenientCompletionSet { lenient: true }])
+    );
+    assert!(outcomes[0][2].is_ok(), "a completion after the flip is lenient everywhere");
+    assert!(replicas.iter().all(Engine::lenient_completion));
+}
+
+/// #1661: the replicated flag survives every recovery path — a full journal
+/// replay, and a snapshot taken before the flip plus the tail carrying it
+/// (and a snapshot taken after it) — so a restarted replica never silently
+/// reverts to strict completion.
+#[cfg(feature = "serde")]
+#[test]
+fn lenient_completion_survives_replay_and_snapshot_plus_tail() {
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    let before_flip = engine.snapshot();
+    let tail = engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    journal.extend(tail.clone());
+    assert!(engine.lenient_completion());
+
+    let replayed = Engine::replay_partition(0, journal.clone());
+    assert!(replayed.lenient_completion(), "full replay restores the flag");
+
+    let mut restored = Engine::from_snapshot(before_flip);
+    assert!(!restored.lenient_completion());
+    restored.apply_replayed_events(tail);
+    assert!(restored.lenient_completion(), "snapshot + tail restores the flag");
+
+    let after = Engine::from_snapshot(engine.snapshot());
+    assert!(after.lenient_completion(), "a snapshot carries the flag");
+
+    // and flipping back is replicated just the same
+    let off = engine
+        .apply_command(Command::SetLenientCompletion { lenient: false })
+        .unwrap();
+    journal.extend(off);
+    assert!(!Engine::replay_partition(0, journal).lenient_completion());
 }

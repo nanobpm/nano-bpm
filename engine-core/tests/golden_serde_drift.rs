@@ -871,6 +871,8 @@ fn build_event_witnesses() -> Vec<Event> {
             raft_state: "{\"opaque\":true}".to_string(),
             start_dispatch_rr: 7,
         },
+        // The #1661 replicated lenient-completion flip (ADR 0066 slice 2).
+        Event::LenientCompletionSet { lenient: true },
         // The #901 bottom-to-top scope-subscription completion frame.
         Event::CompensationScopeSubscriptionCompleted {
             instance_key: 1,

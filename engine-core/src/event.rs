@@ -1410,6 +1410,14 @@ pub enum Event {
     /// record (skipping command re-execution) restores it from here and routes
     /// the next round-robin start identically to a peer that never restarted.
     /// Additive: a pre-existing record decodes with `0`.
+    /// The partition's lenient-completion mode was set (#1661, ADR 0066 slice
+    /// 2) by a replicated [`crate::Command::SetLenientCompletion`]. When
+    /// `lenient` is `true`, `CompleteJob` / `FailJob` / `ThrowJobError` no longer
+    /// require the job to have been activated on this replica (activation is
+    /// leader-local). Engine state, not host config: every replica flips it at
+    /// the same log index, a snapshot carries it and a journal replay restores
+    /// it. Additive variant (old journals never contain it).
+    LenientCompletionSet { lenient: bool },
     RaftEntryApplied {
         index: u64,
         raft_state: String,
@@ -2132,6 +2140,7 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
+            | Event::LenientCompletionSet { .. }
             | Event::RoutedDeliveryRecorded { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }

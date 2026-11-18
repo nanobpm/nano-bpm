@@ -139,6 +139,9 @@ pub fn apply(state: &mut State, event: &Event) {
         // `Engine::replay_partition` / `apply_replayed_events`); it mutates no
         // state.
         Event::RaftEntryApplied { .. } => {}
+        // Replicated lenient-completion mode (#1661): engine state, so every
+        // replica (and every replay of the journal) holds the same value.
+        Event::LenientCompletionSet { lenient } => state.lenient_completion = *lenient,
     }
 }
 
