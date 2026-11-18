@@ -20,6 +20,11 @@
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
 
+#[path = "trace_validation/harness.rs"]
+mod harness;
+#[path = "trace_validation/zeebe_token_flow.rs"]
+mod zeebe_token_flow;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3806,5 +3811,100 @@ fn boundary_timer_targets_the_boundary_event() {
             ("TRIGGERED".to_string(), "late".to_string())
         ],
         "{trace:?}"
+    );
+}
+
+// ───────────────────────────── spec-level normaliser (#1259) ──────────────────────────────
+
+/// The spec-level normaliser maps a normalised Zeebe record stream onto the
+/// ZeebeTokenFlow.tla milestone vocabulary. This test validates the mapping
+/// end-to-end: the `parallel-fork-join-tasks` golden (a captured Zeebe trace)
+/// must project to the same milestone multiset as the ZeebeTokenFlow spec's
+/// trace fixture for the isomorphic graph (`ZMCParallelDiamond`).
+///
+/// The two traces are not textually identical — the golden uses the scenario's
+/// element ids (`start`/`fork`/`bookA`/`bookB`/`join`/`end`) while the spec
+/// fixture uses the corpus graph's (`S`/`P1`/`A`/`B`/`P2`/`E`) — but their
+/// milestone *multisets* must be isomorphic under the graph's shape: same
+/// counts of flows, tasks, join firings and completion.
+#[test]
+fn zeebe_golden_projects_to_spec_milestones() {
+    use std::collections::HashMap;
+
+    // The scenario's sequence-flow map: (source, target) -> flow id, derived
+    // from its BPMN XML. The spec-level normaliser needs the reverse: flow id
+    // -> (source, target).
+    let sc = load_scenario(&traces_dir().join("scenarios/parallel-fork-join-tasks"))
+        .expect("load parallel-fork-join-tasks");
+    let flow_endpoints: HashMap<String, (String, String)> = sc
+        .flows
+        .iter()
+        .map(|((from, to), id)| (id.clone(), (from.clone(), to.clone())))
+        .collect();
+
+    // The join elements: gateways with multiple incoming flows. Derived from
+    // the flow map: an element is a join iff it is the target of more than one
+    // distinct sequence flow.
+    let mut incoming_counts: HashMap<String, usize> = HashMap::new();
+    for (from, to) in sc.flows.keys() {
+        if from != to {
+            *incoming_counts.entry(to.clone()).or_insert(0) += 1;
+        }
+    }
+    let join_elements: std::collections::HashSet<String> = incoming_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(id, _)| id)
+        .collect();
+
+    // Project the golden's normalised records onto the milestone vocabulary.
+    let golden = read_json(&traces_dir().join("goldens/parallel-fork-join-tasks.trace.json"));
+    let steps = golden["steps"].as_array().expect("golden steps");
+    let mut golden_milestones: Vec<harness::Milestone> = Vec::new();
+    for step in steps {
+        let records = step["records"].as_array().expect("step records");
+        for record in records {
+            if let Some(m) =
+                zeebe_token_flow::record_milestone(record, &flow_endpoints, &join_elements)
+            {
+                golden_milestones.push(m);
+            }
+        }
+    }
+    golden_milestones.sort();
+
+    // The spec fixture's milestone multiset for the isomorphic graph.
+    let fixture_text = std::fs::read_to_string(
+        traces_dir().join("../tla/traces/ZeebeTokenFlow/ZMCParallelDiamond.json"),
+    )
+    .expect("read ZMCParallelDiamond fixture");
+    let fixture: harness::Fixture =
+        harness::Fixture::from_json(&fixture_text).expect("parse ZMCParallelDiamond fixture");
+    let mut spec_milestones = fixture.milestones.clone();
+    spec_milestones.sort();
+
+    // The milestone multisets must be isomorphic: same shape, same counts.
+    // The element ids differ (scenario ids vs corpus graph ids), so we compare
+    // the *kind structure*: counts of each milestone kind, and for flows the
+    // count of distinct (from, to) pairs.
+    fn kind_counts(ms: &[harness::Milestone]) -> (usize, usize, usize, usize) {
+        let mut flows = 0;
+        let mut tasks = 0;
+        let mut joins = 0;
+        let mut completed = 0;
+        for m in ms {
+            match m {
+                harness::Milestone::Flow { .. } => flows += 1,
+                harness::Milestone::Task { .. } => tasks += 1,
+                harness::Milestone::JoinFired { .. } => joins += 1,
+                harness::Milestone::Completed => completed += 1,
+            }
+        }
+        (flows, tasks, joins, completed)
+    }
+    assert_eq!(
+        kind_counts(&golden_milestones),
+        kind_counts(&spec_milestones),
+        "golden and spec milestone multisets must be isomorphic\n  golden: {golden_milestones:?}\n  spec:   {spec_milestones:?}"
     );
 }

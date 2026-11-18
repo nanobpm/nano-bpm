@@ -194,6 +194,12 @@ function num (fn, key) { return (fn && key in fn) ? fn[key] : 0 }
 // with its own mapping (future work, #1227/#1240) rather than reuse this one.
 const REQUIRED_STATE_VARS = ['pending', 'waiting', 'fireCount', 'completed']
 
+// The ZeebeTokenFlow family's observable state vocabulary (#1240): `queue`
+// (flow taken / activation queued), `active` (task activated), `fired` (join
+// fired) and `done` (instance completed). The auxiliary `open`/`taken`/`earlyPar`
+// are derivable control state, not observable milestones.
+const ZEEBE_STATE_VARS = ['queue', 'active', 'fired', 'done']
+
 function assertObservableVocabulary (spec, model, states) {
   if (!states.length) {
     process.stderr.write(
@@ -208,12 +214,13 @@ function assertObservableVocabulary (spec, model, states) {
   // `milestones()` would then default that transition's missing map to `{}` and
   // silently omit (or miscount) observations. A per-state check turns any parse
   // gap — or a sibling spec's divergent state vocabulary — into a loud failure.
+  const required = spec === 'ZeebeTokenFlow' ? ZEEBE_STATE_VARS : REQUIRED_STATE_VARS
   for (const s of states) {
-    const missing = REQUIRED_STATE_VARS.filter((v) => !(v in s.vars))
+    const missing = required.filter((v) => !(v in s.vars))
     if (missing.length) {
       process.stderr.write(
         `error: ${spec}/${model}: state ${s.step} (${s.action}) does not define the ` +
-        `TokenFlow-family observable variables [${missing.join(', ')}]. This means TLC ` +
+        `${spec}-family observable variables [${missing.join(', ')}]. This means TLC ` +
         `printed a value parse.mjs could not parse (so extractStates dropped it), or a ` +
         `sibling spec uses a different state vocabulary and must extend parse.mjs ` +
         `milestones() with its own mapping (see formal/README.md, #1227/#1240) rather ` +
@@ -249,6 +256,46 @@ function milestones (graph, states) {
     }
     // Instance completed.
     if (a.completed === false && b.completed === true) out.push({ kind: 'completed' })
+  }
+  return out
+}
+
+// Milestones from the per-state deltas of the ZeebeTokenFlow family (#1240).
+// The ZeebeTokenFlow state vocabulary differs from TokenFlow's:
+//   - `queue`  : [AllFlows -> Nat] ACTIVATE commands in flight, keyed by flow.
+//                A flow is "taken" when its activation is queued (equivalent of
+//                TokenFlow's `pending`). The synthetic `<create>` pseudo-flow
+//                into the start event is skipped.
+//   - `active` : [Nodes -> Nat] ELEMENT_ACTIVATED tasks (job wait states).
+//   - `fired`  : [Nodes -> Nat] gateway ELEMENT_ACTIVATED count (ghost).
+//   - `done`   : BOOLEAN process instance ELEMENT_COMPLETED.
+// The auxiliary `open`/`taken`/`earlyPar` are derivable control state, not
+// observable milestones.
+function zeebeMilestones (graph, states) {
+  const out = []
+  const flowOf = {}
+  for (const f of graph.flows) flowOf[f.id] = f
+  for (let k = 1; k < states.length; k++) {
+    const a = states[k - 1].vars
+    const b = states[k].vars
+    // Flow taken: queue[g] increased (skip the synthetic create pseudo-flow).
+    for (const g of Object.keys(b.queue || {})) {
+      if (g === '<create>' || !flowOf[g]) continue
+      const d = num(b.queue, g) - num(a.queue, g)
+      for (let x = 0; x < d; x++) out.push({ kind: 'flow', from: flowOf[g].from, to: flowOf[g].to })
+    }
+    // Task activated: active[n] increased.
+    for (const n of Object.keys(b.active || {})) {
+      const d = num(b.active, n) - num(a.active, n)
+      for (let x = 0; x < d; x++) out.push({ kind: 'task', node: n })
+    }
+    // Join fired: fired[n] increased.
+    for (const n of Object.keys(b.fired || {})) {
+      const d = num(b.fired, n) - num(a.fired, n)
+      for (let x = 0; x < d; x++) out.push({ kind: 'joinFired', node: n })
+    }
+    // Instance completed.
+    if (a.done === false && b.done === true) out.push({ kind: 'completed' })
   }
   return out
 }
@@ -360,7 +407,8 @@ function main () {
   assertObservableVocabulary(spec, model, states)
   // Sort the milestone multiset canonically: the engine replay compares
   // multisets, so a stable committed order keeps the fixture diff-free.
-  const ms = milestones(graph, states).sort((x, y) => milestoneKey(x).localeCompare(milestoneKey(y)))
+  const extract = spec === 'ZeebeTokenFlow' ? zeebeMilestones : milestones
+  const ms = extract(graph, states).sort((x, y) => milestoneKey(x).localeCompare(milestoneKey(y)))
   const fixture = { spec, model, graph, milestones: ms }
   process.stdout.write(JSON.stringify(fixture, null, 2) + '\n')
 }
