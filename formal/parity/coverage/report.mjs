@@ -52,6 +52,26 @@ function pct(covered, total) {
   return total === 0 ? 100 : (covered / total) * 100;
 }
 
+/**
+ * An empty measurement (no instrumented sites at all) is a collection failure,
+ * not 100 % coverage: `pct` maps `total === 0` to 100, which would PASS the
+ * ratchet and let `--update` raise the floor to 100 % on an empty report.
+ * Fail closed on it in both `--check` and `--update`.
+ */
+function emptyMeasurementErrors(measured) {
+  const errors = [];
+  for (const side of ['nano', 'zeebe']) {
+    const m = measured[side];
+    if (m && m.total === 0) {
+      errors.push(
+        `${side}: the coverage report contains no instrumented ${m.unit}s — the measurement is empty ` +
+          '(collection failed or the filter matched nothing), so it must not pass the ratchet or seed a floor',
+      );
+    }
+  }
+  return errors;
+}
+
 /** First rule whose `match` glob matches `id`, or undefined. */
 function firstMatch(rules, id) {
   return rules.find((r) => globToRegExp(r.match).test(id));
@@ -285,11 +305,11 @@ function main() {
   process.stdout.write(md);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
 
-  const errors = [];
+  const errors = emptyMeasurementErrors(measured);
   if (args.update) {
     const { next, errors: e } = updateBaseline(measured, baseline, { allowLower: args.allowLower });
     errors.push(...e);
-    if (e.length === 0) writeFileSync(args.baseline, JSON.stringify(next, null, 2) + '\n');
+    if (errors.length === 0) writeFileSync(args.baseline, JSON.stringify(next, null, 2) + '\n');
   }
   if (args.check) errors.push(...checkRatchet(measured, baseline));
   if (errors.length) {

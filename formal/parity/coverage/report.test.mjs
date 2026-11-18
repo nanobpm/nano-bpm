@@ -2,7 +2,11 @@
 // ratchet logic (#1247), on synthetic llvm-cov / JaCoCo fixtures (no cargo,
 // no JVM, no Docker).
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import {
@@ -129,4 +133,31 @@ test('the committed baseline seeds a floor for both engines', () => {
     assert.equal(typeof b[side].floorPercent, 'number');
   }
   assert.equal(b.zeebe.unit, 'branch');
+});
+
+test('an empty measurement fails --check and --update instead of passing at 100%', () => {
+  // pct() maps total === 0 to 100, so without the guard an empty report (a
+  // failed collection, or a filter that matched nothing) would PASS the
+  // ratchet and --update would raise the floor to 100% on nothing measured.
+  const dir = mkdtempSync(join(tmpdir(), 'parity-cov-'));
+  const write = (name, text) => {
+    const p = join(dir, name);
+    writeFileSync(p, text);
+    return p;
+  };
+  const emptyNano = write('empty-nano.json', JSON.stringify({ data: [{ files: [], functions: [] }] }));
+  const emptyJacoco = write('empty-jacoco.xml', '<?xml version="1.0"?><report name="x"></report>');
+  const baseline = write('baseline.json', JSON.stringify({ nano: { unit: 'region', floorPercent: 50 }, zeebe: { unit: 'branch', floorPercent: 10 } }));
+  const script = fileURLToPath(new URL('./report.mjs', import.meta.url));
+  for (const args of [
+    ['--nano', emptyNano, '--check'],
+    ['--zeebe', emptyJacoco, '--check'],
+    ['--nano', emptyNano, '--zeebe', emptyJacoco, '--update', '--allow-lower'],
+  ]) {
+    const r = spawnSync(process.execPath, [script, ...args, '--baseline', baseline], { encoding: 'utf8' });
+    assert.notEqual(r.status, 0, `expected failure for ${args.join(' ')}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /no instrumented|measurement is empty/);
+  }
+  // --update must not have written a raised floor from the empty measurement.
+  assert.deepEqual(JSON.parse(readFileSync(baseline, 'utf8')), { nano: { unit: 'region', floorPercent: 50 }, zeebe: { unit: 'branch', floorPercent: 10 } });
 });

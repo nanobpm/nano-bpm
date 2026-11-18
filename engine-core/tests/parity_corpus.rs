@@ -35,8 +35,12 @@ use std::path::{Path, PathBuf};
 use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Key, Value};
 use serde_json::Value as Json;
 
-/// The same activation cap as `observation.mjs`'s `MAX_JOBS_TO_ACTIVATE`.
-const MAX_JOBS_TO_ACTIVATE: usize = 32;
+/// The same activation cap as `observation.mjs`'s `MAX_JOBS_TO_ACTIVATE`
+/// (100). `formal/parity/runtime/driver.test.mjs` reads this constant and
+/// asserts it stays equal to the runtime cap, so a drift on either side fails
+/// a test instead of silently diverging the native replay from the runtime
+/// backends.
+const MAX_JOBS_TO_ACTIVATE: usize = 100;
 
 fn to_value(j: &Json) -> Value {
     match j {
