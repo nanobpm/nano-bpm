@@ -133,22 +133,24 @@ each hit. Line numbers are at this ADR's commit.
 
 | # | input | where | status today | A (events) | C (enforced determinism) |
 |---|---|---|---|---|---|
-| 1 | **Cluster-variable host handle** (#1657): `Arc<RwLock<ClusterVariableSnapshot>>` | type `cluster_vars.rs:63`; installed `engine/mod.rs:772` via `journal.rs:1334/1379` from `server/src/main.rs:3436`; read `engine/resolve.rs:444` | **Open leak**: node-local, unjournaled, mutated by REST | Read only on the leader, but still unjournaled (lost on restart, replay sees today's values), so it has to move into engine state anyway | Becomes engine state changed by replicated commands; the handle type is deleted from the apply signature |
+| 1 | **Cluster-variable host handle** (#1657): `Arc<RwLock<ClusterVariableSnapshot>>` | type `cluster_vars.rs:63`; installed `engine/mod.rs:772` via `journal.rs:1334/1379` from `server/src/main.rs:3436`; read `engine/resolve.rs:444` | **Open leak**: node-local, unjournaled, mutated by REST | Read only on the leader, and its result is recorded in events, so historical replay (`Engine::replay_partition` folds events without FEEL or `overlay_cluster_variables`) never re-evaluates past outcomes. The definitions themselves are still unjournaled: they disappear on restart and change *future* evaluations, so they have to move into engine state anyway | Becomes engine state changed by replicated commands; the handle type is deleted from the apply signature |
 | 2 | **FEEL wall clock / entropy fallback** | `feel/builtins.rs:1096` (`SystemTime::now` in `now()`/`today()`), `feel/builtins.rs:1330` (`random number()`/`uuid()`) | Closed by #1649 when `feel::env::with_env` is installed (`feel/env.rs:62`), but **fails open**: without an installed env it silently reads the host clock | Harmless on followers (no evaluation there) | Fail closed: under the apply build the fallback is a hard error, and `SystemTime`/`Instant` are banned in the apply crates by lint (below) |
-| 3 | **`lenient_completion` flag** (host config) | `engine/mod.rs:741`; set from activation policy at `server/src/main.rs:3078` and **changed at runtime** at `main.rs:43375` | Leak during a policy flip: each node flips at its own wall-clock moment, not at a log index, so one committed `CompleteJob` can be accepted on one replica and rejected on another | Leader-only decision, recorded as events | Becomes engine state set by a replicated command (flips at a log index on every replica) |
+| 3 | **`lenient_completion` flag** (host config) | `engine/mod.rs:741`; set during engine construction from activation policy (`server/src/main.rs:3078`, `:19737`); `main.rs:43375` is the test helper `boot_rf3_intake_cluster_with`, not a production runtime toggle | **Startup-configuration agreement requirement**, not a live defect: replicas configured differently would accept a committed `CompleteJob` on one node and reject it on another, and nothing verifies agreement | Leader-only decision, recorded as events | Verified at join (refuse a member whose value differs), or made engine state set by a replicated command |
 | 4 | **`num_partitions`** (host config, `NANOBPMN_PARTITIONS`) | `engine/mod.rs:731`; set at `main.rs:3071` | Documented "must be identical on every node" but not checked | Leader-only routing decision, recorded | Engine state from a replicated command, or verified at join (refuse a mismatching member) |
 | 5 | **Leader-local activation state** (ADR 0002) | soft grants `main.rs` `prepare_activation`; apply reads job state (with #3 papering over it) | By design followers do not hold the leader's locks | Unchanged (leader-local in both) | Unchanged; apply must not read it: the apply-input type excludes it, and #3 stops being a toggle |
 | 6 | **`HashMap` iteration order** (std `RandomState`, per-process random seed) | engine state maps `state/types.rs:2352-2407` (`instances`, `jobs`, `timers`, `message_subscriptions`, …) | Kept safe **by hand**: event-emitting walks sort first (`engine/mod.rs:17337`, `:17351`; `engine/event_subprocess.rs:460`; 97 `sort*` calls in `engine/`); unique-key lookups (`engine/mod.rs:971`) are order-independent. Nothing enforces it, and the JSON journal encoding of these maps is **not canonical** (bytes differ between replicas holding equal state) | Cannot diverge followers; leader order only has to be self-consistent | Replace engine-state `HashMap`/`HashSet` with ordered collections (`BTreeMap`/`BTreeSet`, or an insertion-ordered map whose order is itself a deterministic function of the applied log); `clippy::disallowed_types` bans `std::collections::HashMap/HashSet` in the apply crates. A fixed-seed `BuildHasher` is **not** enough: equal maps can still iterate differently after different capacity or mutation histories (e.g. a snapshot-restored replica vs. one that applied the log). Ordered collections make both iteration and the encoding canonical, which the digest below relies on |
 | 7 | **Platform `libm` transcendental floats** | `feel/builtins.rs:525-526` (`ln`, `exp`), `feel/eval.rs:542` (`powf`) | Can differ by an ulp across OS/arch (glibc vs. Apple libm); same-binary clusters agree. `sqrt` is IEEE-exact; float formatting is Rust's own shortest-repr (deterministic) | Cannot diverge followers | Route through a pure-Rust `libm` (or the FEEL decimal type) so the result is platform-independent |
 | 8 | **Node-local residency / cold-store I/O** | `journal.rs:2327` `ensure_resident_for_command` | An unreadable local row **fails closed** under replicated apply (#1470), so it fail-stops rather than diverges | Folding events still needs residency; same behaviour | Same; the digest (below) is a second line of defence |
+| 8a | **Deployment installation outside the partition log** | `install_replicated_deployment` / `install_into_raft_replicas` (`server/src/main.rs:16859–16885`, `:20176–20193`) install deployment events into every engine directly, not via each partition's Raft log; `Latest` form binding resolves against `state.forms` (`engine/resolve.rs:765–767`) | **Open leak**: a completion racing a form redeploy can resolve `latest` to different form keys on different replicas | Leader resolves and records the key; followers never resolve | Deployment visibility is ordered against each partition's command log: either the install is a replicated command on every partition, or partition commands carry a deployment-version fence (the minimum deployment generation the leader resolved against) and a replica that has not installed it waits before applying |
 | 9 | **Orphan sink / leadership** | `journal.rs:1703`, `:1719` | Decides which node *proposes* a stamped quarantine; the stamp travels in the command | Unchanged | Unchanged (already in the envelope) |
 | 10 | **Clock and seed** | `ReplicatedCommand.now` (`raft.rs:106`); `TriggerTimers/ExpireJobs { now }` (`command.rs:273-282`); FEEL seed from replicated state (#1649) | Closed: carried in the envelope | n/a | Already compliant |
 | 11 | **Environment variables** | none in `engine-core/src` (grep `std::env`: no hits) | Closed | n/a | Lint keeps it closed |
 | 12 | **Dependencies** | `engine-core/Cargo.toml`: only optional `serde`/`serde_json`; no regex crate, no time-zone DB (`feel/temporal.rs:20`, offsets only) | Small surface; the Rust toolchain/std is the remaining one | n/a | Covered by the determinism CI across the previous release and build profiles |
 
 **What the audit shows: the leaks are few and closable.** Two are live defects (#1 cluster
-variables, #3 the runtime `lenient_completion` flip); three are latent and closable mechanically
-(#2 fail-open fallback, #6 hasher, #7 libm); #4 needs a check. The FEEL surface that motivated A is
+variables, #8a deployment install outside the partition log); #3 `lenient_completion` is a
+startup-agreement requirement; three are latent and closable mechanically
+(#2 fail-open fallback, #6 hasher, #7 libm); #3 and #4 need a join-time check. The FEEL surface that motivated A is
 already closed by #1649, engine-core has no non-std dependency on the apply path, and the hardest
 class (#6) is already handled by convention — the gap is enforcement, not design. That is the
 case in which C keeps today's efficiency and simplicity and adds a safety net, rather than the
@@ -202,15 +204,19 @@ pervasive case in which A's "cannot diverge by construction" earns its migration
   `state/types.rs:2466`) as arrays in table order — so the chain needs audit item #6 first
   (ordered collections, not merely a fixed hash seed, since layout depends on history). Without it, a replica
   would have to re-encode canonically, which is far more expensive (measured below).
-- **Periodic full hash, at snapshot time only.** The snapshot already serializes the whole state;
-  its digest (over the canonical snapshot bytes) is recorded with the snapshot and checked on
-  install. It is too expensive for the apply path (measured below).
+- **Periodic full hash, at snapshot time only.** The digest is over a **durable-state
+  projection**, not raw snapshot bytes: snapshots retain leader-local job leases that
+  `Journal::activate_jobs_with_fetch` does not journal (`journal.rs:3487–3512`) and the engine's
+  `now`, which event replay initializes to zero (`engine/memory.rs:18–26`, `engine/mod.rs:848–853`).
+  The projection keeps replicated (journaled) activations, drops local soft grants, and normalizes
+  every non-journaled field, so a healthy replay and a live replica hash equal. It is recorded with
+  the snapshot and checked on install. It is too expensive for the apply path (measured below).
 - **On mismatch:** the follower fails stop (stops applying, like the #1405 fenced
   journal), reports both digests and the index, and resyncs by installing the leader's snapshot.
   The divergent journal segment is kept for forensics. A leader never adopts a follower's state.
 - **Snapshots and #1071.** A snapshot records `(last_applied, chain digest, full digest, key
-  allocator high-water)`, where the full digest is a **versioned canonical digest of durable
-  state**; a restored replica resumes the chain from the recorded value. The chain only proves
+  allocator high-water)`, where the full digest is a **versioned canonical digest of the
+  durable-state projection** above (never raw snapshot bytes); a restored replica resumes the chain from the recorded value. The chain only proves
   *event-byte integrity*: replaying identical event bytes reproduces it even if `state::apply` or
   allocator advancement reconstructs different state. So migration-by-replay checks two things
   separately at each snapshot checkpoint: the re-derived chain (integrity of the journal) **and**
@@ -233,7 +239,8 @@ hash):
 full digest sorts every array as a cost stand-in for set canonicalisation; production instead
 gets canonical bytes from ordered collections, #6.)
 
-Reading: once item #6 makes the journal bytes canonical, the per-entry chain costs **~1–1.2 µs per
+Reading (hash cost only, against today's `HashMap`-based engine — the ordered-collection (#6) and
+pure-`libm` (#7) changes have their own apply cost that this probe does not measure): once item #6 makes the journal bytes canonical, the per-entry chain costs **~1–1.2 µs per
 command (~3 % of apply)**, because it only hashes bytes that are written anyway. Re-encoding
 canonically through a sorted DOM instead costs 24–29 µs (76–84 %), which is why #6 is a
 precondition rather than an option. A full-state hash is O(state) (≈ 85–185 ms per 1,000 live
@@ -246,7 +253,7 @@ instances), so it belongs at snapshot time only.
 | Determinism surface | Followers are a pure fold over events; FEEL, iteration order, floats and upgrades cannot diverge them. Leader-only non-determinism is acceptable (it is recorded). | Every apply path, forever; guards see only exercised paths; #1657 shipped undetected. | The audited inputs (12 items), closed by type boundary + lint; anything missed is **detected** at the next digest instead of silently persisting. |
 | Failure mode on a missed input | None for replica agreement (leader just records its result). | Silent split-brain. | Fail-stop of the divergent follower + snapshot resync; alert. |
 | Log size / bandwidth | Measured above (payload-only, uncompressed): +2–3 % at benchmark payloads, ~7–8x on tiny instances (~1.6 KB/lifecycle). Raft log store keeps its own copy, so disk volume grows until the stores merge. | Smallest entries. | Smallest entries + 16–32 B digest every k entries. |
-| CPU | Followers fold (cheaper than processing); leader unchanged. | Every replica processes. | Every replica processes + ~1–1.2 µs/cmd chain hash. |
+| CPU | Followers fold (cheaper than processing); leader unchanged. | Every replica processes. | Every replica processes + ~1–1.2 µs/cmd chain hash (hash-only estimate; total impact of #6/#7 pending representative measurement). |
 | Leader-side complexity | **Substantial and new.** Speculative processing ahead of commit against a copy-on-write overlay of committed state (engine-core has no such overlay today); discard the overlay on failed proposal or failover; hold every client response until commit; activation, queries, lease digests and snapshots must read committed state only; key allocation is leader-only and the fold must advance the generator from observed keys; per-command record metadata (`operation_reference` lives on `Record`) has to ride in the entry. | None new. | None new: leader and followers run the same code path. |
 | Activation / leases (ADR 0001, 0002) | ADR 0002 split preserved: soft grants stay leader-local; durable activations replicate as `JobActivated` events. | Activation commands re-executed on followers. | As B; the runtime `lenient_completion` toggle (#3) becomes replicated state. |
 | Timers, `ExpireJobs`, pump | Leader-proposed commands to the leader's processor; only results replicate. | Re-evaluated everywhere with replicated `now`. | As B (`now` already in the envelope). |
@@ -258,8 +265,9 @@ instances), so it belongs at snapshot time only.
 ## Decision (proposed)
 
 **Adopt option C** — command replication with enforced determinism — because the audit shows the
-apply-input leaks are few and closable, and C closes them for ~3 % apply CPU with no Raft log
-format change. B is rejected: #1657 is the proof that hoping is not enough. A is **not**
+apply-input leaks are few and closable, and C closes them with no Raft log format change, at an
+estimated ~3 % apply CPU for the digest chain alone (the ordered-collection and libm costs are not
+yet measured; total CPU impact is pending representative measurements). B is rejected: #1657 is the proof that hoping is not enough. A is **not**
 rejected on principle; it is deferred with an explicit trigger: if, after C ships, the divergence
 digest fires in production for a cause the type boundary and lint cannot express, or the audit
 has to grow without bound, re-open this ADR for A (its staged plan is kept below so it is not lost).
@@ -272,6 +280,9 @@ enforced determinism, per this ADR.
 1. **#1657: cluster variables become engine state** (see below). Removes audit item #1.
 2. **Host config into state.** `lenient_completion` and `num_partitions` become engine state set by
    replicated commands (or verified at join); `set_*` hooks deleted from `Engine` (#3, #4).
+2a. **Order deployment visibility against partition logs** (#8a). Deployment install becomes a
+   replicated command on each partition, or partition commands carry a deployment-generation fence
+   that a replica must have installed before applying; `latest` resolution then agrees everywhere.
 3. **Ordered collections.** `BTreeMap`/`BTreeSet` (or a log-ordered map) for every engine-state
    map and set; `disallowed-types` lint for std `HashMap`/`HashSet`. A fixed-seed hasher is not
    sufficient (layout depends on capacity and mutation history). Journal and snapshot encoding
@@ -280,7 +291,7 @@ enforced determinism, per this ADR.
 4. **Purity lint + fail-closed FEEL env.** `disallowed-methods` for clocks, env, std float
    transcendental intrinsics; pure-Rust `libm` wrapper (#7); FEEL fallback unreachable in apply (#2).
 5. **Divergence digest.** Chain digest per entry, leader digest carried additively in the entry,
-   fail-stop + snapshot resync, digests recorded in snapshots and checked by #1071 replay.
+   fail-stop + snapshot resync, digests recorded in snapshots and checked by #1071 replay (over the normalized durable-state projection).
 6. **Determinism CI.** Seed / profile / platform / previous-release replay matrix comparing digests.
 
 ### Staged plan for A (deferred; kept for the re-open trigger)
@@ -319,8 +330,9 @@ the loss on restart, and replay against today's values.
 - (C) Replica consistency still depends on engine determinism, but determinism is now enforced
   (type boundary + lint), tested beyond exercised paths (determinism CI), and **detected** at
   runtime (digest) with a fail-stop rather than silent split-brain.
-- (C) Raft entries stay small; apply cost grows ~3 % for the digest chain; snapshotting gains a
-  full-state hash over bytes it already produces.
+- (C) Raft entries stay small; the digest chain adds an estimated ~3 % apply cost
+  (hash only; ordered collections and pure libm still need measuring); snapshotting gains a
+  full-state hash over a normalized durable-state projection.
 - (C) Two persisted shapes remain (command wire + event journal); both stay under the golden drift
   guards.
 - (C) A non-Rust or cross-platform follower (e.g. a wasm replica) must reproduce the same digest;
