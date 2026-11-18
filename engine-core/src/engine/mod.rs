@@ -7497,6 +7497,9 @@ impl Engine {
                     element_instance_key,
                     scope,
                     vars,
+                    // A re-driven body never sees the mapping-time view:
+                    // no secret provenance (fail closed, #1640).
+                    Vec::new(),
                 );
                 if pending {
                     (gate_activated(events, activated, 0), followups)
@@ -8155,6 +8158,11 @@ impl Engine {
             });
         }
 
+        // Mapping-time secret-reference provenance (#1640), captured from the
+        // exact view the mappings just evaluated against — never re-derived
+        // later — and journaled on the element's `JobCreated`.
+        let secret_provenance = self.secret_provenance_of(instance_key, &element_vars, &inputs);
+
         // Scope writes above have not been applied yet. Both listeners and the
         // activation body must evaluate against the same post-input view.
         let mut activation_vars = element_vars;
@@ -8242,6 +8250,7 @@ impl Engine {
             element_instance_key,
             scope,
             activation_vars,
+            secret_provenance,
         );
         events.extend(kind_events);
         (events, kind_followups)
@@ -8661,6 +8670,7 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         match self.try_activation_body(
@@ -8669,6 +8679,7 @@ impl Engine {
             element_instance_key,
             scope,
             element_vars,
+            secret_provenance,
         ) {
             Ok(planned) => planned,
             Err(failure) => {
@@ -8760,6 +8771,7 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
@@ -8866,6 +8878,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: secret_provenance.clone(),
                 });
                 // An ad-hoc container: register its runtime state alongside the
                 // agent job. The container element instance is the ad-hoc scope
@@ -10023,6 +10036,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
                 // A multi-instance child that is a JOB_WORKER ad-hoc container
                 // (`adHocSubProcess` with a `zeebe:taskDefinition`) registers its
@@ -11675,6 +11689,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             return (events, followups);
@@ -11703,6 +11718,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             // A user-task tool parks the child on a real user task, resolving its
@@ -12597,6 +12613,7 @@ impl Engine {
             created_at: self.now,
             priority,
             retries,
+            secret_provenance: Vec::new(),
         }]
     }
 
@@ -15087,6 +15104,10 @@ impl Engine {
                         element_instance_key,
                         scope,
                         vars,
+                        // Listeners ran between the mappings and the body and
+                        // may have rewritten the scope: no secret provenance
+                        // (fail closed, #1640).
+                        Vec::new(),
                     );
                     if owed {
                         (gate_activated(events, activated, 0), followups)
@@ -15593,6 +15614,7 @@ impl Engine {
                         created_at: self.now,
                         priority,
                         retries,
+                        secret_provenance: Vec::new(),
                     }],
                     Vec::new(),
                 )

@@ -386,6 +386,7 @@ mod tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
         }
     }
 

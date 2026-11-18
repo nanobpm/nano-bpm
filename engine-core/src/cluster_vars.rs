@@ -12,7 +12,7 @@
 //! snapshot/replay determinism; a host re-installs the shared handle on every
 //! engine rebuild so the engine keeps observing the live set.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::model::Value;
@@ -33,6 +33,11 @@ pub struct ClusterVariableSnapshot {
     pub global: HashMap<String, Value>,
     /// Tenant-scoped cluster variables, keyed by tenant id then name.
     pub tenants: HashMap<String, HashMap<String, Value>>,
+    /// Names of the `global` variables whose kind is `SECRET_REFERENCE` — the
+    /// host-trusted carriers of `camunda.secrets.<name>` reference text (#1640).
+    pub global_secret_references: HashSet<String>,
+    /// Per-tenant names of the `SECRET_REFERENCE`-kind variables.
+    pub tenant_secret_references: HashMap<String, HashSet<String>>,
 }
 
 impl ClusterVariableSnapshot {
@@ -53,6 +58,31 @@ impl ClusterVariableSnapshot {
         self.global
             .iter()
             .chain(self.tenants.get(tenant).into_iter().flatten())
+    }
+
+    /// The `SECRET_REFERENCE`-kind cluster variables an instance running under
+    /// `tenant` resolves, with their values: a name is trusted only when the
+    /// binding that WINS the overlay (a tenant variable shadows a same-named
+    /// global) is itself of kind `SECRET_REFERENCE` — a JSON-kind tenant
+    /// variable shadowing a trusted global is untrusted (fail closed).
+    pub fn trusted_secret_roots_for(&self, tenant: &str) -> HashMap<String, Value> {
+        let mut out: HashMap<String, Value> = HashMap::new();
+        for (name, value) in &self.global {
+            if self.global_secret_references.contains(name) {
+                out.insert(name.clone(), value.clone());
+            }
+        }
+        if let Some(scoped) = self.tenants.get(tenant) {
+            let trusted = self.tenant_secret_references.get(tenant);
+            for (name, value) in scoped {
+                if trusted.is_some_and(|t| t.contains(name)) {
+                    out.insert(name.clone(), value.clone());
+                } else {
+                    out.remove(name);
+                }
+            }
+        }
+        out
     }
 }
 

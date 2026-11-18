@@ -553,12 +553,21 @@ impl ClusterVariableStore {
             match &entry.tenant_id {
                 None => {
                     snap.global.insert(entry.name.clone(), entry.value.clone());
+                    if entry.kind == models::ClusterVariableKindEnum::SecretReference {
+                        snap.global_secret_references.insert(entry.name.clone());
+                    }
                 }
                 Some(tenant) => {
                     snap.tenants
                         .entry(tenant.clone())
                         .or_default()
                         .insert(entry.name.clone(), entry.value.clone());
+                    if entry.kind == models::ClusterVariableKindEnum::SecretReference {
+                        snap.tenant_secret_references
+                            .entry(tenant.clone())
+                            .or_default()
+                            .insert(entry.name.clone());
+                    }
                 }
             }
         }
@@ -1469,6 +1478,15 @@ mod cluster_variable_tests {
     /// whose input mappings read them, a literal `camunda.secrets.<direct>`
     /// path, and a process variable carrying reference text.
     async fn secret_job_server(direct: &str) -> ServerImpl {
+        secret_job_server_with(direct, Vec::new()).await
+    }
+
+    /// [`secret_job_server`] with extra process variables layered over the
+    /// default `bodyRef` request-body variable.
+    async fn secret_job_server_with(
+        direct: &str,
+        extra_vars: Vec<(&str, serde_json::Value)>,
+    ) -> ServerImpl {
         use nanobpmn_engine_core::{IoMapping, Mapping};
         let server = ServerImpl {
             secret_store: Arc::new(crate::secrets::MapSecretStore(
@@ -1512,6 +1530,10 @@ mod cluster_variable_tests {
                         m(&format!("=camunda.secrets.{direct}"), "direct"),
                         m("=jsonCfg", "fromJson"),
                         m("=bodyRef", "fromBody"),
+                        m("=apiCfg", "payload.auth"),
+                        m("=bodyRef", "payload.other"),
+                        m("=apiCfg", "overwritten"),
+                        m("=bodyRef", "overwritten"),
                     ],
                     outputs: Vec::new(),
                 },
@@ -1534,10 +1556,10 @@ mod cluster_variable_tests {
             .create_for_stream(
                 Some("secrets".into()),
                 None,
-                std::collections::HashMap::from([(
-                    "bodyRef".to_string(),
-                    val(json!("camunda.secrets.TOKEN")),
-                )]),
+                std::iter::once(("bodyRef", json!("camunda.secrets.TOKEN")))
+                    .chain(extra_vars)
+                    .map(|(name, value)| (name.to_string(), val(value)))
+                    .collect(),
             )
             .await
             .unwrap();
@@ -1570,6 +1592,16 @@ mod cluster_variable_tests {
         assert_eq!(vars["fromJson"].0, json!("camunda.secrets.TOKEN"));
         assert_eq!(vars["fromBody"].0, json!("camunda.secrets.TOKEN"));
         assert_eq!(
+            vars["payload"].0,
+            json!({"auth": "s3cr3t", "other": "camunda.secrets.TOKEN"}),
+            "only the trusted path resolves — never a sibling holding equal text"
+        );
+        assert_eq!(
+            vars["overwritten"].0,
+            json!("camunda.secrets.TOKEN"),
+            "a trusted target overwritten by a later untrusted mapping stays unresolved"
+        );
+        assert_eq!(
             vars["apiCfg"].0,
             json!("camunda.secrets.TOKEN"),
             "the bare cluster-variable overlay is not an input mapping: never resolved"
@@ -1593,6 +1625,39 @@ mod cluster_variable_tests {
         assert!(
             !leaked.contains("s3cr3t") && !leaked.contains("direct-value"),
             "a resolved secret must never be persisted in engine state: {leaked}"
+        );
+    }
+
+    /// #1640: trust is fixed when the input mappings run. Deleting the
+    /// SECRET_REFERENCE cluster variable afterwards neither withholds the job
+    /// nor raises an incident; recreating a deleted root as JSON-kind cannot
+    /// retroactively distrust or trust anything either.
+    #[tokio::test]
+    async fn job_activation_uses_mapping_time_provenance_not_live_cluster_variables() {
+        let server = secret_job_server("DIRECT").await;
+        assert!(server.cluster_variables.delete(None, "apiCfg"));
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].variables["token"].0, json!("s3cr3t"));
+    }
+
+    /// #1640: a process variable shadowing the trusted cluster root (same
+    /// name, same reference text) is untrusted — the mapping read the
+    /// caller-supplied value, so it is never resolved.
+    #[tokio::test]
+    async fn job_activation_does_not_resolve_a_shadowing_process_variable() {
+        let server =
+            secret_job_server_with("DIRECT", vec![("apiCfg", json!("camunda.secrets.TOKEN"))])
+                .await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        let vars = &jobs[0].variables;
+        assert_eq!(vars["token"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(vars["payload"].0["auth"], json!("camunda.secrets.TOKEN"));
+        assert_eq!(
+            vars["direct"].0,
+            json!("direct-value"),
+            "a literal camunda.secrets path is unaffected by the shadow"
         );
     }
 
@@ -20533,37 +20598,18 @@ impl ServerImpl {
         &self,
         activated: Vec<ActivatedJobWithIdentity>,
     ) -> Vec<ActivatedJobWithIdentity> {
-        if activated.iter().all(|a| a.input_mappings.is_empty()) {
+        if activated.iter().all(|a| a.secret_provenance.is_empty()) {
             return activated;
         }
-        // Trusted roots: the SECRET_REFERENCE-kind cluster variables visible
-        // to the (single-tenant) engine — globals overlaid by the default
-        // tenant, exactly the engine's own overlay.
-        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot();
-        let mut cluster_ctx = globals;
-        if let Some(overlay) = tenants.get(nanobpmn_engine_core::DEFAULT_TENANT) {
-            for (name, value, kind) in overlay {
-                cluster_ctx.insert(name.clone(), value.clone());
-                kinds.insert(name.clone(), *kind);
-            }
-        }
-        let trusted_roots: Vec<String> = kinds
-            .into_iter()
-            .filter(|(_, kind)| *kind == models::ClusterVariableKindEnum::SecretReference)
-            .map(|(name, _)| name)
-            .collect();
-
         let mut out = Vec::with_capacity(activated.len());
         for mut a in activated {
-            let trusted =
-                secrets::trusted_secrets_by_target(&a.input_mappings, &cluster_ctx, &trusted_roots);
-            if trusted.is_empty() {
+            if a.secret_provenance.is_empty() {
                 out.push(a);
                 continue;
             }
             match secrets::resolve_job_variables(
                 &a.job.variables,
-                &trusted,
+                &a.secret_provenance,
                 self.secret_store.as_ref(),
             ) {
                 Ok(None) => out.push(a),
@@ -26417,10 +26463,10 @@ struct ActivatedJobWithIdentity {
     process_id: String,
     version: i32,
     process_definition_key: String,
-    /// The job element's `zeebe:input` mappings (BPMN-element jobs only; empty
-    /// for listener jobs), captured on the engine thread so activation-time
-    /// secret resolution (#1640) can derive which references are trusted.
-    input_mappings: Vec<nanobpmn_engine_core::Mapping>,
+    /// The job's mapping-time secret-reference provenance (#1640), read from
+    /// engine state on the engine thread: the only input activation-time
+    /// secret resolution trusts.
+    secret_provenance: Vec<nanobpmn_engine_core::SecretProvenance>,
 }
 
 enum PreparedActivation {
@@ -26495,22 +26541,20 @@ fn activated_jobs_with_identity(
                     )
                 })
                 .unwrap_or_else(|| (String::new(), 1, String::new()));
-            let input_mappings = if matches!(job.kind, nanobpmn_engine_core::JobKind::BpmnElement) {
-                journal
-                    .instance(job.instance_key)
-                    .and_then(|instance| journal.state().definition_for(instance))
-                    .and_then(|deployed| deployed.definition.element(&job.element_id))
-                    .map(|element| element.io.inputs.clone())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            // Mapping-time secret provenance journaled on `JobCreated`
+            // (#1640) — never re-derived from the live cluster variables.
+            let secret_provenance = journal
+                .state()
+                .jobs
+                .get(&job.key)
+                .map(|j| j.secret_provenance.clone())
+                .unwrap_or_default();
             ActivatedJobWithIdentity {
                 job,
                 process_id,
                 version,
                 process_definition_key,
-                input_mappings,
+                secret_provenance,
             }
         })
         .collect()
@@ -26695,7 +26739,7 @@ fn activated_job_result(
         process_id,
         version,
         process_definition_key,
-        input_mappings: _,
+        secret_provenance: _,
     } = activated;
 
     // Project the job's variables into the REST object map off the engine
@@ -35810,6 +35854,7 @@ mod clustered_startup_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let job_failed = |job_key: u64, instance_key: u64, retries: i32| Event::JobFailed {
             job_key,

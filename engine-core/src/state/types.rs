@@ -615,6 +615,32 @@ pub struct Job {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub terminal_end: Option<JobTerminalEnd>,
+    /// Mapping-time secret-reference provenance (#1640): which value paths of
+    /// the job's input-mapping targets hold a TRUSTED `camunda.secrets.<name>`
+    /// reference, and which names. Copied from [`crate::Event::JobCreated`].
+    /// Only paths and secret NAMES are stored — never plaintext. Empty (resolve
+    /// nothing — fail closed) for jobs created before this field existed.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub secret_provenance: Vec<SecretProvenance>,
+}
+
+/// One trusted secret-reference site of a job's input mappings (#1640): the
+/// dotted input-mapping target `path` (e.g. `token`, `payload.auth`) and the
+/// secret names whose `camunda.secrets.<name>` references the mapping
+/// structurally delivered there from a trusted source (a literal
+/// `camunda.secrets.<name>` path or a direct read of a `SECRET_REFERENCE`
+/// cluster variable — [`crate::feel::eval_with_provenance`]). Host-side
+/// activation resolves only these names, only inside this path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SecretProvenance {
+    /// The dotted input-mapping target path.
+    pub path: String,
+    /// The trusted secret names (sorted).
+    pub secrets: Vec<String>,
 }
 
 /// See [`Job::terminal_end`] (#1440).
@@ -3147,7 +3173,33 @@ mod job_attribution_worker_tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
         }
+    }
+
+    /// #1640: a job's mapping-time secret provenance survives the snapshot
+    /// round-trip (paths + names only), and a pre-#1640 job record without
+    /// the field decodes to EMPTY provenance (resolve nothing — fail closed).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn secret_provenance_snapshot_round_trip() {
+        let mut job = job_with_worker(Some("w"));
+        job.secret_provenance = vec![super::SecretProvenance {
+            path: "payload.auth".to_string(),
+            secrets: vec!["TOKEN".to_string()],
+        }];
+        let json = serde_json::to_string(&job).expect("serialize");
+        assert!(json.contains("\"secret_provenance\""));
+        let back: Job = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, job);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("secret_provenance");
+        let old: Job = serde_json::from_value(legacy).expect("legacy record decodes");
+        assert!(old.secret_provenance.is_empty());
     }
 
     /// #1191 — the single-source capture helper the three terminal sites use must

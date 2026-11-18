@@ -134,6 +134,78 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Mapping-time **secret-reference provenance** of an element's input
+    /// mappings (#1640): for each `=`-FEEL mapping, the secret names
+    /// [`crate::feel::eval_with_provenance`] (the single, fail-closed
+    /// structural attribution of #1636) attributes to a trusted source when
+    /// the source is evaluated against `vars` — the exact view the mappings
+    /// run against — keyed by the mapping's target path.
+    ///
+    /// Trusted roots are the `SECRET_REFERENCE`-kind cluster variables that
+    /// are actually what `vars` resolves for that name: a root bound by ANY
+    /// instance or scope variable of the instance (a shadowing process /
+    /// parent-scope variable), or whose visible value differs from the cluster
+    /// value, is untrusted (fail closed).
+    ///
+    /// Overwrite: mappings apply in order, so a later mapping writing a path
+    /// drops the provenance of that path, its ancestors and its descendants,
+    /// and re-records it only when its own value is attributable. Static
+    /// (non-`=`) sources and unevaluable sources record nothing.
+    pub(crate) fn secret_provenance_of(
+        &self,
+        instance_key: Key,
+        vars: &HashMap<String, Value>,
+        mappings: &[crate::model::Mapping],
+    ) -> Vec<crate::state::SecretProvenance> {
+        if mappings.is_empty() {
+            return Vec::new();
+        }
+        let cluster_roots = {
+            let guard = match self.cluster_variables.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT)
+        };
+        let instance = self.state.instances.get(&instance_key);
+        let bound_by_instance = |name: &str| {
+            instance.is_some_and(|i| {
+                i.variables.contains_key(name)
+                    || i.scope_variables.values().any(|m| m.contains_key(name))
+            })
+        };
+        let trusted: Vec<String> = cluster_roots
+            .into_iter()
+            .filter(|(name, value)| !bound_by_instance(name) && vars.get(name) == Some(value))
+            .map(|(name, _)| name)
+            .collect();
+        // Fast path: nothing can be attributed without a trusted root or a
+        // literal `camunda.secrets.<name>` path.
+        if trusted.is_empty() && !mappings.iter().any(|m| m.source.contains("camunda")) {
+            return Vec::new();
+        }
+        let mut out: Vec<crate::state::SecretProvenance> = Vec::new();
+        for m in mappings {
+            let path = m.target.trim();
+            out.retain(|p| !paths_overlap(&p.path, path));
+            if !m.source.trim_start().starts_with('=') {
+                continue;
+            }
+            let Ok(evaluated) =
+                crate::feel::eval_with_provenance(m.source.trim(), vars, trusted.iter().cloned())
+            else {
+                continue;
+            };
+            if !evaluated.referenced_secrets.is_empty() {
+                out.push(crate::state::SecretProvenance {
+                    path: path.to_string(),
+                    secrets: evaluated.referenced_secrets,
+                });
+            }
+        }
+        out
+    }
+
     /// Evaluates the given io mappings against an explicit variable context
     /// `vars` (rather than the instance's persisted variables), returning the
     /// merged projection. Used when an as-yet-unapplied result (e.g. a script
@@ -918,6 +990,14 @@ impl Engine {
             .map(|e| e.io.outputs.clone())
             .unwrap_or_default()
     }
+}
+
+/// `true` when writing dotted path `b` replaces (part of) the value at `a`, or
+/// vice versa: equal paths, or one is a dotted ancestor of the other.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|r| r.starts_with('.'))
+        || b.strip_prefix(a).is_some_and(|r| r.starts_with('.'))
 }
 
 #[cfg(test)]

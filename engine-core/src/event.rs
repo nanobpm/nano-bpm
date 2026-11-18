@@ -656,6 +656,16 @@ pub enum Event {
             serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
+        /// Mapping-time secret-reference provenance (#1640): the input-mapping
+        /// target paths holding trusted `camunda.secrets.<name>` references,
+        /// captured when the mappings ran (never re-derived later). Paths and
+        /// secret NAMES only — never plaintext. Additive: a pre-#1640 record
+        /// decodes to empty provenance, which resolves nothing (fail closed).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        secret_provenance: Vec<crate::state::SecretProvenance>,
     },
     /// A job was created for one execution listener in an element's sequential
     /// listener chain (ADR 0037). Distinct from [`Event::JobCreated`] so that

@@ -36,6 +36,7 @@ mod modify_scopes;
 mod multi_instance;
 mod retry_phases;
 mod scoped_conditions;
+mod secret_provenance;
 mod terminal_timing;
 mod timer_cycle_bounds;
 mod timers_catch;

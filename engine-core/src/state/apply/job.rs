@@ -14,6 +14,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             created_at,
             priority,
             retries,
+            secret_provenance,
         } => {
             state.jobs.insert(
                 *job_key,
@@ -40,6 +41,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: secret_provenance.clone(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -91,6 +93,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -142,6 +145,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);

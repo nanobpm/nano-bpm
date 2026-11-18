@@ -10,16 +10,23 @@
 //! `ClusterVariableJobSecretResolver`.
 //!
 //! **Trust.** Only references a job's element input mappings *structurally*
-//! deliver from a trusted source are resolved, and only inside that mapping's
-//! target variable. Provenance reuses the fail-closed
+//! deliver from a trusted source are resolved, and only at the exact target
+//! path the mapping wrote. The engine captures this **mapping-time provenance**
+//! (`SecretProvenance`: target path + secret names, never plaintext) when the
+//! input mappings run, with the fail-closed
 //! [`eval_with_provenance`](nanobpmn_engine_core::feel::eval_with_provenance)
-//! attribution of `POST /v2/expression/evaluation` (`referencedSecrets`): a
-//! mapping source is evaluated against the cluster variables alone, with the
-//! `SECRET_REFERENCE`-kind ones as the trusted roots. References arriving via
+//! attribution of #1636 against the exact view the mappings saw — trusted
+//! roots are the `SECRET_REFERENCE`-kind cluster variables not shadowed by any
+//! instance/scope variable, and a later mapping overwriting a path drops that
+//! path's provenance — and journals it on `JobCreated`. Activation never
+//! re-derives trust from the live cluster variables, so editing or deleting
+//! one after the mapping ran changes nothing. References arriving via
 //! request-body / process variables, JSON-kind cluster variables, static
-//! (non-`=`) mapping literals, or the bare cluster-variable overlay are never
-//! resolved — false negatives (the reference text stays visible) over false
-//! positives (an attacker-chosen reference steering resolution).
+//! (non-`=`) mapping literals, the bare cluster-variable overlay, or a sibling
+//! path holding equal text are never resolved; nor are jobs created on a
+//! deferred path (start listeners, incident re-drive, multi-instance / ad-hoc
+//! children), which carry no provenance — false negatives (the reference text
+//! stays visible) over false positives.
 //!
 //! **Store.** The secret provider follows the ADR 0027 §5 env-pointer
 //! convention: secret `<name>` is the environment variable
@@ -32,9 +39,9 @@
 //! raises an incident on the element (the job is failed with no retries and
 //! the upstream message) instead of passing the literal through.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use nanobpmn_engine_core::{Mapping, Value};
+use nanobpmn_engine_core::{SecretProvenance, Value};
 
 /// The store id of the env-pointer secret store (also the `storeId` the
 /// expression endpoint's `referencedSecrets` reports).
@@ -100,86 +107,66 @@ impl MissingSecret {
     }
 }
 
-/// The trusted secret names per input-mapping **target root variable**: for
-/// each FEEL (`=`-prefixed) input mapping, the names
-/// [`eval_with_provenance`](nanobpmn_engine_core::feel::eval_with_provenance)
-/// structurally attributes to a trusted source when the source is evaluated
-/// against `cluster_ctx` (the cluster variables visible to the job) with
-/// `trusted_roots` (the `SECRET_REFERENCE`-kind ones) as trusted carriers.
-/// Static literals and unevaluable sources contribute nothing (fail-closed).
-pub(crate) fn trusted_secrets_by_target(
-    inputs: &[Mapping],
-    cluster_ctx: &HashMap<String, Value>,
-    trusted_roots: &[String],
-) -> HashMap<String, HashSet<String>> {
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-    for mapping in inputs {
-        if !mapping.source.trim_start().starts_with('=') {
-            continue;
-        }
-        let Ok(evaluated) = nanobpmn_engine_core::feel::eval_with_provenance(
-            mapping.source.trim(),
-            cluster_ctx,
-            trusted_roots.iter().cloned(),
-        ) else {
-            continue;
-        };
-        if evaluated.referenced_secrets.is_empty() {
-            continue;
-        }
-        let root = mapping
-            .target
-            .split('.')
-            .next()
-            .unwrap_or(&mapping.target)
-            .to_string();
-        out.entry(root)
-            .or_default()
-            .extend(evaluated.referenced_secrets);
-    }
-    out
-}
-
-/// Substitutes every whole-string `camunda.secrets.<name>` reference inside the
-/// trusted target variables whose `<name>` is trusted for that target. Returns
-/// `Ok(None)` when nothing was substituted (the caller keeps its shared
-/// variable snapshot), `Ok(Some(vars))` with the resolved copy otherwise, or
-/// the first [`MissingSecret`] (targets visited in name order, so the incident
-/// is deterministic).
+/// Substitutes every whole-string `camunda.secrets.<name>` reference at each
+/// provenance site — only inside that site's dotted target `path`, and only for
+/// the names trusted for that site (#1640). Provenance was captured when the
+/// input mappings ran and journaled on `JobCreated`, so nothing here consults
+/// the live cluster variables. Returns `Ok(None)` when nothing was substituted
+/// (the caller keeps its shared variable snapshot), `Ok(Some(vars))` with the
+/// resolved copy otherwise, or the first [`MissingSecret`] (sites visited in
+/// path order, so the incident is deterministic).
 pub(crate) fn resolve_job_variables(
     vars: &HashMap<String, Value>,
-    trusted: &HashMap<String, HashSet<String>>,
+    provenance: &[SecretProvenance],
     store: &dyn SecretStore,
 ) -> Result<Option<HashMap<String, Value>>, MissingSecret> {
-    let mut targets: Vec<&String> = trusted.keys().collect();
-    targets.sort();
-    let mut resolved: BTreeMap<String, Value> = BTreeMap::new();
-    for target in targets {
-        let (Some(value), Some(names)) = (vars.get(target), trusted.get(target)) else {
+    let mut sites: Vec<&SecretProvenance> = provenance.iter().collect();
+    sites.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut out: Option<HashMap<String, Value>> = None;
+    for site in sites {
+        let names: HashSet<&str> = site.secrets.iter().map(String::as_str).collect();
+        let mut segments = site.path.split('.');
+        let Some(root) = segments.next() else {
             continue;
         };
-        let mut value = value.clone();
-        if substitute(&mut value, names, store)? {
-            resolved.insert(target.clone(), value);
+        let rest: Vec<&str> = segments.collect();
+        let current = out.as_ref().unwrap_or(vars);
+        let Some(mut value) = current.get(root).cloned() else {
+            continue;
+        };
+        let Some(target) = select_mut(&mut value, &rest) else {
+            continue;
+        };
+        if substitute(target, &names, store)? {
+            out.get_or_insert_with(|| vars.clone())
+                .insert(root.to_string(), value);
         }
     }
-    if resolved.is_empty() {
-        return Ok(None);
+    Ok(out)
+}
+
+/// The value at a dotted member path below a variable; `None` when a segment
+/// is absent or the value is not a context there.
+fn select_mut<'v>(value: &'v mut Value, path: &[&str]) -> Option<&'v mut Value> {
+    let mut v = value;
+    for key in path {
+        v = match v {
+            Value::Map(entries) => entries.get_mut(*key)?,
+            _ => return None,
+        };
     }
-    let mut out = vars.clone();
-    out.extend(resolved);
-    Ok(Some(out))
+    Some(v)
 }
 
 fn substitute(
     value: &mut Value,
-    names: &HashSet<String>,
+    names: &HashSet<&str>,
     store: &dyn SecretStore,
 ) -> Result<bool, MissingSecret> {
     match value {
         Value::Str(s) => {
             let Some(name) = nanobpmn_engine_core::feel::secret_reference_name(s)
-                .filter(|n| names.contains(*n))
+                .filter(|n| names.contains(n))
                 .map(str::to_owned)
             else {
                 return Ok(false);
@@ -231,17 +218,12 @@ impl SecretStore for MapSecretStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn s(v: &str) -> Value {
         Value::Str(v.to_string())
-    }
-
-    fn mapping(source: &str, target: &str) -> Mapping {
-        Mapping {
-            source: source.to_string(),
-            target: target.to_string(),
-        }
     }
 
     fn store() -> MapSecretStore {
@@ -251,60 +233,28 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn trust_matrix_of_input_mappings() {
-        let cluster = HashMap::from([
-            ("secretCfg".to_string(), s("camunda.secrets.TOKEN")),
-            ("jsonCfg".to_string(), s("camunda.secrets.JSONREF")),
-        ]);
-        let roots = vec!["secretCfg".to_string()];
-        let trusted = trusted_secrets_by_target(
-            &[
-                mapping("=secretCfg", "a"),
-                mapping("=camunda.secrets.DIRECT", "b.inner"),
-                mapping("=jsonCfg", "c"),
-                mapping("=bodyVar", "d"),
-                mapping("camunda.secrets.STATIC", "e"),
-                mapping("=if true then secretCfg else jsonCfg", "f"),
-            ],
-            &cluster,
-            &roots,
-        );
-        assert_eq!(
-            trusted.get("a"),
-            Some(&HashSet::from(["TOKEN".to_string()]))
-        );
-        assert_eq!(
-            trusted.get("b"),
-            Some(&HashSet::from(["DIRECT".to_string()])),
-            "a dotted target keys on its root variable"
-        );
-        for untrusted in ["c", "d", "e", "f"] {
-            assert!(
-                !trusted.contains_key(untrusted),
-                "{untrusted} must not be trusted"
-            );
+    fn site(path: &str, names: &[&str]) -> SecretProvenance {
+        SecretProvenance {
+            path: path.to_string(),
+            secrets: names.iter().map(|n| n.to_string()).collect(),
         }
     }
 
     #[test]
-    fn resolves_only_trusted_names_in_trusted_targets() {
+    fn resolves_only_trusted_names_at_trusted_paths() {
         let vars = HashMap::from([
             ("a".to_string(), s("camunda.secrets.TOKEN")),
             (
                 "b".to_string(),
                 Value::Map(BTreeMap::from([
                     ("inner".to_string(), s("camunda.secrets.DIRECT")),
-                    ("other".to_string(), s("camunda.secrets.TOKEN")),
+                    ("other".to_string(), s("camunda.secrets.DIRECT")),
                 ])),
             ),
             ("c".to_string(), s("camunda.secrets.TOKEN")),
         ]);
-        let trusted = HashMap::from([
-            ("a".to_string(), HashSet::from(["TOKEN".to_string()])),
-            ("b".to_string(), HashSet::from(["DIRECT".to_string()])),
-        ]);
-        let out = resolve_job_variables(&vars, &trusted, &store())
+        let provenance = [site("a", &["TOKEN"]), site("b.inner", &["DIRECT"])];
+        let out = resolve_job_variables(&vars, &provenance, &store())
             .expect("resolvable")
             .expect("substituted");
         assert_eq!(out.get("a"), Some(&s("s3cr3t")));
@@ -312,9 +262,9 @@ mod tests {
             out.get("b"),
             Some(&Value::Map(BTreeMap::from([
                 ("inner".to_string(), s("direct-value")),
-                ("other".to_string(), s("camunda.secrets.TOKEN")),
+                ("other".to_string(), s("camunda.secrets.DIRECT")),
             ]))),
-            "only the name trusted for this target is resolved"
+            "a sibling path holding equal reference text is never resolved"
         );
         assert_eq!(
             out.get("c"),
@@ -329,19 +279,30 @@ mod tests {
     }
 
     #[test]
+    fn only_the_name_trusted_for_the_site_resolves() {
+        let vars = HashMap::from([("a".to_string(), s("camunda.secrets.DIRECT"))]);
+        assert_eq!(
+            resolve_job_variables(&vars, &[site("a", &["TOKEN"])], &store()),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn nothing_trusted_is_a_no_op() {
         let vars = HashMap::from([("a".to_string(), s("camunda.secrets.TOKEN"))]);
+        assert_eq!(resolve_job_variables(&vars, &[], &store()), Ok(None));
         assert_eq!(
-            resolve_job_variables(&vars, &HashMap::new(), &store()),
-            Ok(None)
+            resolve_job_variables(&vars, &[site("a.missing", &["TOKEN"])], &store()),
+            Ok(None),
+            "a path that no longer exists resolves nothing"
         );
     }
 
     #[test]
     fn missing_secret_reports_the_upstream_incident_message() {
         let vars = HashMap::from([("a".to_string(), s("camunda.secrets.NOPE"))]);
-        let trusted = HashMap::from([("a".to_string(), HashSet::from(["NOPE".to_string()]))]);
-        let err = resolve_job_variables(&vars, &trusted, &store()).expect_err("missing");
+        let err =
+            resolve_job_variables(&vars, &[site("a", &["NOPE"])], &store()).expect_err("missing");
         assert_eq!(
             err.incident_message(),
             "Failed to resolve secret 'NOPE' from default. Ensure the secret exists and the store is available, then resolve the incident to retry."

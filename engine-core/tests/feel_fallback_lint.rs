@@ -117,6 +117,18 @@ const ALLOW: &[Allow] = &[
              (Zeebe BpmnVariableMappingBehavior)",
         ),
     },
+    Allow {
+        file: "resolve.rs",
+        contains: "crate::feel::eval_with_provenance(m.source.trim(), vars,",
+        rule: Rule::DirectFeel,
+        count: 1,
+        why: Why::Zeebe(
+            "#1640 secret provenance: a provenance-only re-read of an ioMapping source \
+             that the authoritative pass (eval_io_mappings_in) already evaluated, raising \
+             IO_MAPPING_ERROR on failure (Zeebe BpmnVariableMappingBehavior); a failure \
+             here records no provenance, so the reference is never resolved (fail closed)",
+        ),
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
