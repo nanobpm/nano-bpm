@@ -510,6 +510,11 @@ The Raft work in §14.3 is **not** just "add replication under the journal." It 
 2. **Replicate events, not commands.** nanobpmn journals *outputs* (the events a command produced),
    so followers apply committed events deterministically to rebuild state — they do not re-run
    command logic. This keeps replicas consistent without requiring deterministic re-execution.
+   *Status (#1655):* the shipped implementation drifted to **command** replication
+   (`ReplicatedCommand` re-executed by every replica in `PartitionStateMachine::apply`). The decision
+   of record and the staged plan back to event replication are in
+   [ADR 0066](adr/0066-replication-model.md) (Proposed); until its cutover lands, engine determinism
+   (#1649 guards) remains a hard invariant.
 3. **Add state snapshotting.** Recovery today is a **full journal replay** (O(history)); there is no
    snapshot. Zeebe periodically snapshots RocksDB and replicates the snapshot so restart/failover
    skips replaying the whole log. HA needs periodic engine-state snapshots (+ snapshot transfer to
