@@ -62,6 +62,8 @@ const PUBLISH_TTL_MS = DEFAULT_COMPLETION_TIMEOUT_MS;
 // indefinitely. Bounding the probe turns that hang into the documented
 // unreachable-runtime skip (#1260 review).
 const DEFAULT_PING_TIMEOUT_MS = 10_000;
+// Poll interval while a `settled.ack` correlation waits for its subscription.
+const ACK_READINESS_POLL_MS = 50;
 // Every ordinary (non-long-poll) REST call — deploy, clock ops, message/signal
 // correlation, job completion — must also carry a deadline. `ping()` alone is
 // not enough: without a client-side timeout a reachable-but-wedged endpoint that
@@ -424,13 +426,29 @@ export class CamundaBackend {
       // so it is the acknowledgement. Publishing first and then correlating
       // would send a SECOND message (404 once the first consumed the
       // subscription, or a stray buffered message if it wins — #1246 review).
-      await this.#json(
-        "POST",
-        "/messages/correlation",
-        { name, correlationKey, variables: variables ?? {} },
-        "correlate message",
-      );
-      return;
+      //
+      // Unbuffered correlation answers 404 — and delivers NOTHING — while the
+      // subscription is not open yet (e.g. a message-first order racing the
+      // instance's start; spec/messages.yaml). So wait for subscription
+      // readiness by re-attempting ONLY on 404, bounded by the completion
+      // deadline: each 404 is a no-op, so exactly one message is ever
+      // delivered (the first 2xx). Any other error fails loudly at once.
+      const deadline = Date.now() + DEFAULT_COMPLETION_TIMEOUT_MS;
+      for (;;) {
+        const res = await fetch(`${this.base}/messages/correlation`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify({ name, correlationKey, variables: variables ?? {} }),
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
+        });
+        const text = await res.text();
+        if (res.status === 404 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, ACK_READINESS_POLL_MS));
+          continue;
+        }
+        requireOk(res, text, "correlate message");
+        return;
+      }
     }
     await this.#json(
       "POST",

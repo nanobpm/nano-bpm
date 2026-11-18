@@ -880,3 +880,62 @@ test("CamundaBackend settled.ack delivers the message ONCE, via synchronous corr
     await once(server, "close");
   }
 });
+
+test("CamundaBackend settled.ack waits for a delayed subscription: a 404 correlation is re-attempted, never published (#1246 review)", async () => {
+  // `/messages/correlation` is unbuffered: before the subscription opens it
+  // answers 404 and delivers NOTHING, so re-attempting it is a readiness wait
+  // (no second message), and the first 2xx is the single delivery + ack.
+  const calls = [];
+  let notReady = 2;
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      if (req.url.endsWith("/messages/correlation") && notReady-- > 0) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end('{"title":"NOT_FOUND"}');
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"processInstanceKey":"1"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
+    assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 3, "two not-ready 404s, then one delivery");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("CamundaBackend settled.ack fails loudly on a non-404 correlation error (#1246 review)", async () => {
+  const calls = [];
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end('{"title":"INVALID_ARGUMENT"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await assert.rejects(
+      backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true }),
+      /HTTP 400/,
+    );
+    assert.equal(calls.length, 1, "a non-readiness error is never re-attempted");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
