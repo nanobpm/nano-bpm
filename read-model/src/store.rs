@@ -1832,7 +1832,7 @@ pub struct ResourceMetaRow {
     pub tenant_id: String,
     /// The key of the deployment that created this resource version, when
     /// known. `None` only for a row projected before schema v17 (or seeded from
-    /// an engine snapshot, which does not carry it) — sorts as absent.
+    /// a legacy engine snapshot whose `deployment_key` is `0`) — sorts as absent.
     pub deployment_key: Option<Key>,
 }
 
@@ -4325,22 +4325,24 @@ fn project_engine_state(
     for res in state.resources.values() {
         tx.cexecute(
             "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-             version_tag, content, tenant_id) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+             version_tag, content, tenant_id, deployment_key) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
              ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
              resource_name = excluded.resource_name, version = excluded.version, \
              version_tag = excluded.version_tag, content = excluded.content, \
-             tenant_id = excluded.tenant_id",
+             tenant_id = excluded.tenant_id, \
+             deployment_key = COALESCE(excluded.deployment_key, resources.deployment_key)",
             // `tenant_id` is not modeled in engine state; default to '<default>'.
-            // Neither is `deployment_key`: it is left untouched (NULL on a fresh
-            // row, the event-projected value preserved on an existing one).
+            // `deployment_key` is carried by the snapshot; only the legacy `0`
+            // means unknown, which binds NULL and preserves any existing value.
             params![
                 res.key as i64,
                 res.resource_id,
                 res.resource_name,
                 res.version,
                 res.content,
-                "<default>"
+                "<default>",
+                (res.deployment_key != 0).then_some(res.deployment_key as i64),
             ],
         )?;
     }
@@ -8781,6 +8783,40 @@ mod definition_xml_tests {
         assert_eq!(
             store.process_definition_by_key(6).map(|d| d.version),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn seed_from_engine_state_carries_resource_deployment_key() {
+        use nanobpmn_engine_core::{DeployedResource, State};
+
+        let mk = |key, deployment_key| DeployedResource {
+            key,
+            version: 1,
+            resource_id: format!("r{key}.txt"),
+            resource_name: format!("r{key}.txt"),
+            content: "c".to_string(),
+            deployment_key,
+            version_tag: None,
+        };
+        let mut state = State::default();
+        state.resources.insert("r7.txt".to_string(), mk(7, 99));
+        state.resources.insert("r8.txt".to_string(), mk(8, 0));
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
+        );
+        assert_eq!(store.resource_by_key_meta(8).unwrap().deployment_key, None);
+
+        // A legacy (0) snapshot value must not clobber a known key.
+        state.resources.insert("r7.txt".to_string(), mk(7, 0));
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
         );
     }
 
