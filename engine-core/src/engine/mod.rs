@@ -8344,6 +8344,7 @@ impl Engine {
                     element_id.clone(),
                     element_instance_key,
                     scope,
+                    scope,
                     Arc::new(vars),
                     true,
                 )
@@ -8419,6 +8420,7 @@ impl Engine {
             element_id,
             element_instance_key,
             scope,
+            view_scope,
             element_vars,
             false,
         )
@@ -8448,13 +8450,19 @@ impl Engine {
         }
     }
 
-    /// [`activate_body_in`] against an explicit variable view.
+    /// [`activate_body_in`] against an explicit variable view. `view_scope` is
+    /// the scope that view was built from (the mapping's evaluation scope): it
+    /// decides which bindings shadow a trusted cluster-variable root for
+    /// secret-reference provenance — only bindings on `view_scope`'s own
+    /// visible chain, never a sibling branch's locals (#1652 round-5 review).
+    #[allow(clippy::too_many_arguments)]
     fn activate_body_with_vars(
         &mut self,
         instance_key: Key,
         element_id: String,
         element_instance_key: Key,
         scope: Key,
+        view_scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
         scope_pre_registered: bool,
     ) -> (Vec<Event>, Vec<Step>) {
@@ -8518,11 +8526,25 @@ impl Engine {
         // A source expression that fails to evaluate raises an `IO_MAPPING_ERROR`
         // incident and halts the element (no scope write, no behaviour) — the
         // resolution re-drives this body (#939).
-        let input_updates = if inputs.is_empty() {
-            HashMap::new()
+        //
+        // Value AND secret-reference provenance (#1640) are captured in ONE
+        // evaluation per mapping (`eval_input_mappings_with_provenance`): a
+        // nondeterministic source (`random number()`, `now()`) re-evaluated
+        // for provenance after the value was computed could take a different
+        // branch, decoupling the journaled value from its recorded trust
+        // (#1652 round-5 review). The provenance is taken from the exact view
+        // the mappings evaluated against — never re-derived later — and
+        // journaled on the element's `JobCreated`.
+        let (input_updates, secret_provenance) = if inputs.is_empty() {
+            (HashMap::new(), Vec::new())
         } else {
-            match self.eval_io_mappings_in(&element_vars, &inputs) {
-                Ok(updates) => updates,
+            match self.eval_input_mappings_with_provenance(
+                instance_key,
+                view_scope,
+                &element_vars,
+                &inputs,
+            ) {
+                Ok(evaluated) => evaluated,
                 Err(failure) => {
                     return (
                         vec![self.io_mapping_incident(
@@ -8551,11 +8573,6 @@ impl Engine {
                 variables: input_updates.clone(),
             });
         }
-
-        // Mapping-time secret-reference provenance (#1640), captured from the
-        // exact view the mappings just evaluated against — never re-derived
-        // later — and journaled on the element's `JobCreated`.
-        let secret_provenance = self.secret_provenance_of(instance_key, &element_vars, &inputs);
 
         // Scope writes above have not been applied yet. Both listeners and the
         // activation body must evaluate against the same post-input view.

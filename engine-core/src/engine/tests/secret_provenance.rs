@@ -373,13 +373,13 @@ fn a_retype_between_overlay_and_trust_reads_is_not_trusted() {
 
     // Pinned: trust is read from the snapshot `vars` came from -> untrusted.
     assert!(engine
-        .secret_provenance_of(inst, &vars, &mappings)
+        .secret_provenance_of(inst, 0, &vars, &mappings)
         .is_empty());
     // The pre-fix behaviour (a fresh read of kinds) WOULD have trusted it —
     // proving the injected retype is real.
     engine.pinned_cluster_variables = None;
     assert_eq!(
-        engine.secret_provenance_of(inst, &vars, &mappings),
+        engine.secret_provenance_of(inst, 0, &vars, &mappings),
         vec![SecretProvenance {
             path: "t".to_string(),
             secrets: vec!["TOKEN".to_string()],
@@ -396,4 +396,171 @@ fn apply_command_unpins_the_cluster_snapshot() {
         HashMap::new(),
     );
     assert!(engine.pinned_cluster_variables.is_none());
+}
+
+/// A trusted root is shadowed only by a binding on the mapping's OWN visible
+/// scope chain. A same-named local in a SIBLING parallel branch's scope is
+/// invisible to this mapping's evaluation, so it must NOT revoke the trust:
+/// the sibling's `=apiCfg` still reads the trusted cluster variable and its
+/// job must keep its provenance (and its missing-secret incident handling).
+/// The pre-fix check scanned EVERY scope of the instance, so one branch's
+/// local `apiCfg` stripped the sibling's trust (#1652 round-5 review).
+#[test]
+fn a_sibling_branch_local_does_not_shadow_a_trusted_root() {
+    let (mut engine, _) = engine_with_cluster_vars();
+    // fork -> (a, b) -> join. `a` maps an untrusted bodyRef onto a LOCAL
+    // `apiCfg`; `b` reads the trusted cluster `apiCfg`.
+    let def = ProcessBuilder::new("par")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .service_task("a", "task-a")
+        .with_io(
+            "a",
+            IoMapping {
+                inputs: vec![m("=bodyRef", "apiCfg")],
+                outputs: Vec::new(),
+            },
+        )
+        .service_task("b", "task-b")
+        .with_io(
+            "b",
+            IoMapping {
+                inputs: vec![m("=apiCfg", "token")],
+                outputs: Vec::new(),
+            },
+        )
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let proc_id = def.id.clone();
+    let mut log = engine.apply_command(Command::DeployProcess(def)).unwrap();
+    log.extend(
+        engine
+            .apply_command(Command::create_instance_with(
+                proc_id,
+                HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+            ))
+            .unwrap(),
+    );
+    // b's job must be trusted (its `=apiCfg` reads the cluster variable); a's
+    // own local `apiCfg` must not have revoked it. Find b's job by type.
+    let b_job = engine
+        .state
+        .jobs
+        .values()
+        .find(|j| j.job_type == "task-b")
+        .expect("task-b job");
+    assert_eq!(
+        b_job.secret_provenance,
+        vec![site("token")],
+        "a sibling branch's local `apiCfg` must not shadow the trusted cluster root"
+    );
+    // a's job wrote an UNTRUSTED local apiCfg (from bodyRef): no provenance.
+    let a_job = engine
+        .state
+        .jobs
+        .values()
+        .find(|j| j.job_type == "task-a")
+        .expect("task-a job");
+    assert!(
+        a_job.secret_provenance.is_empty(),
+        "{:?}",
+        a_job.secret_provenance
+    );
+}
+
+/// Value and provenance come from ONE evaluation of each mapping. A
+/// nondeterministic source (`random number()`) re-evaluated for provenance
+/// after the value was computed could take a different branch, so the
+/// journaled value and its recorded trust would describe different runs — an
+/// untrusted field the value-evaluation kept could then be resolved to
+/// plaintext at activation. The fused evaluator never re-evaluates, so the
+/// provenance always describes the journaled value (#1652 round-5 review).
+///
+/// Seeded: the engine's deterministic FEEL environment (#1642) is installed
+/// so `random number()` is reproducible. Across seeds the single evaluation
+/// yields EITHER `other = bodyRef` (untrusted text, withheld) OR `other =
+/// null`; in BOTH the recorded provenance must match the journaled value —
+/// never trust a target whose journaled value carries the untrusted text.
+#[test]
+fn provenance_matches_the_single_evaluated_value_under_nondeterminism() {
+    let (mut engine, _) = engine_with_cluster_vars();
+    let inst = {
+        let def = task(vec![m(
+            "={auth: camunda.secrets.TOKEN, other: if random number() < 0.5 then bodyRef else null}",
+            "payload",
+        )]);
+        let proc_id = def.id.clone();
+        let mut log = engine.apply_command(Command::DeployProcess(def)).unwrap();
+        log.extend(
+            engine
+                .apply_command(Command::create_instance_with(
+                    proc_id,
+                    HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+                ))
+                .unwrap(),
+        );
+        log.iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let vars = engine.variables_for_element(inst, 0);
+    let mappings = vec![m(
+        "={auth: camunda.secrets.TOKEN, other: if random number() < 0.5 then bodyRef else null}",
+        "payload",
+    )];
+
+    // Across several seeded environments the single evaluation must keep
+    // value and provenance consistent: whenever the journaled `payload.other`
+    // carries the untrusted reference text, `payload` must NOT be trusted.
+    let mut saw_body_ref = false;
+    let mut saw_null = false;
+    for seed in 0..40u64 {
+        let mut env = crate::feel::EvalEnv::new(1_700_000_000_000, seed);
+        let (updates, prov) = crate::feel::with_env(&mut env, || {
+            match engine.eval_input_mappings_with_provenance(inst, 0, &vars, &mappings) {
+                Ok(evaluated) => evaluated,
+                Err(f) => panic!("seed {seed}: mapping failed: {}", f.reason),
+            }
+        });
+        let other = updates
+            .get("payload")
+            .and_then(|p| match p {
+                Value::Map(map) => map.get("other"),
+                _ => None,
+            })
+            .cloned();
+        let trusted = prov.iter().any(|p| p.path == "payload");
+        match other {
+            Some(Value::Str(s)) if s == REF => {
+                saw_body_ref = true;
+                assert!(
+                    !trusted,
+                    "seed {seed}: journaled value carries the untrusted bodyRef text \
+                     but `payload` was trusted — value and provenance diverged"
+                );
+            }
+            Some(Value::Null) => {
+                saw_null = true;
+                // `other` is null; only the trusted literal `auth` remains, so
+                // `payload` may be trusted. Either way it must not contradict
+                // the value (there is no untrusted text to leak).
+            }
+            other => panic!("seed {seed}: unexpected payload.other = {other:?}"),
+        }
+    }
+    assert!(
+        saw_body_ref && saw_null,
+        "expected both branches across the seeds (bodyRef={saw_body_ref}, null={saw_null})"
+    );
 }

@@ -123,10 +123,22 @@ const ALLOW: &[Allow] = &[
         rule: Rule::DirectFeel,
         count: 1,
         why: Why::Zeebe(
-            "#1640 secret provenance: a provenance-only re-read of an ioMapping source \
-             that the authoritative pass (eval_io_mappings_in) already evaluated, raising \
-             IO_MAPPING_ERROR on failure (Zeebe BpmnVariableMappingBehavior); a failure \
-             here records no provenance, so the reference is never resolved (fail closed)",
+            "#1640 secret provenance: the cfg(test) provenance-only \
+             secret_provenance_of used by the focused provenance tests; a failure \
+             records no provenance, so the reference is never resolved (fail closed)",
+        ),
+    },
+    Allow {
+        file: "resolve.rs",
+        contains: "match crate::feel::eval_with_provenance(",
+        rule: Rule::DirectFeel,
+        count: 1,
+        why: Why::Zeebe(
+            "#1640 secret provenance: the input-mapping value AND its provenance are \
+             captured in ONE evaluation (eval_input_mappings_with_provenance) — a \
+             nondeterministic source is never re-evaluated, so the journaled value \
+             and its recorded trust cannot diverge. A failure is propagated and \
+             raised as IO_MAPPING_ERROR (Zeebe BpmnVariableMappingBehavior)",
         ),
     },
 ];

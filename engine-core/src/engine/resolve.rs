@@ -159,44 +159,38 @@ impl Engine {
     /// run against — keyed by the mapping's target path.
     ///
     /// Trusted roots are the `SECRET_REFERENCE`-kind cluster variables that
-    /// are actually what `vars` resolves for that name: a root bound by ANY
-    /// instance or scope variable of the instance (a shadowing process /
-    /// parent-scope variable), or whose visible value differs from the cluster
-    /// value, is untrusted (fail closed).
+    /// are actually what `vars` resolves for that name from `view_scope` — the
+    /// scope the mappings evaluate against. A root bound by a variable on
+    /// `view_scope`'s OWN visible chain (the root or an ENCLOSING scope — the
+    /// bindings that genuinely shadow the cluster variable for this element),
+    /// or whose visible value differs from the cluster value, is untrusted
+    /// (fail closed). A binding in a scope OFF that chain (a sibling parallel
+    /// branch's local) is invisible to the mapping's evaluation, so it must
+    /// not revoke trust — checking every scope of the instance would let one
+    /// branch's local `apiCfg` strip a sibling's trust and bypass its
+    /// missing-secret incident handling (#1652 round-5 review).
     ///
     /// Overwrite: mappings apply in order, so a later mapping writing a path
     /// drops the provenance of that path, its ancestors and its descendants,
     /// and re-records it only when its own value is attributable. Static
     /// (non-`=`) sources and unevaluable sources record nothing.
+    ///
+    /// Test-only: production captures value and provenance in ONE evaluation
+    /// via [`eval_input_mappings_with_provenance`](Self::eval_input_mappings_with_provenance)
+    /// (a re-evaluation could diverge for a nondeterministic source); this
+    /// provenance-only form survives for the focused provenance tests.
+    #[cfg(test)]
     pub(crate) fn secret_provenance_of(
         &self,
         instance_key: Key,
+        view_scope: Key,
         vars: &HashMap<String, Value>,
         mappings: &[crate::model::Mapping],
     ) -> Vec<crate::state::SecretProvenance> {
         if mappings.is_empty() {
             return Vec::new();
         }
-        // The SAME pinned snapshot `vars` was overlaid from (#1640): reading
-        // kinds from a fresh snapshot would let a JSON -> SECRET_REFERENCE
-        // retype between the two reads mint trust. Cluster variables are
-        // node-local, not replicated state, so replicas can still disagree on
-        // this attribution — tracked in #1657.
-        let cluster_roots = self
-            .cluster_snapshot()
-            .trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT);
-        let instance = self.state.instances.get(&instance_key);
-        let bound_by_instance = |name: &str| {
-            instance.is_some_and(|i| {
-                i.variables.contains_key(name)
-                    || i.scope_variables.values().any(|m| m.contains_key(name))
-            })
-        };
-        let trusted: Vec<String> = cluster_roots
-            .into_iter()
-            .filter(|(name, value)| !bound_by_instance(name) && vars.get(name) == Some(value))
-            .map(|(name, _)| name)
-            .collect();
+        let trusted = self.trusted_secret_roots(instance_key, view_scope, vars);
         // Fast path: nothing can be attributed without a trusted root or a
         // literal `camunda.secrets.<name>` path.
         if trusted.is_empty() && !mappings.iter().any(|m| m.source.contains("camunda")) {
@@ -228,6 +222,140 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// The trusted secret-reference roots for an evaluation against `vars`
+    /// from `view_scope` (#1640): the `SECRET_REFERENCE`-kind cluster
+    /// variables that no binding ON `view_scope`'s visible chain shadows and
+    /// whose visible value equals the cluster value. Fail-closed on any doubt.
+    fn trusted_secret_roots(
+        &self,
+        instance_key: Key,
+        view_scope: Key,
+        vars: &HashMap<String, Value>,
+    ) -> Vec<String> {
+        // The SAME pinned snapshot `vars` was overlaid from (#1640): reading
+        // kinds from a fresh snapshot would let a JSON -> SECRET_REFERENCE
+        // retype between the two reads mint trust. Cluster variables are
+        // node-local, not replicated state, so replicas can still disagree on
+        // this attribution — tracked in #1657.
+        let cluster_roots = self
+            .cluster_snapshot()
+            .trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT);
+        let instance = self.state.instances.get(&instance_key);
+        // Only bindings on `view_scope`'s OWN chain shadow what the mapping
+        // reads: the root scope plus every enclosing scope from the view scope
+        // upward — exactly the set `visible_variables` merges. A binding in a
+        // scope off that chain (a sibling branch) is invisible here.
+        let shadowed_on_chain = |name: &str| {
+            instance.is_some_and(|i| {
+                if i.variables.contains_key(name) {
+                    return true;
+                }
+                let mut cur = self.variable_scope_of(i, view_scope);
+                let mut steps = 0usize;
+                loop {
+                    if cur == i.key || steps > i.scope_parents.len() {
+                        return false;
+                    }
+                    if i.scope_variables
+                        .get(&cur)
+                        .is_some_and(|m| m.contains_key(name))
+                    {
+                        return true;
+                    }
+                    match i.scope_parents.get(&cur) {
+                        Some(&parent) if parent != cur => cur = parent,
+                        _ => return false,
+                    }
+                    steps += 1;
+                }
+            })
+        };
+        cluster_roots
+            .into_iter()
+            .filter(|(name, value)| !shadowed_on_chain(name) && vars.get(name) == Some(value))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Evaluates input `mappings` against `vars` AND captures their
+    /// secret-reference provenance in the SAME pass (#1640 round-5 review).
+    ///
+    /// Value and provenance must come from ONE evaluation per mapping:
+    /// evaluating the value first and re-evaluating for provenance afterwards
+    /// lets a nondeterministic source (`random number()`, `now()`, `uuid()`)
+    /// take a different branch on the second pass, so the journaled value and
+    /// its recorded trust can describe different evaluations — an untrusted
+    /// field the first evaluation kept could be resolved to plaintext at
+    /// activation because the second evaluation dropped it. Here each
+    /// `=`-FEEL source is evaluated exactly once by
+    /// [`crate::feel::eval_with_provenance`], which returns the value and the
+    /// trusted secret names of THAT evaluation together; the value is
+    /// assigned to the mapping's target and the provenance recorded under the
+    /// same overwrite rule (a later mapping drops the provenance of the path,
+    /// its ancestors and its descendants, re-recording only its own
+    /// attributable writes).
+    ///
+    /// The failure contract is [`eval_io_mappings_in`](Self::eval_io_mappings_in)'s,
+    /// unchanged: a source that fails to evaluate is a hard `Err` (the caller
+    /// raises an `IO_MAPPING_ERROR` incident); a static (non-`=`) source is a
+    /// literal that carries no provenance.
+    pub(crate) fn eval_input_mappings_with_provenance(
+        &self,
+        instance_key: Key,
+        view_scope: Key,
+        vars: &HashMap<String, Value>,
+        mappings: &[crate::model::Mapping],
+    ) -> Result<(HashMap<String, Value>, Vec<crate::state::SecretProvenance>), IoMappingFailure>
+    {
+        let trusted = self.trusted_secret_roots(instance_key, view_scope, vars);
+        let mut result: HashMap<String, Value> = HashMap::new();
+        let mut provenance: Vec<crate::state::SecretProvenance> = Vec::new();
+        for m in mappings {
+            // The SAME segmentation `assign_io_target` writes with, so an
+            // aliased spelling (`payload..auth`) overwrites the provenance of
+            // the field it actually overwrites.
+            let path = io_target_segments(&m.target).join(".");
+            provenance.retain(|p| !paths_overlap(&p.path, &path));
+            if m.source.trim_start().starts_with('=') {
+                match crate::feel::eval_with_provenance(
+                    m.source.trim(),
+                    vars,
+                    trusted.iter().cloned(),
+                ) {
+                    Ok(evaluated) => {
+                        Self::assign_io_target(&mut result, vars, &m.target, evaluated.value);
+                        if !path.is_empty() && !evaluated.referenced_secrets.is_empty() {
+                            provenance.push(crate::state::SecretProvenance {
+                                path,
+                                secrets: evaluated.referenced_secrets,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        return Err(IoMappingFailure {
+                            reason: format!(
+                                "failed to evaluate io mapping source '{}' for target '{}': {}",
+                                m.source.trim(),
+                                m.target,
+                                err.0
+                            ),
+                        });
+                    }
+                }
+            } else {
+                // A static literal is passed through verbatim and carries no
+                // provenance (it is never a resolved reference).
+                Self::assign_io_target(
+                    &mut result,
+                    vars,
+                    &m.target,
+                    Value::Str(m.source.to_string()),
+                );
+            }
+        }
+        Ok((result, provenance))
     }
 
     /// Evaluates the given io mappings against an explicit variable context
