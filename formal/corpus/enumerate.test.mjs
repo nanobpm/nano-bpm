@@ -13,7 +13,8 @@ import {
   exploreOrders,
   scenariosFor,
   artifactsFor,
-  flowCount
+  flowCount,
+  Reference
 } from './enumerate.mjs'
 import {
   parseArgs,
@@ -208,6 +209,42 @@ test('a gateway the FIRST command activates routes via start variables, not a le
   }
 })
 
+test('a routed join reads its OWN activation choice, not the next one (#1246 review)', () => {
+  // S -> AND -2x-> OR-join -> {E, E}: the inclusive gateway G2 is BOTH a join
+  // (two incoming flows) and a split (two outgoing). `choice()` indexes
+  // `route[route_G2][activations_G2]`, so the join branch must read the choice
+  // BEFORE advancing the counter — incrementing first skips firing#0's route
+  // entry and reads firing#1's. With firing#0 routed to f4 and firing#1 to f5,
+  // the first (and here only) firing must take f4; taking f5 is the skip.
+  const g = graphOf(['and', 'or'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'direct'], [2, 3, 'direct'], [2, 3, 'direct']])
+  const rv = routeVariable('G2')
+  const ref = new Reference(g, { [rv]: [['f4'], ['f5']] })
+  assert.equal(ref.activations.G2, 1, 'the join fired once during the create settle')
+  assert.equal(ref.takenFlows.f4, 1, 'firing#0 took its OWN route entry (index 0)')
+  assert.equal(ref.takenFlows.f5, undefined, 'firing#1 route entry (index 1) was NOT consumed early')
+})
+
+test('a correlation whose catch leads straight to the end event gets NO job barrier (#1246 review)', () => {
+  // S -> AND -> {T1 -> E, EVT -> {M1 -> E, M2 -> E}}: correlating M1 (or M2)
+  // resumes the catch straight into the end event — it creates NO job. The
+  // already-waiting T1 is left as the sole task, so `barrierJob()` would name
+  // T1; but T1 was waiting BEFORE the correlation, so Camunda can activate and
+  // release it before the message correlates — no barrier at all. The step
+  // must carry no `settled` jobType (the awaitCompletion create settling is
+  // the barrier), never the pre-existing task.
+  const g = graphOf(['and', 'evt'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 3, 'task'], [2, 3, 'msg'], [2, 3, 'msg']])
+  const { scenarios } = scenariosFor(g)
+  let publishes = 0
+  for (const s of scenarios) {
+    for (const step of s.steps) {
+      if (step.op !== 'publishMessage') continue
+      publishes++
+      assert.equal(step.settled?.jobType, undefined, `correlation into the end event must not barrier on the pre-existing task (${s.name})`)
+    }
+  }
+  assert.ok(publishes > 0, 'the graph produces publishMessage steps')
+})
+
 test('event-based gateway oracle: substituting the other catch FAILS the branch-sensitive expectation', () => {
   // The negative oracle guard (#1246 review): the two catches of an event-based
   // gateway produce identical completion/variables AND identical completed
@@ -362,6 +399,26 @@ test('a committed case is NOT obsolete when shrink discards its reproducer but t
   // "did not reproduce" and the committed case is misreported obsolete.
   const lossy = classify(shrunk, committed, () => true)
   assert.deepEqual(lossy.obsolete.map((c) => c.signature), ['nano:variables:completed=true/false'], 'defaulting the full set to the shrunk list reproduces the bug')
+})
+
+test('the reproducer key includes the signature: same graph+scenario, different signature, cannot cross-validate (#1246 review)', () => {
+  // Two committed cases share a graph and scenario but fail with DIFFERENT
+  // signatures. If `(A, g1, s1)` now fails only with known signature B while
+  // another graph still produces A, keying the reproducer on graph+scenario
+  // alone would let A's committed case pass on B's failure. The signature must
+  // be part of the key so each committed case reproduces its OWN failure class.
+  const committed = [
+    { signature: 'sigA', issue: '#11', graph: { key: 'g1' }, scenario: { name: 's1' } },
+    { signature: 'sigB', issue: '#12', graph: { key: 'g1' }, scenario: { name: 's1' } }
+  ]
+  // This run: g1/s1 fails only with sigB; sigA still reproduces on another graph.
+  const full = [
+    { signature: 'sigB', entry: { graph: { key: 'g1' } }, scenario: { name: 's1' } },
+    { signature: 'sigA', entry: { graph: { key: 'g2' } }, scenario: { name: 's2' } }
+  ]
+  const r = classify(full, committed, () => true, full)
+  assert.deepEqual(r.obsolete.map((c) => c.signature), ['sigA'], 'sigA committed case did not reproduce its OWN class on g1/s1 — obsolete')
+  assert.deepEqual(r.obsolete.filter((c) => c.signature === 'sigB'), [], 'sigB reproduced on its own g1/s1 — not obsolete')
 })
 
 test('the committed divergence corpus is well-formed: every case is filed and re-materialisable', () => {

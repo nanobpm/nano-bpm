@@ -693,9 +693,16 @@ test("publishMessage with a settled barrier long-polls the follow-on job and fai
     }
     const f = req.url.match(/\/jobs\/(\d+)\/failure$/);
     if (f) {
-      calls.push(`failback:${f[1]}`);
-      res.writeHead(204);
-      res.end();
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        // JobFailRequest (spec/jobs.yaml) names the back-off `retryBackOff`
+        // (additionalProperties:false) — capture the body so the assertion
+        // below fails loudly if the driver sends the v1 `retryBackOffMs`.
+        calls.push(`failback:${f[1]}:${body}`);
+        res.writeHead(204);
+        res.end();
+      });
       return;
     }
     res.writeHead(204);
@@ -708,7 +715,11 @@ test("publishMessage with a settled barrier long-polls the follow-on job and fai
     const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
     const handle = { instanceKeys: new Set() };
     await backend.publishMessage(handle, "M", "k", {}, { jobType: "T1" });
-    assert.deepEqual(calls, ["publish", "activate", "failback:31"]);
+    assert.deepEqual(calls, [
+      "publish",
+      "activate",
+      'failback:31:{"retries":1,"retryBackOff":0}',
+    ]);
     assert.deepEqual([...handle.instanceKeys], ["5"]);
     // Without a barrier (catch leads straight to the end event) there is no
     // activation — the awaitCompletion create settling is the barrier.

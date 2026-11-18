@@ -405,7 +405,11 @@ export class CamundaBackend {
       await this.#json(
         "POST",
         `/jobs/${job.jobKey ?? job.key}/failure`,
-        { retries: 1, retryBackOffMs: 0 },
+        // JobFailRequest (spec/jobs.yaml) names the back-off field
+        // `retryBackOff` (int64) and sets `additionalProperties: false`, so the
+        // v1-style `retryBackOffMs` is schema-invalid and a conforming endpoint
+        // rejects the fail-back — stalling the barrier mid-scenario (#1246).
+        { retries: 1, retryBackOff: 0 },
         "fail back barrier job",
       );
     }

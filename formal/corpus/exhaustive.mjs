@@ -369,12 +369,17 @@ export function classify (shrunk, committed, inScope, divergences = shrunk) {
   // scenario now wins the same signature) would otherwise read as "did not
   // reproduce" and be misreported `obsolete` even though it still fails (#1246).
   const seen = new Set(divergences.map((d) => d.signature))
-  // The exact reproducer key: graph + scenario (a TLC divergence has no
-  // scenario). Two cases share a signature only when the same defect shows on
-  // both; a committed case is validated against ITS OWN reproducer.
-  const reproKey = (graphKey, scenarioName) => `${graphKey}${scenarioName ?? ''}`
-  const seenRepro = new Set(divergences.map((d) => reproKey(d.entry.graph.key, d.scenario?.name)))
-  const reproduced = (c) => seenRepro.has(reproKey(c.graph.key, c.scenario?.name))
+  // The exact reproducer key: signature + graph + scenario (a TLC divergence
+  // has no scenario). Two cases share a signature only when the same defect
+  // shows on both; a committed case is validated against ITS OWN reproducer.
+  // The signature is part of the key so two committed cases that share a graph
+  // and scenario but fail with DIFFERENT signatures cannot cross-validate:
+  // `(A, g1, s1)` failing only with known signature B while another graph still
+  // produces A must not let A's committed reproducer pass on B's failure — each
+  // committed case must reproduce its own failure CLASS (#1246 review).
+  const reproKey = (signature, graphKey, scenarioName) => `${signature}${graphKey}${scenarioName ?? ''}`
+  const seenRepro = new Set(divergences.map((d) => reproKey(d.signature, d.entry.graph.key, d.scenario?.name)))
+  const reproduced = (c) => seenRepro.has(reproKey(c.signature, c.graph.key, c.scenario?.name))
   return {
     known: shrunk.filter((d) => bySig.has(d.signature)),
     fresh: shrunk.filter((d) => !bySig.has(d.signature)),

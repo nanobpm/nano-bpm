@@ -485,9 +485,16 @@ export class Reference {
         if (this.joinFires(n)) {
           for (const id of Object.keys(arr)) if (arr[id] > 0) arr[id] -= 1
           this.joinOpen[n] = Object.values(arr).some((c) => c > 0)
+          // Read THIS firing's choice BEFORE advancing the activation counter:
+          // `choice()` indexes `seq[activations[n]]`, so incrementing first
+          // would skip the current choice and read the NEXT activation's route
+          // (the pass-through branch below reads-then-increments for the same
+          // reason). A routed join (an inclusive gateway that is BOTH a join
+          // and a split) must consume its own route entry (#1246 review).
+          const flows = this.choice(n, settleChoice)
           this.activations[n] += 1
           this.complete(n)
-          this.take(this.choice(n, settleChoice))
+          this.take(flows)
         } else {
           this.joinOpen[n] = this.joinOpen[n] || Object.values(arr).some((c) => c > 0)
         }
@@ -718,8 +725,19 @@ export function scenariosFor (graph) {
         steps.push({ op: 'completeOneJob', jobType: c.node })
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
+        // The barrier must be a job THIS correlation creates, not a task that
+        // was already waiting: `barrierJob()` returns the sole waiting task,
+        // but when the catch leads straight to the end event the correlation
+        // activates no job — it only leaves a PRE-EXISTING task as the sole
+        // wait. Long-polling that pre-existing job is no barrier: Camunda can
+        // activate and release it before the message correlates, letting the
+        // next command run before the message-first step settles (#1246
+        // review). Only a job whose count the correlation INCREASED is created
+        // by it; otherwise the correlation produces no job and the driver
+        // relies on the awaitCompletion create settling as the barrier.
+        const createdByCorrelation = (b) => b && (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0)
         const barrier = after.barrierJob()
-        if (barrier) step.settled = { jobType: barrier }
+        if (createdByCorrelation(barrier)) step.settled = { jobType: barrier }
         steps.push(step)
       }
       state = state.apply(c)
