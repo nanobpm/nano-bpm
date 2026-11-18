@@ -1286,11 +1286,21 @@ mod tests {
         let mut engine = Engine::new();
         // A global var, and a same-named var the instance will shadow.
         put(&mut engine, None, "region", Value::Str("EMEA".to_string()));
-        put(&mut engine, None, "shared", Value::Str("from-global".to_string()));
+        put(
+            &mut engine,
+            None,
+            "shared",
+            Value::Str("from-global".to_string()),
+        );
         // A default-tenant var (visible to the single-tenant engine).
         put(&mut engine, Some(DEFAULT_TENANT), "tier", Value::Int(2));
         // A var scoped to some other tenant must NOT be visible.
-        put(&mut engine, Some("other"), "secret", Value::Str("nope".to_string()));
+        put(
+            &mut engine,
+            Some("other"),
+            "secret",
+            Value::Str("nope".to_string()),
+        );
 
         let mut base = HashMap::new();
         base.insert(

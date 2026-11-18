@@ -166,6 +166,11 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
+        Command::CreateClusterVariable { .. }
+        | Command::UpdateClusterVariable { .. }
+        | Command::DeleteClusterVariable { .. } => Surface::NotSurfaced {
+            reason: "operator-managed cluster variables (REST cluster-variables surface); not exposed by the in-browser test engine",
+        },
         Command::EvaluateDecision { .. } => Surface::Surfaced {
             js_method: "evaluateDecision",
         },

@@ -25,14 +25,24 @@ fn m(source: &str, target: &str) -> Mapping {
 /// JSON-kind `jsonCfg`, both carrying `camunda.secrets.TOKEN`.
 fn engine_with_cluster_vars() -> Engine {
     let mut engine = Engine::new();
-    put_cluster_var(&mut engine, None, "apiCfg", ClusterVariableKind::SecretReference);
+    put_cluster_var(
+        &mut engine,
+        None,
+        "apiCfg",
+        ClusterVariableKind::SecretReference,
+    );
     put_cluster_var(&mut engine, None, "jsonCfg", ClusterVariableKind::Json);
     engine
 }
 
 /// Creates a cluster variable holding [`REF`] through the replicated command
 /// (#1657) — the only way cluster-variable state changes.
-fn put_cluster_var(engine: &mut Engine, tenant: Option<&str>, name: &str, kind: ClusterVariableKind) {
+fn put_cluster_var(
+    engine: &mut Engine,
+    tenant: Option<&str>,
+    name: &str,
+    kind: ClusterVariableKind,
+) {
     engine
         .apply_command(Command::CreateClusterVariable {
             tenant_id: tenant.map(str::to_string),
@@ -362,11 +372,7 @@ fn a_retype_is_a_command_ordered_against_evaluation() {
     let mut engine = engine_with_cluster_vars();
     // Retype `jsonCfg` -> SECRET_REFERENCE through the (distributed upsert)
     // command: only evaluations AFTER it in the log observe the new kind.
-    let (before, _) = run(
-        &mut engine,
-        task(vec![m("=jsonCfg", "t")]),
-        HashMap::new(),
-    );
+    let (before, _) = run(&mut engine, task(vec![m("=jsonCfg", "t")]), HashMap::new());
     assert!(before.is_empty(), "{before:?}");
     engine
         .apply_command(Command::CreateClusterVariable {

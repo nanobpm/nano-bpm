@@ -1116,11 +1116,8 @@ impl PeerLink {
     /// advertisement — is treated as NOT supporting it (fail closed).
     pub async fn supports(&self, feature: &str) -> bool {
         let mut rx = self.features.subscribe();
-        let announced = tokio::time::timeout(
-            fast_forward_timeout(),
-            rx.wait_for(|f| f.is_some()),
-        )
-        .await;
+        let announced =
+            tokio::time::timeout(fast_forward_timeout(), rx.wait_for(|f| f.is_some())).await;
         match announced {
             Ok(Ok(f)) => f.as_ref().is_some_and(|f| f.iter().any(|x| x == feature)),
             _ => false,

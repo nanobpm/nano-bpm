@@ -26,8 +26,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
-    ProcessInstance, State, Value, encode_record_json,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, OrphanKind, ProcessInstance,
+    State, Value, encode_record_json,
 };
 use tokio::sync::oneshot;
 
@@ -9308,7 +9308,11 @@ mod tests {
         let before = {
             let (mut j, _) = Journal::open_segmented(&dir).unwrap();
             let (_, c) = j
-                .apply_command_ref_at(create("inSnapshot", ClusterVariableKind::SecretReference), 1, None)
+                .apply_command_ref_at(
+                    create("inSnapshot", ClusterVariableKind::SecretReference),
+                    1,
+                    None,
+                )
                 .unwrap();
             c.blocking_wait();
             let (snap, covered) = j.snapshot_and_rotate().unwrap();

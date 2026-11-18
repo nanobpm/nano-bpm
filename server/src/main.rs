@@ -74,10 +74,9 @@ use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, AdHocActivateElement, AdHocJobResult,
-    Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
-    ProcessBuilder, ProcessDefinition, ProcessInstanceState, TaskListenerJobResult,
-    UserTaskCorrections, Value, partition_of,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
+    IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
+    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -828,9 +827,11 @@ impl ServerImpl {
                     ),
                 ),
             )),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -868,9 +869,11 @@ impl ServerImpl {
                     ),
                 ),
             ),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -899,9 +902,11 @@ impl ServerImpl {
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
             ))),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -935,9 +940,11 @@ impl ServerImpl {
                     path_params.name
                 ),
             ))),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -1000,9 +1007,11 @@ impl ServerImpl {
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
             ))),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -1027,9 +1036,11 @@ impl ServerImpl {
                     path_params.name
                 ),
             ))),
-            Err(e) => Ok(Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                cluster_variable_internal(e),
-            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -1133,7 +1144,9 @@ mod cluster_variable_tests {
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         // Same (scope, name) again -> false, which the handler maps to 409.
@@ -1144,12 +1157,16 @@ mod cluster_variable_tests {
                 val(json!("APAC")),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_none()
         );
         // The rejected create left the stored value untouched.
         assert_eq!(
-            cluster_variable_value_string(&s.cluster_variable_get(None, "region").await.unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"EMEA\""
         );
     }
@@ -1164,13 +1181,15 @@ mod cluster_variable_tests {
         // second lookup that a delete could lose.
         let s = store();
 
-        let created = s.cluster_variable_create(
+        let created = s
+            .cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new(),
-            ).await.ok()
+            )
+            .await
             .expect("create of a fresh (scope, name) returns the stored snapshot");
         assert_eq!(created.name, "region");
         assert_eq!(created.tenant_id.as_deref(), Some("acme"));
@@ -1178,8 +1197,16 @@ mod cluster_variable_tests {
 
         // A delete landing right after the mutation cannot invalidate the
         // snapshot already returned to the handler.
-        assert!(s.cluster_variable_delete(Some("acme"), "region").await.is_ok());
-        assert!(s.cluster_variable_get(Some("acme"), "region").await.is_none());
+        assert!(
+            s.cluster_variable_delete(Some("acme"), "region")
+                .await
+                .is_ok()
+        );
+        assert!(
+            s.cluster_variable_get(Some("acme"), "region")
+                .await
+                .is_none()
+        );
         assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
 
         // Update returns its own post-mutation snapshot the same way.
@@ -1190,15 +1217,19 @@ mod cluster_variable_tests {
                 val(json!(false)),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
-        let updated = s.cluster_variable_update(
+        let updated = s
+            .cluster_variable_update(
                 None,
                 "flag",
                 val(json!(true)),
                 ClusterVariableMetadata::new(),
-            ).await.ok()
+            )
+            .await
             .expect("update of an existing (scope, name) returns the stored snapshot");
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
         assert!(s.cluster_variable_delete(None, "flag").await.is_ok());
@@ -1215,7 +1246,9 @@ mod cluster_variable_tests {
                 val(json!("global")),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         assert!(
@@ -1225,20 +1258,33 @@ mod cluster_variable_tests {
                 val(json!("acme")),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         assert_eq!(s.cluster_variable_all().await.len(), 2);
         assert_eq!(
-            cluster_variable_value_string(&s.cluster_variable_get(None, "region").await.unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"global\""
         );
         assert_eq!(
-            cluster_variable_value_string(&s.cluster_variable_get(Some("acme"), "region").await.unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(Some("acme"), "region")
+                    .await
+                    .unwrap()
+                    .value
+            ),
             "\"acme\""
         );
         // A lookup never crosses scopes.
-        assert!(s.cluster_variable_get(Some("other"), "region").await.is_none());
+        assert!(
+            s.cluster_variable_get(Some("other"), "region")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1246,7 +1292,9 @@ mod cluster_variable_tests {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
         assert!(
-            s.cluster_variable_update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()).await.ok()
+            s.cluster_variable_update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_none()
         );
         assert!(
@@ -1256,15 +1304,21 @@ mod cluster_variable_tests {
                 val(json!(1)),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         assert!(
-            s.cluster_variable_update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()).await.ok()
+            s.cluster_variable_update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.cluster_variable_get(None, "ghost").await.unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "ghost").await.unwrap().value
+            ),
             "2"
         );
     }
@@ -1280,7 +1334,9 @@ mod cluster_variable_tests {
                 val(json!(true)),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         assert!(s.cluster_variable_delete(None, "nope").await.is_ok());
@@ -1297,11 +1353,15 @@ mod cluster_variable_tests {
                 val(json!({})),
                 None,
                 ClusterVariableMetadata::new()
-            ).await.ok()
+            )
+            .await
+            .ok()
             .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.cluster_variable_get(None, "cfg").await.unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "cfg").await.unwrap().value
+            ),
             "{}"
         );
     }
@@ -1313,7 +1373,10 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn mutations_land_in_every_partition_engine_state() {
         let s = build_server_in_memory(
-            vec![Journal::in_memory_partition(0), Journal::in_memory_partition(1)],
+            vec![
+                Journal::in_memory_partition(0),
+                Journal::in_memory_partition(1),
+            ],
             cluster::Topology::single(2),
         );
         assert!(
@@ -1393,7 +1456,10 @@ mod cluster_variable_tests {
             );
         }
         assert_eq!(
-            s.cluster_variable_delete(None, "region").await.unwrap_err().0,
+            s.cluster_variable_delete(None, "region")
+                .await
+                .unwrap_err()
+                .0,
             404
         );
     }
@@ -1407,14 +1473,18 @@ mod cluster_variable_tests {
             val(json!("x")),
             None,
             ClusterVariableMetadata::new(),
-        ).await.ok();
+        )
+        .await
+        .ok();
         s.cluster_variable_create(
             Some("acme"),
             "t",
             val(json!("y")),
             None,
             ClusterVariableMetadata::new(),
-        ).await.ok();
+        )
+        .await
+        .ok();
         let g = cluster_variable_result(&s.cluster_variable_get(None, "g").await.unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
@@ -1434,7 +1504,9 @@ mod cluster_variable_tests {
             val(json!(long)),
             None,
             ClusterVariableMetadata::new(),
-        ).await.ok();
+        )
+        .await
+        .ok();
         let stored = s.cluster_variable_get(None, "big").await.unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
@@ -1602,7 +1674,11 @@ mod cluster_variable_tests {
         ));
         assert_eq!(
             cluster_variable_value_string(
-                &server.cluster_variable_get(None, "small").await.unwrap().value
+                &server
+                    .cluster_variable_get(None, "small")
+                    .await
+                    .unwrap()
+                    .value
             ),
             "\"v\"",
             "a rejected update leaves the variable untouched"
@@ -1901,13 +1977,16 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_kind_filter_distinguishes_secret_references() {
         let server = ServerImpl::default();
-        server.cluster_variable_create(
-            None,
-            "plain",
-            val(json!(1)),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
+        server
+            .cluster_variable_create(
+                None,
+                "plain",
+                val(json!(1)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
         let mut req = create_req("token", None);
         req.value = types::Object(json!("camunda.secrets.TOKEN"));
         req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
@@ -1951,27 +2030,36 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_kind_and_metadata() {
         let server = ServerImpl::default();
-        server.cluster_variable_create(
-            None,
-            "a",
-            val(json!(1)),
-            None,
-            meta(json!({"owner": "team-a", "ttl": 30})),
-        ).await.ok();
-        server.cluster_variable_create(
-            None,
-            "b",
-            val(json!(2)),
-            None,
-            meta(json!({"owner": "team-b", "ttl": "30"})),
-        ).await.ok();
-        server.cluster_variable_create(
-            None,
-            "c",
-            val(json!(3)),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
+        server
+            .cluster_variable_create(
+                None,
+                "a",
+                val(json!(1)),
+                None,
+                meta(json!({"owner": "team-a", "ttl": 30})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "b",
+                val(json!(2)),
+                None,
+                meta(json!({"owner": "team-b", "ttl": "30"})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "c",
+                val(json!(3)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         let kind =
             |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
@@ -2039,27 +2127,36 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server.cluster_variable_create(
-            None,
-            "region",
-            val(json!("global")),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
-        server.cluster_variable_create(
-            Some("acme"),
-            "region",
-            val(json!("acme")),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
-        server.cluster_variable_create(
-            Some("beta"),
-            "tier",
-            val(json!(2)),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
+        server
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("global")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("acme"),
+                "region",
+                val(json!("acme")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("beta"),
+                "tier",
+                val(json!(2)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -2108,20 +2205,26 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server.cluster_variable_create(
-            None,
-            "big",
-            val(json!(long)),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
-        server.cluster_variable_create(
-            None,
-            "small",
-            val(json!("x")),
-            None,
-            ClusterVariableMetadata::new(),
-        ).await.ok();
+        server
+            .cluster_variable_create(
+                None,
+                "big",
+                val(json!(long)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "small",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -2169,13 +2272,16 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server.cluster_variable_create(
-                None,
-                n,
-                val(json!(n)),
-                None,
-                ClusterVariableMetadata::new(),
-            ).await.ok();
+            server
+                .cluster_variable_create(
+                    None,
+                    n,
+                    val(json!(n)),
+                    None,
+                    ClusterVariableMetadata::new(),
+                )
+                .await
+                .ok();
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {

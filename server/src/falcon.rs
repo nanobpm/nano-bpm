@@ -1610,7 +1610,10 @@ async fn handle_client_frame(
             partition,
             command,
         } => {
-            let reply = match server.apply_cluster_variable_local(partition, command).await {
+            let reply = match server
+                .apply_cluster_variable_local(partition, command)
+                .await
+            {
                 Ok(record) => ServerFrame::CommandResult {
                     corr,
                     status: 200,

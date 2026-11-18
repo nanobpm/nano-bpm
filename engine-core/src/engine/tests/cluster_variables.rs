@@ -120,7 +120,10 @@ fn cluster_variables_are_read_at_the_log_position() {
 fn replay_rebuilds_cluster_variables_from_the_log() {
     let (engine, events) = apply_journal();
     let replayed = Engine::replay(events);
-    assert_eq!(replayed.state.cluster_variables, engine.state.cluster_variables);
+    assert_eq!(
+        replayed.state.cluster_variables,
+        engine.state.cluster_variables
+    );
     let region = replayed.cluster_variables().get(None, "region").unwrap();
     assert_eq!(region.value, Value::Str("APAC".into()));
     assert_eq!(
@@ -147,7 +150,10 @@ fn snapshot_and_tail_recovery_preserves_values_and_kinds() {
     assert!(json.contains("SECRET_REFERENCE"), "{json}");
     let mut restored =
         Engine::from_snapshot(serde_json::from_str::<EngineSnapshot>(&json).unwrap());
-    assert_eq!(restored.state.cluster_variables, engine.state.cluster_variables);
+    assert_eq!(
+        restored.state.cluster_variables,
+        engine.state.cluster_variables
+    );
     // A tail command after restore observes the restored state identically.
     let tail = |e: &mut Engine| {
         e.apply_command_at(Command::create_instance("p"), T0 + 100)
