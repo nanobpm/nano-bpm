@@ -84,6 +84,12 @@ const DETERMINISTIC_KINDS = new Set(['start', 'end', 'task', 'and', 'or', 'xor']
 // diverging exclusive/inclusive gateway reads, the message a catch event
 // subscribes to, and its (constant) correlation key. bpmnFor emits them and
 // enumerate.mjs's scenarios set / correlate them, so the pair cannot drift.
+// The route variable holds the gateway's REMAINING choice sequence — one entry
+// per activation still to route, since a token can reach the same gateway twice
+// (a parallel split through an exclusive merge) and each activation may route
+// differently. The condition reads the HEAD (`route[1]`); the scenario sets the
+// variable to the remaining suffix before each activation (a `setVariables`
+// step), so the head is always the next activation's choice.
 export const routeVariable = (gatewayId) => `route_${gatewayId}`
 export const messageName = (graphId, nodeId) => `${graphId}_${nodeId}`
 export const messageId = (nodeId) => `Message_${nodeId}`
@@ -671,10 +677,15 @@ export function bpmnFor (graph, opts = {}) {
     // condition.
     let cond = null
     if (isSplit(e.from) && variableRouting) {
+      // The route variable holds the gateway's REMAINING choice sequence (one
+      // entry per activation still to route — a parallel split can bring a
+      // token back to the same gateway, and each activation may choose
+      // differently). The head `route[1]` is the next activation's choice; the
+      // scenario re-sets the variable to the suffix before each activation.
       const v = routeVariable(e.from)
       cond = graph.nodes[e.from] === 'xor'
-        ? `=${v} = &quot;${xmlEscape(e.id)}&quot;`
-        : `=list contains(${v}, &quot;${xmlEscape(e.id)}&quot;)`
+        ? `=${v}[1][1] = &quot;${xmlEscape(e.id)}&quot;`
+        : `=list contains(${v}[1], &quot;${xmlEscape(e.id)}&quot;)`
     } else if (isSplit(e.from)) {
       cond = taken.has(e.id) ? '=true' : '=false'
     }

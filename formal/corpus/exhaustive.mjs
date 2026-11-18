@@ -41,6 +41,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { enumerateGraphs, artifactsFor, exploreOrders, routesFor, GATEWAY_KINDS } from './enumerate.mjs'
+import { installSignalCleanup } from '../parity/runtime/run.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const tlaDir = path.join(here, '..', 'tla')
@@ -245,6 +246,18 @@ async function runtimePhase (entries, args, log) {
       log('::notice::no reachable Camunda 8 (CAMUNDA_REST_ADDRESS) — SKIPPING the Camunda backend (skip-tolerant)')
     }
   }
+  // Interrupting a manual exhaustive run (SIGINT/SIGTERM) must not leave the
+  // shared Camunda cluster clock pinned at epoch zero or instances in flight:
+  // Node's default signal handling exits WITHOUT running the `finally` below,
+  // so install the same cleanup the parity runner uses (#1246 review).
+  installSignalCleanup(async () => {
+    if (nano) await nano.close()
+    if (camunda) await camunda.close()
+  })
+  // The phases that ACTUALLY run — a skipped Camunda backend (unset/unreachable
+  // address) means no camunda/differential case can reproduce, so the stale
+  // check must not ask for one (#1246 review).
+  const phasesRan = new Set(['nano', ...(camunda ? ['camunda', 'differential'] : [])])
   const divergences = []
   let ran = 0
   const fieldsSig = (ms) => ms.map((m) => m.field).sort().join(',')
@@ -283,7 +296,7 @@ async function runtimePhase (entries, args, log) {
     if (camunda) await camunda.close()
   }
   log(`  runtime: ${ran} scenario(s) on nano${camunda ? ' + camunda' : ''}`)
-  return divergences
+  return { divergences, phasesRan }
 }
 
 // A stable class for an error message: its first line with ids and numbers
@@ -330,17 +343,33 @@ export function loadDivergences (file = DIVERGENCES_PATH) {
 
 /**
  * Classify a run's (shrunk) divergences against the committed corpus. Returns
- * `{ known, fresh, stale, unfiled }`: `fresh` divergence classes not committed;
- * `stale` committed cases inside this run's scope that no longer reproduce;
- * `unfiled` committed cases with no issue. Any non-empty list fails the run.
+ * `{ known, fresh, stale, unfiled, obsolete }`: `fresh` divergence classes not
+ * committed; `stale` committed cases inside this run's scope that no longer
+ * reproduce; `unfiled` committed cases with no issue. Any non-empty list fails
+ * the run.
+ *
+ * A committed case is `known` only when ITS OWN graph/scenario reproduced with
+ * the same signature this run — not merely when some OTHER graph produced the
+ * signature. Field-based signatures can group unrelated defects, so keying
+ * `known` on the signature alone would let a committed reproducer whose own
+ * case stopped failing pass as "known" while a different graph still trips the
+ * class — the committed reproduction no longer reproduces, and the run must
+ * say so (`obsolete`) rather than ratchet on a dead case (#1246 review).
  */
 export function classify (shrunk, committed, inScope) {
   const bySig = new Map(committed.map((c) => [c.signature, c]))
   const seen = new Set(shrunk.map((d) => d.signature))
+  // The exact reproducer key: graph + scenario (a TLC divergence has no
+  // scenario). Two cases share a signature only when the same defect shows on
+  // both; a committed case is validated against ITS OWN reproducer.
+  const reproKey = (graphKey, scenarioName) => `${graphKey}${scenarioName ?? ''}`
+  const seenRepro = new Set(shrunk.map((d) => reproKey(d.entry.graph.key, d.scenario?.name)))
+  const reproduced = (c) => seenRepro.has(reproKey(c.graph.key, c.scenario?.name))
   return {
     known: shrunk.filter((d) => bySig.has(d.signature)),
     fresh: shrunk.filter((d) => !bySig.has(d.signature)),
     stale: committed.filter((c) => inScope(c) && !seen.has(c.signature)),
+    obsolete: committed.filter((c) => inScope(c) && seen.has(c.signature) && !reproduced(c)),
     unfiled: committed.filter((c) => !c.issue)
   }
 }
@@ -355,34 +384,50 @@ async function main () {
   const t0 = Date.now()
   const entries = enumerateGraphs(bound).map(({ skel, graph }) => ({ skel, graph, artifacts: artifactsFor(graph) }))
   const scenarios = entries.reduce((s, e) => s + e.artifacts.scenarios.length, 0)
-  const skipped = entries.reduce((s, e) => s + e.artifacts.skipped, 0)
   log(`bound: ${bound.gateways} gateway(s) [${bound.kinds.join(', ')}], ${bound.flows} flow(s): ` +
-    `${entries.length} graph(s), ${scenarios} scenario(s) (${skipped} non-1-safe command order(s) left to TLC)`)
+    `${entries.length} graph(s), ${scenarios} scenario(s)`)
 
   if (args.out) {
+    // The export is a RUNTIME corpus: run.mjs's discoverScenarios only reads
+    // `DIR/*/scenario.json`, so each scenario lands directly under the output
+    // root (named by the scenario, which already carries the graph id), its
+    // `bpmn` pointing at the graph's process.bpmn next to it. The graph's
+    // graph.json / *.tla sit in a per-graph `graphs/<id>/` subdir (not a
+    // scenario dir, so discovery ignores them).
     for (const e of entries) {
-      const dir = path.join(args.out, e.graph.id)
-      fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(path.join(dir, 'graph.json'), JSON.stringify(e.graph, null, 2) + '\n')
-      fs.writeFileSync(path.join(dir, 'process.bpmn'), e.artifacts.bpmn)
-      for (const [fam, tla] of Object.entries(e.artifacts.tla)) fs.writeFileSync(path.join(dir, `${e.graph.families[fam].module}.tla`), tla)
+      const gdir = path.join(args.out, 'graphs', e.graph.id)
+      fs.mkdirSync(gdir, { recursive: true })
+      fs.writeFileSync(path.join(gdir, 'graph.json'), JSON.stringify(e.graph, null, 2) + '\n')
+      fs.writeFileSync(path.join(gdir, 'process.bpmn'), e.artifacts.bpmn)
+      for (const [fam, tla] of Object.entries(e.artifacts.tla)) fs.writeFileSync(path.join(gdir, `${e.graph.families[fam].module}.tla`), tla)
       for (const sc of e.artifacts.scenarios) {
-        const sdir = path.join(dir, 'scenarios', sc.name)
+        const sdir = path.join(args.out, sc.name)
         fs.mkdirSync(sdir, { recursive: true })
-        fs.writeFileSync(path.join(sdir, 'scenario.json'), JSON.stringify({ ...sc, bpmn: '../../process.bpmn' }, null, 2) + '\n')
+        // Copy the BPMN next to the scenario so `bpmn: process.bpmn` resolves
+        // inside the scenario dir, exactly as the runner's loadScenario reads.
+        fs.writeFileSync(path.join(sdir, 'process.bpmn'), e.artifacts.bpmn)
+        fs.writeFileSync(path.join(sdir, 'scenario.json'), JSON.stringify({ ...sc, bpmn: 'process.bpmn' }, null, 2) + '\n')
       }
     }
     log(`wrote ${entries.length} graph(s) to ${args.out}`)
   }
 
   const divergences = []
+  // The phases that ACTUALLY run drive the stale check's scope: a phase that
+  // did not run (no --tlc, no --backend, or a Camunda backend skipped as
+  // unreachable) cannot reproduce its committed cases, so it must not ask for
+  // them (#1246 review).
+  const phasesRan = new Set()
   if (args.tlc) {
     log('tlc: nano spec (MC*) vs Zeebe reference (ZMC*) per graph')
     divergences.push(...await tlcPhase(entries, log))
+    for (const k of ['tlc-refines', 'tlc-verdict', 'reference-vs-tlc']) phasesRan.add(k)
   }
   if (args.backend) {
     log(`runtime: ${args.backend}`)
-    divergences.push(...await runtimePhase(entries, args, log))
+    const { divergences: d, phasesRan: rp } = await runtimePhase(entries, args, log)
+    divergences.push(...d)
+    for (const k of rp) phasesRan.add(k)
   }
   if (!args.tlc && !args.backend) return
 
@@ -390,11 +435,8 @@ async function main () {
   const shrunk = shrink(divergences, order)
   const committed = loadDivergences()
   // A committed case is in this run's scope when its graph is enumerated here
-  // and its kind belongs to a phase that ran.
-  const phases = new Set([...(args.tlc ? ['tlc-refines', 'tlc-verdict', 'reference-vs-tlc'] : []),
-    ...(args.backend ? ['nano'] : []),
-    ...(args.backend && args.backend !== 'nano' && process.env.CAMUNDA_REST_ADDRESS ? ['camunda', 'differential'] : [])])
-  const result = classify(shrunk, committed, (c) => order.has(c.graph.key) && phases.has(c.kind))
+  // and its kind belongs to a phase that ACTUALLY ran.
+  const result = classify(shrunk, committed, (c) => order.has(c.graph.key) && phasesRan.has(c.kind))
 
   for (const d of result.known) {
     const c = committed.find((x) => x.signature === d.signature)
@@ -406,6 +448,7 @@ async function main () {
       `\n  ${JSON.stringify(d.detail)}`)
   }
   for (const c of result.stale) console.error(`FAIL stale committed divergence ${c.signature} (${c.graph.id}): no longer reproduces — delete it from formal/corpus/divergences.json`)
+  for (const c of result.obsolete) console.error(`FAIL obsolete committed divergence ${c.signature} (${c.graph.id}): its own graph/scenario did not reproduce this run (another graph still trips the signature) — re-record the minimal case or delete it from formal/corpus/divergences.json`)
   for (const c of result.unfiled) console.error(`FAIL committed divergence ${c.signature} (${c.graph.id}) has no filed issue — file one and set "issue"`)
 
   if (args.record && result.fresh.length > 0) {
@@ -415,7 +458,7 @@ async function main () {
     console.error(`recorded ${result.fresh.length} minimal case(s) in formal/corpus/divergences.json — file an issue for each and set "issue"`)
   }
 
-  const failed = result.fresh.length + result.stale.length + result.unfiled.length
+  const failed = result.fresh.length + result.stale.length + result.obsolete.length + result.unfiled.length
   log(`${entries.length} graph(s) in ${Math.round((Date.now() - t0) / 1000)}s: ${divergences.length} divergence(s) in ${shrunk.length} class(es), ${result.known.length} known`)
   if (failed > 0) process.exit(1)
   log('ok    no unexplained divergence within the bound')

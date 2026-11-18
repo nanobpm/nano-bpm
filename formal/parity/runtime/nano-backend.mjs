@@ -114,6 +114,39 @@ export class NanoBackend {
     return jobs.length;
   }
 
+  // Complete EXACTLY ONE job of `jobType` (#1246): the bounded-exhaustive
+  // scenarios address a single job activation, so a run that holds two
+  // same-type jobs (a parallel split through an exclusive merge) is still
+  // driven deterministically — one completion per step, in the reference's
+  // order. Throws like `activateAndComplete` when no job is activatable.
+  async completeOneJob(_handle, jobType, variables) {
+    const jobs = JSON.parse(
+      this.engine.activateJobs(jobType, 1, 60_000, "parity-runner"),
+    );
+    if (jobs.length === 0) {
+      throw new Error(
+        `no '${jobType}' job was activatable — the nano engine reached RTC ` +
+          `quiescence without creating this job (the Camunda adapter throws in ` +
+          `the same situation). A parity step must drive the same job on both ` +
+          `backends; a malformed or regressed scenario must fail, not proceed.`,
+      );
+    }
+    this.engine.completeJob(String(jobs[0].key), JSON.stringify(variables ?? {}));
+    return 1;
+  }
+
+  // Set (override) process-instance variables mid-run (#1246): a per-activation
+  // route schedule is delivered as the gateway's `route_<id>` list before the
+  // activation that reads it. Nano's setVariables applies to the instance's
+  // root scope synchronously (RTC), so the next step's conditions read it.
+  async setVariables(handle, variables) {
+    this.engine.setVariables(
+      handle.processInstanceKey,
+      JSON.stringify(variables ?? {}),
+      false,
+    );
+  }
+
   async correlateMessage(_handle, name, correlationKey, variables) {
     this.engine.correlateMessage(name, correlationKey, JSON.stringify(variables ?? {}));
   }
@@ -121,8 +154,9 @@ export class NanoBackend {
   // A BUFFERED correlation (#1246): the message reaches the subscription that the
   // previous step opens, however late it opens. Nano runs every command to RTC
   // quiescence synchronously, so that subscription is already open when this
-  // step runs and an immediate correlation is the same thing. (The Camunda
-  // adapter has no such barrier and publishes with a TTL instead.)
+  // step runs and an immediate correlation is the same thing — the barrier the
+  // Camunda adapter needs (`settled`) is free here: the correlation itself has
+  // already settled the follow-on work by the time it returns.
   async publishMessage(handle, name, correlationKey, variables) {
     return this.correlateMessage(handle, name, correlationKey, variables);
   }
@@ -167,6 +201,13 @@ export class NanoBackend {
       this.engine.searchVariables(JSON.stringify({ processInstanceKey: pik })),
     );
     obs.variables = rootVariablesFromSearch(vars.items, pik);
+    // The bounded-exhaustive scenarios drive routing through `route_*` start /
+    // set variables — the driver's own schedule, not a process outcome. Drop
+    // them from the observation so the oracle compares the variables the
+    // PROCESS produced (#1246).
+    for (const k of Object.keys(obs.variables)) {
+      if (k.startsWith("route_")) delete obs.variables[k];
+    }
 
     return obs;
   }

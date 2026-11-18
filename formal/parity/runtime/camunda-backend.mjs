@@ -111,15 +111,21 @@ export class CamundaBackend {
     return h;
   }
 
-  // Handles whose awaitCompletion create is still in flight. `reset()` aborts the
-  // create (so a scenario that fails before `observe()` cannot keep the process
-  // alive until the create's ~135 s deadline) and cancels every instance key the
-  // scenario learned from its activated jobs, so a still-running instance cannot
-  // leave jobs for a later run of the same job type (#1260 review). An instance
-  // that never yielded a job has no known key (the bare gateway exposes no
-  // instance search); it is parked before its first job, which the next run's
-  // first activation of that type would complete along with its own (the
-  // activation cap leaves room), so the residue is bounded and never silent.
+  // Handles whose awaitCompletion create is still in flight OR whose instance
+  // may still be running. `reset()` aborts the create (so a scenario that fails
+  // before `observe()` cannot keep the process alive until the create's ~135 s
+  // deadline) and cancels every instance key the scenario learned from its
+  // activated jobs, so a still-running instance cannot leave jobs for a later
+  // run of the same job type (#1260 review). A handle whose create REJECTED
+  // (e.g. an awaitCompletion timeout on a stuck scenario) STAYS in the set
+  // until `reset()` confirms the cancellation: dropping it on rejection would
+  // orphan a still-running instance whose leftover jobs (generated graphs reuse
+  // job types like `T1`) a later scenario could activate, contaminating results
+  // (#1246 review). An instance that never yielded a job has no known key (the
+  // bare gateway exposes no instance search); it is parked before its first
+  // job, which the next run's first activation of that type would complete
+  // along with its own (the activation cap leaves room), so the residue is
+  // bounded and never silent.
   #inflight = new Set();
 
   async #json(method, path, body, what, { timeoutMs, signal } = {}) {
@@ -259,7 +265,15 @@ export class CamundaBackend {
         timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS,
         signal: handle.abort.signal,
       },
-    ).finally(() => this.#inflight.delete(handle));
+    );
+    // A create that SETTLED (completed instance) leaves nothing to cancel —
+    // drop it. A REJECTED create (awaitCompletion timeout on a stuck scenario,
+    // a transport failure) may still have a running instance: keep the handle
+    // in #inflight so `reset()` cancels every key it learned (#1246 review).
+    pending.then(
+      () => this.#inflight.delete(handle),
+      () => {},
+    );
     // Surface a create-time rejection eagerly rather than as an unhandled
     // rejection; the stored promise is still awaited in `observe`.
     pending.catch(() => {});
@@ -301,6 +315,45 @@ export class CamundaBackend {
     return jobs.length;
   }
 
+  // Complete EXACTLY ONE job of `jobType` (#1246): the bounded-exhaustive
+  // scenarios address a single job activation, so a run that holds two
+  // same-type jobs (a parallel split through an exclusive merge) is still
+  // driven deterministically — one completion per step, in the reference's
+  // order. `maxJobsToActivate: 1` keeps the step to one job even when more are
+  // activatable.
+  async completeOneJob(handle, jobType, variables) {
+    const job = await this.#activateOne(jobType);
+    if (job.processInstanceKey != null) handle.instanceKeys.add(String(job.processInstanceKey));
+    await this.#json(
+      "POST",
+      `/jobs/${job.jobKey ?? job.key}/completion`,
+      { variables: variables ?? {} },
+      "complete job",
+    );
+    return 1;
+  }
+
+  // Set (override) process-instance variables mid-run (#1246): a per-activation
+  // route schedule is delivered as the gateway's `route_<id>` list before the
+  // activation that reads it. The v2 API sets variables on the instance's root
+  // scope (`/process-instances/{key}/variables`).
+  async setVariables(handle, variables) {
+    const key = [...handle.instanceKeys][0];
+    if (key == null) {
+      throw new Error(
+        "setVariables before the instance key is known (no job activated yet) — " +
+          "the bare gateway exposes no instance lookup; schedule the route in the " +
+          "start variables or after the first job activation",
+      );
+    }
+    await this.#json(
+      "POST",
+      `/process-instances/${key}/variables`,
+      { variables: variables ?? {} },
+      "set variables",
+    );
+  }
+
   async correlateMessage(_handle, name, correlationKey, variables) {
     await this.#json(
       "POST",
@@ -318,7 +371,22 @@ export class CamundaBackend {
   // and correlates it then. A scenario using this op must give every scenario
   // its own correlation key, so a buffered message can never reach another
   // scenario's instance on the shared runtime.
-  async publishMessage(_handle, name, correlationKey, variables) {
+  //
+  // The publication endpoint does not wait for correlation
+  // (spec/messages.yaml), so the response alone is no barrier: the NEXT step
+  // could run while the message is still buffered, and an opposite
+  // message/job command order would execute in the same order on Camunda —
+  // missing coverage or producing a misleading difference from the settled
+  // reference execution. `settled` is the driver's barrier: when the scenario
+  // knows the correlation resumes the instance into a job of type
+  // `settled.jobType`, publish then LONG-POLL one activation of that type —
+  // the job exists only after the message correlated and the follow-on work
+  // activated — then FAIL the activation back (with retries) so the driver's
+  // own completion step re-activates and completes it. A correlation that
+  // leads straight to the end event has no job to barrier on; there the
+  // awaitCompletion create settling IS the barrier, and the driver waits it
+  // via `observe`.
+  async publishMessage(handle, name, correlationKey, variables, settled) {
     await this.#json(
       "POST",
       "/messages/publication",
@@ -330,6 +398,41 @@ export class CamundaBackend {
       },
       "publish message",
     );
+    if (settled?.jobType) {
+      const job = await this.#activateOne(settled.jobType);
+      if (job.processInstanceKey != null) handle.instanceKeys.add(String(job.processInstanceKey));
+      await this.#json(
+        "POST",
+        `/jobs/${job.jobKey ?? job.key}/failure`,
+        { retries: 1, retryBackOffMs: 0 },
+        "fail back barrier job",
+      );
+    }
+  }
+
+  async #activateOne(jobType) {
+    const activated = await this.#json(
+      "POST",
+      "/jobs/activation",
+      {
+        type: jobType,
+        maxJobsToActivate: 1,
+        timeout: DEFAULT_ACTIVATE_TIMEOUT_MS,
+        worker: "parity-runner",
+        requestTimeout: DEFAULT_LONG_POLL_MS,
+      },
+      "activate jobs",
+      { timeoutMs: DEFAULT_LONG_POLL_MS + REQUEST_TIMEOUT_MARGIN_MS },
+    );
+    const jobs = activated.jobs ?? [];
+    if (jobs.length === 0) {
+      throw new Error(
+        `no '${jobType}' job became activatable within ${DEFAULT_LONG_POLL_MS}ms — ` +
+          `the published message did not correlate into the expected job (a ` +
+          `correlation barrier miss), or the scenario is mis-ordered (do not retry)`,
+      );
+    }
+    return jobs[0];
   }
 
   async broadcastSignal(_handle, name, variables) {

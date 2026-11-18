@@ -35,7 +35,8 @@ test('the enumeration size is pinned for small bounds (drift guard on the well-f
   // S->E and S->T->E.
   assert.equal(count(0, 2), 2)
   assert.equal(count(1, 5), 30)
-  assert.equal(count(2, 5), 93)
+  // 2-gateway/5-flow includes the MIXED join/split gateways (#1246 review).
+  assert.equal(count(2, 5), 102)
 })
 
 test('every enumerated graph is well-formed, within the bound, and connected S -> E', () => {
@@ -75,12 +76,21 @@ test('isomorphism reduction: one graph per class, and relabelling gateways is in
   assert.deepEqual(materialize(a), materialize(b))
 })
 
-test('well-formedness rejects mixed / no-op gateways and misplaced message edges', () => {
+test('well-formedness rejects no-op gateways and misplaced message edges, but keeps mixed join/split gateways', () => {
   assert.equal(wellFormed(['xor'], [[0, 1, 'direct'], [1, 2, 'direct']]), false, '1-in-1-out no-op')
   assert.equal(wellFormed(['evt'], [[0, 1, 'direct'], [1, 2, 'msg'], [1, 2, 'msg']]), true)
   assert.equal(wellFormed(['evt'], [[0, 1, 'direct'], [1, 2, 'msg'], [1, 2, 'task']]), false)
   assert.equal(wellFormed(['xor'], [[0, 1, 'direct'], [1, 2, 'msg'], [1, 2, 'msg']]), false)
   assert.equal(wellFormed([], [[0, 1, 'direct'], [0, 1, 'task']]), false, 'S has one out-flow')
+  // Mixed gateways (>= 2 in, >= 2 out) are supported by the engine and the TLA
+  // specs, so the enumeration must include them (#1246 review): S -> A(and),
+  // two flows A -> B, two flows B(or) -> E is the cited 2-gateway/5-flow case.
+  const mixed = [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'direct'], [2, 3, 'direct'], [2, 3, 'direct']]
+  assert.equal(wellFormed(['and', 'or'], mixed), true, 'mixed and-split -> or-split/join')
+  assert.equal(wellFormed(['or', 'and'], mixed), true, 'mixed or-split -> and-split/join')
+  assert.equal(wellFormed(['xor', 'xor'], mixed), true, 'mixed xor-split -> xor-split/join')
+  // An event-based gateway stays split-only (a join evt is unmodelled).
+  assert.equal(wellFormed(['and', 'evt'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'direct'], [2, 3, 'msg'], [2, 3, 'msg']]), false, 'evt with 2 in-flows is not a pure split')
 })
 
 test('the gateway kinds of the bound are honoured', () => {
@@ -100,9 +110,9 @@ const parallelDiamond = () => graphOf(['and', 'and'], [[0, 1, 'direct'], [1, 2, 
 test('reference: a parallel diamond has both completion orders, each completing', () => {
   const g = parallelDiamond()
   assert.deepEqual(routesFor(g), [{}])
-  const runs = exploreOrders(g, {})
+  const runs = exploreOrders(g)
   assert.deepEqual(runs.map((r) => r.steps.map((s) => s.node)), [['T1', 'T2'], ['T2', 'T1']])
-  assert.ok(runs.every((r) => r.completed && r.oneSafe))
+  assert.ok(runs.every((r) => r.completed))
   assert.deepEqual(runs[0].jobsCreated, { T1: 1, T2: 1 })
 })
 
@@ -118,23 +128,44 @@ test('reference: an exclusive split into a parallel join gets stuck, on every ro
 test('reference: an inclusive split routes every non-empty subset and its join waits for each', () => {
   const g = graphOf(['or', 'or'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'task'], [2, 3, 'direct']])
   const routes = routesFor(g)
-  assert.deepEqual(routes.map((r) => r[routeVariable('G1')].length).sort(), [1, 1, 2])
+  // Each route is the choice SEQUENCE (one entry per activation); a single
+  // activation's route is a one-element sequence of the chosen subset.
+  assert.deepEqual(routes.map((r) => r[routeVariable('G1')][0].length).sort(), [1, 1, 2])
   for (const r of routes) {
     for (const run of exploreOrders(g, r)) {
       assert.equal(run.completed, true)
-      assert.equal(run.steps.length, r[routeVariable('G1')].length)
+      assert.equal(run.steps.length, r[routeVariable('G1')][0].length)
     }
   }
 })
 
+test('reference: a gateway reached twice routes PER ACTIVATION, not per instance (#1246 review)', () => {
+  // S -> P(and split) -> {T1, T2} -> X(xor merge) -> {E, T3 -> E}: the two
+  // parallel tokens each activate X, and the valid execution that routes the
+  // first to T3 and the second to E creates exactly ONE T3 job — a per-instance
+  // route (all activations share one choice) can only make zero or two.
+  const g = graphOf(['and', 'xor'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'task'], [2, 3, 'task'], [2, 3, 'direct']])
+  const runs = exploreOrders(g)
+  const byJobs = new Map(runs.map((r) => [JSON.stringify(r.jobsCreated), r]))
+  assert.ok(byJobs.has('{"T1":1,"T2":1}'), 'route both to E: no T3')
+  assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":1}'), 'route one to T3, one to E: exactly one T3 job')
+  assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":2}'), 'route both to T3: two T3 jobs')
+  // The one-T3 run's route is a per-activation sequence with DIFFERENT entries.
+  const mixed = byJobs.get('{"T1":1,"T2":1,"T3":1}')
+  const seq = mixed.route[routeVariable('G2')]
+  assert.equal(seq.length, 2)
+  assert.notDeepEqual(seq[0], seq[1], 'the two activations of X choose differently')
+  assert.ok(runs.every((r) => r.completed))
+})
+
 test('reference: an event-based gateway is a wait state resolved by one correlation', () => {
   const g = graphOf(['evt'], [[0, 1, 'direct'], [1, 2, 'msg'], [1, 2, 'msg']])
-  const runs = exploreOrders(g, {})
+  const runs = exploreOrders(g)
   assert.deepEqual(runs.map((r) => r.steps.map((s) => s.catch)), [['M1'], ['M2']])
   assert.ok(runs.every((r) => r.completed))
 })
 
-test('scenarios: one per route and command order, from the one graph source', () => {
+test('scenarios: one per (route, command order) run, from the one graph source', () => {
   const g = graphOf(['evt'], [[0, 1, 'task'], [1, 2, 'msg'], [1, 2, 'msg']])
   const { scenarios, skipped } = scenariosFor(g)
   assert.equal(skipped, 0)
@@ -143,12 +174,46 @@ test('scenarios: one per route and command order, from the one graph source', ()
   assert.equal(s.processId, g.id)
   assert.equal(s.variables[CORRELATION_KEY_VARIABLE], s.name, 'each scenario has its own correlation key')
   assert.deepEqual(s.steps, [
-    { op: 'activateAndComplete', jobType: 'T1' },
+    { op: 'completeOneJob', jobType: 'T1' },
     { op: 'publishMessage', name: messageName(g.id, 'M1'), correlationKey: s.name }
   ])
-  assert.deepEqual(s.expect, { completed: true, jobsCreated: { T1: 1 }, variables: s.variables })
+  // The oracle is branch-sensitive via the taken flows: the engine arms EVERY
+  // catch (M1 AND the losing M2 both complete — the loser is withdrawn), so the
+  // catch's completion does not distinguish the branch. The taken OUTGOING flow
+  // does: only the winner's continuation (M1->E) is taken, never M2->E.
+  assert.deepEqual(s.expect, {
+    completed: true,
+    jobsCreated: { T1: 1 },
+    variables: s.variables,
+    completedElements: { S: 1, T1: 1, G1: 1, M1: 1, M2: 1, E: 1 },
+    sequenceFlows: { 'S->T1': 1, 'T1->G1': 1, 'G1->M1': 1, 'G1->M2': 1, 'M1->E': 1 }
+  })
   const stuck = scenariosFor(graphOf(['xor', 'and'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'direct'], [2, 3, 'direct']]))
   assert.ok(stuck.scenarios.every((sc) => sc.expect.completed === false && sc.backends?.join() === 'nano'))
+})
+
+test('event-based gateway oracle: substituting the other catch FAILS the branch-sensitive expectation', () => {
+  // The negative oracle guard (#1246 review): the two catches of an event-based
+  // gateway produce identical completion/variables AND identical completed
+  // elements (the engine arms both, withdrawing the loser). Only the taken
+  // OUTGOING flow distinguishes them — swapping the correlated catch takes the
+  // other catch's continuation and must mismatch the sequenceFlows oracle.
+  const g = graphOf(['evt'], [[0, 1, 'task'], [1, 2, 'msg'], [1, 2, 'msg']])
+  const { scenarios } = scenariosFor(g)
+  const [m1, m2] = scenarios
+  // Both complete both catches (the loser is withdrawn)…
+  assert.equal(m1.expect.completedElements.M1, 1)
+  assert.equal(m1.expect.completedElements.M2, 1)
+  // …but only the SELECTED catch's outgoing flow is taken.
+  assert.equal(m1.expect.sequenceFlows['M1->E'], 1)
+  assert.equal(m1.expect.sequenceFlows['M2->E'], undefined)
+  assert.equal(m2.expect.sequenceFlows['M2->E'], 1)
+  assert.equal(m2.expect.sequenceFlows['M1->E'], undefined)
+  // An observation that resumed M2 instead of M1 fails M1's flow oracle.
+  const wrongCatchFlows = { ...m1.expect.sequenceFlows, 'M2->E': 1 }
+  delete wrongCatchFlows['M1->E']
+  assert.notDeepEqual(wrongCatchFlows, m1.expect.sequenceFlows,
+    'resuming the wrong catch must be observable in the taken-flow multiset')
 })
 
 test('artifacts: variable-routed BPMN with DI, messages, and MC/ZMC models', () => {
@@ -157,7 +222,7 @@ test('artifacts: variable-routed BPMN with DI, messages, and MC/ZMC models', () 
   assert.match(a.bpmn, /<bpmn:eventBasedGateway /)
   assert.match(a.bpmn, /<bpmn:messageEventDefinition messageRef="Message_M1"\/>/)
   assert.match(a.bpmn, new RegExp(`correlationKey="=${CORRELATION_KEY_VARIABLE}"`))
-  assert.match(a.bpmn, new RegExp(`=${routeVariable("G")}\\d = &quot;f\\d&quot;`))
+  assert.match(a.bpmn, new RegExp(`=${routeVariable("G")}\\d\\[1\\]\\[1\\] = &quot;f\\d&quot;`))
   for (const n of Object.keys(g.nodes)) assert.match(a.bpmn, new RegExp(`bpmnElement="${n}"`), `DI shape for ${n}`)
   assert.match(a.tla.TokenFlow, new RegExp(`MODULE MC${g.id} `))
   assert.match(a.tla.ZeebeTokenFlow, new RegExp(`MODULE ZMC${g.id} `))
@@ -209,17 +274,50 @@ test('shrinking keeps the smallest graph and then the shortest scenario per dive
 
 test('the divergence corpus: fresh classes fail, stale and unfiled committed cases fail', () => {
   const committed = [
-    { signature: 'known', issue: '#1', graph: { key: 'k1' } },
+    { signature: 'known', issue: '#1', graph: { key: 'k1' }, scenario: { name: 'k1-o0' } },
     { signature: 'gone', issue: '#2', graph: { key: 'k2' } },
     { signature: 'outside', issue: '#3', graph: { key: 'k3' } },
     { signature: 'unfiled', issue: null, graph: { key: 'k4' } }
   ]
   const inScope = (c) => c.graph.key !== 'k3'
-  const r = classify([{ signature: 'known' }, { signature: 'new' }, { signature: 'unfiled' }], committed, inScope)
+  const r = classify(
+    [
+      { signature: 'known', entry: { graph: { key: 'k1' } }, scenario: { name: 'k1-o0' } },
+      { signature: 'new', entry: { graph: { key: 'k9' } } },
+      { signature: 'unfiled', entry: { graph: { key: 'k4' } } }
+    ],
+    committed,
+    inScope
+  )
   assert.deepEqual(r.known.map((d) => d.signature), ['known', 'unfiled'])
   assert.deepEqual(r.fresh.map((d) => d.signature), ['new'])
   assert.deepEqual(r.stale.map((c) => c.signature), ['gone'])
   assert.deepEqual(r.unfiled.map((c) => c.signature), ['unfiled'])
+})
+
+test('a committed case is validated against its OWN reproducer, not just its signature (#1246 review)', () => {
+  // The committed case's graph stopped failing, but ANOTHER graph still trips
+  // the same field-based signature: signature-only classification would call
+  // the case "known" and pass, yet the committed reproduction no longer
+  // reproduces. It must surface as `obsolete` (re-record or delete), not pass.
+  const committed = [
+    { signature: 'nano:variables:completed=true/false', issue: '#7', graph: { key: 'old' }, scenario: { name: 'old-o0' } }
+  ]
+  const r = classify(
+    [{ signature: 'nano:variables:completed=true/false', entry: { graph: { key: 'other' } }, scenario: { name: 'other-o3' } }],
+    committed,
+    () => true
+  )
+  assert.deepEqual(r.known.map((d) => d.signature), ['nano:variables:completed=true/false'], 'the signature still reproduces on some graph')
+  assert.deepEqual(r.obsolete.map((c) => c.signature), ['nano:variables:completed=true/false'], 'but the committed case itself did not')
+  assert.deepEqual(r.stale, [], 'not stale: the signature still reproduces')
+  // When the committed case's OWN graph/scenario reproduces, it is not obsolete.
+  const ok = classify(
+    [{ signature: 'nano:variables:completed=true/false', entry: { graph: { key: 'old' } }, scenario: { name: 'old-o0' } }],
+    committed,
+    () => true
+  )
+  assert.deepEqual(ok.obsolete, [])
 })
 
 test('the committed divergence corpus is well-formed: every case is filed and re-materialisable', () => {

@@ -111,12 +111,20 @@ source, three artifacts:
 - `bpmnFor(graph, { routing: 'variables' })` → BPMN with DI, whose diverging
   exclusive / inclusive gateways read their route from a start variable
   (`route_<gateway>`), and whose catch events subscribe to
-  `<graph>_<node>` keyed by the `correlationKey` start variable;
+  `<graph>_<node>` keyed by the `correlationKey` start variable. The route
+  variable holds the gateway's **remaining choice sequence** (one entry per
+  activation still to route — a parallel split can bring a token back to the
+  same gateway, and each activation may choose differently); the condition
+  reads the head (`route[1]`) and the scenario re-sets the variable to the
+  suffix before each activation;
 - `scenariosFor` → runtime scenario scripts (formal/parity/runtime format): one
-  per **route × command order**. A command-level executor of `TokenFlow.tla`
-  (`Reference`) derives, after each settled step, every possible next command
-  (complete a job, correlate a message), as TLC explores every interleaving;
-  its outcome is the scenario's `expect`.
+  per **(route × command order) run**. A command-level executor of
+  `TokenFlow.tla` (`Reference`) explores, after each settled step, every
+  pending routing decision AND every possible next command (complete a job,
+  correlate a message), as TLC explores every interleaving; its outcome is the
+  scenario's `expect` — including the completed-element multiset, so an
+  event-based gateway resumed on the wrong catch fails the oracle even when
+  completion and the variables match.
 
 `exhaustive.mjs` runs them:
 
@@ -138,11 +146,17 @@ also takes a manual dispatch with overrides). Checks per graph:
 | `nano` | the engine-wasm TestEngine's outcome (completion, jobs created, variables) ≠ the reference outcome |
 | `camunda` | live Camunda 8 ≠ the reference, or ≠ nano on the fields both expose (`differential`) — completing scenarios only (the bare-gateway backend observes an instance through completion) |
 
-Command orders that put two tokens on one wait state (not 1-safe) are left to
-TLC: the driver addresses a job by type and a message by name, so it cannot
-single one of them out. Message steps use the driver's `publishMessage` op (a
-buffered correlation: Camunda publishes with a TTL, so no race with the
-subscription the previous step opens; nano's RTC makes it immediate).
+Command orders are driven one job at a time: `completeOneJob` completes exactly
+one job of a type, so a run that holds two same-type jobs (a parallel split
+through an exclusive merge) is still deterministic — multi-token runs are kept,
+not skipped. Message steps use the driver's `publishMessage` op (a buffered
+correlation: Camunda publishes with a TTL, so no race with the subscription the
+previous step opens; nano's RTC makes it immediate). The publication endpoint
+does not wait for correlation, so when resuming the catch activates exactly one
+follow-on task the step carries a `settled.jobType` barrier: Camunda long-polls
+one activation of that type (the job exists only once the message correlated)
+and fails it back for the driver's own completion step, so the driver never
+advances past a still-buffered message.
 
 **Any divergence fails the run and is shrunk.** Graphs are enumerated
 smallest-first (flows, then gateways), so the first graph showing a divergence
@@ -151,8 +165,12 @@ scenarios the shortest is kept. `--record` appends these minimal cases to
 `divergences.json`, the committed corpus of known divergences. Each committed
 case needs a filed `issue` (an unfiled case fails the run and the unit tests);
 a committed case that stops reproducing inside the bound fails as stale, so a
-fix deletes it. Nano divergences are filed as their own issues and fixed
-there, never inside the generator.
+fix deletes it. A committed case is validated against **its own** graph and
+scenario, not just its signature: field-based signatures can group unrelated
+defects, so a case whose own reproducer stopped failing while another graph
+still trips the signature fails as **obsolete** (re-record or delete it) rather
+than ratcheting on a dead reproduction. Nano divergences are filed as their own
+issues and fixed there, never inside the generator.
 
 The generated scenarios are deterministic command scripts (fixed ids, fixed
 order, unique correlation keys), so the same `--out` corpus can feed the

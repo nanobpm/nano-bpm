@@ -550,6 +550,197 @@ test("cleanup cancels a failed scenario's still-running Camunda instance", async
   }
 });
 
+test("a REJECTED create (awaitCompletion timeout) still cancels its instance on reset (#1246)", async () => {
+  // Dropping the handle from #inflight on a create rejection would orphan the
+  // still-running instance; a later scenario reusing its job type could activate
+  // the leftover job. The handle must be retained until reset confirms the
+  // cancellation of every key it learned.
+  const cancelled = [];
+  let activations = 0;
+  const server = createServer((req, res) => {
+    // The create responds 504 (awaitCompletion timeout) — the instance is
+    // still running server-side, parked on its job.
+    if (req.url.endsWith("/process-instances") && req.method === "POST") {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end('{"message":"timeout"}');
+      return;
+    }
+    const m = req.url.match(/\/process-instances\/(\d+)\/cancellation$/);
+    if (m) {
+      cancelled.push(m[1]);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      activations++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"11","processInstanceKey":"777"}]}');
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const scenario = {
+      xml: "<definitions/>",
+      processId: "p",
+      steps: [{ op: "completeOneJob", jobType: "T1" }],
+    };
+    // The step completes a job (learning key 777), then observe() awaits the
+    // rejected create and the scenario fails.
+    await assert.rejects(() => runScenario(backend, scenario));
+    await backend.close();
+    assert.deepEqual(cancelled, ["777"], "the rejected create's instance must still be cancelled");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("completeOneJob activates and completes exactly ONE job of the type", async () => {
+  const completions = [];
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/jobs/activation")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"21","processInstanceKey":"5"}]}');
+      return;
+    }
+    const m = req.url.match(/\/jobs\/(\d+)\/completion$/);
+    if (m) {
+      completions.push(m[1]);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set() };
+    const n = await backend.completeOneJob(handle, "T1", {});
+    assert.equal(n, 1);
+    assert.deepEqual(completions, ["21"]);
+    assert.deepEqual([...handle.instanceKeys], ["5"]);
+    // No activatable job is a loud serialisation defect, like the batch op.
+    const empty = createServer((req, res) => {
+      if (req.url.endsWith("/jobs/activation")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"jobs":[]}');
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+    });
+    empty.listen(0);
+    await once(empty, "listening");
+    try {
+      const b2 = new CamundaBackend({ address: `http://127.0.0.1:${empty.address().port}` });
+      await assert.rejects(() => b2.completeOneJob({ instanceKeys: new Set() }, "T9", {}), /no 'T9' job became activatable/);
+    } finally {
+      empty.closeAllConnections();
+      empty.close();
+      await once(empty, "close");
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("publishMessage with a settled barrier long-polls the follow-on job and fails it back", async () => {
+  // The correlation barrier (#1246 review): the publication endpoint does not
+  // wait for correlation, so the driver must not advance while the message is
+  // still buffered. With `settled.jobType` the publish long-polls one
+  // activation of that type (the job exists only once the message correlated)
+  // and fails it back so the driver's own completion step re-activates it.
+  const calls = [];
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/messages/publication")) {
+      calls.push("publish");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      calls.push("activate");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"31","processInstanceKey":"5"}]}');
+      return;
+    }
+    const f = req.url.match(/\/jobs\/(\d+)\/failure$/);
+    if (f) {
+      calls.push(`failback:${f[1]}`);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set() };
+    await backend.publishMessage(handle, "M", "k", {}, { jobType: "T1" });
+    assert.deepEqual(calls, ["publish", "activate", "failback:31"]);
+    assert.deepEqual([...handle.instanceKeys], ["5"]);
+    // Without a barrier (catch leads straight to the end event) there is no
+    // activation — the awaitCompletion create settling is the barrier.
+    calls.length = 0;
+    await backend.publishMessage(handle, "M", "k", {}, undefined);
+    assert.deepEqual(calls, ["publish"]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("setVariables targets the instance's root scope and is loud without a known key", async () => {
+  const seen = [];
+  const server = createServer((req, res) => {
+    const m = req.url.match(/\/process-instances\/(\d+)\/variables$/);
+    if (m) {
+      seen.push(m[1]);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set(["8080"]) };
+    await backend.setVariables(handle, { route_G1: [["f2"]] });
+    assert.deepEqual(seen, ["8080"]);
+    await assert.rejects(
+      () => backend.setVariables({ instanceKeys: new Set() }, { a: 1 }),
+      /before the instance key is known/,
+    );
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
 test("SIGINT/SIGTERM run backend cleanup (unpin the cluster clock) before exiting", async () => {
   // A killed run must not leave the cluster-global Camunda clock pinned at epoch
   // 0, freezing timers for every other user of the cluster (#1260 review).

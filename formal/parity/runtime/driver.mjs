@@ -20,6 +20,8 @@ import { join } from "node:path";
  *     "variables": { },               // start variables (optional)
  *     "steps": [                      // ordered, serialised
  *       { "op": "activateAndComplete", "jobType": "a", "variables": { "a": 1 } },
+ *       { "op": "completeOneJob", "jobType": "a", "variables": { "a": 1 } },
+ *       { "op": "setVariables", "variables": { "route_G1": [["f2"]] } },
  *       { "op": "correlateMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "publishMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "broadcastSignal", "name": "S", "variables": {} },
@@ -39,6 +41,10 @@ async function dispatchStep(backend, handle, step) {
   switch (step.op) {
     case "activateAndComplete":
       return backend.activateAndComplete(handle, step.jobType, step.variables ?? {});
+    case "completeOneJob":
+      return backend.completeOneJob(handle, step.jobType, step.variables ?? {});
+    case "setVariables":
+      return backend.setVariables(handle, step.variables ?? {});
     case "correlateMessage":
       return backend.correlateMessage(
         handle,
@@ -52,6 +58,7 @@ async function dispatchStep(backend, handle, step) {
         step.name,
         step.correlationKey,
         step.variables ?? {},
+        step.settled,
       );
     case "broadcastSignal":
       return backend.broadcastSignal(handle, step.name, step.variables ?? {});
