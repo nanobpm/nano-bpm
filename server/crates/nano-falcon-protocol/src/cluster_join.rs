@@ -19,7 +19,7 @@
 //! A peer that sends neither header is a pre-#1661 binary: it is admitted
 //! (rolling upgrade) unless a feature is already required.
 //!
-//! 
+//!
 /// Header carrying the sender's cluster-wide partition count.
 pub const CLUSTER_PARTITIONS_HEADER: &str = "x-nano-cluster-partitions";
 

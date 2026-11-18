@@ -1122,7 +1122,8 @@ fn lenient_completion_accepts_a_job_that_was_never_activated() {
     // given a replica engine in lenient-completion mode (leader-local
     // activation: this replica never saw the job activated)
     let mut engine = Engine::new();
-    engine.apply_command(Command::SetLenientCompletion { lenient: true })
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
         .unwrap();
     assert!(engine.lenient_completion());
     engine
@@ -3806,7 +3807,10 @@ fn replicas_agree_on_a_completion_racing_a_lenient_policy_flip() {
         })
         .collect();
 
-    assert_eq!(outcomes[0], outcomes[1], "replicas must agree on every entry");
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "replicas must agree on every entry"
+    );
     assert_eq!(
         outcomes[0][0],
         Err(EngineError::JobNotActivated { job_key: early }),
@@ -3816,7 +3820,10 @@ fn replicas_agree_on_a_completion_racing_a_lenient_policy_flip() {
         outcomes[0][1],
         Ok(vec![Event::LenientCompletionSet { lenient: true }])
     );
-    assert!(outcomes[0][2].is_ok(), "a completion after the flip is lenient everywhere");
+    assert!(
+        outcomes[0][2].is_ok(),
+        "a completion after the flip is lenient everywhere"
+    );
     assert!(replicas.iter().all(Engine::lenient_completion));
 }
 
@@ -3842,12 +3849,18 @@ fn lenient_completion_survives_replay_and_snapshot_plus_tail() {
     assert!(engine.lenient_completion());
 
     let replayed = Engine::replay_partition(0, journal.clone());
-    assert!(replayed.lenient_completion(), "full replay restores the flag");
+    assert!(
+        replayed.lenient_completion(),
+        "full replay restores the flag"
+    );
 
     let mut restored = Engine::from_snapshot(before_flip);
     assert!(!restored.lenient_completion());
     restored.apply_replayed_events(tail);
-    assert!(restored.lenient_completion(), "snapshot + tail restores the flag");
+    assert!(
+        restored.lenient_completion(),
+        "snapshot + tail restores the flag"
+    );
 
     let after = Engine::from_snapshot(engine.snapshot());
     assert!(after.lenient_completion(), "a snapshot carries the flag");

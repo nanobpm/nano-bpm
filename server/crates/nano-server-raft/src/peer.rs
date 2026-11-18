@@ -225,7 +225,10 @@ impl PeerLink {
     /// count on the join handshake (#1661): both sides refuse a link whose
     /// `NANOBPMN_PARTITIONS` differs. `None` skips the check (tests / tools
     /// dialing without a topology).
-    pub async fn connect_as(base_url: &str, num_partitions: Option<u64>) -> Result<Self, PeerError> {
+    pub async fn connect_as(
+        base_url: &str,
+        num_partitions: Option<u64>,
+    ) -> Result<Self, PeerError> {
         let app_connected = Arc::new(AtomicBool::new(true));
         let raft_connected = Arc::new(AtomicBool::new(true));
         let pending_app: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -290,7 +293,14 @@ impl PeerLink {
         connected: Arc<AtomicBool>,
         secret: Option<&str>,
         num_partitions: Option<u64>,
-    ) -> Result<(mpsc::Sender<Message>, [tokio::task::AbortHandle; 2], Vec<String>), PeerError> {
+    ) -> Result<
+        (
+            mpsc::Sender<Message>,
+            [tokio::task::AbortHandle; 2],
+            Vec<String>,
+        ),
+        PeerError,
+    > {
         use nano_falcon_protocol::cluster_join;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = ws_url
@@ -346,9 +356,8 @@ impl PeerLink {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         };
-        let remote_features = cluster_join::parse_features(
-            header(cluster_join::CLUSTER_FEATURES_HEADER).as_deref(),
-        );
+        let remote_features =
+            cluster_join::parse_features(header(cluster_join::CLUSTER_FEATURES_HEADER).as_deref());
         if let Some(local) = num_partitions {
             cluster_join::check_join(
                 local,

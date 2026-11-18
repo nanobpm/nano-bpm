@@ -399,9 +399,9 @@ async fn join_with_matching_partition_count_links_and_learns_features() {
     let link = PeerLink::connect_as(&base, Some(1))
         .await
         .expect("same partition count joins");
-    assert!(link.supports(
-        nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION
-    ));
+    assert!(
+        link.supports(nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION)
+    );
 }
 
 /// #1661: a joiner whose partition count differs is refused at the handshake,

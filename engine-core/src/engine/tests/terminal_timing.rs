@@ -372,7 +372,8 @@ fn a_soft_activation_records_no_terminal_deadline() {
     // documented absence so a regression that re-introduces replica-local
     // stamping is caught.
     let mut engine = Engine::new();
-    engine.apply_command(Command::SetLenientCompletion { lenient: true })
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
         .unwrap();
     engine
         .apply_command_at(Command::DeployProcess(three_branches()), 1_000)

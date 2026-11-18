@@ -19955,7 +19955,9 @@ impl ServerImpl {
                     .with(|journal| journal.engine().lenient_completion())
                     .await
             {
-                return vec![nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION];
+                return vec![
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION,
+                ];
             }
         }
         Vec::new()
@@ -19992,7 +19994,9 @@ impl ServerImpl {
             .propose_result(Command::SetLenientCompletion { lenient: desired }, now)
             .await
         {
-            tracing::warn!("raft: proposing SetLenientCompletion {{ lenient: {desired} }} failed: {e}; retrying next tick");
+            tracing::warn!(
+                "raft: proposing SetLenientCompletion {{ lenient: {desired} }} failed: {e}; retrying next tick"
+            );
         }
     }
 
@@ -43959,12 +43963,18 @@ mod clustered_startup_tests {
         // ever arrives through the log.
         let before = lenient_flags([&n0, &n1, &n2]).await;
         assert_eq!(before.len(), 9, "3 partitions x RF3 replicas");
-        assert!(before.iter().all(|f| !f), "no host-config lenient flag: {before:?}");
+        assert!(
+            before.iter().all(|f| !f),
+            "no host-config lenient flag: {before:?}"
+        );
 
         // One replicated tick: each partition leader proposes the flag.
         parity_tick([&n0, &n1, &n2], now_millis()).await;
         let after = await_lenient_flags([&n0, &n1, &n2], true).await;
-        assert!(after.iter().all(|f| *f), "every replica applied the flag: {after:?}");
+        assert!(
+            after.iter().all(|f| *f),
+            "every replica applied the flag: {after:?}"
+        );
 
         // A policy flip (to fully-replicated activation) is replicated too.
         for node in [&mut n0, &mut n1, &mut n2] {
@@ -43972,7 +43982,10 @@ mod clustered_startup_tests {
         }
         parity_tick([&n0, &n1, &n2], now_millis()).await;
         let flipped = await_lenient_flags([&n0, &n1, &n2], false).await;
-        assert!(flipped.iter().all(|f| !f), "every replica cleared the flag: {flipped:?}");
+        assert!(
+            flipped.iter().all(|f| !f),
+            "every replica cleared the flag: {flipped:?}"
+        );
     }
 
     /// #1661: `prepare_activation` grants a leader-local (soft, unjournaled)
