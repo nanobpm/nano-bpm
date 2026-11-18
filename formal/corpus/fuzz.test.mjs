@@ -217,3 +217,27 @@ test('executionNamer gives every execution a distinct scenario name (correlation
 test('the committed fuzz corpus is well-formed', () => {
   assert.deepEqual(corpusProblems(loadCorpus()), [])
 })
+
+test('renameScenario gives a stored scenario a fresh name and correlation key everywhere', async () => {
+  const { renameScenario } = await import('./fuzz.mjs')
+  const sc = { name: 'G-o1', variables: { correlationKey: 'G-o1', x: 1 }, steps: [{ op: 'publishMessage', name: 'm', correlationKey: 'G-o1' }], expect: { variables: { correlationKey: 'G-o1' } } }
+  const r = renameScenario(sc, 'G-replayx1')
+  assert.equal(r.name, 'G-replayx1')
+  assert.equal(r.variables.correlationKey, 'G-replayx1')
+  assert.equal(r.steps[0].correlationKey, 'G-replayx1')
+  assert.equal(r.expect.variables.correlationKey, 'G-replayx1')
+  assert.equal(sc.variables.correlationKey, 'G-o1', 'original untouched')
+  assert.ok(!JSON.stringify(r).includes('G-o1'))
+})
+
+test('shrinkGraph checkpoints each accepted reduction, so an aborted shrink keeps a reproducer', async () => {
+  const { shrinkGraph } = await import('./fuzz.mjs')
+  const skel = randomSkeleton(picker(prng(7)), { minGateways: 4, maxGateways: 6 })
+  let calls = 0
+  let latest = null
+  const reproduce = async (cand) => { if (++calls > 1) throw new Error('cleanup failed'); return { signature: 's', cand } }
+  await assert.rejects(shrinkGraph(skel, reproduce, { signature: 's' }, (b) => { latest = b }), /cleanup failed/)
+  assert.ok(latest, 'a reproducer was checkpointed before the failure')
+  assert.equal(latest.d.signature, 's')
+  assert.ok(latest.d.cand, 'the checkpoint is the accepted reduction, not just the initial case')
+})

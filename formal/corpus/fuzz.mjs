@@ -202,14 +202,15 @@ const stepCount = (sc) => sc.steps.length
  * Keeps applying the first reproducing reduction until none reproduces, so the
  * result is 1-minimal: no single reduction of it still diverges.
  */
-export async function shrinkGraph (skel, reproduce, initial) {
+export async function shrinkGraph (skel, reproduce, initial, onBest = () => {}) {
   let best = { skel, d: initial }
+  onBest(best)
   let progress = true
   while (progress) {
     progress = false
     for (const cand of reductions(best.skel)) {
       const d = await reproduce(cand)
-      if (d) { best = { skel: cand, d }; progress = true; break }
+      if (d) { best = { skel: cand, d }; onBest(best); progress = true; break }
     }
   }
   return best
@@ -303,6 +304,21 @@ export const shorterRepro = (a, b) => (!a ? b : !b ? a : b.scenario.steps.length
  * can never interact with messages or instances an earlier attempt left on a
  * backend.
  */
+/**
+ * A clone of stored scenario `sc` under the fresh execution name `name`: every
+ * occurrence of its old name (the scenario name, the start-variable
+ * correlation key, each message step's key, expected variables) is replaced,
+ * so a replay never reuses a key an earlier execution left on a backend.
+ */
+export function renameScenario (sc, name) {
+  const old = sc.name
+  const walk = (v) => v === old ? name
+    : Array.isArray(v) ? v.map(walk)
+      : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]))
+        : v
+  return { ...walk(sc), name }
+}
+
 export function executionNamer (tag) {
   let n = 0
   return (kind) => `${kind}${tag}x${++n}`
@@ -342,8 +358,19 @@ async function main () {
   // A completed minimum is persisted at once, so a later scenario error or a
   // failing backend close can never discard it.
   const nextName = executionNamer(`r${args.seed ?? 'replay'}`)
+  // The latest reproducer (the discovered one, then each accepted reduction)
+  // is checkpointed, so a shrink aborted by a backend error still keeps it.
   const found = async (seed, skel, d) => {
-    const min = { seed, ...(await shrink(backends, skel, d, nextName)) }
+    let latest = { seed, skel, d }
+    let min
+    try {
+      min = { seed, ...(await shrink(backends, skel, d, nextName, (b) => { latest = { seed, ...b } })) }
+    } catch (err) {
+      fresh.set(d.signature, latest)
+      if (args.record) record(latest)
+      failures.push(`shrinking ${d.signature} aborted (unshrunk-or-partial reproducer kept): ${err.message ?? err}`)
+      throw err
+    }
     fresh.set(d.signature, min)
     if (args.record) record(min)
   }
@@ -352,8 +379,9 @@ async function main () {
     // 1. Replay the permanent corpus.
     for (const c of cases) {
       if (!c.skeleton || !c.scenario || !caseRunnable(c, backends.phasesRan)) continue
-      const entry = entryFor(c.skeleton, () => [], nextName('replay'))
-      const divs = await checkScenario(backends, entry, c.scenario)
+      const name = nextName('replay')
+      const entry = entryFor(c.skeleton, () => [], name)
+      const divs = await checkScenario(backends, entry, renameScenario(c.scenario, `${entry.graph.id}-${name}`))
       const verdict = judgeCase(c, divs)
       if (verdict) failures.push(verdict)
       // A fixed case's divergence is already a REGRESSION verdict; an open
@@ -421,7 +449,7 @@ async function main () {
   }
 }
 
-async function shrink (backends, skel, d, nextName) {
+async function shrink (backends, skel, d, nextName, onBest) {
   const reproduce = async (cand) => {
     let best = null
     const entry = entryFor(cand, shrinkRuns, nextName('shrink'))
@@ -436,7 +464,7 @@ async function shrink (backends, skel, d, nextName) {
   // The original graph's known reproducer `d` is kept when the bounded
   // shrink sample only finds longer ones.
   const start = shorterRepro(d, await reproduce(skel))
-  const { skel: minSkel, d: minD } = await shrinkGraph(skel, reproduce, start)
+  const { skel: minSkel, d: minD } = await shrinkGraph(skel, reproduce, start, onBest)
   return { skel: minSkel, d: minD }
 }
 
