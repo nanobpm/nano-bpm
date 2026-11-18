@@ -185,6 +185,8 @@ jobs:
             # sources it is built from must re-run it.
             parityruntime:
               - 'formal/parity/runtime/**'
+              # The bounded-exhaustive generator (#1246) feeds the same runner.
+              - 'formal/corpus/**'
               # The inputs of the engine-wasm/pkg build it tests (#668: the
               # pkg is built from source per run, not committed), so an engine
               # change re-runs it against the new wasm.
@@ -773,6 +775,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Corpus generator + bounded-exhaustive enumeration tests
+        run: node --test formal/corpus/*.test.mjs
+      - name: Bounded-exhaustive TLC (#1246) — every graph in the CI bound, nano spec vs Zeebe reference
+        # The bound is the `ci` entry of formal/corpus/bounds.json; the nightly
+        # workflow (parity-exhaustive-nightly.yml) runs the larger `nightly` one.
+        # Any divergence not committed (with a filed issue) to
+        # formal/corpus/divergences.json fails the job.
+        run: node formal/corpus/exhaustive.mjs --bound ci --tlc
       - uses: actions/cache@v4
         with:
           path: ~/.cache/nanobpm-parity
@@ -941,6 +951,10 @@ jobs:
         run: node --test formal/parity/runtime/*.test.mjs
       - name: Nano backend — corpus vs. its expect oracle
         run: node formal/parity/runtime/run.mjs --backend nano
+      - name: Nano backend — bounded-exhaustive scenarios (#1246, CI bound)
+        # Every route x command order of every graph in the `ci` bound of
+        # formal/corpus/bounds.json, checked against the reference outcome.
+        run: node formal/corpus/exhaustive.mjs --bound ci --backend nano
       # Live Camunda 8 differential. Off by default (skip-tolerant): the step is
       # gated on the RUN_CAMUNDA_PARITY repo variable so the job stays green
       # until a maintainer provisions a Camunda 8 runtime and turns it on. When
