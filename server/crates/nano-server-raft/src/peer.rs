@@ -229,6 +229,20 @@ impl PeerLink {
         base_url: &str,
         num_partitions: Option<u64>,
     ) -> Result<Self, PeerError> {
+        Self::connect_requiring(base_url, num_partitions, &[]).await
+    }
+
+    /// [`connect_as`](Self::connect_as), additionally refusing the link (on
+    /// BOTH lanes) unless the peer's handshake response advertises every
+    /// replicated-command feature in `required_features` (#1661): once this
+    /// node's replicated state depends on a feature, it must not open an
+    /// outbound link to a member restarted on an older binary that could not
+    /// decode the entries Raft would then send it.
+    pub async fn connect_requiring(
+        base_url: &str,
+        num_partitions: Option<u64>,
+        required_features: &[&'static str],
+    ) -> Result<Self, PeerError> {
         let app_connected = Arc::new(AtomicBool::new(true));
         let raft_connected = Arc::new(AtomicBool::new(true));
         let pending_app: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -245,6 +259,7 @@ impl PeerLink {
             app_connected.clone(),
             secret.as_deref(),
             num_partitions,
+            required_features,
         )
         .await?;
         // Until ownership transfers to the returned `PeerLink`, the app lane's
@@ -260,6 +275,7 @@ impl PeerLink {
             raft_connected.clone(),
             secret.as_deref(),
             num_partitions,
+            required_features,
         )
         .await?;
 
@@ -293,6 +309,7 @@ impl PeerLink {
         connected: Arc<AtomicBool>,
         secret: Option<&str>,
         num_partitions: Option<u64>,
+        required_features: &[&'static str],
     ) -> Result<
         (
             mpsc::Sender<Message>,
@@ -349,24 +366,25 @@ impl PeerLink {
             }
         };
         // The peer answers with its own partition count + features: refuse the
-        // link from this side too when the counts differ (#1661).
+        // link from this side too when the counts differ, or when the peer
+        // lacks a feature this node's replicated state requires (#1661).
         let header = |name: &str| {
             resp.headers()
                 .get(name)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         };
-        let remote_features =
-            cluster_join::parse_features(header(cluster_join::CLUSTER_FEATURES_HEADER).as_deref());
-        if let Some(local) = num_partitions {
-            cluster_join::check_join(
-                local,
-                header(cluster_join::CLUSTER_PARTITIONS_HEADER).as_deref(),
-                None,
-                &[],
-            )
-            .map_err(|e| PeerError::Connect(e.to_string()))?;
-        }
+        let features_header = header(cluster_join::CLUSTER_FEATURES_HEADER);
+        let remote_features = cluster_join::parse_features(features_header.as_deref());
+        cluster_join::check_join(
+            num_partitions.unwrap_or_default(),
+            num_partitions
+                .and(header(cluster_join::CLUSTER_PARTITIONS_HEADER))
+                .as_deref(),
+            features_header.as_deref(),
+            required_features,
+        )
+        .map_err(|e| PeerError::Connect(e.to_string()))?;
         // Disable Nagle on the peer socket: the Falcon protocol carries small,
         // latency-sensitive request/response frames (notably Raft AppendEntries),
         // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
@@ -1329,6 +1347,10 @@ pub struct PeerSet {
     /// replicating over it — without first redialing the app socket — until a
     /// fresh link is dialed or the Raft socket itself drops (#1582).
     retired_raft: Arc<Mutex<HashMap<u32, PeerLink>>>,
+    /// Replicated-command features this node's replicated state depends on
+    /// (#1661): every outbound dial is refused unless the peer advertises all
+    /// of them. Monotonic — see [`require_feature`](Self::require_feature).
+    required_features: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 /// Circuit-breaker state for one down peer.
@@ -1352,7 +1374,42 @@ impl PeerSet {
             breaker: Arc::new(Mutex::new(HashMap::new())),
             connect_locks: Arc::new(Mutex::new(HashMap::new())),
             retired_raft: Arc::new(Mutex::new(HashMap::new())),
+            required_features: Arc::default(),
         }
+    }
+
+    /// Records that this node's replicated state now depends on `feature`
+    /// (#1661). One-way: from now on every outbound dial (both lanes) is
+    /// refused unless the peer advertises it, and any cached link to a peer
+    /// that did not advertise it is dropped so the next use redials (and is
+    /// refused) instead of streaming entries the peer cannot decode.
+    pub async fn require_feature(&self, feature: &'static str) {
+        {
+            let mut required = self
+                .required_features
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if required.contains(&feature) {
+                return;
+            }
+            required.push(feature);
+        }
+        self.links
+            .lock()
+            .await
+            .retain(|_, link| link.supports(feature));
+        self.retired_raft
+            .lock()
+            .await
+            .retain(|_, link| link.supports(feature));
+    }
+
+    /// Whether [`require_feature`](Self::require_feature) recorded `feature`.
+    pub fn requires_feature(&self, feature: &str) -> bool {
+        self.required_features
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&feature)
     }
 
     /// Whether this node has any peers (false for a single-node cluster).
@@ -1516,7 +1573,13 @@ impl PeerSet {
             .ok_or_else(|| PeerError::Connect(format!("no address for node {node_id}")))?;
         // Onset-diagnosis instrument: count every dial to a peer, split by outcome.
         // A survivor's redial rate to a *dead* peer is the "wasted send work" signal.
-        let dial = PeerLink::connect_as(addr, Some(self.topology.num_partitions)).await;
+        let required = self
+            .required_features
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let dial =
+            PeerLink::connect_requiring(addr, Some(self.topology.num_partitions), &required).await;
         crate::metrics::record_peer_connect_attempt(node_id, dial.is_ok());
         match dial {
             Ok(link) => {

@@ -423,6 +423,9 @@ pub struct Journal {
     /// starts with an empty set and must be re-linked to the live host handle,
     /// exactly as `num_partitions` is preserved across a snapshot load.
     cluster_variables: ClusterVariables,
+    /// Pre-cutover legacy lenient-completion host flag (#1661), re-applied to
+    /// every rebuilt engine (it is not in the snapshot body).
+    legacy_lenient_completion: bool,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -1254,6 +1257,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1292,6 +1296,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1324,10 +1329,11 @@ impl Journal {
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
-        // Lenient completion is replicated engine state (#1661): the snapshot
-        // body carries it, so the restored engine holds the value at the
-        // snapshot's log index — never this node's pre-restore value.
+        // The REPLICATED lenient flag (#1661) is in the snapshot body; only the
+        // pre-cutover legacy host flag is config to re-apply.
+        let legacy = self.legacy_lenient_completion;
         self.engine = Engine::from_snapshot(snapshot);
+        self.engine.set_legacy_lenient_completion(legacy);
         // Cluster variables are host-injected external config, absent from the
         // snapshot body: re-link the fresh engine to the live shared handle.
         self.engine
@@ -1372,9 +1378,11 @@ impl Journal {
     /// from its durable replay; any stale cold rows are reaped by the
     /// post-recovery GC).
     pub fn replace_engine(&mut self, engine: Engine) {
-        // Lenient completion is replicated engine state (#1661), rebuilt with
-        // the durable replay — never carried over from the fenced engine.
+        // The REPLICATED lenient flag (#1661) is rebuilt with the durable
+        // replay; only the pre-cutover legacy host flag is re-applied.
         self.engine = engine;
+        self.engine
+            .set_legacy_lenient_completion(self.legacy_lenient_completion);
         self.engine
             .set_cluster_variables(self.cluster_variables.clone());
         if self.varstore.is_some() {
@@ -1461,6 +1469,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         })
     }
 
@@ -1503,6 +1512,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         };
         Ok((journal, recovery))
     }
@@ -1550,6 +1560,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1592,6 +1603,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -3862,6 +3874,15 @@ impl Journal {
     /// key (see [`Engine::set_num_partitions`]). A no-op effect when `1`.
     pub fn set_num_partitions(&mut self, num_partitions: u64) {
         self.engine.set_num_partitions(num_partitions);
+    }
+
+    /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
+    /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
+    /// identically on every node from the activation policy at startup; kept
+    /// across snapshot restores / engine replacement like other host config.
+    pub fn set_legacy_lenient_completion(&mut self, lenient: bool) {
+        self.legacy_lenient_completion = lenient;
+        self.engine.set_legacy_lenient_completion(lenient);
     }
 
     /// Installs the shared [`ClusterVariables`] handle on this journal and its

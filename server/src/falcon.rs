@@ -603,12 +603,18 @@ async fn cluster_ws_handler(
         tracing::warn!("refusing /cluster join: {rejection}");
         return (axum::http::StatusCode::CONFLICT, rejection.to_string()).into_response();
     }
+    let advertise_features = state
+        .server
+        .advertise_cluster_features
+        .load(std::sync::atomic::Ordering::Relaxed);
     let worker = params.worker.unwrap_or_default();
     let mut response = ws.on_upgrade(move |socket| handle_socket(socket, state, worker));
     // Answer with our own partition count + features so the dialer can refuse
     // a mismatch from its side and learn what we can decode.
     let response_headers = response.headers_mut();
-    if let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_features_header()) {
+    if advertise_features
+        && let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_features_header())
+    {
         response_headers.insert(cluster_join::CLUSTER_FEATURES_HEADER, value);
     }
     response_headers.insert(

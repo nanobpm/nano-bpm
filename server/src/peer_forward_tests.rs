@@ -456,3 +456,25 @@ async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
         .await
         .expect("legacy binary joins before the feature is in use");
 }
+
+/// #1661 (outbound direction): once this node's replicated state requires a
+/// feature, it must not DIAL a member that restarted on an older binary — on
+/// either lane — or Raft would stream it entries it cannot decode.
+#[tokio::test]
+async fn outbound_link_to_incompatible_binary_is_refused_once_feature_is_required() {
+    use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+    let old = crate::ServerImpl::default();
+    old.advertise_cluster_features
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let base = serve(old).await;
+    let err = match PeerLink::connect_requiring(&base, Some(1), &[F]).await {
+        Ok(_) => panic!("an outbound link to a featureless binary must be refused"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:?}").contains(F), "got {err:?}");
+    // Before the requirement exists the same peer links (rolling upgrade).
+    let link = PeerLink::connect_requiring(&base, Some(1), &[])
+        .await
+        .expect("no requirement yet");
+    assert!(!link.supports(F));
+}

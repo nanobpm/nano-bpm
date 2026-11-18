@@ -802,8 +802,10 @@ pub enum Command {
     /// Set this partition's lenient-completion mode (#1661, ADR 0066 slice 2):
     /// see [`crate::state::State::lenient_completion`]. Proposed by the host
     /// (the partition leader) through the replicated log, so every replica
-    /// flips the mode at the same log index. Always emits
-    /// [`crate::Event::LenientCompletionSet`]; idempotent.
+    /// flips the mode at the same log index. ONE-WAY: `lenient: true` emits
+    /// [`crate::Event::LenientCompletionSet`] (idempotent); `lenient: false` is
+    /// a no-op — lenience can never be cleared, so no replica can strand a
+    /// leader-local activation its peers never saw.
     SetLenientCompletion { lenient: bool },
 }
 

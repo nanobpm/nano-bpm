@@ -97,6 +97,7 @@ impl Engine {
             now: snapshot.now,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: snapshot.start_dispatch_rr,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,

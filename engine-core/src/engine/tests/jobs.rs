@@ -3865,10 +3865,85 @@ fn lenient_completion_survives_replay_and_snapshot_plus_tail() {
     let after = Engine::from_snapshot(engine.snapshot());
     assert!(after.lenient_completion(), "a snapshot carries the flag");
 
-    // and flipping back is replicated just the same
+    // and it is one-way: a `false` command emits nothing and clears nothing
     let off = engine
         .apply_command(Command::SetLenientCompletion { lenient: false })
         .unwrap();
+    assert!(off.is_empty(), "disabling is a no-op: {off:?}");
+    assert!(engine.lenient_completion());
     journal.extend(off);
-    assert!(!Engine::replay_partition(0, journal).lenient_completion());
+    assert!(Engine::replay_partition(0, journal).lenient_completion());
+}
+
+/// #1661 (one-way lenience): after a leader-local activation — `activated` on
+/// the leader's replica only — a committed `SetLenientCompletion { false }`
+/// must not strand the job: every replica still accepts its completion /
+/// failure / error identically. A clearable flag would let the leader succeed
+/// and the followers fail `JobNotActivated`.
+#[test]
+fn disabling_lenience_cannot_strand_a_soft_activated_job() {
+    for terminal in 0..3 {
+        let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+        for replica in &mut replicas {
+            replica
+                .apply_command(Command::DeployProcess(linear_with_task()))
+                .unwrap();
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+            replica
+                .apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+        }
+        // The leader (replica 0) activates locally; the follower never sees it.
+        let job = replicas[0].pending_jobs()[0].key;
+        replicas[0]
+            .apply_command(Command::activate_jobs("payment", "w", 1, 60_000, 0))
+            .unwrap();
+        let terminal_cmd = match terminal {
+            0 => Command::complete_job(job),
+            1 => Command::fail_job(job, 0, "boom"),
+            _ => Command::throw_job_error(job, "E", "boom"),
+        };
+        let committed = [
+            Command::SetLenientCompletion { lenient: false },
+            terminal_cmd,
+        ];
+        let outcomes: Vec<Vec<bool>> = replicas
+            .iter_mut()
+            .map(|r| {
+                committed
+                    .iter()
+                    .cloned()
+                    .map(|c| r.apply_command(c).is_ok())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(outcomes[0], outcomes[1], "replicas agree (case {terminal})");
+        assert!(
+            outcomes[0][1],
+            "the terminal command applies (case {terminal})"
+        );
+        assert!(replicas.iter().all(Engine::replicated_lenient_completion));
+    }
+}
+
+/// #1661 rolling upgrade: before the replicated flag is committed, the legacy
+/// host flag (set from the activation policy, identically on every node, as
+/// before #1661) still grants lenient completion — without counting as
+/// replicated state.
+#[test]
+fn legacy_lenient_flag_applies_before_cutover_without_replicated_state() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    engine.set_legacy_lenient_completion(true);
+    assert!(engine.lenient_completion());
+    assert!(!engine.replicated_lenient_completion());
+    let job = engine.pending_jobs()[0].key;
+    assert!(engine.apply_command(Command::complete_job(job)).is_ok());
 }

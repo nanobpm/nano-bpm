@@ -185,6 +185,14 @@ pub struct Engine {
     /// restores — a replica seeded from the journal then routes the next
     /// round-robin start exactly like a peer that never restarted.
     start_dispatch_rr: u64,
+    /// LEGACY (pre-cutover) lenient completion (#1661, ADR 0066 "Rolling
+    /// upgrade"): host config set from the activation policy at startup,
+    /// identically on every node — today's (pre-#1661) behaviour, kept only
+    /// until every cluster member advertises the replicated-lenient feature and
+    /// the leader commits `SetLenientCompletion`. From that log index on the
+    /// replicated [`State::lenient_completion`] governs; this flag can then only
+    /// agree with it (lenience is one-way). NOT part of the snapshot.
+    legacy_lenient_completion: bool,
     /// The current command's proposer-stamped terminal deadline (#1494):
     /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
     /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
@@ -679,6 +687,7 @@ impl Engine {
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
@@ -741,10 +750,26 @@ impl Engine {
         }
     }
 
-    /// Whether lenient completion is enabled: replicated engine state set by
-    /// [`Command::SetLenientCompletion`] (see [`State::lenient_completion`]).
+    /// Whether lenient completion is in effect: the replicated
+    /// [`State::lenient_completion`] (set by [`Command::SetLenientCompletion`])
+    /// OR the pre-cutover legacy host flag (see
+    /// [`Self::set_legacy_lenient_completion`]).
     pub fn lenient_completion(&self) -> bool {
+        self.state.lenient_completion || self.legacy_lenient_completion
+    }
+
+    /// Whether the REPLICATED lenient-completion flag has been committed (#1661).
+    /// One-way: once `true` it stays `true` for the partition's life.
+    pub fn replicated_lenient_completion(&self) -> bool {
         self.state.lenient_completion
+    }
+
+    /// Sets the pre-cutover legacy lenient-completion host flag (#1661, ADR 0066
+    /// "Rolling upgrade"): set identically on every node from the activation
+    /// policy at startup, exactly as before #1661, so a mixed-version cluster
+    /// keeps today's behaviour until the replicated flag is committed.
+    pub fn set_legacy_lenient_completion(&mut self, lenient: bool) {
+        self.legacy_lenient_completion = lenient;
     }
 
     /// Installs the shared [`ClusterVariables`](crate::cluster_vars::ClusterVariables)
@@ -862,6 +887,7 @@ impl Engine {
             now: 0,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
@@ -2815,7 +2841,7 @@ impl Engine {
                 // completion (leader-local locks; see `lenient_completion`) the
                 // activation may not have been replicated to this engine, so the
                 // latch is not required.
-                if !self.state.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3671,7 +3697,7 @@ impl Engine {
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // Like completion, failing a job requires that it was activated
                 // (unless lenient completion allows leader-local activation).
-                if !self.state.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3771,7 +3797,7 @@ impl Engine {
                 if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                if !self.state.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -6499,7 +6525,12 @@ impl Engine {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
             }
             Command::SetLenientCompletion { lenient } => {
-                self.emit(&mut log, Event::LenientCompletionSet { lenient });
+                // One-way (#1661): lenience can only be enabled. A `false`
+                // command is a no-op, so no replica can ever clear the flag and
+                // strand a leader-local activation it never saw.
+                if lenient {
+                    self.emit(&mut log, Event::LenientCompletionSet { lenient });
+                }
             }
         }
 
