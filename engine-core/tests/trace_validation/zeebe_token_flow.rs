@@ -25,6 +25,16 @@
 //! loader derives from the BPMN XML. A `SEQUENCE_FLOW_TAKEN` record names only
 //! the flow's `elementId`; the endpoints are the graph identity the spec
 //! reasons about.
+//!
+//! This module is included (via `#[path]`) by several integration-test targets
+//! (`zeebe_traces.rs`, `zeebe_token_flow_trace_validation.rs`). Each target uses
+//! a different subset of its surface: `zeebe_traces.rs` uses only the
+//! record-projection functions and never constructs `ZeebeTokenFlowMapping`,
+//! while `zeebe_token_flow_trace_validation.rs` uses the mapping and not the
+//! projection. Allow `dead_code` so a target exercising only one half does not
+//! trip `dead_code` under `-D warnings` (the same pattern `harness.rs` uses for
+//! this shared-module shape).
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 
@@ -48,14 +58,15 @@ const TASK_ELEMENT_TYPES: &[&str] = &[
     "CALL_ACTIVITY",
 ];
 
-/// The Zeebe `BpmnElementType` names that are gateways. A gateway's
-/// `ELEMENT_ACTIVATED` is the spec's `fired` ghost increment.
-const GATEWAY_ELEMENT_TYPES: &[&str] = &[
-    "EXCLUSIVE_GATEWAY",
-    "PARALLEL_GATEWAY",
-    "INCLUSIVE_GATEWAY",
-    "EVENT_BASED_GATEWAY",
-];
+/// The Zeebe `BpmnElementType` names whose `ELEMENT_ACTIVATED` can be the
+/// spec's `fired` ghost increment — i.e. the gateway kinds `ZeebeTokenFlow.tla`
+/// treats as joins. `IsJoin(n)` is `Kind[n] ∈ {"and","or"} ∧ |In(n)| > 1`, so
+/// only PARALLEL (`and`) and INCLUSIVE (`or`) gateways ever fire a join. An
+/// EXCLUSIVE (`xor`) or EVENT_BASED merge passes each arriving token straight
+/// through without incrementing `fired`, so it is NOT join-eligible even when
+/// it has multiple incoming flows — keeping those types out of this set is what
+/// stops a multi-input exclusive merge from emitting a spurious `JoinFired`.
+const JOIN_GATEWAY_ELEMENT_TYPES: &[&str] = &["PARALLEL_GATEWAY", "INCLUSIVE_GATEWAY"];
 
 /// Project one normalised record onto the ZeebeTokenFlow milestone vocabulary.
 /// Returns `None` for a record that carries no milestone (commands, rejections,
@@ -90,7 +101,7 @@ pub fn record_milestone(
                 Some(Milestone::Task {
                     node: element_id.to_string(),
                 })
-            } else if GATEWAY_ELEMENT_TYPES.contains(&element_type)
+            } else if JOIN_GATEWAY_ELEMENT_TYPES.contains(&element_type)
                 && join_elements.contains(element_id)
             {
                 Some(Milestone::JoinFired {
@@ -306,6 +317,38 @@ mod tests {
             "flowScopeKey": 1
         });
         assert!(record_milestone(&record, &flow_map(), &join_elements()).is_none());
+    }
+
+    #[test]
+    fn exclusive_merge_activation_carries_no_milestone() {
+        // A multi-input EXCLUSIVE merge is never a join: `ZeebeTokenFlow.tla`'s
+        // `IsJoin(n)` is `Kind[n] ∈ {"and","or"} ∧ |In(n)| > 1`, so `xor` is
+        // excluded — each arriving token passes straight through without
+        // incrementing `fired`. Even when the incoming-flow-count rule flags the
+        // element as a "join", its EXCLUSIVE_GATEWAY type must suppress the
+        // spurious `JoinFired` (regression for the exclusive-merge false
+        // positive: the type guard in the caller's `join_elements` keeps `X`
+        // out, so `record_milestone` returns `None`).
+        let record = json!({
+            "valueType": "PROCESS_INSTANCE",
+            "intent": "ELEMENT_ACTIVATED",
+            "elementId": "X",
+            "bpmnElementType": "EXCLUSIVE_GATEWAY",
+            "processInstanceKey": 1,
+            "flowScopeKey": 1
+        });
+        // `X` is NOT in `join_elements()` (the caller's type guard excludes
+        // exclusive gateways), so no JoinFired is emitted.
+        assert!(record_milestone(&record, &flow_map(), &join_elements()).is_none());
+
+        // Defence in depth: even if a buggy caller DID admit an exclusive
+        // gateway into `join_elements`, the projection must still refuse to
+        // fire a join for it — `record_milestone` only fires for the gateway
+        // types the spec treats as joins (`JOIN_GATEWAY_ELEMENT_TYPES`:
+        // parallel/inclusive), and an exclusive gateway is not one.
+        let mut with_xor = join_elements();
+        with_xor.insert("X".to_string());
+        assert!(record_milestone(&record, &flow_map(), &with_xor).is_none());
     }
 
     #[test]

@@ -3842,9 +3842,14 @@ fn zeebe_golden_projects_to_spec_milestones() {
         .map(|((from, to), id)| (id.clone(), (from.clone(), to.clone())))
         .collect();
 
-    // The join elements: gateways with multiple incoming flows. Derived from
-    // the flow map: an element is a join iff it is the target of more than one
-    // distinct sequence flow.
+    // The join elements: parallel/inclusive gateways with multiple incoming
+    // flows. `ZeebeTokenFlow.tla`'s `IsJoin(n)` is `Kind[n] ∈ {"and","or"} ∧
+    // |In(n)| > 1` — an EXCLUSIVE (`xor`) merge is never a join: it passes each
+    // arriving token straight through without incrementing `fired`. So an
+    // element is a join iff (a) it is the target of more than one distinct
+    // sequence flow AND (b) it is a parallel or inclusive gateway. Without the
+    // type guard a multi-input exclusive merge would emit a spurious
+    // `JoinFired` and falsely diverge from the spec.
     let mut incoming_counts: HashMap<String, usize> = HashMap::new();
     for (from, to) in sc.flows.keys() {
         if from != to {
@@ -3855,6 +3860,12 @@ fn zeebe_golden_projects_to_spec_milestones() {
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(id, _)| id)
+        .filter(|id| {
+            matches!(
+                sc.element_types.get(id).map(String::as_str),
+                Some("PARALLEL_GATEWAY") | Some("INCLUSIVE_GATEWAY")
+            )
+        })
         .collect();
 
     // Project the golden's normalised records onto the milestone vocabulary.
@@ -3883,28 +3894,44 @@ fn zeebe_golden_projects_to_spec_milestones() {
     let mut spec_milestones = fixture.milestones.clone();
     spec_milestones.sort();
 
-    // The milestone multisets must be isomorphic: same shape, same counts.
-    // The element ids differ (scenario ids vs corpus graph ids), so we compare
-    // the *kind structure*: counts of each milestone kind, and for flows the
-    // count of distinct (from, to) pairs.
-    fn kind_counts(ms: &[harness::Milestone]) -> (usize, usize, usize, usize) {
-        let mut flows = 0;
-        let mut tasks = 0;
-        let mut joins = 0;
-        let mut completed = 0;
-        for m in ms {
-            match m {
-                harness::Milestone::Flow { .. } => flows += 1,
-                harness::Milestone::Task { .. } => tasks += 1,
-                harness::Milestone::JoinFired { .. } => joins += 1,
-                harness::Milestone::Completed => completed += 1,
-            }
+    // The scenario and the fixture are the SAME parallel-diamond graph under
+    // different element ids (the scenario's BPMN ids vs the corpus's graph
+    // ids). Rename the golden's milestones into the fixture's id space, then
+    // compare the COMPLETE sorted milestone vectors — not just per-kind counts.
+    // Counting kinds alone would not catch an endpoint swap (a `fork → bookB`
+    // flow replaced by a second `fork → bookA`) or a join firing attributed to
+    // the wrong node; a full vector equality does.
+    let id_of = |scenario_id: &str| -> String {
+        match scenario_id {
+            "start" => "S",
+            "fork" => "P1",
+            "bookA" => "A",
+            "bookB" => "B",
+            "join" => "P2",
+            "end" => "E",
+            other => panic!("no fixture id for scenario element {other:?}"),
         }
-        (flows, tasks, joins, completed)
-    }
+        .to_string()
+    };
+    let mut golden_in_fixture_ids: Vec<harness::Milestone> = golden_milestones
+        .iter()
+        .map(|m| match m {
+            harness::Milestone::Flow { from, to } => harness::Milestone::Flow {
+                from: id_of(from),
+                to: id_of(to),
+            },
+            harness::Milestone::Task { node } => harness::Milestone::Task { node: id_of(node) },
+            harness::Milestone::JoinFired { node } => {
+                harness::Milestone::JoinFired { node: id_of(node) }
+            }
+            harness::Milestone::Completed => harness::Milestone::Completed,
+        })
+        .collect();
+    golden_in_fixture_ids.sort();
+
     assert_eq!(
-        kind_counts(&golden_milestones),
-        kind_counts(&spec_milestones),
-        "golden and spec milestone multisets must be isomorphic\n  golden: {golden_milestones:?}\n  spec:   {spec_milestones:?}"
+        golden_in_fixture_ids, spec_milestones,
+        "golden and spec milestone multisets must be identical once renamed into \
+         the fixture's id space\n  golden: {golden_in_fixture_ids:?}\n  spec:   {spec_milestones:?}"
     );
 }
