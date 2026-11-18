@@ -21,6 +21,7 @@ import {
   caseRunnable,
   loadCorpus,
   caseRecord,
+  unexplained,
   MAX_GATEWAYS
 } from './fuzz.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
@@ -109,6 +110,28 @@ test('reductions: every candidate is well-formed and strictly smaller', () => {
       assert.ok(size(r) < size(skel), `seed ${s}`)
     }
   }
+})
+
+test('reductions: gateway removal bridges to every successor, not just the first edge', () => {
+  // S->AND, AND->E listed before AND->OR, OR->E twice (task + direct).
+  const skel = { kinds: ['and', 'or'], edges: [[0, 1, 'direct'], [1, 3, 'direct'], [1, 2, 'direct'], [2, 3, 'task'], [2, 3, 'direct']] }
+  const orOnly = reductions(skel).filter((r) => r.kinds.length === 1 && r.kinds[0] === 'or')
+  assert.ok(orOnly.some((r) => r.edges.some(([i, j]) => i === 0 && j === 1)), 'S->OR bridge candidate is offered')
+})
+
+test('randomSkeleton: never generates a gateway kind outside the requested vocabulary', () => {
+  for (const kinds of [['evt'], ['xor'], ['and', 'evt'], ['or']]) {
+    for (let s = 0; s < 300; s++) {
+      const skel = randomSkeleton(picker(prng(s)), { kinds })
+      for (const k of skel.kinds) assert.ok(kinds.includes(k), `seed ${s} kinds ${kinds}: got ${k}`)
+    }
+  }
+})
+
+test('unexplained: a replay divergence no open case explains is surfaced', () => {
+  const divs = [{ signature: 'a' }, { signature: 'b' }]
+  assert.deepEqual(unexplained(divs, new Set(['a'])).map((d) => d.signature), ['b'])
+  assert.deepEqual(unexplained(divs, new Set(['a', 'b'])), [])
 })
 
 test('shrinkGraph: the result is 1-minimal for the divergence predicate', async () => {

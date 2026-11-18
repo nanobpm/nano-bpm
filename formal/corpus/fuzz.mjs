@@ -109,32 +109,25 @@ export function randomSkeleton (pick, { minGateways = 3, maxGateways = 5, kinds 
     for (const [i, j] of raw) { outD[i]++; inD[j]++ }
     return { inD, outD }
   }
-  const later = (g) => g + 1 + pick(E - g) // a node in (g, E]
   raw.push([0, k === 0 ? E : 1])
   // Spanning: every gateway past the first is reached from an earlier gateway.
   for (let g = 2; g <= k; g++) raw.push([1 + pick(g - 1), g])
-  // A few extra random forward flows between gateways / to E.
-  const extra = pick(k + 1)
-  for (let x = 0; x < extra && k > 0; x++) {
-    const i = 1 + pick(k)
-    raw.push([i, later(i)])
-  }
-  // An event-based gateway is a pure split: one incoming flow only.
-  let { inD } = deg()
-  for (let g = 1; g <= k; g++) {
-    if (ks[g - 1] === 'evt' && inD[g] > 1) {
-      const others = kinds.filter((x) => x !== 'evt')
-      ks[g - 1] = others.length ? others[pick(others.length)] : 'xor'
-    }
-  }
-  // Degree repair: every gateway leads on, and is never a 1-in-1-out no-op. A
-  // repair flow never gives an event-based gateway a second incoming flow.
+  // A flow out of `g` to a later node that never gives an event-based gateway
+  // (a pure split: one incoming flow only) a second incoming flow — so the
+  // requested `kinds` vocabulary is never overridden.
   const open = (g) => {
     const { inD: now } = deg()
     const js = []
     for (let j = g + 1; j <= E; j++) if (j === E || ks[j - 1] !== 'evt' || now[j] === 0) js.push(j)
     return js[pick(js.length)] // never empty: E is always open
   }
+  // A few extra random forward flows between gateways / to E.
+  const extra = pick(k + 1)
+  for (let x = 0; x < extra && k > 0; x++) {
+    const i = 1 + pick(k)
+    raw.push([i, open(i)])
+  }
+  // Degree repair: every gateway leads on, and is never a 1-in-1-out no-op.
   for (let g = 1; g <= k; g++) {
     let d = deg()
     if (d.outD[g] === 0) raw.push([g, open(g)])
@@ -142,8 +135,7 @@ export function randomSkeleton (pick, { minGateways = 3, maxGateways = 5, kinds 
     const needSplit = ks[g - 1] === 'evt' ? d.outD[g] < 2 : d.inD[g] < 2 && d.outD[g] < 2
     if (needSplit) raw.push([g, open(g)])
   }
-  ;({ inD } = deg())
-  if (inD[E] === 0) raw.push([k, E])
+  if (deg().inD[E] === 0) raw.push([k, E])
   const edges = raw.map(([i, j]) => {
     const fromEvt = i > 0 && ks[i - 1] === 'evt'
     return [i, j, fromEvt ? 'msg' : pick(1000) < taskBias * 1000 ? 'task' : 'direct']
@@ -185,10 +177,10 @@ export function reductions (skel) {
     // each (pred -> g) to each (g -> succ) when g was a 1-in pass-through.
     const preds = skel.edges.filter(([, j]) => j === g)
     const succs = skel.edges.filter(([i]) => i === g)
-    const bridged = preds.length === 1 && succs.length >= 1
-      ? [...edges, [re(preds[0][0]), re(succs[0][1]), preds[0][2]]]
-      : null
-    for (const cand of [edges, bridged]) if (cand && wellFormed(kinds, cand)) out.push({ kinds, edges: cand })
+    const bridges = preds.length === 1
+      ? succs.map(([, j]) => [...edges, [re(preds[0][0]), re(j), preds[0][2]]])
+      : []
+    for (const cand of [edges, ...bridges]) if (wellFormed(kinds, cand)) out.push({ kinds, edges: cand })
   }
   for (let e = 0; e < skel.edges.length; e++) {
     const edges = skel.edges.filter((_, i) => i !== e)
@@ -286,6 +278,14 @@ export function judgeCase (c, divergences) {
   return sigs.includes(c.signature) ? null : `stale fuzz case ${c.signature} (${c.graph.id}) no longer reproduces — set "fixed": true (keep it as a regression guard)`
 }
 
+/**
+ * The divergences of a replayed scenario no open corpus case explains: they
+ * are new failures and go through the shrink/record path like fuzz findings.
+ */
+export function unexplained (divergences, openSignatures) {
+  return divergences.filter((d) => !openSignatures.has(d.signature))
+}
+
 /** The phase a committed case needs: a camunda/differential case needs Camunda. */
 export const caseRunnable = (c, phasesRan) => phasesRan.has(c.kind)
 
@@ -319,20 +319,36 @@ async function main () {
   const failures = corpusProblems(cases)
   const backends = await openBackends(args, log)
   const fresh = new Map()
+  const known = new Set(cases.filter((c) => !c.fixed).map((c) => c.signature))
+  // A completed minimum is persisted at once, so a later scenario error or a
+  // failing backend close can never discard it.
+  const found = async (seed, skel, d) => {
+    const min = { seed, ...(await shrink(backends, skel, d)) }
+    fresh.set(d.signature, min)
+    if (args.record) record(min)
+  }
   let ran = 0
   try {
     // 1. Replay the permanent corpus.
     for (const c of cases) {
       if (!c.skeleton || !c.scenario || !caseRunnable(c, backends.phasesRan)) continue
       const entry = entryFor(c.skeleton, () => [], 'replay')
-      const verdict = judgeCase(c, await checkScenario(backends, entry, c.scenario))
+      const divs = await checkScenario(backends, entry, c.scenario)
+      const verdict = judgeCase(c, divs)
       if (verdict) failures.push(verdict)
+      // A fixed case's divergence is already a REGRESSION verdict; an open
+      // case's must still not hide a different, unknown divergence.
+      if (c.fixed) continue
+      for (const d of unexplained(divs, known)) {
+        if (fresh.has(d.signature)) continue
+        log(`new divergence ${d.signature} while replaying ${c.signature} — shrinking`)
+        await found(c.seed, c.skeleton, d)
+      }
     }
     log(`replayed ${cases.length} committed fuzz case(s)`)
     if (args.replayOnly) return finish()
 
     // 2. Fuzz.
-    const known = new Set(cases.filter((c) => !c.fixed).map((c) => c.signature))
     const opts = { minGateways: args.minGateways, maxGateways: args.maxGateways, kinds: args.kinds }
     for (let i = 0; i < args.cases; i++) {
       const s = caseSeed(args.seed, i)
@@ -344,8 +360,7 @@ async function main () {
           if (known.has(d.signature)) { log(`known ${d.signature} (case seed ${s})`); continue }
           if (fresh.has(d.signature)) continue
           log(`divergence ${d.signature} at case ${i} (case seed ${s}, ${entry.graph.id}) — shrinking`)
-          const min = await shrink(backends, entry.skel, d)
-          fresh.set(d.signature, { seed: s, ...min })
+          await found(s, entry.skel, d)
         }
       }
       if ((i + 1) % 50 === 0) log(`  fuzz ${i + 1}/${args.cases}`)
@@ -360,19 +375,20 @@ async function main () {
       failures.push(`FAIL divergence ${sig} (case seed ${seed})\n  minimal graph ${d.entry.graph.id} ${JSON.stringify(skel)}\n  scenario ${JSON.stringify(d.scenario.steps)}\n  ${JSON.stringify(d.detail)}`)
     }
     if (args.record && fresh.size > 0) {
-      const file = JSON.parse(fs.readFileSync(CORPUS_PATH, 'utf8'))
-      for (const { seed, skel, d } of fresh.values()) {
-        const rec = caseRecord(seed, skel, d)
-        if (args.fileIssues) rec.issue = fileIssue(rec)
-        file.cases.push(rec)
-      }
-      fs.writeFileSync(CORPUS_PATH, JSON.stringify(file, null, 2) + '\n')
       console.error(`recorded ${fresh.size} minimal case(s) in formal/corpus/fuzz-corpus.json${args.fileIssues ? ' (issues filed)' : ' — file an issue for each and set "issue"'}`)
     }
     for (const f of failures) console.error(f.startsWith('FAIL') ? f : `FAIL ${f}`)
     log(`${ran} fuzzed scenario(s) in ${Math.round((Date.now() - t0) / 1000)}s: ${fresh.size} new divergence class(es)`)
     if (failures.length > 0) process.exitCode = 1
     else log('ok    no unexplained divergence')
+  }
+
+  function record ({ seed, skel, d }) {
+    const file = JSON.parse(fs.readFileSync(CORPUS_PATH, 'utf8'))
+    const rec = caseRecord(seed, skel, d)
+    if (args.fileIssues) rec.issue = fileIssue(rec)
+    file.cases.push(rec)
+    fs.writeFileSync(CORPUS_PATH, JSON.stringify(file, null, 2) + '\n')
   }
 }
 
