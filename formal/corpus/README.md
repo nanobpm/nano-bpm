@@ -144,7 +144,27 @@ also takes a manual dispatch with overrides). Checks per graph:
 | --- | --- |
 | `tlc` | `RefinesZeebe` violated, or the nano spec's verdict ≠ the Zeebe reference's verdict (`tlc-refines`, `tlc-verdict`); a reference run that gets stuck where TLC reports no stuck state (`reference-vs-tlc`) |
 | `nano` | the engine-wasm TestEngine's outcome (completion, jobs created, variables) ≠ the reference outcome |
+| `spec-oracle` | the nano observation is NOT a behaviour of `ZeebeTokenFlow` (#1261): its token-flow milestone multiset (taken flows, task wait states, completion) ≠ the generating run's. See below |
 | `camunda` | live Camunda 8 ≠ the reference, or ≠ nano on the fields both expose (`differential`) — completing scenarios only (the bare-gateway backend observes an instance through completion) |
+
+### The spec oracle (#1261)
+
+Beyond the *differential* oracle (nano ≡ Camunda on the shared fields) and the
+`expect` block (nano ≡ the reference outcome), the `spec-oracle` phase asserts
+the **spec** half of #1261: the trace nano emits is a **behaviour of
+`ZeebeTokenFlow.tla`**. `spec-oracle.mjs` projects both the generating run and
+the nano observation onto the spec's observable milestone vocabulary
+(`taken` → `from->to` flows, `active` → task wait states, `done` → completion)
+and asserts the multisets are equal. The run a scenario is generated from is by
+construction a spec behaviour (the `Reference` executor's `joinFires` is Zeebe's
+arrival-time join guard), so an observation that differs from it is a trace that
+is not a `ZeebeTokenFlow` behaviour — a parity defect on the token-flow surface.
+The `fired` (join-firing) milestone is anchored separately: the `Reference`
+records it (`joinsFired`) and the Rust trace-validation harness
+(`engine-core/tests/trace_validation/zeebe_token_flow.rs`) ties it to both the
+engine and the captured Zeebe goldens. The Nano-only surface that is *out* of
+this oracle's scope is the extension register (`formal/parity/extensions.json`).
+
 
 Command orders are driven one job at a time: `completeOneJob` completes exactly
 one job of a type, so a run that holds two same-type jobs (a parallel split

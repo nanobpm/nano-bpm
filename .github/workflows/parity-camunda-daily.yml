@@ -23,6 +23,8 @@ on:
       # corpus, the sources the nano read-model wasm is built from (#668: the
       # wasm is built per run, not committed), and the Zeebe pin.
       - 'formal/parity/runtime/**'
+      - 'formal/parity/extensions.json'
+      - 'formal/parity/extensions.mjs'
       - 'engine-core/**'
       - 'engine-wasm/**'
       - 'read-model/**'
@@ -57,6 +59,14 @@ jobs:
         env:
           CAMUNDA_REST_ADDRESS: http://localhost:8080
         run: node formal/parity/runtime/run.mjs --backend both --require-camunda
+      - name: Extension-acceptance probe (#1261)
+        # Every registered Nano-only extension must be REJECTED (or honoured only
+        # as inert metadata) by Camunda. A registered extension Camunda ACCEPTS
+        # as executable surface is not an extension — fail. --require-camunda so
+        # a green run has probed every entry.
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:8080
+        run: node formal/parity/runtime/extension-acceptance.mjs --require-camunda
       - name: Camunda logs
         if: failure()
         run: docker logs parity-camunda 2>&1 | tail -300

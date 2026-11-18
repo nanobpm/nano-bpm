@@ -41,6 +41,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { enumerateGraphs, artifactsFor, exploreOrders, routesFor, GATEWAY_KINDS } from './enumerate.mjs'
+import { checkSpecOracle } from './spec-oracle.mjs'
 import { installSignalCleanup, backendEligible } from '../parity/runtime/run.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -268,7 +269,7 @@ export async function openBackends (args, log) {
   // The phases that ACTUALLY run — a skipped Camunda backend (unset/unreachable
   // address) means no camunda/differential case can reproduce, so the stale
   // check must not ask for one (#1246 review).
-  const phasesRan = new Set(['nano', ...(camunda ? ['camunda', 'differential'] : [])])
+  const phasesRan = new Set(['nano', 'spec-oracle', ...(camunda ? ['camunda', 'differential'] : [])])
   return { nano, camunda, CleanupError, phasesRan, close }
 }
 
@@ -291,6 +292,17 @@ export async function checkScenario (backends, entry, sc) {
     const check = checkExpectations(nanoObs, scenario.expect)
     if (!check.ok) {
       divergences.push({ kind: 'nano', signature: `nano:${fieldsSig(check.mismatches)}:completed=${nanoObs.completed}/${scenario.expect.completed}`, detail: check.mismatches, entry, scenario: sc })
+    }
+    // The SPEC oracle (#1261): nano's observation must be a behaviour of
+    // `ZeebeTokenFlow`. The scenario's `run` (attached by scenariosFor) is
+    // by construction a spec behaviour — the Reference IS an executable
+    // ZeebeTokenFlow — so the observation's milestone multiset must equal
+    // the run's. A mismatch is a parity defect on the token-flow surface.
+    if (sc.run) {
+      const spec = checkSpecOracle(entry.graph, sc.run, nanoObs)
+      if (!spec.ok) {
+        divergences.push({ kind: 'spec-oracle', signature: `spec-oracle:${fieldsSig(spec.mismatches)}`, detail: spec.mismatches, entry, scenario: sc })
+      }
     }
   } catch (err) {
     divergences.push({ kind: 'nano', signature: `nano:error:${errorClass(err)}`, detail: String(err.message ?? err), entry, scenario: sc })
@@ -451,8 +463,11 @@ async function main () {
         fs.mkdirSync(sdir, { recursive: true })
         // Copy the BPMN next to the scenario so `bpmn: process.bpmn` resolves
         // inside the scenario dir, exactly as the runner's loadScenario reads.
+        // Strip the in-memory `run` link (#1261 spec oracle): it is not part of
+        // the serialised scenario contract and holds a Reference class instance.
         fs.writeFileSync(path.join(sdir, 'process.bpmn'), e.artifacts.bpmn)
-        fs.writeFileSync(path.join(sdir, 'scenario.json'), JSON.stringify({ ...sc, bpmn: 'process.bpmn' }, null, 2) + '\n')
+        const { run: _run, ...serialisable } = sc
+        fs.writeFileSync(path.join(sdir, 'scenario.json'), JSON.stringify({ ...serialisable, bpmn: 'process.bpmn' }, null, 2) + '\n')
       }
     }
     log(`wrote ${entries.length} graph(s) to ${args.out}`)
