@@ -26,7 +26,8 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+    clippy::disallowed_methods,
+    reason = "non-production target (integration tests / examples; wall-clock timing is the probe's purpose, not an apply path — #1663); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hasher};
