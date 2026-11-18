@@ -416,6 +416,9 @@ pub struct Journal {
     /// resident set drops back within budget so the next overflow is caught
     /// immediately.
     spill_check_skip: u32,
+    /// Pre-cutover legacy lenient-completion host flag (#1661), re-applied to
+    /// every rebuilt engine (it is not in the snapshot body).
+    legacy_lenient_completion: bool,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -1246,6 +1249,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1283,6 +1287,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1315,10 +1320,11 @@ impl Journal {
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
-        // Config the snapshot body does not carry, re-applied onto the new engine.
-        let lenient = self.engine.lenient_completion();
+        // The REPLICATED lenient flag (#1661) is in the snapshot body; only the
+        // pre-cutover legacy host flag is config to re-apply.
+        let legacy = self.legacy_lenient_completion;
         self.engine = Engine::from_snapshot(snapshot);
-        self.engine.set_lenient_completion(lenient);
+        self.engine.set_legacy_lenient_completion(legacy);
         // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
         // fresh engine and re-seed the dirty set so the next checkpoint rewrites
         // the full resident variable state into the authoritative store
@@ -1353,15 +1359,17 @@ impl Journal {
     ///
     /// Like [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot),
     /// this preserves everything the journal carries that is NOT engine state:
-    /// the writer/exporter/seg wiring, the spill tiers, the var store, and the
-    /// host-injected cluster variables are all re-linked onto the fresh engine.
+    /// the writer/exporter/seg wiring, the spill tiers, and the var store are
+    /// all re-linked onto the fresh engine.
     /// The cold routing index is cleared (the rebuilt engine is fully resident
     /// from its durable replay; any stale cold rows are reaped by the
     /// post-recovery GC).
     pub fn replace_engine(&mut self, engine: Engine) {
-        let lenient = self.engine.lenient_completion();
+        // The REPLICATED lenient flag (#1661) is rebuilt with the durable
+        // replay; only the pre-cutover legacy host flag is re-applied.
         self.engine = engine;
-        self.engine.set_lenient_completion(lenient);
+        self.engine
+            .set_legacy_lenient_completion(self.legacy_lenient_completion);
         if self.varstore.is_some() {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
@@ -1445,6 +1453,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         })
     }
 
@@ -1486,6 +1495,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         };
         Ok((journal, recovery))
     }
@@ -1532,6 +1542,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1573,6 +1584,7 @@ impl Journal {
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
+            legacy_lenient_completion: false,
         }
     }
 
@@ -3845,13 +3857,13 @@ impl Journal {
         self.engine.set_num_partitions(num_partitions);
     }
 
-    /// Enables leftover-tolerant ("lenient") job completion on the underlying
-    /// engine so a replicated `CompleteJob`/`FailJob`/`ThrowJobError` applies even
-    /// when this engine never observed the (leader-local) activation. See
-    /// [`Engine::set_lenient_completion`]. Set identically on every replica from
-    /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
-    pub fn set_lenient_completion(&mut self, lenient: bool) {
-        self.engine.set_lenient_completion(lenient);
+    /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
+    /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
+    /// identically on every node from the activation policy at startup; kept
+    /// across snapshot restores / engine replacement like other host config.
+    pub fn set_legacy_lenient_completion(&mut self, lenient: bool) {
+        self.legacy_lenient_completion = lenient;
+        self.engine.set_legacy_lenient_completion(lenient);
     }
 
     /// The currently-held activation leases `(job_key, deadline)` on the

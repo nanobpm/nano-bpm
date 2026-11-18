@@ -1,0 +1,4 @@
+{
+  "ci": { "gateways": 2, "flows": 5 },
+  "nightly": { "gateways": 2, "flows": 7 }
+}

@@ -607,7 +607,8 @@ impl ServerImpl {
     ///
     /// Rolling-upgrade gate (ADR 0066): the new command variants are Raft
     /// entries an older binary cannot decode, so nothing is emitted unless
-    /// every peer advertises [`falcon::FEATURE_CLUSTER_VARIABLES`]; otherwise
+    /// every peer advertises [`falcon::cluster_join::FEATURE_CLUSTER_VARIABLES`]
+    /// on its `/cluster` join handshake (#1661); otherwise
     /// the write fails closed with 503 and no partition is touched. Writes from
     /// this gateway are serialized so its fan-outs never interleave.
     ///
@@ -652,7 +653,7 @@ impl ServerImpl {
                     format!("cluster variables unavailable: peer {node} unreachable: {m}"),
                 )
             })?;
-            if !link.supports(falcon::FEATURE_CLUSTER_VARIABLES).await {
+            if !link.supports(falcon::cluster_join::FEATURE_CLUSTER_VARIABLES) {
                 return Err((
                     503,
                     format!(
@@ -3646,6 +3647,13 @@ pub struct ServerImpl {
     // (s1-broadcast / s1-bykey-forward); constructed and tested now.
     #[allow(dead_code)]
     peers: peer::PeerSet,
+    /// Whether this node's `/cluster` handshake response advertises its
+    /// replicated-command features (#1661). Always `true` in production; a
+    /// mixed-version test clears it to model a pre-#1661 binary, which sends
+    /// no feature header at all and never proposes `SetLenientCompletion`
+    /// (`reconcile_lenient_completion_via_raft` honours it as the leader's own
+    /// feature support).
+    advertise_cluster_features: Arc<std::sync::atomic::AtomicBool>,
     /// The Raft groups this node hosts (one per partition it replicates), empty
     /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
@@ -3684,9 +3692,12 @@ pub struct ServerImpl {
     /// do NOT propose `ActivateJobs`: the leader
     /// locks jobs in its own engine actor only and lock-expiry stays local, so each
     /// job costs 2 quorum commits and per-worker activation stops fragmenting the
-    /// commit budget. Replicas then run with lenient completion (see
-    /// [`Engine::set_lenient_completion`]) so a replicated completion applies even
-    /// though they never saw the activation.
+    /// commit budget. Replicas then run with lenient completion — replicated
+    /// engine state set by `Command::SetLenientCompletion` at one log index on
+    /// every replica (#1661, see [`Self::reconcile_lenient_completion_via_raft`])
+    /// — so a replicated completion applies even though they never saw the
+    /// activation. Until that flag is committed (the ADR 0066 rolling-upgrade
+    /// window), every node runs the pre-#1661 LEGACY host flag from this policy.
     ///
     /// No effect on a single node / RF=1 (no Raft). DURABILITY TRADE-OFF in the
     /// leader-local variants: the lease is leader-RAM-only and does NOT survive
@@ -3940,13 +3951,34 @@ impl ServerImpl {
         let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
-            // Leader-local activation (any policy that can lock leader-only): replicas
-            // must accept a replicated completion for a job they never saw activated
-            // (the lock is not replicated). Harmless on a single node (no follower
-            // ever applies a completion for an un-activated job in practice, but the
-            // relaxed check is still correct there).
-            if activation_policy.may_be_leader_local() {
-                journal.set_lenient_completion(true);
+            // Leader-local activation (any policy that can lock leader-only) needs
+            // lenient completion: a completion for a job whose (unreplicated) lock
+            // was lost must still apply. It is replicated engine state (#1661), so
+            // it is set by a journaled command — directly here on a single node
+            // (no Raft log can exist), through the Raft log on a cluster
+            // (`reconcile_lenient_completion_via_raft`), never as host config.
+            //
+            // ROLLING UPGRADE (ADR 0066): until the replicated flag is committed,
+            // every node keeps today's behaviour — the LEGACY host flag from the
+            // activation policy, set identically on every node at startup.
+            journal.set_legacy_lenient_completion(activation_policy.may_be_leader_local());
+            // One-way (ADR 0002 notes): once replicated state is lenient it
+            // stays lenient — state wins over config.
+            if journal.engine().replicated_lenient_completion()
+                && !activation_policy.may_be_leader_local()
+            {
+                tracing::warn!(
+                    "partition state has replicated lenient completion enabled, but the \
+                     activation policy {activation_policy:?} does not need it; lenient \
+                     completion is one-way and stays on (replicated state wins over config)"
+                );
+            }
+            if topology.is_single_node() {
+                reconcile_lenient_completion_local(
+                    journal,
+                    activation_policy.may_be_leader_local(),
+                    now_millis(),
+                );
             }
         }
         // The deployment partition (id 0) is the only one that seeds the demo
@@ -4359,6 +4391,7 @@ impl ServerImpl {
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
+            advertise_cluster_features: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             )),
@@ -4725,6 +4758,17 @@ impl ServerImpl {
         Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
     }
 
+    /// [`Self::raft_transport`] for a Raft group about to START replicating
+    /// (#1661): first installs the outbound feature requirement derived from
+    /// this node's recovered / snapshot-restored state, so a restarted leader
+    /// whose enabling `SetLenientCompletion` entry was compacted into a snapshot
+    /// can never stream that snapshot to a legacy peer before the periodic
+    /// requirement sync. Every production Raft start path goes through here.
+    async fn raft_transport_for_start(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
+        let _required = self.required_cluster_features().await;
+        self.raft_transport()
+    }
+
     /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
     /// replica of `partition`, and return its serialized response. `Err((status,
     /// message))` maps to the falcon `CommandResult` status (400 malformed,
@@ -4747,9 +4791,22 @@ impl ServerImpl {
                 format!("no raft group for partition {partition} on this node"),
             )
         })?;
+        // #1661: lenient state can reach this node over the wire, and a later
+        // leadership change could ship it onward (AppendEntries or, once the
+        // enabling entry is compacted, InstallSnapshot) before the periodic
+        // requirement sync. Record the requirement on receipt: inbound entries
+        // by their payload, an inbound snapshot by the state it restored.
+        let inbound_requirements = crate::raft_net::required_features_for(&req);
+        let is_snapshot = matches!(req, crate::raft_net::RaftRpcRequest::InstallSnapshot(_));
+        for feature in inbound_requirements {
+            self.peers.require_feature(feature).await;
+        }
         let resp = crate::raft_net::dispatch(&part.raft, req)
             .await
             .map_err(|e| (500u16, format!("raft dispatch failed: {e}")))?;
+        if is_snapshot {
+            let _required = self.required_cluster_features().await;
+        }
         serde_json::to_value(resp).map_err(|e| (500u16, format!("encode raft response: {e}")))
     }
 }
@@ -18139,7 +18196,7 @@ impl ServerImpl {
         tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
-            let transport = server.raft_transport();
+            let transport = server.raft_transport_for_start().await;
             // ADR 0003 replication tier: in `leader-durable` mode a non-owned
             // replica is a NON-VOTING async learner (the leader's on-disk log is
             // the sole durability point); in `quorum` mode it is a voter whose
@@ -19193,7 +19250,7 @@ impl ServerImpl {
         // own journal remains the local durability source). Initialize with this
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // No local exporter unless this node statically owns `p`; a promoted
         // replica must evict terminal shells itself (see bootstrap_member).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -20488,7 +20545,7 @@ impl ServerImpl {
             );
             return false;
         };
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -20576,7 +20633,7 @@ impl ServerImpl {
             return false;
         }
 
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
         // leak guard); an owned partition keeps shells for its read path.
@@ -20771,6 +20828,104 @@ impl ServerImpl {
         }
     }
 
+    /// The replicated-command features this node's replicated state already
+    /// depends on (#1661): a `/cluster` join from a binary lacking any of them is
+    /// refused, and (via [`peer::PeerSet::require_feature`]) so is every
+    /// OUTBOUND dial to such a binary. Lenient completion becomes a requirement
+    /// as soon as any hosted partition (owned or replica) has applied the
+    /// REPLICATED `LenientCompletionSet` — an older binary could not decode that
+    /// command in the log. One-way, like the flag itself (the legacy host flag
+    /// never counts: it is what a pre-#1661 cluster already runs).
+    ///
+    /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
+    /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
+    /// `try_with` (never the panicking `with`), because it runs on the
+    /// partition-recovery path (`raft_transport_for_start`) BEFORE a failed
+    /// actor is replaced — a panic there would unwind the recovery supervisor,
+    /// a wedged actor would block it. Callers that admit peers must fail closed
+    /// on `None`; best-effort syncs simply retry on the next tick.
+    async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        // A single node never replicates its log to anyone, so its local flag
+        // places no requirement on a peer.
+        if self.engine.topology().is_single_node() {
+            return Some(Vec::new());
+        }
+        if self.peers.requires_feature(F) {
+            return Some(vec![F]);
+        }
+        let mut unknown = false;
+        for p in 0..self.engine.topology().num_partitions {
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if !handle.is_alive() {
+                unknown = true;
+                continue;
+            }
+            match tokio::time::timeout(
+                ENGINE_HEALTH_PROBE_BOUND,
+                handle.try_with(|journal| journal.engine().replicated_lenient_completion()),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    self.peers.require_feature(F).await;
+                    return Some(vec![F]);
+                }
+                Ok(Some(false)) => {}
+                Ok(None) | Err(_) => unknown = true,
+            }
+        }
+        if unknown { None } else { Some(Vec::new()) }
+    }
+
+    /// Leader-side reconciliation of partition `p`'s replicated lenient-completion
+    /// flag with this node's activation policy (#1661). When the policy needs
+    /// lenience and the replicated flag is not yet set, the leader proposes
+    /// `Command::SetLenientCompletion { lenient: true }` through the Raft log, so
+    /// every replica flips the flag at the same log index — never as a per-node
+    /// host config that a racing policy change could apply between a completion's
+    /// commit and its apply. ROLLING UPGRADE (ADR 0066): the command is proposed
+    /// only once every cluster member advertised the feature on its join
+    /// handshake; until then the flag stays put and activation stays replicated
+    /// (`prepare_activation` only grants a leader-local lock under a committed
+    /// lenient flag), which is correct, just slower.
+    ///
+    /// ONE-WAY (ADR 0002 notes): the flag is never proposed back to `false` — a
+    /// replica may hold a leader-local activation its peers never saw, so
+    /// clearing lenience would make them reject its completion. Until the
+    /// cutover, the legacy host flag keeps today's (pre-#1661) behaviour.
+    async fn reconcile_lenient_completion_via_raft(
+        &self,
+        part: &crate::raft::RaftPartition,
+        replicated_lenient: bool,
+        now: u64,
+    ) {
+        if replicated_lenient
+            || !self.activation_policy.may_be_leader_local()
+            || !self
+                .advertise_cluster_features
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || !self
+                .peers
+                .all_peers_support(
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION,
+                )
+                .await
+        {
+            return;
+        }
+        if let Err(e) = part
+            .propose_result(Command::SetLenientCompletion { lenient: true }, now)
+            .await
+        {
+            tracing::warn!(
+                "raft: proposing SetLenientCompletion {{ lenient: true }} failed: {e}; retrying next tick"
+            );
+        }
+    }
+
     /// Returns (building if necessary) the dedicated engine actor for a partition
     /// this node **replicates but does not own**. The Raft state machine drives it
     /// to apply the replicated log on a follower; it is not part of the read-model
@@ -20800,9 +20955,11 @@ impl ServerImpl {
         };
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
-        if self.activation_policy.may_be_leader_local() {
-            journal.set_lenient_completion(true);
-        }
+        // The REPLICATED lenient flag is not configured here (#1661): this
+        // replica learns it from the Raft log / snapshot at exactly the index
+        // the leader committed it. Only the pre-cutover LEGACY host flag (ADR
+        // 0066 rolling upgrade: today's behaviour, identical on every node) is.
+        journal.set_legacy_lenient_completion(self.activation_policy.may_be_leader_local());
         // Wire the same spill tiers the owned engines got, so this follower
         // replica reclaims hot RAM under pressure instead of pinning the whole
         // replicated working set resident. Spill is local memory management (no
@@ -21829,7 +21986,7 @@ impl ServerImpl {
             .await;
         // One read on the leader: variable/cold spill + what (if anything) is due
         // now. Only the leader runs this gate; followers never propose, so safe.
-        let (timers_due, jobs_due) = handle
+        let (timers_due, jobs_due, lenient_now) = handle
             .with(move |journal| {
                 // The tick pre-check gate runs on the single-writer engine actor
                 // every tick per led partition; profiled here to attribute its
@@ -21861,8 +22018,14 @@ impl ServerImpl {
                         .is_some_and(|d| d <= now)
                 });
                 cmd_profile::finish(timer, "tick_precheck");
-                (timers_due, jobs_due)
+                (
+                    timers_due,
+                    jobs_due,
+                    journal.engine().replicated_lenient_completion(),
+                )
             })
+            .await;
+        self.reconcile_lenient_completion_via_raft(&part, lenient_now, now)
             .await;
 
         let mut produced = false;
@@ -27604,6 +27767,29 @@ enum PreparedActivation {
     Soft(Vec<ActivatedJobWithIdentity>),
 }
 
+/// Brings a journal that is its partition's ONLY replica (no Raft log: a single
+/// node, or the non-Raft tick) to the activation policy's lenient-completion
+/// flag by applying the journaled `Command::SetLenientCompletion` (#1661). A
+/// no-op once the replicated flag is set, so it journals at most one event.
+/// ONE-WAY: a policy that does not need lenience never clears it.
+/// Whether the non-Raft tick may journal the irreversible replicated lenient
+/// flag directly (#1661). Only a genuinely single-node deployment: an empty
+/// Raft registry is also what a multi-node node looks like mid-bootstrap, and
+/// a multi-node non-Raft deployment has no peer-compatibility gate on that
+/// path — both keep the per-node legacy host flag instead.
+fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolicy) -> bool {
+    topology.is_single_node() && policy.may_be_leader_local()
+}
+
+fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
+    if !lenient || journal.engine().replicated_lenient_completion() {
+        return;
+    }
+    if let Err(e) = journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
+        tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+    }
+}
+
 fn prepare_activation(
     journal: &mut Journal,
     command: Command,
@@ -27625,7 +27811,13 @@ fn prepare_activation(
     if job_keys.is_empty() {
         return PreparedActivation::Soft(Vec::new());
     }
+    // A leader-local (soft, unreplicated) lock is only safe while every replica
+    // will accept its completion: the partition's REPLICATED lenient flag
+    // (#1661, committed before the lock, one-way), or — before the ADR 0066
+    // cutover — the legacy host flag every node sets identically from the
+    // activation policy. Otherwise the activation must go through the log.
     if force_durable
+        || !journal.engine().lenient_completion()
         || with_lease
         || job_keys
             .iter()
@@ -31972,14 +32164,32 @@ async fn main() {
                         })
                     }))
                     .await;
+                    // Keep the outbound-dial feature requirement in step with
+                    // replicated state on EVERY node (#1661) — leader or
+                    // follower — so no link opens to an older binary once the
+                    // log carries an entry it cannot decode. One-way, so a
+                    // single cheap check per tick after it first fires.
+                    let _required = tick_server.required_cluster_features().await;
                     futures_util::future::join_all(
                         led.iter()
                             .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
                     )
                     .await
                 } else {
+                    // Only a genuinely single-node deployment may journal the
+                    // irreversible flag locally (#1661): an empty Raft registry
+                    // is also what a multi-node node looks like mid-bootstrap,
+                    // and a multi-node non-Raft deployment has no compatibility
+                    // gate here — both keep the legacy host flag instead.
+                    let lenient = local_lenient_reconcile(
+                        tick_server.engine.topology(),
+                        tick_server.activation_policy,
+                    );
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
+                            // Without Raft this journal is the partition's only
+                            // replica: reconcile the lenient flag directly (#1661).
+                            reconcile_lenient_completion_local(journal, lenient, now);
                             let (fired, _commit) = journal.trigger_timers(now);
                             #[allow(
                                 clippy::expect_used,
@@ -33595,6 +33805,70 @@ mod clustered_startup_tests {
             store.try_get_cold(replica_live).unwrap().is_some(),
             "the replica partition's live row survives (the sweep ran after its engine was hosted)"
         );
+    }
+
+    /// #1661: a restarted multi-node leader whose enabling `SetLenientCompletion`
+    /// entry was compacted into its snapshot holds the replicated flag ONLY in
+    /// recovered state. Starting Raft must install the outbound requirement from
+    /// that state before any transfer, so the snapshot can never be streamed to
+    /// a legacy peer ahead of the periodic requirement sync.
+    #[tokio::test]
+    async fn raft_start_installs_feature_requirement_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let mut journal = Journal::in_memory();
+        let _applied = journal
+            .apply_command_at(Command::SetLenientCompletion { lenient: true }, 1)
+            .expect("apply");
+        assert!(journal.engine().replicated_lenient_completion());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(
+            !server.peers.requires_feature(F),
+            "precondition: no tick has synced the requirement yet"
+        );
+        let _transport = server.raft_transport_for_start().await;
+        assert!(
+            server.peers.requires_feature(F),
+            "Raft start must derive the requirement from recovered state"
+        );
+    }
+
+    /// #1661 review finding: the requirement probe runs on the partition-recovery
+    /// path BEFORE a failed actor is replaced, so a DEAD engine actor must yield
+    /// `None` (unknown — join admission fails closed) instead of panicking the
+    /// recovery supervisor via `with()`; and Raft start must not panic either.
+    #[tokio::test]
+    async fn required_features_probe_is_unknown_not_panic_on_a_dead_actor() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![Journal::in_memory()], topology);
+        assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
+        let handle = server.engine_handle_for(0).expect("partition 0 hosted");
+        handle.spawn_job(|_journal| panic!("kill the engine actor"));
+        for _ in 0..200 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!handle.is_alive(), "precondition: actor is dead");
+        assert_eq!(server.required_cluster_features().await, None);
+        let _transport = server.raft_transport_for_start().await;
     }
 
     /// #1479 review finding: when a hosted partition's recovery FAILS at boot
@@ -44514,19 +44788,12 @@ mod clustered_startup_tests {
 
         // Digest mode = leader-local activation PLUS the soft lease broadcast.
         // Configure the policy directly (the env reader can't be used safely under
-        // parallel tests) and relax the completion check on every owned engine
-        // actor, exactly as `ServerImpl::new` would have for a leader-local policy.
-        // The follower replica engines built during `raft_bootstrap` then pick up
-        // lenient completion automatically (they read the now-leader-local policy).
+        // parallel tests). Lenient completion is replicated engine state (#1661):
+        // each partition leader proposes it through the Raft log on its tick.
         if digest {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = ActivationPolicy::Digest;
                 node.lease_digest = true;
-                for handle in node.engine.all() {
-                    handle
-                        .with(|journal| journal.set_lenient_completion(true))
-                        .await;
-                }
             }
         }
 
@@ -44545,12 +44812,6 @@ mod clustered_startup_tests {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = policy;
                 node.lease_digest = policy.broadcasts_lease_digest();
-                let lenient = policy.may_be_leader_local();
-                for handle in node.engine.all() {
-                    handle
-                        .with(move |journal| journal.set_lenient_completion(lenient))
-                        .await;
-                }
             }
         }
 
@@ -44656,6 +44917,22 @@ mod clustered_startup_tests {
             ok,
             "every partition must have its owning node as leader before creates"
         );
+        // A leader-local policy needs the partition's REPLICATED lenient flag
+        // before any leader-local lock is granted (#1661). In production the
+        // first clock tick proposes it; run that tick here so the cluster starts
+        // in the steady state the activation-policy tests exercise.
+        if node0.activation_policy.may_be_leader_local() {
+            for node in nodes {
+                for p in 0..3u64 {
+                    node.tick_partition_via_raft(p, now_millis(), true).await;
+                }
+            }
+            let flags = await_lenient_flags(nodes, true).await;
+            assert!(
+                flags.iter().all(|f| *f),
+                "every replica applied the replicated lenient flag: {flags:?}"
+            );
+        }
         (node0, node1, node2, serve_handles)
     }
 
@@ -44714,6 +44991,242 @@ mod clustered_startup_tests {
             vec![parity_timed_process()],
         )
         .await
+    }
+
+    /// Every hosted engine's (owned + replica) replicated lenient flag, per node.
+    async fn lenient_flags(nodes: [&ServerImpl; 3]) -> Vec<bool> {
+        let mut flags = Vec::new();
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    flags.push(h.with(|j| j.engine().replicated_lenient_completion()).await);
+                }
+            }
+        }
+        flags
+    }
+
+    /// Polls until every hosted replica reports `want` (followers apply the
+    /// committed entry asynchronously). Returns the final flags.
+    async fn await_lenient_flags(nodes: [&ServerImpl; 3], want: bool) -> Vec<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let flags = lenient_flags(nodes).await;
+            if flags.iter().all(|f| *f == want) || std::time::Instant::now() > deadline {
+                return flags;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #1661: lenient completion is replicated engine state, not host config.
+    /// No replica is lenient until the partition leader commits
+    /// `SetLenientCompletion` through the Raft log (so a leader-local lock is
+    /// never granted before every replica will accept its completion), after
+    /// which EVERY replica — leader and followers — holds the flag; a policy
+    /// flip back never clears it (one-way).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_lenient_completion_is_replicated_through_the_log() {
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        let before = lenient_flags([&n0, &n1, &n2]).await;
+        assert_eq!(before.len(), 9, "3 partitions x RF3 replicas");
+        assert!(
+            before.iter().all(|f| !f),
+            "strict under `always`: {before:?}"
+        );
+
+        // Switching to a leader-local policy configures nothing locally: the
+        // flag only arrives through the log, proposed by each partition leader
+        // on its tick, and then holds on EVERY replica.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+        }
+        assert!(lenient_flags([&n0, &n1, &n2]).await.iter().all(|f| !f));
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let after = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            after.iter().all(|f| *f),
+            "every replica applied the flag: {after:?}"
+        );
+
+        // One-way (ADR 0002 notes): flipping the policy back never clears the
+        // flag — a replica may hold a leader-local activation its peers never
+        // saw. Nothing is proposed; every replica stays lenient.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::Always;
+        }
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let kept = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            kept.iter().all(|f| *f),
+            "lenience is one-way on every replica: {kept:?}"
+        );
+    }
+
+    /// #1661 rolling upgrade (ADR 0066): with ONE pre-#1661 member (it
+    /// advertises no features), the leader never emits `SetLenientCompletion`
+    /// — every node runs today's legacy lenient flag from its policy, and
+    /// leader-local completions still apply. Once every member advertises the
+    /// feature, the command is emitted and lenience becomes log-derived on every
+    /// replica; from then on a featureless (old) binary is refused at join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_mixed_version_cutover_gates_replicated_lenience() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        // Re-dial every link so the handshakes observe the current advertisement.
+        async fn redial(nodes: [&ServerImpl; 3]) {
+            for (i, node) in nodes.iter().enumerate() {
+                for peer in 0..3u32 {
+                    if peer as usize != i {
+                        node.peers.fail_node(peer).await;
+                        node.peers.heal_node(peer).await;
+                    }
+                }
+            }
+        }
+
+        // Node 2 is an old binary. Every node starts under a leader-local policy
+        // with the legacy host flag, exactly as `ServerImpl::new` sets it.
+        n2.advertise_cluster_features
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    h.with(|j| j.set_legacy_lenient_completion(true)).await;
+                }
+            }
+        }
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mixed = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            mixed.iter().all(|f| !f),
+            "no SetLenientCompletion while an old member is present: {mixed:?}"
+        );
+        assert!(!n0.peers.requires_feature(F));
+        // Leader-local completions still apply under the legacy flag.
+        for node in [&n0, &n1, &n2] {
+            node.create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("create commits");
+        }
+        let mut completed = 0;
+        for node in [&n0, &n1, &n2] {
+            completed += parity_activate_complete(node, "do-work", 4).await;
+        }
+        assert!(completed >= 1, "completions apply in the mixed cluster");
+
+        // Every member upgraded: the leader emits the command; lenience is now
+        // log-derived on every replica.
+        n2.advertise_cluster_features
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let upgraded = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            upgraded.iter().all(|f| *f),
+            "every replica holds the replicated flag: {upgraded:?}"
+        );
+
+        // A featureless (pre-#1661) binary is now refused at join.
+        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
+        assert!(
+            n0.peers.requires_feature(F),
+            "outbound dials require it too"
+        );
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let url = format!(
+            "{}/cluster",
+            n0.engine.topology().peers[0].replacen("http://", "ws://", 1)
+        );
+        let err =
+            match tokio_tungstenite::connect_async(url.into_client_request().expect("req")).await {
+                Ok(_) => panic!("an old binary must be refused once the feature is in use"),
+                Err(e) => e,
+            };
+        assert!(format!("{err:?}").contains("409"), "got {err:?}");
+    }
+
+    /// #1661: `prepare_activation` grants a leader-local (soft, unjournaled)
+    /// lock only once the partition's REPLICATED state is lenient; before that
+    /// the activation is forced through the log even under a leader-local policy.
+    /// #1661: the non-Raft tick may journal the irreversible replicated flag
+    /// only on a genuinely single-node deployment — never on a multi-node node
+    /// (mid-bootstrap with an empty Raft registry, or explicit non-Raft), where
+    /// it would diverge replicas / bypass the peer-compatibility gate.
+    #[test]
+    fn local_lenient_reconcile_only_on_single_node() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://a".into(), "http://b".into()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        for policy in [
+            ActivationPolicy::LeaderLocal,
+            ActivationPolicy::Digest,
+            ActivationPolicy::Auto,
+            ActivationPolicy::Always,
+        ] {
+            assert!(!local_lenient_reconcile(&multi, policy), "{policy:?}");
+            assert_eq!(
+                local_lenient_reconcile(&cluster::Topology::single(1), policy),
+                policy.may_be_leader_local()
+            );
+        }
+    }
+
+    #[test]
+    fn soft_activation_requires_replicated_lenient_completion() {
+        let mut journal = Journal::in_memory();
+        let process = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "soft")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid");
+        let (_, _commit) = journal
+            .apply_command_at(Command::DeployProcess(process), 1)
+            .expect("deploy");
+        let (_, _commit) = journal
+            .apply_command_at(Command::create_instance("p"), 1)
+            .expect("create");
+        let activate = || Command::activate_jobs("soft", "w", 1, 60_000, 2);
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Durable(_)
+            ),
+            "strict replicated state forces a journaled activation"
+        );
+        reconcile_lenient_completion_local(&mut journal, true, 2);
+        assert!(journal.engine().lenient_completion());
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Soft(ref jobs) if jobs.len() == 1
+            ),
+            "a committed lenient flag permits the leader-local lock"
+        );
     }
 
     /// Spill tally for one [`parity_force_spill`] sweep: the per-command
@@ -58163,6 +58676,11 @@ mod no_direct_engine_apply_guard {
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
         "ServerImpl::apply_partition_command_ref",
+        // #1661: reconciles the lenient-completion flag on a journal that is its
+        // partition's ONLY replica — called solely on a single node (boot) and
+        // from the non-Raft tick branch; the Raft path proposes the same command
+        // through the log (`reconcile_lenient_completion_via_raft`).
+        "reconcile_lenient_completion_local",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -58426,7 +58944,11 @@ mod no_direct_engine_apply_guard {
         // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
-        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
+        const BARE_FREE_FNS: &[&str] = &[
+            "main",
+            "apply_create_instance_direct",
+            "reconcile_lenient_completion_local",
+        ];
         for entry in ALLOWED {
             if BARE_FREE_FNS.contains(entry) {
                 continue;

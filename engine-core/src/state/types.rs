@@ -2614,6 +2614,23 @@ pub struct State {
     /// command, so no stamped proposal can be outstanding against them).
     #[cfg_attr(feature = "serde", serde(default))]
     pub terminal_epoch: u64,
+    /// Lenient completion (#1661, ADR 0066 slice 2): when `true`, a
+    /// `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a job that was
+    /// never activated on this replica (the `activated` latch is not required).
+    /// This supports a clustered mode where the activation lock is
+    /// *leader-local* (not replicated through Raft): a follower never observes
+    /// the `JobActivated` event, so a replicated completion would otherwise fail
+    /// `JobNotActivated` and diverge from the leader. Possession of the job key
+    /// *is* the capability (keys are only handed out by activation), so this
+    /// stays within the at-least-once contract.
+    ///
+    /// Replicated engine state, derived only from
+    /// [`crate::Event::LenientCompletionSet`] (emitted by the replicated
+    /// [`crate::Command::SetLenientCompletion`]), so every replica flips it at
+    /// the same log index — never host config a node changes on its own clock.
+    /// `serde(default)`: older snapshots load strict (`false`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lenient_completion: bool,
 }
 
 /// Bound on [`State::recently_terminated`]. The window it must cover is one

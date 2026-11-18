@@ -7117,6 +7117,8 @@ fn project_event(
         | Event::ProcessStartTimerFired { .. }
         // A Raft applied-entry record (#1405): no read-model state.
         | Event::RaftEntryApplied { .. }
+        // Replicated lenient-completion mode (#1661): engine-internal config.
+        | Event::LenientCompletionSet { .. }
         // Engine-internal routed-delivery dedup / close-tombstone ledger
         // (#1497): no read-model projection.
         | Event::RoutedDeliveryRecorded { .. }
@@ -9520,7 +9522,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         engine
             .apply_command_at(Command::DeployProcess(def), 1_000)
             .unwrap();
@@ -9594,7 +9598,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         let store = ReadStore::open(None).unwrap();
         let run = |engine: &mut Engine, cmd: Command, now: u64| {
             let events = engine.apply_command_at(cmd, now).unwrap();
