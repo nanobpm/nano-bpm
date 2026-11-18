@@ -1,6 +1,6 @@
 # ADR 0066 — Replication model: event replication vs. command replication with enforced determinism
 
-Status: **Proposed.** (A human accepts it; implementation slices follow acceptance.)
+Status: **Accepted** (option C), 2026-11-18. The maintainer accepted it; implementation slices are tracked in milestone M6 "Replicas agree by construction".
 Date: 2026-11-18.
 Relates to:
 ADR 0001 (`0001-cluster-job-activation-fairness.md`),
@@ -262,9 +262,9 @@ instances), so it belongs at snapshot time only.
 | Rolling upgrade | Entry-format version; gated cutover; mixed old/new clusters cannot share a log in both directions. | None. | None for the log format. A determinism-affecting change (e.g. #7's libm swap, a collection-type change) is gated on the previous-release replay CI. The digest entry field is additive, but new command variants (cluster-variable and config commands, #1/#3/#4) are **not** decodable by older replicas: they are emitted only once every voter and learner advertises support (a cluster feature flag), later joins of an incompatible binary are rejected, and once such an entry is persisted the downgrade boundary is that release. |
 | Migration + effort | **Large**: 6 slices (below); about 2–3 engineer-months, with a running-system Raft log format change and a cutover that cannot be cleanly rolled back once events are emitted. | Doc change + #1657. | **Medium**: #1657 + #3/#4 to state (needed anyway), hasher swap (#6, mechanical but touches every state map), libm wrapper (#7), lint, digest field + fail-stop/resync path, determinism CI. About 3–5 engineer-weeks; no log format break; slices are independently revertible until the first new command variant is persisted (after that, downgrade is bounded at that release, see Rolling upgrade). |
 
-## Decision (proposed)
+## Decision
 
-**Adopt option C** — command replication with enforced determinism — because the audit shows the
+**Adopted: option C** — command replication with enforced determinism — because the audit shows the
 apply-input leaks are few and closable, and C closes them with no Raft log format change, at an
 estimated ~3 % apply CPU for the digest chain alone (the ordered-collection and libm costs are not
 yet measured; total CPU impact is pending representative measurements). B is rejected: #1657 is the proof that hoping is not enough. A is **not**
