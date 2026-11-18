@@ -336,6 +336,49 @@ test('a correlation whose catch leads straight to the end event gets NO job barr
   assert.ok(publishes > 0, 'the graph produces publishMessage steps')
 })
 
+test('a correlation creating a job at an ALREADY-WAITING type falls back to settled.ack, not a type barrier (#1246 review)', () => {
+  // S -> AND -> {EVT, XOR}; EVT -> {M1, M2} -> XOR; XOR -> T1 -> E. The create
+  // settle drains the AND's direct token through the XOR to T1, so a T1 job is
+  // ALREADY waiting (jobsCreated[T1] = 1) before any command. Correlating M1
+  // routes the XOR to T1 AGAIN, creating a SECOND job of the SAME type
+  // (jobsCreated[T1] = 2). `barrierJob()` still names T1 (the sole waiting
+  // task), but Camunda's type-only activation can return the OLDER job before
+  // the message correlates — the type barrier does not acknowledge THIS
+  // correlation. The step must therefore NOT carry `settled.jobType`; with the
+  // instance surviving (the second T1 job is still waiting) it must carry
+  // `settled.ack` so the backend acknowledges the correlation before advancing.
+  const g = graphOf(['and', 'evt', 'xor'], [[0, 1, 'direct'], [1, 2, 'direct'], [1, 3, 'direct'], [2, 3, 'msg'], [2, 3, 'msg'], [3, 4, 'task']])
+  const { scenarios } = scenariosFor(g)
+  let acked = 0
+  let barriered = 0
+  for (const s of scenarios) {
+    s.steps.forEach((step, i) => {
+      if (step.op !== 'publishMessage') return
+      const messageFirst = !s.steps.slice(0, i).some((x) => x.op === 'completeOneJob')
+      if (messageFirst) {
+        // Message-first: the create settle already left a T1 job waiting, so the
+        // correlation creates a SECOND job of that already-waiting type. Never a
+        // type barrier (Camunda could return the older job); the instance
+        // survives (the second T1 job is still waiting), so it must be ack'd.
+        assert.equal(step.settled?.jobType, undefined,
+          `message-first correlation creating a second job at an already-waiting type must not barrier on that type (${s.name})`)
+        assert.equal(step.settled?.ack, true,
+          `message-first correlation into a surviving instance must be acknowledged (${s.name})`)
+        acked++
+      } else {
+        // Job-first: the first T1 job was completed before the correlation, so
+        // the correlation creates the ONLY waiting T1 job — a valid type barrier.
+        assert.equal(step.settled?.jobType, 'T1',
+          `job-first correlation creating the only waiting job keeps the type barrier (${s.name})`)
+        assert.equal(step.settled?.ack, undefined, `${s.name}: a type barrier needs no separate ack`)
+        barriered++
+      }
+    })
+  }
+  assert.ok(acked > 0, 'the graph produces a message-first correlation into an already-waiting type that needs an ack')
+  assert.ok(barriered > 0, 'the graph still produces a job-first correlation that validly barriers on the created job')
+})
+
 test('event-based gateway oracle: substituting the other catch FAILS the branch-sensitive expectation', () => {
   // The negative oracle guard (#1246 review): the two catches of an event-based
   // gateway produce identical completion/variables AND identical completed

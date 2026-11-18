@@ -783,7 +783,17 @@ export function scenariosFor (graph) {
         // review). Only a job whose count the correlation INCREASED is created
         // by it; otherwise the correlation produces no job and the driver
         // relies on the awaitCompletion create settling as the barrier.
-        const createdByCorrelation = (b) => b && (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0)
+        //
+        // The count increase is NOT sufficient on its own: when a job of the
+        // SAME type was ALREADY waiting at the time of the correlation
+        // (`seeded.waiting[b] > 0`), Camunda's type-only activation can return
+        // that OLDER job before the message correlates, so the type barrier
+        // still does not acknowledge THIS correlation (#1246 review). Use the
+        // job-type barrier only when NO job of that type was waiting; otherwise
+        // fall through to the `settled.ack` correlation acknowledgement below.
+        const createdByCorrelation = (b) => b &&
+          (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0) &&
+          (seeded.waiting[b] ?? 0) === 0
         const barrier = after.barrierJob()
         if (createdByCorrelation(barrier)) {
           step.settled = { jobType: barrier }

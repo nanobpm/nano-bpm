@@ -153,10 +153,16 @@ not skipped. Message steps use the driver's `publishMessage` op (a buffered
 correlation: Camunda publishes with a TTL, so no race with the subscription the
 previous step opens; nano's RTC makes it immediate). The publication endpoint
 does not wait for correlation, so when resuming the catch activates exactly one
-follow-on task the step carries a `settled.jobType` barrier: Camunda long-polls
-one activation of that type (the job exists only once the message correlated)
-and fails it back for the driver's own completion step, so the driver never
-advances past a still-buffered message.
+follow-on task — and no job of that type was already waiting — the step carries
+a `settled.jobType` barrier: Camunda long-polls one activation of that type (the
+job exists only once the message correlated) and fails it back for the driver's
+own completion step, so the driver never advances past a still-buffered message.
+A type barrier cannot acknowledge a correlation when a job of that type was
+ALREADY waiting (Camunda's type-only activation could return the older job first)
+or when the catch activates no job at all; then, if the instance survives, the
+step carries `settled.ack` instead and the backend acknowledges the correlation
+(a synchronous `/messages/correlation`, retried on a not-yet-open subscription)
+before advancing.
 
 **Any divergence fails the run and is shrunk.** Graphs are enumerated
 smallest-first (flows, then gateways), so the first graph showing a divergence
