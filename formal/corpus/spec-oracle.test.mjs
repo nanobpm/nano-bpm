@@ -1,0 +1,136 @@
+// Tests for the ZeebeTokenFlow spec oracle (#1261, slice 6 of #1240).
+//
+// The oracle asserts a backend's observation is a BEHAVIOUR of
+// `ZeebeTokenFlow.tla` by comparing its milestone multiset against the run the
+// scenario was generated from (a `Reference` run IS a spec behaviour). These
+// tests pin the milestone projection, the endpoint-collapsing grammar, and —
+// Red/Green — that the oracle actually FIRES on a trace that is not a spec
+// behaviour.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { artifactsFor } from "./enumerate.mjs";
+import {
+  referenceMilestones,
+  observationMilestones,
+  checkSpecOracle,
+} from "./spec-oracle.mjs";
+
+const graphsDir = fileURLToPath(new URL("./graphs", import.meta.url));
+const loadGraph = (id) =>
+  JSON.parse(readFileSync(join(graphsDir, `${id}.json`), "utf8"));
+
+test("a parallel diamond's run projects to the ZeebeTokenFlow milestones", () => {
+  const graph = loadGraph("ParallelDiamond");
+  const { scenarios } = artifactsFor(graph);
+  assert.ok(scenarios.length > 0);
+  for (const sc of scenarios) {
+    const ms = referenceMilestones(graph, sc.run);
+    // The split takes S->P1, P1->A, P1->B; the join fires once (P2), consuming
+    // A->P2 and B->P2, then takes P2->E; the instance completes.
+    assert.equal(ms.completed, true);
+    assert.deepEqual(ms.jobsCreated, { A: 1, B: 1 });
+    assert.deepEqual(ms.joinsFired, { P2: 1 });
+    assert.deepEqual(ms.sequenceFlows, {
+      "S->P1": 1,
+      "P1->A": 1,
+      "P1->B": 1,
+      "A->P2": 1,
+      "B->P2": 1,
+      "P2->E": 1,
+    });
+  }
+});
+
+test("the milestone projection collapses a taken flow to its (from,to) endpoints", () => {
+  // Two distinct flows sharing endpoints are ONE `from->to` milestone — nano's
+  // SequenceFlowTaken carries no per-flow identity (the documented #1227 gap).
+  const graph = loadGraph("ParallelDuplicateFlows");
+  const { scenarios } = artifactsFor(graph);
+  for (const sc of scenarios) {
+    const ms = referenceMilestones(graph, sc.run);
+    // Every milestone key is an endpoint pair, never a raw flow id.
+    for (const key of Object.keys(ms.sequenceFlows)) {
+      assert.match(key, /^[^-]+->[^-]+$/, `endpoint-keyed: ${key}`);
+    }
+  }
+});
+
+test("a matching observation IS a behaviour of the spec (oracle passes)", () => {
+  const graph = loadGraph("ParallelDiamond");
+  const { scenarios } = artifactsFor(graph);
+  for (const sc of scenarios) {
+    // The scenario's `expect` block IS the reference observation (the same
+    // projection), so feeding it back must pass the oracle.
+    const obs = {
+      completed: sc.expect.completed,
+      sequenceFlows: sc.expect.sequenceFlows,
+      jobsCreated: sc.expect.jobsCreated,
+    };
+    const res = checkSpecOracle(graph, sc.run, obs);
+    assert.ok(
+      res.ok,
+      `${sc.name} should be a spec behaviour: ${JSON.stringify(res.mismatches)}`,
+    );
+  }
+});
+
+test("Red/Green: the oracle FIRES on a trace that is not a spec behaviour", () => {
+  const graph = loadGraph("ParallelDiamond");
+  const { scenarios } = artifactsFor(graph);
+  const sc = scenarios[0];
+
+  // A join that fired WITHOUT taking both incoming flows is not a ZeebeTokenFlow
+  // behaviour (it violates `ParallelJoinWaitsForEveryFlow`): drop one incoming
+  // flow from the observation and the oracle must report it.
+  const missingFlow = {
+    completed: sc.expect.completed,
+    sequenceFlows: { ...sc.expect.sequenceFlows, "B->P2": 0 },
+    jobsCreated: sc.expect.jobsCreated,
+  };
+  const r1 = checkSpecOracle(graph, sc.run, missingFlow);
+  assert.ok(!r1.ok, "a missing taken flow must fail the spec oracle");
+  assert.ok(
+    r1.mismatches.some((m) => m.field === "sequenceFlows"),
+    "the mismatch must name sequenceFlows",
+  );
+
+  // A task that never reached its wait state is not a spec behaviour.
+  const missingTask = {
+    completed: sc.expect.completed,
+    sequenceFlows: sc.expect.sequenceFlows,
+    jobsCreated: { A: 1 }, // B never activated
+  };
+  const r2 = checkSpecOracle(graph, sc.run, missingTask);
+  assert.ok(!r2.ok, "a missing task wait state must fail the spec oracle");
+
+  // An instance that did NOT complete when the spec says it must is not a spec
+  // behaviour.
+  const notCompleted = {
+    completed: false,
+    sequenceFlows: sc.expect.sequenceFlows,
+    jobsCreated: sc.expect.jobsCreated,
+  };
+  const r3 = checkSpecOracle(graph, sc.run, notCompleted);
+  assert.ok(!r3.ok, "a non-completing trace must fail the spec oracle");
+});
+
+test("observationMilestones projects only the shared token-flow fields", () => {
+  const ms = observationMilestones({
+    completed: true,
+    sequenceFlows: { "A->B": 2 },
+    jobsCreated: { A: 1 },
+    // Fields outside the token-flow vocabulary are dropped:
+    variables: { x: 1 },
+    completedElements: { A: 1 },
+    incidents: { SOME_ERROR: 1 },
+  });
+  assert.deepEqual(ms, {
+    completed: true,
+    sequenceFlows: { "A->B": 2 },
+    jobsCreated: { A: 1 },
+  });
+});

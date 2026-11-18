@@ -79,12 +79,23 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // long-poll into a spurious client abort).
 const REQUEST_TIMEOUT_MARGIN_MS = 15_000;
 
+/** A non-2xx Camunda REST response, carrying its status and parsed body. */
+export class CamundaHttpError extends Error {
+  constructor(message, { status, body }) {
+    super(message);
+    this.name = "CamundaHttpError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 function requireOk(res, body, what) {
   if (!res.ok) {
-    throw new Error(
+    throw new CamundaHttpError(
       `camunda ${what} failed: HTTP ${res.status} ${res.statusText} — ${
         typeof body === "string" ? body : JSON.stringify(body)
       }`,
+      { status: res.status, body },
     );
   }
 }

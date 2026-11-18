@@ -336,6 +336,11 @@ export class Reference {
     // variables match.
     this.completedElements = Object.create(null)
     this.takenFlows = Object.create(null)
+    // The spec's `fired` ghost (#1261): how many times each join gateway has
+    // fired (consumed one token per incoming flow and activated). Recorded here
+    // so the spec oracle can read the ZeebeTokenFlow `JoinFired` milestone
+    // straight off the run instead of re-deriving it.
+    this.joinsFired = Object.create(null)
     this.completed = false
     // Per-gateway count of activations already routed: the next choice of `n`
     // is `route[routeVariable(n)][activations[n]]` (padded with its last entry).
@@ -361,6 +366,7 @@ export class Reference {
     c.jobsCreated = { ...this.jobsCreated }
     c.completedElements = { ...this.completedElements }
     c.takenFlows = { ...this.takenFlows }
+    c.joinsFired = { ...this.joinsFired }
     c.activations = { ...this.activations }
     c.route = Object.fromEntries(Object.entries(this.route).map(([k, v]) => [k, [...v]]))
     c.joinTokens = Object.fromEntries(Object.entries(this.joinTokens).map(([j, a]) => [j, { ...a }]))
@@ -483,6 +489,7 @@ export class Reference {
       } else if (this.isJoin(n)) {
         const arr = this.joinTokens[n]
         if (this.joinFires(n)) {
+          this.joinsFired[n] = (this.joinsFired[n] ?? 0) + 1
           for (const id of Object.keys(arr)) if (arr[id] > 0) arr[id] -= 1
           this.joinOpen[n] = Object.values(arr).some((c) => c > 0)
           // Read THIS firing's choice BEFORE advancing the activation counter:
@@ -627,7 +634,10 @@ const runOf = (state, steps) => ({
   completed: state.completed,
   jobsCreated: { ...state.jobsCreated },
   completedElements: { ...state.completedElements },
-  takenFlows: { ...state.takenFlows }
+  takenFlows: { ...state.takenFlows },
+  // The spec's `fired` ghost (#1261): per-join firing count, so the spec
+  // oracle reads the ZeebeTokenFlow `JoinFired` milestone off the run.
+  joinsFired: { ...state.joinsFired }
 })
 
 /**
@@ -864,6 +874,13 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         // branch — resuming the wrong catch takes the wrong flow and fails here.
         sequenceFlows: sequenceFlowExpect(graph, run.takenFlows)
       },
+      // The run this scenario was generated from, kept so the spec oracle
+      // (#1261) can re-derive the ZeebeTokenFlow milestone multiset the run
+      // exhibits (a Reference run IS a behaviour of the spec by construction)
+      // and assert the backend's observation equals it. Not serialised into the
+      // runtime corpus export (`--out` strips it); it is the in-memory link from
+      // a scenario back to its generating run.
+      run,
       ...(run.completed ? {} : { backends: ['nano'] })
     })
   })
