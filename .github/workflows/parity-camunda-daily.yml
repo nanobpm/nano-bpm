@@ -34,6 +34,8 @@ on:
       # The JaCoCo coverage job (#1247): report, ratchet, matrix it tags against.
       - 'formal/parity/coverage/**'
       - 'formal/parity/coverage.json'
+      # The exhaustive corpus generator + bounds the Zeebe measurement replays.
+      - 'formal/corpus/**'
 
 permissions:
   contents: read

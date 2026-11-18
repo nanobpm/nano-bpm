@@ -94,7 +94,10 @@ impl Run {
     fn apply(&mut self, cmd: Command) {
         let evs = self
             .engine
-            .apply_command(cmd)
+            // Stamp every command with the scenario clock (as the wasm driver's
+            // `apply_command_at(command, self.now)` does) so timers armed after
+            // an `advanceTime` get deadlines relative to the advanced clock.
+            .apply_command_at(cmd, self.now)
             .unwrap_or_else(|e| panic!("command failed: {e}"));
         self.events.extend(evs);
     }
