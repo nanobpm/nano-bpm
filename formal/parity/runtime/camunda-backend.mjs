@@ -413,13 +413,25 @@ export class CamundaBackend {
   // an acknowledgement the driver advances to the next command while the
   // buffered message is still in flight, and Camunda can run that command
   // (e.g. complete the still-waiting T1) BEFORE the message correlates —
-  // inverting the scripted order. Acknowledge the correlation with a
-  // SYNCHRONOUS `/messages/correlation` of the same name/key: it is not
-  // buffered (timeToLive 0) and returns 200 only once a subscription has
-  // correlated, which the buffered publication has by then already done. (On a
-  // runtime too old for `/messages/correlation` this 404s; the runner is
-  // skip-tolerant on reachability, and the ack only runs on a live backend.)
+  // inverting the scripted order. So the message is delivered through the
+  // SYNCHRONOUS `/messages/correlation` INSTEAD of a buffered publication: it
+  // returns only once a subscription correlated, so the delivery is its own
+  // acknowledgement and no second message is ever sent.
   async publishMessage(handle, name, correlationKey, variables, settled) {
+    if (settled?.ack) {
+      // Correlate SYNCHRONOUSLY instead of publishing: `/messages/correlation`
+      // is itself the delivery and returns only once the message correlated,
+      // so it is the acknowledgement. Publishing first and then correlating
+      // would send a SECOND message (404 once the first consumed the
+      // subscription, or a stray buffered message if it wins — #1246 review).
+      await this.#json(
+        "POST",
+        "/messages/correlation",
+        { name, correlationKey, variables: variables ?? {} },
+        "correlate message",
+      );
+      return;
+    }
     await this.#json(
       "POST",
       "/messages/publication",
@@ -443,13 +455,6 @@ export class CamundaBackend {
         // rejects the fail-back — stalling the barrier mid-scenario (#1246).
         { retries: 1, retryBackOff: 0 },
         "fail back barrier job",
-      );
-    } else if (settled?.ack) {
-      await this.#json(
-        "POST",
-        "/messages/correlation",
-        { name, correlationKey, variables: variables ?? {} },
-        "acknowledge message correlation",
       );
     }
   }

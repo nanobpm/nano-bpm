@@ -209,7 +209,7 @@ test('a gateway the FIRST command activates routes via start variables, not a le
   }
 })
 
-test('a two-activation route delivers the FULL suffix from the first pending index, not the about-to-be-consumed one (#1246 review)', () => {
+test('each activation of a twice-activated gateway reads its own choice at the route head (#1246 review)', () => {
   // Gen_de3a1f331f: S -> AND -> {XOR, T1 -> XOR}; XOR -> {E, T2 -> E}. The
   // create settle activates XOR (activation 0) and leaves T1 waiting; completing
   // T1 activates XOR again (activation 1). The scenario that routes activation 0
@@ -225,14 +225,19 @@ test('a two-activation route delivers the FULL suffix from the first pending ind
   // other to f5) carry a two-entry route. The head MUST be activation 0's own
   // choice: the run whose activation 0 takes f6 (T2) starts with [f6]; slicing
   // from the about-to-be-consumed index would drop it and deliver [f5] first.
-  const twoStep = scenarios.filter((s) => s.expect.jobsCreated.T2 === 1
-    && s.steps.length === 2 && s.steps.every((st) => st.op === 'completeOneJob'))
-  assert.equal(twoStep.length, 2, 'the T2-first and E-first runs both exist')
-  const byHead = new Map(twoStep.map((s) => [s.variables[rv][0][0], s]))
-  assert.deepEqual(byHead.get('f6').variables[rv], [['f6'], ['f5']],
-    'activation 0 -> f6 reads the head [f6]; the suffix carries [f5] for activation 1')
-  assert.deepEqual(byHead.get('f5').variables[rv], [['f5'], ['f6']],
-    'activation 0 -> f5 reads the head [f5]; the suffix carries [f6] for activation 1')
+  // Each XOR activation must read ITS OWN choice at the head: activation 0
+  // reads the start variables, activation 1 (drained by T1's completion) reads
+  // the suffix T1's completion carries. A stale create-time index would leave
+  // the head unchanged so both activations take the same flow.
+  const oneT2 = scenarios.filter((s) => s.expect.jobsCreated.T2 === 1)
+  assert.equal(oneT2.length, 3, 'f6-then-f5 (two orders) and f5-then-f6 runs')
+  for (const s of oneT2) {
+    const first = s.variables[rv][0][0]
+    const t1 = s.steps.find((st) => st.op === 'completeOneJob' && st.jobType === 'T1')
+    const second = first === 'f6' ? 'f5' : 'f6'
+    assert.deepEqual(t1.variables?.[rv], [[second]], `${s.name}: T1's completion moves the head to activation 1's choice`)
+    assert.ok(!s.steps.some((st) => st.op === 'setVariables'), `${s.name}: no stale re-delivery`)
+  }
 })
 
 test('a message-first scenario delivers a pre-first-job route suffix through the first job completion, not a setVariables step (#1246 review)', () => {

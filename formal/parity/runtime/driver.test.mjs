@@ -853,3 +853,30 @@ test("--require-camunda fails (never skips) when no Camunda runtime is reachable
   const tolerant = run(["--backend", "camunda"]);
   assert.equal(tolerant.status, 0, "without the flag the skip stays tolerant");
 });
+
+test("CamundaBackend settled.ack delivers the message ONCE, via synchronous correlation only (#1246 review)", async () => {
+  // Publishing and then correlating would send a SECOND message: it 404s once
+  // the first consumed the subscription, or leaves a stray buffered message.
+  // The ack must be the delivery itself.
+  const calls = [];
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"processInstanceKey":"1"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
+    assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 1, "exactly one correlation");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

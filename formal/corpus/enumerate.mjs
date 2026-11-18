@@ -677,12 +677,12 @@ export function scenariosFor (graph) {
       else if (steps.some((s) => s.op === 'completeOneJob')) steps.push({ op: 'setVariables', variables: { [k]: remaining } })
       else (pendingCompletionVars ??= {})[k] = remaining
     }
-    // The lowest activation index each gateway had a pending decision at: the
-    // suffix the BPMN holds starts there, so a later delivery for the same
-    // gateway must start at min(this, the about-to-be-consumed index) — never
-    // drop the entries between them (#1246 review).
-    const pendingFrom = Object.create(null)
+    // Within ONE pending-decision pass, the lowest activation index each
+    // gateway paused at: the delivered suffix starts there. It is local to the
+    // pass — a persistent index would go stale once the BPMN consumed that
+    // activation and pin the head to an old choice (#1246 review).
     const emitPendingDecisions = () => {
+      const pendingFrom = Object.create(null)
       let pending = state.pendingChoices()
       const decided = []
       while (pending.length > 0) {
@@ -722,6 +722,7 @@ export function scenariosFor (graph) {
       const seeded = state.clone()
       seeded.route = Object.fromEntries(Object.entries(run.route).map(([k, v]) => [k, v.map((c) => [...c])]))
       const after = seeded.apply(c)
+      const cmdVars = {}
       for (const n of Object.keys(graph.nodes)) {
         if (!state.isRouted(n)) continue
         const k = routeVariable(n)
@@ -741,13 +742,21 @@ export function scenariosFor (graph) {
           // the BPMN takes f5 and creates T2 twice — a false divergence,
           // #1246 review). Take the lowest index any pending decision for this
           // gateway already delivered from, when it is lower.
-          const from = Math.min(pendingFrom[n] ?? seeded.activations[n], seeded.activations[n])
-          // No command is queued yet when the FIRST command itself activates
-          // this gateway: its route suffix must ride the start variables, not a
-          // leading `setVariables` step — Camunda's `setVariables` needs the
-          // instance key, which only a job activation exposes, so a pre-first-
-          // command update step is rejected before any job runs (#1246 review).
-          deliver(k, seq.slice(from), steps.length === 0)
+          // The instance already ran its create settle, so the suffix can never
+          // go back into the start variables (that would overwrite the head the
+          // create-time activation already consumed). It rides THIS command's own
+          // variables — a job completion's or a message's are merged into the
+          // instance before the token drains to the gateway — so it needs no
+          // instance key and is in place exactly when the activation reads it.
+          const remaining = seq.slice(seeded.activations[n])
+          if (JSON.stringify(held[k]) !== JSON.stringify(remaining)) {
+            // Before the first command, a gateway the create settle never
+            // reached has no held suffix: the start variables can still carry
+            // it untouched (nothing has read them yet for this gateway).
+            if (steps.length === 0 && held[k] === undefined) Object.assign(variables, { [k]: remaining })
+            else cmdVars[k] = remaining
+            held[k] = remaining
+          }
         }
       }
       if (c.op === 'complete') {
@@ -759,9 +768,11 @@ export function scenariosFor (graph) {
           step.variables = pendingCompletionVars
           pendingCompletionVars = null
         }
+        if (Object.keys(cmdVars).length > 0) step.variables = { ...step.variables, ...cmdVars }
         steps.push(step)
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
+        if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
         // The barrier must be a job THIS correlation creates, not a task that
         // was already waiting: `barrierJob()` returns the sole waiting task,
         // but when the catch leads straight to the end event the correlation
