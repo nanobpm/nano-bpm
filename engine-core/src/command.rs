@@ -1396,6 +1396,33 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // Cluster-variable writes carry an arbitrary value and metadata map
+            // (#1657 review): count them so the Raft batcher's byte budget sees
+            // the real proposal size instead of the fixed base.
+            Command::CreateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+                ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+            } => {
+                tenant_id.as_ref().map_or(0, |t| t.len() as u64)
+                    + name.len() as u64
+                    + value.approx_bytes()
+                    + metadata
+                        .iter()
+                        .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+                        .sum::<u64>()
+            }
+            Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => tenant_id.as_ref().map_or(0, |t| t.len() as u64) + name.len() as u64,
             // The stamp's strings are leader-resolved metadata of unbounded
             // length (#1574 review): count them so the batcher's byte budget
             // sees the real proposal size.
@@ -1949,6 +1976,45 @@ mod kind_tests {
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
         );
+    }
+
+    // #1657 review: cluster-variable create/update (incl. distributed fan-out
+    // copies) and delete must count their payload, not the fixed base.
+    #[test]
+    fn approx_bytes_counts_cluster_variable_payloads() {
+        use std::collections::BTreeMap;
+        let big = "x".repeat(50_000);
+        let mut meta = BTreeMap::new();
+        meta.insert("m".to_string(), Value::Str("y".repeat(10_000)));
+        let tenant = Some("t".repeat(1_000));
+        let name = "n".repeat(1_000);
+        for distributed in [false, true] {
+            let c = Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: Value::Str(big.clone()),
+                kind: crate::cluster_vars::ClusterVariableKind::default(),
+                metadata: meta.clone(),
+                distributed,
+            };
+            assert!(
+                c.approx_bytes() >= 62_000,
+                "create distributed={distributed}"
+            );
+        }
+        let u = Command::UpdateClusterVariable {
+            tenant_id: tenant.clone(),
+            name: name.clone(),
+            value: Value::Str(big),
+            metadata: meta,
+        };
+        assert!(u.approx_bytes() >= 62_000);
+        let d = Command::DeleteClusterVariable {
+            tenant_id: tenant,
+            name,
+            distributed: false,
+        };
+        assert!(d.approx_bytes() >= 2_000);
     }
 
     // #1574 review: a stamped orphan quarantine carries leader-resolved strings;

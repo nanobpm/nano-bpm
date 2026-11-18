@@ -1519,28 +1519,59 @@ fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
 /// Tolerates a bare `<event-json>` line (no tab): it falls back to the event's
 /// key partition, so a directory written by the pre-tag multi-partition format
 /// still recovers with the same demux behaviour it had then.
+#[cfg(test)]
 fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
     read_segment_events_tagged_with(path, num_partitions, TailPolicy::DropTorn)
 }
 
-/// [`read_segment_events_tagged`] under an explicit [`TailPolicy`].
+/// `read_segment_events_tagged` under an explicit [`TailPolicy`].
+#[cfg(test)]
 fn read_segment_events_tagged_with(
     path: &Path,
     num_partitions: usize,
     tail: TailPolicy,
 ) -> io::Result<Vec<(u64, Event)>> {
+    read_segment_events_flagged_with(path, num_partitions, tail)
+        .map(|v| v.into_iter().map(|(t, e, _)| (t, e)).collect())
+}
+
+/// A `(write-tag, event, untagged)` record: `untagged` is `true` for a bare
+/// legacy line whose tag is only the key-partition fallback.
+type FlaggedEvent = (u64, Event, bool);
+
+/// `read_segment_events_tagged_with`, additionally reporting per record
+/// whether the line was UNTAGGED (a bare legacy line whose tag is only the
+/// key-partition fallback). Recovery needs this to broadcast untagged
+/// partition-agnostic records — see [`untagged_broadcast`].
+fn read_segment_events_flagged_with(
+    path: &Path,
+    num_partitions: usize,
+    tail: TailPolicy,
+) -> io::Result<Vec<FlaggedEvent>> {
     read_segment_with(path, tail, |line| {
         let (tag, json) = match line.split_once('\t') {
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
         let event = decode_journal_event(json)?;
+        let untagged = tag.is_none();
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
-        Ok((tag, event))
+        Ok((tag, event, untagged))
     })
     .map(|(events, _)| events)
+}
+
+/// `true` when an untagged (legacy, non-segmented) record must be replayed
+/// into EVERY partition, not just its key-partition fallback tag. The legacy
+/// single-file journal records no producing partition, and cluster-variable
+/// lifecycle events are keyless and replicated cluster-wide by the fan-out —
+/// so routing them by the fallback tag (partition 0) would lose every other
+/// partition's variables after an unsegmented → segmented restart (#1657, PR
+/// #1670 review). Mirrors the legacy demux in the server.
+fn untagged_broadcast(event: &Event, untagged: bool) -> bool {
+    untagged && event.is_cluster_variable_lifecycle()
 }
 
 /// Loads the latest persisted snapshot in `dir`.
@@ -2175,10 +2206,18 @@ fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
 }
 
 /// Decodes ONE cold-archive file into `(write-tag, event)` pairs (multi-partition
-/// — the cold analog of [`read_segment_events_tagged`]). A bare (untagged) line
+/// — the cold analog of `read_segment_events_tagged`). A bare (untagged) line
 /// falls back to the event's key partition, exactly as the hot tagged reader.
 /// Decode failures are FATAL (never a torn tail).
+#[cfg(test)]
 fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
+    parse_cold_file_flagged(path, num_partitions)
+        .map(|v| v.into_iter().map(|(t, e, _)| (t, e)).collect())
+}
+
+/// `parse_cold_file_tagged`, additionally reporting whether each line was
+/// untagged (see [`read_segment_events_flagged_with`]).
+fn parse_cold_file_flagged(path: &Path, num_partitions: usize) -> io::Result<Vec<FlaggedEvent>> {
     let plaintext = inflate_all(&fs::read(path)?)?;
     let mut events = Vec::new();
     for line in plaintext.split(|&b| b == b'\n') {
@@ -2211,10 +2250,11 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
         };
         let event = decode_journal_event(json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let untagged = tag.is_none();
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
-        events.push((tag, event));
+        events.push((tag, event, untagged));
     }
     Ok(events)
 }
@@ -2262,14 +2302,14 @@ fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
 fn read_cold_prefix_tagged(
     dir: &Path,
     num_partitions: usize,
-) -> io::Result<(Vec<(u64, Event)>, u64)> {
+) -> io::Result<(Vec<FlaggedEvent>, u64)> {
     let mut events = Vec::new();
     let mut expected = 0u64;
     for (start, end, path) in list_cold(dir)? {
         if start != expected {
             break;
         }
-        let decoded = parse_cold_file_tagged(&path, num_partitions)?;
+        let decoded = parse_cold_file_flagged(&path, num_partitions)?;
         if decoded.len() as u64 != end.saturating_sub(start) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2404,7 +2444,7 @@ fn full_cold_prefix_tagged(
     first_index: u64,
     total_events: u64,
     hot_len: usize,
-) -> io::Result<Option<Vec<(u64, Event)>>> {
+) -> io::Result<Option<Vec<FlaggedEvent>>> {
     let (cold, cold_end) = read_cold_prefix_tagged(dir, num_partitions)?;
     let hot_covers_tail = hot_len as u64 == total_events.saturating_sub(first_index);
     if cold_end != first_index || !hot_covers_tail {
@@ -2416,6 +2456,18 @@ fn full_cold_prefix_tagged(
         return Ok(None);
     }
     Ok(Some(cold))
+}
+
+/// Splits flagged `(tag, event, untagged)` records into the `(tag, event)`
+/// history and its parallel [`untagged_broadcast`] mask.
+fn split_flagged(flagged: Vec<FlaggedEvent>) -> (Vec<(u64, Event)>, Vec<bool>) {
+    let mut tagged = Vec::with_capacity(flagged.len());
+    let mut bcast = Vec::with_capacity(flagged.len());
+    for (tag, event, untagged) in flagged {
+        bcast.push(untagged_broadcast(&event, untagged));
+        tagged.push((tag, event));
+    }
+    (tagged, bcast)
 }
 
 // ----------------------------------------------------------------------------
@@ -2795,12 +2847,16 @@ pub fn recover_multi_scoped(
     let mut sealed: Vec<SealedSeg> = Vec::with_capacity(sealed_files.len());
     // Surviving events with their write-partition tag, in global log order.
     let mut tagged: Vec<(u64, Event)> = Vec::new();
+    // Parallel to `tagged`: whether each record is an untagged legacy record
+    // that must be replayed into EVERY partition ([`untagged_broadcast`]).
+    let mut tagged_bcast: Vec<bool> = Vec::new();
     let mut cursor = first_index_opt.unwrap_or(0);
     let mut pp_running = pp_base.clone();
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events_tagged_with(path, num_partitions, TailPolicy::Strict)?;
+        let seg_events =
+            read_segment_events_flagged_with(path, num_partitions, TailPolicy::Strict)?;
         let end = start + seg_events.len() as u64;
-        for (tag, _) in &seg_events {
+        for (tag, _, _) in &seg_events {
             let p = (*tag as usize).min(num_partitions.saturating_sub(1));
             if p < pp_running.len() {
                 pp_running[p] += 1;
@@ -2812,7 +2868,10 @@ pub fn recover_multi_scoped(
             path: path.clone(),
             per_partition_end: pp_running.clone(),
         });
-        tagged.extend(seg_events);
+        for (tag, event, untagged) in seg_events {
+            tagged_bcast.push(untagged_broadcast(&event, untagged));
+            tagged.push((tag, event));
+        }
         cursor = end;
     }
 
@@ -2831,18 +2890,22 @@ pub fn recover_multi_scoped(
         pp_running.clone()
     };
 
-    let active_events = read_segment_events_tagged(&active_path, num_partitions)?;
+    let active_events =
+        read_segment_events_flagged_with(&active_path, num_partitions, TailPolicy::DropTorn)?;
     let total_events = active_start + active_events.len() as u64;
     let first_index = first_index_opt.unwrap_or(active_start);
     // Per-partition totals = active start + active-segment per-partition counts.
     let mut per_partition_total = per_partition_active_start.clone();
-    for (tag, _) in &active_events {
+    for (tag, _, _) in &active_events {
         let p = (*tag as usize).min(num_partitions.saturating_sub(1));
         if p < per_partition_total.len() {
             per_partition_total[p] += 1;
         }
     }
-    tagged.extend(active_events);
+    for (tag, event, untagged) in active_events {
+        tagged_bcast.push(untagged_broadcast(&event, untagged));
+        tagged.push((tag, event));
+    }
 
     // `events` (untagged, global order) drives the caller's read-model catch-up.
     let events: Vec<Event> = tagged.iter().map(|(_, e)| e.clone()).collect();
@@ -2876,6 +2939,7 @@ pub fn recover_multi_scoped(
     // The full tagged history for a migration replay (cold-archived prefix +
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
+    let mut cold_bcast: Vec<bool> = Vec::new();
     sweep_unique_tmp(dir);
     let loaded = load_multi_snapshot_based(dir);
     for &p in owned {
@@ -2911,7 +2975,7 @@ pub fn recover_multi_scoped(
                 tagged.len(),
             )? {
                 Some(cold) => {
-                    cold_tagged = cold;
+                    (cold_tagged, cold_bcast) = split_flagged(cold);
                     tracing::warn!(
                         "no multi snapshot but the journal starts at {first_index}; \
                          reconstructing by replaying the cold archive + surviving tail and \
@@ -2947,7 +3011,7 @@ pub fn recover_multi_scoped(
                 tagged.len(),
             )? {
                 Some(cold) => {
-                    cold_tagged = cold;
+                    (cold_tagged, cold_bcast) = split_flagged(cold);
                     tracing::warn!(
                         "multi snapshot unreadable ({e}); migrating by replaying the journal \
                          (cold archive + surviving tail) and rewriting a fresh v{} snapshot",
@@ -3080,14 +3144,24 @@ pub fn recover_multi_scoped(
                 .filter(|(tag, _)| *tag == p)
                 .map(|(_, e)| e.clone())
                 .collect();
+            // A from-scratch replay of `p` also takes every untagged legacy
+            // cluster-variable record in global order ([`untagged_broadcast`]),
+            // whatever its fallback tag. A snapshot-restored partition does not:
+            // its snapshot was taken by a segmented boot that already replayed
+            // them (legacy lines all precede the first segmented write).
+            let replay_stream = |tags: &mut dyn Iterator<Item = (&(u64, Event), &bool)>| {
+                tags.filter(|((tag, _), bcast)| *tag == p || **bcast)
+                    .map(|((_, e), _)| e.clone())
+                    .collect::<Vec<Event>>()
+            };
             let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
             let mut engine = if migrate {
-                let p_full: Vec<Event> = cold_tagged
-                    .iter()
-                    .chain(tagged.iter())
-                    .filter(|(tag, _)| *tag == p)
-                    .map(|(_, e)| e.clone())
-                    .collect();
+                let p_full = replay_stream(
+                    &mut cold_tagged
+                        .iter()
+                        .zip(cold_bcast.iter())
+                        .chain(tagged.iter().zip(tagged_bcast.iter())),
+                );
                 Engine::replay_partition(p, p_full)
             } else {
                 match combined.as_ref().and_then(|m| m.get(&p)) {
@@ -3106,7 +3180,10 @@ pub fn recover_multi_scoped(
                         }
                         engine
                     }
-                    None => Engine::replay_partition(p, p_events),
+                    None => Engine::replay_partition(
+                        p,
+                        replay_stream(&mut tagged.iter().zip(tagged_bcast.iter())),
+                    ),
                 }
             };
             // Install partition-agnostic replicated deployments produced under
@@ -6917,6 +6994,60 @@ mod tests {
     /// The tagged multi-partition reader applies the same discipline: an unknown
     /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
     /// dropped record.
+    // PR #1670 review: a multi-partition node that wrote cluster variables with
+    // `NANOBPMN_JOURNAL_SEGMENTED=0` (bare, untagged lines) and then restarts
+    // segmented must rebuild the variables on EVERY partition, not only on the
+    // key-partition fallback (0). A TAGGED cluster-variable line stays routed
+    // by its tag (each partition journals its own fan-out copy).
+    #[test]
+    fn segmented_recovery_broadcasts_untagged_cluster_variables() {
+        let dir = temp_dir("untagged-cluster-vars");
+        fs::create_dir_all(&dir).unwrap();
+        let created = |name: &str| {
+            serde_json::to_string(&Event::ClusterVariableCreated {
+                tenant_id: None,
+                name: name.to_string(),
+                value: nanobpmn_engine_core::Value::Int(1),
+                kind: Default::default(),
+                metadata: Default::default(),
+            })
+            .unwrap()
+        };
+        let deleted = serde_json::to_string(&Event::ClusterVariableDeleted {
+            tenant_id: None,
+            name: "gone".to_string(),
+        })
+        .unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!(
+                "{}\n{}\n{deleted}\n0\t{}\n",
+                created("legacy"),
+                created("gone"),
+                created("tagged0")
+            ),
+        )
+        .unwrap();
+        let recovery = recover_multi(&dir, &[0, 1, 2], 3, None).expect("recover");
+        for (p, engine) in &recovery.engines {
+            let vars = engine.cluster_variables();
+            assert!(
+                vars.get(None, "legacy").is_some(),
+                "partition {p} lost the legacy variable"
+            );
+            assert!(
+                vars.get(None, "gone").is_none(),
+                "partition {p} missed the legacy delete"
+            );
+            assert_eq!(
+                vars.get(None, "tagged0").is_some(),
+                *p == 0,
+                "a tagged record stays on its write partition (p={p})"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn read_segment_events_tagged_rejects_unknown_variant() {
         let dir = temp_dir("unknown-variant-tagged");

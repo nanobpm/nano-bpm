@@ -2182,6 +2182,21 @@ impl Event {
         }
     }
 
+    /// `true` for the cluster-variable lifecycle events (#1657): keyless and
+    /// partition-agnostic, replicated to EVERY partition by the fan-out. Any
+    /// recovery path reading an untagged (legacy) journal must broadcast them
+    /// to every partition rather than route them by [`Event::owning_partition`]
+    /// (which assigns the keyless record to partition 0). The single canonical
+    /// predicate shared by the legacy demux and segmented recovery.
+    pub fn is_cluster_variable_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::ClusterVariableCreated { .. }
+                | Event::ClusterVariableUpdated { .. }
+                | Event::ClusterVariableDeleted { .. }
+        )
+    }
+
     /// The decision evaluation an [`Event::DecisionEvaluated`] records — Zeebe's
     /// `decisionEvaluationKey`, which every decision-instance row of the
     /// evaluation shares — or `None` for any other event.

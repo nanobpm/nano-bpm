@@ -367,3 +367,183 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
     drop(link);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0066 rolling-upgrade gate for cluster variables (#1657, PR #1670 review).
+//
+// The new cluster-variable command variants are Raft entries an older binary
+// cannot decode, so the gateway must emit nothing unless EVERY peer advertises
+// `FEATURE_CLUSTER_VARIABLES`. These drive a real multi-node layout: a gateway
+// (node 0, owning partition 0) plus served peers owning the other partitions.
+// ---------------------------------------------------------------------------
+
+/// Serves a real cluster node `node_id` of `topology` and returns its base URL
+/// plus a handle on its server (for asserting its partition state).
+async fn serve_cluster_node(
+    mut topology: crate::cluster::Topology,
+    node_id: u32,
+) -> (String, crate::ServerImpl) {
+    topology.node_id = node_id;
+    let journals: Vec<crate::Journal> = topology
+        .local_partitions()
+        .iter()
+        .map(|p| crate::Journal::in_memory_partition(*p))
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server.clone(), registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://127.0.0.1:{port}"), server)
+}
+
+/// Serves a peer that predates capability advertisement: its `/cluster`
+/// channel answers with a legacy `Welcome` carrying NO `features` field.
+async fn serve_legacy_welcome_peer() -> String {
+    use axum::extract::ws::{Message, WebSocketUpgrade};
+    let app = axum::Router::new().route(
+        "/cluster",
+        axum::routing::get(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                let welcome = r#"{"type":"welcome","submissionCredits":1,"heartbeatMs":30000}"#;
+                if socket.send(Message::Text(welcome.into())).await.is_err() {
+                    return;
+                }
+                // Hold the socket open (a live-but-old peer), draining input.
+                while let Some(Ok(_)) = socket.recv().await {}
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// An unreachable base URL (a bound-then-dropped ephemeral port).
+async fn unreachable_peer() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn cluster_topology(peers: Vec<String>) -> crate::cluster::Topology {
+    let n = peers.len() as u64;
+    crate::cluster::Topology {
+        node_id: 0,
+        peers,
+        num_partitions: n,
+        replication_factor: 1,
+    }
+}
+
+fn create_var(name: &str) -> nanobpmn_engine_core::Command {
+    nanobpmn_engine_core::Command::CreateClusterVariable {
+        tenant_id: None,
+        name: name.to_string(),
+        value: nanobpmn_engine_core::Value::Int(7),
+        kind: Default::default(),
+        metadata: Default::default(),
+        distributed: false,
+    }
+}
+
+/// Asserts a write was rejected 503 BEFORE any partition was touched: the
+/// gateway's partition 0 holds nothing, and so does every capable peer.
+async fn assert_rejected_untouched(
+    gateway: &crate::ServerImpl,
+    capable_peers: &[crate::ServerImpl],
+    name: &str,
+) {
+    let Err(err) = gateway.cluster_variable_mutate(create_var(name)).await else {
+        panic!("the write must fail closed");
+    };
+    assert_eq!(
+        err.0, 503,
+        "rolling-upgrade gate must answer 503: {}",
+        err.1
+    );
+    assert!(
+        gateway.cluster_variable_get(None, name).await.is_none(),
+        "partition 0 must be untouched by a rejected write"
+    );
+    for peer in capable_peers {
+        assert!(
+            peer.cluster_variable_get(None, name).await.is_none(),
+            "a capable peer's partition must be untouched by a rejected write"
+        );
+    }
+}
+
+/// All peers capable: the write commits on partition 0 AND its fan-out copy
+/// reaches the remotely-led partition 1 through the peer link.
+#[tokio::test]
+async fn cluster_variable_write_reaches_remote_partition_when_all_peers_capable() {
+    let (peer_base, peer) = serve_cluster_node(
+        cluster_topology(vec!["http://n0".into(), "http://n1".into()]),
+        1,
+    )
+    .await;
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), peer_base]),
+    );
+    let rec = gateway
+        .cluster_variable_mutate(create_var("ok"))
+        .await
+        .expect("an all-capable cluster accepts the write");
+    assert!(rec.is_some());
+    assert!(gateway.cluster_variable_get(None, "ok").await.is_some());
+    assert!(
+        peer.cluster_variable_get(None, "ok").await.is_some(),
+        "the fan-out copy must reach the remotely-led partition 1"
+    );
+}
+
+/// A peer whose `Welcome` predates the `features` field advertises nothing:
+/// the write is rejected and no partition (local or capable peer) is touched.
+#[tokio::test]
+async fn cluster_variable_write_rejected_for_legacy_welcome_peer() {
+    let topo = cluster_topology(vec![
+        "http://n0".into(),
+        "http://n1".into(),
+        "http://n2".into(),
+    ]);
+    let (capable_base, capable) = serve_cluster_node(topo, 1).await;
+    let legacy_base = serve_legacy_welcome_peer().await;
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), capable_base, legacy_base]),
+    );
+    assert_rejected_untouched(&gateway, &[capable], "legacy").await;
+}
+
+/// An unreachable peer cannot confirm support: fail closed, nothing touched.
+#[tokio::test]
+async fn cluster_variable_write_rejected_for_unreachable_peer() {
+    let topo = cluster_topology(vec![
+        "http://n0".into(),
+        "http://n1".into(),
+        "http://n2".into(),
+    ]);
+    let (capable_base, capable) = serve_cluster_node(topo, 1).await;
+    let gone = unreachable_peer().await;
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), capable_base, gone]),
+    );
+    assert_rejected_untouched(&gateway, &[capable], "unreachable").await;
+}

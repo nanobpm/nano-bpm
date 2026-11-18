@@ -4777,21 +4777,6 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
     }
 }
 
-/// `true` for the cluster-variable lifecycle events (#1657): keyless and
-/// partition-agnostic, replicated to EVERY partition by the fan-out, so a
-/// legacy (untagged) journal's recovery demux must broadcast them to every
-/// (owned) partition rather than route them by [`Event::owning_partition`]
-/// (which would assign the keyless record to partition 0 and lose every other
-/// partition's variables on restart).
-fn cluster_variable_broadcast(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::ClusterVariableCreated { .. }
-            | Event::ClusterVariableUpdated { .. }
-            | Event::ClusterVariableDeleted { .. }
-    )
-}
-
 /// Demultiplexes a legacy (non-segmented, untagged) shared journal into the
 /// events each of `owned` partitions replays on recovery — the single canonical
 /// demux for every legacy multi-partition boot path (single-node, where `owned`
@@ -4806,7 +4791,7 @@ fn cluster_variable_broadcast(event: &Event) -> bool {
 ///   cluster-wide from a single durable copy (see
 ///   `Journal::install_deployment_durable`). Start subscriptions / timers keep
 ///   their partition-0 keys and demux normally.
-/// * A **cluster-variable lifecycle** event ([`cluster_variable_broadcast`]) is
+/// * A **cluster-variable lifecycle** event ([`Event::is_cluster_variable_lifecycle`]) is
 ///   likewise broadcast to every owned partition: the fan-out replicates it
 ///   cluster-wide, and the legacy format records no producing partition, so a
 ///   key-based route would rebuild the variables only on partition 0 and lose
@@ -4832,7 +4817,7 @@ fn demux_legacy_shared_log(
                 | Event::DecisionDeployed { .. }
                 | Event::FormDeployed { .. }
                 | Event::GenericResourceDeployed { .. }
-        ) || cluster_variable_broadcast(&event)
+        ) || event.is_cluster_variable_lifecycle()
         {
             for bucket in per_partition.values_mut() {
                 bucket.push(event.clone());
