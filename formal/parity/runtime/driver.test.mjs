@@ -368,6 +368,19 @@ test("CamundaBackend.observe defaults an absent processCompleted flag to complet
   assert.deepEqual(done.variables, { a: 3 });
 });
 
+test("CamundaBackend.observe strips route_* schedule variables like NanoBackend (#1246)", async () => {
+  // The driver's routing schedule (`route_*`) is fed INTO both backends, not a
+  // process outcome. NanoBackend.observe drops it; Camunda must too, or the
+  // differential reports a false `variables` mismatch on every routed scenario.
+  const backend = new CamundaBackend({ address: "http://localhost:8080/v2" });
+  const obs = await backend.observe({
+    pending: Promise.resolve({
+      variables: { route_G1: [["f2"]], corr: "k", out: 1 },
+    }),
+  });
+  assert.deepEqual(obs.variables, { corr: "k", out: 1 }, "route_* dropped, process variables kept");
+});
+
 test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset error", async () => {
   // A swallowed /clock/reset could leave the global clock pinned while the
   // runner reports success, so cleanup must fail loudly, not be caught (#1260).
@@ -712,11 +725,20 @@ test("publishMessage with a settled barrier long-polls the follow-on job and fai
 test("setVariables targets the instance's root scope and is loud without a known key", async () => {
   const seen = [];
   const server = createServer((req, res) => {
-    const m = req.url.match(/\/process-instances\/(\d+)\/variables$/);
-    if (m) {
-      seen.push(m[1]);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end("{}");
+    // Camunda v2 updates a scope's variables via
+    // `PUT /element-instances/{elementInstanceKey}/variables` — the mock requires
+    // BOTH the documented method and path so a wrong route fails loudly (#1246).
+    const m = req.url.match(/\/element-instances\/(\d+)\/variables$/);
+    if (m && req.method === "PUT") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        // The request body is a SetVariableRequest: `{ variables: {...} }`
+        // (additionalProperties:false), NOT a flat variables object (#1246).
+        seen.push({ key: m[1], body: JSON.parse(body || "{}") });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      });
       return;
     }
     res.writeHead(204);
@@ -729,7 +751,7 @@ test("setVariables targets the instance's root scope and is loud without a known
     const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
     const handle = { instanceKeys: new Set(["8080"]) };
     await backend.setVariables(handle, { route_G1: [["f2"]] });
-    assert.deepEqual(seen, ["8080"]);
+    assert.deepEqual(seen, [{ key: "8080", body: { variables: { route_G1: [["f2"]] } } }]);
     await assert.rejects(
       () => backend.setVariables({ instanceKeys: new Set() }, { a: 1 }),
       /before the instance key is known/,

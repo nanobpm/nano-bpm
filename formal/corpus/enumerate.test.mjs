@@ -192,6 +192,22 @@ test('scenarios: one per (route, command order) run, from the one graph source',
   assert.ok(stuck.scenarios.every((sc) => sc.expect.completed === false && sc.backends?.join() === 'nano'))
 })
 
+test('a gateway the FIRST command activates routes via start variables, not a leading setVariables step (#1246 review)', () => {
+  // S -> T1 -> XOR -> {E, E}: the only command (completeOneJob T1) activates the
+  // gateway, so the route must be decided before that command runs. Emitting it
+  // as a leading `setVariables` step is rejected by Camunda — `setVariables`
+  // needs the instance key, which only a job activation exposes. The route must
+  // ride the START variables instead.
+  const g = graphOf(['xor'], [[0, 1, 'task'], [1, 2, 'direct'], [1, 2, 'direct']])
+  const { scenarios } = scenariosFor(g)
+  assert.ok(scenarios.length >= 2, 'one scenario per XOR branch')
+  for (const s of scenarios) {
+    assert.notEqual(s.steps[0]?.op, 'setVariables', 'no leading setVariables step')
+    assert.ok(s.variables[routeVariable('G1')], 'the route rides the start variables')
+    assert.deepEqual(s.steps, [{ op: 'completeOneJob', jobType: 'T1' }])
+  }
+})
+
 test('event-based gateway oracle: substituting the other catch FAILS the branch-sensitive expectation', () => {
   // The negative oracle guard (#1246 review): the two catches of an event-based
   // gateway produce identical completion/variables AND identical completed
@@ -318,6 +334,34 @@ test('a committed case is validated against its OWN reproducer, not just its sig
     () => true
   )
   assert.deepEqual(ok.obsolete, [])
+})
+
+test('a committed case is NOT obsolete when shrink discards its reproducer but the full divergences still have it (#1246 review)', () => {
+  // shrink() keeps ONE minimal case per signature. A committed case whose own
+  // graph/scenario still fails — but is NOT the shrunk minimal case (a smaller
+  // graph now wins the same signature) — must NOT be reported `obsolete`: the
+  // committed reproduction still reproduces, shrink merely discarded it. So
+  // classification validates against the FULL divergences, not the shrunk list.
+  const committed = [
+    { signature: 'nano:variables:completed=true/false', issue: '#9', graph: { key: 'big' }, scenario: { name: 'big-o0' } }
+  ]
+  // The full run produced BOTH the committed reproducer (big) and a smaller
+  // graph (small) tripping the same signature; shrink keeps only `small`.
+  const sc = { steps: [{}] }
+  const full = [
+    { signature: 'nano:variables:completed=true/false', entry: { graph: { key: 'big' } }, scenario: { name: 'big-o0', ...sc } },
+    { signature: 'nano:variables:completed=true/false', entry: { graph: { key: 'small' } }, scenario: { name: 'small-o0', ...sc } }
+  ]
+  const order = new Map([['small', 0], ['big', 1]])
+  const shrunk = shrink(full, order)
+  assert.deepEqual(shrunk.map((d) => d.entry.graph.key), ['small'], 'shrink keeps only the minimal case')
+  const r = classify(shrunk, committed, () => true, full)
+  assert.deepEqual(r.obsolete, [], 'the committed case still reproduces in the full divergences — not obsolete')
+  assert.deepEqual(r.known.map((d) => d.entry.graph.key), ['small'], 'the shrunk minimal case is the reported known case')
+  // Without the full set (the old behaviour), the discarded reproducer reads as
+  // "did not reproduce" and the committed case is misreported obsolete.
+  const lossy = classify(shrunk, committed, () => true)
+  assert.deepEqual(lossy.obsolete.map((c) => c.signature), ['nano:variables:completed=true/false'], 'defaulting the full set to the shrunk list reproduces the bug')
 })
 
 test('the committed divergence corpus is well-formed: every case is filed and re-materialisable', () => {

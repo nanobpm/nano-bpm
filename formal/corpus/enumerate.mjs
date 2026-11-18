@@ -706,7 +706,12 @@ export function scenariosFor (graph) {
         const seq = run.route[k]
         if (!seq) continue
         if (after.activations[n] > seeded.activations[n]) {
-          deliver(k, seq.slice(seeded.activations[n]), false)
+          // No command is queued yet when the FIRST command itself activates
+          // this gateway: its route suffix must ride the start variables, not a
+          // leading `setVariables` step — Camunda's `setVariables` needs the
+          // instance key, which only a job activation exposes, so a pre-first-
+          // command update step is rejected before any job runs (#1246 review).
+          deliver(k, seq.slice(seeded.activations[n]), steps.length === 0)
         }
       }
       if (c.op === 'complete') {

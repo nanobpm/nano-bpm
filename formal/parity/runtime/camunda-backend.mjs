@@ -335,8 +335,9 @@ export class CamundaBackend {
 
   // Set (override) process-instance variables mid-run (#1246): a per-activation
   // route schedule is delivered as the gateway's `route_<id>` list before the
-  // activation that reads it. The v2 API sets variables on the instance's root
-  // scope (`/process-instances/{key}/variables`).
+  // activation that reads it. The v2 API updates a scope's variables via
+  // `PUT /element-instances/{elementInstanceKey}/variables`, which accepts the
+  // PROCESS-instance key for the root scope (spec/element-instances.yaml:127).
   async setVariables(handle, variables) {
     const key = [...handle.instanceKeys][0];
     if (key == null) {
@@ -347,8 +348,8 @@ export class CamundaBackend {
       );
     }
     await this.#json(
-      "POST",
-      `/process-instances/${key}/variables`,
+      "PUT",
+      `/element-instances/${key}/variables`,
       { variables: variables ?? {} },
       "set variables",
     );
@@ -460,6 +461,14 @@ export class CamundaBackend {
     // forward-compat with a server that does report the flag (#1260 review).
     obs.completed = result?.processCompleted !== false;
     obs.variables = result?.variables ?? {};
+    // The bounded-exhaustive scenarios drive routing through `route_*` start /
+    // set variables — the driver's own schedule, not a process outcome. Drop
+    // them from the observation so the oracle compares the variables the
+    // PROCESS produced. NanoBackend.observe does the same; without symmetry the
+    // differential reports a false mismatch on every routed scenario (#1246).
+    for (const k of Object.keys(obs.variables)) {
+      if (k.startsWith("route_")) delete obs.variables[k];
+    }
     return obs;
   }
 

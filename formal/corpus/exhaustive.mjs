@@ -361,14 +361,19 @@ export function loadDivergences (file = DIVERGENCES_PATH) {
  * class — the committed reproduction no longer reproduces, and the run must
  * say so (`obsolete`) rather than ratchet on a dead case (#1246 review).
  */
-export function classify (shrunk, committed, inScope) {
+export function classify (shrunk, committed, inScope, divergences = shrunk) {
   const bySig = new Map(committed.map((c) => [c.signature, c]))
-  const seen = new Set(shrunk.map((d) => d.signature))
+  // `seen`/`reproduced` validate a committed case against the FULL divergence
+  // set, not the shrunk minimal cases: `shrink` keeps ONE case per signature, so
+  // a committed reproducer discarded by shrinking (a smaller graph or shorter
+  // scenario now wins the same signature) would otherwise read as "did not
+  // reproduce" and be misreported `obsolete` even though it still fails (#1246).
+  const seen = new Set(divergences.map((d) => d.signature))
   // The exact reproducer key: graph + scenario (a TLC divergence has no
   // scenario). Two cases share a signature only when the same defect shows on
   // both; a committed case is validated against ITS OWN reproducer.
   const reproKey = (graphKey, scenarioName) => `${graphKey}${scenarioName ?? ''}`
-  const seenRepro = new Set(shrunk.map((d) => reproKey(d.entry.graph.key, d.scenario?.name)))
+  const seenRepro = new Set(divergences.map((d) => reproKey(d.entry.graph.key, d.scenario?.name)))
   const reproduced = (c) => seenRepro.has(reproKey(c.graph.key, c.scenario?.name))
   return {
     known: shrunk.filter((d) => bySig.has(d.signature)),
@@ -441,7 +446,7 @@ async function main () {
   const committed = loadDivergences()
   // A committed case is in this run's scope when its graph is enumerated here
   // and its kind belongs to a phase that ACTUALLY ran.
-  const result = classify(shrunk, committed, (c) => order.has(c.graph.key) && phasesRan.has(c.kind))
+  const result = classify(shrunk, committed, (c) => order.has(c.graph.key) && phasesRan.has(c.kind), divergences)
 
   for (const d of result.known) {
     const c = committed.find((x) => x.signature === d.signature)
