@@ -181,6 +181,23 @@ test("Red/Green: an extension also named in the divergence allowlist fails (reco
   );
 });
 
+test("Red/Green: modelUsesExtension decodes XML references in namespace declarations", () => {
+  // Decimal, hexadecimal and predefined-entity references all resolve to the
+  // registered namespace per XML attribute-value normalisation.
+  const ns = NANO_NS;
+  const last = ns.charCodeAt(ns.length - 1);
+  const dec = ns.slice(0, -1) + `&#${last};`;
+  const hex = ns.slice(0, -1) + `&#x${last.toString(16).toUpperCase()};`;
+  for (const v of [dec, hex]) {
+    assert.ok(modelUsesExtension(`<d xmlns:nano="${v}"><nano:cost/></d>`, costEntry), v);
+    assert.ok(modelUsesExtension(`<d><cost xmlns='${v}'/></d>`, costEntry), v);
+  }
+  const amp = ns.replace("http", "&#104;ttp");
+  assert.ok(modelUsesExtension(`<d xmlns:nano="${amp}"><nano:cost/></d>`, costEntry));
+  // A reference decoding to a DIFFERENT namespace is still not the extension.
+  assert.ok(!modelUsesExtension(`<d xmlns:nano="${ns}&amp;x"><nano:cost/></d>`, costEntry));
+});
+
 test("Red/Green: modelUsesExtension resolves default namespaces, shadowing and spaced `=`", () => {
   // Default-namespace form of the registered extension IS the extension.
   const dflt = `<bpmn:definitions xmlns:bpmn="b"><bpmn:extensionElements><cost xmlns="${NANO_NS}" value="1"/></bpmn:extensionElements></bpmn:definitions>`;

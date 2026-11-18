@@ -111,6 +111,24 @@ export function modelUsesExtension(xml, entry) {
   return false;
 }
 
+const XML_PREDEFINED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+/**
+ * Decode an XML attribute value as a conforming parser would: character
+ * references (`&#48;`, `&#x30;`), the predefined entities, and whitespace
+ * normalisation (tab/CR/LF -> space). Without this, an equivalent spelling of a
+ * registered namespace (`…/1.&#48;`) would bypass the extension guard.
+ */
+export function decodeXmlAttr(raw) {
+  return String(raw)
+    .replace(/[\t\r\n]/g, " ")
+    .replace(/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g, (whole, d, h, n) => {
+      if (n) return XML_PREDEFINED[n];
+      const cp = d !== undefined ? Number.parseInt(d, 10) : Number.parseInt(h, 16);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : whole;
+    });
+}
+
 /**
  * A minimal namespace-resolving XML element scanner (no dependency). Yields
  * `{ local, ns }` for every start/empty element, resolving its prefix (or the
@@ -133,7 +151,7 @@ export function* scanElements(xml) {
     let a;
     attrRe.lastIndex = 0;
     while ((a = attrRe.exec(m[3] ?? "")) !== null) {
-      const value = a[2] ?? a[3] ?? "";
+      const value = decodeXmlAttr(a[2] ?? a[3] ?? "");
       if (a[1] === "xmlns") scope.set("", value);
       else if (a[1].startsWith("xmlns:")) scope.set(a[1].slice(6), value);
     }
