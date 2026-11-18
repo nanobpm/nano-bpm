@@ -174,52 +174,19 @@ impl TraceMapping for ZeebeTokenFlowMapping {
     fn build_process(&self, fixture: &Fixture) -> ProcessDefinition {
         // The ZeebeTokenFlow graph vocabulary is the same as TokenFlow's
         // (`start`/`end`/`task`/`and`/`or`/`xor`), so the process construction
-        // is identical. The difference is the *oracle*: ZeebeTokenFlow is the
-        // reference semantics, not nano's.
-        let g = &fixture.graph;
-        let mut b = nanobpmn_engine_core::ProcessBuilder::new(fixture.model.clone());
-        for (id, kind) in &g.nodes {
-            b = match kind.as_str() {
-                "start" => b.start_event(id.clone()),
-                "end" => b.end_event(id.clone()),
-                "task" => b.service_task(id.clone(), id.clone()),
-                "and" => b.parallel_gateway(id.clone()),
-                "or" => b.inclusive_gateway(id.clone()),
-                "xor" => b.exclusive_gateway(id.clone()),
-                other => panic!("unmapped ZeebeTokenFlow node kind {other:?}"),
-            };
-        }
-        for (_id, from, to) in &g.flows {
-            b = b.connect(from.clone(), to.clone());
-        }
-        b.build()
-            .expect("ZeebeTokenFlow graph builds a valid process")
+        // is the canonical shared one (`harness::build_spec_process`). The
+        // difference is the *oracle*: ZeebeTokenFlow is the reference
+        // semantics, not nano's.
+        super::harness::build_spec_process(fixture)
     }
 
     fn engine_milestones(&self, events: &[Event]) -> Vec<Milestone> {
-        // The engine-side projection is the same as TokenFlow's: the engine's
-        // `Event` stream carries the same observable facts (SequenceFlowTaken,
-        // JobCreated, ParallelJoinFired, ProcessInstanceCompleted). The
-        // ZeebeTokenFlow spec is the *reference* for these facts, not a
-        // different vocabulary.
-        let mut out = Vec::new();
-        for e in events {
-            match e {
-                Event::SequenceFlowTaken { from, to, .. } => out.push(Milestone::Flow {
-                    from: from.to_string(),
-                    to: to.to_string(),
-                }),
-                Event::JobCreated { element_id, .. } => out.push(Milestone::Task {
-                    node: element_id.to_string(),
-                }),
-                Event::ParallelJoinFired { element_id, .. } => out.push(Milestone::JoinFired {
-                    node: element_id.to_string(),
-                }),
-                Event::ProcessInstanceCompleted { .. } => out.push(Milestone::Completed),
-                _ => {}
-            }
-        }
-        out
+        // The engine-side projection is the canonical shared one
+        // (`harness::spec_engine_milestones`): the engine's `Event` stream
+        // carries the same observable facts (SequenceFlowTaken, JobCreated,
+        // ParallelJoinFired, ProcessInstanceCompleted). The ZeebeTokenFlow spec
+        // is the *reference* for these facts, not a different vocabulary.
+        super::harness::spec_engine_milestones(events)
     }
 }
 
