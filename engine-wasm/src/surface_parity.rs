@@ -231,6 +231,12 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         | Command::QuarantineColdOrphan { .. } => Surface::NotSurfaced {
             reason: "host-internal durability command raised by the storage layer, not a public worker/JS API",
         },
+        // Proposed by a clustered host's partition leader (#1661) to flip the
+        // replicated lenient-completion mode; a single in-browser engine has
+        // no leader-local activation to tolerate.
+        Command::SetLenientCompletion { .. } => Surface::NotSurfaced {
+            reason: "host-internal cluster replication command proposed by the partition leader, not a public worker/JS API",
+        },
     }
 }
 

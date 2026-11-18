@@ -2716,7 +2716,9 @@ fn recover_lease_restores_a_soft_lease_and_holds_redelivery_until_the_deadline()
     // replicated the create but, under leader-local activation, never saw the
     // previous leader's activation) and a digested lease (key, deadline=1000)
     let mut engine = Engine::new();
-    engine.set_lenient_completion(true);
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();

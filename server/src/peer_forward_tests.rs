@@ -14,7 +14,11 @@ use crate::peer::{PeerLink, PeerSet};
 /// returns its HTTP base URL. Models a peer node: a `PeerLink` connects to
 /// its `/cluster` channel exactly as a forwarding gateway would in a cluster.
 async fn serve_peer() -> String {
-    let server = crate::ServerImpl::default();
+    serve(crate::ServerImpl::default()).await
+}
+
+/// Serves `server`'s intra-cluster falcon endpoint; returns its base URL.
+async fn serve(server: crate::ServerImpl) -> String {
     let registry = crate::falcon::Registry::new();
     crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
     let app = crate::falcon::cluster_router(server, registry, None);
@@ -78,7 +82,9 @@ async fn peer_set_dials_lazily_and_forwards() {
     let topology = crate::cluster::Topology {
         node_id: 0,
         peers: vec!["http://self-unused".to_string(), peer_base],
-        num_partitions: 4,
+        // Must match the served peer's partition count: a mismatch is refused
+        // at the join handshake (#1661).
+        num_partitions: 1,
         replication_factor: 1,
     };
     let peers = PeerSet::new(topology);
@@ -366,4 +372,109 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
     }
     drop(link);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serves node 0 of a two-node, one-partition cluster whose partition's
+/// REPLICATED lenient-completion flag is `lenient` (#1661), set through the
+/// journaled command. (A single node never requires peer features: it
+/// replicates its log to no one.)
+async fn serve_peer_lenient(lenient: bool) -> String {
+    let server = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory()],
+        crate::cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://self-unused".into(), "http://other-unused".into()],
+            num_partitions: 1,
+            replication_factor: 1,
+        },
+    );
+    for handle in server.engine.all() {
+        handle
+            .with(move |journal| {
+                let (_events, _commit) = journal
+                    .apply_command_at(
+                        nanobpmn_engine_core::Command::SetLenientCompletion { lenient },
+                        1,
+                    )
+                    .expect("set lenient");
+            })
+            .await;
+    }
+    serve(server).await
+}
+
+/// #1661: a joiner with the same `NANOBPMN_PARTITIONS` links, and learns the
+/// peer's replicated-command features from the handshake.
+#[tokio::test]
+async fn join_with_matching_partition_count_links_and_learns_features() {
+    let base = serve_peer_lenient(true).await;
+    let link = PeerLink::connect_as(&base, Some(1))
+        .await
+        .expect("same partition count joins");
+    assert!(
+        link.supports(nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION)
+    );
+}
+
+/// #1661: a joiner whose partition count differs is refused at the handshake,
+/// before any frame is exchanged — it would place keys on partitions the rest
+/// of the cluster routes elsewhere.
+#[tokio::test]
+async fn join_with_mismatched_partition_count_is_rejected() {
+    let base = serve_peer().await;
+    let err = match PeerLink::connect_as(&base, Some(4)).await {
+        Ok(_) => panic!("a partition-count mismatch must be refused at join"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:?}").contains("409"),
+        "refused with 409 Conflict, got {err:?}"
+    );
+}
+
+/// #1661 rolling upgrade: once a node's replicated state carries
+/// `LenientCompletionSet`, a binary that does not advertise the feature (a
+/// pre-#1661 build: no handshake headers at all) is refused — it could not
+/// decode that command in the log it would replicate.
+#[tokio::test]
+async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let base = serve_peer_lenient(true).await;
+    let url = format!("{}/cluster", base.replacen("http://", "ws://", 1));
+    let request = url.clone().into_client_request().expect("request");
+    let err = match tokio_tungstenite::connect_async(request).await {
+        Ok(_) => panic!("a featureless (pre-#1661) binary must be refused"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:?}").contains("409"), "got {err:?}");
+
+    // A legacy binary still joins a node whose state does not yet depend on
+    // the feature (the rolling-upgrade window).
+    let plain = serve_peer_lenient(false).await;
+    let url = format!("{}/cluster", plain.replacen("http://", "ws://", 1));
+    tokio_tungstenite::connect_async(url.into_client_request().expect("request"))
+        .await
+        .expect("legacy binary joins before the feature is in use");
+}
+
+/// #1661 (outbound direction): once this node's replicated state requires a
+/// feature, it must not DIAL a member that restarted on an older binary — on
+/// either lane — or Raft would stream it entries it cannot decode.
+#[tokio::test]
+async fn outbound_link_to_incompatible_binary_is_refused_once_feature_is_required() {
+    use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+    let old = crate::ServerImpl::default();
+    old.advertise_cluster_features
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let base = serve(old).await;
+    let err = match PeerLink::connect_requiring(&base, Some(1), &[F]).await {
+        Ok(_) => panic!("an outbound link to a featureless binary must be refused"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:?}").contains(F), "got {err:?}");
+    // Before the requirement exists the same peer links (rolling upgrade).
+    let link = PeerLink::connect_requiring(&base, Some(1), &[])
+        .await
+        .expect("no requirement yet");
+    assert!(!link.supports(F));
 }

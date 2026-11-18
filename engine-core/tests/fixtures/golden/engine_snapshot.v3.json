@@ -1396,6 +1396,7 @@
         97
       ]
     },
+    "lenient_completion": false,
     "message_start_subscriptions": {},
     "message_subscriptions": {
       "103": {
