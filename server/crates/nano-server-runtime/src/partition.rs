@@ -620,7 +620,7 @@ impl Partitions {
             .map_or(0, |d| d.as_millis() as u64);
         for h in self.all() {
             let per_partition = h
-                .with_low(|j: &mut crate::journal::Journal| {
+                .with_low(move |j: &mut crate::journal::Journal| {
                     // Includes elapsed `retryBackOff` deferred jobs (#933).
                     j.state()
                         .waiting_job_counts(now)
