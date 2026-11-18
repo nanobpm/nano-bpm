@@ -24,7 +24,7 @@ import { CamundaHttpError } from "./runtime/camunda-backend.mjs";
 
 // A scratch directory holding a synthetic register + surface + coverage + corpus,
 // so each rule can be tripped in isolation without touching the committed files.
-function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {}, runtimeScenarios = {} }) {
+function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {}, runtimeScenarios = {}, traceScenarios = {} }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nano-ext-"));
   const write = (name, obj) =>
     fs.writeFileSync(path.join(dir, name), typeof obj === "string" ? obj : JSON.stringify(obj));
@@ -46,7 +46,15 @@ function fixture({ extensions, surfaceCells = [], coverageRules = [], bpmn = {},
     fs.writeFileSync(path.join(scenarioDir, "scenario.json"), JSON.stringify({ name, bpmn: bpmnFile }));
     fs.writeFileSync(path.join(scenarioDir, bpmnFile), xml);
   }
+  const traceScenariosDir = path.join(dir, "trace-scenarios");
+  fs.mkdirSync(traceScenariosDir);
+  for (const [name, xml] of Object.entries(traceScenarios)) {
+    fs.mkdirSync(path.join(traceScenariosDir, name));
+    fs.writeFileSync(path.join(traceScenariosDir, name, "process.bpmn"), xml);
+    fs.writeFileSync(path.join(traceScenariosDir, name, "script.json"), "[]");
+  }
   return {
+    traceScenariosDir,
     extensionsFile: path.join(dir, "extensions.json"),
     surfaceFile: path.join(dir, "zeebe-surface.json"),
     coverageFile: path.join(dir, "coverage.json"),
@@ -324,4 +332,18 @@ test("Red/Green: an unreadable runtime scenario.json fails closed (not a crash, 
     problems.some((p) => p.includes("broken") && p.includes("fails closed")),
     `an unreadable scenario must fail closed: ${problems}`,
   );
+});
+
+test("Red/Green: a Zeebe trace-corpus process.bpmn using an extension fails", () => {
+  const f = fixture({ extensions: [costEntry], traceScenarios: { "nano-trace": nanoModel } });
+  const problems = checkExtensions(f);
+  assert.ok(
+    problems.some((p) => p.includes("trace parity-corpus scenario") && p.includes("nano-trace")),
+    `a trace-corpus model using an extension must fail: ${problems}`,
+  );
+});
+
+test("a trace corpus with NO extension passes rule 4b", () => {
+  const f = fixture({ extensions: [costEntry], traceScenarios: { "plain-trace": plainModel } });
+  assert.deepEqual(checkExtensions(f), []);
 });

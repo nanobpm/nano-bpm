@@ -40,6 +40,7 @@ const COVERAGE_PATH = path.join(here, "coverage.json");
 const CORPUS_GRAPHS = path.join(here, "..", "corpus", "graphs");
 const CORPUS_BPMN = path.join(here, "..", "corpus", "bpmn");
 const RUNTIME_CORPUS = path.join(here, "runtime", "corpus");
+const TRACE_SCENARIOS = path.join(here, "..", "traces", "scenarios");
 const ALLOWLIST_PATH = path.join(here, "..", "traces", "allowlist.json");
 
 /** `*` matches any run of characters; everything else is literal. */
@@ -230,6 +231,35 @@ export function runtimeCorpusExtensions(extensions, runtimeCorpusDir = RUNTIME_C
 }
 
 /**
+ * Scan the Zeebe record-stream trace corpus (`formal/traces/scenarios/<name>/
+ * process.bpmn`, parity-checked against captured Zeebe goldens by
+ * `engine-core/tests/zeebe_traces.rs`). A registered extension there would be
+ * compared against Camunda records with no extension skip. Returns the
+ * `{ scenario, extensionId }` hits.
+ */
+export function traceCorpusExtensions(extensions, traceScenariosDir = TRACE_SCENARIOS) {
+  const hits = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(traceScenariosDir);
+  } catch {
+    return hits; // no trace corpus — nothing to scan
+  }
+  for (const name of names) {
+    let xml;
+    try {
+      xml = fs.readFileSync(path.join(traceScenariosDir, name, "process.bpmn"), "utf8");
+    } catch {
+      continue; // not a scenario directory (no process.bpmn)
+    }
+    for (const entry of extensions) {
+      if (modelUsesExtension(xml, entry)) hits.push({ scenario: name, extensionId: entry.id });
+    }
+  }
+  return hits;
+}
+
+/**
  * Run every register guard. Returns a list of problem strings; an empty list
  * passes. Pure over its inputs (dependency-injected file paths for tests).
  */
@@ -240,6 +270,7 @@ export function checkExtensions({
   graphsDir = CORPUS_GRAPHS,
   bpmnDir = CORPUS_BPMN,
   runtimeCorpusDir = RUNTIME_CORPUS,
+  traceScenariosDir = TRACE_SCENARIOS,
   allowlistFile = ALLOWLIST_PATH,
 } = {}) {
   const problems = [];
@@ -308,6 +339,13 @@ export function checkExtensions({
   }
   for (const bad of runtime.invalid) {
     problems.push(`runtime parity-corpus scenario ${bad}: the guard cannot scan an unreadable scenario, so it fails closed`);
+  }
+
+  // Rule 4b — nor may a Zeebe TRACE-corpus model (record-stream parity suite).
+  for (const hit of traceCorpusExtensions(extensions, traceScenariosDir)) {
+    problems.push(
+      `trace parity-corpus scenario ${JSON.stringify(hit.scenario)} uses registered extension ${JSON.stringify(hit.extensionId)}: zeebe_traces.rs compares it against captured Zeebe records, so an extension here must fail the register guard`,
+    );
   }
 
   // Rule 5 — the three lists stay RECONCILED (separate, never overlapping). An
