@@ -148,6 +148,11 @@ function runTlc (jar, work, module, tla, cfg) {
       // Each model is tiny: a small serial-GC, C1-only JVM starts fastest and lets
       // many run side by side.
       '-XX:+UseSerialGC', '-Xmx256m', '-XX:TieredStopAtLevel=1', `-Djava.io.tmpdir=${path.join(dir, 'tmp')}`, '-cp', jar, 'tlc2.TLC', '-workers', '1', '-cleanup',
+      // `-nowarning` silences TLC's benign "use a throughput-optimised GC" notice
+      // (we deliberately run a serial-GC, C1-only JVM for fast startup). The
+      // verdict parser treats any `Warning:` line as a hard error, so the notice
+      // must not reach the log — genuinely actionable warnings still fail closed.
+      '-nowarning',
       '-continue', '-deadlock', '-lncheck', 'final', '-metadir', path.join(dir, `${module}.meta`), '-config', `${module}.cfg`, `${module}.tla`],
     { cwd: dir })
     let log = ''
