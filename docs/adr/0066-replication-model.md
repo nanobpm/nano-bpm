@@ -99,8 +99,10 @@ benchmark) are within **3 %**; deploys within **~12 %**. Tiny-payload workloads 
 from ~125 B to ~1.8 KB per lifecycle, i.e. ~18 MB/s of replication per 10k lifecycles/s per
 follower, well inside a LAN link; the per-entry overhead (one entry per batch, ADR 0003's group
 commit) is unchanged. Notably, **the journal already persists exactly these events on every
-replica today**, so local disk write volume does not change; only the Raft log entry (and the
-network) grows. Structural compaction of the event encoding (dropping redundant fields, binary
+replica today**, so *journal* write volume does not change. Total local disk volume does grow,
+however: `RaftLogStore::append_entries` (`raft_logstore.rs`) persists its own copy of each entry,
+so the larger Raft entries are written to disk a second time alongside the journal (and sent over
+the network) until the two stores are merged — which is explicitly deferred. Structural compaction of the event encoding (dropping redundant fields, binary
 framing) is an optimization available later and is not needed for the decision.
 
 ## Options
@@ -142,19 +144,30 @@ with this ADR as the decision of record.
    every node first (rolling-upgrade-safe: new nodes read both). Golden corpus covers the new
    frame (additive variant — no `SNAPSHOT_FORMAT_VERSION` bump).
 3. **Leader processes, proposes events.** Behind a cluster-wide feature flag: the leader applies
-   the command batch once against its live engine (buffered, as `begin_raft_entry` does today),
-   proposes `Events` carrying the events and per-command responses; followers fold. Leader
-   rollback on a failed proposal reuses the existing fail-closed path (rebuild from journal). Keys
-   come only from the leader; the fold advances the key generator from observed keys.
-4. **Cutover.** Flip the flag once every voter runs ≥ slice 2 (membership/version check refuses
-   the flip otherwise). Old v1 entries still in the log are applied by command replay; nothing
+   the command batch once to produce events, proposes `Events` carrying the events and
+   per-command responses; followers fold. `begin_raft_entry` buffers only *journal* writes, not
+   engine mutations, so processing must not touch committed engine state: the leader processes
+   against an isolated speculative state (a copy-on-write overlay over committed state), and only
+   after commit folds the committed events into its live engine through the **same** fold the
+   followers use — exactly once, so events are never applied twice. Job activation, queries,
+   lease digests and snapshots read committed state only (a snapshot's `last_applied` therefore
+   always matches its contents); a failed proposal simply discards the overlay. Keys come only
+   from the leader; the fold advances the key generator from observed keys.
+4. **Cutover.** Flip the flag only once every voter **and every learner** (ADR 0003 learners
+   receive the same log) runs ≥ slice 3, i.e. can decode *and* apply `Events` entries; the
+   membership/version check refuses the flip otherwise, and keeps refusing any later membership
+   change (join/learner add) by a node below slice 3 while the flag is on. Old v1 entries still in the log are applied by command replay; nothing
    is rewritten.
-5. **Remove follower command execution** after one release: v1 decode stays (historical logs),
-   follower command processing and the `now`-hoisting special cases (orphan detection) are deleted.
+5. **Remove follower command execution** only once v1 replay is provably unnecessary: every node
+   has a verified snapshot whose `last_applied` is at or beyond the last v1 entry, and log
+   compaction has removed all v1 entries from every replica (so no recovery or catch-up path can
+   replay one). Until that boundary is verified, legacy command execution **and** its determinism
+   guards stay; a release delay alone is not sufficient. After it, v1 decode is retained only to
+   reject-explicitly, and the `now`-hoisting special cases (orphan detection) are deleted.
 6. **Measure** replication bandwidth and p99 latency on the existing cluster benchmarks before/after
    slice 4; optional encoding compaction if tiny-payload overhead matters.
 
-Until slice 4 lands, the determinism guards from #1649 remain required and must not be weakened.
+Until slice 5's verified v1 boundary is reached, the determinism guards from #1649 remain required and must not be weakened.
 
 ### How #1657 (cluster variables) is solved
 
@@ -171,9 +184,10 @@ recorded in events, so a follower can never re-evaluate it against different val
 - Replica consistency no longer depends on engine determinism; FEEL may stay naturally
   non-deterministic on the leader (matching Zeebe). Determinism is still wanted for *replay
   parity tests*, not for correctness of replication.
-- Raft entries grow (measured above); disk volume is unchanged since the journal already stores
-  these events.
-- The command wire format (`ReplicatedCommandWire`) becomes legacy-read-only after slice 5.
+- Raft entries grow (measured above); journal volume is unchanged since the journal already
+  stores these events, but total disk volume grows because the Raft log store keeps its own copy
+  of each (larger) entry until the stores are merged (deferred).
+- The command wire format (`ReplicatedCommandWire`) becomes legacy-read-only (reject-explicitly) after slice 5.
 - One persisted, replay-guarded shape (events) for journal, Raft log and migration-by-replay.
 
 ## Open questions
