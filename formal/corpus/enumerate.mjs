@@ -596,9 +596,10 @@ export class Reference {
  * that ends with wait states still held is stuck (left to TLC / the nano-only
  * scenarios).
  */
-export function exploreOrders (graph, route = {}) {
+export function exploreOrders (graph, route = {}, { limit = Infinity } = {}) {
   const runs = []
   const rec = (state, steps) => {
+    if (runs.length >= limit) return
     // Branch on routing decisions first: a queued unrouted activation of a
     // diverging gateway must choose before any command runs (the choice decides
     // which wait states exist).
@@ -610,20 +611,49 @@ export function exploreOrders (graph, route = {}) {
     }
     const cmds = state.commands()
     if (cmds.length === 0) {
-      runs.push({
-        steps,
-        route: state.route,
-        completed: state.completed,
-        jobsCreated: { ...state.jobsCreated },
-        completedElements: { ...state.completedElements },
-        takenFlows: { ...state.takenFlows }
-      })
+      runs.push(runOf(state, steps))
       return
     }
     for (const c of cmds) rec(state.apply(c), [...steps, c])
   }
   rec(new Reference(graph, route), [])
   return runs
+}
+
+/** A finished reference walk in the `exploreOrders` run shape. */
+const runOf = (state, steps) => ({
+  steps,
+  route: state.route,
+  completed: state.completed,
+  jobsCreated: { ...state.jobsCreated },
+  completedElements: { ...state.completedElements },
+  takenFlows: { ...state.takenFlows }
+})
+
+/**
+ * ONE command order from instance creation to a settled state with no command
+ * left, chosen by `pick(n)` (an integer in `[0, n)`): the random walk through the
+ * SAME (choice x command) tree `exploreOrders` enumerates, for graphs too large
+ * to enumerate every order of (the differential fuzzer, #1250). Every pending
+ * routing decision and every next command is a `pick`, so a seeded `pick` makes
+ * the run deterministic.
+ */
+export function randomRun (graph, pick) {
+  let state = new Reference(graph)
+  const steps = []
+  for (;;) {
+    const pending = state.pendingChoices()
+    if (pending.length > 0) {
+      const p = pending[0]
+      state = state.decide(p.node, p.activation, p.choices[pick(p.choices.length)])
+      continue
+    }
+    const cmds = state.commands()
+    if (cmds.length === 0) return runOf(state, steps)
+    const c = cmds[pick(cmds.length)]
+    steps.push(c)
+    state = state.apply(c)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -640,11 +670,11 @@ export function exploreOrders (graph, route = {}) {
  * A non-completing run is marked `backends: ["nano"]`, since the bare-gateway
  * Camunda backend only observes an instance through completion.
  */
-export function scenariosFor (graph) {
+export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) => `${graph.id}-o${o}` } = {}) {
   const hasMsg = Object.values(graph.nodes).includes('msg')
   const scenarios = []
-  exploreOrders(graph).forEach((run, o) => {
-    const name = `${graph.id}-o${o}`
+  runs.forEach((run, o) => {
+    const name = names(o)
     const variables = {}
     if (hasMsg) variables[CORRELATION_KEY_VARIABLE] = name
     // Replay the run against a fresh reference to schedule its route: whenever

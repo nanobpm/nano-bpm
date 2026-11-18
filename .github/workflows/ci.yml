@@ -955,6 +955,11 @@ jobs:
         # Every route x command order of every graph in the `ci` bound of
         # formal/corpus/bounds.json, checked against the reference outcome.
         run: node formal/corpus/exhaustive.mjs --bound ci --backend nano
+      - name: Nano backend — permanent fuzz corpus replay (#1250)
+        # Every committed minimal reproducer of formal/corpus/fuzz-corpus.json:
+        # an open case must still reproduce, a fixed one must agree (regression
+        # guard). The random fuzzing itself is nightly (parity-fuzz-nightly.yml).
+        run: node formal/corpus/fuzz.mjs --replay-only
       # Live Camunda 8 differential. Off by default (skip-tolerant): the step is
       # gated on the RUN_CAMUNDA_PARITY repo variable so the job stays green
       # until a maintainer provisions a Camunda 8 runtime and turns it on. When
