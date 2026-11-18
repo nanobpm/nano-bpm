@@ -25,5 +25,5 @@ node "$repo/formal/corpus/exhaustive.mjs" --bound "$bound" --out "$work/exhausti
 
 PARITY_CORPUS_DIRS="$work/exhaustive" cargo llvm-cov \
   --manifest-path "$repo/engine-core/Cargo.toml" \
-  --test parity_corpus --json --output-path "$out"
+  --features serde --test parity_corpus --json --output-path "$out"
 echo "wrote $out"

@@ -137,6 +137,8 @@ pub use event::{
     SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
+#[cfg(feature = "serde")]
+pub use model::value_from_json;
 pub use model::{
     tool_name_of, tool_properties_of, AdHocActivateElement, AdHocImplementationType,
     AdHocJobResult, AdHocSubProcessDef, AdHocTool, AdHocToolKind, BindingType, BuildError,

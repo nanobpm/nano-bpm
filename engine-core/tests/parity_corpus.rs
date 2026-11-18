@@ -19,6 +19,8 @@
 //! into executing a different run than the wasm driver does (a scenario that
 //! stops matching fails here as well as in the runner).
 
+// Uses the canonical `value_from_json` (serde feature) shared with engine-wasm.
+#![cfg(feature = "serde")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -43,17 +45,9 @@ use serde_json::Value as Json;
 const MAX_JOBS_TO_ACTIVATE: usize = 100;
 
 fn to_value(j: &Json) -> Value {
-    match j {
-        Json::Null => Value::Null,
-        Json::Bool(b) => Value::Bool(*b),
-        Json::Number(n) => match n.as_i64() {
-            Some(i) => Value::Int(i),
-            None => Value::Double(n.as_f64().unwrap()),
-        },
-        Json::String(s) => Value::Str(s.clone()),
-        Json::Array(a) => Value::List(a.iter().map(to_value).collect()),
-        Json::Object(o) => Value::Map(o.iter().map(|(k, v)| (k.clone(), to_value(v))).collect()),
-    }
+    // The single canonical conversion the wasm runner also uses, so both
+    // runners execute the same scenario identically.
+    nanobpmn_engine_core::value_from_json(j)
 }
 
 fn vars(j: Option<&Json>) -> HashMap<String, Value> {
