@@ -349,6 +349,7 @@ fn update_event_carries_the_preserved_kind() {
 /// must be one-way — once a partition applied a cluster-variable create, the
 /// retained log/snapshot depends on `cluster-variables-v1` even after every
 /// variable was deleted, and across snapshot restore.
+#[cfg(feature = "serde")]
 #[test]
 fn cluster_variables_ever_used_is_sticky_across_delete_and_snapshot() {
     let mut engine = Engine::new();
