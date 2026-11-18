@@ -73,3 +73,7 @@ expect_used = "deny"
 [[example]]
 name = "replication_size"
 required-features = ["serde"]
+
+[[example]]
+name = "divergence_digest"
+required-features = ["serde"]

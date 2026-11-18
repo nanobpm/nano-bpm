@@ -1,4 +1,4 @@
-# ADR 0066 — Replication model: replicate events, not commands
+# ADR 0066 — Replication model: event replication vs. command replication with enforced determinism
 
 Status: **Proposed.** (A human accepts it; implementation slices follow acceptance.)
 Date: 2026-11-18.
@@ -11,6 +11,10 @@ issues #1655 (this decision), #1657 (cluster variables unreplicated), #1642 / #1
 non-determinism), #1071 (migration-by-replay), #1069 (golden serde drift guard).
 
 ## Context
+
+The options compared are **A** event replication (Zeebe), **B** today's command replication as-is,
+and **C** command replication with *enforced* determinism (TigerBeetle / FoundationDB style). The
+apply-input audit below is the evidence that decides between A and C.
 
 ### Current state: command replication
 
@@ -119,101 +123,198 @@ each entry, so the larger Raft entries are written to disk a second time alongsi
 Structural compaction of the event encoding (dropping redundant fields, binary
 framing) is an optimization available later and is not needed for the decision.
 
+## Apply-input audit
+
+Every input that engine apply (`Engine::apply_command_records_at`, reached from
+`Journal::apply_command_ref_at`, `nano-server-storage/src/journal.rs:3032`) reads that is **not**
+in `(engine state, command)`. Method: a grep of `engine-core/src` for clocks, RNG, environment,
+hashers and float intrinsics, plus every `set_*` host hook on `Engine` and `Journal`, then reading
+each hit. Line numbers are at this ADR's commit.
+
+| # | input | where | status today | A (events) | C (enforced determinism) |
+|---|---|---|---|---|---|
+| 1 | **Cluster-variable host handle** (#1657): `Arc<RwLock<ClusterVariableSnapshot>>` | type `cluster_vars.rs:63`; installed `engine/mod.rs:772` via `journal.rs:1334/1379` from `server/src/main.rs:3436`; read `engine/resolve.rs:444` | **Open leak**: node-local, unjournaled, mutated by REST | Read only on the leader, but still unjournaled (lost on restart, replay sees today's values), so it has to move into engine state anyway | Becomes engine state changed by replicated commands; the handle type is deleted from the apply signature |
+| 2 | **FEEL wall clock / entropy fallback** | `feel/builtins.rs:1096` (`SystemTime::now` in `now()`/`today()`), `feel/builtins.rs:1330` (`random number()`/`uuid()`) | Closed by #1649 when `feel::env::with_env` is installed (`feel/env.rs:62`), but **fails open**: without an installed env it silently reads the host clock | Harmless on followers (no evaluation there) | Fail closed: under the apply build the fallback is a hard error, and `SystemTime`/`Instant` are banned in the apply crates by lint (below) |
+| 3 | **`lenient_completion` flag** (host config) | `engine/mod.rs:741`; set from activation policy at `server/src/main.rs:3078` and **changed at runtime** at `main.rs:43375` | Leak during a policy flip: each node flips at its own wall-clock moment, not at a log index, so one committed `CompleteJob` can be accepted on one replica and rejected on another | Leader-only decision, recorded as events | Becomes engine state set by a replicated command (flips at a log index on every replica) |
+| 4 | **`num_partitions`** (host config, `NANOBPMN_PARTITIONS`) | `engine/mod.rs:731`; set at `main.rs:3071` | Documented "must be identical on every node" but not checked | Leader-only routing decision, recorded | Engine state from a replicated command, or verified at join (refuse a mismatching member) |
+| 5 | **Leader-local activation state** (ADR 0002) | soft grants `main.rs` `prepare_activation`; apply reads job state (with #3 papering over it) | By design followers do not hold the leader's locks | Unchanged (leader-local in both) | Unchanged; apply must not read it: the apply-input type excludes it, and #3 stops being a toggle |
+| 6 | **`HashMap` iteration order** (std `RandomState`, per-process random seed) | engine state maps `state/types.rs:2352-2407` (`instances`, `jobs`, `timers`, `message_subscriptions`, …) | Kept safe **by hand**: event-emitting walks sort first (`engine/mod.rs:17337`, `:17351`; `engine/event_subprocess.rs:460`; 97 `sort*` calls in `engine/`); unique-key lookups (`engine/mod.rs:971`) are order-independent. Nothing enforces it, and the JSON journal encoding of these maps is **not canonical** (bytes differ between replicas holding equal state) | Cannot diverge followers; leader order only has to be self-consistent | Replace the hasher with a fixed-seed `BuildHasher` alias (or `BTreeMap`) in engine state; `clippy::disallowed_types` bans `std::collections::HashMap/HashSet` in the apply crates. Also makes the encoding canonical, which the digest below relies on |
+| 7 | **Platform `libm` transcendental floats** | `feel/builtins.rs:525-526` (`ln`, `exp`), `feel/eval.rs:542` (`powf`) | Can differ by an ulp across OS/arch (glibc vs. Apple libm); same-binary clusters agree. `sqrt` is IEEE-exact; float formatting is Rust's own shortest-repr (deterministic) | Cannot diverge followers | Route through a pure-Rust `libm` (or the FEEL decimal type) so the result is platform-independent |
+| 8 | **Node-local residency / cold-store I/O** | `journal.rs:2327` `ensure_resident_for_command` | An unreadable local row **fails closed** under replicated apply (#1470), so it fail-stops rather than diverges | Folding events still needs residency; same behaviour | Same; the digest (below) is a second line of defence |
+| 9 | **Orphan sink / leadership** | `journal.rs:1703`, `:1719` | Decides which node *proposes* a stamped quarantine; the stamp travels in the command | Unchanged | Unchanged (already in the envelope) |
+| 10 | **Clock and seed** | `ReplicatedCommand.now` (`raft.rs:106`); `TriggerTimers/ExpireJobs { now }` (`command.rs:273-282`); FEEL seed from replicated state (#1649) | Closed: carried in the envelope | n/a | Already compliant |
+| 11 | **Environment variables** | none in `engine-core/src` (grep `std::env`: no hits) | Closed | n/a | Lint keeps it closed |
+| 12 | **Dependencies** | `engine-core/Cargo.toml`: only optional `serde`/`serde_json`; no regex crate, no time-zone DB (`feel/temporal.rs:20`, offsets only) | Small surface; the Rust toolchain/std is the remaining one | n/a | Covered by the determinism CI across the previous release and build profiles |
+
+**What the audit shows: the leaks are few and closable.** Two are live defects (#1 cluster
+variables, #3 the runtime `lenient_completion` flip); three are latent and closable mechanically
+(#2 fail-open fallback, #6 hasher, #7 libm); #4 needs a check. The FEEL surface that motivated A is
+already closed by #1649, engine-core has no non-std dependency on the apply path, and the hardest
+class (#6) is already handled by convention — the gap is enforcement, not design. That is the
+case in which C keeps today's efficiency and simplicity and adds a safety net, rather than the
+pervasive case in which A's "cannot diverge by construction" earns its migration cost.
+
 ## Options
 
-1. **Event replication (Zeebe model).** The leader applies a command batch once, buffering the
-   produced events (the existing `begin_raft_entry` buffering), and proposes **the events** (with
-   the per-command responses) as the Raft entry. Followers fold committed events into state.
-2. **Formally adopt command replication.** Keep the model, rewrite `falcon-design.md` §15.3, and
-   declare engine determinism a hard invariant guarded by CI (replica-agreement test of #1649,
-   `replay_determinism_differential`, FEEL differential gate), banning host-injected state during
-   apply.
+- **A. Event replication (Zeebe model).** The leader applies a command batch once and proposes
+  **the events** (plus per-command record metadata and responses) as the Raft entry. Followers fold
+  committed events into state.
+- **B. Command replication as-is.** Keep today's model, rewrite `falcon-design.md` §15.3, rely on
+  the existing tests (#1649 replica agreement, `replay_determinism_differential`, FEEL differential
+  gate).
+- **C. Command replication with enforced determinism.** Keep replicating commands; make
+  determinism an enforced and *detected* invariant:
+  1. **Pure apply boundary.** Apply is a function of `(state, command)`. The engine's apply entry
+     takes an `ApplyInput { command, now, seed, operation_reference }` and `&mut EngineState`; the
+     host-side hooks that feed apply today (`set_cluster_variables`, `set_lenient_completion`,
+     `set_num_partitions`) are removed from `Engine` and become state changed by replicated
+     commands (#1, #3, #4). No `Arc<RwLock<…>>`, no `dyn` callback reaches apply. A
+     `clippy.toml` `disallowed-methods`/`disallowed-types` list, enabled at `deny` in `engine-core`,
+     bans `SystemTime::now`, `Instant::now`, `std::env::*`, `std::collections::HashMap`/`HashSet`
+     (with `RandomState`) and `f64::{ln, exp, powf, …}` outside a deterministic wrapper module;
+     the FEEL clock/RNG fallback becomes unreachable in the apply build (#2).
+  2. **Every non-deterministic input travels in the envelope.** Today: `now`, the FEEL seed (from
+     replicated state), `operation_reference`, and the terminal attribution `stamp_for_proposal`
+     resolves on the leader (worker, lock deadline), plus orphan stamps. Nothing else the leader
+     samples reaches apply once #1/#3/#4 become state; the lint keeps it that way.
+  3. **Runtime divergence detection.** See the digest specification below.
+  4. **Determinism CI.** A job replays the same recorded journals (the `golden_replay` corpus plus a
+     generated randomized workload) under (a) several `HashMap` seeds — run before #6 lands, it
+     flushes out any unsorted walk; after it, a guard — (b) debug and release profiles and
+     Linux/macOS × x86_64/aarch64 (#7), and (c) the previous release's binary, then compares
+     digests at every checkpoint. This exercises paths no unit test targets, which is where B's
+     tests are blind.
 
-| dimension | 1. events | 2. commands |
-|---|---|---|
-| Determinism surface | Followers are a pure fold over events; FEEL, iteration order, floats, dependency upgrades cannot diverge replicas. Leader-only non-determinism is acceptable (it is recorded). | Every apply code path, forever. Guards catch only exercised paths; host state (#1657) is a design-level violation that tests did not catch. |
-| Log size / bandwidth | Measured above (payload-only, uncompressed): +2–3 % at benchmark payloads, ~7–8x on tiny instances (~1.6 KB/lifecycle absolute). | Smallest entries. |
-| Leader-only processing / activation (ADR 0001, 0002) | Natural fit, and the ADR 0002 split is **preserved, not superseded**: soft activation grants/expiry (`prepare_activation`, `main.rs:26481`) stay leader-local and unreplicated — never journaled in either model, so the measurement above is untouched. Only *durable* activations (`ActivateJobsByKey`, for leased/locked jobs) enter the log, and under event replication they enter as their resulting events (`JobActivated` et al.), not as a re-executed command. | Works today; activation commands are re-executed on followers. |
-| Leases | Lease grant/expiry is decided on the leader and recorded; followers never evaluate a deadline. | Followers must agree on `now` (carried in the entry) — fine until a new clock read slips in. |
-| Timers, `ExpireJobs`, routing pump | Remain leader-proposed *commands to the leader's processor*; only their resulting events replicate. Removes the hand-hoisting needed for orphans. | Leader proposes ticks; every replica re-evaluates them. |
-| Durability tiers (ADR 0003) | Unchanged semantics — and replication acknowledgment stays **separate** from local durability: `quorum` = events committed on a quorum before ack; `leader-durable` (`acks=1`) = leader-local journal commit before ack, events then replicate asynchronously — a failover can lose the unreplicated tail exactly as today. The local commit's power-loss strength is governed independently by `NANOBPMN_DURABILITY`: fsynced in `sync` mode, but acknowledged at the page-cache point in `async` mode (`journal.rs:129–132`; `raft_logstore.rs:853–861`), so `acks=1` is not by itself an fsync guarantee in either model. Simpler to reason about: the leader's journal *is* the entry. | Unchanged. |
-| Snapshot / replay / #1071 | Aligns: migration-by-replay already replays **event** journals (`decode_event_json`); the Raft log and the journal become one shape. `golden_serde_drift` / `golden_replay` now guard the replication frame too (one guard, not two). | Two persisted shapes to keep compatible: the command wire (`ReplicatedCommandWire` legacy promotion) and the event journal. |
-| Rolling upgrade / cutover | Requires an entry-format version (see plan). Mixed old/new cluster cannot share a log in both directions; needs a gated cutover. | None. |
-| Effort | Medium-large: entry type, leader/follower apply split, response plumbing, event-apply path in engine-core (most exists: replay already folds events), cutover. | Small doc change plus #1657 fix, then perpetual vigilance. |
+### Divergence digest (option C)
+
+- **Incremental chain, every entry.** Each replica folds `h_i = H(h_{i-1} || encoded records of
+  entry i)` over the journal bytes it already writes. Equal chains imply equal state, because state
+  is the fold of its events (#1071). The leader proposes its `h` for index `i - k` inside entry `i`
+  (so the digest never delays the entry it covers); followers compare at that index. `H` is a
+  stable, versioned hash (xxh3-128 or BLAKE3) pinned in the server, not std's `DefaultHasher`.
+- **Precondition: canonical bytes.** Today's journal JSON is **not** canonical — `HashMap` fields
+  serialize in `RandomState` order — so the chain needs audit item #6 first. Without it, a replica
+  would have to re-encode canonically, which is far more expensive (measured below).
+- **Periodic full hash, at snapshot time only.** The snapshot already serializes the whole state;
+  its digest (over the canonical snapshot bytes) is recorded with the snapshot and checked on
+  install. It is too expensive for the apply path (measured below).
+- **On mismatch:** the follower fails stop (stops applying, like the #1405 fenced
+  journal), reports both digests and the index, and resyncs by installing the leader's snapshot.
+  The divergent journal segment is kept for forensics. A leader never adopts a follower's state.
+- **Snapshots and #1071.** A snapshot records `(last_applied, chain digest, full digest)`;
+  a restored replica resumes the chain from the recorded value. Migration-by-replay re-derives the
+  chain from the replayed journal and must reproduce the recorded digest at each snapshot index —
+  a migration that changes the fold now fails loudly instead of silently. A deliberate encoding
+  change (a `SNAPSHOT_FORMAT_VERSION` bump) re-bases the chain at the migration point.
+
+Measured cost (`engine-core/examples/divergence_digest.rs`, added with this ADR;
+`cargo run --release --features serde --example divergence_digest`; Apple M1 Max; each step is a
+create with 4 variables or a job completion with 1; `DefaultHasher` stands in for the production
+hash):
+
+| live instances | apply / cmd | canonical re-encode + hash / cmd | overhead | hash of already-encoded journal bytes / cmd | full digest | snapshot bytes |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 39 µs | 30 µs | 77 % | 1.2 µs | 64 ms | 1.3 MB |
+| 10,000 | 63 µs | 31 µs | 49 % | 1.3 µs | 1.19 s | 13.3 MB |
+| 50,000 | 265 µs | 36 µs | 13 % | 1.4 µs | 6.9 s | 67 MB |
+
+Reading: once item #6 makes the journal bytes canonical, the per-entry chain costs **~1–1.4 µs per
+command (~2–3 % of apply)**, because it only hashes bytes that are written anyway. Re-encoding
+canonically through a sorted DOM instead costs 30–36 µs (13–77 %), which is why #6 is a
+precondition rather than an option. A full-state hash is O(state) (≈ 140 ms per 1,000 live
+instances), so it belongs at snapshot time only.
+
+## Comparison
+
+| dimension | A. events | B. commands as-is | C. commands, enforced determinism |
+|---|---|---|---|
+| Determinism surface | Followers are a pure fold over events; FEEL, iteration order, floats and upgrades cannot diverge them. Leader-only non-determinism is acceptable (it is recorded). | Every apply path, forever; guards see only exercised paths; #1657 shipped undetected. | The audited inputs (12 items), closed by type boundary + lint; anything missed is **detected** at the next digest instead of silently persisting. |
+| Failure mode on a missed input | None for replica agreement (leader just records its result). | Silent split-brain. | Fail-stop of the divergent follower + snapshot resync; alert. |
+| Log size / bandwidth | Measured above (payload-only, uncompressed): +2–3 % at benchmark payloads, ~7–8x on tiny instances (~1.6 KB/lifecycle). Raft log store keeps its own copy, so disk volume grows until the stores merge. | Smallest entries. | Smallest entries + 16–32 B digest every k entries. |
+| CPU | Followers fold (cheaper than processing); leader unchanged. | Every replica processes. | Every replica processes + ~1–1.4 µs/cmd chain hash. |
+| Leader-side complexity | **Substantial and new.** Speculative processing ahead of commit against a copy-on-write overlay of committed state (engine-core has no such overlay today); discard the overlay on failed proposal or failover; hold every client response until commit; activation, queries, lease digests and snapshots must read committed state only; key allocation is leader-only and the fold must advance the generator from observed keys; per-command record metadata (`operation_reference` lives on `Record`) has to ride in the entry. | None new. | None new: leader and followers run the same code path. |
+| Activation / leases (ADR 0001, 0002) | ADR 0002 split preserved: soft grants stay leader-local; durable activations replicate as `JobActivated` events. | Activation commands re-executed on followers. | As B; the runtime `lenient_completion` toggle (#3) becomes replicated state. |
+| Timers, `ExpireJobs`, pump | Leader-proposed commands to the leader's processor; only results replicate. | Re-evaluated everywhere with replicated `now`. | As B (`now` already in the envelope). |
+| Durability tiers (ADR 0003) | Semantics unchanged; replication acknowledgment stays separate from local durability (`NANOBPMN_DURABILITY`, `journal.rs:129–132`; `raft_logstore.rs:853–861`). | Unchanged. | Unchanged. |
+| Snapshot / replay / #1071 | One persisted, replay-guarded shape (events) for log and journal. | Two shapes: command wire (`ReplicatedCommandWire`) and event journal. | Two shapes as B, but migration-by-replay is now *checked* against recorded digests. |
+| Rolling upgrade | Entry-format version; gated cutover; mixed old/new clusters cannot share a log in both directions. | None. | None for the log format. A determinism-affecting change (e.g. #7's libm swap, a hasher change) is gated on the previous-release replay CI. The digest entry field is additive. |
+| Migration + effort | **Large**: 6 slices (below); about 2–3 engineer-months, with a running-system Raft log format change and a cutover that cannot be cleanly rolled back once events are emitted. | Doc change + #1657. | **Medium**: #1657 + #3/#4 to state (needed anyway), hasher swap (#6, mechanical but touches every state map), libm wrapper (#7), lint, digest field + fail-stop/resync path, determinism CI. About 3–5 engineer-weeks; no log format break, each slice independently revertible. |
 
 ## Decision (proposed)
 
-**Adopt event replication (option 1)**, staged so each slice ships independently and the cluster
-stays correct at every step. `falcon-design.md` §15.3 item 2 is kept as the target and annotated
-with this ADR as the decision of record.
+**Adopt option C** — command replication with enforced determinism — because the audit shows the
+apply-input leaks are few and closable, and C closes them for ~2–3 % apply CPU with no Raft log
+format change. B is rejected: #1657 is the proof that hoping is not enough. A is **not**
+rejected on principle; it is deferred with an explicit trigger: if, after C ships, the divergence
+digest fires in production for a cause the type boundary and lint cannot express, or the audit
+has to grow without bound, re-open this ADR for A (its staged plan is kept below so it is not lost).
 
-### Staged migration plan (each slice is fileable as an issue)
+`falcon-design.md` §15.3 item 2 is annotated: the decision of record is command replication with
+enforced determinism, per this ADR.
 
-1. **Event-apply path parity.** Ensure `engine-core` exposes a single canonical "apply events to
-   state" fold used by replay *and* (later) by followers, and add a differential test: for any
-   command sequence, `state(process commands)` == `state(fold produced events)`. This test is the
-   invariant that makes the switch safe. No wire change.
-2. **Versioned entry payload.** Introduce `ReplicatedEntry::{Commands(ReplicatedBatch) /* v1 */,
-   Events(EventBatch) /* v2 */}` with decode support for both; still only *emit* v1. Ship this to
-   every node first (rolling-upgrade-safe: new nodes read both). Golden corpus covers the new
-   frame (additive variant — no `SNAPSHOT_FORMAT_VERSION` bump).
-3. **Leader processes, proposes events.** Behind a cluster-wide feature flag: the leader applies
-   the command batch once to produce events, proposes `Events` carrying the events and
-   per-command responses; followers fold. `begin_raft_entry` buffers only *journal* writes, not
-   engine mutations, so processing must not touch committed engine state: the leader processes
-   against an isolated speculative state (a copy-on-write overlay over committed state), and only
-   after commit folds the committed events into its live engine through the **same** fold the
-   followers use — exactly once, so events are never applied twice. Job activation, queries,
-   lease digests and snapshots read committed state only (a snapshot's `last_applied` therefore
-   always matches its contents); a failed proposal simply discards the overlay. Keys come only
-   from the leader; the fold advances the key generator from observed keys. The entry must carry
-   **record metadata, not just domain events**: `operation_reference` lives on `Record`, not
-   `Event` (`engine-core/src/event.rs`), and today's journal re-derives it from each replicated
-   command (`journal.rs`). `Events` therefore replicates the per-command metadata (at minimum
-   each command's `operation_reference`, mapped to the records it produced) so follower journals
-   and a post-failover leader retain callers' operation references.
-4. **Cutover.** Flip the flag only once every voter **and every learner** (ADR 0003 learners
-   receive the same log) runs ≥ slice 3, i.e. can decode *and* apply `Events` entries; the
-   membership/version check refuses the flip otherwise, and keeps refusing any later membership
-   change (join/learner add) by a node below slice 3 while the flag is on. Old v1 entries still in the log are applied by command replay; nothing
-   is rewritten.
-5. **Remove follower command execution** only once v1 replay is provably unnecessary: every node
-   has a verified snapshot whose `last_applied` is at or beyond the last v1 entry, and log
-   compaction has removed all v1 entries from every replica (so no recovery or catch-up path can
-   replay one). Until that boundary is verified, legacy command execution **and** its determinism
-   guards stay; a release delay alone is not sufficient. After it, v1 decode is retained only to
-   reject-explicitly, and the `now`-hoisting special cases (orphan detection) are deleted.
-6. **Measure** replication bandwidth and p99 latency on the existing cluster benchmarks before/after
-   slice 4; optional encoding compaction if tiny-payload overhead matters.
+### Staged plan for C (each slice is fileable as an issue)
 
-Until slice 5's verified v1 boundary is reached, the determinism guards from #1649 remain required and must not be weakened.
+1. **#1657: cluster variables become engine state** (see below). Removes audit item #1.
+2. **Host config into state.** `lenient_completion` and `num_partitions` become engine state set by
+   replicated commands (or verified at join); `set_*` hooks deleted from `Engine` (#3, #4).
+3. **Deterministic hasher.** Type alias over a fixed-seed `BuildHasher` for every engine-state map;
+   `disallowed-types` lint for std `HashMap`/`HashSet`. Journal encoding becomes canonical (#6).
+   Not a format change: the same JSON shape, only key order becomes stable.
+4. **Purity lint + fail-closed FEEL env.** `disallowed-methods` for clocks, env, std float
+   transcendental intrinsics; pure-Rust `libm` wrapper (#7); FEEL fallback unreachable in apply (#2).
+5. **Divergence digest.** Chain digest per entry, leader digest carried additively in the entry,
+   fail-stop + snapshot resync, digests recorded in snapshots and checked by #1071 replay.
+6. **Determinism CI.** Seed / profile / platform / previous-release replay matrix comparing digests.
+
+### Staged plan for A (deferred; kept for the re-open trigger)
+
+1. Event-apply path parity: one canonical "apply events to state" fold shared by replay and
+   followers; differential test `state(process commands) == state(fold produced events)`.
+2. Versioned entry payload `ReplicatedEntry::{Commands /* v1 */, Events /* v2 */}`, decode both,
+   emit v1; golden corpus covers the new frame.
+3. Leader processes against an isolated copy-on-write speculative state and proposes `Events` with
+   per-command record metadata (`operation_reference`) and responses; after commit it folds the
+   committed events through the follower fold exactly once; failed proposals discard the overlay;
+   activation/queries/lease digests/snapshots read committed state only; keys leader-only.
+4. Cutover behind a cluster-wide flag, refused unless every voter **and learner** runs ≥ slice 3,
+   and refusing later joins below slice 3 while on.
+5. Remove follower command execution only after a verified boundary: every node has a snapshot at
+   or beyond the last v1 entry and compaction removed all v1 entries; until then #1649 guards stay.
+6. Measure bandwidth and p99 before/after cutover.
 
 ### How #1657 (cluster variables) is solved
 
-Independently of, and **before**, the cutover: cluster-variable mutations become replicated engine
-commands producing new additive events (`ClusterVariableCreated/Updated/Deleted`, carrying `kind`),
-and cluster-variable state moves into engine state (snapshotted, rebuilt by replay). The host-side
-live overlay handle (`set_cluster_variables`) is removed. This is required under *both* models —
-it fixes data loss on restart and historical replay — and under event replication it additionally
-means a read during processing happens only on the leader at a log position, with the result
-recorded in events, so a follower can never re-evaluate it against different values.
+Under **every** option the first step is the same: cluster-variable mutations become replicated
+engine commands producing new additive events (`ClusterVariableCreated/Updated/Deleted`, carrying
+`kind`); cluster-variable state moves into engine state (snapshotted, rebuilt by replay); the
+host-side `Arc<RwLock<…>>` handle and `set_cluster_variables` are removed. This fixes the split-brain,
+the loss on restart, and replay against today's values.
+
+- **Under A**, a read during processing additionally happens only on the leader at a log
+  position, and its result is recorded in events, so followers never re-evaluate it.
+- **Under C**, every replica reads the same engine state at the same log index, because the
+  mutation is itself a log entry; the removed handle can no longer be reintroduced because apply's
+  input type has no place for it and the lint bans the lock types in the apply crates. If a host
+  input ever slips in anyway, the divergence digest fail-stops the affected follower.
 
 ## Consequences
 
-- Replica consistency no longer depends on engine determinism; FEEL may stay naturally
-  non-deterministic on the leader (matching Zeebe). Determinism is still wanted for *replay
-  parity tests*, not for correctness of replication.
-- Raft entries grow (measured above, payload-only); journal volume is unchanged since the journal
-  already stores these events, but total disk volume grows because the Raft log store keeps its
-  own copy of each (larger) entry until the stores are merged (deferred).
-- The command wire format (`ReplicatedCommandWire`) becomes legacy-read-only (reject-explicitly) after slice 5.
-- One persisted, replay-guarded shape (events) for journal, Raft log and migration-by-replay.
+- (C) Replica consistency still depends on engine determinism, but determinism is now enforced
+  (type boundary + lint), tested beyond exercised paths (determinism CI), and **detected** at
+  runtime (digest) with a fail-stop rather than silent split-brain.
+- (C) Raft entries stay small; apply cost grows ~2–3 % for the digest chain; snapshotting gains a
+  full-state hash over bytes it already produces.
+- (C) Two persisted shapes remain (command wire + event journal); both stay under the golden drift
+  guards.
+- (C) A non-Rust or cross-platform follower (e.g. a wasm replica) must reproduce the same digest;
+  the libm and hasher slices are what make that possible.
+- If the re-open trigger fires, A's plan above applies unchanged.
 
 ## Open questions
 
-- Should the Raft log and the event journal be merged into one store (Zeebe's single log) after
-  cutover, removing the duplicate write? Out of scope; follow-up ADR if pursued.
-- Exact per-command response encoding inside `EventBatch` (needed for the SDK reply on the leader
-  only — possibly not replicated at all).
-- Whether `ActivateJobs` commands that still flow through the log should be retired entirely in
-  favour of the ADR 0002 leader-local path plus `JobActivated` events.
+- Digest cadence `k` (every entry vs. every N entries) and whether the leader's digest rides in
+  every entry or in a periodic marker entry.
+- Whether the full-state snapshot hash should be computed incrementally (e.g. a sum of per-key
+  hashes maintained on write) to make it cheap enough for periodic checks between snapshots.
+- Whether the Raft log and the event journal should be merged into one store (relevant to both
+  options; follow-up ADR if pursued).
