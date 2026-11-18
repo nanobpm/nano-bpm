@@ -20000,27 +20000,48 @@ impl ServerImpl {
     /// REPLICATED `LenientCompletionSet` — an older binary could not decode that
     /// command in the log. One-way, like the flag itself (the legacy host flag
     /// never counts: it is what a pre-#1661 cluster already runs).
-    async fn required_cluster_features(&self) -> Vec<&'static str> {
+    ///
+    /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
+    /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
+    /// `try_with` (never the panicking `with`), because it runs on the
+    /// partition-recovery path (`raft_transport_for_start`) BEFORE a failed
+    /// actor is replaced — a panic there would unwind the recovery supervisor,
+    /// a wedged actor would block it. Callers that admit peers must fail closed
+    /// on `None`; best-effort syncs simply retry on the next tick.
+    async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
         // A single node never replicates its log to anyone, so its local flag
         // places no requirement on a peer.
         if self.engine.topology().is_single_node() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         if self.peers.requires_feature(F) {
-            return vec![F];
+            return Some(vec![F]);
         }
+        let mut unknown = false;
         for p in 0..self.engine.topology().num_partitions {
-            if let Some(handle) = self.engine_handle_for(p)
-                && handle
-                    .with(|journal| journal.engine().replicated_lenient_completion())
-                    .await
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if !handle.is_alive() {
+                unknown = true;
+                continue;
+            }
+            match tokio::time::timeout(
+                ENGINE_HEALTH_PROBE_BOUND,
+                handle.try_with(|journal| journal.engine().replicated_lenient_completion()),
+            )
+            .await
             {
-                self.peers.require_feature(F).await;
-                return vec![F];
+                Ok(Some(true)) => {
+                    self.peers.require_feature(F).await;
+                    return Some(vec![F]);
+                }
+                Ok(Some(false)) => {}
+                Ok(None) | Err(_) => unknown = true,
             }
         }
-        Vec::new()
+        if unknown { None } else { Some(Vec::new()) }
     }
 
     /// Leader-side reconciliation of partition `p`'s replicated lenient-completion
@@ -32958,6 +32979,36 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #1661 review finding: the requirement probe runs on the partition-recovery
+    /// path BEFORE a failed actor is replaced, so a DEAD engine actor must yield
+    /// `None` (unknown — join admission fails closed) instead of panicking the
+    /// recovery supervisor via `with()`; and Raft start must not panic either.
+    #[tokio::test]
+    async fn required_features_probe_is_unknown_not_panic_on_a_dead_actor() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![Journal::in_memory()], topology);
+        assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
+        let handle = server.engine_handle_for(0).expect("partition 0 hosted");
+        handle.spawn_job(|_journal| panic!("kill the engine actor"));
+        for _ in 0..200 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!handle.is_alive(), "precondition: actor is dead");
+        assert_eq!(server.required_cluster_features().await, None);
+        let _transport = server.raft_transport_for_start().await;
+    }
+
     /// #1479 review finding: when a hosted partition's recovery FAILS at boot
     /// (a Raft `bootstrap_member` error — e.g. its durable snapshot failed to
     /// restore — after `replica_engine_for` already registered the fresh,
@@ -44219,7 +44270,7 @@ mod clustered_startup_tests {
         );
 
         // A featureless (pre-#1661) binary is now refused at join.
-        assert_eq!(n0.required_cluster_features().await, vec![F]);
+        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
         assert!(
             n0.peers.requires_feature(F),
             "outbound dials require it too"

@@ -592,7 +592,20 @@ async fn cluster_ws_handler(
     // replicated state already depends on (an incompatible, older binary).
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let local_partitions = state.server.engine.topology().num_partitions;
-    let required = state.server.required_cluster_features().await;
+    // Fail closed (#1661): if the requirement is UNKNOWN (an engine actor is
+    // dead/wedged mid-recovery) refuse with a retryable 503 rather than treat
+    // it as "no requirement" and admit a possibly-incompatible binary.
+    let Some(required) = state.server.required_cluster_features().await else {
+        use axum::response::IntoResponse as _;
+        tracing::warn!(
+            "refusing /cluster join: feature requirements unavailable (engine recovering)"
+        );
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature requirements temporarily unavailable; retry",
+        )
+            .into_response();
+    };
     if let Err(rejection) = cluster_join::check_join(
         local_partitions,
         header(cluster_join::CLUSTER_PARTITIONS_HEADER),
