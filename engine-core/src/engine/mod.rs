@@ -763,6 +763,14 @@ impl Engine {
         &self.state.cluster_variables
     }
 
+    /// Whether this partition has EVER applied a cluster-variable create
+    /// (#1657). One-way: the id cursor is never reset, so this stays `true`
+    /// after every variable is deleted and across snapshot recovery — the
+    /// retained log/snapshot still depends on `cluster-variables-v1`.
+    pub fn cluster_variables_ever_used(&self) -> bool {
+        !self.state.cluster_variables.is_unused()
+    }
+
     /// The cluster-wide partition count this engine is configured with.
     pub fn num_partitions(&self) -> u64 {
         self.num_partitions

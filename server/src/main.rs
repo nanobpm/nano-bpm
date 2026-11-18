@@ -20835,7 +20835,10 @@ impl ServerImpl {
     /// as soon as any hosted partition (owned or replica) has applied the
     /// REPLICATED `LenientCompletionSet` — an older binary could not decode that
     /// command in the log. One-way, like the flag itself (the legacy host flag
-    /// never counts: it is what a pre-#1661 cluster already runs).
+    /// never counts: it is what a pre-#1661 cluster already runs). Likewise
+    /// `cluster-variables-v1` (#1657) once any hosted partition has EVER applied
+    /// a cluster-variable create — sticky even after every variable is deleted,
+    /// because the retained log/snapshot still carries those records.
     ///
     /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
     /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
@@ -20845,14 +20848,23 @@ impl ServerImpl {
     /// a wedged actor would block it. Callers that admit peers must fail closed
     /// on `None`; best-effort syncs simply retry on the next tick.
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
-        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
-        // A single node never replicates its log to anyone, so its local flag
+        use nano_falcon_protocol::cluster_join::{
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+        };
+        // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
         if self.engine.topology().is_single_node() {
             return Some(Vec::new());
         }
-        if self.peers.requires_feature(F) {
-            return Some(vec![F]);
+        // Every feature the recovered/replicated state can depend on, each
+        // with its one-way state predicate (sticky once observed).
+        const FEATURES: [&str; 2] = [LC, CV];
+        let mut required: Vec<&'static str> = FEATURES
+            .into_iter()
+            .filter(|f| self.peers.requires_feature(f))
+            .collect();
+        if required.len() == FEATURES.len() {
+            return Some(required);
         }
         let mut unknown = false;
         for p in 0..self.engine.topology().num_partitions {
@@ -20865,19 +20877,30 @@ impl ServerImpl {
             }
             match tokio::time::timeout(
                 ENGINE_HEALTH_PROBE_BOUND,
-                handle.try_with(|journal| journal.engine().replicated_lenient_completion()),
+                handle.try_with(|journal| {
+                    let engine = journal.engine();
+                    [
+                        engine.replicated_lenient_completion(),
+                        engine.cluster_variables_ever_used(),
+                    ]
+                }),
             )
             .await
             {
-                Ok(Some(true)) => {
-                    self.peers.require_feature(F).await;
-                    return Some(vec![F]);
+                Ok(Some(flags)) => {
+                    for (feature, set) in FEATURES.into_iter().zip(flags) {
+                        if set && !required.contains(&feature) {
+                            self.peers.require_feature(feature).await;
+                            required.push(feature);
+                        }
+                    }
                 }
-                Ok(Some(false)) => {}
                 Ok(None) | Err(_) => unknown = true,
             }
         }
-        if unknown { None } else { Some(Vec::new()) }
+        // The order is canonical (FEATURES order) regardless of discovery order.
+        required.sort_by_key(|f| FEATURES.iter().position(|g| g == f));
+        if unknown { None } else { Some(required) }
     }
 
     /// Leader-side reconciliation of partition `p`'s replicated lenient-completion
@@ -33839,6 +33862,53 @@ mod clustered_startup_tests {
             server.peers.requires_feature(F),
             "Raft start must derive the requirement from recovered state"
         );
+    }
+
+    /// PR #1670 review: a node whose recovered state holds (or ever held) a
+    /// cluster variable must require `cluster-variables-v1` from every peer,
+    /// even after every variable was deleted, so an incompatible binary can
+    /// neither join nor be streamed the retained log/snapshot.
+    #[tokio::test]
+    async fn raft_start_requires_cluster_variables_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES as F;
+        let mut journal = Journal::in_memory();
+        let _ = journal
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    value: nanobpmn_engine_core::Value::Int(1),
+                    kind: Default::default(),
+                    metadata: Default::default(),
+                    distributed: false,
+                },
+                1,
+            )
+            .expect("create");
+        let _ = journal
+            .apply_command_at(
+                Command::DeleteClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    distributed: false,
+                },
+                2,
+            )
+            .expect("delete");
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
     }
 
     /// #1661 review finding: the requirement probe runs on the partition-recovery

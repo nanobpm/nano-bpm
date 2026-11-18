@@ -344,3 +344,32 @@ fn update_event_carries_the_preserved_kind() {
         .expect("stored");
     assert_eq!(stored.kind, ClusterVariableKind::SecretReference);
 }
+
+/// PR #1670 review: the peer-feature requirement derived from recovered state
+/// must be one-way — once a partition applied a cluster-variable create, the
+/// retained log/snapshot depends on `cluster-variables-v1` even after every
+/// variable was deleted, and across snapshot restore.
+#[test]
+fn cluster_variables_ever_used_is_sticky_across_delete_and_snapshot() {
+    let mut engine = Engine::new();
+    assert!(!engine.cluster_variables_ever_used());
+    engine
+        .apply_command(create(None, "x", Value::Int(1), false))
+        .unwrap();
+    assert!(engine.cluster_variables_ever_used());
+    engine
+        .apply_command(Command::DeleteClusterVariable {
+            tenant_id: None,
+            name: "x".into(),
+            distributed: false,
+        })
+        .unwrap();
+    assert!(engine.state.cluster_variables.is_empty());
+    assert!(engine.cluster_variables_ever_used(), "sticky after delete");
+    let json = serde_json::to_string(&engine.snapshot_control_only()).unwrap();
+    let restored = Engine::from_snapshot(serde_json::from_str::<EngineSnapshot>(&json).unwrap());
+    assert!(
+        restored.cluster_variables_ever_used(),
+        "sticky across snapshot"
+    );
+}
