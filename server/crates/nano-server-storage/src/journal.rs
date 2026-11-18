@@ -421,7 +421,7 @@ pub struct Journal {
     /// be re-installed whenever the engine is rebuilt from a snapshot — cluster
     /// variables are external configuration, so a `from_snapshot`/replay engine
     /// starts with an empty set and must be re-linked to the live host handle,
-    /// exactly as `lenient_completion` is preserved across a snapshot load.
+    /// exactly as `num_partitions` is preserved across a snapshot load.
     cluster_variables: ClusterVariables,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
@@ -1324,10 +1324,10 @@ impl Journal {
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
-        // Config the snapshot body does not carry, re-applied onto the new engine.
-        let lenient = self.engine.lenient_completion();
+        // Lenient completion is replicated engine state (#1661): the snapshot
+        // body carries it, so the restored engine holds the value at the
+        // snapshot's log index — never this node's pre-restore value.
         self.engine = Engine::from_snapshot(snapshot);
-        self.engine.set_lenient_completion(lenient);
         // Cluster variables are host-injected external config, absent from the
         // snapshot body: re-link the fresh engine to the live shared handle.
         self.engine
@@ -1372,9 +1372,9 @@ impl Journal {
     /// from its durable replay; any stale cold rows are reaped by the
     /// post-recovery GC).
     pub fn replace_engine(&mut self, engine: Engine) {
-        let lenient = self.engine.lenient_completion();
+        // Lenient completion is replicated engine state (#1661), rebuilt with
+        // the durable replay — never carried over from the fenced engine.
         self.engine = engine;
-        self.engine.set_lenient_completion(lenient);
         self.engine
             .set_cluster_variables(self.cluster_variables.clone());
         if self.varstore.is_some() {
@@ -3862,15 +3862,6 @@ impl Journal {
     /// key (see [`Engine::set_num_partitions`]). A no-op effect when `1`.
     pub fn set_num_partitions(&mut self, num_partitions: u64) {
         self.engine.set_num_partitions(num_partitions);
-    }
-
-    /// Enables leftover-tolerant ("lenient") job completion on the underlying
-    /// engine so a replicated `CompleteJob`/`FailJob`/`ThrowJobError` applies even
-    /// when this engine never observed the (leader-local) activation. See
-    /// [`Engine::set_lenient_completion`]. Set identically on every replica from
-    /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
-    pub fn set_lenient_completion(&mut self, lenient: bool) {
-        self.engine.set_lenient_completion(lenient);
     }
 
     /// Installs the shared [`ClusterVariables`] handle on this journal and its
