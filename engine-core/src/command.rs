@@ -799,6 +799,14 @@ pub enum Command {
     /// active `VariablesLost` incident already names the instance. Additive
     /// brand-new variant — old journals never carry it.
     QuarantineColdOrphan { instance_key: Key },
+    /// Set this partition's lenient-completion mode (#1661, ADR 0066 slice 2):
+    /// see [`crate::state::State::lenient_completion`]. Proposed by the host
+    /// (the partition leader) through the replicated log, so every replica
+    /// flips the mode at the same log index. ONE-WAY: `lenient: true` emits
+    /// [`crate::Event::LenientCompletionSet`] (idempotent); `lenient: false` is
+    /// a no-op — lenience can never be cleared, so no replica can strand a
+    /// leader-local activation its peers never saw.
+    SetLenientCompletion { lenient: bool },
 }
 
 /// Which off-heap tier lost an orphan's payload (#1447).
@@ -1154,6 +1162,7 @@ impl Command {
             | Command::ModifyInstance { instance_key, .. }
             | Command::QuarantineOffheapOrphan { instance_key, .. }
             | Command::QuarantineColdOrphan { instance_key } => h.key(*instance_key),
+            Command::SetLenientCompletion { lenient } => h.str(if *lenient { "1" } else { "0" }),
             Command::MigrateInstance {
                 instance_key,
                 target_process_definition_key,
@@ -1249,6 +1258,7 @@ impl Command {
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
             Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
             Command::QuarantineColdOrphan { .. } => "quarantine_cold_orphan",
+            Command::SetLenientCompletion { .. } => "set_lenient_completion",
         }
     }
 

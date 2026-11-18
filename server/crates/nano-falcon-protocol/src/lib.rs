@@ -14,6 +14,8 @@
 //! here (`pub(crate) use nano_falcon_protocol::*;`) so its handler code keeps
 //! its unqualified `ClientFrame`/`ServerFrame` paths unchanged.
 
+pub mod cluster_join;
+
 use nanobpmn_engine_core::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

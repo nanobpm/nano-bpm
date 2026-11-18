@@ -52,7 +52,28 @@ original fully-replicated lifecycle; single-node / RF=1 unaffected). When set to
   the leader (job is `Activated`) but nothing on followers (job is still
   `Created`), diverging the replicated event stream. `TriggerTimers` **stays
   logged** (it mints state / drives follower key allocation).
-- Replicas run with **lenient completion** (`Engine::set_lenient_completion`):
+- Replicas run with **lenient completion** — since #1661 (ADR 0066 slice 2) a
+  piece of *replicated engine state* (`State::lenient_completion`), set by the
+  journaled `Command::SetLenientCompletion` → `Event::LenientCompletionSet`
+  that the partition leader proposes through the Raft log, so every replica
+  flips it at the same log index (it was a per-node host setter before).
+  **One-way (#1661):** once enabled at a log index it stays enabled for the
+  cluster's life — the command can only set it to `true` (a `false` is a
+  no-op). After any leader-local activation, clearing lenience would make
+  replicas reject completions of jobs they never saw activated (the very
+  divergence this removes); switching the policy back to `always` while lenience
+  stays on is harmless (activations are replicated again, and the relaxed check
+  only accepts what the leader already validated — as Zeebe completing an
+  ACTIVATABLE job). A node starting with a non-lenient policy on state that says
+  lenient logs a warning and keeps it on (state wins over config).
+  **Rolling upgrade (ADR 0066):** until every member advertises the
+  `replicated-lenient-completion` feature on the `/cluster` handshake, nodes keep
+  the pre-#1661 behaviour (a *legacy* host flag from the activation policy, set
+  identically at startup) and the command is never emitted; once all do, the
+  leader proposes it as the first gated command and from that index replicated
+  state governs. From then on a binary lacking the feature is refused at join,
+  inbound and outbound.
+  The relaxed guard:
   the `!job.activated` completion guard is relaxed so a replicated `CompleteJob`
   applies on a follower's `Created` job (the follower never saw the activation).
   This is gated — default-strict preserves single-node semantics and the
@@ -286,9 +307,9 @@ leader-local under leader-durable.
 
 
 
-- Code (Part A): `engine-core/src/engine.rs` (`lenient_completion`,
-  `set_lenient_completion`, relaxed completion guards),
-  `server/src/journal.rs` (`set_lenient_completion`),
+- Code (Part A): `engine-core/src/engine.rs` (`lenient_completion`, relaxed
+  completion guards; the flag is replicated state since #1661 —
+  `Command::SetLenientCompletion`),
   `server/src/main.rs` (`replicate_activation_from_env`,
   `ServerImpl.replicate_activation`, `try_activate`, `activate_on_local`,
   `tick_partition_via_raft`). Env: `NANOBPMN_REPLICATE_ACTIVATION`.
