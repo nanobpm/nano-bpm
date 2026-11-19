@@ -158,6 +158,14 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# First-party crates outside this workspace match `"*"` too; keep their line
+# tables so engine/read-model frames still carry file:line.
+[profile.dev.package.nanobpmn-engine-core]
+debug = "line-tables-only"
+
+[profile.dev.package.nanobpmn-read-model]
+debug = "line-tables-only"
+
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate
 # boundaries. opt-level stays at 3 so request handling keeps its speed.

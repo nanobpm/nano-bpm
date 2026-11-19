@@ -93,10 +93,14 @@ make -C "$wt" generate \
     "$wt/server/src/stub_impls.rs" \
     "$wt/server/src/response_contract_schema.json"
 
-if [ ! -f "$wt/console/dist/index.html" ]; then
-    mkdir -p "$wt/console/dist"
-    printf '<!doctype html>\n' > "$wt/console/dist/index.html"
-fi
+# Mirror CI's "Stub console assets" step: `console` embeds console/dist and
+# `console-observe` embeds console/dist-observe, so stub both.
+for d in console/dist console/dist-observe; do
+    if [ ! -f "$wt/$d/index.html" ]; then
+        mkdir -p "$wt/$d"
+        printf '<!doctype html>\n' > "$wt/$d/index.html"
+    fi
+done
 
 wait "$seed_pid"
 
