@@ -2212,15 +2212,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     if let Some(claim) = batch.digest
                         && let Some(local) = self.digest.check(&claim)
                     {
-                        return Err(
-                            self.fail_stop_divergence(Divergence {
+                        return Err(self
+                            .fail_stop_divergence(Divergence {
                                 index: claim.index,
                                 detected_at: log_id.index,
                                 leader: claim.chain,
                                 local,
                             })
-                            .await,
-                        );
+                            .await);
                     }
                     let membership = self
                         .inner
@@ -7329,7 +7328,8 @@ mod tests {
     fn journaled_raft_state_round_trips() {
         use openraft::CommittedLeaderId;
         let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
-        let json = journaled_raft_state(log_id, &StoredMembership::default(), None).expect("encode");
+        let json =
+            journaled_raft_state(log_id, &StoredMembership::default(), None).expect("encode");
         let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.log_id, log_id);
     }
@@ -7342,7 +7342,10 @@ mod tests {
         use openraft::CommittedLeaderId;
         let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
         let legacy = journaled_raft_state(log_id, &StoredMembership::default(), None).expect("e");
-        assert!(!legacy.contains("digest"), "no digest -> legacy shape: {legacy}");
+        assert!(
+            !legacy.contains("digest"),
+            "no digest -> legacy shape: {legacy}"
+        );
         let d = nano_server_storage::digest::next_entry_digest(None, 17, &[]);
         let json = journaled_raft_state(log_id, &StoredMembership::default(), Some(d)).expect("e");
         let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
@@ -7366,7 +7369,10 @@ mod tests {
         let back: ReplicatedBatch = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.digest, Some(claim));
         let plain = serde_json::to_string(&ReplicatedBatch::new(vec![])).expect("encode");
-        assert!(!plain.contains("digest"), "no claim -> legacy shape: {plain}");
+        assert!(
+            !plain.contains("digest"),
+            "no claim -> legacy shape: {plain}"
+        );
     }
 
     /// #1664: the ledger reports a divergence ONLY for a recorded, comparable
@@ -7383,20 +7389,50 @@ mod tests {
         assert_eq!(ledger.check(&same), None, "equal chains agree");
         let mut other = a;
         other.hash[0] ^= 1;
-        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: other }), Some(a));
-        assert_eq!(ledger.check(&DigestClaim { index: 4, chain: other }), None, "unknown index");
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: other
+            }),
+            Some(a)
+        );
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 4,
+                chain: other
+            }),
+            None,
+            "unknown index"
+        );
         let rebased = next_entry_digest(None, 3, &[]).chain;
-        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: rebased }), None, "other base");
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: rebased
+            }),
+            None,
+            "other base"
+        );
         // A Blank entry keeps the chain; a gap does not invent one.
         ledger.record_unchanged(6);
-        assert_eq!(ledger.latest_claim(), Some(DigestClaim { index: 6, chain: a }));
+        assert_eq!(
+            ledger.latest_claim(),
+            Some(DigestClaim { index: 6, chain: a })
+        );
         ledger.record_unchanged(8);
         assert_eq!(ledger.latest_claim().map(|c| c.index), Some(6));
         // The window is bounded.
         for i in 10..(10 + DIGEST_WINDOW as u64 + 5) {
             ledger.record(i, a);
         }
-        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: other }), None, "evicted");
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: other
+            }),
+            None,
+            "evicted"
+        );
         ledger.reset();
         assert_eq!(ledger.latest_claim(), None);
     }

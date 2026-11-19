@@ -7638,8 +7638,7 @@ mod tests {
         recover(&dir).expect("a faithful journal replays and verifies");
         // Snapshot + tail: the tail continues from the snapshot base's chain.
         {
-            let (mut journal, _r) =
-                crate::journal::Journal::open_segmented(&dir).expect("reopen");
+            let (mut journal, _r) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
             digest_entry(&mut journal, 4, Command::create_instance("demo"));

@@ -43405,7 +43405,11 @@ mod clustered_startup_tests {
                 if let Some(claim) = part.digest_claim() {
                     let seen = by_index.entry(claim.index).or_insert(claim);
                     if seen.chain.comparable(&claim.chain) {
-                        assert_eq!(*seen, claim, "node {n} p{p} chain disagrees at {}", claim.index);
+                        assert_eq!(
+                            *seen, claim,
+                            "node {n} p{p} chain disagrees at {}",
+                            claim.index
+                        );
                     }
                 }
             }
@@ -43456,8 +43460,14 @@ mod clustered_startup_tests {
     #[tokio::test]
     async fn a_diverged_follower_fail_stops_and_resyncs_from_the_leader() {
         let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
-        part0.propose(deploy_cmd("d-1"), 1_000).await.expect("deploy 1");
-        assert!(wait_follower_applied(&node1, &part0).await, "follower catches up");
+        part0
+            .propose(deploy_cmd("d-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        assert!(
+            wait_follower_applied(&node1, &part0).await,
+            "follower catches up"
+        );
         // Healthy replicas agree on the chain: no false positive so far.
         assert!(part1.divergence().is_none());
         assert_eq!(part0.digest_claim(), part1.digest_claim(), "chains agree");
@@ -43471,8 +43481,14 @@ mod clustered_startup_tests {
             .await;
         // Entry A folds from the perturbed chain on the follower; entry B
         // carries the leader's claim for A, so the follower detects it there.
-        part0.propose(deploy_cmd("d-2"), 2_000).await.expect("deploy A");
-        part0.propose(deploy_cmd("d-3"), 3_000).await.expect("deploy B");
+        part0
+            .propose(deploy_cmd("d-2"), 2_000)
+            .await
+            .expect("deploy A");
+        part0
+            .propose(deploy_cmd("d-3"), 3_000)
+            .await
+            .expect("deploy B");
 
         let mut stopped = false;
         for _ in 0..500 {
@@ -43491,18 +43507,36 @@ mod clustered_startup_tests {
             before + 1,
             "the operator-visible divergence metric is raised"
         );
-        assert!(part0.divergence().is_none(), "the leader never diverges on its own claims");
+        assert!(
+            part0.divergence().is_none(),
+            "the leader never diverges on its own claims"
+        );
 
         // Resync: the supervisor rebuilds the member fresh from the leader.
         let recovered = node1.recover_shutdown_partitions_once().await;
-        assert!(recovered.contains(&0), "diverged partition is resynced: {recovered:?}");
+        assert!(
+            recovered.contains(&0),
+            "diverged partition is resynced: {recovered:?}"
+        );
         let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
         assert!(!rebuilt.is_shutdown());
-        assert!(rebuilt.divergence().is_none(), "the resynced member starts clean");
+        assert!(
+            rebuilt.divergence().is_none(),
+            "the resynced member starts clean"
+        );
 
-        part0.propose(deploy_cmd("d-4"), 4_000).await.expect("deploy after resync");
-        part0.propose(deploy_cmd("d-5"), 5_000).await.expect("deploy after resync");
-        assert!(wait_follower_applied(&node1, &part0).await, "resynced follower catches up");
+        part0
+            .propose(deploy_cmd("d-4"), 4_000)
+            .await
+            .expect("deploy after resync");
+        part0
+            .propose(deploy_cmd("d-5"), 5_000)
+            .await
+            .expect("deploy after resync");
+        assert!(
+            wait_follower_applied(&node1, &part0).await,
+            "resynced follower catches up"
+        );
         let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
         assert!(!rebuilt.is_shutdown(), "no false positive after the resync");
         assert!(rebuilt.divergence().is_none());

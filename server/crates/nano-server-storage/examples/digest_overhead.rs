@@ -52,7 +52,10 @@ fn main() {
 
     let events: usize = entries.iter().map(|e| e.len()).sum();
     let per = |d: std::time::Duration| d.as_nanos() as f64 / ENTRIES as f64 / 1000.0;
-    println!("entries: {ENTRIES}, events/entry: {:.1}", events as f64 / ENTRIES as f64);
+    println!(
+        "entries: {ENTRIES}, events/entry: {:.1}",
+        events as f64 / ENTRIES as f64
+    );
     println!("apply+journal (in-memory): {:.2} us/entry", per(apply));
     println!("digest fold + record:      {:.2} us/entry", per(fold));
     println!(

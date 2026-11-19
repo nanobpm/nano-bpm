@@ -162,7 +162,11 @@ pub fn chain_of_raft_state(raft_state: &str) -> Option<ChainDigest> {
 
 /// The chain after folding entry `index` (with `events`) onto the replica's
 /// last applied record `prev_raft_state` (`None` when there is none).
-pub fn next_entry_digest(prev_raft_state: Option<&str>, index: u64, events: &[Event]) -> EntryDigest {
+pub fn next_entry_digest(
+    prev_raft_state: Option<&str>,
+    index: u64,
+    events: &[Event],
+) -> EntryDigest {
     let prev = prev_raft_state
         .and_then(chain_of_raft_state)
         .filter(|c| c.version == CHAIN_VERSION)
