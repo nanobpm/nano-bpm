@@ -1638,7 +1638,15 @@ impl PartitionStateMachine {
     /// adopted — the member resyncs from the leader (fresh receiver, or an
     /// installed leader snapshot, which clears the marker).
     async fn restore_newest_boot_state(&self) -> anyhow::Result<()> {
-        self.refuse_diverged_local_state()?;
+        if let Err(refused) = self.refuse_diverged_local_state() {
+            // Fence the engine too (#1691 review): a refused member is never
+            // hosted, and with no Raft member registered the server's direct
+            // (non-Raft) write paths would otherwise append to the very
+            // known-diverged journal this refusal protects. The journal's
+            // fence fails every command closed until a rebuild.
+            self.engine.with(|journal| journal.abort_raft_entry()).await;
+            return Err(refused);
+        }
         let journaled = self.journaled_applied().await?;
         let snapshot = self
             .current_snapshot
@@ -1876,10 +1884,6 @@ impl PartitionStateMachine {
         };
         write_snapshot_ptr(&self.snapshot_dir, &stored)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        // The leader's snapshot is now the durable boot baseline (#1691):
-        // only an authoritative resync clears the divergence marker.
-        clear_divergence_marker(&self.snapshot_dir)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         // #1488: publish the installed snapshot's per-partition/per-replica size
         // (+ the oversize alert) and promptly reap every OTHER superseded
         // snapshot artifact on this follower — under a catch-up retry loop the
@@ -1937,6 +1941,24 @@ impl PartitionStateMachine {
         if adopt {
             // The installed state carries the snapshot's chain (#1664).
             self.reseed_digest_from_journal().await;
+            // Only NOW — the leader's state adopted AND checkpointed as the
+            // journal's recovery base — is the divergent local state gone, so
+            // only now may the crash-durable marker (#1691) be cleared. A
+            // crash or adoption/checkpoint failure before this point keeps the
+            // marker and the next boot still refuses the diverged journal.
+            // Cleared under the publication lock the divergence latch +
+            // marker are published under, so a divergence detected
+            // concurrently is never erased.
+            let _publish = self.engine.snapshot_publish_lock().await;
+            if let Some(d) = self.digest.divergence() {
+                return Err(StorageIOError::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(d.to_string()),
+                )
+                .into());
+            }
+            clear_divergence_marker(&self.snapshot_dir)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -5337,7 +5359,8 @@ mod tests {
     /// and only an authoritative leader snapshot install clears the marker.
     #[tokio::test]
     async fn a_restart_after_a_divergence_refuses_local_state_until_resync() {
-        let (restarted, dir, leader_meta, diverged, received) = publication_race_fixture().await;
+        let (mut restarted, dir, leader_meta, diverged, received) =
+            publication_race_fixture().await;
         let chain = ChainDigest::genesis(1);
         let divergence = Divergence {
             index: 1,
@@ -5359,12 +5382,16 @@ mod tests {
             .await
             .expect_err("a diverged replica must not resume its local state");
         assert!(refused.to_string().contains("#1691"), "{refused}");
+        assert!(
+            restarted.engine.with(|j| j.is_fenced()).await,
+            "a refused boot fences the engine against direct writes"
+        );
         // A corrupt marker still fails closed.
         std::fs::write(divergence_marker_path(&dir), b"{not json").expect("corrupt");
         assert!(restarted.restore_newest_boot_state().await.is_err());
         // Authoritative leader resync: the install durably clears the marker.
         restarted
-            .install_snapshot_skip_adoption_for_test(&leader_meta, received)
+            .install_snapshot(&leader_meta, received)
             .await
             .expect("leader resync installs");
         assert!(read_divergence_marker(&dir).is_none(), "cleared by resync");
@@ -5372,6 +5399,33 @@ mod tests {
             .restore_newest_boot_state()
             .await
             .expect("boots after resync");
+    }
+
+    /// #1691 review: the marker must survive until the leader's state is
+    /// ADOPTED and checkpointed. A snapshot published without adoption (the
+    /// crash/adoption-failure window) leaves the divergent journal on disk, so
+    /// the marker must still fence the next boot.
+    #[tokio::test]
+    async fn a_resync_interrupted_before_adoption_keeps_the_marker() {
+        let (restarted, dir, leader_meta, diverged, received) = publication_race_fixture().await;
+        let chain = ChainDigest::genesis(1);
+        let _ = diverged
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 2,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            })
+            .await;
+        restarted
+            .install_snapshot_skip_adoption_for_test(&leader_meta, received)
+            .await
+            .expect("publication without adoption");
+        assert!(
+            read_divergence_marker(&dir).is_some(),
+            "an unadopted resync must not clear the marker"
+        );
+        assert!(restarted.restore_newest_boot_state().await.is_err());
     }
 
     /// A per-test scratch dir under the system temp dir, removed on drop.
