@@ -85,3 +85,14 @@ required-features = ["serde"]
 [[example]]
 name = "divergence_digest"
 required-features = ["serde"]
+
+# Determinism CI (ADR 0066 slice 6, #1665): the command-corpus generator and
+# the corpus runner `scripts/determinism-ci.sh` drives across seeds, restarts,
+# profiles, platforms and the previous release.
+[[example]]
+name = "determinism_corpus"
+required-features = ["serde"]
+
+[[example]]
+name = "determinism_replay"
+required-features = ["serde"]
