@@ -1,0 +1,82 @@
+{
+  "observational_variants": [
+    {
+      "variant": "GatewayRouteSelected",
+      "introduced_in": "v0.0.28",
+      "issue": "#1402",
+      "rationale": "Journals the split gateway's activation-time flow selection so completion takes exactly those flows instead of re-evaluating FEEL. The state it writes (Instance::gateway_routes, serde(default)) is transient - cleared when the gateway completes - and a gateway completing without a recorded selection re-selects from the current variables exactly as the previous release does, so the routed flows (SequenceFlowTaken, compared unfiltered) agree on both builds. The previous release cannot decode the frame, so mixed-version replicas must not share a journal: a rolling upgrade replaces replicas whole-node (snapshot + replay under the new build), never by an old node replaying a new node's log."
+    }
+  ],
+  "divergences": [
+    {
+      "scenario": "messages-signals-conditional",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true,
+        "only_in_prev": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "rationale": "Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Rolling upgrade: the order is decided by the replica that APPLIES the command and is journaled as events, which followers replay rather than re-derive, so a partition never mixes the two orders within one log; an in-flight join opened under the previous release keeps its recorded state (ParallelJoinTokenArrived/ParallelJoinOpened, compared unchanged) and fires under the new one with the same outcome."
+    },
+    {
+      "scenario": "suspend-resume-cancel",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "rationale": "Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Rolling upgrade: the order is decided by the replica that APPLIES the command and is journaled as events, which followers replay rather than re-derive, so a partition never mixes the two orders within one log; an in-flight join opened under the previous release keeps its recorded state (ParallelJoinTokenArrived/ParallelJoinOpened, compared unchanged) and fires under the new one with the same outcome."
+    },
+    {
+      "scenario": "random-workload",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true,
+        "only_in_prev": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "rationale": "Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Rolling upgrade: the order is decided by the replica that APPLIES the command and is journaled as events, which followers replay rather than re-derive, so a partition never mixes the two orders within one log; an in-flight join opened under the previous release keeps its recorded state (ParallelJoinTokenArrived/ParallelJoinOpened, compared unchanged) and fires under the new one with the same outcome."
+    }
+  ]
+}

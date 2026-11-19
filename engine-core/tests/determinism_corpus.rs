@@ -34,7 +34,8 @@ use nanobpmn_engine_core::{Command, Engine};
 const RANDOM: usize = 64;
 
 fn corpus_jsonl() -> String {
-    corpus::to_jsonl(&corpus::build(RANDOM))
+    let (entries, labels) = corpus::build_labeled(RANDOM);
+    corpus::to_jsonl(&entries, &labels)
 }
 
 fn run(jsonl: &str, opts: &runner::RunOptions, engine: &mut Engine) -> String {
@@ -256,13 +257,86 @@ fn records(text: &str) -> Vec<serde_json::Value> {
     compare::parse_records(text).unwrap()
 }
 
+fn labels() -> Vec<String> {
+    corpus::build_labeled(RANDOM)
+        .1
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `cross_release_checked` over `head`/`prev` with `allowlist` (JSON) and
+/// `added` as the golden-derived additive set, previous release `v0.0.1`.
+fn checked(
+    head: &[serde_json::Value],
+    prev: &[serde_json::Value],
+    allowlist: serde_json::Value,
+    added: &[&str],
+) -> Result<compare::CheckedReport, String> {
+    let scenarios = labels();
+    let allowlist = compare::parse_allowlist(&allowlist.to_string())?;
+    let added: compare::Vocab = added.iter().map(|t| (*t).to_owned()).collect();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(head, prev, &ctx)
+}
+
+fn no_allowlist() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn head_records() -> Vec<serde_json::Value> {
+    records(&full_run(&corpus_jsonl(), false))
+}
+
+/// The entry records (not state checkpoints) of `records`, mutably.
+fn entries_mut(records: &mut [serde_json::Value]) -> Vec<&mut serde_json::Value> {
+    records
+        .iter_mut()
+        .filter(|r| r.get("state").is_none())
+        .collect()
+}
+
+/// Removes every `variant` event from `records` (a release that never emits
+/// it).
+fn without_variant(records: &[serde_json::Value], variant: &str) -> Vec<serde_json::Value> {
+    let mut out = records.to_vec();
+    for r in entries_mut(&mut out) {
+        if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+            events.retain(|e| e.get(variant).is_none());
+        }
+    }
+    out
+}
+
+/// The first entry index of `scenario` whose events contain at least two
+/// distinct events.
+fn reorderable_entry(records: &[serde_json::Value], scenario: &str) -> usize {
+    let scenarios = labels();
+    records
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .enumerate()
+        .find(|(i, r)| {
+            scenarios[*i] == scenario
+                && r.get("events")
+                    .and_then(|e| e.as_array())
+                    .is_some_and(|e| e.len() >= 2 && e.first() != e.last())
+        })
+        .map(|(i, _)| i)
+        .expect("a multi-event entry in the scenario")
+}
+
 #[test]
 fn cross_release_compares_durable_state() {
-    let jsonl = corpus_jsonl();
-    let head = records(&full_run(&jsonl, false));
-    let report = compare::cross_release(&head, &head).unwrap();
-    assert!(report.states_compared > 0);
-    assert_eq!(report.states_skipped_format_bump, 0);
+    let head = head_records();
+    let report = checked(&head, &head, no_allowlist(), &[]).unwrap();
+    assert!(report.base.states_compared > 0);
+    assert_eq!(report.base.states_skipped_format_bump, 0);
 
     // Identical events, divergent durable state at the same format: caught.
     let mut prev = head.clone();
@@ -272,16 +346,16 @@ fn cross_release_compares_durable_state() {
         .find(|r| r.get("state").is_some())
         .unwrap();
     state["state"]["next_local"] = serde_json::json!(987_654_321u64);
-    let err = compare::cross_release(&head, &prev).unwrap_err();
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
     assert!(err.contains("durable state diverges"), "{err}");
 
     // A snapshot-format bump is the explicit shape-change decision: skipped.
     for r in prev.iter_mut().filter(|r| r.get("state").is_some()) {
         r["format"] = serde_json::json!(0);
     }
-    let report = compare::cross_release(&head, &prev).unwrap();
-    assert_eq!(report.states_compared, 0);
-    assert!(report.states_skipped_format_bump > 0);
+    let report = checked(&head, &prev, no_allowlist(), &[]).unwrap();
+    assert_eq!(report.base.states_compared, 0);
+    assert!(report.base.states_skipped_format_bump > 0);
 
     // Missing checkpoints are not a silent pass.
     let no_state: Vec<_> = head
@@ -289,7 +363,162 @@ fn cross_release_compares_durable_state() {
         .filter(|r| r.get("state").is_none())
         .cloned()
         .collect();
-    assert!(compare::cross_release(&no_state, &no_state).is_err());
+    assert!(checked(&no_state, &no_state, no_allowlist(), &[]).is_err());
+}
+
+/// #1698: a new event variant the previous release never emits fails unless
+/// it is ratified as observational — and then it passes, filtered.
+#[test]
+fn prev_release_gate_undeclared_new_variant_fails_declared_observational_passes() {
+    let head = head_records();
+    let prev = without_variant(&head, "JobCanceled");
+    let err = checked(&head, &prev, no_allowlist(), &["JobCanceled"]).unwrap_err();
+    assert!(
+        err.contains("UNDECLARED new event variant `JobCanceled`"),
+        "{err}"
+    );
+
+    let allow = serde_json::json!({"observational_variants": [{
+        "variant": "JobCanceled", "introduced_in": "v0.0.2", "issue": "#0",
+        "rationale": "test"
+    }]});
+    let report = checked(&head, &prev, allow.clone(), &["JobCanceled"]).unwrap();
+    assert!(report.observational_filtered > 0);
+
+    // Only a golden-recorded additive variant can be ratified.
+    let err = checked(&head, &prev, allow, &[]).unwrap_err();
+    assert!(err.contains("not recorded by the golden"), "{err}");
+}
+
+/// #1698: a golden-added field the previous release never emits is erased; a
+/// field the golden does not record as added is a real divergence.
+#[test]
+fn prev_release_gate_erases_only_golden_added_fields() {
+    let head = head_records();
+    let mut prev = head.clone();
+    for r in entries_mut(&mut prev) {
+        if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+            for e in events {
+                if let Some(body) = e.get_mut("JobCanceled").and_then(|b| b.as_object_mut()) {
+                    body.remove("canceled_at");
+                }
+            }
+        }
+    }
+    // (Re-decoded through the head type, the missing field defaults to 0.)
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
+    assert!(err.contains("canceled_at"), "{err}");
+    let report = checked(&head, &prev, no_allowlist(), &["JobCanceled.canceled_at"]).unwrap();
+    assert_eq!(report.erased_fields, ["JobCanceled.canceled_at".to_owned()]);
+}
+
+/// #1698: an allowlisted scenario admits exactly its declared divergence;
+/// anything more fails, and an entry the run does not need is stale.
+#[test]
+fn prev_release_gate_allowlisted_scenario_admits_only_the_declared_divergence() {
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    let i = reorderable_entry(&head, scenario);
+    let declare = |expected: serde_json::Value, introduced: &str| {
+        serde_json::json!({"divergences": [{
+            "scenario": scenario, "expected": expected, "introduced_in": introduced,
+            "issue": "#0", "rationale": "test"
+        }]})
+    };
+    let reorder = serde_json::json!({"reorder": true});
+
+    // Reordered events: undeclared → fails; declared `reorder` → passes.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        events.reverse();
+    }
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
+    assert!(err.contains(&format!("scenario {scenario}")), "{err}");
+    let report = checked(&head, &prev, declare(reorder.clone(), "v0.0.2"), &[]).unwrap();
+    assert_eq!(report.ratified_divergent_entries, 1);
+
+    // An undeclared EXTRA divergence in the allowlisted scenario fails.
+    let mut extra = prev.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut extra)[i].get_mut("events") {
+        events.pop();
+    }
+    let err = checked(&head, &extra, declare(reorder.clone(), "v0.0.2"), &[]).unwrap_err();
+    assert!(err.contains("UNDECLARED extra divergence"), "{err}");
+
+    // Stale: the scenario no longer diverges.
+    let err = checked(&head, &head, declare(reorder.clone(), "v0.0.2"), &[]).unwrap_err();
+    assert!(
+        err.contains("STALE") && err.contains("no longer diverges"),
+        "{err}"
+    );
+
+    // Expired: the previous release (v0.0.1) is at or past the introducing
+    // release, so both builds run the new behaviour.
+    let err = checked(&head, &prev, declare(reorder, "v0.0.1"), &[]).unwrap_err();
+    assert!(err.contains("STALE") && err.contains("at or past"), "{err}");
+}
+
+/// #1698: every entry the previous release cannot decode must be explained
+/// by the golden-derived additive set; an unexplained drop fails.
+#[test]
+fn prev_release_gate_unexplained_drop_fails() {
+    let probe = |err: &str| vec![serde_json::json!({"i": 3, "undecodable": err})];
+    let added: compare::Vocab = [
+        "DeployBundle".to_owned(),
+        "ModifyInstance.terminate_element_ids".to_owned(),
+    ]
+    .into();
+    let variant = probe("unknown variant `DeployBundle`, expected one of ...");
+    assert_eq!(compare::explain_drops(&variant, &added).unwrap().len(), 1);
+    let lossy = probe("lossy decode: drops field `ModifyInstance.terminate_element_ids`");
+    assert_eq!(compare::explain_drops(&lossy, &added).unwrap().len(), 1);
+
+    for unexplained in [
+        "unknown variant `SomethingElse`, expected one of ...",
+        "lossy decode: drops field `ModifyInstance.other`",
+        "invalid type: string, expected u64",
+    ] {
+        let err = compare::explain_drops(&probe(unexplained), &added).unwrap_err();
+        assert!(err.contains("NOT explained"), "{err}");
+    }
+}
+
+/// #1698: a field the previous release silently ignores is reported as a
+/// lossy decode (not applied as a different command), unless it holds the
+/// default.
+#[test]
+fn prev_release_gate_detects_lossy_decode() {
+    let modify = serde_json::json!({"ModifyInstance": {
+        "instance_key": 1, "activate_instructions": [], "move_instructions": [],
+        "terminate_instructions": [], "terminate_element_ids": ["pay"]
+    }});
+    assert!(!compare::lossy_is_benign(
+        &modify,
+        &["ModifyInstance.terminate_element_ids".to_owned()]
+    ));
+    let full = corpus::build(RANDOM);
+    let deploy = serde_json::to_value(&full[0].1).unwrap();
+    assert!(compare::lossy_is_benign(
+        &deploy,
+        &["UserTask.form_binding_type".to_owned()]
+    ));
+
+    // The runner reports an unknown, non-empty field instead of applying.
+    let line = format!(
+        "{}\n",
+        serde_json::json!({"now": 1, "command": {"CancelInstance": {
+            "instance_key": 1, "from_the_future": "x"
+        }}})
+    );
+    let opts = runner::RunOptions {
+        skip_undecodable: true,
+        ..Default::default()
+    };
+    let out = run(&line, &opts, &mut Engine::new());
+    assert!(
+        out.contains("lossy decode: drops field `CancelInstance.from_the_future`"),
+        "{out}"
+    );
 }
 
 /// Excluding entries a previous release cannot decode regenerates the corpus
@@ -302,7 +531,7 @@ fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
     let last = full.len() as u64 - 1;
 
     // A self-contained tail entry: exactly one fewer entry, rest intact.
-    let (tail, excluded) = corpus::build_excluding(RANDOM, [last].into()).unwrap();
+    let (tail, _, excluded) = corpus::build_excluding(RANDOM, [last].into()).unwrap();
     assert_eq!(tail.len(), full.len() - 1);
     assert_eq!(excluded, [last].into());
 
@@ -310,7 +539,7 @@ fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
     // key; re-harvesting keeps every kept outcome.
     let deploy_forms = position_of(&full, "deploy_forms");
     assert_eq!(deploy_forms.len(), 1, "one DeployForms entry");
-    let (_, excluded) =
+    let (_, _, excluded) =
         corpus::build_excluding(RANDOM, deploy_forms.iter().copied().collect()).unwrap();
     assert_eq!(excluded, deploy_forms.into_iter().collect());
 
@@ -320,7 +549,7 @@ fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
         .into_iter()
         .find(|&p| matches!(&full[p as usize].1, Command::DeployProcess(d) if d.id == "escalation"))
         .expect("escalation deploy");
-    let (_, excluded) = corpus::build_excluding(RANDOM, [esp_deploy].into()).unwrap();
+    let (_, _, excluded) = corpus::build_excluding(RANDOM, [esp_deploy].into()).unwrap();
     assert!(excluded.len() > 1, "dependents excluded: {excluded:?}");
 
     // The core order-process deployment: most of the corpus depends on it.
