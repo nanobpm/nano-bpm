@@ -5,10 +5,12 @@ import type {
   AgentInstanceResult,
 } from "./gen-c8/types.gen";
 import {
+  AGENT_HISTORY_FILTER,
   agentBadge,
   agentsByElement,
   chapters,
   initialPlayhead,
+  isPendingItem,
   isAgentActive,
   onHistoryChanged,
   orderHistory,
@@ -111,6 +113,28 @@ test("de-duplicates by key, and the later copy wins", () => {
   assert.equal(out[0].commitStatus, "COMMITTED");
 });
 
+// --- commit status (nano-bpm#1686) ----------------------------------------------
+
+test("history filter asks for PENDING turns as well as COMMITTED ones", () => {
+  // A running agent's turns are PENDING until its job completes. Asking for
+  // COMMITTED only left long-running agents with no transcript at all.
+  assert.deepEqual(AGENT_HISTORY_FILTER, {
+    commitStatus: { $in: ["PENDING", "COMMITTED"] },
+  });
+});
+
+test("isPendingItem marks only PENDING turns", () => {
+  assert.equal(
+    isPendingItem(item("1", 1, "USER", 0, { commitStatus: "PENDING" })),
+    true,
+  );
+  assert.equal(isPendingItem(item("2", 1, "USER", 0)), false);
+  assert.equal(
+    isPendingItem(item("3", 1, "USER", 0, { commitStatus: "DISCARDED" })),
+    false,
+  );
+});
+
 // --- chapters -------------------------------------------------------------------
 
 test("one chapter per loop iteration, sized by step count", () => {
@@ -188,6 +212,24 @@ test("live: a parked playhead past a shrunken history clamps but does not start 
   assert.deepEqual(onHistoryChanged({ index: 5, follow: false }, 3), {
     index: 2,
     follow: false,
+  });
+});
+
+test("live: a following playhead clamps to a shrunken history's new end", () => {
+  // The discard case behind nano-bpm#1686's review: a refetch after PENDING
+  // turns became DISCARDED shrinks the log, and a playhead parked at the old
+  // end must land on the new end in the SAME render — the scrubber derives
+  // `items[head.index]` synchronously, before the reconciliation effect can
+  // run, so an unclamped index crashes the view on `current.producedAt`.
+  assert.deepEqual(onHistoryChanged({ index: 4, follow: true }, 2), {
+    index: 1,
+    follow: true,
+  });
+  // Shrunk to nothing: no step is current, and follow re-arms for the next
+  // item (the same shape `initialPlayhead(0)` produces).
+  assert.deepEqual(onHistoryChanged({ index: 4, follow: true }, 0), {
+    index: -1,
+    follow: true,
   });
 });
 

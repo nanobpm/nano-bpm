@@ -9,20 +9,40 @@
 // `metrics.durationMs`) and tool calls (from the ASSISTANT item that requested
 // them to the TOOL_RESULT that answered them) on fixed lanes.
 //
-// "Live" is turn granularity: new committed items arrive with each refetch and
-// the playhead follows the end when it was already there.
+// "Live" is turn granularity: new items arrive with each refetch and the
+// playhead follows the end when it was already there. A running agent's turns
+// are PENDING until its job completes (nano-bpm#1686), so the history shows
+// PENDING and COMMITTED items; PENDING ones are marked as in progress.
 //
 // Pure: no React, no fetch. Rendering lives in components/AgentHistoryPanel.tsx.
 // Lane/chapter model after the Temporal Agent Harness console
 // (ui/src/lib/state/{stepTimeline,scrubLane}.ts, MIT).
 
 import type {
+  AgentInstanceHistoryFilter,
   AgentInstanceHistoryItemResult,
   AgentInstanceResult,
   AgentInstanceStatusEnum,
 } from "./gen-c8/types.gen";
 
 export type HistoryItem = AgentInstanceHistoryItemResult;
+
+// --- Commit status -------------------------------------------------------------
+
+/** The history search filter a data source should send. A harness streams each
+ *  turn into AgentHistory as it happens, as a PENDING item that commits only when
+ *  the job completes, so a long-running agent would have no transcript at all
+ *  under a COMMITTED-only filter (nano-bpm#1686). DISCARDED items (a failed or
+ *  superseded attempt's turns) stay out. */
+export const AGENT_HISTORY_FILTER = {
+  commitStatus: { $in: ["PENDING", "COMMITTED"] },
+} as const satisfies AgentInstanceHistoryFilter;
+
+/** A turn that is not final yet: its job is still running (or its attempt has
+ *  not been settled). */
+export function isPendingItem(item: HistoryItem): boolean {
+  return item.commitStatus === "PENDING";
+}
 
 // --- Ordering ----------------------------------------------------------------
 
