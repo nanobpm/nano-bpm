@@ -145,6 +145,13 @@ command limit. Therefore:
   rather than `| tail`, so a failure can be inspected without re-running.
 - **Commit and push early** on your task branch once a coherent step compiles, so
   a killed run resumes from your work instead of starting over.
+- **Never background a job and `sleep` on it.** Patterns like
+  `cmd > /tmp/x.log 2>&1 & sleep 600; tail /tmp/x.log` are silent for the whole
+  sleep, so the idle watchdog kills the run (#1664 lost a 156-minute run this
+  way, #1705). Run long commands in the **foreground** with the log-file pattern
+  above. If a step genuinely outlasts the command limit, split or scope it rather
+  than waiting on it in the background. Benchmarks are long commands too: run
+  them in the foreground, scoped, with a bounded iteration count.
 
 ## BPMN Models need DI
 
