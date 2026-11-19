@@ -853,10 +853,42 @@ fn write_divergence_marker(dir: &Path, d: &Divergence) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, divergence_marker_path(dir))?;
-    if let Ok(dirf) = std::fs::File::open(dir) {
-        let _ = dirf.sync_all();
+    sync_dir(dir)
+}
+
+/// Fsyncs `dir` so a rename/unlink in it is durable; failures propagate (a
+/// swallowed directory fsync would report a non-durable fence as durable).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Establishes the boot-time divergence fence (#1691), failing closed: when
+/// the detailed marker cannot be published (e.g. a full disk), it falls back
+/// to an EMPTY marker file at the marker path — a create needs no data
+/// blocks — which [`read_divergence_marker`] reads as an undecodable marker
+/// and therefore still refuses the boot.
+fn persist_divergence_fence(dir: &Path, d: &Divergence) -> std::io::Result<()> {
+    let Err(detailed) = write_divergence_marker(dir, d) else {
+        return Ok(());
+    };
+    let fallback = (|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(divergence_marker_path(dir))?
+            .sync_all()?;
+        sync_dir(dir)
+    })();
+    match fallback {
+        Ok(()) => Err(std::io::Error::other(format!(
+            "detailed divergence marker failed ({detailed}); an empty fail-closed marker was \
+             published instead"
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "divergence marker failed ({detailed}) and so did the fallback fence ({e})"
+        ))),
     }
-    Ok(())
 }
 
 /// Reads the durable divergence marker (#1691). An unreadable/undecodable
@@ -864,8 +896,12 @@ fn write_divergence_marker(dir: &Path, d: &Divergence) -> std::io::Result<()> {
 /// detail rather than being ignored.
 fn read_divergence_marker(dir: &Path) -> Option<Result<Divergence, String>> {
     let path = divergence_marker_path(dir);
-    if !path.exists() {
-        return None;
+    // `symlink_metadata`, not `exists()`: a lookup error other than NotFound
+    // must fail closed rather than read as "no marker".
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("marker lookup failed: {e}"))),
+        Ok(_) => {}
     }
     Some(
         std::fs::read(&path)
@@ -879,13 +915,11 @@ fn read_divergence_marker(dir: &Path) -> Option<Result<Divergence, String>> {
 fn clear_divergence_marker(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(divergence_marker_path(dir)) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Still sync below: a retry must complete an earlier failed barrier.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    if let Ok(dirf) = std::fs::File::open(dir) {
-        let _ = dirf.sync_all();
-    }
-    Ok(())
+    sync_dir(dir)
 }
 
 /// The name a diverged snapshot artifact is quarantined under (#1664): a
@@ -1570,7 +1604,7 @@ impl PartitionStateMachine {
             // Crash-durable marker (#1691) BEFORE the quarantine: a restart
             // must never resume the diverged journal, and a self-consistent
             // diverged chain passes replay verification on its own.
-            if let Err(e) = write_divergence_marker(&self.snapshot_dir, &divergence) {
+            if let Err(e) = persist_divergence_fence(&self.snapshot_dir, &divergence) {
                 tracing::error!(
                     dir = ?self.snapshot_dir,
                     error = %e,
@@ -5338,6 +5372,65 @@ mod tests {
             .restore_newest_boot_state()
             .await
             .expect("boots after resync");
+    }
+
+    /// A per-test scratch dir under the system temp dir, removed on drop.
+    struct MarkerTestDir(PathBuf);
+    impl MarkerTestDir {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "nano-marker-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for MarkerTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// #1691 review: marker publication failure still leaves a durable fence
+    /// (an empty fallback marker) that refuses the next boot.
+    #[test]
+    fn a_failed_marker_publication_still_fences_the_boot() {
+        let dir = MarkerTestDir::new();
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        // A directory squatting the tmp path makes the detailed write fail.
+        let tmp = dir
+            .path()
+            .join(format!("divergence-marker.json.tmp-{}", std::process::id()));
+        std::fs::create_dir(&tmp).expect("squat tmp");
+        assert!(persist_divergence_fence(dir.path(), &d).is_err());
+        assert!(
+            matches!(read_divergence_marker(dir.path()), Some(Err(_))),
+            "the fallback marker fails closed"
+        );
+    }
+
+    /// #1691 review: a marker lookup error is not "absent".
+    #[test]
+    fn a_marker_lookup_error_fails_closed() {
+        let dir = MarkerTestDir::new();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").expect("file");
+        // `<file>/divergence-marker.json` → ENOTDIR, not NotFound.
+        assert!(matches!(read_divergence_marker(&file), Some(Err(_))));
+        assert!(read_divergence_marker(dir.path()).is_none());
+        clear_divergence_marker(dir.path()).expect("absent clear still syncs");
     }
 
     /// #1664 review: a divergence quarantine keeps BOTH the pointer and the
