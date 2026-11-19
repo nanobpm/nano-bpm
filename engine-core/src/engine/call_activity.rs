@@ -7,7 +7,7 @@
 //! tool, projecting the child's output back onto the caller on completion, and
 //! the recursion-depth guard. Pure movement of whole methods; no logic change.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::{Engine, Step, MAX_CALL_ACTIVITY_DEPTH};
 use crate::event::Event;
@@ -59,9 +59,9 @@ impl Engine {
     /// `call_eiks` (lowest key wins, same lifecycle filter).
     pub(super) fn call_activity_children_of(
         &self,
-        call_eiks: &std::collections::HashSet<Key>,
-    ) -> std::collections::HashMap<Key, Key> {
-        let mut out = std::collections::HashMap::new();
+        call_eiks: &std::collections::BTreeSet<Key>,
+    ) -> std::collections::BTreeMap<Key, Key> {
+        let mut out = std::collections::BTreeMap::new();
         if call_eiks.is_empty() {
             return out;
         }
@@ -128,7 +128,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
-        preserved_seed: Option<HashMap<String, Value>>,
+        preserved_seed: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Ad-hoc call-activity tool (issue #1159): the tool element is pruned from
         // the flat element graph, so `element_kind` returns `None` for it and the
@@ -193,7 +193,7 @@ impl Engine {
         element_id: &str,
         called_process_id: &str,
         propagate_all_parent: bool,
-        element_vars: &HashMap<String, Value>,
+        element_vars: &BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings are evaluated into the call activity's local scope
         // regardless (Zeebe: they seed the child's local variables). With
@@ -204,7 +204,7 @@ impl Engine {
         // an isolated child seeded purely by the mappings.
         let inputs = self.io_inputs(parent_instance, element_id);
         let input_results = if inputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             match self.eval_io_mappings_in(element_vars, &inputs) {
                 Ok(updates) => updates,
@@ -265,8 +265,8 @@ impl Engine {
         call_eik: Key,
         element_id: &str,
         called_process_id: &str,
-        eval_view: &HashMap<String, Value>,
-        child_seed: HashMap<String, Value>,
+        eval_view: &BTreeMap<String, Value>,
+        child_seed: BTreeMap<String, Value>,
         // The ad-hoc tool's single-pass input projection to preserve on any
         // recoverable spawn incident (issue #1159 / #1176), or `None` for a
         // mainstream sequence-flow call activity. When `Some`, a spawn incident
@@ -276,7 +276,7 @@ impl Engine {
         // already-mutated child scope; a mainstream call activity (`None`)
         // re-derives its seed idempotently from its still-stable element scope and
         // so carries the plain [`state::IoMappingRedrive::CallActivitySpawn`].
-        adhoc_input_projection: Option<HashMap<String, Value>>,
+        adhoc_input_projection: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // The recoverable-spawn-incident redrive: for an ad-hoc tool it preserves
         // the single-pass input projection so the respawn does not re-evaluate the
@@ -419,7 +419,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let still_active = self
             .state
@@ -481,7 +481,7 @@ impl Engine {
                 .map(|mi| mi.element_id == element_id)
                 .unwrap_or(false);
         if is_mi_child {
-            let mut overlay: HashMap<String, Value> = HashMap::new();
+            let mut overlay: BTreeMap<String, Value> = BTreeMap::new();
             if propagate_all_child && !child_variables.is_empty() {
                 overlay.extend(child_variables.clone());
             }

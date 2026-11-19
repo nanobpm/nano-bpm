@@ -244,7 +244,7 @@ fn migration_of_adhoc_sub_process_with_active_inner_instances() {
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -254,7 +254,7 @@ fn migration_of_adhoc_sub_process_with_active_inner_instances() {
     // Complete one tool before migrating, leaving one inner instance active.
     let tools = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     assert_eq!(tools.len(), 2);
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("A".to_string()));
     run(
         &mut engine,
@@ -305,7 +305,7 @@ fn migration_of_adhoc_sub_process_with_active_inner_instances() {
     assert_replays(&log, &engine, inst);
 
     // Finish the remaining tool; the agent re-runs on the target container.
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("B".to_string()));
     run(
         &mut engine,
@@ -322,7 +322,7 @@ fn migration_of_adhoc_sub_process_with_active_inner_instances() {
         &mut log,
         Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -730,7 +730,7 @@ fn migration_remaps_a_pending_adhoc_tool_activation_incident() {
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -768,7 +768,7 @@ fn migration_remaps_a_pending_adhoc_tool_activation_incident() {
     run(
         &mut engine,
         &mut log,
-        Command::set_variables(inst, HashMap::from([("base".to_string(), Value::Int(5))])),
+        Command::set_variables(inst, BTreeMap::from([("base".to_string(), Value::Int(5))])),
     );
     run(&mut engine, &mut log, Command::resolve_incident(incident));
     let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
@@ -843,7 +843,7 @@ fn migration_remaps_a_pending_adhoc_tool_job_type_incident() {
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -882,7 +882,7 @@ fn migration_remaps_a_pending_adhoc_tool_job_type_incident() {
         &mut log,
         Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ),
     );
     run(&mut engine, &mut log, Command::resolve_incident(incident));
@@ -954,7 +954,7 @@ fn migration_raises_a_recoverable_incident_when_the_renamed_output_collection_is
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -988,7 +988,7 @@ fn migration_raises_a_recoverable_incident_when_the_renamed_output_collection_is
     // incident parks on the tool child instead of the append.
     let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     assert_eq!(tool.len(), 1);
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("A".to_string()));
     run(
         &mut engine,
@@ -1010,7 +1010,7 @@ fn migration_raises_a_recoverable_incident_when_the_renamed_output_collection_is
         &mut log,
         Command::set_variables_scoped(
             container,
-            HashMap::from([("results2".to_string(), Value::List(Vec::new()))]),
+            BTreeMap::from([("results2".to_string(), Value::List(Vec::new()))]),
             true,
         ),
     );
@@ -1097,7 +1097,7 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1142,7 +1142,7 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
     let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     assert_eq!(tool.len(), 1, "the migrated tool is still in flight");
     assert_eq!(tool[0].element_id, "toolA2");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("A".to_string()));
     run(
         &mut engine,
@@ -1183,7 +1183,7 @@ fn migration_refreshes_the_advertised_adhoc_tool_catalog() {
         &mut log,
         Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolB2")],
                 ..Default::default()
@@ -1313,7 +1313,7 @@ fn container_only_migration_with_pending_tool(
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1378,7 +1378,7 @@ fn migration_ignores_resolved_tool_retry_incidents() {
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1391,7 +1391,7 @@ fn migration_ignores_resolved_tool_retry_incidents() {
         &mut log,
         Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ),
     );
     run(&mut engine, &mut log, Command::resolve_incident(incident));
@@ -1400,7 +1400,7 @@ fn migration_ignores_resolved_tool_retry_incidents() {
     run(
         &mut engine,
         &mut log,
-        Command::complete_job_with(tool[0].key, HashMap::new()),
+        Command::complete_job_with(tool[0].key, BTreeMap::new()),
     );
     assert!(engine.active_incidents().is_empty());
     run(
@@ -1440,7 +1440,7 @@ fn container_completion_after_collection_rename_raises_a_recoverable_incident() 
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1453,7 +1453,7 @@ fn container_completion_after_collection_rename_raises_a_recoverable_incident() 
         &mut log,
         Command::complete_job_with(
             tool[0].key,
-            HashMap::from([("result".to_string(), Value::Str("A".to_string()))]),
+            BTreeMap::from([("result".to_string(), Value::Str("A".to_string()))]),
         ),
     );
     run(
@@ -1468,7 +1468,7 @@ fn container_completion_after_collection_rename_raises_a_recoverable_incident() 
         &mut log,
         Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -1505,7 +1505,7 @@ fn container_completion_after_collection_rename_raises_a_recoverable_incident() 
         &mut log,
         Command::set_variables_scoped(
             container,
-            HashMap::from([("results2".to_string(), source)]),
+            BTreeMap::from([("results2".to_string(), source)]),
             true,
         ),
     );

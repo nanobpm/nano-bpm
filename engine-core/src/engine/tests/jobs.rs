@@ -12,7 +12,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -32,7 +32,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
     // The `work` job completes writing `scoped = 99` (a name owned by the
     // sub-process scope). It must update the sub-process scope, not root.
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("scoped".to_string(), Value::Int(99));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -179,7 +179,7 @@ fn variable_spill_selects_only_job_parked_instances() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -218,7 +218,7 @@ fn spilling_a_nested_scope_instance_preserves_the_merged_job_view() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -263,7 +263,7 @@ fn leased_job_instance_is_still_spillable() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -352,7 +352,7 @@ fn cold_spill_round_trips_a_job_parked_instance() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -418,7 +418,7 @@ fn cold_spill_excludes_instances_with_a_locked_job() {
 
 #[test]
 fn static_retries_declaration_sets_initial_job_retries() {
-    let engine = deploy_and_create_retryable(Some("5"), HashMap::new());
+    let engine = deploy_and_create_retryable(Some("5"), BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, 5);
 }
@@ -433,7 +433,7 @@ fn feel_retries_expression_resolves_against_variables() {
 
 #[test]
 fn missing_retries_declaration_defaults_to_three() {
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, state::DEFAULT_JOB_RETRIES);
 }
@@ -468,7 +468,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
     engine
         .apply_command(Command::create_instance_full(
             "p",
-            HashMap::new(),
+            BTreeMap::new(),
             vec!["vip".to_string(), "eu".to_string()],
             Some("order-42".to_string()),
         ))
@@ -507,7 +507,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
 fn activated_job_has_empty_custom_headers_when_task_declares_none() {
     // A service task without zeebe:taskHeaders yields an empty header map — the
     // conservative default, never a borrowed or synthesised set.
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let mut engine = engine;
     let activated = engine.activate_jobs("do-work", "w1", 10, 60_000, 0);
     assert_eq!(activated.len(), 1);
@@ -720,7 +720,7 @@ fn should_route_on_variables_returned_by_a_completed_job() {
 
     // when the worker completes the job, returning decision=yes
     let job_key = engine.activate_jobs("decision", "w", 1, 60_000, 0)[0].key;
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::complete_job_with(job_key, vars))
         .unwrap();
@@ -1045,7 +1045,7 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // when an instance is created with jobType bound to a concrete value
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("jobType".to_string(), Value::Str("payment".to_string()));
     engine
         .apply_command(Command::create_instance_with("dynamic", vars))
@@ -1361,7 +1361,7 @@ fn should_dispatch_jobs_to_a_callback_worker() {
     let mut seen = Vec::new();
     let handled = engine.poll_jobs("payment", "cb", 10, 60_000, 0, |job| {
         seen.push(job.job_type.clone());
-        Some(HashMap::new())
+        Some(BTreeMap::new())
     });
 
     // then the job was dispatched and completed, finishing the instance
@@ -1408,7 +1408,7 @@ fn poll_jobs_does_not_panic_when_a_batch_entry_cancels_a_sibling() {
     // A single batch poll activates both jobs, then completes each in turn.
     // Completing the trigger entry terminates the instance and cancels the work
     // entry, so the work entry is no longer completable when its turn comes.
-    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(HashMap::new()));
+    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(BTreeMap::new()));
 
     // No panic; the instance completed (terminate end, Zeebe parity), and at
     // least the trigger job was completed. The cancelled sibling is simply not
@@ -1542,7 +1542,7 @@ fn input_mapping_merges_before_job_activation() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let inst = engine
         .apply_command(Command::create_instance_with("io-in", vars))
@@ -1588,7 +1588,7 @@ fn output_mapping_projects_job_result() {
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
     let mut result = std::collections::BTreeMap::new();
     result.insert("ok".to_string(), Value::Bool(true));
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("result".to_string(), Value::Map(result));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -1673,7 +1673,7 @@ fn business_rule_task_evaluates_decision_and_binds_result_variable() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1760,7 +1760,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
             Some("out".to_string()),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1838,7 +1838,7 @@ fn evaluated_decisions_are_stamped_within_the_evaluated_drg() {
     assert_ne!(deployed_decision_key(&second, "base"), own_base);
     let first_root = deployed_decision_key(&first, "root");
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::EvaluateDecision {
@@ -1879,7 +1879,7 @@ fn standalone_evaluation_records_failures_and_rejects_unknown_decisions() {
             "drg",
         )]))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     // A failed evaluation is recorded (with its failure), not rejected.
     let events = engine
@@ -1926,7 +1926,7 @@ fn business_rule_task_resolves_decision_id_via_feel_expression() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("en".into()));
     vars.insert("decisionToCall".to_string(), Value::Str("greeting".into()));
     let events = engine
@@ -1987,7 +1987,7 @@ fn business_rule_task_spreads_map_output_without_result_variable() {
         .apply_command(Command::DeployProcess(brt_process("scores", None)))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("tier".to_string(), Value::Str("gold".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -2794,7 +2794,7 @@ fn job_parked_instance(business_id: Option<&str>) -> (Engine, Key, Key) {
     let created = engine
         .apply_command(Command::create_instance_full(
             "biz",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             business_id.map(str::to_string),
         ))
@@ -2966,7 +2966,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         let err = engine
             .apply_command(Command::create_instance_full(
                 "biz",
-                HashMap::new(),
+                BTreeMap::new(),
                 Vec::new(),
                 Some(id),
             ))
@@ -2984,7 +2984,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "k".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: Some(over),
         })
         .unwrap_err();

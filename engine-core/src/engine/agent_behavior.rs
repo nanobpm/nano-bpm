@@ -34,7 +34,7 @@ impl Engine {
         let invalid = |reason: &str| EngineError::AgentHistoryInvalid {
             reason: reason.to_string(),
         };
-        let mut ids = HashSet::new();
+        let mut ids = BTreeSet::new();
         for turn in history {
             let id = turn
                 .history_item_id

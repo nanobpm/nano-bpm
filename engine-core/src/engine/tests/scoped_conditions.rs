@@ -58,7 +58,7 @@ fn yes_no_tails(builder: ProcessBuilder) -> ProcessBuilder {
         .connect("no", "no_end")
 }
 
-fn complete_with(engine: &mut Engine, job_type: &str, vars_in: HashMap<String, Value>) {
+fn complete_with(engine: &mut Engine, job_type: &str, vars_in: BTreeMap<String, Value>) {
     let job = engine
         .activate_jobs(job_type, "test-worker", 10, 60_000, 0)
         .into_iter()

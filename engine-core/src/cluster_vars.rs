@@ -16,7 +16,7 @@
 //! deliberately **no** host-injected handle: the engine's apply input has no
 //! place for node-local cluster-variable state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::model::Value;
 
@@ -211,8 +211,8 @@ impl ClusterVariableState {
     /// binding that WINS the overlay (a tenant variable shadows a same-named
     /// global) is itself of kind `SECRET_REFERENCE` — a JSON-kind tenant
     /// variable shadowing a trusted global is untrusted (fail closed).
-    pub fn trusted_secret_roots_for(&self, tenant: &str) -> HashMap<String, Value> {
-        let mut out: HashMap<String, Value> = HashMap::new();
+    pub fn trusted_secret_roots_for(&self, tenant: &str) -> BTreeMap<String, Value> {
+        let mut out: BTreeMap<String, Value> = BTreeMap::new();
         for (name, var) in &self.global {
             if var.kind == ClusterVariableKind::SecretReference {
                 out.insert(name.clone(), var.value.clone());

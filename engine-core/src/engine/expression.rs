@@ -16,7 +16,7 @@
 //! applied to evaluation results anywhere under `src/engine`, except at
 //! allow-listed sites citing the matching Zeebe behaviour.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::Value;
 use crate::state;
@@ -105,7 +105,7 @@ pub(crate) fn is_expression(raw: &str) -> bool {
 /// [`Failure`] (Zeebe `ExpressionProcessor.evaluateExpressionAsEither`).
 pub(crate) fn evaluate_or_failure(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Evaluated, Failure> {
     if !is_expression(raw) {
         return Ok(Evaluated {
@@ -140,7 +140,7 @@ fn type_failure(raw: &str, expected: &str, actual_kind: &str) -> Failure {
 
 /// Zeebe `evaluateStringExpression`: the result must be a `STRING` (a `null`
 /// result is a failure).
-pub(crate) fn evaluate_string(raw: &str, vars: &HashMap<String, Value>) -> Result<String, Failure> {
+pub(crate) fn evaluate_string(raw: &str, vars: &BTreeMap<String, Value>) -> Result<String, Failure> {
     match evaluate_or_failure(raw, vars)? {
         Evaluated {
             value: Value::Str(s),
@@ -155,7 +155,7 @@ pub(crate) fn evaluate_string(raw: &str, vars: &HashMap<String, Value>) -> Resul
 /// most `max_len` characters long.
 pub(crate) fn evaluate_non_empty_string(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
     max_len: usize,
 ) -> Result<String, Failure> {
     let s = evaluate_string(raw, vars)?;
@@ -180,7 +180,7 @@ pub(crate) fn evaluate_non_empty_string(
 /// Zeebe `evaluateLongExpression`: the result must be a `NUMBER` (truncated
 /// to an integer, as Java's `Number.longValue`). A static value must parse
 /// as a number.
-pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<i64, Failure> {
+pub(crate) fn evaluate_long(raw: &str, vars: &BTreeMap<String, Value>) -> Result<i64, Failure> {
     if !is_expression(raw) {
         let t = raw.trim();
         return t
@@ -216,7 +216,7 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
 /// `ExpressionLanguage.parseExpression`, never as static values).
 pub(crate) fn evaluate_feel(
     expr: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Evaluated, Failure> {
     let trimmed = expr.trim();
     if is_expression(trimmed) {
@@ -228,7 +228,7 @@ pub(crate) fn evaluate_feel(
 
 /// Zeebe `evaluateBooleanExpression`: the result must be a `BOOLEAN` (a `null`
 /// result is a failure — a completion condition is never "silently false").
-pub(crate) fn evaluate_bool(expr: &str, vars: &HashMap<String, Value>) -> Result<bool, Failure> {
+pub(crate) fn evaluate_bool(expr: &str, vars: &BTreeMap<String, Value>) -> Result<bool, Failure> {
     match evaluate_feel(expr, vars)? {
         Evaluated {
             value: Value::Bool(b),
@@ -241,7 +241,7 @@ pub(crate) fn evaluate_bool(expr: &str, vars: &HashMap<String, Value>) -> Result
 /// Zeebe `evaluateArrayExpression`: the result must be an `ARRAY`.
 pub(crate) fn evaluate_array(
     expr: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>, Failure> {
     match evaluate_feel(expr, vars)? {
         Evaluated {
@@ -256,7 +256,7 @@ pub(crate) fn evaluate_array(
 /// `STRING`s.
 pub(crate) fn evaluate_array_of_strings(
     expr: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<String>, Failure> {
     let evaluated = evaluate_feel(expr, vars)?;
     let Evaluated {
@@ -286,7 +286,7 @@ pub(crate) fn evaluate_array_of_strings(
 /// (rendered as its integer / decimal text); anything else is a failure.
 pub(crate) fn evaluate_correlation_key(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<String, Failure> {
     // A correlation key is always FEEL (a bare `orderId` is a variable
     // reference), with or without the leading `=`.
@@ -313,7 +313,7 @@ pub(crate) fn evaluate_correlation_key(
 /// date-time `STRING` is the date; anything else is a failure.
 pub(crate) fn evaluate_nullable_date_time(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Option<String>, Failure> {
     if !is_expression(raw) {
         return Ok(Some(raw.to_string()).filter(|s| !s.trim().is_empty()));
@@ -349,7 +349,7 @@ pub(crate) fn evaluate_nullable_date_time(
 /// `NUMBER` in `[0,100]`.
 pub(crate) fn evaluate_user_task_priority(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<i32, Failure> {
     let n = evaluate_long(raw, vars)?;
     if !(0..=100).contains(&n) {
@@ -364,7 +364,7 @@ pub(crate) fn evaluate_user_task_priority(
 /// with no fraction, e.g. `1.0`, is accepted), clamped into `i32`.
 pub(crate) fn evaluate_job_priority(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<i32, Failure> {
     let integral = |d: f64| d.is_finite() && d.fract() == 0.0;
     let wrong = |kind: &str| {
@@ -398,7 +398,7 @@ pub(crate) fn evaluate_job_priority(
 /// an `EXTRACT_VALUE_ERROR`.
 pub(crate) fn evaluate_timer<T>(
     raw: &str,
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
     what: &str,
     parse: impl FnOnce(&str) -> Option<T>,
 ) -> Result<T, Failure> {
@@ -429,14 +429,14 @@ mod tests {
 
     #[test]
     fn evaluate_long_rejects_non_finite_static_values() {
-        let v = HashMap::new();
+        let v = BTreeMap::new();
         for lit in ["NaN", "inf", "-inf", "infinity"] {
             assert!(evaluate_long(lit, &v).is_err(), "{lit} must be rejected");
         }
         assert_eq!(evaluate_long("3.7", &v).unwrap(), 3);
     }
 
-    fn vars(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+    fn vars(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn array_of_strings_rejects_temporal_items() {
-        let v = HashMap::new();
+        let v = BTreeMap::new();
         assert_eq!(
             evaluate_array_of_strings(r#"=["a", "b"]"#, &v).unwrap(),
             vec!["a".to_string(), "b".to_string()]
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn static_values_pass_through() {
-        let v = HashMap::new();
+        let v = BTreeMap::new();
         assert_eq!(evaluate_string("payment", &v).unwrap(), "payment");
         assert_eq!(evaluate_long(" 5 ", &v).unwrap(), 5);
         assert!(evaluate_long("five", &v).is_err());
@@ -516,7 +516,7 @@ mod tests {
     fn temporal_results_are_not_strings() {
         // #1399 review: FEEL temporals render to `Value::Str` at the API
         // boundary, but their native type is not STRING.
-        let v = HashMap::new();
+        let v = BTreeMap::new();
         for (expr, kind) in [
             ("=date(\"2024-01-15\")", "DATE"),
             ("=time(\"10:00:00\")", "TIME"),
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn evaluation_error_is_extract_value_failure() {
-        let f = evaluate_or_failure("=1 +", &HashMap::new()).unwrap_err();
+        let f = evaluate_or_failure("=1 +", &BTreeMap::new()).unwrap_err();
         assert_eq!(f.error_type, ErrorType::ExtractValueError);
         assert!(
             f.message

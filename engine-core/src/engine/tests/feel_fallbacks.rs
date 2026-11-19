@@ -17,7 +17,7 @@ fn parse(body: &str) -> ProcessDefinition {
     crate::bpmn::parse_bpmn(&xml).unwrap().remove(0)
 }
 
-fn start(def: ProcessDefinition, vars_in: HashMap<String, Value>) -> (Engine, Key) {
+fn start(def: ProcessDefinition, vars_in: BTreeMap<String, Value>) -> (Engine, Key) {
     let mut engine = Engine::new();
     let id = def.id.clone();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
@@ -142,7 +142,7 @@ fn task_listener_job_type_expression_failure_raises_incident() {
     // too: a failure is EXTRACT_VALUE_ERROR, never a job typed `=listenerType`.
     let (mut engine, inst) = start(
         user_task_with_creating_listener("=listenerType"),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert!(
         engine
@@ -218,7 +218,7 @@ fn boundary_message_name_expression_failure_raises_incident_on_host() {
 fn boundary_correlation_key_failure_raises_incident_on_host() {
     // nano used to open the boundary subscription with an empty (never
     // matchable) correlation key.
-    let (mut engine, inst) = start(task_with_message_boundary("cancel", "=k"), HashMap::new());
+    let (mut engine, inst) = start(task_with_message_boundary("cancel", "=k"), BTreeMap::new());
     assert!(engine.message_subscriptions().is_empty());
     assert!(engine.pending_jobs().is_empty());
     let incidents = engine.active_incidents();
@@ -270,7 +270,7 @@ fn signal_process(catch: &str) -> ProcessDefinition {
 #[test]
 fn signal_boundary_and_catch_name_expression_failure_raise_incidents() {
     for catch in ["boundary", "intermediate"] {
-        let (mut engine, inst) = start(signal_process(catch), HashMap::new());
+        let (mut engine, inst) = start(signal_process(catch), BTreeMap::new());
         assert!(engine.signal_subscriptions().is_empty(), "{catch}");
         let incident = extract_value_incident(&engine, "work", "'=sigName'");
         set_and_resolve(
@@ -626,7 +626,7 @@ fn adhoc_completion_condition_failure_raises_incident() {
             r#"activeElementsCollection="=[&quot;tool&quot;]""#,
             r#"<bpmn:completionCondition>=done</bpmn:completionCondition>"#,
         ),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     complete_one(&mut engine, "tool");
     let incident = extract_value_incident(&engine, "tool", "'=done'");
@@ -655,7 +655,7 @@ fn user_task(ext: &str) -> ProcessDefinition {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn user_task_property_expression_failures_raise_incidents() {
-    let cases: Vec<(&str, HashMap<String, Value>, &str)> = vec![
+    let cases: Vec<(&str, BTreeMap<String, Value>, &str)> = vec![
         // evaluateAssigneeExpression -> evaluateStringExpression: NULL fails.
         (
             r#"<zeebe:assignmentDefinition assignee="=who" />"#,
@@ -708,7 +708,7 @@ fn user_task_nullable_dates_and_resolution() {
     // A null due date is legal (Zeebe `isNullable = true`).
     let (engine, _) = start(
         user_task(r#"<zeebe:taskSchedule dueDate="=due" />"#),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert!(engine.active_incidents().is_empty());
     assert_eq!(engine.state().user_tasks.len(), 1);
@@ -716,7 +716,7 @@ fn user_task_nullable_dates_and_resolution() {
     // Resolving an assignee incident after fixing the variable creates the task.
     let (mut engine, inst) = start(
         user_task(r#"<zeebe:assignmentDefinition assignee="=who" />"#),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     let incident = extract_value_incident(&engine, "review", "'NULL'");
     set_and_resolve(
@@ -830,7 +830,7 @@ fn resolved_assignee_failure_does_not_rerun_completed_start_listener() {
     // The `creating` listener job runs and completes; the assignee expression
     // then fails. Resolving the incident must NOT run the `creating` listener a
     // second time (#1398 review).
-    let (mut engine, inst) = start(user_task_with_listener_and_bad_assignee(), HashMap::new());
+    let (mut engine, inst) = start(user_task_with_listener_and_bad_assignee(), BTreeMap::new());
     // The creating listener job exists; the assignee failure parks the task.
     let listener_jobs: Vec<String> = engine
         .pending_jobs()
@@ -878,7 +878,7 @@ fn creating_task_listener_type_reads_staged_input_mapping() {
           <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
         </bpmn:process>"#,
     );
-    let (engine, _inst) = start(def, HashMap::new());
+    let (engine, _inst) = start(def, BTreeMap::new());
     assert!(
         engine.active_incidents().is_empty(),
         "the mapped listener type resolves, no incident: {:?}",
@@ -913,7 +913,7 @@ fn resolved_boundary_timer_failure_does_not_duplicate_host_job() {
     // The host's job is minted; the boundary timer's duration expression fails.
     // Resolving the incident must re-arm ONLY the timer — a full activation
     // re-drive would mint a SECOND host job (#1398 review).
-    let (mut engine, inst) = start(task_with_failing_boundary_timer(), HashMap::new());
+    let (mut engine, inst) = start(task_with_failing_boundary_timer(), BTreeMap::new());
     assert_eq!(
         job_types(&engine),
         vec!["work".to_string()],
@@ -993,7 +993,7 @@ fn mi_call_activity_completion_retry_reuses_projected_output_overlay() {
     engine
         .apply_command(Command::complete_job_with_result(
             jobs[0].key,
-            HashMap::from([("result".to_string(), Value::Int(7))]),
+            BTreeMap::from([("result".to_string(), Value::Int(7))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -1107,7 +1107,7 @@ fn resolved_boundary_timer_failure_preserves_user_task_host() {
           <bpmn:sequenceFlow id="f3" sourceRef="ping" targetRef="eb" />
         </bpmn:process>"#,
     );
-    let (mut engine, inst) = start(def, HashMap::new());
+    let (mut engine, inst) = start(def, BTreeMap::new());
     assert_eq!(
         engine.state().user_tasks.len(),
         1,
@@ -1167,7 +1167,7 @@ fn resolved_boundary_timer_failure_rearms_every_sibling_boundary() {
           <bpmn:sequenceFlow id="fm" sourceRef="m_msg" targetRef="em" />
         </bpmn:process>"#,
     );
-    let (mut engine, inst) = start(def, HashMap::new());
+    let (mut engine, inst) = start(def, BTreeMap::new());
     assert_eq!(engine.state().user_tasks.len(), 1, "the host is live");
     let incident = extract_value_incident(&engine, "review", "'=d'");
     set_and_resolve(
@@ -1273,7 +1273,7 @@ fn resolved_agent_job_retries_failure_preserves_container_results() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1435,7 +1435,7 @@ fn later_end_listener_failure_restarts_the_chain_and_reprojects_outputs() {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn first_start_listener_failure_retry_mints_the_listener_then_the_work() {
-    let (mut engine, inst) = start(task_with_start_listener(r#"type="=audit""#), HashMap::new());
+    let (mut engine, inst) = start(task_with_start_listener(r#"type="=audit""#), BTreeMap::new());
     let incident = extract_value_incident(&engine, "work", "audit");
     set_and_resolve(
         &mut engine,

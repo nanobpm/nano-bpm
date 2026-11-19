@@ -23,7 +23,7 @@ fn parse(body: &str) -> ProcessDefinition {
     crate::bpmn::parse_bpmn(&xml).unwrap().remove(0)
 }
 
-fn start(def: ProcessDefinition, vars_in: HashMap<String, Value>) -> (Engine, Key) {
+fn start(def: ProcessDefinition, vars_in: BTreeMap<String, Value>) -> (Engine, Key) {
     let mut engine = Engine::new();
     let id = def.id.clone();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
@@ -145,7 +145,7 @@ fn mi_body(listener: &str, extra: &str) -> ProcessDefinition {
     ))
 }
 
-fn items() -> HashMap<String, Value> {
+fn items() -> BTreeMap<String, Value> {
     vars(&[(
         "items",
         Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
@@ -454,7 +454,7 @@ fn nested_agentic_container_job_type_retry_is_catalog_aware() {
           <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
         </bpmn:process>"#,
     );
-    let (mut engine, inst) = start(def, HashMap::new());
+    let (mut engine, inst) = start(def, BTreeMap::new());
     let agent = engine
         .activate_jobs("agent-worker", "W", 10, 60_000, 0)
         .into_iter()
@@ -463,7 +463,7 @@ fn nested_agentic_container_job_type_retry_is_catalog_aware() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("inner")],
                 ..Default::default()

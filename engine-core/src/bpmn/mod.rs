@@ -150,7 +150,7 @@
 //!   a non-user-task element is likewise rejected (`UnsupportedTaskListener`),
 //!   since task-listener jobs only run on the user-task path.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{ProcessBuilder, ProcessDefinition};
 /// The BPMN parse-error type, owned by [`crate::validate::error`] (the

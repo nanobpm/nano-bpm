@@ -12,7 +12,7 @@ fn subprocess_input_mapping_is_local_to_the_subprocess_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -40,7 +40,7 @@ fn inner_element_input_mapping_resolves_against_the_enclosing_subprocess_scope()
             subprocess_with_nested_input_mapping(),
         ))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     engine
         .apply_command(Command::create_instance_with("nested-scope", vars))
@@ -63,7 +63,7 @@ fn subprocess_scope_local_variable_is_dropped_when_the_subprocess_completes() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -93,7 +93,7 @@ fn subprocess_output_mapping_reads_local_scope_and_propagates_to_root() {
             },
         ])))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -133,7 +133,7 @@ fn set_variables_local_writes_only_the_target_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -152,7 +152,7 @@ fn set_variables_local_writes_only_the_target_scope() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("only_here".to_string(), Value::Int(7))]),
+            BTreeMap::from([("only_here".to_string(), Value::Int(7))]),
             true,
         ))
         .unwrap();
@@ -179,7 +179,7 @@ fn set_variables_non_local_propagates_to_the_root_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -198,7 +198,7 @@ fn set_variables_non_local_propagates_to_the_root_scope() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("bubbled".to_string(), Value::Int(3))]),
+            BTreeMap::from([("bubbled".to_string(), Value::Int(3))]),
             false,
         ))
         .unwrap();
@@ -216,7 +216,7 @@ fn set_variables_non_local_updates_the_defining_scope_not_root() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -236,7 +236,7 @@ fn set_variables_non_local_updates_the_defining_scope_not_root() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("scoped".to_string(), Value::Int(42))]),
+            BTreeMap::from([("scoped".to_string(), Value::Int(42))]),
             false,
         ))
         .unwrap();
@@ -428,7 +428,7 @@ fn resident_variable_bytes_counts_scope_local_maps() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -464,7 +464,7 @@ fn completing_an_instance_drops_its_variables_from_hot_state() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -499,7 +499,7 @@ fn terminating_an_instance_drops_its_variables_from_hot_state() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -559,7 +559,7 @@ fn suspend_drops_message_correlation_and_does_not_rebuffer() {
         engine.instance(instance_key).unwrap().state,
         ProcessInstanceState::Suspended
     );
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 1_500);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 1_500);
     assert!(
         !fired
             .iter()
@@ -588,7 +588,7 @@ fn suspend_drops_message_correlation_and_does_not_rebuffer() {
     );
 
     // A fresh matching message after resume correlates normally and completes.
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 2_500);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 2_500);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -730,7 +730,7 @@ fn engine_snapshot_round_trips_scope_variables_and_parents() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -777,7 +777,7 @@ fn cold_spill_round_trips_a_message_parked_instance() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command(Command::create_instance_with("wait", vars))
@@ -835,14 +835,14 @@ fn feel_message_name_resolves_on_activation() {
     assert_eq!(subs[0].correlation_key, "A");
 
     // A message for a different region does not correlate.
-    let fired = engine.correlate_message("payment-us", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-us", "A", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
     assert!(!engine.is_completed(instance_key));
 
     // The resolved name correlates and completes the instance.
-    let fired = engine.correlate_message("payment-eu", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-eu", "A", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -1169,7 +1169,7 @@ fn cross_partition_cancel_emits_a_routable_closing() {
         .apply_command(Command::correlate_message_with(
             "payment-received",
             order.clone(),
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     assert!(
@@ -1405,7 +1405,7 @@ fn redriven_dispatch_start_after_a_lost_ack_mints_exactly_one_instance() {
     let dispatch = Command::DispatchStartInstance {
         process_id: "order-flow".into(),
         start_element_id: "start".into(),
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         tags: Vec::new(),
         business_id: None,
         message_start: None,
@@ -1513,7 +1513,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
         .apply_command(Command::correlate_message_with(
             "reminder",
             order.clone(),
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let (r_msg, r_kind, r_delivery) = published
@@ -1536,7 +1536,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
         element_instance_key: eik,
         element_id: "notify".into(),
         kind: r_kind,
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         delivery_key: r_delivery,
     };
 
@@ -1564,7 +1564,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
 fn should_publish_a_message_with_no_subscription() {
     let mut engine = Engine::new();
     // With nothing subscribed, a published message is minted and dropped.
-    let fired = engine.correlate_message("nobody-home", "X", HashMap::new(), 0);
+    let fired = engine.correlate_message("nobody-home", "X", BTreeMap::new(), 0);
     assert_eq!(fired.len(), 1);
     assert!(matches!(fired[0], Event::MessagePublished { .. }));
     assert!(engine.message_subscriptions().is_empty());
@@ -1639,7 +1639,7 @@ fn should_correlate_only_the_instance_with_the_matching_key() {
         .unwrap();
 
     // Correlating "A" releases only instance A; B stays parked.
-    engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+    engine.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(engine.is_completed(a));
     assert!(!engine.is_completed(b));
 }
@@ -1671,7 +1671,7 @@ fn should_recover_an_open_message_subscription_via_replay() {
     assert!(!recovered.is_completed(instance_key));
 
     // The recovered engine correlates the message and completes the instance.
-    recovered.correlate_message("payment-received", "A", HashMap::new(), 0);
+    recovered.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(recovered.is_completed(instance_key));
 }
 
@@ -1771,7 +1771,7 @@ fn should_run_inclusive_split_taking_every_matching_flow() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([
+    let vars = BTreeMap::from([
         ("x".to_string(), Value::Bool(true)),
         ("y".to_string(), Value::Bool(true)),
         ("z".to_string(), Value::Bool(false)),
@@ -1826,7 +1826,7 @@ fn should_take_inclusive_split_default_when_no_condition_matches() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let vars = BTreeMap::from([("temp".to_string(), Value::Int(20))]);
     let events = engine
         .apply_command(Command::create_instance_with("inc-def", vars))
         .unwrap();
@@ -2471,7 +2471,7 @@ fn should_route_exclusive_gateway_by_variable() {
         .apply_command(Command::DeployProcess(approval_process()))
         .unwrap();
 
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -2495,7 +2495,7 @@ fn should_take_default_flow_when_no_condition_matches() {
         .apply_command(Command::DeployProcess(approval_process()))
         .unwrap();
 
-    let vars = HashMap::from([("decision".to_string(), Value::Str("no".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("no".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -2524,7 +2524,7 @@ fn should_route_exclusive_gateway_on_a_numeric_feel_comparison() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([("amount".to_string(), Value::Int(250))]);
+    let vars = BTreeMap::from([("amount".to_string(), Value::Int(250))]);
     let events = engine
         .apply_command(Command::create_instance_with("amounts", vars))
         .unwrap();
@@ -2644,7 +2644,7 @@ fn should_set_variables_via_an_element_instance_scope_key() {
     engine
         .apply_command(Command::set_variables(
             element_instance_key,
-            HashMap::from([("x".to_string(), Value::Int(42))]),
+            BTreeMap::from([("x".to_string(), Value::Int(42))]),
         ))
         .unwrap();
 
@@ -2661,7 +2661,7 @@ fn should_reject_setting_variables_on_an_unknown_scope() {
     let err = engine
         .apply_command(Command::set_variables(
             404,
-            HashMap::from([("x".to_string(), Value::Int(1))]),
+            BTreeMap::from([("x".to_string(), Value::Int(1))]),
         ))
         .unwrap_err();
     assert_eq!(err, EngineError::ScopeNotFound { scope_key: 404 });
@@ -2810,7 +2810,7 @@ fn should_reject_a_lock_extension_once_the_lock_has_expired() {
 #[cfg(feature = "serde")]
 #[test]
 fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // (a) Old log entries lack the new fields — they must still deserialize.
     let throw: Command = serde_json::from_str(
@@ -2839,7 +2839,7 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
         job_key: 7,
         error_code: "E".into(),
         error_message: "m".into(),
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
     };
     let s = serde_json::to_string(&throw_empty).unwrap();
     assert!(
@@ -2889,7 +2889,7 @@ fn should_not_seed_variables_when_a_thrown_error_is_unhandled() {
     let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
 
     // when an error no boundary catches is thrown with variables
-    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    let vars = BTreeMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
     let events = engine
         .apply_command(Command::throw_job_error_with(
             job_key, "UNKNOWN", "boom", vars,
@@ -3821,7 +3821,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
     engine.set_track_dirty_vars(true);
 
     // Create two instances with variables -> both dirty.
-    let mut v = std::collections::HashMap::new();
+    let mut v = std::collections::BTreeMap::new();
     v.insert("amount".to_string(), Value::Int(50));
     let a = engine
         .apply_command(Command::create_instance_with("order", v.clone()))
@@ -3837,7 +3837,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
         .unwrap();
 
     let (upserts, forgets) = engine.drain_dirty_vars();
-    let keys: std::collections::HashSet<Key> = upserts.iter().map(|(k, _)| *k).collect();
+    let keys: std::collections::BTreeSet<Key> = upserts.iter().map(|(k, _)| *k).collect();
     assert_eq!(keys, [a, b].into_iter().collect());
     assert!(forgets.is_empty());
     // Draining clears the set.
@@ -3845,7 +3845,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
     assert!(again.is_empty());
 
     // A spilled instance is skipped in the upserts (spill write-through owns it).
-    let mut v2 = std::collections::HashMap::new();
+    let mut v2 = std::collections::BTreeMap::new();
     v2.insert("k".to_string(), Value::Int(1));
     engine
         .apply_command(Command::SetVariables {
@@ -3877,7 +3877,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
 
     // Restoring variables from the store onto a lean-recovered engine.
     let mut recovered = Engine::from_snapshot(lean);
-    let mut restored = std::collections::HashMap::new();
+    let mut restored = std::collections::BTreeMap::new();
     restored.insert("amount".to_string(), Value::Int(99));
     recovered.install_variables(b, restored);
     assert_eq!(
@@ -3998,7 +3998,7 @@ fn static_output_mapping_source_is_passed_through_as_literal_not_feel() {
     let inst = create_instance_key(&mut engine, "io-static-out");
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
     let events = engine
-        .apply_command(Command::complete_job_with(job_key, HashMap::new()))
+        .apply_command(Command::complete_job_with(job_key, BTreeMap::new()))
         .unwrap();
     assert!(
         engine.active_incidents().is_empty(),
@@ -4044,7 +4044,7 @@ fn input_mapping_with_dotted_target_builds_nested_context() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let mut existing_order = std::collections::BTreeMap::new();
     existing_order.insert("id".to_string(), Value::Str("A1".to_string()));
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("price".to_string(), Value::Int(3));
     vars.insert("qty".to_string(), Value::Int(4));
     vars.insert("order".to_string(), Value::Map(existing_order));
@@ -4094,7 +4094,7 @@ fn input_mapped_local_variable_is_not_visible_to_a_later_activity() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let inst = engine
         .apply_command(Command::create_instance_with("io-local", vars))
@@ -4200,8 +4200,8 @@ fn variable_propagation_updates_nearest_defining_scope_else_root() {
         ]),
         false,
     );
-    let mut by_scope: std::collections::HashMap<Key, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut by_scope: std::collections::BTreeMap<Key, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (scope, map) in writes {
         by_scope
             .entry(scope)
@@ -5066,7 +5066,7 @@ fn create_by_key_pins_instance_to_that_exact_version() {
     let events = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             Some(k1),
@@ -5107,7 +5107,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     let by_v1 = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             None,
@@ -5129,7 +5129,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     let by_latest = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             None,
@@ -5150,7 +5150,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     // Unknown version → error, no instance created.
     let err = engine.apply_command(Command::create_instance_versioned(
         "order",
-        HashMap::new(),
+        BTreeMap::new(),
         Vec::new(),
         None,
         None,
@@ -5232,7 +5232,7 @@ fn snapshot_round_trip_retains_all_versions_and_instance_pins() {
     let created = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             Some(k1),
@@ -5332,7 +5332,7 @@ fn subprocess_end_event_output_propagates_reached_branch_not_last_defined() {
         engine
             .apply_command(Command::DeployProcess(def.clone()))
             .unwrap();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("pick".to_string(), Value::Str(pick.to_string()));
         engine
             .apply_command(Command::create_instance_with("sp-ends", vars))
@@ -5787,7 +5787,7 @@ fn agent_history_committed_turns_are_immutable_across_later_batches() {
     let stored = stored_history(&engine, instance_key, aik);
     assert_eq!(stored.len(), 2);
     // The first turn is still COMMITTED; only the second flipped to DISCARDED.
-    let by_key: std::collections::HashMap<Key, AgentHistoryCommitStatus> = stored
+    let by_key: std::collections::BTreeMap<Key, AgentHistoryCommitStatus> = stored
         .iter()
         .map(|r| (r.agent_history_key, r.commit_status))
         .collect();
@@ -6331,7 +6331,7 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
             instance_key: pi_a,
             activate_instructions: vec![crate::command::ActivateElementInstruction {
                 element_id: "agent".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             terminate_instructions: vec![],
@@ -6831,7 +6831,7 @@ fn inclusive_join_is_not_reevaluated_when_a_competing_path_diverges_like_zeebe()
     let created = engine
         .apply_command(Command::create_instance_with(
             "inc-diverge",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -6951,7 +6951,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "inclusive_multi_arrival",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -6975,7 +6975,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("go".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7012,7 +7012,7 @@ fn inclusive_join_late_arrival_while_an_incident_is_pending_activates_again_like
     let created = engine
         .apply_command(Command::create_instance_with(
             "inclusive_multi_arrival",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -7501,7 +7501,7 @@ fn terminate_end_listener_incident_resolution_restarts_the_chain() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7608,7 +7608,7 @@ fn terminate_end_output_mapping_failure_parks_and_redrives() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+            BTreeMap::from([("missingVar".to_string(), Value::Int(21))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7685,7 +7685,7 @@ fn terminate_end_recovery_reprojects_output_mappings_without_repeating_completin
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("x".to_string(), Value::Int(0))]),
+            BTreeMap::from([("x".to_string(), Value::Int(0))]),
         ))
         .unwrap();
 
@@ -7712,7 +7712,7 @@ fn terminate_end_recovery_reprojects_output_mappings_without_repeating_completin
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7786,7 +7786,7 @@ fn terminate_end_mid_chain_recovery_restarts_the_chain_and_reprojects_outputs() 
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("x".to_string(), Value::Int(0))]),
+            BTreeMap::from([("x".to_string(), Value::Int(0))]),
         ))
         .unwrap();
 
@@ -7801,7 +7801,7 @@ fn terminate_end_mid_chain_recovery_restarts_the_chain_and_reprojects_outputs() 
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7906,7 +7906,7 @@ fn terminate_end_output_mapping_failed_retry_does_not_repeat_completing() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+            BTreeMap::from([("missingVar".to_string(), Value::Int(21))]),
         ))
         .unwrap();
     let resolved = engine
@@ -8012,7 +8012,7 @@ fn terminate_end_listener_completion_variables_are_not_shadowed_for_later_listen
         .into_iter()
         .next()
         .expect("listener 0 job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("listenerType".to_string(), Value::Str("next".into()));
     engine
         .apply_command(Command::complete_job_with(job.key, vars))
@@ -8044,7 +8044,7 @@ fn message_start_correlation_is_recorded() {
         .apply_command(Command::CorrelateMessage {
             message_name: "order-placed".into(),
             correlation_key: "c-1".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: Some("biz-1".into()),
         })
         .unwrap();
@@ -8099,7 +8099,7 @@ fn dispatched_message_start_records_the_correlation_on_the_target() {
         .apply_command(Command::DispatchStartInstance {
             process_id: "order-flow".into(),
             start_element_id: "start".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             message_start: Some(crate::MessageStartCorrelation {
@@ -8151,7 +8151,7 @@ fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
         .apply_command(Command::DispatchStartInstance {
             process_id: "order-flow".into(),
             start_element_id: "start".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             message_start: Some(crate::MessageStartCorrelation {
@@ -8255,7 +8255,7 @@ fn allocator_fold_is_not_masked_by_a_foreign_max_key() {
         element_instance_key: foreign,
         element_id: "catch".into(),
         kind: state::MessageSubscriptionKind::IntermediateCatch,
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         delivery_key: local,
     };
     let mut next_local = 0;

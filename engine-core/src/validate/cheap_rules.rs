@@ -51,7 +51,7 @@
 //! is already registered in `validate/mod.rs`, and every `ParseError` reason it
 //! raises is already declared.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use super::ParseError;
 use super::ValidationInput;
@@ -91,7 +91,7 @@ fn no_duplicate_typed_starts(input: &ValidationInput<'_>) -> Result<(), ParseErr
     // Duplicate message start events: message starts survive as
     // `MessageStartEvent` on the built definition, keyed by the resolved
     // message name. Only process-level (top-level) starts count.
-    let mut seen_messages: HashSet<&str> = HashSet::new();
+    let mut seen_messages: BTreeSet<&str> = BTreeSet::new();
     for element in def.elements.values() {
         if element.parent.is_some() {
             continue;
@@ -115,12 +115,12 @@ fn no_duplicate_typed_starts(input: &ValidationInput<'_>) -> Result<(), ParseErr
     // start when its declaring node is a process-level flow node that has no
     // incoming flow and is not a boundary / intermediate catch event — i.e. it
     // builds to a `StartEvent` or the demotion target `IntermediateThrowEvent`.
-    let flow_targets: HashSet<&str> = def
+    let flow_targets: BTreeSet<&str> = def
         .elements
         .values()
         .flat_map(|e| e.outgoing.iter().map(|f| f.to.as_str()))
         .collect();
-    let mut seen_signals: HashSet<&str> = HashSet::new();
+    let mut seen_signals: BTreeSet<&str> = BTreeSet::new();
     for site in &input.capture.references {
         if site.kind != "signalRef" {
             continue;

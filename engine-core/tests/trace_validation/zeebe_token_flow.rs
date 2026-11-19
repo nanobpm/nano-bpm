@@ -36,7 +36,7 @@
 //! this shared-module shape).
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{Event, ProcessDefinition};
 use serde_json::Value as J;
@@ -82,8 +82,8 @@ const JOIN_GATEWAY_ELEMENT_TYPES: &[&str] = &["PARALLEL_GATEWAY", "INCLUSIVE_GAT
 /// is a pass-through that takes its outgoing flows).
 pub fn record_milestone(
     record: &J,
-    flow_endpoints: &HashMap<String, (String, String)>,
-    join_elements: &std::collections::HashSet<String>,
+    flow_endpoints: &BTreeMap<String, (String, String)>,
+    join_elements: &std::collections::BTreeSet<String>,
 ) -> Option<Milestone> {
     let value_type = record.get("valueType")?.as_str()?;
     let intent = record.get("intent")?.as_str()?;
@@ -133,8 +133,8 @@ pub fn record_milestone(
 /// element ids that are joins (gateways with multiple incoming flows).
 pub fn normalised_records_to_milestones(
     steps: &[J],
-    flow_endpoints: &HashMap<String, (String, String)>,
-    join_elements: &std::collections::HashSet<String>,
+    flow_endpoints: &BTreeMap<String, (String, String)>,
+    join_elements: &std::collections::BTreeSet<String>,
 ) -> Vec<Milestone> {
     let mut out = Vec::new();
     for step in steps {
@@ -196,7 +196,7 @@ mod tests {
 
     use super::*;
 
-    fn flow_map() -> HashMap<String, (String, String)> {
+    fn flow_map() -> BTreeMap<String, (String, String)> {
         [
             ("f1".to_string(), ("S".to_string(), "P1".to_string())),
             ("f2".to_string(), ("P1".to_string(), "A".to_string())),
@@ -209,7 +209,7 @@ mod tests {
         .collect()
     }
 
-    fn join_elements() -> std::collections::HashSet<String> {
+    fn join_elements() -> std::collections::BTreeSet<String> {
         ["P2".to_string()].into_iter().collect()
     }
 

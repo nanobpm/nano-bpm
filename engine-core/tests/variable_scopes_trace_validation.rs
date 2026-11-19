@@ -28,7 +28,7 @@
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
@@ -98,7 +98,7 @@ fn to_json(v: &Value) -> Json {
 }
 
 /// One scope's map projected onto the spec's `Names`.
-fn project_scope(map: &HashMap<String, Value>) -> Json {
+fn project_scope(map: &BTreeMap<String, Value>) -> Json {
     let m: serde_json::Map<String, Json> = NAMES
         .iter()
         .filter_map(|n| map.get(*n).map(|v| ((*n).to_string(), to_json(v))))
@@ -133,7 +133,7 @@ fn engine_state(engine: &Engine, key: Key, n: usize) -> Json {
                     .find(|(k, idx)| **idx == i - 1 && mi.active.contains(k))
                     .map(|(k, _)| *k);
                 let scope = live.map(|k| {
-                    project_scope(inst.scope_variables.get(&k).unwrap_or(&HashMap::new()))
+                    project_scope(inst.scope_variables.get(&k).unwrap_or(&BTreeMap::new()))
                 });
                 children.insert(i.to_string(), scope.unwrap_or(Json::Null));
             }
@@ -151,7 +151,7 @@ fn engine_state(engine: &Engine, key: Key, n: usize) -> Json {
             project_scope(
                 inst.scope_variables
                     .get(&body_key)
-                    .unwrap_or(&HashMap::new()),
+                    .unwrap_or(&BTreeMap::new()),
             )
         }
         None => {
@@ -200,7 +200,7 @@ impl Replay {
         let key = engine
             .apply_command(Command::create_instance_with(
                 "vs",
-                HashMap::from([("items".to_string(), items)]),
+                BTreeMap::from([("items".to_string(), items)]),
             ))
             .unwrap()
             .iter()
@@ -229,7 +229,7 @@ impl Replay {
         }
     }
 
-    fn complete(&mut self, ty: &'static str, child: i64, vars: HashMap<String, Value>) {
+    fn complete(&mut self, ty: &'static str, child: i64, vars: BTreeMap<String, Value>) {
         let job = self
             .jobs
             .remove(&(ty, child))
@@ -245,7 +245,7 @@ impl Replay {
             "Activate" | "Complete" => {}
             "Write" => {
                 let i = child.expect("Write names a child");
-                let vars = HashMap::from([
+                let vars = BTreeMap::from([
                     ("result".to_string(), Value::Int(i)),
                     ("seen".to_string(), Value::Int(i)),
                 ]);
@@ -254,7 +254,7 @@ impl Replay {
             }
             "Finish" => {
                 let i = child.expect("Finish names a child");
-                self.complete("second", i, HashMap::new());
+                self.complete("second", i, BTreeMap::new());
             }
             other => panic!("unknown VariableScopes action {other}"),
         }

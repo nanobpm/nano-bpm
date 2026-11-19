@@ -195,7 +195,7 @@ fn process_with_message_catch() -> ProcessDefinition {
         .unwrap()
 }
 
-fn vars(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+fn vars(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
@@ -213,7 +213,7 @@ fn process_with_signal_catch() -> ProcessDefinition {
         .unwrap()
 }
 
-fn deploy_and_create_retryable(retries: Option<&str>, vars_in: HashMap<String, Value>) -> Engine {
+fn deploy_and_create_retryable(retries: Option<&str>, vars_in: BTreeMap<String, Value>) -> Engine {
     let mut builder = ProcessBuilder::new("retryable")
         .start_event("start")
         .service_task("work", "do-work")
@@ -565,9 +565,9 @@ fn process_none_plus_timer() -> ProcessDefinition {
 }
 
 fn assert_job_index_consistent(engine: &Engine) {
-    use std::collections::{BTreeSet, HashMap, HashSet};
-    let mut expected: HashMap<String, BTreeSet<(i64, Key)>> = HashMap::new();
-    let mut expected_activated: HashSet<Key> = HashSet::new();
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut expected: BTreeMap<String, BTreeSet<(i64, Key)>> = BTreeMap::new();
+    let mut expected_activated: BTreeSet<Key> = BTreeSet::new();
     for job in engine.state().jobs.values() {
         if job.state == state::JobState::Created {
             expected
@@ -589,7 +589,7 @@ fn assert_job_index_consistent(engine: &Engine) {
         expected_activated,
         "activated index drifted from jobs"
     );
-    let mut expected_by_instance: HashMap<Key, HashSet<Key>> = HashMap::new();
+    let mut expected_by_instance: BTreeMap<Key, BTreeSet<Key>> = BTreeMap::new();
     for job in engine.state().jobs.values() {
         expected_by_instance
             .entry(job.instance_key)
@@ -711,7 +711,7 @@ fn propagating_child() -> ProcessDefinition {
 }
 
 /// Finds the child instance's seed variables (its `ProcessInstanceCreated`).
-fn child_seed_of(events: &[Event]) -> HashMap<String, Value> {
+fn child_seed_of(events: &[Event]) -> BTreeMap<String, Value> {
     events
         .iter()
         .find_map(|e| match e {
@@ -1616,7 +1616,7 @@ fn adhoc_declarative_process() -> ProcessDefinition {
 fn create_instance_with_vars(
     engine: &mut Engine,
     process_id: &str,
-    variables: HashMap<String, Value>,
+    variables: BTreeMap<String, Value>,
 ) -> Key {
     engine
         .apply_command(Command::create_instance_with(process_id, variables))
@@ -2805,7 +2805,7 @@ fn adhoc_agent_tool_chained_inputs(callee: &str) -> ProcessDefinition {
 /// spawn parks a recoverable `CALLED_ELEMENT_ERROR` incident; the callee is then
 /// deployed and the incident resolved, so the returned seed is the *respawn*
 /// seed.
-fn chained_input_child_seed(deploy_callee_first: bool) -> HashMap<String, Value> {
+fn chained_input_child_seed(deploy_callee_first: bool) -> BTreeMap<String, Value> {
     let mut engine = Engine::new();
     if deploy_callee_first {
         engine
@@ -2831,7 +2831,7 @@ fn chained_input_child_seed(deploy_callee_first: bool) -> HashMap<String, Value>
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallChain")],
                 ..Default::default()
@@ -2961,7 +2961,7 @@ fn chained_output_container_projection(
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallChain")],
                 ..Default::default()

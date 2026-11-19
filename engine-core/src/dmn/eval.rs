@@ -11,7 +11,7 @@
 //! This is Nano's native DMN decision engine, signed for **Sebastian Menski**,
 //! creator of Camunda's `engine-dmn`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::model::{
     Aggregation, Decision, DecisionEvaluationResult, DecisionLogic, DecisionRequirementsGraph,
@@ -35,12 +35,12 @@ const INPUT_VAR: &str = "__dmn_input__";
 pub fn evaluate(
     drg: &DecisionRequirementsGraph,
     decision_id: &str,
-    input: &HashMap<String, Value>,
+    input: &BTreeMap<String, Value>,
 ) -> DecisionEvaluationResult {
     let mut ctx = input.clone();
     let mut evaluated = Vec::new();
-    let mut done = HashSet::new();
-    let mut on_stack = HashSet::new();
+    let mut done = BTreeSet::new();
+    let mut on_stack = BTreeSet::new();
 
     match eval_decision(
         drg,
@@ -71,10 +71,10 @@ pub fn evaluate(
 fn eval_decision(
     drg: &DecisionRequirementsGraph,
     decision_id: &str,
-    ctx: &mut HashMap<String, Value>,
+    ctx: &mut BTreeMap<String, Value>,
     evaluated: &mut Vec<EvaluatedDecision>,
-    done: &mut HashSet<String>,
-    on_stack: &mut HashSet<String>,
+    done: &mut BTreeSet<String>,
+    on_stack: &mut BTreeSet<String>,
 ) -> Result<Value, EvaluationFailure> {
     let decision = drg.decision(decision_id).ok_or_else(|| EvaluationFailure {
         message: format!("no decision found with id '{decision_id}'"),
@@ -157,7 +157,7 @@ fn failed_entry(decision: &Decision) -> EvaluatedDecision {
 /// [`EvaluatedDecision`].
 fn eval_logic(
     decision: &Decision,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
     evaluated: &mut Vec<EvaluatedDecision>,
 ) -> Result<Value, EvaluationFailure> {
     match &decision.logic {
@@ -195,7 +195,7 @@ fn eval_logic(
 fn eval_table(
     decision: &Decision,
     table: &DecisionTable,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
     evaluated: &mut Vec<EvaluatedDecision>,
 ) -> Result<Value, EvaluationFailure> {
     let fail = |message: String| EvaluationFailure {
@@ -456,7 +456,7 @@ fn output_priorities(outputs: &[OutputClause]) -> Vec<Vec<Value>> {
         .map(|o| {
             o.output_values
                 .iter()
-                .map(|t| feel::eval(t, &HashMap::new()).unwrap_or(Value::Null))
+                .map(|t| feel::eval(t, &BTreeMap::new()).unwrap_or(Value::Null))
                 .collect()
         })
         .collect()
@@ -482,7 +482,7 @@ fn priority_key(per_output: &[Value], priorities: &[Vec<Value>]) -> Vec<usize> {
 fn unary_test_matches(
     entry: &str,
     input: &Value,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
 ) -> Result<bool, String> {
     let t = entry.trim();
     // An empty entry or `-` is irrelevant: it always matches.
@@ -503,7 +503,7 @@ fn unary_test_matches(
 fn positive_list_matches(
     list: &str,
     input: &Value,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
 ) -> Result<bool, String> {
     for test in split_top_level_commas(list) {
         if subtest_matches(&test, input, ctx)? {
@@ -516,7 +516,7 @@ fn positive_list_matches(
 fn subtest_matches(
     test: &str,
     input: &Value,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
 ) -> Result<bool, String> {
     let t = test.trim();
     if t.is_empty() {
@@ -555,7 +555,7 @@ fn subtest_matches(
 fn eval_bool_with_input(
     expr: &str,
     input: &Value,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
 ) -> Result<bool, String> {
     let mut c = ctx.clone();
     c.insert(INPUT_VAR.to_string(), input.clone());

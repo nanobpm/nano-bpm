@@ -340,7 +340,7 @@ fn a_conflicting_outcome_under_the_recorded_lease_is_rejected() {
     );
     // Throw-error under the failed token: likewise.
     let throw =
-        Command::throw_job_error_with(job_key, "E".to_string(), "m".to_string(), HashMap::new())
+        Command::throw_job_error_with(job_key, "E".to_string(), "m".to_string(), BTreeMap::new())
             .with_lease_token(Some(token.clone()));
     assert_eq!(
         engine.apply_command(throw),
@@ -487,7 +487,7 @@ fn replaying_a_settlement_frame_advances_the_lease_allocator() {
 }
 
 fn throw(job_key: Key, token: &str, code: &str) -> Command {
-    Command::throw_job_error_with(job_key, code.to_string(), "m".to_string(), HashMap::new())
+    Command::throw_job_error_with(job_key, code.to_string(), "m".to_string(), BTreeMap::new())
         .with_lease_token(Some(token.to_string()))
 }
 
