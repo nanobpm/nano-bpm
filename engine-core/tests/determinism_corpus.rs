@@ -76,7 +76,10 @@ fn corpus_covers_every_command_variant() {
         .map(str::to_string)
         .collect();
     let missing: Vec<_> = all.difference(&covered).collect();
-    assert!(missing.is_empty(), "corpus misses Command variants: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "corpus misses Command variants: {missing:?}"
+    );
 }
 
 #[test]
@@ -89,7 +92,10 @@ fn corpus_exercises_the_engine_not_just_rejections() {
     let records = full_run(&corpus_jsonl(), false);
     let ok = records.lines().filter(|l| l.contains("\"events\"")).count();
     let err = records.lines().filter(|l| l.contains("\"err\"")).count();
-    assert!(ok > err * 3, "corpus is mostly rejections: ok={ok} err={err}");
+    assert!(
+        ok > err * 3,
+        "corpus is mostly rejections: ok={ok} err={err}"
+    );
     assert!(!records.contains("\"undecodable\""));
 }
 
@@ -123,7 +129,11 @@ fn replay_is_reproducible_and_restart_invisible() {
             },
             &mut resumed,
         );
-        assert_eq!(full, format!("{first}{second}"), "restart at {split} diverged");
+        assert_eq!(
+            full,
+            format!("{first}{second}"),
+            "restart at {split} diverged"
+        );
     }
 }
 
@@ -135,8 +145,14 @@ fn replay_is_reproducible_and_restart_invisible() {
 #[test]
 fn seeded_hashmap_nondeterminism_is_detected() {
     let jsonl = corpus_jsonl();
-    let creates = jsonl.lines().filter(|l| l.contains("\"CreateInstance\"")).count();
-    assert!(creates > 32, "canary needs >32 distinct creates, has {creates}");
+    let creates = jsonl
+        .lines()
+        .filter(|l| l.contains("\"CreateInstance\""))
+        .count();
+    assert!(
+        creates > 32,
+        "canary needs >32 distinct creates, has {creates}"
+    );
     let a = full_run(&jsonl, true);
     let b = full_run(&jsonl, true);
     assert_ne!(a, b, "canary non-determinism escaped the comparison");

@@ -234,7 +234,10 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
         .connect("w", "e")
         .build()
         .expect("starters");
-    g.push(Command::DeployResources(vec![timers, messaging, starters]));
+    g.push(Command::DeployResources(vec![timers, starters]));
+    // Its own entry: a build that cannot decode the event sub-process skips
+    // only this deployment in the previous-release cell.
+    g.push(Command::DeployProcess(messaging));
 
     let order_v2 = ProcessBuilder::new("order")
         .start_event("s")
@@ -329,9 +332,11 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
 
     g.push(Command::assign_user_task(user_task, "alice"));
     g.push(Command::unassign_user_task(user_task));
-    g.push_json(json!({"UpdateUserTask": {"user_task_key": user_task, "changeset": {
-        "candidate_groups": ["ops"], "priority": 80
-    }}}));
+    g.push_json(
+        json!({"UpdateUserTask": {"user_task_key": user_task, "changeset": {
+            "candidate_groups": ["ops"], "priority": 80
+        }}}),
+    );
     g.push(Command::set_variables(
         big_instance,
         vars(&[("note", Value::Str("reviewed".into()))]),
@@ -485,7 +490,10 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
                 let amount = (g.next_rand() % 300) as i64;
                 g.push(create(
                     "order",
-                    vars(&[("amount", Value::Int(amount)), ("seq", Value::Int(n as i64))]),
+                    vars(&[
+                        ("amount", Value::Int(amount)),
+                        ("seq", Value::Int(n as i64)),
+                    ]),
                 ));
             }
             2 => {
@@ -509,7 +517,7 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
             let now = g.now;
             let act = g.push(activate("payment", 4, now));
             for key in all(&act, "JobActivated", "job_key") {
-                if g.next_rand() % 3 == 0 {
+                if g.next_rand().is_multiple_of(3) {
                     g.push(Command::fail_job(key, 1, "random failure"));
                 } else {
                     g.push(Command::complete_job(key));

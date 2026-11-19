@@ -3,6 +3,8 @@
 //! ```bash
 //! # write the command corpus (every Command variant + a seeded workload)
 //! cargo run --features serde --example determinism_corpus -- emit CORPUS [--random N]
+//! # drop the entries a previous release's probe run marked undecodable
+//! cargo run --features serde --example determinism_corpus -- filter CORPUS PROBE OUT
 //! # compare head records with a previous release's, through the head decoder
 //! cargo run --features serde --example determinism_corpus -- cross-release HEAD PREV
 //! ```
@@ -11,9 +13,9 @@
 //! `Event` type and re-encodes them (so an additive `#[serde(default)]` field —
 //! replay-compatible by the event-frame rules — is not a false divergence),
 //! compares rejections by presence only (error wording is not replicated
-//! state), ignores `state` checkpoints (the snapshot shape is versioned
-//! separately, `SNAPSHOT_FORMAT_VERSION`), and checks every entry up to the
-//! first one the previous release could not decode.
+//! state) and ignores `state` checkpoints (the snapshot shape is versioned
+//! separately, `SNAPSHOT_FORMAT_VERSION`). Both record files must come from
+//! the `filter`ed corpus, so every entry is compared.
 
 #![allow(
     clippy::unwrap_used,
@@ -44,6 +46,27 @@ fn main() {
                 corpus::covered_kinds(&entries).len()
             );
         }
+        Some("filter") => {
+            let corpus = std::fs::read_to_string(args.get(1).expect("CORPUS")).expect("corpus");
+            let probe = read(args.get(2).expect("PROBE"));
+            let skip: std::collections::BTreeSet<u64> = probe
+                .iter()
+                .filter(|r| r.get("undecodable").is_some())
+                .filter_map(|r| r.get("i").and_then(Json::as_u64))
+                .collect();
+            let kept: String = corpus
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .enumerate()
+                .filter(|(i, _)| !skip.contains(&(*i as u64)))
+                .map(|(_, l)| format!("{l}\n"))
+                .collect();
+            std::fs::write(args.get(3).expect("OUT"), kept).expect("write");
+            eprintln!(
+                "determinism_corpus: dropped {} entries the previous release cannot decode",
+                skip.len()
+            );
+        }
         Some("cross-release") => {
             let head = read(args.get(1).expect("HEAD"));
             let prev = read(args.get(2).expect("PREV"));
@@ -56,7 +79,9 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: determinism_corpus emit PATH [--random N] | cross-release HEAD PREV");
+            eprintln!(
+                "usage: determinism_corpus emit PATH [--random N] | filter CORPUS PROBE OUT | cross-release HEAD PREV"
+            );
             std::process::exit(2);
         }
     }
@@ -72,14 +97,13 @@ fn read(path: &str) -> Vec<Json> {
         .collect()
 }
 
-/// A record in cross-release canonical form, or `None` past the comparable
-/// prefix (an `undecodable` marker).
-fn canonical(record: &Json) -> Result<Option<String>, String> {
-    if record.get("undecodable").is_some() {
-        return Ok(None);
+/// A record in cross-release canonical form.
+fn canonical(record: &Json) -> Result<String, String> {
+    if let Some(e) = record.get("undecodable") {
+        return Err(format!("undecodable entry in a filtered corpus: {e}"));
     }
     if record.get("err").is_some() {
-        return Ok(Some("err".into()));
+        return Ok("err".into());
     }
     let events = record
         .get("events")
@@ -91,25 +115,25 @@ fn canonical(record: &Json) -> Result<Option<String>, String> {
             .map_err(|err| format!("event does not decode under head: {err}: {e}"))?;
         out.push(serde_json::to_string(&event).map_err(|err| err.to_string())?);
     }
-    Ok(Some(out.join("\n")))
+    Ok(out.join("\n"))
 }
 
 fn cross_release(head: &[Json], prev: &[Json]) -> Result<usize, String> {
-    let mut compared = 0;
-    for (i, p) in prev.iter().enumerate() {
-        let Some(p) = canonical(p)? else { break };
-        let h = head
-            .get(i)
-            .ok_or_else(|| format!("head has no record {i}"))
-            .and_then(canonical)?
-            .ok_or_else(|| format!("head could not decode entry {i}"))?;
+    if head.len() != prev.len() {
+        return Err(format!(
+            "record counts differ: head {} vs prev {}",
+            head.len(),
+            prev.len()
+        ));
+    }
+    if prev.is_empty() {
+        return Err("no comparable entries".into());
+    }
+    for (i, (h, p)) in head.iter().zip(prev).enumerate() {
+        let (h, p) = (canonical(h)?, canonical(p)?);
         if h != p {
             return Err(format!("entry {i}:\n  head: {h}\n  prev: {p}"));
         }
-        compared += 1;
     }
-    if compared == 0 {
-        return Err("no comparable entries (previous release decoded nothing)".into());
-    }
-    Ok(compared)
+    Ok(prev.len())
 }

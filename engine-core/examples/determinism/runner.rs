@@ -10,7 +10,8 @@
 //!   every `--state-every` checkpoint (the canonical durable-state digest
 //!   input; snapshot encoding is canonical since slice 3, #1662);
 //! * `{"i":N,"undecodable":"…"}` — this build cannot decode entry `N` (a
-//!   command variant newer than the build); the run stops there.
+//!   command variant newer than the build); the run stops there, or with
+//!   `--skip-undecodable` continues without applying it.
 //!
 //! The CI job hashes these files and compares them across hash seeds, process
 //! restarts, build profiles, platforms and the previous release.
@@ -40,12 +41,16 @@ pub struct RunOptions {
     /// in `HashMap` iteration order, which varies with the per-process hash
     /// seed and reaches the emitted events (instance keys, variables).
     pub canary: bool,
+    /// Record an undecodable entry and continue instead of stopping. The
+    /// previous-release cell uses this once to learn which entries the old
+    /// build cannot decode, then both builds replay the corpus without them.
+    pub skip_undecodable: bool,
 }
 
 /// One decoded corpus entry. Undecodable lines are kept as their error so
 /// the runner can report exactly where an older build stops.
 pub enum Entry {
-    Ok { now: u64, command: Command },
+    Ok { now: u64, command: Box<Command> },
     Undecodable(String),
 }
 
@@ -71,7 +76,7 @@ fn decode_entry(line: &str) -> Entry {
     match serde_json::from_str::<Wire>(line) {
         Ok(w) => Entry::Ok {
             now: w.now,
-            command: w.command,
+            command: Box::new(w.command),
         },
         Err(e) => Entry::Undecodable(e.to_string()),
     }
@@ -102,16 +107,20 @@ pub fn run(
             Entry::Ok { now, command } => (now, command),
             Entry::Undecodable(e) => {
                 writeln!(out, "{}", serde_json::json!({ "i": i, "undecodable": e }))?;
-                return Ok(i);
+                if !opts.skip_undecodable {
+                    return Ok(i);
+                }
+                i += 1;
+                continue;
             }
         };
-        let record = match engine.apply_command_at(command, now) {
+        let record = match engine.apply_command_at(*command, now) {
             Ok(events) => serde_json::json!({ "i": i, "events": events }),
             Err(e) => serde_json::json!({ "i": i, "err": e.to_string() }),
         };
         writeln!(out, "{record}")?;
         i += 1;
-        if opts.state_every > 0 && i % opts.state_every == 0 {
+        if opts.state_every > 0 && i.is_multiple_of(opts.state_every) {
             let state = serde_json::to_value(engine.snapshot())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             writeln!(out, "{}", serde_json::json!({ "i": i - 1, "state": state }))?;
@@ -142,27 +151,21 @@ fn canary_permute(entries: &mut [Entry]) {
         .iter()
         .enumerate()
         .filter(|(_, e)| {
-            matches!(
-                e,
-                Entry::Ok {
-                    command: Command::CreateInstance { .. },
-                    ..
-                }
-            )
+            matches!(e, Entry::Ok { command, .. } if matches!(**command, Command::CreateInstance { .. }))
         })
         .map(|(i, _)| i)
         .collect();
     let mut by_hash: std::collections::HashMap<usize, Command> = std::collections::HashMap::new();
     for &p in &positions {
         if let Entry::Ok { command, .. } = &entries[p] {
-            by_hash.insert(p, command.clone());
+            by_hash.insert(p, (**command).clone());
         }
     }
     // HashMap iteration order depends on the per-process random hash seed.
     let shuffled: Vec<Command> = by_hash.into_values().collect();
     for (&p, command) in positions.iter().zip(shuffled) {
         if let Entry::Ok { command: slot, .. } = &mut entries[p] {
-            *slot = command;
+            **slot = command;
         }
     }
 }

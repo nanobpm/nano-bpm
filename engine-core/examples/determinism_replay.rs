@@ -5,7 +5,7 @@
 //! ```bash
 //! cargo run --features serde --example determinism_replay -- CORPUS --out RECORDS \
 //!     [--state-every N] [--stop-after K --snapshot-out SNAP] \
-//!     [--resume SNAP --start-at K] [--canary]
+//!     [--resume SNAP --start-at K] [--canary] [--skip-undecodable]
 //! ```
 //!
 //! Kept free of newer engine API: the previous-release cell builds this file
@@ -41,14 +41,16 @@ fn main() {
             "--resume" => resume = Some(val()),
             "--start-at" => opts.start_at = val().parse().expect("--start-at"),
             "--canary" => opts.canary = true,
+            "--skip-undecodable" => opts.skip_undecodable = true,
             _ if corpus.is_none() => corpus = Some(arg),
             _ => panic!("unexpected argument {arg}"),
         }
     }
     let corpus = corpus.expect("usage: determinism_replay CORPUS --out RECORDS …");
-    let entries =
-        runner::read_corpus(BufReader::new(std::fs::File::open(&corpus).expect("corpus")))
-            .expect("read corpus");
+    let entries = runner::read_corpus(BufReader::new(
+        std::fs::File::open(&corpus).expect("corpus"),
+    ))
+    .expect("read corpus");
     let mut engine = match &resume {
         Some(path) => runner::load_snapshot(&std::fs::read(path).expect("snapshot")).expect("load"),
         None => nanobpmn_engine_core::Engine::new(),
@@ -60,5 +62,8 @@ fn main() {
     if let Some(path) = snapshot_out {
         std::fs::write(path, runner::save_snapshot(&engine).expect("snapshot")).expect("write");
     }
-    eprintln!("determinism_replay: applied entries [{}, {end})", opts.start_at);
+    eprintln!(
+        "determinism_replay: applied entries [{}, {end})",
+        opts.start_at
+    );
 }

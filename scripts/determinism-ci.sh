@@ -108,20 +108,26 @@ cmd_prev_release() {
   echo "previous release: $tag"
   build debug
   emit "$out/corpus.jsonl"
-  "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/head.jsonl"
 
-  local prev="$out/prev-src"
-  rm -rf "$prev"
-  git -C "$ROOT" worktree remove --force "$prev" 2>/dev/null || true
-  git -C "$ROOT" worktree add --detach "$prev" "$tag" >/dev/null
-  trap 'git -C "$ROOT" worktree remove --force "$prev" 2>/dev/null || true' EXIT
+  PREV_SRC="$out/prev-src"
+  git -C "$ROOT" worktree remove --force "$PREV_SRC" 2>/dev/null || true
+  rm -rf "$PREV_SRC"
+  git -C "$ROOT" worktree add --detach "$PREV_SRC" "$tag" >/dev/null
+  trap 'git -C "$ROOT" worktree remove --force "$PREV_SRC" 2>/dev/null || true' EXIT
   # The previous release has no runner: build HEAD's (API-minimal) runner
   # against the previous release's engine.
-  mkdir -p "$prev/engine-core/examples/determinism"
-  cp "$ENGINE/examples/determinism_replay.rs" "$prev/engine-core/examples/"
-  cp "$ENGINE/examples/determinism/runner.rs" "$prev/engine-core/examples/determinism/"
-  (cd "$prev/engine-core" && cargo build --features serde --example determinism_replay)
-  "$prev/engine-core/target/debug/examples/determinism_replay" "$out/corpus.jsonl" --out "$out/prev.jsonl"
+  mkdir -p "$PREV_SRC/engine-core/examples/determinism"
+  cp "$ENGINE/examples/determinism_replay.rs" "$PREV_SRC/engine-core/examples/"
+  cp "$ENGINE/examples/determinism/runner.rs" "$PREV_SRC/engine-core/examples/determinism/"
+  (cd "$PREV_SRC/engine-core" && cargo build --features serde --example determinism_replay)
+  local prev_bin="$PREV_SRC/engine-core/target/debug/examples/determinism_replay"
+
+  # Probe which entries the old build cannot decode (newer command variants
+  # or model shapes), drop them, then replay the same filtered corpus on both.
+  "$prev_bin" "$out/corpus.jsonl" --out "$out/probe.jsonl" --skip-undecodable
+  "$BIN/determinism_corpus" filter "$out/corpus.jsonl" "$out/probe.jsonl" "$out/compat.jsonl"
+  "$prev_bin" "$out/compat.jsonl" --out "$out/prev.jsonl"
+  "$BIN/determinism_replay" "$out/compat.jsonl" --out "$out/head.jsonl"
   "$BIN/determinism_corpus" cross-release "$out/head.jsonl" "$out/prev.jsonl"
 }
 
