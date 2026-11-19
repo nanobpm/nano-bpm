@@ -3962,26 +3962,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else if let Some(u) = n.as_u64() {
-                Value::Int(u as i64)
-            } else {
-                Value::Double(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => Value::Str(s.clone()),
-        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(map) => Value::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect(),
-        ),
-    }
+    nanobpmn_engine_core::value_from_json(v)
 }
 
 #[cfg(test)]

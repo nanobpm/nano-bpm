@@ -3618,3 +3618,43 @@ mod approx_bytes_tests {
         assert!(got < blob.len() as u64 + 200, "no runaway overhead: {got}");
     }
 }
+
+/// Canonical JSON → [`Value`] conversion shared by every runner (engine-wasm,
+/// the native parity replay). Integers representable as `i64` become
+/// [`Value::Int`]; every other number — including unsigned values above
+/// `i64::MAX` — becomes [`Value::Double`], never a wrapped negative `Int`
+/// (which would flip FEEL comparisons such as `x > 0`).
+#[cfg(feature = "serde")]
+pub fn value_from_json(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Double(n.as_f64().unwrap_or(0.0)),
+        },
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(items) => Value::List(items.iter().map(value_from_json).collect()),
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_from_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod value_from_json_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_above_i64_max_is_positive_double_not_wrapped_int() {
+        let v = value_from_json(&serde_json::json!(10_000_000_000_000_000_000u64));
+        assert_eq!(v, Value::Double(1e19));
+        assert_eq!(
+            value_from_json(&serde_json::json!(i64::MAX)),
+            Value::Int(i64::MAX)
+        );
+        assert_eq!(value_from_json(&serde_json::json!(-5)), Value::Int(-5));
+    }
+}

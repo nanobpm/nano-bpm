@@ -1,0 +1,20 @@
+{
+  "$comment": "Registry of Nano-only extensions in engine-core (#1247). A Nano region/branch the parity corpus never reaches is EITHER a registered Nano-only extension (a path matched below — no Camunda 8 behaviour to scenario against) OR a missing scenario. Ordered rules; the first match wins; `*` matches any run of characters. Paths are relative to the repository root. Adding a path here is a reviewed claim that the code has no Camunda-surface meaning.",
+  "extensions": [
+    {
+      "match": "engine-core/src/ffi.rs",
+      "id": "c-abi",
+      "note": "coarse C-ABI embedding surface for mobile/wasm hosts; not a Camunda behaviour"
+    },
+    {
+      "match": "engine-core/src/engine/debug.rs",
+      "id": "debugger",
+      "note": "stepping/breakpoint debugger (#646); a Nano tooling extension"
+    },
+    {
+      "match": "engine-core/src/lease.rs",
+      "id": "job-lease",
+      "note": "fenced job-lease tokens; a Nano extension over Zeebe job activation"
+    }
+  ]
+}
