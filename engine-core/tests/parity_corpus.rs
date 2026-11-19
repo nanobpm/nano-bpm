@@ -31,7 +31,7 @@
     reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Key, Value};
@@ -50,10 +50,10 @@ fn to_value(j: &Json) -> Value {
     nanobpmn_engine_core::value_from_json(j)
 }
 
-fn vars(j: Option<&Json>) -> HashMap<String, Value> {
+fn vars(j: Option<&Json>) -> BTreeMap<String, Value> {
     match j {
         Some(Json::Object(o)) => o.iter().map(|(k, v)| (k.clone(), to_value(v))).collect(),
-        _ => HashMap::new(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -100,7 +100,7 @@ impl Run {
         self.events.extend(evs);
     }
 
-    fn complete_jobs(&mut self, job_type: &str, max: usize, variables: HashMap<String, Value>) {
+    fn complete_jobs(&mut self, job_type: &str, max: usize, variables: BTreeMap<String, Value>) {
         let jobs = self
             .engine
             .activate_jobs(job_type, "parity-runner", max, 60_000, self.now);

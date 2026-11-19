@@ -32,7 +32,7 @@
 //! The engine core is untouched: this is purely a new ingress to the existing
 //! command path and a new consumer of `activate_jobs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -2247,7 +2247,7 @@ where
     };
 }
 
-fn to_engine_vars(variables: Option<Map<String, Value>>) -> HashMap<String, crate::Value> {
+fn to_engine_vars(variables: Option<Map<String, Value>>) -> BTreeMap<String, crate::Value> {
     variables
         .map(|map| {
             map.iter()

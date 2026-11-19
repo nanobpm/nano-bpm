@@ -109,7 +109,7 @@ fn migrated_event_gateway_race_is_won_by_target_message() {
 #[test]
 fn migrated_event_gateway_race_is_won_by_target_signal() {
     let (mut engine, inst) = migrated_instance("reply", full_mapping());
-    let events = engine.broadcast_signal("go", HashMap::new(), 0);
+    let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
     assert_completed_via(&engine, inst, &events, "endSig2");
 }
 
@@ -129,7 +129,7 @@ fn migration_withdraws_an_unmapped_race_member() {
             .any(|s| s.instance_key == inst && s.state == state::MessageSubscriptionState::Open),
         "the unmapped message catch's subscription is deleted"
     );
-    let events = engine.broadcast_signal("go", HashMap::new(), 0);
+    let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
     assert_completed_via(&engine, inst, &events, "endSig2");
 }
 
@@ -306,7 +306,7 @@ fn migration_withdrawal_cancels_a_parked_start_listener_job() {
         "the parked listener job is cancelled"
     );
     assert!(engine.activate_jobs("audit", "W", 10, 1_000, 0).is_empty());
-    let events = engine.broadcast_signal("go", HashMap::new(), 0);
+    let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
     assert_completed_via(&engine, inst, &events, "endSig2");
 }
 
@@ -385,7 +385,7 @@ fn migration_rejects_two_source_races_merged_onto_one_target_gateway() {
 fn migration_race_check_treats_each_scope_as_its_own_race() {
     let source = two_timer_race("source");
     let target = two_timer_race("target");
-    let mapped: HashMap<String, String> = pairs(&[("t1", "t1")]).into_iter().collect();
+    let mapped: BTreeMap<String, String> = pairs(&[("t1", "t1")]).into_iter().collect();
     let active = vec![
         (10, "t1".to_string()),
         (11, "t2".to_string()),
@@ -426,7 +426,8 @@ fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
         .build()
         .unwrap();
     let target = two_timer_race("target");
-    let mapped: HashMap<String, String> = pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
+    let mapped: BTreeMap<String, String> =
+        pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
     let active = vec![
         (10, "a1".to_string()),
         (11, "a2".to_string()),
@@ -447,7 +448,7 @@ fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
 fn migration_race_check_rejects_paused_gateways_merged_onto_one_target() {
     let source = two_races("source");
     let target = two_timer_race("target");
-    let mapped: HashMap<String, String> =
+    let mapped: BTreeMap<String, String> =
         pairs(&[("gwA", "gw"), ("gwB", "gw")]).into_iter().collect();
     let active = vec![(10, "gwA".to_string()), (11, "gwB".to_string())];
     let err =

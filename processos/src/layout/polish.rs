@@ -13,7 +13,7 @@
 //! No LLM, no randomness — this is the safe deterministic starting point
 //! before we contemplate a stochastic refinement loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::layout::conformance;
 use crate::layout::gates;
@@ -125,8 +125,8 @@ fn build_all_moves(base: &Geom, ann: &SemanticAnnotations) -> Vec<Move> {
     let mut moves: Vec<Move> = Vec::new();
 
     // 1. Gateway centring on mean y of branches.
-    let mut out: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut inc: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut inc: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for e in base.edges.iter().filter(|e| e.is_sequence_flow) {
         out.entry(e.source.as_str())
             .or_default()
@@ -193,7 +193,7 @@ fn build_all_moves(base: &Geom, ann: &SemanticAnnotations) -> Vec<Move> {
     //    happy chain (bake-off polish only aligns nodes actually on the
     //    happy sequence chain — we approximate that by intersecting
     //    happy-flow membership with the leaves).
-    let happy: HashSet<String> = ann
+    let happy: BTreeSet<String> = ann
         .flows
         .iter()
         .filter(|f| f.kind == FlowKind::Primary)
@@ -229,7 +229,7 @@ fn apply_moves(xml: &str, moves: &[Move]) -> String {
         return xml.to_string();
     }
     // Collapse per-id moves (a node can appear in gateway + grid + happy).
-    let mut delta: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut delta: BTreeMap<String, (f64, f64)> = BTreeMap::new();
     for m in moves {
         let e = delta.entry(m.id.clone()).or_insert((0.0, 0.0));
         e.0 += m.dx;
@@ -275,7 +275,7 @@ fn apply_moves(xml: &str, moves: &[Move]) -> String {
     reroute_edges(&out, &geom, &delta)
 }
 
-fn reroute_edges(xml: &str, geom: &Geom, delta: &HashMap<String, (f64, f64)>) -> String {
+fn reroute_edges(xml: &str, geom: &Geom, delta: &BTreeMap<String, (f64, f64)>) -> String {
     let mut result = String::with_capacity(xml.len() + 64);
     let mut cursor = 0;
     while let Some(rel) = xml[cursor..].find("<bpmndi:BPMNEdge") {

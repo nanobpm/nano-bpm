@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(v.active_profile.as_deref(), Some("gemma-4-local"));
         assert!(v.profiles.iter().all(|p| p.sidecar));
         // Every sidecar gets its own port so several can run side by side.
-        let ports: std::collections::HashSet<u16> = v
+        let ports: std::collections::BTreeSet<u16> = v
             .profiles
             .iter()
             .filter_map(|p| p.base_url.as_deref().and_then(parse_port))

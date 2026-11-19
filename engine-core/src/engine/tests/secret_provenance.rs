@@ -78,7 +78,7 @@ fn task(inputs: Vec<Mapping>) -> ProcessDefinition {
 fn run(
     engine: &mut Engine,
     def: ProcessDefinition,
-    vars: HashMap<String, Value>,
+    vars: BTreeMap<String, Value>,
 ) -> (Vec<SecretProvenance>, Vec<Event>) {
     let proc_id = def.id.clone();
     let mut log = engine.apply_command(Command::DeployProcess(def)).unwrap();
@@ -119,7 +119,7 @@ fn trusted_sources_are_recorded_untrusted_are_not() {
             m("camunda.secrets.TOKEN", "static"),
             m("=if true then apiCfg else jsonCfg", "computed"),
         ]),
-        HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+        BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
     );
     assert_eq!(prov, vec![site("token"), site("direct.inner")]);
     // The job state carries the same provenance (what activation reads).
@@ -135,7 +135,7 @@ fn a_process_variable_shadowing_a_trusted_root_is_untrusted() {
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
-        HashMap::from([("apiCfg".to_string(), Value::Str(REF.to_string()))]),
+        BTreeMap::from([("apiCfg".to_string(), Value::Str(REF.to_string()))]),
     );
     assert!(prov.is_empty(), "{prov:?}");
 }
@@ -176,7 +176,7 @@ fn a_parent_scope_variable_shadowing_a_trusted_root_is_untrusted() {
     let (prov, _) = run(
         &mut engine,
         def,
-        HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+        BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
     );
     assert!(prov.is_empty(), "{prov:?}");
 }
@@ -196,7 +196,7 @@ fn a_later_untrusted_mapping_overwrites_provenance() {
             m("=bodyRef", "retrusted"),
             m("=apiCfg", "retrusted"),
         ]),
-        HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+        BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
     );
     assert_eq!(
         prov,
@@ -218,7 +218,7 @@ fn a_jsonkind_tenant_variable_shadowing_a_trusted_global_is_untrusted() {
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert!(prov.is_empty(), "{prov:?}");
 }
@@ -229,7 +229,7 @@ fn provenance_is_fixed_at_mapping_time() {
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert_eq!(prov, vec![site("token")]);
     // Deleting / retyping the cluster variable afterwards changes nothing
@@ -254,7 +254,7 @@ fn journal_and_snapshot_hold_no_plaintext() {
     let (_, log) = run(
         &mut engine,
         task(vec![m("=apiCfg", "token")]),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     let journal = serde_json::to_vec(&log).unwrap();
     let snapshot = serde_json::to_vec(&engine.snapshot()).unwrap();
@@ -288,7 +288,7 @@ fn an_aliased_target_overwrites_provenance() {
         let (prov, _) = run(
             &mut engine,
             task(vec![m("=apiCfg", "payload.auth"), m("=bodyRef", alias)]),
-            HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+            BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
         );
         assert!(prov.is_empty(), "alias {alias}: {prov:?}");
     }
@@ -297,7 +297,7 @@ fn an_aliased_target_overwrites_provenance() {
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "payload..auth")]),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert_eq!(prov, vec![site("payload.auth")]);
 }
@@ -312,7 +312,7 @@ fn a_post_creation_variable_write_revokes_provenance() {
         let (prov, _) = run(
             &mut engine,
             task(vec![m("=apiCfg", "payload.auth")]),
-            HashMap::new(),
+            BTreeMap::new(),
         );
         assert_eq!(prov, vec![site("payload.auth")]);
         let job = engine.state.jobs.values().next().unwrap().clone();
@@ -326,7 +326,7 @@ fn a_post_creation_variable_write_revokes_provenance() {
         engine
             .apply_command(Command::set_variables_scoped(
                 scope,
-                HashMap::from([("payload".to_string(), Value::Map(other))]),
+                BTreeMap::from([("payload".to_string(), Value::Map(other))]),
                 local,
             ))
             .unwrap();
@@ -344,7 +344,7 @@ fn a_sibling_scope_write_preserves_provenance() {
     let (prov, _) = run(
         &mut engine,
         task(vec![m("=apiCfg", "payload.auth")]),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert_eq!(prov, vec![site("payload.auth")]);
     let job = engine.state.jobs.values().next().unwrap().clone();
@@ -352,7 +352,7 @@ fn a_sibling_scope_write_preserves_provenance() {
     let write = |scope_key| crate::event::Event::ScopedVariablesUpdated {
         instance_key: job.instance_key,
         scope_key,
-        variables: HashMap::from([("payload".to_string(), Value::Str(REF.to_string()))]),
+        variables: BTreeMap::from([("payload".to_string(), Value::Str(REF.to_string()))]),
     };
     crate::state::apply(&mut engine.state, &write(sibling));
     assert_eq!(
@@ -372,7 +372,7 @@ fn a_retype_is_a_command_ordered_against_evaluation() {
     let mut engine = engine_with_cluster_vars();
     // Retype `jsonCfg` -> SECRET_REFERENCE through the (distributed upsert)
     // command: only evaluations AFTER it in the log observe the new kind.
-    let (before, _) = run(&mut engine, task(vec![m("=jsonCfg", "t")]), HashMap::new());
+    let (before, _) = run(&mut engine, task(vec![m("=jsonCfg", "t")]), BTreeMap::new());
     assert!(before.is_empty(), "{before:?}");
     engine
         .apply_command(Command::CreateClusterVariable {
@@ -385,7 +385,7 @@ fn a_retype_is_a_command_ordered_against_evaluation() {
         })
         .unwrap();
     let after = engine
-        .apply_command(Command::create_instance_with("p", HashMap::new()))
+        .apply_command(Command::create_instance_with("p", BTreeMap::new()))
         .unwrap()
         .into_iter()
         .find_map(|e| match e {
@@ -445,7 +445,7 @@ fn a_sibling_branch_local_does_not_shadow_a_trusted_root() {
         engine
             .apply_command(Command::create_instance_with(
                 proc_id,
-                HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+                BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
             ))
             .unwrap(),
     );
@@ -503,7 +503,7 @@ fn provenance_matches_the_single_evaluated_value_under_nondeterminism() {
             engine
                 .apply_command(Command::create_instance_with(
                     proc_id,
-                    HashMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
+                    BTreeMap::from([("bodyRef".to_string(), Value::Str(REF.to_string()))]),
                 ))
                 .unwrap(),
         );

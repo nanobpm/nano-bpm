@@ -606,7 +606,7 @@ impl Engine {
         &mut self,
         message_name: impl Into<String>,
         correlation_key: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         now: u64,
     ) -> Vec<Event> {
         self.apply_command_at(
@@ -629,7 +629,7 @@ impl Engine {
     pub fn broadcast_signal(
         &mut self,
         signal_name: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         now: u64,
     ) -> Vec<Event> {
         self.apply_command_at(
@@ -690,7 +690,7 @@ impl Engine {
         mut handler: F,
     ) -> usize
     where
-        F: FnMut(&ActivatedJob) -> Option<HashMap<String, Value>>,
+        F: FnMut(&ActivatedJob) -> Option<BTreeMap<String, Value>>,
     {
         let jobs = self.activate_jobs(job_type, worker, max_jobs, timeout, now);
         let mut completed = 0;

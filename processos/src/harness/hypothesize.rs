@@ -11,7 +11,7 @@
 //! The model is reached through the pluggable [`super::llm`] client, so the same
 //! code path serves a local `llama.cpp`/Ollama/vLLM server and Anthropic alike.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use serde::Deserialize;
@@ -29,7 +29,7 @@ struct ProposedCandidate {
     name: Option<String>,
     /// `job_type -> worker_id` overrides over the scenario defaults.
     #[serde(default)]
-    assignment: HashMap<String, String>,
+    assignment: BTreeMap<String, String>,
     #[serde(default)]
     rationale: Option<String>,
     /// An optional full BPMN rewrite (structural change). Validated before use.
@@ -66,7 +66,7 @@ pub async fn run_hypothesis(
     let (defs, process_id) = rank::prepare(scenario)?;
 
     // Establish the baseline first; it anchors the prompt and the comparison.
-    let baseline_assignment = rank::effective_assignment(scenario, &HashMap::new());
+    let baseline_assignment = rank::effective_assignment(scenario, &BTreeMap::new());
     let baseline = rank::evaluate(
         scenario,
         &defs,
@@ -396,7 +396,7 @@ mod tests {
     fn prompt_lists_workers_and_baseline() {
         let scenario = crate::harness::example_scenario();
         let (defs, pid) = rank::prepare(&scenario).unwrap();
-        let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
+        let base_assign = rank::effective_assignment(&scenario, &BTreeMap::new());
         let baseline = rank::evaluate(
             &scenario,
             &defs,
@@ -419,7 +419,7 @@ mod tests {
     fn prompt_includes_measured_production_signal() {
         let scenario = crate::harness::example_scenario();
         let (defs, pid) = rank::prepare(&scenario).unwrap();
-        let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
+        let base_assign = rank::effective_assignment(&scenario, &BTreeMap::new());
         let baseline = rank::evaluate(
             &scenario,
             &defs,

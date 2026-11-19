@@ -271,7 +271,7 @@ fn snapshot_recovery_continues_the_seed_sequence() {
 #[test]
 fn feel_now_and_today_observe_the_command_timestamp() {
     let events = replay_journal();
-    let outputs: Vec<&HashMap<String, Value>> = events
+    let outputs: Vec<&BTreeMap<String, Value>> = events
         .iter()
         .filter_map(|e| match e {
             Event::VariablesUpdated { variables, .. }

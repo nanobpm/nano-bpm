@@ -32,7 +32,7 @@ mod replay;
 mod replay_rank;
 mod sim;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub use calibrate::{apply as apply_calibration, calibrate_from_measured};
 #[allow(unused_imports)]
@@ -100,7 +100,7 @@ pub struct WorkerModel {
     /// (its "answer"). Cheaper/weaker workers can encode a different answer to
     /// model lower correctness.
     #[serde(default)]
-    pub output: HashMap<String, Json>,
+    pub output: BTreeMap<String, Json>,
 }
 
 /// One scenario input: the variables a process instance starts with, plus the
@@ -109,11 +109,11 @@ pub struct WorkerModel {
 #[serde(rename_all = "camelCase")]
 pub struct ScenarioInput {
     #[serde(default)]
-    pub vars: HashMap<String, Json>,
+    pub vars: BTreeMap<String, Json>,
     /// Expected output variables. A run is *correct* when every expected
     /// key/value is present and equal in the final instance variables.
     #[serde(default)]
-    pub expected: HashMap<String, Json>,
+    pub expected: BTreeMap<String, Json>,
 }
 
 /// A candidate process configuration. In the MVP transform space the BPMN is the
@@ -125,7 +125,7 @@ pub struct Variant {
     pub name: String,
     /// `job_type -> worker_id` overrides over the default task assignment.
     #[serde(default)]
-    pub assignment: HashMap<String, String>,
+    pub assignment: BTreeMap<String, String>,
 }
 
 /// How candidates are ranked. Feasible candidates (meeting the correctness and
@@ -176,12 +176,12 @@ pub struct Scenario {
     #[serde(default)]
     pub process_id: Option<String>,
     /// Worker pool, keyed by worker id.
-    pub workers: HashMap<String, WorkerModel>,
+    pub workers: BTreeMap<String, WorkerModel>,
     /// Default assignment: `job_type -> worker_id` for the test model.
-    pub task_workers: HashMap<String, String>,
+    pub task_workers: BTreeMap<String, String>,
     /// Latent swappable options per job type — the MVP transform space.
     #[serde(default)]
-    pub latent_options: HashMap<String, Vec<String>>,
+    pub latent_options: BTreeMap<String, Vec<String>>,
     /// Inputs with expected outputs (for correctness scoring).
     pub inputs: Vec<ScenarioInput>,
     /// Optional golden variant we hope exploration recovers or beats.

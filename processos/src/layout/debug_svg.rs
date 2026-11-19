@@ -8,7 +8,7 @@
 //! [`crate::bpmn_model::append_diagram`] writes; if the DI format changes those
 //! two functions move in lockstep.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use super::schema::{FlowKind, SemanticAnnotations};
@@ -46,7 +46,7 @@ pub fn render_debug_svg(bpmn_xml: &str, ann: &SemanticAnnotations) -> String {
 pub fn render_debug_svg_with_forces(
     bpmn_xml: &str,
     ann: &SemanticAnnotations,
-    node_forces: Option<&HashMap<String, (f64, f64)>>,
+    node_forces: Option<&BTreeMap<String, (f64, f64)>>,
 ) -> String {
     let shapes = parse_shapes(bpmn_xml);
     let edges = parse_edges(bpmn_xml);

@@ -1279,7 +1279,7 @@ const RUNAWAY_MAX_REPEATS: usize = 6;
 
 /// True if any single trimmed line of at least `min_line` chars occurs `max_repeats`+ times.
 fn has_repeated_line(s: &str, min_line: usize, max_repeats: usize) -> bool {
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for line in s.lines() {
         let l = line.trim();
         if l.len() >= min_line {

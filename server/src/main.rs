@@ -1981,7 +1981,7 @@ mod cluster_variable_tests {
         use nanobpmn_engine_core::{IoMapping, Mapping};
         let server = ServerImpl {
             secret_store: Arc::new(crate::secrets::MapSecretStore(
-                std::collections::HashMap::from([
+                std::collections::BTreeMap::from([
                     ("TOKEN".to_string(), "s3cr3t".to_string()),
                     ("DIRECT".to_string(), "direct-value".to_string()),
                 ]),
@@ -4030,7 +4030,7 @@ impl ServerImpl {
         // set (hot ∪ cold across every replayed partition) and mark every Active
         // read row absent from it as Completed, then seed the gauge from the
         // reconciled (true) count.
-        let mut live_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live_keys: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for journal in journals.iter() {
             journal.collect_live_instance_keys(&mut live_keys);
         }
@@ -4466,8 +4466,8 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 /// definitions through the index fallback, so the seed must include them too
 /// (otherwise a freshly-seeded peer cannot resolve what the owner can).
 fn seed_versions<'a, T>(
-    versions: &'a std::collections::HashMap<Key, T>,
-    latest: &'a std::collections::HashMap<String, T>,
+    versions: &'a std::collections::BTreeMap<Key, T>,
+    latest: &'a std::collections::BTreeMap<String, T>,
     key: impl Fn(&T) -> Key,
 ) -> std::collections::BTreeMap<Key, &'a T> {
     let mut all: std::collections::BTreeMap<Key, &'a T> =
@@ -9116,7 +9116,7 @@ impl ServerImpl {
         // error-throw, keeping that path unchanged.
         let variables = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
         if let Some(node) = self.route_by_leader(job_key) {
@@ -10272,7 +10272,7 @@ impl ServerImpl {
             };
         }
 
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .iter()
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
@@ -10650,7 +10650,7 @@ impl ServerImpl {
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
@@ -10730,7 +10730,7 @@ impl ServerImpl {
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
         operation_reference: Option<i64>,
@@ -10784,7 +10784,7 @@ impl ServerImpl {
         business_id: Option<String>,
         operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
             .map(|m| {
                 m.iter()
@@ -11907,7 +11907,7 @@ impl ServerImpl {
     pub(crate) async fn set_variables_local(
         &self,
         scope_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         local: bool,
     ) -> Result<(), (u16, String)> {
         self.apply_partition_command(
@@ -12743,7 +12743,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         await_completion: bool,
@@ -21122,14 +21122,14 @@ impl ServerImpl {
             return 0;
         }
         let num = self.engine.topology().num_partitions;
-        let mut live: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for p in 0..num {
             let Some(handle) = self.engine_handle_for(p) else {
                 continue;
             };
             let keys = handle
                 .with(|journal| {
-                    let mut s = std::collections::HashSet::new();
+                    let mut s = std::collections::BTreeSet::new();
                     journal.collect_live_instance_keys(&mut s);
                     s
                 })
@@ -22153,7 +22153,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
         // is saturated — the global bottleneck that hits every definition at once.
@@ -22408,7 +22408,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
@@ -22590,7 +22590,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
         tags: Vec<String>,
         business_id: Option<String>,
@@ -22706,7 +22706,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
     ) -> Result<
@@ -22899,7 +22899,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         use apis::process_instance::CreateProcessInstanceResponse as R;
         let wire_vars = if variables.is_empty() {
@@ -23071,7 +23071,7 @@ impl ServerImpl {
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
@@ -23091,7 +23091,7 @@ impl ServerImpl {
         &self,
         job_key: u64,
         lease_token: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
         business_id: Option<String>,
@@ -23194,7 +23194,7 @@ impl ServerImpl {
         lease_token: Option<String>,
         error_code: String,
         error_message: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
@@ -24809,11 +24809,11 @@ impl ServerImpl {
     async fn cluster_variable_snapshot(
         &self,
     ) -> (
-        std::collections::HashMap<String, Value>,
+        std::collections::BTreeMap<String, Value>,
         std::collections::HashMap<String, models::ClusterVariableKindEnum>,
         std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
     ) {
-        let mut globals: std::collections::HashMap<String, Value> = Default::default();
+        let mut globals: std::collections::BTreeMap<String, Value> = Default::default();
         let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
             Default::default();
         let mut tenants: std::collections::HashMap<
@@ -24856,9 +24856,9 @@ impl ServerImpl {
         // endpoints are stateless, so no process-instance / element-instance
         // scope is resolved here. `Nullable::Null` (an explicit `"variables":
         // null`) and an omitted map both mean "no variables".
-        let mut ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
+        let mut ctx: std::collections::BTreeMap<String, Value> = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
         // Layer the cluster variables UNDERNEATH the request-body variables (a
@@ -27944,7 +27944,7 @@ pub(crate) struct JobCompletion {
 
 fn completion_command(
     job_key: u64,
-    variables: std::collections::HashMap<String, Value>,
+    variables: std::collections::BTreeMap<String, Value>,
     adhoc_result: Option<AdHocJobResult>,
     task_result: Option<TaskListenerJobResult>,
     lease_token: Option<String>,
@@ -28101,7 +28101,7 @@ fn activated_job_result(
     // here neither blocks the command thread nor deep-clones the value tree.
     let variables = match fetch_variable {
         Some(names) => {
-            let filtered: std::collections::HashMap<String, Value> = job
+            let filtered: std::collections::BTreeMap<String, Value> = job
                 .variables
                 .iter()
                 .filter(|(name, _)| names.iter().any(|n| n == *name))
@@ -28170,7 +28170,7 @@ fn activated_job_result(
 /// Converts engine variables into the generated `Object` (JSON) map used by the
 /// REST models.
 fn to_object_map(
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> std::collections::HashMap<String, types::Object> {
     variables
         .iter()
@@ -28202,7 +28202,7 @@ fn adhoc_result_from_completion(
                     element_id: el.element_id.clone().unwrap_or_default(),
                     variables: match el.variables.as_ref() {
                         Some(types::Nullable::Present(map)) => from_object_map(map),
-                        _ => std::collections::HashMap::new(),
+                        _ => std::collections::BTreeMap::new(),
                     },
                 })
                 .collect()
@@ -28255,7 +28255,7 @@ fn adhoc_activation_command(
 /// the drop. Returns `Some((400, detail))` to reject, `None` to allow.
 fn reject_task_result_with_variables(
     task_result: &Option<TaskListenerJobResult>,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> Option<(u16, String)> {
     if task_result.is_some() && !variables.is_empty() {
         Some((
@@ -28364,7 +28364,7 @@ fn user_task_corrections_from_model(c: &models::JobResultCorrections) -> UserTas
 
 fn from_object_map(
     variables: &std::collections::HashMap<String, types::Object>,
-) -> std::collections::HashMap<String, Value> {
+) -> std::collections::BTreeMap<String, Value> {
     variables
         .iter()
         .map(|(name, object)| (name.clone(), json_to_value(&object.0)))
@@ -28422,7 +28422,7 @@ enum ForwardCreateOutcome {
 /// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
 /// meter in-flight create payloads for byte-aware admission control. Sums each
 /// key's length plus its value's [`Value::approx_bytes`].
-fn engine_vars_bytes(vars: &std::collections::HashMap<String, Value>) -> u64 {
+fn engine_vars_bytes(vars: &std::collections::BTreeMap<String, Value>) -> u64 {
     vars.iter()
         .map(|(k, v)| k.len() as u64 + v.approx_bytes())
         .sum()
@@ -28570,7 +28570,7 @@ fn modify_instructions_from_rest(
         };
         out.activate_instructions.push(ActivateElementInstruction {
             element_id: a.element_id.clone(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             ancestor_element_instance_key,
             variable_instructions: variable_instructions_from_rest(
                 a.variable_instructions.as_ref(),
@@ -35363,7 +35363,7 @@ mod clustered_startup_tests {
 
         // Create the instance via node 0; it lands on a node-0 partition (0 or 2)
         // and parks at the catch. The create path routes the Opening to node 1.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         let (instance_key, completed) = node0
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -35468,7 +35468,7 @@ mod clustered_startup_tests {
 
         // Creating an instance evaluates the decision synchronously: the
         // businessRuleTask has no job to wait on, so the instance completes.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (_instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -36306,7 +36306,7 @@ mod clustered_startup_tests {
             .await
             .expect("mixed dmn+bpmn deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -36403,7 +36403,7 @@ mod clustered_startup_tests {
                 "hallo",
             )]))
             .expect("deploy the DRG");
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert(
             "lang".to_string(),
             nanobpmn_engine_core::Value::Str("de".into()),
@@ -36512,7 +36512,7 @@ mod clustered_startup_tests {
 
     /// Starts a `greeter` instance with `lang`, returning its key.
     async fn start_greeter(server: &ServerImpl, lang: &str) -> u64 {
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str(lang.into()));
         server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -37221,7 +37221,7 @@ mod clustered_startup_tests {
             .expect("deploy succeeds");
         let mut instances = Vec::new();
         for tier in tiers {
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert(
                 "tier".to_string(),
                 nanobpmn_engine_core::Value::Str((*tier).into()),
@@ -37366,7 +37366,7 @@ mod clustered_startup_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -37618,7 +37618,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the approval instance");
@@ -37730,7 +37730,7 @@ mod clustered_startup_tests {
                 .await
                 .expect("create charger");
         }
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -37832,11 +37832,11 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -38071,7 +38071,7 @@ mod clustered_startup_tests {
         let mut keys = std::collections::HashMap::new();
         for id in ["timed", "signalled", "gated"] {
             // `approved = false` keeps the conditional catch parked.
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("approved".to_string(), Value::Bool(false));
             let (key, _) = server
                 .create_for_stream(Some(id.into()), None, vars)
@@ -38175,7 +38175,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create approval");
@@ -38335,7 +38335,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
@@ -38412,7 +38412,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -38822,7 +38822,7 @@ mod clustered_startup_tests {
             .expect("deploy succeeds");
 
         // Start an instance of the waiter so a PROCESS_EVENT row exists too.
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -39093,7 +39093,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -39405,7 +39405,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
         let (instance_key, _) = server
-            .create_for_stream(Some("fork".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("fork".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create the fork instance");
 
@@ -39543,7 +39543,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the failer instance");
@@ -39684,7 +39684,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("scripted-fail".into()),
                 None,
-                std::collections::HashMap::from([("n".to_string(), Value::Str("oops".into()))]),
+                std::collections::BTreeMap::from([("n".to_string(), Value::Str("oops".into()))]),
             )
             .await
             .expect("create the instance");
@@ -39793,7 +39793,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("job-failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -39921,7 +39921,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("waits-forever".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -40040,7 +40040,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["order-v1", "order-v1", "audit-v1"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "audit-v1" {
@@ -40269,7 +40269,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["move-me", "move-me", "other"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "other" {
@@ -40558,7 +40558,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("order-v1".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -40676,7 +40676,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("modify-me".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -41709,7 +41709,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("feature".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the feature instance");
@@ -45360,7 +45360,7 @@ mod clustered_startup_tests {
         let n = jobs.len();
         for job in jobs {
             let key = job.job_key.0.parse::<u64>().expect("numeric job key");
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("result".to_string(), Value::Str("r".repeat(512)));
             node.complete_job_for_stream(key, vars, None, None)
                 .await
@@ -45391,7 +45391,7 @@ mod clustered_startup_tests {
     async fn parity_workload_round(nodes: [&ServerImpl; 3], tally: &mut ParityTally) {
         for node in nodes {
             for i in 0..6 {
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert(
                     "payload".to_string(),
                     Value::Str(format!("{i}").repeat(256)),
@@ -45494,7 +45494,7 @@ mod clustered_startup_tests {
         node.engine_handle_for(p)
             .expect("replica engine exists")
             .with(|journal| {
-                let mut live = std::collections::HashSet::new();
+                let mut live = std::collections::BTreeSet::new();
                 journal.collect_live_instance_keys(&mut live);
                 let (_restored, unreadable) = journal.rehydrate_all_cold();
                 let state = journal.engine().state();
@@ -45834,7 +45834,7 @@ mod clustered_startup_tests {
         } else {
             let still_live = follower
                 .with(move |j| {
-                    let mut live = std::collections::HashSet::new();
+                    let mut live = std::collections::BTreeSet::new();
                     j.collect_live_instance_keys(&mut live);
                     live.contains(&instance_key)
                 })
@@ -46610,7 +46610,7 @@ mod clustered_startup_tests {
         let p1_before =
             leader_applied(&all, sub_partition).expect("partition 1 has a leader at boot");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
         let (instance_key, _) = node0
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -46792,7 +46792,7 @@ mod clustered_startup_tests {
             let node = node0.clone();
             let order = order_id.clone();
             tokio::spawn(async move {
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert("orderId".to_string(), Value::Str(order));
                 node.create_for_stream(Some("waiter".into()), None, vars)
                     .await
@@ -51626,7 +51626,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -51651,7 +51651,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -51729,7 +51729,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -51756,7 +51756,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 Some(REF),
@@ -51867,7 +51867,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("cancel-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -51904,7 +51904,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -51936,7 +51936,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("gate-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, _) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -52048,7 +52048,7 @@ mod subscription_placement_tests {
         }
         let order = chosen.expect("a cross-partition correlation key exists");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         // The caller is CANCELLED immediately: it never observes the outcome.
         let accounting = CreateAccounting::enter(&server, 0);
@@ -52116,7 +52116,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -52161,7 +52161,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -52257,7 +52257,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -52342,7 +52342,7 @@ mod subscription_placement_tests {
             }
         }
         let order = chosen.expect("a cross-partition correlation key exists");
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
 
         // The durability gate the test holds open: the create's commit is
@@ -52397,7 +52397,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".to_string(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -52659,7 +52659,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("abort-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("guarded".into()), None, variables)
@@ -52684,7 +52684,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "abort-order".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -52742,7 +52742,7 @@ mod subscription_placement_tests {
                 .correlate_message_everywhere(
                     "order-placed".into(),
                     format!("order-{i}"),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     None,
                     None,
                     None,
@@ -52817,7 +52817,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("svc-order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, _completed) = server
                 .create_for_stream(Some("work-then-wait".into()), None, variables)
@@ -52844,7 +52844,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None, None)
+            .complete_job_for_stream(job_key, std::collections::BTreeMap::new(), None, None)
             .await
             .expect("complete succeeds")
             .wait()
@@ -52859,7 +52859,7 @@ mod subscription_placement_tests {
                 .correlate_message_local(
                     "payment-received".into(),
                     order.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     None,
                     None,
                     None,
@@ -52926,7 +52926,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "order-placed".into(),
                 key,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -52955,7 +52955,7 @@ mod subscription_placement_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str("order-x".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -52967,7 +52967,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 "order-x".into(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -53476,7 +53476,7 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
 
         let rejection = reject_task_result_with_variables(&task_result, &variables)
@@ -53495,10 +53495,10 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let empty = std::collections::HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         assert!(reject_task_result_with_variables(&task_result, &empty).is_none());
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
         assert!(reject_task_result_with_variables(&None, &variables).is_none());
     }
@@ -54268,7 +54268,7 @@ mod batch_operation_tests {
             .create_for_stream(
                 Some("to-cancel".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -54884,7 +54884,7 @@ mod search_process_instances_tags_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -54993,7 +54993,7 @@ mod search_process_instances_tenant_suspended_unprojected_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -55159,7 +55159,7 @@ mod search_process_instances_suspend_resume_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 1_700_000_000_000,
             tags: Vec::new(),
             business_id: None,
@@ -55343,7 +55343,7 @@ mod search_filter_honesty_tests {
             Event::ProcessInstanceCreated {
                 instance_key: key,
                 process_id: process_id.to_string(),
-                variables: std::collections::HashMap::new(),
+                variables: std::collections::BTreeMap::new(),
                 created_at: 1_700_000_000_000,
                 tags: tags.iter().map(|t| (*t).to_string()).collect(),
                 business_id: business_id.map(str::to_string),
@@ -57647,7 +57647,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ca-top".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ca-top");
@@ -57817,7 +57817,7 @@ mod call_activity_hierarchy_read_model_tests {
         let server = ServerImpl::default();
         deploy(&server, vec![parking_process("solo", "work")]).await;
         let (solo_key, _) = server
-            .create_for_stream(Some("solo".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("solo".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create solo");
 
@@ -57894,7 +57894,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-parent");
@@ -57902,7 +57902,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-solo".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-solo");
@@ -57970,7 +57970,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-parent");
@@ -58049,7 +58049,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-state".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-state");
@@ -58179,7 +58179,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -58262,7 +58262,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -58379,7 +58379,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -58490,7 +58490,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,

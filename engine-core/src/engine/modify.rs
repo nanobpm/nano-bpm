@@ -31,10 +31,10 @@ struct PlannedActivation {
     resolution: FlowScopeResolution,
     /// Root-scope variables (the instruction's `variables` plus variable
     /// instructions without / with the process id as scope).
-    global: Vec<HashMap<String, Value>>,
+    global: Vec<BTreeMap<String, Value>>,
     /// Variable instructions on a flow scope (or the element itself), by
     /// scope element id, in instruction order.
-    scoped: Vec<(ElementId, HashMap<String, Value>)>,
+    scoped: Vec<(ElementId, BTreeMap<String, Value>)>,
 }
 
 /// A fully validated modification, ready to apply.
@@ -58,13 +58,13 @@ type CreatedScopePath = (Key, Vec<ElementId>);
 /// its own lineage (#1398 review).
 enum StagedWrite {
     /// A root-scope write (a `global` batch).
-    Root(HashMap<String, Value>),
+    Root(BTreeMap<String, Value>),
     /// A write to an already-existing scope instance, resolved (to its
     /// variable scope) at staging time within the writing activation's
     /// lineage — exactly the instance application writes.
-    ExistingScope(Key, HashMap<String, Value>),
+    ExistingScope(Key, BTreeMap<String, Value>),
     /// A write to a flow scope this command creates.
-    CreatedScope(CreatedScopePath, HashMap<String, Value>),
+    CreatedScope(CreatedScopePath, BTreeMap<String, Value>),
 }
 
 /// The writes of the activations planned so far, in instruction order — the
@@ -79,7 +79,7 @@ impl StagedWrites {
     fn created_scope_writes<'a>(
         &'a self,
         path: &'a CreatedScopePath,
-    ) -> impl Iterator<Item = &'a HashMap<String, Value>> + 'a {
+    ) -> impl Iterator<Item = &'a BTreeMap<String, Value>> + 'a {
         self.writes.iter().filter_map(move |w| match w {
             StagedWrite::CreatedScope(p, vars) if p == path => Some(vars),
             _ => None,
@@ -279,7 +279,7 @@ impl Engine {
         let mut spawn_activation = |m: &MoveInstruction, ancestor: Option<Key>| {
             activate_instructions.push(ActivateElementInstruction {
                 element_id: m.target_element_id.clone(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ancestor_element_instance_key: ancestor,
                 variable_instructions: m.variable_instructions.clone(),
             });
@@ -664,8 +664,8 @@ impl Engine {
         // them (keyed by parent instance + scope id) and arms their boundaries
         // only once, on creation — so only the FIRST creation is checked; a
         // later activation sharing the scope keeps the captured subscription.
-        let mut created: std::collections::HashSet<CreatedScopePath> =
-            std::collections::HashSet::new();
+        let mut created: std::collections::BTreeSet<CreatedScopePath> =
+            std::collections::BTreeSet::new();
         for planned in &activations {
             if planned.resolution.to_create.is_empty() {
                 self.stage_writes(instance_key, planned, &mut staged);
@@ -942,10 +942,10 @@ impl Engine {
         instance_key: Key,
         planned: &PlannedActivation,
         staged: &StagedWrites,
-    ) -> HashMap<String, Value> {
+    ) -> BTreeMap<String, Value> {
         let existing = planned.resolution.existing;
         let Some(instance) = self.state.instances.get(&instance_key) else {
-            return HashMap::new();
+            return BTreeMap::new();
         };
         let leaf = self.variable_scope_of(instance, existing);
         let mut chain: Vec<Key> = Vec::new();
@@ -958,7 +958,7 @@ impl Engine {
             }
         }
         let mut root = (*instance.variables).clone();
-        let mut locals: HashMap<Key, HashMap<String, Value>> = chain
+        let mut locals: BTreeMap<Key, BTreeMap<String, Value>> = chain
             .iter()
             .map(|k| {
                 (
@@ -974,14 +974,15 @@ impl Engine {
         // writes are layered per scope while descending the created chain
         // (in `plan_modification`), never merged into the root here.
         let instance_root = instance.key;
-        let mut land =
-            |target: Key, variables: &HashMap<String, Value>, root: &mut HashMap<String, Value>| {
-                if target == instance_root || target == 0 {
-                    root.extend(variables.clone());
-                } else if let Some(local) = locals.get_mut(&target) {
-                    local.extend(variables.clone());
-                }
-            };
+        let mut land = |target: Key,
+                        variables: &BTreeMap<String, Value>,
+                        root: &mut BTreeMap<String, Value>| {
+            if target == instance_root || target == 0 {
+                root.extend(variables.clone());
+            } else if let Some(local) = locals.get_mut(&target) {
+                local.extend(variables.clone());
+            }
+        };
         let mut own = StagedWrites::default();
         self.stage_writes(instance_key, planned, &mut own);
         for staged_write in staged.writes.iter().chain(own.writes.iter()) {
@@ -1030,7 +1031,7 @@ impl Engine {
         instance_key: Key,
         element_id: ElementId,
         scope: Key,
-        locals: Vec<HashMap<String, Value>>,
+        locals: Vec<BTreeMap<String, Value>>,
     ) {
         // A join target does not activate as one plain element instance (it is
         // guarded): queue its seeded guarded activation (after this command's
@@ -1113,7 +1114,7 @@ impl Engine {
         instance_key: Key,
         element_id: ElementId,
         scope: Key,
-        locals: Vec<HashMap<String, Value>>,
+        locals: Vec<BTreeMap<String, Value>>,
     ) {
         let step = Step::Activate {
             instance_key,

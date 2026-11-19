@@ -43,7 +43,7 @@
 //! UPDATE_REQUEST_FIELDS=1 cargo nextest run -p nanobpm-gateway-rest-server request_field
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -125,7 +125,7 @@ fn served_operations() -> BTreeSet<String> {
 /// gateway actually serves (see module docs).
 struct Spec {
     dir: PathBuf,
-    files: HashMap<String, Value>,
+    files: BTreeMap<String, Value>,
 }
 
 impl Spec {
@@ -234,7 +234,7 @@ fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
     let served = served_operations();
     let mut spec = Spec {
         dir: build_spec_dir(),
-        files: HashMap::new(),
+        files: BTreeMap::new(),
     };
     let paths = spec
         .file("rest-api.yaml")

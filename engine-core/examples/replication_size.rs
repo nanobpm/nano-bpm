@@ -22,12 +22,12 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{Command, Engine, Event, ProcessBuilder, Value};
 
-fn payload(size_kb: usize) -> HashMap<String, Value> {
-    let mut m = HashMap::new();
+fn payload(size_kb: usize) -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
     if size_kb > 0 {
         let s: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
             .chars()

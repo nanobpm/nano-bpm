@@ -2134,7 +2134,7 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
             .unwrap();
         let mut engine = Engine::new();
         engine.apply_command(Command::DeployProcess(def)).unwrap();
-        let mut items = HashMap::new();
+        let mut items = BTreeMap::new();
         items.insert(
             "items".to_string(),
             Value::List(vec![Value::Int(1), Value::Int(2)]),
@@ -2315,7 +2315,7 @@ fn whole_scope_throw_reaches_the_explicit_handler_of_a_completed_multi_instance_
         let created = engine
             .apply_command(Command::create_instance_with(
                 "comp-mi-explicit",
-                HashMap::from([(
+                BTreeMap::from([(
                     "items".to_string(),
                     Value::List(vec![Value::Int(1), Value::Int(2)]),
                 )]),
@@ -2414,7 +2414,7 @@ fn whole_scope_throw_runs_an_explicit_handler_on_each_completed_mi_child() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "comp-mi-child-explicit",
-            HashMap::from([(
+            BTreeMap::from([(
                 "items".to_string(),
                 Value::List(vec![Value::Int(1), Value::Int(2)]),
             )]),
@@ -2531,7 +2531,7 @@ fn whole_scope_throw_reaches_the_explicit_handler_after_the_mi_body_end_listener
     let created = engine
         .apply_command(Command::create_instance_with(
             "comp-mi-explicit-listener",
-            HashMap::from([(
+            BTreeMap::from([(
                 "items".to_string(),
                 Value::List(vec![Value::Int(1), Value::Int(2)]),
             )]),
@@ -3125,7 +3125,7 @@ fn assert_boundary_lifecycle_occurrences(
         "{context}: boundary `{boundary}` must journal one lifecycle per completed instance"
     );
     // Distinct occurrences run under distinct element-instance keys.
-    let distinct: std::collections::HashSet<Key> = keys_in_order.iter().copied().collect();
+    let distinct: std::collections::BTreeSet<Key> = keys_in_order.iter().copied().collect();
     assert_eq!(
         distinct.len(),
         expected,

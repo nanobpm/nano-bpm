@@ -5,7 +5,7 @@
 //! carries enough data to rebuild state, the event stream is a replayable log —
 //! persist it however you like and replay to recover.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
 use crate::state::types::{
@@ -33,7 +33,7 @@ pub struct ActivateElementInstruction {
     /// Variables merged into the instance's root scope before the token is
     /// placed (Zeebe's global variable instructions). Empty for none.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The ancestor element instance (an existing flow-scope instance) to
     /// activate the element under (Zeebe `ancestorElementInstanceKey`). `None`
     /// (Zeebe's `-1`) = use the single existing instance of the flow scope, or
@@ -56,7 +56,7 @@ pub struct ActivateElementInstruction {
 pub struct VariableInstruction {
     /// The variables to set.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The element id of the scope to set them on; `None` = process root.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_id: Option<ElementId>,
@@ -476,7 +476,7 @@ pub enum Event {
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         created_at: u64,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -512,7 +512,7 @@ pub enum Event {
     /// Variables were merged into a process instance.
     VariablesUpdated {
         instance_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
 
     /// Variables were merged into a specific variable scope (Part C hierarchical
@@ -524,7 +524,7 @@ pub enum Event {
     ScopedVariablesUpdated {
         instance_key: Key,
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// A non-root variable scope was opened (Part C). Registers `scope_key`
     /// (a scope-owning element instance: sub-process, multi-instance body or
@@ -550,7 +550,7 @@ pub enum Event {
     EventSubProcessPayloadHeld {
         instance_key: Key,
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
 
     /// An element instance entered `ACTIVATING`. It registers the element
@@ -1414,7 +1414,7 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
         kind: MessageSubscriptionKind,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
     },
@@ -1721,7 +1721,7 @@ pub enum Event {
         body_key: Key,
         child_key: Key,
         index: usize,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// A multi-instance child completed: its `output` (the evaluated
     /// `output_element`, if any) is recorded at `index` in the body's collected
@@ -1761,7 +1761,7 @@ pub enum Event {
         instance_key: Key,
         container_key: Key,
         child_key: Key,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// An ad-hoc tool child completed: its `output` (the container's evaluated
     /// `output_element`, if any) is appended to the container's accumulated
@@ -1897,7 +1897,7 @@ pub enum Event {
     StartInstanceDispatched {
         process_id: String,
         start_element_id: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         tags: Vec<String>,
         #[cfg_attr(feature = "serde", serde(default))]

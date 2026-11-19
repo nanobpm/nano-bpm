@@ -34,7 +34,7 @@
 //! is more useful with the node coloured for the exception context — the
 //! interesting one.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::layout::schema::{FlowKind, SemanticAnnotations};
 
@@ -54,8 +54,8 @@ pub fn fill_for_kind(kind: FlowKind) -> &'static str {
 
 /// Resolve, for each element id, the winning `FlowKind` after precedence.
 /// `None` means the element isn't in any flow — leave it uncoloured.
-pub fn winning_kinds(ann: &SemanticAnnotations) -> HashMap<String, FlowKind> {
-    let mut out: HashMap<String, FlowKind> = HashMap::new();
+pub fn winning_kinds(ann: &SemanticAnnotations) -> BTreeMap<String, FlowKind> {
+    let mut out: BTreeMap<String, FlowKind> = BTreeMap::new();
     for flow in &ann.flows {
         for node in &flow.nodes {
             let current = out.get(node).copied();
@@ -100,7 +100,7 @@ pub fn colorize_flows(xml: &str, ann: &SemanticAnnotations) -> String {
 /// Walk each `<bpmndi:BPMNShape ... bpmnElement="ID" ...>` open tag and
 /// splice in a `color:background-color="…"` attribute when we have a
 /// winning kind for `ID` — but only if the tag doesn't already carry one.
-fn inject_shape_fills(xml: &str, kinds: &HashMap<String, FlowKind>) -> String {
+fn inject_shape_fills(xml: &str, kinds: &BTreeMap<String, FlowKind>) -> String {
     let needle = "<bpmndi:BPMNShape";
     if !xml.contains(needle) {
         return xml.to_string();

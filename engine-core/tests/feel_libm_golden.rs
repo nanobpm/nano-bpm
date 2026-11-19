@@ -12,7 +12,7 @@
     reason = "non-production target (integration tests / examples)"
 )]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{feel, Value};
 
@@ -33,7 +33,7 @@ const GOLDEN: &[(&str, u64)] = &[
 ];
 
 fn bits(expr: &str) -> u64 {
-    match feel::eval(expr, &HashMap::new()).unwrap() {
+    match feel::eval(expr, &BTreeMap::new()).unwrap() {
         Value::Double(d) => d.to_bits(),
         Value::Int(i) => (i as f64).to_bits(),
         other => panic!("{expr}: non-numeric {other:?}"),

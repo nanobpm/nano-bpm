@@ -154,7 +154,7 @@ fn should_park_on_a_user_task_then_resume_when_completed() {
 
     // Completing it (merging a variable) resumes the token to the end event,
     // completing the instance.
-    let vars = HashMap::from([("approved".to_string(), Value::Bool(true))]);
+    let vars = BTreeMap::from([("approved".to_string(), Value::Bool(true))]);
     let done = engine
         .apply_command(Command::complete_user_task_with(user_task_key, vars))
         .unwrap();
@@ -251,7 +251,7 @@ fn should_create_a_user_task_with_resolved_attributes() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([
+    let vars = BTreeMap::from([
         ("requester".to_string(), Value::Str("alice".to_string())),
         (
             "reviewers".to_string(),
@@ -324,7 +324,7 @@ fn should_raise_an_incident_when_assignee_expression_is_null() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // maybeNull is explicitly null (intent: escalate unassigned).
-    let vars = HashMap::from([
+    let vars = BTreeMap::from([
         ("maybeNull".to_string(), Value::Null),
         ("who".to_string(), Value::Null),
     ]);
@@ -357,7 +357,7 @@ fn should_raise_an_incident_when_assignee_expression_is_null() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("who".to_string(), Value::Str("operator-1".into()))]),
+            BTreeMap::from([("who".to_string(), Value::Str("operator-1".into()))]),
         ))
         .unwrap();
     engine
@@ -412,7 +412,7 @@ fn should_create_a_user_task_assigned_when_assignee_expression_is_a_string() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([("maybeNull".to_string(), Value::Str("alice".to_string()))]);
+    let vars = BTreeMap::from([("maybeNull".to_string(), Value::Str("alice".to_string()))]);
     let created = engine
         .apply_command(Command::CreateInstance {
             process_id: "escalation".to_string(),

@@ -43,7 +43,7 @@
 // the module keeps a dead-code allowance for that residue.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
@@ -54,7 +54,7 @@ use nanobpmn_engine_core::{
 /// Render a process definition to canonical IR text. `names` maps element id → human label (as
 /// recovered from the source BPMN, which the engine model itself drops); ids absent from the map
 /// render without a quoted name.
-pub fn definition_to_ir(def: &ProcessDefinition, names: &HashMap<String, String>) -> String {
+pub fn definition_to_ir(def: &ProcessDefinition, names: &BTreeMap<String, String>) -> String {
     let mut normalized = def.clone();
     normalized.normalize_legacy_agent_tasks();
     let def = &normalized;
@@ -674,7 +674,7 @@ fn split_ir_tokens(raw: &str) -> Result<Vec<String>, String> {
 #[derive(Debug, Clone)]
 pub struct ParsedIr {
     pub definition: ProcessDefinition,
-    pub names: HashMap<String, String>,
+    pub names: BTreeMap<String, String>,
 }
 
 /// Parse canonical IR text into a [`ProcessDefinition`] and its element-name map, validating
@@ -958,7 +958,7 @@ fn read_string(chars: &[char], start: usize) -> Result<(String, usize), String> 
 #[derive(Default)]
 struct NodeAttrs {
     /// Scalar `key value` attributes (value already unquoted); keyed by attribute name.
-    scalars: HashMap<String, String>,
+    scalars: BTreeMap<String, String>,
     inputs: Vec<Mapping>,
     outputs: Vec<Mapping>,
     /// `zeebe:taskHeaders` entries (serviceTask only), keyed by header name.
@@ -1067,8 +1067,8 @@ impl<'a> Parser<'a> {
         }
         let start_event = self.expect_word("for the start event id")?;
 
-        let mut elements: HashMap<String, Element> = HashMap::new();
-        let mut names: HashMap<String, String> = HashMap::new();
+        let mut elements: BTreeMap<String, Element> = BTreeMap::new();
+        let mut names: BTreeMap<String, String> = BTreeMap::new();
         // Collect flows until every node is known, then attach (so forward references resolve).
         let mut pending_flows: Vec<(String, SequenceFlow)> = Vec::new();
 
@@ -1654,7 +1654,7 @@ mod tests {
             .connect_default("Gate", "Alpha")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         let zeta = ir.find("Gate -> Zeta").expect("zeta flow present");
         let alpha = ir.find("Gate -> Alpha").expect("alpha flow present");
         assert!(
@@ -1692,7 +1692,7 @@ mod tests {
                 crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
             assert!(xml.contains("<bpmndi:BPMNDiagram"));
             let reparsed = parse_bpmn(&xml).unwrap();
-            assert_eq!(definition_to_ir(&reparsed[0], &HashMap::new()), canonical);
+            assert_eq!(definition_to_ir(&reparsed[0], &BTreeMap::new()), canonical);
         }
     }
 
@@ -1751,8 +1751,8 @@ mod tests {
                     definition: AgentDefinition::default(),
                     limits: None,
                 };
-                let ir = definition_to_ir(&def, &HashMap::new());
-                let xml = crate::bpmn_model::definition_to_xml_labeled(&def, &HashMap::new());
+                let ir = definition_to_ir(&def, &BTreeMap::new());
+                let xml = crate::bpmn_model::definition_to_xml_labeled(&def, &BTreeMap::new());
                 assert!(ir.contains("serviceTask Agent"));
                 assert!(!ir.contains("agentTask Agent"));
                 assert!(xml.contains("<zeebe:taskDefinition"));
@@ -1797,7 +1797,7 @@ mod tests {
             target: "approved".into(),
         });
         work.retries = Some("5".into());
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         assert!(ir.contains("input amount <- \"=order.amount\""), "\n{ir}");
         assert!(ir.contains("output approved <- \"=result.ok\""), "\n{ir}");
         assert!(ir.contains("retries \"5\""), "\n{ir}");
@@ -1816,7 +1816,7 @@ mod tests {
             .connect("OnDecline", "Declined")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         assert!(
             ir.contains("errorBoundaryEvent OnDecline {\n    attachedTo Charge\n    errorCode \"CARD_DECLINED\"\n  }\n"),
             "\n{ir}"
@@ -1833,7 +1833,7 @@ mod tests {
             .connect("Start", "Done")
             .build()
             .unwrap();
-        let mut names = HashMap::new();
+        let mut names = BTreeMap::new();
         names.insert("Start".to_string(), "the \"real\" start".to_string());
         let ir = definition_to_ir(&def, &names);
         assert!(
@@ -1914,7 +1914,7 @@ mod tests {
                 sequential: true,
             });
         }
-        let ir1 = definition_to_ir(&def, &HashMap::new());
+        let ir1 = definition_to_ir(&def, &BTreeMap::new());
         let parsed = ir_to_definition(&ir1).expect("parse");
         let ir2 = definition_to_ir(&parsed.definition, &parsed.names);
         assert_eq!(ir1, ir2, "annotations must survive the round-trip:\n{ir1}");
@@ -1950,7 +1950,7 @@ mod tests {
             .connect_default("Gate", "Alpha")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         let parsed = ir_to_definition(&ir).expect("parse");
         let gate = &parsed.definition.elements["Gate"];
         // First declared flow (the conditional) must remain first after parsing.
@@ -2017,8 +2017,8 @@ mod tests {
         // `Element.name` (which engine-core's parser now populates from `name=`);
         // compare the structural model with that display-only field cleared.
         fn strip_names(
-            els: &std::collections::HashMap<String, Element>,
-        ) -> std::collections::HashMap<String, Element> {
+            els: &std::collections::BTreeMap<String, Element>,
+        ) -> std::collections::BTreeMap<String, Element> {
             let mut m = els.clone();
             for el in m.values_mut() {
                 el.name = None;
@@ -2455,7 +2455,7 @@ mod tests {
 
 #[cfg(test)]
 mod cancel_remaining_instances_ir_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::{MultiInstance, ProcessBuilder};
 
@@ -2477,7 +2477,7 @@ mod cancel_remaining_instances_ir_tests {
                 cancel_remaining_instances: cancel,
                 ..Default::default()
             });
-            let ir1 = definition_to_ir(&def, &HashMap::new());
+            let ir1 = definition_to_ir(&def, &BTreeMap::new());
             let parsed = ir_to_definition(&ir1).expect("parse");
             let mi = parsed.definition.elements["Work"]
                 .multi_instance
@@ -2491,7 +2491,7 @@ mod cancel_remaining_instances_ir_tests {
 
 #[cfg(test)]
 mod esp_validation_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::{EventSubProcessTrigger, ProcessBuilder};
 
@@ -2511,7 +2511,7 @@ mod esp_validation_tests {
             .contained_in("esp_end", "esp")
             .build()
             .unwrap();
-        definition_to_ir(&def, &HashMap::new())
+        definition_to_ir(&def, &BTreeMap::new())
     }
 
     fn signal() -> EventSubProcessTrigger {

@@ -9,7 +9,7 @@
 //! hand candidate generation to an LLM in M2).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{bpmn::parse_bpmn, ProcessDefinition};
 use serde::Serialize;
@@ -125,7 +125,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
             .to_string(),
     );
 
-    let baseline_assignment = effective_assignment(scenario, &HashMap::new());
+    let baseline_assignment = effective_assignment(scenario, &BTreeMap::new());
     let baseline = evaluate(
         scenario,
         &defs,
@@ -218,10 +218,10 @@ pub(crate) fn baked_candidates(
         ));
     }
 
-    let baseline_assignment = effective_assignment(scenario, &HashMap::new());
+    let baseline_assignment = effective_assignment(scenario, &BTreeMap::new());
     let mut variants: Vec<VariantResult> = Vec::with_capacity(combos.len());
     for combo in &combos {
-        let mut overrides: HashMap<String, String> = HashMap::new();
+        let mut overrides: BTreeMap<String, String> = BTreeMap::new();
         for (slot, &choice) in combo.iter().enumerate() {
             let (jt, opts) = &option_lists[slot];
             overrides.insert(jt.clone(), opts[choice].clone());
@@ -308,7 +308,7 @@ pub(crate) fn finalize(
 /// Merge per-task overrides onto the scenario defaults into a full assignment.
 pub(crate) fn effective_assignment(
     scenario: &Scenario,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut m: BTreeMap<String, String> = scenario
         .task_workers
@@ -354,7 +354,7 @@ pub(crate) fn evaluate(
     rationale: Option<String>,
     assignment: &BTreeMap<String, String>,
 ) -> VariantResult {
-    let lookup: HashMap<String, String> = assignment
+    let lookup: BTreeMap<String, String> = assignment
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();

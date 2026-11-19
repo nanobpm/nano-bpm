@@ -12,7 +12,7 @@
 //!   * Execution mutators return a [`Snapshot`] for rendering; agent CREATE/UPDATE
 //!     return their canonical REST result with `createdHistory`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
@@ -107,7 +107,7 @@ pub struct TestEngine {
 /// decision instances.
 #[derive(Default)]
 struct HistoryAggregates {
-    completed_counts: HashMap<String, u64>,
+    completed_counts: BTreeMap<String, u64>,
     taken_flows: std::collections::BTreeSet<(String, String)>,
     decisions: Vec<DecisionInstanceDto>,
 }
@@ -803,7 +803,7 @@ impl TestEngine {
             attribution: None,
             error_code: error_code.to_string(),
             error_message: error_message.to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             lease_token,
         })
         .map_err(|e| js_err(&format!("throw error: {e}")))?;
@@ -2357,7 +2357,7 @@ impl TestEngine {
     fn evaluate_decision_json(
         &mut self,
         decision_id: &str,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> Result<serde_json::Value, String> {
         let events = self
             .apply(Command::EvaluateDecision {
@@ -2480,7 +2480,7 @@ impl TestEngine {
             })
             .collect();
         tokens.sort_by(|a, b| cmp_key(&a.0, &b.0));
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         tokens
             .into_iter()
             .filter_map(|(_, id)| seen.insert(id.clone()).then_some(id))
@@ -2547,7 +2547,7 @@ impl TestEngine {
         ids: &[String],
         events: &[Event],
     ) -> Result<Vec<serde_json::Value>, JsValue> {
-        let mut created: std::collections::HashSet<_> = events
+        let mut created: std::collections::BTreeSet<_> = events
             .iter()
             .filter_map(|event| match event {
                 Event::AgentHistoryCreated { record, .. } => Some(record.agent_history_key),
@@ -2749,7 +2749,7 @@ impl TestEngine {
         // current live token count (from instance active elements); `completed`
         // and `incidents` are cumulative counts. `completed` comes from the
         // incrementally-maintained history aggregate (no per-poll log scan).
-        let mut stats: HashMap<String, ElementStat> = HashMap::new();
+        let mut stats: BTreeMap<String, ElementStat> = BTreeMap::new();
         for inst in &instances {
             for el in &inst.active_elements {
                 stats.entry(el.element_id.clone()).or_default().active += 1;
@@ -3651,7 +3651,7 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
             }
         };
         let variables = match map.get("variables") {
-            None | Some(serde_json::Value::Null) => HashMap::new(),
+            None | Some(serde_json::Value::Null) => BTreeMap::new(),
             Some(serde_json::Value::Object(vars)) => vars
                 .iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -3705,7 +3705,7 @@ fn parse_adhoc_result(s: &str) -> Result<AdHocJobResult, JsValue> {
                     }
                 };
                 let variables = match obj.get("variables") {
-                    None | Some(serde_json::Value::Null) => HashMap::new(),
+                    None | Some(serde_json::Value::Null) => BTreeMap::new(),
                     Some(serde_json::Value::Object(vars)) => vars
                         .iter()
                         .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -3809,10 +3809,10 @@ fn parse_mapping_instructions(s: &str) -> Result<Vec<(String, String)>, JsValue>
 }
 
 /// Parse a JSON object string into engine variables. Empty/whitespace ⇒ none.
-fn parse_vars(s: &str) -> Result<HashMap<String, Value>, JsValue> {
+fn parse_vars(s: &str) -> Result<BTreeMap<String, Value>, JsValue> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
     let json: serde_json::Value =
         serde_json::from_str(t).map_err(|e| js_err(&format!("invalid variables JSON: {e}")))?;
@@ -3931,7 +3931,7 @@ fn parse_user_task_changeset(s: &str) -> Result<UserTaskChangeset, JsValue> {
 }
 
 /// Convert engine variables to a natural JSON object (not the tagged enum form).
-fn vars_to_json(vars: &HashMap<String, Value>) -> serde_json::Value {
+fn vars_to_json(vars: &BTreeMap<String, Value>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     let mut keys: Vec<&String> = vars.keys().collect();
     keys.sort();

@@ -60,6 +60,8 @@ pub fn pow(a: f64, b: f64) -> f64 { a.powf(b) }
 pub fn asinh(x: f64) -> f64 { x.asinh() }
 pub fn sin32(x: f32) -> f32 { x.sin() }
 pub fn log2_32(x: f32) -> f32 { x.log2() }
+pub fn map() -> std::collections::HashMap<u64, u64> { Default::default() }
+pub fn set() -> std::collections::HashSet<u64> { Default::default() }
 "#,
     );
     let (ok, stderr) = clippy(&dir);
@@ -77,6 +79,12 @@ pub fn log2_32(x: f32) -> f32 { x.log2() }
     ] {
         assert!(
             stderr.contains(&format!("use of a disallowed method `{banned}`")),
+            "{banned} not flagged:\n{stderr}"
+        );
+    }
+    for banned in ["std::collections::HashMap", "std::collections::HashSet"] {
+        assert!(
+            stderr.contains(&format!("use of a disallowed type `{banned}`")),
             "{banned} not flagged:\n{stderr}"
         );
     }

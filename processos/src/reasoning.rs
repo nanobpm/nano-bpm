@@ -18,7 +18,7 @@
 //! Callers always retain the existing cancel/steer path as a fallback: when the endpoint is
 //! absent (older build) or no live completion id is known, behaviour is unchanged.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -51,9 +51,9 @@ fn control_url(base_url: &str) -> String {
 /// Per-`base_url` cache of the support probe, so we pay the round-trip at most once per endpoint.
 /// Only **definitive HTTP responses** are cached; transport errors (server not up yet) are not,
 /// so a sidecar that starts later can still be detected on a subsequent call.
-fn cache() -> &'static Mutex<HashMap<String, bool>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn cache() -> &'static Mutex<BTreeMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn cached(base_url: &str) -> Option<bool> {
