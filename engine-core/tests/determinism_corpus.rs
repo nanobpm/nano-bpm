@@ -929,7 +929,7 @@ fn string_valued_map_keys_are_never_fields() {
 
 /// Drift guard: every String-keyed map field declared ANYWHERE in
 /// engine-core/src is covered by `compare::data_map_fields` (derived from
-/// `MAP_FIELD_SOURCES`); a map declared in an unlisted file fails here.
+/// `ENGINE_TYPE_SOURCES`); a map declared in an unlisted file fails here.
 #[test]
 fn data_map_fields_cover_every_engine_map_field() {
     fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
@@ -954,7 +954,7 @@ fn data_map_fields_cover_every_engine_map_field() {
     let missing: Vec<_> = all.difference(compare::data_map_fields()).collect();
     assert!(
         missing.is_empty(),
-        "map fields not covered by MAP_FIELD_SOURCES (add their file): {missing:?}"
+        "map fields not covered by ENGINE_TYPE_SOURCES (add their file): {missing:?}"
     );
 }
 
@@ -1013,5 +1013,132 @@ fn allowlist_entries_declare_upgrade_mode() {
     assert_eq!(
         real.upgrade_boundaries().len(),
         real.observational_variants.len() + real.divergences.len()
+    );
+}
+
+/// #1700 review: job identities are one-to-one across the corpus. Two jobs
+/// for the same element (in separate entries) must not canonicalize to one
+/// identity: pointing a completion at ANOTHER already-minted same-element
+/// job key diverges, even under an allowlisted `remint_keys` scenario.
+#[test]
+fn prev_release_gate_remint_rejects_other_same_element_job_key() {
+    let head = head_records();
+    let scenarios = labels();
+    let entries: Vec<&serde_json::Value> =
+        head.iter().filter(|r| r.get("state").is_none()).collect();
+    let events_of = |r: &serde_json::Value| -> Vec<serde_json::Value> {
+        r.get("events")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    // job_key -> element_id over the whole corpus, in mint order.
+    let mut jobs: Vec<(u64, String)> = Vec::new();
+    let mut found = None;
+    'outer: for (i, r) in entries.iter().enumerate() {
+        for e in events_of(r) {
+            if let Some(b) = e.get("JobCreated") {
+                let k = b["job_key"].as_u64().unwrap();
+                let el = b["element_id"].as_str().unwrap().to_owned();
+                jobs.push((k, el));
+            }
+            if let Some(b) = e.get("JobCompleted") {
+                let k = b["job_key"].as_u64().unwrap();
+                let Some((_, el)) = jobs.iter().find(|(jk, _)| *jk == k) else {
+                    continue;
+                };
+                if let Some((other, _)) = jobs.iter().find(|(jk, e2)| *jk != k && e2 == el) {
+                    found = Some((i, k, *other));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (i, k, other) = found.expect("a completion of a job whose element has another job");
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(b) = e.get_mut("JobCompleted") {
+                if b["job_key"] == serde_json::json!(k) {
+                    b["job_key"] = serde_json::json!(other);
+                }
+            }
+        }
+    }
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenarios[i],
+        "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#0",
+        "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
+    }]});
+    let err = checked(&head, &prev, allow, &[]).unwrap_err();
+    assert!(err.contains("entry"), "{err}");
+}
+
+/// #1700 review: a map keyed by a type ALIAS (`ProcessDefinition.elements`,
+/// `BTreeMap<ElementId, Element>`) is a data boundary: an element id is never
+/// a shape token and never erased, even when named like an added field.
+/// Pinned by name, independent of the source scanner.
+#[test]
+fn aliased_map_keys_are_never_fields() {
+    assert!(compare::data_map_fields().contains("elements"));
+    let v = serde_json::json!({"ProcessDeployed": {"process": {
+        "elements": {"slow": {"id": "slow", "kind": "StartEvent"}}
+    }}});
+    let mut vocab = compare::Vocab::new();
+    compare::shape_tokens(&v, &mut vocab);
+    assert!(!vocab.contains("ProcessDeployed.slow"), "{vocab:?}");
+    let mut erased = v.clone();
+    let erasable: compare::Vocab = ["ProcessDeployed.slow".to_owned()].into();
+    compare::erase_fields(&mut erased, "$", &erasable);
+    assert_eq!(
+        erased, v,
+        "an element named like an added field must survive"
+    );
+}
+
+/// #1700 review: unit variants nested under another variant (an element
+/// `kind` of `StartEvent` inside `DeployProcess`) are recorded in the shape
+/// vocabulary; arbitrary application strings are not.
+#[test]
+fn nested_unit_variants_are_shape_tokens() {
+    let v = serde_json::json!({"DeployProcess": {
+        "name": "Hello", "elements": {"s": {"kind": "StartEvent"}},
+        "gw": {"kind": "ParallelGateway"}
+    }});
+    let mut vocab = compare::Vocab::new();
+    compare::shape_tokens(&v, &mut vocab);
+    assert!(vocab.contains("StartEvent"), "{vocab:?}");
+    assert!(vocab.contains("ParallelGateway"), "{vocab:?}");
+    assert!(!vocab.contains("Hello"), "{vocab:?}");
+}
+
+/// Drift guard: every unit variant declared anywhere in engine-core/src is
+/// covered by `compare::unit_variants` (derived from `ENGINE_TYPE_SOURCES`).
+#[test]
+fn unit_variants_cover_every_engine_unit_variant() {
+    fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "tests") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.extend(compare::unit_variants_in(
+                    &std::fs::read_to_string(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut all = BTreeSet::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut all,
+    );
+    let missing: Vec<_> = all.difference(compare::unit_variants()).collect();
+    assert!(
+        missing.is_empty(),
+        "unit variants not covered by ENGINE_TYPE_SOURCES (add their file): {missing:?}"
     );
 }

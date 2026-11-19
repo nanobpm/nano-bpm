@@ -155,12 +155,13 @@ fn is_field_name(key: &str) -> bool {
 }
 
 /// The engine source files whose types reach the serialized `Command` /
-/// `Event` / `EngineSnapshot` shapes the gate compares. The String-keyed map
-/// fields they declare are DERIVED from this source (never hand-listed), so a
-/// new map field is protected the moment it is declared;
-/// `data_map_fields_cover_every_engine_map_field` (tests) fails if a map
-/// field is declared in a file missing from this list.
-pub const MAP_FIELD_SOURCES: &[&str] = &[
+/// `Event` / `EngineSnapshot` shapes the gate compares. The map fields and
+/// serialized unit variants they declare are DERIVED from this source (never
+/// hand-listed), so a new one is covered the moment it is declared;
+/// `data_map_fields_cover_every_engine_map_field` and
+/// `unit_variants_cover_every_engine_unit_variant` (tests) fail if one is
+/// declared in a file missing from this list.
+pub const ENGINE_TYPE_SOURCES: &[&str] = &[
     include_str!("../../src/command.rs"),
     include_str!("../../src/event.rs"),
     include_str!("../../src/model.rs"),
@@ -170,11 +171,13 @@ pub const MAP_FIELD_SOURCES: &[&str] = &[
     include_str!("../../src/engine/call_activity.rs"),
     include_str!("../../src/bpmn/build.rs"),
     include_str!("../../src/validate/mod.rs"),
+    include_str!("../../src/agent.rs"),
+    include_str!("../../src/dmn/model.rs"),
 ];
 
-/// The String-keyed map field names (`name: BTreeMap<String, _>`, also
-/// `HashMap`/`IndexMap`, optionally wrapped in `Option<…>`) declared in
-/// `source`. A superset is safe: a name wrongly treated as a map only stops
+/// The map field names (`name: BTreeMap<K, _>`, also `HashMap`/`IndexMap`,
+/// optionally wrapped in `Option<…>`, for ANY key type `K` — aliases such as
+/// `ElementId` included) declared in `source`. A superset is safe: a name wrongly treated as a map only stops
 /// erasure under it, so a real difference still surfaces (fail closed).
 pub fn map_fields_in(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -194,7 +197,10 @@ pub fn map_fields_in(source: &str) -> BTreeSet<String> {
         let ty = ty.trim_start();
         let ty = ty.strip_prefix("Option<").unwrap_or(ty);
         let ty = ty.strip_prefix("std::collections::").unwrap_or(ty);
-        if ["BTreeMap<String", "HashMap<String", "IndexMap<String"]
+        // ANY key type, not just a literal `String`: a key-type alias
+        // (`BTreeMap<ElementId, Element>`, `ElementId = String`) or a
+        // numeric key still serializes as a JSON object whose keys are DATA.
+        if ["BTreeMap<", "HashMap<", "IndexMap<"]
             .iter()
             .any(|p| ty.starts_with(p))
         {
@@ -204,17 +210,81 @@ pub fn map_fields_in(source: &str) -> BTreeSet<String> {
     out
 }
 
-/// Every String-keyed map field of the compared engine types (see
-/// [`MAP_FIELD_SOURCES`]). Under such a field the object's keys are DATA
+/// Every map field of the compared engine types (see
+/// [`ENGINE_TYPE_SOURCES`]). Under such a field the object's keys are DATA
 /// (variable names, header names, process ids) — never struct fields — so
 /// they are neither shape tokens nor erasable, whatever their values hold
 /// (`Value`s, plain strings like `ServiceTask.custom_headers`, or structs).
 pub fn data_map_fields() -> &'static BTreeSet<String> {
     static FIELDS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
     FIELDS.get_or_init(|| {
-        MAP_FIELD_SOURCES
+        ENGINE_TYPE_SOURCES
             .iter()
             .flat_map(|s| map_fields_in(s))
+            .collect()
+    })
+}
+
+/// The unit variant names (`Name,` lines inside an `enum … {` body) of the
+/// serde-`Serialize`d enums declared in `source`. A superset is safe: it only lets a matching bare string add
+/// a (known) token.
+pub fn unit_variants_in(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut depth: Option<usize> = None; // brace depth inside an enum body
+                                         // Whether the attributes since the last item derive `Serialize` (plain
+                                         // or `cfg_attr(feature = "serde", …)`): only serialized enums reach the
+                                         // compared shapes.
+    let mut serialized = false;
+    for line in source.lines() {
+        let t = line.trim();
+        match depth {
+            None => {
+                if t.starts_with("#[") {
+                    serialized |= t.contains("Serialize");
+                    continue;
+                }
+                if t.starts_with("//") || t.is_empty() {
+                    continue;
+                }
+                let derives = std::mem::take(&mut serialized);
+                let decl = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub(super) "))
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                if derives && decl.starts_with("enum ") && t.ends_with('{') {
+                    depth = Some(1);
+                }
+            }
+            Some(d) => {
+                if d == 1 {
+                    let name = t.strip_suffix(',').unwrap_or(t);
+                    let name = name.split_once(" =").map_or(name, |(n, _)| n);
+                    if is_variant_tag(name) && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        out.insert(name.to_owned());
+                    }
+                }
+                let opens = t.matches('{').count();
+                let closes = t.matches('}').count();
+                let nd = (d + opens).saturating_sub(closes);
+                depth = (nd > 0).then_some(nd);
+            }
+        }
+    }
+    out
+}
+
+/// Every unit variant of the compared engine types (see
+/// [`ENGINE_TYPE_SOURCES`]). A unit variant serializes as a bare string at an
+/// enum-valued location at ANY depth (`{"kind": "StartEvent"}` inside
+/// `DeployProcess`), so it is recorded wherever it appears — but only a
+/// string naming a DECLARED unit variant, never arbitrary application text.
+pub fn unit_variants() -> &'static BTreeSet<String> {
+    static VARIANTS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    VARIANTS.get_or_init(|| {
+        ENGINE_TYPE_SOURCES
+            .iter()
+            .flat_map(|s| unit_variants_in(s))
             .collect()
     })
 }
@@ -268,7 +338,7 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
                         out.insert(format!("{ctx}.{k}"));
                     }
                     if is_field_name(k) && data_map_fields().contains(k) {
-                        // A String-keyed map field: its keys are DATA. Only
+                        // A map field: its keys are DATA. Only
                         // its values (which may be structs) carry shapes.
                         walk_map_values(v, ctx, out);
                         continue;
@@ -285,8 +355,11 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
             }
         }
         Json::Array(items) => items.iter().for_each(|v| walk_tokens(v, ctx, out)),
-        Json::String(s) if ctx == "$" && is_variant_tag(s) => {
-            // A unit variant serializes as a bare string (`"Ping"`).
+        Json::String(s)
+            if is_variant_tag(s) && (ctx == "$" || unit_variants().contains(s.as_str())) =>
+        {
+            // A unit variant serializes as a bare string (`"Ping"` at the
+            // root, `"StartEvent"` nested under `DeployProcess`).
             out.insert(s.clone());
         }
         _ => {}
@@ -563,87 +636,124 @@ impl EventPattern {
     }
 }
 
-/// The entity a minted key refers to, built from an entry's own creation
-/// events. `remint_keys` declares the keys may be re-minted in a different
-/// order (#1244 fork order) — a bijection on keys — so the comparison must
-/// normalize each key to *which entity it references*, not erase it. Erasing
-/// (zeroing) hides an inconsistent reference: a completion/job/subscription
-/// pointing at the wrong entity zeroes to the same shape as the correct one.
+/// The entity a minted key refers to. `remint_keys` declares the keys may be
+/// re-minted in a different order (#1244 fork order) — a bijection on keys —
+/// so the comparison must normalize each key to *which entity it references*,
+/// not erase it. Erasing (zeroing) hides an inconsistent reference: a
+/// completion/job/subscription pointing at the wrong entity zeroes to the
+/// same shape as the correct one.
 ///
-/// The map is keyed by the raw `u64` key and valued by a stable identity
-/// token for the entity that key was minted for:
-/// * `ElementActivating`/`ElementActivated` mint an element-instance key →
-///   `element:<element_id>`;
-/// * `JobCreated` mints a `job_key` → `job:<element_id>`;
-/// * `MessageSubscriptionCreated`/`SignalSubscriptionCreated` mint a
-///   `subscription_key` → `subscription:<element_id>`.
-///
-/// A key minted for two different entities (a collision), or two distinct
-/// keys minted for one element, is not a clean per-entity remint: the entry
-/// fails closed ([`key_identities`] returns `None`) rather than reconcile.
-fn key_identities(events: &[String]) -> Option<std::collections::BTreeMap<u64, String>> {
-    let mut key_to_id: std::collections::BTreeMap<u64, String> = Default::default();
-    let mut element_to_key: std::collections::BTreeMap<String, u64> = Default::default();
-    let mut record = |key: u64, identity: String, element: Option<&str>| -> Option<()> {
-        if let Some(prev) = key_to_id.get(&key) {
-            if *prev != identity {
-                return None; // one key minted for two entities (collision)
+/// Identities are ONE-TO-ONE per side: each minted key gets
+/// `<kind>:<owner>#<n>`, where `<owner>` is the process instance plus element
+/// id (element instances) or the identity of the owning element instance
+/// (jobs, subscriptions), and `<n>` is the ordinal of that mint for its owner
+/// over the whole corpus. Two `pay` jobs in different entries (or a retried
+/// job) therefore never share an identity, so a reference to *another*
+/// already-minted same-element key cannot canonicalize to the right one.
+/// Mints:
+/// * `ElementActivating`/`ElementActivated` → `element:<instance>:<element_id>#n`;
+/// * `JobCreated` / `ExecutionListenerJobCreated` / `TaskListenerJobCreated`
+///   → `job:<owning element identity>#n`;
+/// * `MessageSubscriptionCreated`/`SignalSubscriptionCreated`
+///   → `subscription:<owning element identity>#n`.
+#[derive(Debug, Default, Clone)]
+struct KeyIds {
+    ids: std::collections::BTreeMap<u64, String>,
+    ordinals: std::collections::BTreeMap<String, u64>,
+}
+
+impl KeyIds {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, key: &u64) -> Option<&String> {
+        self.ids.get(key)
+    }
+
+    /// The identity of an owning element instance key (or a distinct orphan
+    /// token when it was never minted on this side).
+    fn owner(&self, key: u64) -> String {
+        self.ids
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| format!("?orphan:{key}"))
+    }
+
+    /// Records the mint of `key` for `base`. Re-sighting the same key (an
+    /// `ElementActivating` followed by its `ElementActivated`) is idempotent
+    /// only for the same base; a key minted for two different entities fails
+    /// closed.
+    fn mint(&mut self, key: u64, base: String) -> Result<(), String> {
+        if let Some(prev) = self.ids.get(&key) {
+            let prev_base = prev.rsplit_once('#').map_or(prev.as_str(), |(b, _)| b);
+            if prev_base == base {
+                return Ok(());
             }
+            return Err(format!(
+                "key {key} minted for two entities across the corpus ({prev} vs {base})"
+            ));
         }
-        if let Some(el) = element {
-            if let Some(prev_key) = element_to_key.insert(el.to_owned(), key) {
-                if prev_key != key {
-                    return None; // one element minted under two distinct keys
-                }
-            }
-        }
-        key_to_id.insert(key, identity);
-        Some(())
-    };
+        let n = self.ordinals.entry(base.clone()).or_insert(0);
+        *n += 1;
+        self.ids.insert(key, format!("{base}#{n}"));
+        Ok(())
+    }
+}
+
+/// Folds `events`' minted keys into `ids` (one side, in corpus order).
+fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> {
     for e in events {
-        let v = serde_json::from_str::<Json>(e).ok()?;
-        // Every event is a single-key externally-tagged object; skip anything
-        // else (a bare unit-variant string carries no keys to canonicalize).
+        let Ok(v) = serde_json::from_str::<Json>(e) else {
+            continue;
+        };
+        // Every event is a single-key externally-tagged object; a bare
+        // unit-variant string carries no keys to canonicalize.
         let Some((variant, body)) = v.as_object().and_then(|o| o.iter().next()) else {
             continue;
         };
-        let get = |f: &str| body.get(f);
-        let u64_of = |f: &str| get(f).and_then(Json::as_u64);
-        let str_of = |f: &str| get(f).and_then(Json::as_str);
-        match variant.as_str() {
+        let u64_of = |f: &str| body.get(f).and_then(Json::as_u64);
+        let str_of = |f: &str| body.get(f).and_then(Json::as_str);
+        let minted = match variant.as_str() {
             "ElementActivating" | "ElementActivated" => {
-                if let (Some(id), Some(key)) =
-                    (str_of("element_id"), u64_of("element_instance_key"))
-                {
-                    record(key, format!("element:{id}"), Some(id))?;
-                }
+                u64_of("element_instance_key").zip(str_of("element_id").map(|id| {
+                    let instance =
+                        u64_of("instance_key").map_or_else(|| "?".to_owned(), |k| k.to_string());
+                    format!("element:{instance}:{id}")
+                }))
             }
-            "JobCreated" => {
-                if let (Some(key), Some(id)) = (u64_of("job_key"), str_of("element_id")) {
-                    record(key, format!("job:{id}"), None)?;
-                }
+            "JobCreated" | "ExecutionListenerJobCreated" | "TaskListenerJobCreated" => {
+                u64_of("job_key").map(|k| {
+                    let owner = u64_of("element_instance_key")
+                        .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                    (k, format!("job:{variant}:{owner}"))
+                })
             }
             "MessageSubscriptionCreated" | "SignalSubscriptionCreated" => {
-                if let (Some(key), Some(id)) = (u64_of("subscription_key"), str_of("element_id")) {
-                    record(key, format!("subscription:{id}"), None)?;
-                }
+                u64_of("subscription_key").map(|k| {
+                    let owner = u64_of("element_instance_key")
+                        .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                    (k, format!("subscription:{owner}"))
+                })
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((k, base)) = minted {
+            ids.mint(k, base)?;
         }
     }
-    Some(key_to_id)
+    Ok(())
 }
 
 /// Rewrites every `key`/`*_key` reference of `value` to the identity of the
-/// entity it references (`ids`, from [`key_identities`]), preserving the
-/// event's structure. A clean remint is a bijection, so both sides
-/// canonicalize every reference to the same per-entity token and reconcile;
-/// a reference to a key the entry never minted (an inconsistent or colliding
-/// reference) rewrites to a distinct `?orphan` token that cannot match the
-/// other side, so it diverges. `instance_key`/`scope_key` name the process
-/// instance / variable scope, not a re-minted element entity, so they are
-/// left as-is (the instance is not re-minted by fork order).
-fn canonicalize_keys(value: &mut Json, ids: &std::collections::BTreeMap<u64, String>) {
+/// entity it references, preserving the event's structure. A clean remint is
+/// a bijection, so both sides canonicalize every reference to the same
+/// per-entity token and reconcile; a reference to a key never minted (an
+/// inconsistent or colliding reference) rewrites to a distinct `?orphan`
+/// token, so it diverges unless the raw key is identical on both sides
+/// (`instance_key`/`scope_key`: the process instance is not re-minted by
+/// fork order).
+fn canonicalize_keys(value: &mut Json, ids: &KeyIds) {
     match value {
         Json::Object(map) => {
             for (k, v) in map.iter_mut() {
@@ -662,63 +772,6 @@ fn canonicalize_keys(value: &mut Json, ids: &std::collections::BTreeMap<u64, Str
         Json::Array(items) => items.iter_mut().for_each(|v| canonicalize_keys(v, ids)),
         _ => {}
     }
-}
-
-/// Key → entity identity accumulated over the WHOLE corpus for one side
-/// (the corpus runs one engine, so a key minted in an earlier entry is still
-/// referenced by later ones). A ratified remint swaps which entity a raw key
-/// names on each side; without carrying that mapping forward, a later entry
-/// whose raw events are byte-identical on both sides (e.g. an
-/// `ElementCompleted` naming key 11, which is element `m` on one side and a
-/// signal subscription on the other) would pass the equality shortcut.
-type KeyIds = std::collections::BTreeMap<u64, String>;
-
-/// Folds an entry's minted keys into the corpus-wide `ids`. Fails on a key
-/// minted for two different entities across the corpus (fail closed).
-fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> {
-    let entry = key_identities_lenient(events);
-    for (key, identity) in entry {
-        if let Some(prev) = ids.insert(key, identity.clone()) {
-            if prev != identity {
-                return Err(format!(
-                    "key {key} minted for two entities across the corpus ({prev} vs {identity})"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// [`key_identities`] without the per-entry clean-remint checks (an element
-/// legitimately mints several keys across a corpus: loops, multi-instance).
-fn key_identities_lenient(events: &[String]) -> KeyIds {
-    let mut out = KeyIds::new();
-    for e in events {
-        let Ok(v) = serde_json::from_str::<Json>(e) else {
-            continue;
-        };
-        let Some((variant, body)) = v.as_object().and_then(|o| o.iter().next()) else {
-            continue;
-        };
-        let u64_of = |f: &str| body.get(f).and_then(Json::as_u64);
-        let str_of = |f: &str| body.get(f).and_then(Json::as_str);
-        let minted = match variant.as_str() {
-            "ElementActivating" | "ElementActivated" => u64_of("element_instance_key")
-                .zip(str_of("element_id").map(|id| format!("element:{id}"))),
-            "JobCreated" => {
-                u64_of("job_key").zip(str_of("element_id").map(|id| format!("job:{id}")))
-            }
-            "MessageSubscriptionCreated" | "SignalSubscriptionCreated" => {
-                u64_of("subscription_key")
-                    .zip(str_of("element_id").map(|id| format!("subscription:{id}")))
-            }
-            _ => None,
-        };
-        if let Some((k, id)) = minted {
-            out.insert(k, id);
-        }
-    }
-    out
 }
 
 /// `events` with every key reference rewritten to its corpus-wide identity.
@@ -748,11 +801,9 @@ fn diverges_only_as(
 ) -> bool {
     let normalize =
         |events: &[String], drop: &[EventPattern], corpus_ids: &KeyIds| -> Option<Vec<String>> {
-            // Fail closed: a structurally inconsistent mint (a collision, or two
-            // keys for one element) is not the declared remint, whatever the
-            // allowlist says.
+            // A structurally inconsistent mint (one key for two entities)
+            // already failed closed in `extend_identities`.
             let ids = if expected.remint_keys {
-                key_identities(events)?;
                 Some(corpus_ids)
             } else {
                 None
@@ -926,7 +977,7 @@ pub fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
             }
             for (k, v) in map.iter_mut() {
                 if is_field_name(k) && data_map_fields().contains(k) {
-                    // A String-keyed map field: its keys are DATA, never
+                    // A map field: its keys are DATA, never
                     // erased; only its values (which may be structs) are
                     // descended into.
                     if let Json::Object(entries) = v {
