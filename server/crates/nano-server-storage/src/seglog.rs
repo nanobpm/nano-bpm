@@ -1865,7 +1865,10 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
                 // digests it recorded, continuing from the snapshot base's.
                 let seed = engine
                     .raft_applied()
-                    .and_then(|(_, state)| crate::digest::chain_of_raft_state(state));
+                    .map(|(_, state)| crate::digest::try_chain_of_raft_state(state))
+                    .transpose()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    .flatten();
                 verify_replayed_chain(seed, &events[skip..])?;
                 engine.apply_replayed_events(events[skip..].iter().cloned());
             }
@@ -3198,7 +3201,10 @@ pub fn recover_multi_scoped(
                         if skip < p_events.len() {
                             let seed = engine
                                 .raft_applied()
-                                .and_then(|(_, st)| crate::digest::chain_of_raft_state(st));
+                                .map(|(_, st)| crate::digest::try_chain_of_raft_state(st))
+                                .transpose()
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                                .flatten();
                             verify_replayed_chain(seed, &p_events[skip..])?;
                             engine.apply_replayed_events(p_events[skip..].iter().cloned());
                         }

@@ -140,17 +140,27 @@ pub struct EntryDigest {
     pub events: u64,
 }
 
-/// Extracts the [`EntryDigest`] from a `RaftEntryApplied` record's opaque
-/// `raft_state` JSON, if it carries one (pre-#1664 records do not).
-pub fn entry_digest_of(raft_state: &str) -> Option<EntryDigest> {
-    #[derive(Deserialize)]
-    struct WithDigest {
-        #[serde(default)]
-        digest: Option<EntryDigest>,
+/// Strictly extracts the [`EntryDigest`] from a `RaftEntryApplied` record's
+/// opaque `raft_state` JSON. `Ok(None)` only when the record genuinely carries
+/// no digest (a pre-#1664 record, or a non-JSON opaque state); a `digest`
+/// field that is present but malformed is an `Err` — never conflated with an
+/// absent one, which would silently re-base a verifier's chain (#1664 review).
+pub fn try_entry_digest_of(raft_state: &str) -> Result<Option<EntryDigest>, String> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str(raft_state) else {
+        return Ok(None);
+    };
+    match obj.remove("digest") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value::<EntryDigest>(v)
+            .map(Some)
+            .map_err(|e| format!("malformed chain digest: {e}")),
     }
-    serde_json::from_str::<WithDigest>(raft_state)
-        .ok()
-        .and_then(|w| w.digest)
+}
+
+/// Lenient form of [`try_entry_digest_of`] for the live (non-verifying)
+/// paths: a malformed digest reads as absent.
+pub fn entry_digest_of(raft_state: &str) -> Option<EntryDigest> {
+    try_entry_digest_of(raft_state).ok().flatten()
 }
 
 /// The chain value a replica continues from after its last applied record.
@@ -158,6 +168,11 @@ pub fn entry_digest_of(raft_state: &str) -> Option<EntryDigest> {
 /// case the next folded entry re-bases the chain.
 pub fn chain_of_raft_state(raft_state: &str) -> Option<ChainDigest> {
     entry_digest_of(raft_state).map(|d| d.chain)
+}
+
+/// Strict form of [`chain_of_raft_state`] for replay verification seeds.
+pub fn try_chain_of_raft_state(raft_state: &str) -> Result<Option<ChainDigest>, String> {
+    try_entry_digest_of(raft_state).map(|d| d.map(|d| d.chain))
 }
 
 /// The chain after folding entry `index` (with `events`) onto the replica's
@@ -230,7 +245,12 @@ pub fn verify_journal_chain(
         else {
             continue;
         };
-        let Some(rec) = entry_digest_of(raft_state) else {
+        let rec = try_entry_digest_of(raft_state).map_err(|e| ChainVerifyError {
+            index: *index,
+            recorded: format!("<{e}>"),
+            derived: "<not derived>".into(),
+        })?;
+        let Some(rec) = rec else {
             // A pre-digest record: the chain re-bases at the next entry.
             prev = None;
             continue;
@@ -302,8 +322,9 @@ mod hex32 {
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         use serde::de::Error as _;
         let s = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(d)?;
-        if s.len() != 64 {
-            return Err(D::Error::custom("chain digest must be 64 hex chars"));
+        // Byte-indexed slicing below is only sound on ASCII input.
+        if s.len() != 64 || !s.is_ascii() {
+            return Err(D::Error::custom("chain digest must be 64 ASCII hex chars"));
         }
         let mut out = [0u8; 32];
         for (i, slot) in out.iter_mut().enumerate() {
@@ -415,6 +436,38 @@ mod tests {
         let mut j = journal(1, &[&[1, 2], &[3, 4]]);
         j.remove(3);
         assert!(verify_journal_chain(None, &j).is_err());
+    }
+
+    fn malformed(hash: &str) -> String {
+        serde_json::json!({"log_id": 2, "digest": {"v": 1, "base": 1, "hash": hash, "events": 1}})
+            .to_string()
+    }
+
+    #[test]
+    fn malformed_digests_are_errors_not_absent() {
+        let bad_hex = malformed(&"z".repeat(64));
+        // 64 BYTES but not ASCII: must not panic on a byte-indexed slice.
+        let non_ascii = malformed(&format!("a\u{20ac}{}", "0".repeat(60)));
+        for state in [bad_hex, non_ascii, r#"{"digest":{"base":1}}"#.to_string()] {
+            assert!(try_entry_digest_of(&state).is_err(), "{state}");
+            assert!(try_chain_of_raft_state(&state).is_err(), "{state}");
+            assert_eq!(entry_digest_of(&state), None);
+        }
+        assert_eq!(try_entry_digest_of(r#"{"log_id":1}"#), Ok(None));
+        assert_eq!(try_entry_digest_of(r#"{"digest":null}"#), Ok(None));
+    }
+
+    #[test]
+    fn a_malformed_mid_chain_digest_fails_closed_instead_of_rebasing() {
+        let mut j = journal(1, &[&[1], &[2], &[3]]);
+        // Corrupt entry 2's recorded digest hash.
+        j[3] = Event::RaftEntryApplied {
+            index: 2,
+            raft_state: malformed(&"z".repeat(64)),
+            start_dispatch_rr: 0,
+        };
+        let err = verify_journal_chain(None, &j).unwrap_err();
+        assert_eq!(err.index, 2);
     }
 
     #[test]

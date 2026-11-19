@@ -20678,6 +20678,20 @@ impl ServerImpl {
         // `leader-durable` mode is a follower a disposable non-voting learner
         // whose sole durability point is the leader, safe to rebuild fresh.
         let voter_must_resume = self.replication_mode == ReplicationMode::Quorum;
+        // A DIVERGED quorum voter cannot be resynced in place: the fresh-receiver
+        // path rebuilds its voting identity on an empty volatile log, discarding
+        // its persisted vote/log (the amnesiac-voter hazard above), and resuming
+        // its durable log resumes the diverged lineage. Fail closed; only a
+        // disposable leader-durable learner is resynced fresh (#1664 review).
+        if divergence.is_some() && voter_must_resume {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED on a quorum VOTER — NOT auto-recovering: rebuilding \
+                 it on an empty log would make it an amnesiac voter; remove and re-add it \
+                 through a membership change (or wipe its data dir and rejoin)"
+            );
+            return false;
+        }
         let log_dir = if divergence.is_some() || (fresh_receiver && !voter_must_resume) {
             None
         } else {
@@ -43548,6 +43562,43 @@ mod clustered_startup_tests {
 
         part0.raft.shutdown().await.ok();
         rebuilt.raft.shutdown().await.ok();
+    }
+
+    /// #1664 review: a diverged quorum VOTER is never resynced onto an empty
+    /// volatile log (that would hand the group an amnesiac voter that lost its
+    /// persisted vote/log); recovery fails closed and leaves it down.
+    #[tokio::test]
+    async fn a_diverged_quorum_voter_is_not_rebuilt_empty() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
+        part0
+            .propose(deploy_cmd("q-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        assert!(wait_follower_applied(&node1, &part0).await, "caught up");
+        part1
+            .sm_engine()
+            .with(|journal| journal.perturb_chain_for_test())
+            .await;
+        part0.propose(deploy_cmd("q-2"), 2_000).await.ok();
+        part0.propose(deploy_cmd("q-3"), 3_000).await.ok();
+        let mut stopped = false;
+        for _ in 0..500 {
+            if part1.is_shutdown() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "the diverged voter must fail-stop");
+        assert!(part1.divergence().is_some());
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            !recovered.contains(&0),
+            "a diverged quorum voter must not be rebuilt empty: {recovered:?}"
+        );
+        let still = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(still.is_shutdown(), "left down for the operator");
+        part0.raft.shutdown().await.ok();
     }
 
     /// Issue #53: a partition whose Raft core enters `Shutdown` must be
