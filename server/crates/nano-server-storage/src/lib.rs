@@ -15,6 +15,7 @@
 //! `remote_sink` on `metrics`/`readstore`.
 
 pub mod coldspill;
+pub mod digest;
 pub mod journal;
 pub mod memory;
 pub mod metrics;

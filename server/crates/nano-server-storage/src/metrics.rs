@@ -53,6 +53,7 @@ struct Metrics {
     /// #100 blowup — 8.4 GB follower snapshots against a 435 KB leader snapshot
     /// of the same partition) is invisible in a process-wide last-write gauge.
     raft_snapshot_file_bytes: prometheus::IntGaugeVec,
+    raft_divergence_total: prometheus::IntCounterVec,
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
@@ -472,6 +473,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["partition", "node"],
     )
     .expect("valid gauge vec");
+    let raft_divergence_total = prometheus::IntCounterVec::new(
+        Opts::new(
+            "nanobpm_raft_divergence_total",
+            "Replica divergences detected by the chain digest (ADR 0066 slice 5, #1664), by partition and replica node: the follower's chain at an index disagreed with the leader's, so it fail-stopped its apply and resyncs from the leader's snapshot. Any non-zero value is an alert.",
+        ),
+        &["partition", "node"],
+    )
+    .expect("valid counter vec");
 
     let commit_wait_seconds = Histogram::with_opts(
         HistogramOpts::new(
@@ -969,6 +978,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_snapshot_fsync_seconds.clone())))
         .and(registry.register(Box::new(raft_snapshot_bytes.clone())))
         .and(registry.register(Box::new(raft_snapshot_file_bytes.clone())))
+        .and(registry.register(Box::new(raft_divergence_total.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
@@ -1046,6 +1056,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_snapshot_fsync_seconds,
         raft_snapshot_bytes,
         raft_snapshot_file_bytes,
+        raft_divergence_total,
         commit_wait_seconds,
         commits_total,
         writes_total,
@@ -1198,6 +1209,23 @@ pub fn set_raft_snapshot_file_bytes(partition: u64, node: u64, bytes: u64) {
         .raft_snapshot_file_bytes
         .with_label_values(&[&p, &n])
         .set(bytes as i64);
+}
+
+/// A replica divergence was detected on `partition` at replica `node` (ADR
+/// 0066 slice 5, #1664).
+pub fn inc_raft_divergence(partition: u64, node: u64) {
+    METRICS
+        .raft_divergence_total
+        .with_label_values(&[&partition.to_string(), &node.to_string()])
+        .inc();
+}
+
+/// The number of divergences detected on `partition` at replica `node`.
+pub fn raft_divergence_count(partition: u64, node: u64) -> u64 {
+    METRICS
+        .raft_divergence_total
+        .with_label_values(&[&partition.to_string(), &node.to_string()])
+        .get()
 }
 
 /// A durable write was enqueued (pipeline depth +1).

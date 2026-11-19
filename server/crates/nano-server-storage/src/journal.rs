@@ -3185,6 +3185,41 @@ impl Journal {
         Ok((events, commit))
     }
 
+    /// The chain digest (ADR 0066 slice 5, #1664) the armed Raft entry at
+    /// `index` will record: this replica's chain after its last applied record
+    /// folded with exactly the command events the entry buffered — the events
+    /// [`commit_raft_entry`](Self::commit_raft_entry) journals ahead of the
+    /// `RaftEntryApplied` record. Pure: call it between the entry's commands
+    /// and its commit, then carry the result in that commit's `raft_state`.
+    pub fn raft_entry_digest(&self, index: u64) -> crate::digest::EntryDigest {
+        let prev = self.engine.raft_applied().map(|(_, state)| state.as_str());
+        let events: &[Event] = self
+            .raft_entry
+            .as_ref()
+            .map(|(events, _)| events.as_slice())
+            .unwrap_or(&[]);
+        crate::digest::next_entry_digest(prev, index, events)
+    }
+
+    /// TEST-ONLY divergence injection (#1664): perturbs THIS replica's
+    /// recorded chain, as if a non-deterministic input had made it journal
+    /// different bytes for its last applied entry. The next entry's digest then
+    /// folds from the perturbed value, so a peer comparing at that index sees a
+    /// mismatch — exactly what a real divergence looks like on the wire.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn perturb_chain_for_test(&mut self) {
+        if let Some((index, state)) = self.engine.raft_applied().cloned()
+            && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&state)
+        {
+            let mut d = crate::digest::next_entry_digest(Some(&state), index, &[]);
+            d.chain.hash[0] ^= 0xff;
+            if let Ok(dv) = serde_json::to_value(d) {
+                v["digest"] = dv;
+                self.engine.set_raft_applied(index, v.to_string());
+            }
+        }
+    }
+
     /// Disarms the Raft entry WITHOUT journaling anything (#1405): the entry
     /// failed closed on an environmental error. The live engine state may hold
     /// the entry's partial, non-durable effects; the replica must shut down and

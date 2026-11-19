@@ -1861,6 +1861,12 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             // Replay only events after the snapshot boundary.
             let skip = covered.saturating_sub(first_index) as usize;
             if skip < events.len() {
+                // ADR 0066 #1664: the replayed tail must re-derive the chain
+                // digests it recorded, continuing from the snapshot base's.
+                let seed = engine
+                    .raft_applied()
+                    .and_then(|(_, state)| crate::digest::chain_of_raft_state(state));
+                verify_replayed_chain(seed, &events[skip..])?;
                 engine.apply_replayed_events(events[skip..].iter().cloned());
             }
             (engine, false)
@@ -1873,6 +1879,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         // as an unreadable snapshot.
         Ok(None) if first_index == 0 => {
             let fresh = total_events == 0;
+            verify_replayed_chain(None, &events)?;
             (Engine::replay_partition(0, events.iter().cloned()), fresh)
         }
         Ok(None) => match migrate_by_replay(dir, 0, first_index, total_events, &events)? {
@@ -2446,11 +2453,33 @@ fn migrate_by_replay(
     }
 
     // Replay cold prefix then hot tail, in global order, from an empty engine.
+    // The migration must re-derive every recorded chain digest (ADR 0066
+    // #1664): a journal whose bytes no longer reproduce them fails closed.
+    // Cold and hot are split at a segment seal, which is always a frame
+    // boundary, so the hot window continues from the cold one's chain.
+    let cold_chain = verify_replayed_chain(None, &cold_events)?;
+    verify_replayed_chain(cold_chain, hot_events)?;
     let engine = Engine::replay_partition(
         partition_id,
         cold_events.into_iter().chain(hot_events.iter().cloned()),
     );
     Ok(Some(engine))
+}
+
+/// Re-derives the chain digests recorded in a replayed event window (ADR 0066
+/// slice 5, #1664) and fails closed — a typed `InvalidData` carrying the
+/// [`ChainVerifyError`](crate::digest::ChainVerifyError) — when the journal no
+/// longer reproduces them (altered bytes, or a fold that changed).
+pub(crate) fn verify_replayed_chain(
+    seed: Option<crate::digest::ChainDigest>,
+    events: &[Event],
+) -> io::Result<Option<crate::digest::ChainDigest>> {
+    crate::digest::verify_journal_chain(seed, events)
+        .map(|(_, last)| last)
+        .map_err(|e| {
+            tracing::error!(error = %e, "replay: journal chain digest verification failed");
+            io::Error::new(io::ErrorKind::InvalidData, e)
+        })
 }
 
 /// The multi-partition migrator's shared "can we soundly replay the FULL
@@ -3152,6 +3181,7 @@ pub fn recover_multi_scoped(
                     .filter(|(tag, _)| *tag == p)
                     .map(|(_, e)| e.clone())
                     .collect();
+                verify_replayed_chain(None, &p_full)?;
                 Engine::replay_partition(p, p_full)
             } else {
                 match combined.as_ref().and_then(|m| m.get(&p)) {
@@ -3166,11 +3196,18 @@ pub fn recover_multi_scoped(
                         }
                         let skip = covered.saturating_sub(base_p) as usize;
                         if skip < p_events.len() {
+                            let seed = engine
+                                .raft_applied()
+                                .and_then(|(_, st)| crate::digest::chain_of_raft_state(st));
+                            verify_replayed_chain(seed, &p_events[skip..])?;
                             engine.apply_replayed_events(p_events[skip..].iter().cloned());
                         }
                         engine
                     }
-                    None => Engine::replay_partition(p, p_events),
+                    None => {
+                        verify_replayed_chain(None, &p_events)?;
+                        Engine::replay_partition(p, p_events)
+                    }
                 }
             };
             // Install partition-agnostic replicated deployments produced under
@@ -3184,9 +3221,9 @@ pub fn recover_multi_scoped(
             if !broadcast_for_p.is_empty() {
                 engine.install_deployment_if_newer(&broadcast_for_p);
             }
-            (p, engine)
+            Ok((p, engine))
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
 
     // Persist the migrated engines as a fresh new-format combined snapshot (each
     // partition covering its full per-partition history), then prune the cold
