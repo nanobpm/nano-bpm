@@ -19,7 +19,7 @@
     clippy::disallowed_methods,
     reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 
 use nanobpmn_engine_core::feel;
@@ -50,7 +50,7 @@ fn canon_value(v: &Value) -> String {
 }
 
 /// Canonical outcome of evaluating `expr` in `ctx` with the Rust engine.
-fn canon_outcome(expr: &str, ctx: &HashMap<String, Value>) -> String {
+fn canon_outcome(expr: &str, ctx: &BTreeMap<String, Value>) -> String {
     match feel::eval(expr, ctx) {
         Ok(v) => format!("ok:{}", canon_value(&v)),
         Err(_) => "err".to_string(),
@@ -59,8 +59,8 @@ fn canon_outcome(expr: &str, ctx: &HashMap<String, Value>) -> String {
 
 /// Parses a `name=type:value` (or `name=null`) context encoding into engine
 /// variables.
-fn parse_ctx(enc: &str) -> Result<HashMap<String, Value>, String> {
-    let mut ctx = HashMap::new();
+fn parse_ctx(enc: &str) -> Result<BTreeMap<String, Value>, String> {
+    let mut ctx = BTreeMap::new();
     if enc.is_empty() {
         return Ok(ctx);
     }

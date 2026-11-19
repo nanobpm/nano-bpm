@@ -157,8 +157,8 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // journal BEFORE the journal is consumed by replay: the Nth terminal
         // event (1-based) sets its instance's `terminated_epoch = N`. Live
         // instances keep `0`.
-        let mut terminal_epoch_by_instance: std::collections::HashMap<Key, u64> =
-            std::collections::HashMap::new();
+        let mut terminal_epoch_by_instance: std::collections::BTreeMap<Key, u64> =
+            std::collections::BTreeMap::new();
         {
             let mut epoch = 0u64;
             for event in &journal {
@@ -220,7 +220,7 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // field and load it `0` via `serde(default)`, so normalize them to the
         // deployment key the archived journal itself carries for each
         // definition (computed from the journal, not the replayed state).
-        let deployment_key_by_definition: std::collections::HashMap<Key, Key> = journal
+        let deployment_key_by_definition: std::collections::BTreeMap<Key, Key> = journal
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessDeployed {

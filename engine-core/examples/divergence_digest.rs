@@ -29,13 +29,13 @@
     clippy::disallowed_methods,
     reason = "non-production target (integration tests / examples; wall-clock timing is the probe's purpose, not an apply path — #1663); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hasher};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{Command, Engine, ProcessBuilder, Value};
 
-fn vars(n: usize) -> HashMap<String, Value> {
+fn vars(n: usize) -> BTreeMap<String, Value> {
     (0..n)
         .map(|i| (format!("v{i}"), Value::Str(format!("value-{i:08}"))))
         .collect()

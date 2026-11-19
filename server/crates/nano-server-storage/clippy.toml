@@ -1,0 +1,15 @@
+# Mirrors server/clippy.toml (clippy reads only the nearest clippy.toml, so a
+# crate-local file must restate the workspace settings).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Ordered-collection lint (#1662, ADR 0066 slice 3). nano-server-storage is the
+# journal/snapshot apply path: anything it iterates to emit or encode replicated
+# state must have a canonical order, so std `HashMap`/`HashSet` (per-process
+# `RandomState`, capacity/history-dependent layout) are banned here exactly as
+# in engine-core. Use `BTreeMap`/`BTreeSet`. A genuinely off-apply-path cache
+# may carry a narrow `#[allow(clippy::disallowed_types, reason = …)]`.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "replica determinism (#1662): apply-path state must use BTreeMap (canonical order)" },
+    { path = "std::collections::HashSet", reason = "replica determinism (#1662): apply-path state must use BTreeSet (canonical order)" },
+]

@@ -63,7 +63,7 @@
     clippy::disallowed_methods,
     reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
@@ -101,9 +101,9 @@ fn event_witnesses_golden_name() -> String {
 /// Serialize `value` to a **canonical**, deterministic, human-readable JSON
 /// string: routed through [`serde_json::Value`] (whose object is a `BTreeMap`,
 /// so every object's keys are emitted in sorted order regardless of the source
-/// `HashMap`'s per-process iteration order) and pretty-printed with a trailing
+/// (pre-#1662) `HashMap`'s per-process iteration order) and pretty-printed with a trailing
 /// newline. The scenario in [`build_golden_corpus`] is deliberately kept so that
-/// every set-valued (`HashSet`) field holds at most one element, so the only
+/// every set-valued (pre-#1662 `HashSet`, now `BTreeSet`) field holds at most one element, so the only
 /// remaining source of non-determinism — array order — cannot bite.
 fn canonical_json<T: serde::Serialize>(value: &T) -> String {
     let canonical: serde_json::Value =
@@ -170,7 +170,7 @@ fn assert_or_update_golden(name: &str, actual: &str) {
 /// full ordered event journal.
 ///
 /// Determinism contract (so the serialized bytes are stable across processes):
-/// the scenario keeps every `HashSet`-valued `State` field to at most one
+/// the scenario keeps every (pre-#1662 `HashSet`, now `BTreeSet`)-valued `State` field to at most one
 /// element — at snapshot time no job is left in the `Activated` set and each
 /// instance owns at most one job — so the only non-`HashMap` collections that
 /// serialize to JSON arrays are trivially ordered. All `HashMap`s are canonically
@@ -289,7 +289,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // Instance A: created with variables, its one job activated + completed, so
     // it walks the full lifecycle to a retained-terminal instance. Leaves the
     // `Activated` set empty again (the job completed).
-    let mut vars_a = HashMap::new();
+    let mut vars_a = BTreeMap::new();
     vars_a.insert("amount".to_string(), Value::Int(4200));
     vars_a.insert("currency".to_string(), Value::Str("EUR".to_string()));
     journal.extend(
@@ -346,7 +346,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             )
             .expect("re-activate job A"),
     );
-    let mut result_a = HashMap::new();
+    let mut result_a = BTreeMap::new();
     result_a.insert("approved".to_string(), Value::Bool(true));
     // The completion assigns a Camunda 8.10 business id to root instance A,
     // pinning the additive `ProcessInstanceBusinessIdAssigned` frame and the
@@ -363,7 +363,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
 
     // Instance B: created and left parked on its (created, NOT activated) job —
     // the live working set. One job, not in the `Activated` set.
-    let mut vars_b = HashMap::new();
+    let mut vars_b = BTreeMap::new();
     vars_b.insert("amount".to_string(), Value::Int(999));
     let created_b = engine
         .apply_command_at(Command::create_instance_with("order", vars_b), T0 + 4)
@@ -451,7 +451,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // the drift guard. The handler parks WITHOUT a job (its job is never
     // created behind the activation incident), and `book` is a pass-through
     // task (no job either), keeping the one-job-per-instance determinism
-    // contract (`jobs_by_instance` is a `HashSet`; a job's serialized order in
+    // contract (`jobs_by_instance` was a `HashSet` before #1662; a job's serialized order in
     // a two-job instance would be nondeterministic).
     let trip: ProcessDefinition = ProcessBuilder::new("trip")
         .start_event("s")
@@ -633,7 +633,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy decide process"),
     );
     for (lang, at) in [("de", T0 + 12), ("xx", T0 + 13)] {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("lang".to_string(), Value::Str(lang.to_string()));
         journal.extend(
             engine
@@ -641,7 +641,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
                 .expect("create decide instance"),
         );
     }
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("en".to_string()));
     journal.extend(
         engine
@@ -697,7 +697,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // frame incl. its additive `migrated_flow_scopes` / `subscriptions` /
     // `child_instances`. No modify step here: a modification that re-activates
     // `charge` leaves a second (canceled) job on D, and `jobs_by_instance` is a
-    // `HashSet` — that would break the one-job-per-instance determinism
+    // `HashSet` before #1662 — that would break the one-job-per-instance determinism
     // contract above. The populated modify shape is pinned by
     // `build_event_witnesses` instead.
     let created_d = engine
@@ -816,14 +816,14 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .apply_command_at(Command::DeployProcess(esp_def), T0 + 24)
             .expect("deploy esp-held"),
     );
-    let mut esp_vars = HashMap::new();
+    let mut esp_vars = BTreeMap::new();
     esp_vars.insert("orderId".to_string(), Value::Int(7));
     journal.extend(
         engine
             .apply_command_at(Command::create_instance_with("esp-held", esp_vars), T0 + 25)
             .expect("create esp-held instance"),
     );
-    let mut payload = HashMap::new();
+    let mut payload = BTreeMap::new();
     payload.insert("payload".to_string(), Value::Int(42));
     let correlated = engine
         .apply_command_at(
@@ -874,7 +874,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
 /// them lands in later slices, but the persisted shape is pinned here, once,
 /// with every new field non-default.
 fn build_event_witnesses() -> Vec<Event> {
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let scoped = VariableInstruction {
         variables: vars.clone(),
@@ -919,7 +919,7 @@ fn build_event_witnesses() -> Vec<Event> {
         Event::StartInstanceDispatched {
             process_id: "p".to_string(),
             start_element_id: "start".to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: vec![],
             business_id: Some("b".to_string()),
             target_partition: 1,
@@ -1343,11 +1343,11 @@ fn canonical_json_is_insensitive_to_map_insertion_order() {
         ("beta", Value::Bool(true)),
     ];
 
-    let mut forward: HashMap<String, Value> = HashMap::new();
+    let mut forward: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in entries.iter() {
         forward.insert((*k).to_string(), v.clone());
     }
-    let mut reverse: HashMap<String, Value> = HashMap::new();
+    let mut reverse: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in entries.iter().rev() {
         reverse.insert((*k).to_string(), v.clone());
     }
@@ -1356,7 +1356,7 @@ fn canonical_json_is_insensitive_to_map_insertion_order() {
     let reverse_json = canonical_json(&reverse);
     assert_eq!(
         forward_json, reverse_json,
-        "canonical_json must not depend on HashMap insertion/iteration order"
+        "canonical_json must not depend on BTreeMap insertion/iteration order"
     );
 
     // The bytes are equal *because* keys are emitted in sorted order — assert

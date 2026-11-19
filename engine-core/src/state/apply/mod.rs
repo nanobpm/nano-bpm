@@ -205,15 +205,15 @@ mod incident_kind_serde_compat_tests {
 /// lost/garbled projection. These guard that replay-safety property directly.
 #[cfg(all(test, feature = "serde"))]
 mod adhoc_redrive_serde_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use crate::event::Event;
     use crate::{IncidentKind, IoMappingRedrive, Value};
 
-    fn projection() -> HashMap<String, Value> {
+    fn projection() -> BTreeMap<String, Value> {
         // A mix of scalar + nested-container values so a structural
         // serialization/recovery regression (not just a dropped key) is caught.
-        HashMap::from([
+        BTreeMap::from([
             ("x".to_string(), Value::Int(1)),
             (
                 "chained".to_string(),

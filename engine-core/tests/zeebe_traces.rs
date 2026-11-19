@@ -29,7 +29,7 @@ mod harness;
 #[path = "trace_validation/zeebe_token_flow.rs"]
 mod zeebe_token_flow;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -74,7 +74,7 @@ fn read_json(path: &Path) -> J {
 /// `Normaliser.java` in the capture harness; both implement the algorithm
 /// written in the spec's `doc` field. `ids` carries the scenario's
 /// canonical-key map ACROSS steps (spec `doc` step 5).
-fn normalise(spec: &J, raw: &[J], ids: &mut HashMap<u64, u64>) -> Vec<J> {
+fn normalise(spec: &J, raw: &[J], ids: &mut BTreeMap<u64, u64>) -> Vec<J> {
     assert_eq!(spec["version"], 1, "unsupported normaliser spec version");
     let lanes = spec["lanes"].as_array().expect("spec.lanes");
     let mut out: Vec<Vec<J>> = vec![Vec::new(); lanes.len() + 1];
@@ -129,7 +129,7 @@ fn normalise(spec: &J, raw: &[J], ids: &mut HashMap<u64, u64>) -> Vec<J> {
 /// assign the same ids. Raw key VALUES are engine-specific, but the identity
 /// pattern is behavioural: completing a task in instance A must not read as
 /// completing it in instance B.
-fn renumber_keys(records: Vec<J>, ids: &mut HashMap<u64, u64>) -> Vec<J> {
+fn renumber_keys(records: Vec<J>, ids: &mut BTreeMap<u64, u64>) -> Vec<J> {
     let mut renumber = |v: &mut J| {
         let J::Object(o) = v else { return };
         for (name, field) in o.iter_mut() {
@@ -161,9 +161,9 @@ struct Scenario {
     xml: String,
     script: J,
     /// element id -> Zeebe `BpmnElementType` (derived from the BPMN tag name).
-    element_types: HashMap<String, String>,
+    element_types: BTreeMap<String, String>,
     /// (source, target) -> sequence-flow id.
-    flows: HashMap<(String, String), String>,
+    flows: BTreeMap<(String, String), String>,
     /// Ids of activities carrying `multiInstanceLoopCharacteristics`: their
     /// first activated element instance is the multi-instance BODY, rendered
     /// `MULTI_INSTANCE_BODY` (Zeebe's type), not the activity's type.
@@ -173,7 +173,7 @@ struct Scenario {
 /// One XML start/empty tag: local name + attributes.
 struct Tag {
     name: String,
-    attrs: HashMap<String, String>,
+    attrs: BTreeMap<String, String>,
 }
 
 /// Every start/empty tag in the document, scanned by the engine's XML
@@ -250,8 +250,8 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
         return Err(format!("{name}: script.json has no `steps` array"));
     }
     let all = tags(&xml).map_err(|e| format!("{name}: process.bpmn: {e}"))?;
-    let mut element_types = HashMap::new();
-    let mut flows = HashMap::new();
+    let mut element_types = BTreeMap::new();
+    let mut flows = BTreeMap::new();
     let mut needs_shape = BTreeSet::new();
     let mut needs_edge = BTreeSet::new();
     let mut shapes = BTreeSet::new();
@@ -374,7 +374,7 @@ fn to_json(v: &Value) -> J {
     }
 }
 
-fn variables(step: &J) -> HashMap<String, Value> {
+fn variables(step: &J) -> BTreeMap<String, Value> {
     step["variables"]
         .as_object()
         .map(|o| o.iter().map(|(k, v)| (k.clone(), to_value(v))).collect())
@@ -460,21 +460,21 @@ struct NanoRun<'a> {
     /// `instance`; completion/variable labels resolve through `element_ids`
     /// instead, so a spawned child never relabels the parent's records.
     process_id: String,
-    element_ids: HashMap<Key, String>,
+    element_ids: BTreeMap<Key, String>,
     /// Element-instance keys of multi-instance BODIES (rendered
     /// `MULTI_INSTANCE_BODY`): a body and its task children share the
     /// activity's BPMN element id, so the type lookup alone cannot tell
     /// them apart.
-    mi_bodies: HashMap<Key, Key>,
+    mi_bodies: BTreeMap<Key, Key>,
     /// Each element instance's FLOW SCOPE (the enclosing sub-process element
     /// instance, from `ElementActivating.scope`; absent = the process root).
     /// Zeebe's `flowScopeKey` for an element inside a sub-process is the
     /// sub-process instance, not the process instance (#1335).
-    flow_scopes: HashMap<Key, Key>,
+    flow_scopes: BTreeMap<Key, Key>,
     /// The flow scope of the most recent activation of each element id: a
     /// `SequenceFlowTaken` names only its source/target ids, and a flow lives
     /// in its source element's scope.
-    scope_by_element_id: HashMap<(Key, String), Key>,
+    scope_by_element_id: BTreeMap<(Key, String), Key>,
     /// Element instances activated but not yet completed, in activation
     /// order: `(element-instance key, element id, process-instance key)`.
     /// nano's `ProcessInstanceTerminated` carries the whole termination
@@ -484,27 +484,27 @@ struct NanoRun<'a> {
     active_elements: Vec<(Key, String, Key)>,
     /// Instances whose root TERMINATING was already rendered (a deferred
     /// cancel with `canceling` listeners emits `ProcessInstanceTerminating`).
-    terminating: HashSet<Key>,
-    jobs_by_type: HashMap<String, Key>,
-    jobs: HashMap<Key, (String, String, i64)>,
+    terminating: BTreeSet<Key>,
+    jobs_by_type: BTreeMap<String, Key>,
+    jobs: BTreeMap<Key, (String, String, i64)>,
     /// job key -> (process-instance key, element-instance key).
-    job_scopes: HashMap<Key, (Key, Key)>,
-    user_tasks: HashMap<String, Key>,
-    user_task_elements: HashMap<Key, String>,
+    job_scopes: BTreeMap<Key, (Key, Key)>,
+    user_tasks: BTreeMap<String, Key>,
+    user_task_elements: BTreeMap<Key, String>,
     /// user-task key -> (process-instance key, element-instance key).
-    user_task_scopes: HashMap<Key, (Key, Key)>,
-    incidents: HashMap<String, Key>,
-    incident_info: HashMap<Key, (String, &'static str)>,
+    user_task_scopes: BTreeMap<Key, (Key, Key)>,
+    incidents: BTreeMap<String, Key>,
+    incident_info: BTreeMap<Key, (String, &'static str)>,
     /// incident key -> (process-instance key, element-instance key).
-    incident_scopes: HashMap<Key, (Key, Key)>,
+    incident_scopes: BTreeMap<Key, (Key, Key)>,
     /// timer key -> Zeebe `targetElementId` (the boundary event for a boundary
     /// timer — see `TimerCreated`).
-    timers: HashMap<Key, String>,
+    timers: BTreeMap<Key, String>,
     /// timer key -> (process-instance key, target element-instance key).
-    timer_scopes: HashMap<Key, (Key, Key)>,
-    subscriptions: HashMap<Key, (String, String)>,
+    timer_scopes: BTreeMap<Key, (Key, Key)>,
+    subscriptions: BTreeMap<Key, (String, String)>,
     /// subscription key -> (process-instance key, element-instance key).
-    subscription_scopes: HashMap<Key, (Key, Key)>,
+    subscription_scopes: BTreeMap<Key, (Key, Key)>,
     /// variables known per runtime scope key (CREATED vs UPDATED). Keyed by the
     /// scope's element-INSTANCE key, not its BPMN element id: two instances of
     /// one process (or a re-entered scope) each get their own CREATED records.
@@ -514,7 +514,7 @@ struct NanoRun<'a> {
     /// variable to the value it already holds (e.g. a repeated
     /// non-interrupting message carrying the same payload, #1555); nano's
     /// merge event still names it, so the general path suppresses the no-op.
-    values: HashMap<(Key, String), J>,
+    values: BTreeMap<(Key, String), J>,
     /// Each live multi-instance body's `outputCollection` accumulator:
     /// body element-instance key -> (collection variable name, per-index slots).
     /// Zeebe seeds the collection on the BODY scope as a list of nulls when the
@@ -523,7 +523,7 @@ struct NanoRun<'a> {
     /// values in `MultiInstanceActivated` / `MultiInstanceChildCompleted`, so the
     /// adapter renders Zeebe's records from them. Only bodies NAMING an
     /// `outputCollection` appear here.
-    mi_output: HashMap<Key, (String, Vec<J>)>,
+    mi_output: BTreeMap<Key, (String, Vec<J>)>,
 }
 
 fn event(value_type: &str, intent: &str, value: J) -> J {
@@ -544,32 +544,32 @@ impl<'a> NanoRun<'a> {
             instance: 0,
             created: Vec::new(),
             process_id: String::new(),
-            element_ids: HashMap::new(),
-            mi_bodies: HashMap::new(),
-            flow_scopes: HashMap::new(),
-            scope_by_element_id: HashMap::new(),
+            element_ids: BTreeMap::new(),
+            mi_bodies: BTreeMap::new(),
+            flow_scopes: BTreeMap::new(),
+            scope_by_element_id: BTreeMap::new(),
             active_elements: Vec::new(),
-            terminating: HashSet::new(),
-            jobs_by_type: HashMap::new(),
-            jobs: HashMap::new(),
-            job_scopes: HashMap::new(),
-            user_tasks: HashMap::new(),
-            user_task_elements: HashMap::new(),
-            user_task_scopes: HashMap::new(),
-            incidents: HashMap::new(),
-            incident_info: HashMap::new(),
-            incident_scopes: HashMap::new(),
-            timers: HashMap::new(),
-            timer_scopes: HashMap::new(),
-            subscriptions: HashMap::new(),
-            subscription_scopes: HashMap::new(),
+            terminating: BTreeSet::new(),
+            jobs_by_type: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            job_scopes: BTreeMap::new(),
+            user_tasks: BTreeMap::new(),
+            user_task_elements: BTreeMap::new(),
+            user_task_scopes: BTreeMap::new(),
+            incidents: BTreeMap::new(),
+            incident_info: BTreeMap::new(),
+            incident_scopes: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            timer_scopes: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
+            subscription_scopes: BTreeMap::new(),
             known: BTreeMap::new(),
-            values: HashMap::new(),
-            mi_output: HashMap::new(),
+            values: BTreeMap::new(),
+            mi_output: BTreeMap::new(),
         }
     }
 
-    fn key(map: &HashMap<String, Key>, id: &str, what: &str) -> Key {
+    fn key(map: &BTreeMap<String, Key>, id: &str, what: &str) -> Key {
         *map.get(id)
             .unwrap_or_else(|| panic!("no {what} '{id}' has been created yet"))
     }
@@ -749,7 +749,7 @@ impl<'a> NanoRun<'a> {
         &mut self,
         scope_key: Key,
         scope_label: String,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
@@ -810,7 +810,7 @@ impl<'a> NanoRun<'a> {
         &mut self,
         child_key: Key,
         scope_label: String,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
@@ -1519,7 +1519,7 @@ impl<'a> NanoRun<'a> {
 /// canonical-key map is kept across the scenario's steps (spec `doc` step 5).
 fn nano_trace(spec: &J, sc: &Scenario) -> Vec<J> {
     let mut run = NanoRun::new(sc);
-    let mut ids = HashMap::new();
+    let mut ids = BTreeMap::new();
     sc.script["steps"]
         .as_array()
         .expect("steps")
@@ -2197,7 +2197,7 @@ fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
             json!({"elementId": "t", "processInstanceKey": 9}),
         ),
     ];
-    let mut ids = HashMap::new();
+    let mut ids = BTreeMap::new();
     assert_eq!(
         normalise(&spec, &raw, &mut ids),
         vec![
@@ -2234,7 +2234,7 @@ fn normaliser_renumbers_runtime_keys_canonically() {
             json!({"elementId": "t", "type": "w", "retries": 3, "processInstanceKey": 2251799813685254_u64, "elementInstanceKey": 2251799813685260_u64}),
         ),
     ];
-    let mut ids = HashMap::new();
+    let mut ids = BTreeMap::new();
     assert_eq!(
         normalise(&spec, &raw, &mut ids),
         vec![
@@ -2247,11 +2247,11 @@ fn normaliser_renumbers_runtime_keys_canonically() {
     // FIRST instance is observably different from completing in the SECOND.
     let mut swapped = raw.clone();
     swapped[2]["value"]["processInstanceKey"] = json!(2251799813685249_u64);
-    let out = normalise(&spec, &swapped, &mut HashMap::new());
+    let out = normalise(&spec, &swapped, &mut BTreeMap::new());
     assert_eq!(out[2]["processInstanceKey"], json!(1), "{out:?}");
     assert_ne!(
         out,
-        normalise(&spec, &raw, &mut HashMap::new()),
+        normalise(&spec, &raw, &mut BTreeMap::new()),
         "the swap must be observable"
     );
     // A plain number is data, not a key: `retries` and a numeric variable
@@ -2261,7 +2261,7 @@ fn normaliser_renumbers_runtime_keys_canonically() {
         "CREATED",
         json!({"name": "n", "value": 2, "scopeElementId": "p", "processInstanceKey": 7, "scopeKey": 7}),
     )];
-    let out = normalise(&spec, &valued, &mut HashMap::new());
+    let out = normalise(&spec, &valued, &mut BTreeMap::new());
     assert_eq!(out[0]["value"], json!(2), "{out:?}");
     assert_eq!(out[0]["scopeKey"], json!(1), "{out:?}");
     // Canonical ids are assigned in SORTED field-name order (spec `doc` step
@@ -2278,7 +2278,7 @@ fn normaliser_renumbers_runtime_keys_canonically() {
         "FAILED",
         json!({"elementId": "t", "type": "w", "retries": 0, "processInstanceKey": 100_u64, "elementInstanceKey": 200_u64, "flowScopeKey": 100_u64}),
     )];
-    let out = normalise(&spec, &shared, &mut HashMap::new());
+    let out = normalise(&spec, &shared, &mut BTreeMap::new());
     assert_eq!(out[0]["flowScopeKey"], J::Null, "not a JOB lane field");
     assert_eq!(out[0]["elementInstanceKey"], json!(1), "{out:?}");
     assert_eq!(out[0]["processInstanceKey"], json!(2), "{out:?}");
@@ -2287,7 +2287,7 @@ fn normaliser_renumbers_runtime_keys_canonically() {
         "ELEMENT_ACTIVATING",
         json!({"elementId": "t", "bpmnElementType": "SERVICE_TASK", "processInstanceKey": 100_u64, "flowScopeKey": 100_u64}),
     )];
-    let out = normalise(&spec, &pi, &mut HashMap::new());
+    let out = normalise(&spec, &pi, &mut BTreeMap::new());
     assert_eq!(out[0]["flowScopeKey"], json!(1), "{out:?}");
     assert_eq!(out[0]["processInstanceKey"], json!(1), "{out:?}");
 }
@@ -2315,7 +2315,7 @@ fn normaliser_keeps_canonical_keys_across_steps() {
         )]
     };
     let (ka, kb) = (2251799813685249_u64, 2251799813685254_u64);
-    let mut ids = HashMap::new();
+    let mut ids = BTreeMap::new();
     normalise(&spec, &created(ka), &mut ids);
     normalise(&spec, &created(kb), &mut ids);
     let update_b = normalise(&spec, &updated(kb), &mut ids);
@@ -2323,7 +2323,7 @@ fn normaliser_keeps_canonical_keys_across_steps() {
     assert_eq!(update_b[0]["scopeKey"], json!(2), "{update_b:?}");
     // Updating A instead must read differently from updating B — the swap is
     // observable only because the map survives the step boundary.
-    let mut ids = HashMap::new();
+    let mut ids = BTreeMap::new();
     normalise(&spec, &created(ka), &mut ids);
     normalise(&spec, &created(kb), &mut ids);
     let update_a = normalise(&spec, &updated(ka), &mut ids);
@@ -2341,8 +2341,8 @@ fn normaliser_does_not_compare_interleaving_across_lanes() {
     );
     let job = raw_event("JOB", "CREATED", json!({"elementId": "a"}));
     assert_eq!(
-        normalise(&spec, &[pi.clone(), job.clone()], &mut HashMap::new()),
-        normalise(&spec, &[job, pi], &mut HashMap::new())
+        normalise(&spec, &[pi.clone(), job.clone()], &mut BTreeMap::new()),
+        normalise(&spec, &[job, pi], &mut BTreeMap::new())
     );
 }
 
@@ -2891,7 +2891,7 @@ fn mi_child_loop_counter_carries_the_event_binding() {
     let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
     fs::remove_dir_all(&tmp).unwrap();
     let mut run = NanoRun::new(&sc);
-    let vars = HashMap::from([
+    let vars = BTreeMap::from([
         ("item".to_string(), Value::Int(7)),
         ("result".to_string(), Value::Null),
         // A WRONG counter: index 0 would derive 1, but the event binds 99 —
@@ -2954,7 +2954,7 @@ fn variable_records_delegates_to_the_single_record_helper() {
     let first = run.render(&Event::ScopedVariablesUpdated {
         instance_key: 1,
         scope_key: 7,
-        variables: HashMap::from([
+        variables: BTreeMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
         ]),
@@ -2962,7 +2962,7 @@ fn variable_records_delegates_to_the_single_record_helper() {
     let second = run.render(&Event::ScopedVariablesUpdated {
         instance_key: 1,
         scope_key: 7,
-        variables: HashMap::from([("a".to_string(), Value::Int(3))]),
+        variables: BTreeMap::from([("a".to_string(), Value::Int(3))]),
     });
     assert_eq!(
         first
@@ -2984,7 +2984,7 @@ fn variable_records_delegates_to_the_single_record_helper() {
         body_key: 8,
         child_key: 9,
         index: 0,
-        local_variables: HashMap::from([
+        local_variables: BTreeMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
         ]),
@@ -3833,14 +3833,14 @@ fn boundary_timer_targets_the_boundary_event() {
 /// counts of flows, tasks, join firings and completion.
 #[test]
 fn zeebe_golden_projects_to_spec_milestones() {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // The scenario's sequence-flow map: (source, target) -> flow id, derived
     // from its BPMN XML. The spec-level normaliser needs the reverse: flow id
     // -> (source, target).
     let sc = load_scenario(&traces_dir().join("scenarios/parallel-fork-join-tasks"))
         .expect("load parallel-fork-join-tasks");
-    let flow_endpoints: HashMap<String, (String, String)> = sc
+    let flow_endpoints: BTreeMap<String, (String, String)> = sc
         .flows
         .iter()
         .map(|((from, to), id)| (id.clone(), (from.clone(), to.clone())))
@@ -3854,13 +3854,13 @@ fn zeebe_golden_projects_to_spec_milestones() {
     // sequence flow AND (b) it is a parallel or inclusive gateway. Without the
     // type guard a multi-input exclusive merge would emit a spurious
     // `JoinFired` and falsely diverge from the spec.
-    let mut incoming_counts: HashMap<String, usize> = HashMap::new();
+    let mut incoming_counts: BTreeMap<String, usize> = BTreeMap::new();
     for (from, to) in sc.flows.keys() {
         if from != to {
             *incoming_counts.entry(to.clone()).or_insert(0) += 1;
         }
     }
-    let join_elements: std::collections::HashSet<String> = incoming_counts
+    let join_elements: std::collections::BTreeSet<String> = incoming_counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(id, _)| id)

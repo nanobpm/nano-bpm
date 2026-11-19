@@ -39,7 +39,7 @@
 //! raises an incident on the element (the job is failed with no retries and
 //! the upstream message) instead of passing the literal through.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use nanobpmn_engine_core::{SecretProvenance, Value};
 
@@ -116,13 +116,13 @@ impl MissingSecret {
 /// resolved copy otherwise, or the first [`MissingSecret`] (sites visited in
 /// path order, so the incident is deterministic).
 pub(crate) fn resolve_job_variables(
-    vars: &HashMap<String, Value>,
+    vars: &BTreeMap<String, Value>,
     provenance: &[SecretProvenance],
     store: &dyn SecretStore,
-) -> Result<Option<HashMap<String, Value>>, MissingSecret> {
+) -> Result<Option<BTreeMap<String, Value>>, MissingSecret> {
     let mut sites: Vec<&SecretProvenance> = provenance.iter().collect();
     sites.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut out: Option<HashMap<String, Value>> = None;
+    let mut out: Option<BTreeMap<String, Value>> = None;
     for site in sites {
         let names: HashSet<&str> = site.secrets.iter().map(String::as_str).collect();
         let mut segments = site.path.split('.');
@@ -203,7 +203,7 @@ fn substitute(
 /// A fixed in-memory store for tests (env vars are process-global, so tests
 /// never mutate them).
 #[cfg(test)]
-pub(crate) struct MapSecretStore(pub(crate) HashMap<String, String>);
+pub(crate) struct MapSecretStore(pub(crate) BTreeMap<String, String>);
 
 #[cfg(test)]
 impl SecretStore for MapSecretStore {
@@ -227,7 +227,7 @@ mod tests {
     }
 
     fn store() -> MapSecretStore {
-        MapSecretStore(HashMap::from([
+        MapSecretStore(BTreeMap::from([
             ("TOKEN".to_string(), "s3cr3t".to_string()),
             ("DIRECT".to_string(), "direct-value".to_string()),
         ]))
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn resolves_only_trusted_names_at_trusted_paths() {
-        let vars = HashMap::from([
+        let vars = BTreeMap::from([
             ("a".to_string(), s("camunda.secrets.TOKEN")),
             (
                 "b".to_string(),
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn only_the_name_trusted_for_the_site_resolves() {
-        let vars = HashMap::from([("a".to_string(), s("camunda.secrets.DIRECT"))]);
+        let vars = BTreeMap::from([("a".to_string(), s("camunda.secrets.DIRECT"))]);
         assert_eq!(
             resolve_job_variables(&vars, &[site("a", &["TOKEN"])], &store()),
             Ok(None)
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn nothing_trusted_is_a_no_op() {
-        let vars = HashMap::from([("a".to_string(), s("camunda.secrets.TOKEN"))]);
+        let vars = BTreeMap::from([("a".to_string(), s("camunda.secrets.TOKEN"))]);
         assert_eq!(resolve_job_variables(&vars, &[], &store()), Ok(None));
         assert_eq!(
             resolve_job_variables(&vars, &[site("a.missing", &["TOKEN"])], &store()),
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn missing_secret_reports_the_upstream_incident_message() {
-        let vars = HashMap::from([("a".to_string(), s("camunda.secrets.NOPE"))]);
+        let vars = BTreeMap::from([("a".to_string(), s("camunda.secrets.NOPE"))]);
         let err =
             resolve_job_variables(&vars, &[site("a", &["NOPE"])], &store()).expect_err("missing");
         assert_eq!(

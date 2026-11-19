@@ -16,7 +16,7 @@
 //! between two genuinely parallel tasks is an artefact of that linearisation, not a real
 //! ordering — treat cross-branch transitions with care.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
@@ -157,7 +157,7 @@ pub fn conformance_check(analysis: &Analysis, model_xml: &str) -> Result<Value, 
     let mut conformant_occurrences = 0i64;
     let mut conformant_edges = 0usize;
     let mut nonconformant: Vec<Value> = Vec::new();
-    let observed_pairs: HashSet<(String, String)> = edges
+    let observed_pairs: BTreeSet<(String, String)> = edges
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
@@ -204,7 +204,7 @@ pub fn conformance_check(analysis: &Analysis, model_xml: &str) -> Result<Value, 
 
     // Model transitions that the trace never exercised (dead model paths).
     let mut unused: Vec<Value> = Vec::new();
-    let mut allowed_from: Vec<(&String, &HashSet<String>)> = mtg.allowed.iter().collect();
+    let mut allowed_from: Vec<(&String, &BTreeSet<String>)> = mtg.allowed.iter().collect();
     allowed_from.sort_by(|a, b| a.0.cmp(b.0));
     for (from, tos) in allowed_from {
         let mut tos_sorted: Vec<&String> = tos.iter().collect();

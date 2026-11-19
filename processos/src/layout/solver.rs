@@ -18,7 +18,7 @@
 //! we can layer a proper constraint solver (WebCola-style projections) or
 //! Rapier-driven refinement on top — but *this* is the seam to prove first.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::schema::{FlowKind, SemanticAnnotations};
 
@@ -28,9 +28,9 @@ use super::schema::{FlowKind, SemanticAnnotations};
 /// [`crate::bpmn_model::desired_row`] (integer-ish grid rows; positive = down
 /// the page). Nodes not mentioned by any flow or cluster don't appear in the
 /// map — the caller falls back to the predecessor-mean heuristic for them.
-pub fn compute_row_bias(ann: &SemanticAnnotations) -> HashMap<String, f64> {
-    let mut bias: HashMap<String, f64> = HashMap::new();
-    let mut node_kind: HashMap<String, FlowKind> = HashMap::new();
+pub fn compute_row_bias(ann: &SemanticAnnotations) -> BTreeMap<String, f64> {
+    let mut bias: BTreeMap<String, f64> = BTreeMap::new();
+    let mut node_kind: BTreeMap<String, FlowKind> = BTreeMap::new();
 
     // Pass 1 — flow bands. Higher-priority kinds override lower-priority ones
     // so the last write wins deterministically regardless of flow order in the

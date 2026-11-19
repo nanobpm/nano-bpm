@@ -13,7 +13,7 @@
 //! the cheapest fully-correct, incident-free configuration. A correct ranking
 //! recovers exactly that.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde_json::json;
 
@@ -57,7 +57,7 @@ fn worker(
     cost: f64,
     latency_ms: u64,
     failure_rate: f64,
-    output: HashMap<String, serde_json::Value>,
+    output: BTreeMap<String, serde_json::Value>,
 ) -> WorkerModel {
     WorkerModel {
         id: id.to_string(),
@@ -70,7 +70,7 @@ fn worker(
 
 /// Build the example scenario.
 pub fn example_scenario() -> Scenario {
-    let mut workers: HashMap<String, WorkerModel> = HashMap::new();
+    let mut workers: BTreeMap<String, WorkerModel> = BTreeMap::new();
     // classify options — both correct; cheap is strictly better.
     workers.insert(
         "accurate-llm".into(),
@@ -79,7 +79,7 @@ pub fn example_scenario() -> Scenario {
             10.0,
             1200,
             0.0,
-            HashMap::from([("category".to_string(), json!("A"))]),
+            BTreeMap::from([("category".to_string(), json!("A"))]),
         ),
     );
     workers.insert(
@@ -89,7 +89,7 @@ pub fn example_scenario() -> Scenario {
             1.0,
             200,
             0.0,
-            HashMap::from([("category".to_string(), json!("A"))]),
+            BTreeMap::from([("category".to_string(), json!("A"))]),
         ),
     );
     // summarize options — premium reliable; budget fails half the time.
@@ -100,7 +100,7 @@ pub fn example_scenario() -> Scenario {
             8.0,
             900,
             0.0,
-            HashMap::from([("summary".to_string(), json!("ok"))]),
+            BTreeMap::from([("summary".to_string(), json!("ok"))]),
         ),
     );
     workers.insert(
@@ -110,16 +110,16 @@ pub fn example_scenario() -> Scenario {
             2.0,
             300,
             0.5,
-            HashMap::from([("summary".to_string(), json!("ok"))]),
+            BTreeMap::from([("summary".to_string(), json!("ok"))]),
         ),
     );
 
-    let task_workers: HashMap<String, String> = HashMap::from([
+    let task_workers: BTreeMap<String, String> = BTreeMap::from([
         ("classify".to_string(), "accurate-llm".to_string()),
         ("summarize".to_string(), "premium-llm".to_string()),
     ]);
 
-    let latent_options: HashMap<String, Vec<String>> = HashMap::from([
+    let latent_options: BTreeMap<String, Vec<String>> = BTreeMap::from([
         ("classify".to_string(), vec!["cheap-llm".to_string()]),
         ("summarize".to_string(), vec!["budget-llm".to_string()]),
     ]);
@@ -127,8 +127,8 @@ pub fn example_scenario() -> Scenario {
     // A handful of inputs; expected output is the same correct answer each time.
     let inputs: Vec<ScenarioInput> = (0..6)
         .map(|i| ScenarioInput {
-            vars: HashMap::from([("docId".to_string(), json!(format!("doc-{i}")))]),
-            expected: HashMap::from([
+            vars: BTreeMap::from([("docId".to_string(), json!(format!("doc-{i}")))]),
+            expected: BTreeMap::from([
                 ("category".to_string(), json!("A")),
                 ("summary".to_string(), json!("ok")),
             ]),
@@ -137,7 +137,7 @@ pub fn example_scenario() -> Scenario {
 
     let golden = Some(Variant {
         name: "golden (cheap classify, premium summarize)".to_string(),
-        assignment: HashMap::from([
+        assignment: BTreeMap::from([
             ("classify".to_string(), "cheap-llm".to_string()),
             ("summarize".to_string(), "premium-llm".to_string()),
         ]),

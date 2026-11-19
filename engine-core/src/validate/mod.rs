@@ -24,7 +24,7 @@
 //! * `start_events`      — start-event count parity (#855).
 //! * `cheap_rules`       — end-event outgoing / duplicate starts / taskDef (#856).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use error::ParseError;
 
@@ -89,7 +89,7 @@ pub(crate) struct TaskDefCapture {
 pub(crate) struct ProcessCapture {
     pub process_id: String,
     /// Every declared `<sequenceFlow>` id, before any ad-hoc pruning.
-    pub flow_ids: HashSet<String>,
+    pub flow_ids: BTreeSet<String>,
     /// `<incoming>`/`<outgoing>` references declared on flow nodes.
     pub flow_refs: Vec<FlowRefCapture>,
     /// `messageRef`/`errorRef`/`signalRef`/`escalationRef`/`default`/
@@ -105,18 +105,18 @@ pub(crate) struct ProcessCapture {
     /// Unmodelled flow elements / event definitions.
     pub unmodelled: Vec<UnmodelledElement>,
     /// Declared definitions-level `<message>` ids.
-    pub declared_messages: HashSet<String>,
+    pub declared_messages: BTreeSet<String>,
     /// Declared definitions-level `<error>` ids.
-    pub declared_errors: HashSet<String>,
+    pub declared_errors: BTreeSet<String>,
     /// Declared definitions-level `<signal>` ids.
-    pub declared_signals: HashSet<String>,
+    pub declared_signals: BTreeSet<String>,
     /// Declared definitions-level `<signal>` id → `name` map. Signals correlate
     /// by *name*, so the duplicate-signal-start rule (#856) resolves each
     /// `signalRef` id through this map and dedupes by the resolved name —
     /// mirroring the name-keyed message-start rule.
-    pub signal_names: HashMap<String, String>,
+    pub signal_names: BTreeMap<String, String>,
     /// Declared definitions-level `<escalation>` ids.
-    pub declared_escalations: HashSet<String>,
+    pub declared_escalations: BTreeSet<String>,
     /// `zeebe:taskDefinition`s on job-based tasks, with raw attribute strings.
     pub task_definitions: Vec<TaskDefCapture>,
 }

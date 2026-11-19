@@ -66,7 +66,7 @@ impl Engine {
     /// `correlationKey` of `""`.
     pub(crate) fn resolve_correlation_value(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         correlation_key: &str,
     ) -> Result<String, expression::Failure> {
         if correlation_key.trim().is_empty() {
@@ -85,7 +85,7 @@ impl Engine {
     /// subscription named after the expression text (#1398).
     pub(crate) fn resolve_event_name(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: &str,
     ) -> Result<String, expression::Failure> {
         expression::evaluate_string(raw, vars)
@@ -159,7 +159,7 @@ impl Engine {
         &self,
         instance_key: Key,
         view_scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Vec<String> {
         // The SAME replicated state `vars` was overlaid from (#1640, #1657):
         // cluster variables are engine state changed only by their own
@@ -232,12 +232,12 @@ impl Engine {
         &self,
         instance_key: Key,
         view_scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         mappings: &[crate::model::Mapping],
-    ) -> Result<(HashMap<String, Value>, Vec<crate::state::SecretProvenance>), IoMappingFailure>
+    ) -> Result<(BTreeMap<String, Value>, Vec<crate::state::SecretProvenance>), IoMappingFailure>
     {
         let trusted = self.trusted_secret_roots(instance_key, view_scope, vars);
-        let mut result: HashMap<String, Value> = HashMap::new();
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
         let mut provenance: Vec<crate::state::SecretProvenance> = Vec::new();
         for m in mappings {
             // The SAME segmentation `assign_io_target` writes with, so an
@@ -300,10 +300,10 @@ impl Engine {
     /// `null` (an `Ok`), so it is assigned as `null` and does not fail here.
     pub(crate) fn eval_io_mappings_in(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         mappings: &[crate::model::Mapping],
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
-        let mut result: HashMap<String, Value> = HashMap::new();
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
         for m in mappings {
             match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
@@ -336,7 +336,7 @@ impl Engine {
     /// stripped by [`crate::feel::eval`].
     fn eval_io_mapping_source(
         source: &str,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<Value, crate::feel::FeelError> {
         if source.trim_start().starts_with('=') {
             crate::feel::eval(source.trim(), vars)
@@ -360,11 +360,11 @@ impl Engine {
     /// silently projecting an empty result (#946).
     pub(crate) fn eval_io_mappings_tolerating(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         mappings: &[crate::model::Mapping],
-        tolerated: &std::collections::HashSet<String>,
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
-        let mut result: HashMap<String, Value> = HashMap::new();
+        tolerated: &std::collections::BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
         for m in mappings {
             // A mapping that READS a per-child binding absent at the body level
             // is skipped up front; the per-child pass applies it
@@ -441,7 +441,7 @@ impl Engine {
     /// multi-instance locals. Gating this accessor to `cfg(test)` makes that
     /// whole defect class a compile error rather than a review catch.
     #[cfg(test)]
-    pub(crate) fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
+    pub(crate) fn variables(&self, instance_key: Key) -> Arc<BTreeMap<String, Value>> {
         let base = self
             .state
             .instances
@@ -461,7 +461,7 @@ impl Engine {
         &self,
         instance_key: Key,
         element_instance_key: Key,
-    ) -> Arc<HashMap<String, Value>> {
+    ) -> Arc<BTreeMap<String, Value>> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Arc::default();
         };
@@ -537,7 +537,7 @@ impl Engine {
         &self,
         instance: &crate::state::ProcessInstance,
         scope_key: Key,
-    ) -> Arc<HashMap<String, Value>> {
+    ) -> Arc<BTreeMap<String, Value>> {
         let is_root = scope_key == 0 || scope_key == instance.key;
         if is_root || instance.scope_variables.is_empty() {
             return self.overlay_cluster_variables(Arc::clone(&instance.variables));
@@ -577,13 +577,13 @@ impl Engine {
     /// overlaid; a variable scoped to any other tenant is not visible here.
     pub(crate) fn overlay_cluster_variables(
         &self,
-        base: Arc<HashMap<String, Value>>,
-    ) -> Arc<HashMap<String, Value>> {
+        base: Arc<BTreeMap<String, Value>>,
+    ) -> Arc<BTreeMap<String, Value>> {
         let guard = &self.state.cluster_variables;
         if guard.is_empty() {
             return base;
         }
-        let mut merged: HashMap<String, Value> = HashMap::new();
+        let mut merged: BTreeMap<String, Value> = BTreeMap::new();
         for (k, v) in guard.resolved_for(crate::cluster_vars::DEFAULT_TENANT) {
             merged.insert(k.clone(), v.clone());
         }
@@ -606,7 +606,7 @@ impl Engine {
         &self,
         instance_key: Key,
         scope: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
     ) -> Vec<crate::Event> {
         let mut writes = self.propagate_variables(instance_key, scope, variables, local);
@@ -642,9 +642,9 @@ impl Engine {
         &self,
         instance_key: Key,
         target_scope: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
-    ) -> Vec<(Key, HashMap<String, Value>)> {
+    ) -> Vec<(Key, BTreeMap<String, Value>)> {
         if variables.is_empty() {
             return Vec::new();
         }
@@ -660,7 +660,7 @@ impl Engine {
         if instance.scope_variables.is_empty() && instance.scope_parents.is_empty() {
             return vec![(root, variables)];
         }
-        let mut by_scope: HashMap<Key, HashMap<String, Value>> = HashMap::new();
+        let mut by_scope: BTreeMap<Key, BTreeMap<String, Value>> = BTreeMap::new();
         for (name, value) in variables {
             let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
             by_scope.entry(dest).or_default().insert(name, value);
@@ -710,7 +710,7 @@ impl Engine {
     /// created (#1390).
     pub(crate) fn resolve_job_type(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         job_type: &str,
     ) -> Result<String, expression::Failure> {
         if !expression::is_expression(job_type) {
@@ -725,7 +725,7 @@ impl Engine {
     /// value must be a `NUMBER` (floored at 0), else an `EXTRACT_VALUE_ERROR`.
     pub(crate) fn resolve_job_retries(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         let Some(raw) = raw else {
@@ -743,7 +743,7 @@ impl Engine {
     /// raw `=expr` text is never returned.
     pub(crate) fn resolve_user_task_assignee(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Option<String>, expression::Failure> {
         let Some(raw) = raw else {
@@ -758,7 +758,7 @@ impl Engine {
     /// `EXTRACT_VALUE_ERROR` (#1398).
     pub(crate) fn resolve_user_task_date(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Option<String>, expression::Failure> {
         match raw {
@@ -773,7 +773,7 @@ impl Engine {
     /// `EXTRACT_VALUE_ERROR` (#1398). `None` resolves to an empty list.
     pub(crate) fn resolve_user_task_list(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Vec<String>, expression::Failure> {
         let Some(raw) = raw else {
@@ -796,7 +796,7 @@ impl Engine {
     /// [`DEFAULT_PRIORITY`].
     pub(crate) fn resolve_user_task_priority(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         match raw {
@@ -810,7 +810,7 @@ impl Engine {
     /// [`DEFAULT_PRIORITY`].
     pub(crate) fn resolve_job_priority(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         match raw {
@@ -826,7 +826,7 @@ impl Engine {
     /// tools.
     pub(crate) fn resolve_user_task_props(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         props: &crate::model::UserTaskProps,
     ) -> Result<ResolvedUserTask, expression::Failure> {
         Ok(ResolvedUserTask {
@@ -847,7 +847,7 @@ impl Engine {
     /// silently (#1398).
     pub(crate) fn resolve_job_props(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         job_type: &str,
         retries: Option<&str>,
         priority: Option<&str>,
@@ -968,7 +968,7 @@ impl Engine {
     /// never the static fallback (#1398).
     pub(crate) fn resolve_timer(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         def: Option<&crate::model::TimerDef>,
         base_now: u64,
         fallback_millis: u64,
@@ -1067,8 +1067,8 @@ impl Engine {
     /// variables so a partial-path mapping (`order.total`) preserves the other
     /// members of `order`.
     fn assign_io_target(
-        result: &mut HashMap<String, Value>,
-        vars: &HashMap<String, Value>,
+        result: &mut BTreeMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         target: &str,
         value: Value,
     ) {
@@ -1159,7 +1159,7 @@ mod tests {
         // expression; it must resolve to Ok("") (absent) rather than being fed
         // to the FEEL parser and raising a spurious incident.
         let engine = Engine::new();
-        let vars = HashMap::new();
+        let vars = BTreeMap::new();
         assert_eq!(
             engine.resolve_correlation_value(&vars, "   "),
             Ok(String::new())
@@ -1175,7 +1175,7 @@ mod tests {
         // A genuinely declared key that cannot evaluate (missing variable)
         // must return Err so the caller can raise an incident.
         let engine = Engine::new();
-        let vars = HashMap::new();
+        let vars = BTreeMap::new();
         assert!(engine
             .resolve_correlation_value(&vars, "missingVar")
             .is_err());
@@ -1185,7 +1185,7 @@ mod tests {
     fn correlation_accepts_string_and_number_only() {
         // Zeebe `evaluateMessageCorrelationKeyExpression`.
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("n".to_string(), Value::Int(42));
         vars.insert("s".to_string(), Value::Str("k".to_string()));
         vars.insert("b".to_string(), Value::Bool(true));
@@ -1207,7 +1207,7 @@ mod tests {
         // malformed is an EXTRACT_VALUE_ERROR (Zeebe `evaluateStringExpression`)
         // — and never the raw `=expr` stored as the assignee.
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("nullVar".to_string(), Value::Null);
         vars.insert("x".to_string(), Value::Str("alice".to_string()));
         for raw in ["=nullVar", "=missing", "=1 + "] {
@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn user_task_date_is_nullable() {
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("nullVar".to_string(), Value::Null);
         vars.insert(
             "dateStr".to_string(),
@@ -1258,7 +1258,7 @@ mod tests {
         // The hot path: with no cluster variables configured, the overlay is a
         // no-op refcount bump — the very same allocation is returned.
         let engine = Engine::new();
-        let mut base = HashMap::new();
+        let mut base = BTreeMap::new();
         base.insert("x".to_string(), Value::Int(1));
         let base = Arc::new(base);
         let out = engine.overlay_cluster_variables(Arc::clone(&base));
@@ -1302,7 +1302,7 @@ mod tests {
             Value::Str("nope".to_string()),
         );
 
-        let mut base = HashMap::new();
+        let mut base = BTreeMap::new();
         base.insert(
             "shared".to_string(),
             Value::Str("from-instance".to_string()),
@@ -1338,7 +1338,7 @@ mod tests {
             Value::Str("camunda.secrets.API_TOKEN".to_string()),
         );
 
-        let out = engine.overlay_cluster_variables(Arc::new(HashMap::new()));
+        let out = engine.overlay_cluster_variables(Arc::new(BTreeMap::new()));
         assert_eq!(
             out.get("api_token"),
             Some(&Value::Str("camunda.secrets.API_TOKEN".to_string())),

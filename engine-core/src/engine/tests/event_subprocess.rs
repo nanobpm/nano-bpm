@@ -66,7 +66,7 @@ fn event_subprocess_is_never_triggered_by_token_flow() {
         .remove(0);
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Int(7));
     let created = engine
         .apply_command(Command::create_instance_with("p", vars))
@@ -329,7 +329,7 @@ fn batch_deploy_with_invalid_event_subprocess_is_rejected_atomically() {
     // Nothing from the batch was installed.
     assert!(
         engine
-            .apply_command(Command::create_instance_with("good", HashMap::new()))
+            .apply_command(Command::create_instance_with("good", BTreeMap::new()))
             .is_err(),
         "the valid process of a rejected batch must not be deployed"
     );
@@ -342,7 +342,7 @@ fn modification_cannot_activate_an_event_subprocess_or_its_descendants() {
         .remove(0);
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Int(7));
     let created = engine
         .apply_command(Command::create_instance_with("p", vars))
@@ -390,7 +390,7 @@ fn modification_with_cyclic_containment_does_not_hang() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let created = engine
-        .apply_command(Command::create_instance_with("p", HashMap::new()))
+        .apply_command(Command::create_instance_with("p", BTreeMap::new()))
         .unwrap();
     let inst = created
         .iter()
@@ -869,7 +869,7 @@ fn boundary_interruption_of_the_host_disarms_event_subprocess_triggers() {
         engine
             .apply_command(Command::BroadcastSignal {
                 signal_name: "kill".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
             })
             .unwrap();
         assert_eq!(armed(&engine, inst), 0, "{t:?}: ESP trigger disarmed");
@@ -1017,7 +1017,7 @@ fn redelivered_message_continuation_starts_one_non_interrupting_run() {
                 element_instance_key: eik,
                 element_id: element_id.clone(),
                 kind: kind.clone(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 // `0` = no routed-delivery identity (#1497), so the dedup under
                 // test is the ESP subscription's own message-key dedup.
                 delivery_key: 0,
@@ -1386,7 +1386,7 @@ fn esp_output_satisfying_a_sibling_condition_fires_before_the_host_drains() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "7".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: None,
         })
         .unwrap();
@@ -1477,7 +1477,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "7".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: None,
         })
         .unwrap();
@@ -1556,7 +1556,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
     let _ = engine.apply_command(Command::CorrelateMessage {
         message_name: "m".into(),
         correlation_key: "7".into(),
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         business_id: None,
     });
     assert_eq!(
@@ -1568,7 +1568,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "99".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: None,
         })
         .unwrap();

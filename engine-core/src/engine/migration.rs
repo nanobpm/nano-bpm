@@ -226,7 +226,7 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
         active: &[(Key, String)],
     ) -> Result<(), EngineError> {
         use super::event_subprocess::ArmableEsp;
@@ -278,7 +278,7 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
         source_id: &str,
         target_id: &str,
     ) -> Result<(), EngineError> {
@@ -349,7 +349,7 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
         active: &[(Key, String)],
         scope_of: impl Fn(Key) -> Key,
     ) -> Result<Vec<(Key, String)>, EngineError> {
@@ -475,10 +475,10 @@ impl Engine {
     /// partition-wide trigger table per migration, not one per active element.
     fn armed_triggers_on(
         &self,
-        hosts: &HashMap<Key, ElementId>,
+        hosts: &BTreeMap<Key, ElementId>,
         source: &ProcessDefinition,
-    ) -> HashMap<Key, Vec<ArmedTrigger>> {
-        let mut by_host: HashMap<Key, Vec<ArmedTrigger>> = HashMap::new();
+    ) -> BTreeMap<Key, Vec<ArmedTrigger>> {
+        let mut by_host: BTreeMap<Key, Vec<ArmedTrigger>> = BTreeMap::new();
         for t in self.state.timers.values() {
             let Some(host_element_id) = hosts.get(&t.element_instance_key) else {
                 continue;
@@ -629,7 +629,7 @@ impl Engine {
     /// its expressions against `vars`.
     fn target_fingerprint(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         target: &Element,
     ) -> Result<Option<TriggerFingerprint>, expression::Failure> {
         Ok(match &target.kind {
@@ -707,7 +707,7 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
     ) -> Result<MigrationPlan, EngineError> {
         let key_mark = self.next_local;
         let planned = self.plan_migration_inner(instance_key, source, target, mapped);
@@ -727,22 +727,22 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
     ) -> Result<MigrationPlan, (ElementId, ElementId, expression::Failure)> {
         let mut plan = MigrationPlan::default();
-        let mut active: Vec<(Key, ElementId)> = self
+        // `active` is a BTreeMap (#1662): collected already in key order.
+        let active: Vec<(Key, ElementId)> = self
             .state
             .instances
             .get(&instance_key)
             .map(|i| i.active.iter().map(|(k, e)| (*k, e.clone())).collect())
             .unwrap_or_default();
-        active.sort();
         // Index triggers and lifecycle blockers once per migration so the
         // per-element loop below is a lookup, not a partition-wide scan.
-        let hosts: HashMap<Key, ElementId> = active.iter().cloned().collect();
+        let hosts: BTreeMap<Key, ElementId> = active.iter().cloned().collect();
         let mut armed_by_host = self.armed_triggers_on(&hosts, source);
         let not_armable = self.hosts_not_armable_now(&hosts);
-        let call_eiks: std::collections::HashSet<Key> = active
+        let call_eiks: std::collections::BTreeSet<Key> = active
             .iter()
             .filter(|(_, e)| {
                 matches!(
@@ -975,9 +975,9 @@ impl Engine {
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
-        mapped: &HashMap<String, String>,
+        mapped: &BTreeMap<String, String>,
         active: &[(Key, ElementId)],
-        not_armable: &HashSet<Key>,
+        not_armable: &BTreeSet<Key>,
     ) -> Result<(), (ElementId, ElementId, expression::Failure)> {
         use super::event_subprocess::ArmableEsp;
         // Live scopes: the root, plus every active scope-owning element
@@ -1026,13 +1026,13 @@ impl Engine {
         // completion-pending scope (an end-listener chain or a
         // completion-phase incident) HAS armed them already: its unarmed
         // subscription triggers fired and ARE consumed (#1379 review).
-        let armed_source: HashSet<(Key, &str)> = armed
+        let armed_source: BTreeSet<(Key, &str)> = armed
             .iter()
             .map(|t| (t.scope_eik, t.esp_id.as_str()))
             .collect();
         // Each live scope instance's mapped TARGET scope-element id (`None`
         // for the root).
-        let scope_target: HashMap<Key, Option<ElementId>> =
+        let scope_target: BTreeMap<Key, Option<ElementId>> =
             scopes.iter().map(|(eik, _, t)| (*eik, t.clone())).collect();
         // The live scope instance(s) a counterpart `tgt_esp` of an event
         // sub-process hosted by source scope instance `host` lands in. The
@@ -1064,7 +1064,7 @@ impl Engine {
             // cyclic `parent` chain (e.g. `contained_in("sub", "sub")`, which
             // deployment preflight does not reject) must not hang migration
             // (#1379 review).
-            let chain: HashSet<ElementId> = std::iter::once(parent.clone())
+            let chain: BTreeSet<ElementId> = std::iter::once(parent.clone())
                 .chain(flow_scope::element_flow_scope_chain(target, &parent))
                 .collect();
             let within = |a: Key, root: Key| -> bool {
@@ -1118,7 +1118,7 @@ impl Engine {
         };
         // `(destination scope, target esp id)` pairs a CONSUMED source
         // counterpart lands in (staying or moved).
-        let mut consumed_in: HashSet<(Key, ElementId)> = HashSet::new();
+        let mut consumed_in: BTreeSet<(Key, ElementId)> = BTreeSet::new();
         for (scope_eik, source_scope, _) in &scopes {
             if self.activation_pending(instance_key, *scope_eik, source, active) {
                 continue;
@@ -1137,13 +1137,13 @@ impl Engine {
         // Target event sub-process ids with an ARMED source counterpart in any
         // scope: arming one in a different scope (a cross-scope move) replaces
         // an existing trigger, so it is audited as `Recreated`, not `Created`.
-        let armed_targets: HashSet<ElementId> =
+        let armed_targets: BTreeSet<ElementId> =
             armed.iter().map(|t| counterpart(&t.esp_id)).collect();
         // `(destination scope, TARGET esp id)` pairs an ARMED source trigger
         // moves INTO from a different host scope: it is cancelled in its host
         // and re-armed at exactly that destination, which a consumed
         // counterpart from another host must not suppress (#1379 review).
-        let mut armed_in: HashSet<(Key, ElementId)> = HashSet::new();
+        let mut armed_in: BTreeSet<(Key, ElementId)> = BTreeSet::new();
         for t in &armed {
             let tgt = counterpart(&t.esp_id);
             for d in destinations_of(t.scope_eik, &tgt) {
@@ -1167,7 +1167,7 @@ impl Engine {
             // subscriptions — they have nothing to retain or re-create — so
             // they cover nothing: a target that turns one into a subscription
             // trigger is newly armed below (#1379 review).
-            let covered: HashSet<ElementId> = source_esps
+            let covered: BTreeSet<ElementId> = source_esps
                 .iter()
                 .filter(|e| {
                     e.trigger.is_subscription()
@@ -1180,9 +1180,9 @@ impl Engine {
             let mut to_arm: Vec<ElementId> = Vec::new();
             // Target event sub-processes re-armed in place of a deleted source
             // trigger (vs newly created ones), by start-event id.
-            let mut recreated: HashSet<ElementId> = HashSet::new();
+            let mut recreated: BTreeSet<ElementId> = BTreeSet::new();
             // Target ids whose armed trigger is retained in place here.
-            let mut handled: HashSet<ElementId> = HashSet::new();
+            let mut handled: BTreeSet<ElementId> = BTreeSet::new();
             for t in armed.iter().filter(|t| t.scope_eik == scope_eik) {
                 let src = source_esps.iter().find(|e| e.esp_id == t.esp_id);
                 let tgt_id = counterpart(&t.esp_id);
@@ -1455,8 +1455,8 @@ impl Engine {
     /// job (start chain not drained, end chain running — including a `Failed`
     /// listener job parked on an incident) is outstanding, or while an active
     /// ioMapping-style incident will re-drive its activation or completion.
-    fn hosts_not_armable_now(&self, hosts: &HashMap<Key, ElementId>) -> HashSet<Key> {
-        let mut blocked: HashSet<Key> = self
+    fn hosts_not_armable_now(&self, hosts: &BTreeMap<Key, ElementId>) -> BTreeSet<Key> {
+        let mut blocked: BTreeSet<Key> = self
             .state
             .jobs
             .values()
@@ -1562,7 +1562,7 @@ pub(crate) fn plan_compensation_migration(
     target_process_id: &str,
     source_def: &ProcessDefinition,
     target_def: &ProcessDefinition,
-    mapped: &HashMap<String, String>,
+    mapped: &BTreeMap<String, String>,
     compensable: &[state::CompensationSubscription],
 ) -> Result<Vec<crate::event::MigratedCompensationSubscription>, EngineError> {
     // Boundary subscriptions are planned per boundary occurrence: every
@@ -1574,12 +1574,12 @@ pub(crate) fn plan_compensation_migration(
     // subscriptions too.
     let mut scope_map: BTreeMap<ElementId, ElementId> = BTreeMap::new();
     let mut out = Vec::new();
-    let mut occurrence: HashMap<(Key, &str), usize> = HashMap::new();
+    let mut occurrence: BTreeMap<(Key, &str), usize> = BTreeMap::new();
     // Loops / multi-instance bodies accumulate many subscriptions per
     // activity: scan the model once per source activity and validate each
     // (source activity, target activity) pair once.
-    let mut boundaries_by_activity: HashMap<&str, Vec<&Element>> = HashMap::new();
-    let mut validated: HashSet<(&str, String)> = HashSet::new();
+    let mut boundaries_by_activity: BTreeMap<&str, Vec<&Element>> = BTreeMap::new();
+    let mut validated: BTreeSet<(&str, String)> = BTreeSet::new();
     for sub in compensable.iter().filter(|c| !c.scope_subscription) {
         let occ = occurrence
             .entry((sub.element_instance_key, sub.handler.as_str()))

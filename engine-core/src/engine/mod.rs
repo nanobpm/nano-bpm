@@ -10,7 +10,7 @@
 //! applying every event through [`state::apply`] as it goes. The processor
 //! ([`Engine::process_step`]) only *reads* state and *decides*; it never mutates.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::command::{Command, JobAttribution};
@@ -218,11 +218,11 @@ pub struct Engine {
     /// Instances whose process-level variables changed since the last
     /// [`drain_dirty_vars`](Engine::drain_dirty_vars) (i.e. since the last
     /// snapshot checkpoint). Only populated when [`track_dirty_vars`] is set.
-    dirty_vars: HashSet<Key>,
+    dirty_vars: BTreeSet<Key>,
     /// Instances evicted (terminal) since the last checkpoint, whose durable
     /// variable rows must be deleted from the store. Only populated when
     /// [`track_dirty_vars`] is set.
-    forgotten_vars: HashSet<Key>,
+    forgotten_vars: BTreeSet<Key>,
     /// Follower-only safety net for the retirement digest (RF>1). A leader completes
     /// and exporter-evicts an instance and broadcasts its key, but under leader-durable
     /// the ack happens on the leader before the async learner has applied the
@@ -234,7 +234,7 @@ pub struct Engine {
     /// per-command check is free). Bounded — it only ever holds keys in the brief
     /// window between a retirement and its create, so it drains continuously. NOT
     /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
-    retired_tombstones: HashSet<Key>,
+    retired_tombstones: BTreeSet<Key>,
     /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
     /// boundary) during the command currently draining. A scoped teardown removes
     /// every descendant token but deliberately leaves the enclosing sub-process
@@ -248,7 +248,7 @@ pub struct Engine {
     /// emitted events, never re-runs the guard), and the whole window lives inside
     /// one command's drain — so it is cleared at the top of every
     /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
-    torn_down_scopes: HashSet<Key>,
+    torn_down_scopes: BTreeSet<Key>,
     /// Event payloads (message / signal variables) for an event sub-process
     /// whose start event carries output mappings, keyed by `(instance_key,
     /// host_scope_key, esp_element_id)` (#1555, Zeebe parity): Zeebe creates
@@ -258,7 +258,7 @@ pub struct Engine {
     /// payload as [`Event::EventSubProcessPayloadHeld`] against the concrete
     /// container instance (durable from then on). Cleared per command, like
     /// [`torn_down_scopes`](Self::torn_down_scopes).
-    esp_start_payloads: HashMap<(Key, Key, String), HashMap<String, Value>>,
+    esp_start_payloads: BTreeMap<(Key, Key, String), BTreeMap<String, Value>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -381,7 +381,7 @@ enum Step {
         element_id: String,
         container_key: Key,
         inner_key: Key,
-        output_updates: HashMap<String, Value>,
+        output_updates: BTreeMap<String, Value>,
     },
     /// Create a fresh job for an already-active service-task element instance.
     /// Used to retry a parked service task when its incident is resolved (the
@@ -495,7 +495,7 @@ enum Step {
         element_id: String,
         body_key: Key,
         child_key: Key,
-        output_overlay: Option<HashMap<String, Value>>,
+        output_overlay: Option<BTreeMap<String, Value>>,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -518,7 +518,7 @@ enum Step {
         instance_key: Key,
         element_id: String,
         scope: Key,
-        locals: Vec<HashMap<String, Value>>,
+        locals: Vec<BTreeMap<String, Value>>,
     },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
@@ -541,7 +541,7 @@ enum Step {
         instance_key: Key,
         container_key: Key,
         element_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// Complete an ad-hoc container: write its aggregated `outputCollection`,
     /// (when `cancel`) cancel any tool children still running, drop its runtime
@@ -588,7 +588,7 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     },
     /// Re-drive a multi-instance **child**'s activation after its input-mapping
     /// incident is resolved (#946): re-apply the child's inputs against its
@@ -632,7 +632,7 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
-        preserved_seed: Option<HashMap<String, Value>>,
+        preserved_seed: Option<BTreeMap<String, Value>>,
     },
 }
 
@@ -677,11 +677,11 @@ impl Engine {
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
-            dirty_vars: HashSet::new(),
-            forgotten_vars: HashSet::new(),
-            retired_tombstones: HashSet::new(),
-            torn_down_scopes: HashSet::new(),
-            esp_start_payloads: HashMap::new(),
+            dirty_vars: BTreeSet::new(),
+            forgotten_vars: BTreeSet::new(),
+            retired_tombstones: BTreeSet::new(),
+            torn_down_scopes: BTreeSet::new(),
+            esp_start_payloads: BTreeMap::new(),
             raft_applied: None,
         }
     }
@@ -847,11 +847,11 @@ impl Engine {
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
-            dirty_vars: HashSet::new(),
-            forgotten_vars: HashSet::new(),
-            retired_tombstones: HashSet::new(),
-            torn_down_scopes: HashSet::new(),
-            esp_start_payloads: HashMap::new(),
+            dirty_vars: BTreeSet::new(),
+            forgotten_vars: BTreeSet::new(),
+            retired_tombstones: BTreeSet::new(),
+            torn_down_scopes: BTreeSet::new(),
+            esp_start_payloads: BTreeMap::new(),
             raft_applied,
         }
     }
@@ -1591,7 +1591,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         process_definition_key: Key,
@@ -1646,7 +1646,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         message_start: Option<MessageStartCorrelation>,
@@ -1701,7 +1701,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         message_start: Option<MessageStartCorrelation>,
@@ -2092,7 +2092,7 @@ impl Engine {
             // `TimerStartEventSubscription` validation, #1398) — never a
             // subscription named after the expression text or a static
             // fallback timer. Resolve all before anything is emitted.
-            let empty = HashMap::new();
+            let empty = BTreeMap::new();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
             for start in typed_starts {
                 let (start_element_id, start_kind, start_timer_def, start_properties) = (
@@ -2143,7 +2143,7 @@ impl Engine {
             // here: otherwise the engine and the read model would each keep a
             // different start for the one subscription (#1499, Zeebe rejects
             // duplicate message start names).
-            let mut seen_message_names: HashSet<&str> = HashSet::new();
+            let mut seen_message_names: BTreeSet<&str> = BTreeSet::new();
             for (start_element_id, r) in &resolved_starts {
                 if let ResolvedStart::Message { message_name, .. } = r {
                     if !seen_message_names.insert(message_name.as_str()) {
@@ -3204,7 +3204,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: Some(assignee),
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -3258,7 +3258,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: None,
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -3330,7 +3330,7 @@ impl Engine {
                             follow_up_date,
                             priority,
                         }),
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -3674,7 +3674,7 @@ impl Engine {
                         &mut queue,
                         process_id,
                         start_element_id,
-                        HashMap::new(),
+                        BTreeMap::new(),
                         Vec::new(),
                         None,
                         None,
@@ -5507,7 +5507,7 @@ impl Engine {
                             event_type: crate::model::TaskListenerEventType::Canceling,
                             assignee: None,
                             update: None,
-                            variables: std::collections::HashMap::new(),
+                            variables: std::collections::BTreeMap::new(),
                             corrections: crate::model::UserTaskCorrections::default(),
                         };
                         for event in self.start_task_listener_chain(
@@ -5625,8 +5625,7 @@ impl Engine {
                 //    exists; each mapped pair keeps the same BPMN type (compared
                 //    by discriminant only, so a service task may map to one with a
                 //    different job type — Zeebe parity).
-                let mut mapped: HashMap<String, String> =
-                    HashMap::with_capacity(mapping_instructions.len());
+                let mut mapped: BTreeMap<String, String> = BTreeMap::new();
                 for (src, tgt) in &mapping_instructions {
                     if mapped.contains_key(src) {
                         return Err(EngineError::DuplicateMappingSourceElement {
@@ -5701,12 +5700,12 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
+                // `active` is a BTreeMap (#1662): already in key order.
                 let mut active_elements: Vec<(Key, String)> = instance
                     .active
                     .iter()
                     .map(|(k, e)| (*k, e.clone()))
                     .collect();
-                active_elements.sort();
                 let mut active_ids: Vec<String> =
                     active_elements.iter().map(|(_, e)| e.clone()).collect();
                 active_ids.sort();
@@ -5953,9 +5952,9 @@ impl Engine {
                     .expect("instance existence checked above");
                 // Joins are keyed per flow-scope instance (#1580): every open
                 // join of every scope instance is checked.
-                let mut open_joins: Vec<state::JoinKey> =
+                // `join_instances` is a BTreeMap (#1662): keys iterate in order.
+                let open_joins: Vec<state::JoinKey> =
                     instance.join_instances.keys().cloned().collect();
-                open_joins.sort();
                 for join in open_joins {
                     let src = join.element_id.clone();
                     let join_kind = source_def.definition.elements.get(&src).map(|e| &e.kind);
@@ -6191,7 +6190,7 @@ impl Engine {
                         Event::ScopedVariablesUpdated {
                             instance_key,
                             scope_key,
-                            variables: HashMap::from([(
+                            variables: BTreeMap::from([(
                                 "adHocSubProcessElements".to_string(),
                                 catalog,
                             )]),
@@ -6837,9 +6836,9 @@ impl Engine {
         // invisible to (or shadowed from) a subscription's scope must not
         // re-fire it, or a non-interrupting boundary whose handler writes a
         // local of the same name would loop forever.
-        let mut changed: HashMap<Key, HashMap<String, std::collections::HashSet<Key>>> =
-            HashMap::new();
-        let mut opened: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut changed: BTreeMap<Key, BTreeMap<String, std::collections::BTreeSet<Key>>> =
+            BTreeMap::new();
+        let mut opened: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for event in &log[cursor..scan_end] {
             match event {
                 Event::VariablesUpdated {
@@ -7022,7 +7021,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: ElementId,
         kind: state::MessageSubscriptionKind,
-        variables: &HashMap<String, Value>,
+        variables: &BTreeMap<String, Value>,
     ) {
         self.emit(
             log,
@@ -7116,7 +7115,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: ElementId,
         kind: state::MessageSubscriptionKind,
-        variables: &HashMap<String, Value>,
+        variables: &BTreeMap<String, Value>,
     ) {
         self.emit(
             log,
@@ -7193,7 +7192,7 @@ impl Engine {
         // active instance instead made this O(total active backlog) per command:
         // under a large undrained backlog that scan dominated the engine thread
         // (per-command cost grew linearly with the backlog).
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
         for instance_key in &touched {
             let Some(instance) = self.state.instances.get(instance_key) else {
@@ -7333,7 +7332,7 @@ impl Engine {
             // scoped writes after `ElementCompleted` has dropped the local scope.
             let outputs = self.io_outputs(instance_key, &element_id);
             let output_updates = if outputs.is_empty() {
-                HashMap::new()
+                BTreeMap::new()
             } else {
                 let visible = self.variables_for_element(instance_key, eik);
                 match self.eval_io_mappings_in(&visible, &outputs) {
@@ -7768,7 +7767,7 @@ impl Engine {
         if !cfg!(debug_assertions) {
             return;
         }
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         for key in touched {
             let Some(instance) = self.state.instances.get(&key) else {
                 continue;
@@ -8479,7 +8478,7 @@ impl Engine {
         instance_key: Key,
         element_id: &str,
         scope: Key,
-    ) -> Option<HashMap<String, Value>> {
+    ) -> Option<BTreeMap<String, Value>> {
         let held = self
             .state
             .instances
@@ -8508,7 +8507,7 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
         view_scope: Key,
-        element_vars: Arc<HashMap<String, Value>>,
+        element_vars: Arc<BTreeMap<String, Value>>,
         scope_pre_registered: bool,
     ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
@@ -8565,7 +8564,7 @@ impl Engine {
             events.push(Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key: element_instance_key,
-                variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                variables: BTreeMap::from([(name, Value::List(Vec::new()))]),
             });
         }
         // A source expression that fails to evaluate raises an `IO_MAPPING_ERROR`
@@ -8581,7 +8580,7 @@ impl Engine {
         // the mappings evaluated against — never re-derived later — and
         // journaled on the element's `JobCreated`.
         let (input_updates, secret_provenance) = if inputs.is_empty() {
-            (HashMap::new(), Vec::new())
+            (BTreeMap::new(), Vec::new())
         } else {
             match self.eval_input_mappings_with_provenance(
                 instance_key,
@@ -9125,7 +9124,7 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
-        element_vars: Arc<HashMap<String, Value>>,
+        element_vars: Arc<BTreeMap<String, Value>>,
         secret_provenance: Vec<state::SecretProvenance>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
@@ -9226,7 +9225,7 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
-        element_vars: Arc<HashMap<String, Value>>,
+        element_vars: Arc<BTreeMap<String, Value>>,
         secret_provenance: Vec<state::SecretProvenance>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let kind = self.element_kind(instance_key, &element_id);
@@ -9288,7 +9287,7 @@ impl Engine {
                             instance_key,
                             container_key: element_instance_key,
                             element_id: id.clone(),
-                            variables: HashMap::new(),
+                            variables: BTreeMap::new(),
                         });
                     }
                     // An empty collection has nothing to run: the container
@@ -9358,7 +9357,7 @@ impl Engine {
                     // without leaking to the parent instance. Per-tool
                     // documentation / `zeebe:properties` / `fromAi` parameter
                     // schema are not parsed by nano yet (deferred; see #614).
-                    let mut catalog_var = HashMap::new();
+                    let mut catalog_var = BTreeMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(def)),
@@ -9489,7 +9488,7 @@ impl Engine {
                         // assigning transition when creating drains.
                         assignee: deferred_initial_assignee,
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     events.extend(self.start_task_listener_chain(
@@ -9519,7 +9518,7 @@ impl Engine {
                             event_type: crate::model::TaskListenerEventType::Assigning,
                             assignee: Some(initial),
                             update: None,
-                            variables: std::collections::HashMap::new(),
+                            variables: std::collections::BTreeMap::new(),
                             corrections: crate::model::UserTaskCorrections::default(),
                         };
                         events.extend(self.start_task_listener_chain(
@@ -9972,7 +9971,7 @@ impl Engine {
             self.io_inputs(instance_key, &element_id)
         };
         let input_updates = if inputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             // Tolerate a mapping that fails because it references a per-child
             // binding (`loopCounter` / the configured `inputElement`) absent at the
@@ -9980,7 +9979,7 @@ impl Engine {
             // fails for any other reason is a genuine failure: park the body on an
             // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
             // activation (#946).
-            let mut tolerated = std::collections::HashSet::new();
+            let mut tolerated = std::collections::BTreeSet::new();
             tolerated.insert("loopCounter".to_string());
             if let Some(name) = &mi.input_element {
                 tolerated.insert(name.clone());
@@ -10008,7 +10007,7 @@ impl Engine {
         }
         // The input collection is evaluated in the body scope view (the enclosing
         // scope with any body input mappings overlaid).
-        let vars: Arc<HashMap<String, Value>> = {
+        let vars: Arc<BTreeMap<String, Value>> = {
             if input_updates.is_empty() {
                 enclosing_vars
             } else {
@@ -10216,7 +10215,7 @@ impl Engine {
         };
 
         let child_key = self.mint_key();
-        let mut locals: HashMap<String, Value> = HashMap::new();
+        let mut locals: BTreeMap<String, Value> = BTreeMap::new();
         if let Some(name) = &input_element {
             locals.insert(name.clone(), item);
         }
@@ -10406,7 +10405,7 @@ impl Engine {
         body_key: Key,
         child_key: Key,
         child_index: usize,
-        child_vars: &HashMap<String, Value>,
+        child_vars: &BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         match self.try_mi_child_behaviour(instance_key, element_id.clone(), child_key, child_vars) {
@@ -10433,7 +10432,7 @@ impl Engine {
         instance_key: Key,
         element_id: String,
         child_key: Key,
-        child_vars: &HashMap<String, Value>,
+        child_vars: &BTreeMap<String, Value>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let mut events = Vec::new();
         let mut followups = Vec::new();
@@ -10490,7 +10489,7 @@ impl Engine {
                             instance_key,
                             container_key: child_key,
                             element_id: id.clone(),
-                            variables: HashMap::new(),
+                            variables: BTreeMap::new(),
                         });
                     }
                     // An empty collection has nothing to run: the container
@@ -10550,7 +10549,7 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
-                    let mut catalog_var = HashMap::new();
+                    let mut catalog_var = BTreeMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(def)),
@@ -10706,7 +10705,7 @@ impl Engine {
         child_eik: Key,
         element_id: String,
         body_key: Key,
-        output_overlay: Option<HashMap<String, Value>>,
+        output_overlay: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = vec![
             Event::ElementCompleting {
@@ -10810,7 +10809,7 @@ impl Engine {
         // `output_overlay` so a call-activity child collects its real
         // (already-projected) result rather than re-deriving — and losing — it
         // (#1398 review).
-        let post_view: Option<Arc<HashMap<String, Value>>> =
+        let post_view: Option<Arc<BTreeMap<String, Value>>> =
             if output_element.is_none() && completion_condition.is_none() {
                 None
             } else {
@@ -11003,8 +11002,8 @@ impl Engine {
     /// body-level read would publish `null` (review r4535034038).
     fn mi_body_tolerated_bindings(
         mi: &crate::state::MultiInstanceState,
-    ) -> std::collections::HashSet<String> {
-        let mut tolerated = std::collections::HashSet::from(["loopCounter".to_string()]);
+    ) -> std::collections::BTreeSet<String> {
+        let mut tolerated = std::collections::BTreeSet::from(["loopCounter".to_string()]);
         if let Some(name) = &mi.input_element {
             tolerated.insert(name.clone());
         }
@@ -11030,7 +11029,7 @@ impl Engine {
         &self,
         instance_key: Key,
         body_key: Key,
-    ) -> Option<HashMap<String, Value>> {
+    ) -> Option<BTreeMap<String, Value>> {
         let mi = self
             .state
             .instances
@@ -11038,7 +11037,7 @@ impl Engine {
             .multi_instances
             .get(&body_key)?;
         mi.output_collection.as_ref().map(|name| {
-            HashMap::from([(
+            BTreeMap::from([(
                 name.clone(),
                 Value::List(
                     mi.output_values
@@ -11057,7 +11056,7 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let (element_id, tolerated, active): (
             ElementId,
-            std::collections::HashSet<String>,
+            std::collections::BTreeSet<String>,
             Vec<Key>,
         ) = match self
             .state
@@ -11081,7 +11080,7 @@ impl Engine {
         let collection_map = self.mi_body_collection_overlay(instance_key, body_key);
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             let mut ctx = (*self.variables_for_element(instance_key, body_key)).clone();
             if let Some(map) = &collection_map {
@@ -11778,13 +11777,13 @@ impl Engine {
         instance_key: Key,
         container_element_id: &str,
         tool_element_id: &str,
-        view: &HashMap<String, Value>,
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
+        view: &BTreeMap<String, Value>,
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
         let inputs = self
             .adhoc_tool_io(instance_key, container_element_id, tool_element_id)
             .inputs;
         if inputs.is_empty() {
-            Ok(HashMap::new())
+            Ok(BTreeMap::new())
         } else {
             self.eval_io_mappings_in(view, &inputs)
         }
@@ -11803,7 +11802,7 @@ impl Engine {
     fn eval_adhoc_active_elements(
         &self,
         expr: &str,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         def: &crate::model::AdHocSubProcessDef,
         container_key: Key,
     ) -> Result<Vec<String>, expression::Failure> {
@@ -11817,7 +11816,7 @@ impl Engine {
                 f.message
             ))
         })?;
-        let names: std::collections::HashSet<&str> =
+        let names: std::collections::BTreeSet<&str> =
             def.tools.iter().map(|t| t.element_id.as_str()).collect();
         let missing: Vec<&str> = ids
             .iter()
@@ -11847,7 +11846,7 @@ impl Engine {
         container_key: Key,
         container_element_id: Option<String>,
         element_id: String,
-        redrive_seed: HashMap<String, Value>,
+        redrive_seed: BTreeMap<String, Value>,
         failure: expression::Failure,
         key_mark: u64,
     ) -> (Vec<Event>, Vec<Step>) {
@@ -12000,7 +11999,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         element_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         let child_key = self.mint_key();
@@ -12033,7 +12032,7 @@ impl Engine {
         // The tool's own input-mapping results, kept aside so a `callActivity`
         // tool can seed its spawned child with exactly them when
         // `propagateAllParentVariables=false` (issue #1159).
-        let mut applied_inputs: HashMap<String, Value> = HashMap::new();
+        let mut applied_inputs: BTreeMap<String, Value> = BTreeMap::new();
         if let Some(cid) = container_element_id.as_deref() {
             match self.adhoc_tool_input_updates(instance_key, cid, &element_id, &child_vars) {
                 Ok(input_updates) => {
@@ -12247,7 +12246,7 @@ impl Engine {
                 events.push(Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key: child_key,
-                    variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                    variables: BTreeMap::from([(name, Value::List(Vec::new()))]),
                 });
             }
             if nested_def.impl_type == crate::model::AdHocImplementationType::BpmnTask {
@@ -12260,7 +12259,7 @@ impl Engine {
                         instance_key,
                         container_key: child_key,
                         element_id: id.clone(),
-                        variables: HashMap::new(),
+                        variables: BTreeMap::new(),
                     });
                 }
                 if ids.is_empty() {
@@ -12279,7 +12278,7 @@ impl Engine {
                 events.push(Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key: child_key,
-                    variables: HashMap::from([(
+                    variables: BTreeMap::from([(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(&nested_def)),
                     )]),
@@ -12523,7 +12522,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         container_element_id: &str,
-        output_updates: &HashMap<String, Value>,
+        output_updates: &BTreeMap<String, Value>,
         others: usize,
     ) -> Result<AdHocPostTool, expression::Failure> {
         // Borrow the container's catalog entry once by reference (no clone of the
@@ -12627,7 +12626,7 @@ impl Engine {
         // single-pass semantics where every mapping reads the original view. An
         // ordinary (single-activity) tool passes `None` and the mapping is
         // evaluated here as before.
-        precomputed_output: Option<HashMap<String, Value>>,
+        precomputed_output: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let tool_element_id = element_id;
         let (output_element, output_collection, active_now, container_element_id) = match self
@@ -12832,7 +12831,7 @@ impl Engine {
                     .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
                     .outputs;
                 if outputs.is_empty() {
-                    HashMap::new()
+                    BTreeMap::new()
                 } else {
                     let vars = self.variables_for_element(instance_key, child_eik);
                     match self.eval_io_mappings_in(&vars, &outputs) {
@@ -12984,7 +12983,7 @@ impl Engine {
         // (`summary -> summaryCopy` then `summaryCopy -> toolCallResult`), exactly
         // the divergence the leaf path guards against. `Some` ⇒ use verbatim;
         // an ordinary tool passes `None` and the mapping is evaluated here.
-        precomputed_output: Option<HashMap<String, Value>>,
+        precomputed_output: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Resolve the container's identity and its active count from live state.
         // The caller already early-returns when this lookup is absent, but resolve
@@ -13051,7 +13050,7 @@ impl Engine {
                     .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
                     .outputs;
                 if outputs.is_empty() {
-                    HashMap::new()
+                    BTreeMap::new()
                 } else {
                     let vars = self.variables_for_element(instance_key, child_eik);
                     match self.eval_io_mappings_in(&vars, &outputs) {
@@ -13136,7 +13135,7 @@ impl Engine {
                 instance_key,
                 container_key,
                 element_id: target,
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
             });
         }
         (events, followups)
@@ -13152,7 +13151,7 @@ impl Engine {
         instance_key: Key,
         child_eik: Key,
         tool_element_id: String,
-        precomputed_output: Option<&HashMap<String, Value>>,
+        precomputed_output: Option<&BTreeMap<String, Value>>,
         failure: expression::Failure,
     ) -> (Vec<Event>, Vec<Step>) {
         let redrive = match precomputed_output {
@@ -13284,14 +13283,14 @@ impl Engine {
         &self,
         instance_key: Key,
         container_key: Key,
-        seed: HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
+        seed: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return seed;
         };
         // Collect the scope chain's bindings NEAREST scope first (the same
         // resolution order the original activation's evaluation view used).
-        let mut chain: Vec<&HashMap<String, Value>> = Vec::new();
+        let mut chain: Vec<&BTreeMap<String, Value>> = Vec::new();
         let mut cur = self.variable_scope_of(instance, container_key);
         loop {
             let scope_vars = if cur == 0 || cur == instance.key {
@@ -13590,7 +13589,7 @@ impl Engine {
                 .and_then(|m| m.get(&name))
                 .cloned()
                 .unwrap_or_else(|| Value::List(Vec::new()));
-            HashMap::from([(name, value)])
+            BTreeMap::from([(name, value)])
         });
         if let Some(map) = &collection_map {
             if !is_nested_tool {
@@ -13848,7 +13847,7 @@ impl Engine {
         // incident is raised and the element stays active — matching Zeebe, which
         // re-evaluates the script when the incident is resolved (the resolution
         // re-runs completion), exactly as an exclusive gateway condition does.
-        let mut script_update: Option<HashMap<String, Value>> = None;
+        let mut script_update: Option<BTreeMap<String, Value>> = None;
         if let Some(ElementKind::ScriptTask {
             expression,
             result_variable,
@@ -13857,7 +13856,7 @@ impl Engine {
             let vars = self.variables_for_element(instance_key, element_instance_key);
             match crate::feel::eval(&expression, &vars) {
                 Ok(value) => {
-                    let mut update = HashMap::new();
+                    let mut update = BTreeMap::new();
                     update.insert(result_variable, value);
                     script_update = Some(update);
                 }
@@ -13982,7 +13981,7 @@ impl Engine {
             // the output under that name; without one, a map output is spread into
             // the scope (Zeebe requires a resultVariable for a scalar output, but
             // spreading a context output is the natural no-name behaviour).
-            let mut update = HashMap::new();
+            let mut update = BTreeMap::new();
             match &result_variable {
                 Some(name) if !name.is_empty() => {
                     update.insert(name.clone(), result.decision_output.clone());
@@ -14019,7 +14018,7 @@ impl Engine {
         // returns, so evaluating here sees the same variable view as merging below.
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             let visible = self.variables_for_element(instance_key, element_instance_key);
             let eval = match &script_update {
@@ -14432,7 +14431,7 @@ impl Engine {
         event_type: crate::model::ListenerEventType,
         index: usize,
         scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Event {
         let listeners = self.listeners_of(instance_key, element_id, event_type);
         // A failed listener job restarts its chain on resolution
@@ -14511,7 +14510,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
         scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Option<Event> {
         let end_listeners = self.listeners_of(
             instance_key,
@@ -15408,7 +15407,7 @@ impl Engine {
             // `TerminateEndCompletion::outputs_applied` is therefore no longer
             // consulted; it is kept only so older journals still decode.
             let outputs = self.io_outputs(instance_key, &element_id);
-            let mut output_updates = HashMap::new();
+            let mut output_updates = BTreeMap::new();
             if !outputs.is_empty() {
                 let visible = self.variables_for_element(instance_key, element_instance_key);
                 match self.eval_io_mappings_in(&visible, &outputs) {
@@ -15479,7 +15478,7 @@ impl Engine {
                 // ONCE, here (the single projection pass), so listeners 1..n and
                 // an incident resume read the output-mapped view without
                 // re-evaluating outputs; later listener writes still land after.
-                let shadowed: HashMap<String, Value> = self
+                let shadowed: BTreeMap<String, Value> = self
                     .state
                     .instances
                     .get(&instance_key)
@@ -15759,7 +15758,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         pending: state::PendingUserTaskTransition,
         first: &crate::model::TaskListener,
-        staged_vars: Option<&HashMap<String, Value>>,
+        staged_vars: Option<&BTreeMap<String, Value>>,
     ) -> Vec<Event> {
         let job_event = self.mint_task_listener_job(
             user_task_key,
@@ -15802,7 +15801,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         index: usize,
         listener: &crate::model::TaskListener,
-        staged_vars: Option<&HashMap<String, Value>>,
+        staged_vars: Option<&BTreeMap<String, Value>>,
     ) -> Event {
         let persisted;
         let listener_vars = match staged_vars {
@@ -16063,7 +16062,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: Some(initial),
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     events.extend(self.start_task_listener_chain(
@@ -16256,7 +16255,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-        vars: Option<&HashMap<String, Value>>,
+        vars: Option<&BTreeMap<String, Value>>,
     ) -> Result<usize, RoutingFailure> {
         let owned;
         let variables = match vars {
@@ -16439,7 +16438,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-        vars: Option<&HashMap<String, Value>>,
+        vars: Option<&BTreeMap<String, Value>>,
     ) -> Result<Vec<usize>, RoutingFailure> {
         let owned;
         let variables = match vars {
@@ -17017,7 +17016,7 @@ impl Engine {
     /// completion — currently the [`Step::CompleteCallActivity`] that releases a
     /// parent's parked call-activity token when its spawned child finishes.
     fn complete_finished_instances(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         let mut finished: Vec<Key> = touched
             .into_iter()
             .filter(|k| {
@@ -17083,7 +17082,7 @@ impl Engine {
         child_eik: Key,
         container_key: Key,
         element_id: String,
-        preserved_seed: Option<HashMap<String, Value>>,
+        preserved_seed: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let container_element_id = match self
             .state
@@ -17225,7 +17224,7 @@ impl Engine {
         element_id: String,
         container_key: Key,
         inner_key: Key,
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let container_element_id = match self
             .state
@@ -17263,7 +17262,7 @@ impl Engine {
             .adhoc_tool_io(instance_key, &container_element_id, &element_id)
             .outputs;
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => updates,
@@ -17354,7 +17353,7 @@ impl Engine {
     ///   instance while its sibling call-activity children are still live and
     ///   must be terminated here.
     fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut ended: HashSet<Key> = log
+        let mut ended: BTreeSet<Key> = log
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessInstanceTerminated { instance_key }
@@ -17801,7 +17800,7 @@ impl Engine {
             options,
             durable,
         } = plan;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         for job_key in job_keys {
             if !seen.insert(job_key) {
                 continue;
@@ -18113,7 +18112,7 @@ fn path_reaches_join(
     join: &str,
     taken: &state::FlowArrivals,
 ) -> bool {
-    let mut visited: HashSet<&str> = HashSet::new();
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
     let mut to_visit: VecDeque<&str> = VecDeque::from([source]);
     while let Some(node) = to_visit.pop_front() {
         if node == join {
@@ -18154,11 +18153,10 @@ fn path_reaches_join(
 }
 
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
-    let mut vars: Vec<String> = crate::feel::referenced_variables(condition)
+    // `referenced_variables` is a BTreeSet (#1662): already sorted.
+    crate::feel::referenced_variables(condition)
         .into_iter()
-        .collect();
-    vars.sort();
-    vars
+        .collect()
 }
 
 /// The postfix Zeebe appends to an ad-hoc sub-process id to form its
@@ -18177,7 +18175,7 @@ pub fn adhoc_inner_instance_id(container_element_id: &str) -> String {
 /// Removes from `map` every entity owned by `instance_key`, returning them. Used
 /// to lift an instance's timers/subscriptions/user-tasks/incidents out of hot
 /// state when snapshotting it for cold spill.
-fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key) -> Vec<V> {
+fn drain_owned<V: OwnedByInstance>(map: &mut BTreeMap<Key, V>, instance_key: Key) -> Vec<V> {
     let owned: Vec<Key> = map
         .iter()
         .filter(|(_, v)| v.instance_key() == instance_key)
@@ -18192,10 +18190,10 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
 /// [`drain_owned`] once per instance (which is quadratic over a backlog).
 #[cfg(feature = "serde")]
 fn group_owned<V: OwnedByInstance>(
-    map: &mut HashMap<Key, V>,
-    owners: &HashSet<Key>,
-) -> HashMap<Key, Vec<V>> {
-    let mut grouped: HashMap<Key, Vec<V>> = HashMap::new();
+    map: &mut BTreeMap<Key, V>,
+    owners: &BTreeSet<Key>,
+) -> BTreeMap<Key, Vec<V>> {
+    let mut grouped: BTreeMap<Key, Vec<V>> = BTreeMap::new();
     let owned: Vec<Key> = map
         .iter()
         .filter(|(_, v)| owners.contains(&v.instance_key()))
@@ -18720,7 +18718,7 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
 ///   concurrent activations could arm several instances of each sibling in one
 ///   scope, and siblings (matched by element id + scope) could not be isolated.
 pub(crate) struct EventGatewayRaceIndex<'a> {
-    owners: HashMap<&'a str, &'a crate::model::Element>,
+    owners: BTreeMap<&'a str, &'a crate::model::Element>,
 }
 
 impl<'a> EventGatewayRaceIndex<'a> {
@@ -18757,13 +18755,13 @@ impl<'a> EventGatewayRaceIndex<'a> {
 pub(crate) fn event_gateway_race_index(
     def: &crate::model::ProcessDefinition,
 ) -> EventGatewayRaceIndex<'_> {
-    let mut incoming: HashMap<&str, usize> = HashMap::with_capacity(def.elements.len());
+    let mut incoming: BTreeMap<&str, usize> = BTreeMap::new();
     for element in def.elements.values() {
         for flow in &element.outgoing {
             *incoming.entry(flow.to.as_str()).or_default() += 1;
         }
     }
-    let mut owners: HashMap<&str, &crate::model::Element> = HashMap::new();
+    let mut owners: BTreeMap<&str, &crate::model::Element> = BTreeMap::new();
     for gateway in def.elements.values() {
         if !matches!(gateway.kind, ElementKind::EventBasedGateway)
             || incoming.get(gateway.id.as_str()).copied().unwrap_or(0) != 1
@@ -19422,7 +19420,7 @@ pub struct ActivatedJob {
     /// `Arc` with the engine's instance state, so activation does not deep-clone
     /// the (up to 50 KB) value tree on the single command thread; the response
     /// mapper encodes it to JSON off-thread by borrowing.
-    pub variables: Arc<HashMap<String, Value>>,
+    pub variables: Arc<BTreeMap<String, Value>>,
     /// Whether this is an ordinary BPMN-element job or an execution-listener job
     /// (ADR 0037), surfaced so the worker/transport can report `jobKind` and
     /// `listenerEventType` (Camunda parity).
@@ -19661,18 +19659,18 @@ fn drain_scope_subscriptions(
     };
     // Hash-based membership + per-scope open-child counts derived once, so the
     // fixpoint is O(n log n) instead of rescanning every open entry per step.
-    let handler_scope_set: HashSet<Key> = remaining_handler_scopes.into_iter().collect();
-    let mut index_of: HashMap<Key, usize> = HashMap::with_capacity(subs.len());
+    let handler_scope_set: BTreeSet<Key> = remaining_handler_scopes.into_iter().collect();
+    let mut index_of: BTreeMap<Key, usize> = BTreeMap::new();
     for (i, k) in subs.iter().enumerate() {
         index_of.entry(*k).or_insert(i);
     }
-    let mut open_children: HashMap<Key, usize> = HashMap::new();
+    let mut open_children: BTreeMap<Key, usize> = BTreeMap::new();
     for i in 0..subs.len() {
         if let Some(p) = parent_of(i) {
             *open_children.entry(p).or_default() += 1;
         }
     }
-    let eligible = |k: &Key, open_children: &HashMap<Key, usize>| {
+    let eligible = |k: &Key, open_children: &BTreeMap<Key, usize>| {
         !handler_scope_set.contains(k) && open_children.get(k).copied().unwrap_or(0) == 0
     };
     // Lowest-index eligible entry first — the same retirement order as the

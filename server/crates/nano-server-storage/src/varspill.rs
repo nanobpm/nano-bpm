@@ -51,7 +51,7 @@
 //! entirely, and skips the thread). `NANOBPMN_VARSPILL_RECLAIM_IDLE_MS` sets how
 //! long the store must be quiet before a drain begins.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
@@ -844,7 +844,7 @@ impl VarSpillStore {
     }
 
     /// Persists `vars` under `key`, replacing any prior payload.
-    pub fn put(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
+    pub fn put(&self, key: Key, vars: &BTreeMap<String, Value>) -> rusqlite::Result<()> {
         let json = serde_json::to_string(vars)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -864,7 +864,7 @@ impl VarSpillStore {
     /// and holds no row for `key`; retrying can never succeed), while `Err` is a
     /// **transient/unreadable** failure (SQLite/IO error or an undecodable row),
     /// where a fail-closed caller must retry rather than proceed.
-    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
+    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<BTreeMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::try_select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         drop(conn);
@@ -1032,8 +1032,8 @@ impl VarSpillStore {
     /// [`gc_orphans_in_table`](Self::gc_orphans_in_table)).
     pub fn gc_orphans(
         &self,
-        live: &std::collections::HashSet<Key>,
-        spill_referenced: &std::collections::HashSet<Key>,
+        live: &std::collections::BTreeSet<Key>,
+        spill_referenced: &std::collections::BTreeSet<Key>,
         partition: u64,
     ) -> rusqlite::Result<u64> {
         // Each pass deletes from its OWN table only. The two passes protect
@@ -1045,7 +1045,7 @@ impl VarSpillStore {
         // key's cold row early (a live instance's cold row is protected, not
         // orphaned). `collected` therefore counts orphaned ROWS (a key with an
         // orphan row in each table is reaped twice — once per pass).
-        let no_references = std::collections::HashSet::new();
+        let no_references = std::collections::BTreeSet::new();
         let mut collected = self.gc_orphans_in_table(
             GcTable::Spill,
             live,
@@ -1090,8 +1090,8 @@ impl VarSpillStore {
     fn gc_orphans_in_table(
         &self,
         table: GcTable,
-        live: &std::collections::HashSet<Key>,
-        referenced: &std::collections::HashSet<Key>,
+        live: &std::collections::BTreeSet<Key>,
+        referenced: &std::collections::BTreeSet<Key>,
         deletes: GcTable,
         partition: u64,
     ) -> rusqlite::Result<u64> {
@@ -1325,8 +1325,8 @@ impl VarSpillStore {
 mod tests {
     use super::*;
 
-    fn vars(payload: &str) -> HashMap<String, Value> {
-        let mut m = HashMap::new();
+    fn vars(payload: &str) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
         m.insert("data".to_string(), Value::Str(payload.to_string()));
         m
     }
@@ -1773,7 +1773,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("var-spill.sqlite");
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("k".to_string(), Value::Int(7));
         {
             let store = VarSpillStore::open(Some(&path)).unwrap();
@@ -1822,26 +1822,26 @@ mod tests {
                 parent_element_instance_key: None,
                 suspended_at: None,
                 terminated_epoch: 0,
-                active: HashMap::new(),
-                scopes: HashMap::new(),
+                active: BTreeMap::new(),
+                scopes: BTreeMap::new(),
                 variables: Arc::new(vars(payload)),
-                join_counts: HashMap::new(),
-                join_flow_arrivals: HashMap::new(),
-                join_instances: HashMap::new(),
+                join_counts: BTreeMap::new(),
+                join_flow_arrivals: BTreeMap::new(),
+                join_instances: BTreeMap::new(),
                 parked_joins: Default::default(),
                 activating: Default::default(),
-                gateway_routes: HashMap::new(),
+                gateway_routes: BTreeMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
-                multi_instances: HashMap::new(),
-                adhoc_instances: HashMap::new(),
-                scope_parents: HashMap::new(),
-                scope_variables: HashMap::new(),
-                esp_held_payloads: HashMap::new(),
+                multi_instances: BTreeMap::new(),
+                adhoc_instances: BTreeMap::new(),
+                scope_parents: BTreeMap::new(),
+                scope_variables: BTreeMap::new(),
+                esp_held_payloads: BTreeMap::new(),
                 compensable: Default::default(),
-                compensation_waits: HashMap::new(),
-                agent_instances: HashMap::new(),
-                agent_history: HashMap::new(),
+                compensation_waits: BTreeMap::new(),
+                agent_instances: BTreeMap::new(),
+                agent_history: BTreeMap::new(),
             },
             jobs: Vec::new(),
             timers: Vec::new(),
@@ -2120,7 +2120,7 @@ mod tests {
         // Live keys: retained by the sweep. Orphan keys: reaped. The two key
         // ranges are disjoint and interleave page boundaries so a broken filter
         // cannot pass by accident.
-        let live: std::collections::HashSet<Key> = (0..64u64).map(|i| i * 2).collect();
+        let live: std::collections::BTreeSet<Key> = (0..64u64).map(|i| i * 2).collect();
         let orphans = FORGET_CHUNK + 137; // > 1 page, with a ragged tail page
         for &key in &live {
             store.put(key, &vars("live")).unwrap();
@@ -2133,7 +2133,7 @@ mod tests {
         }
 
         let collected = store
-            .gc_orphans(&live, &std::collections::HashSet::new(), 0)
+            .gc_orphans(&live, &std::collections::BTreeSet::new(), 0)
             .expect("sweep succeeds");
 
         // Each orphan key held one row per table and each pass reaps its own
@@ -2161,7 +2161,7 @@ mod tests {
             );
         }
         // The spill-reference set preserves a row even when its key is not live.
-        let referenced: std::collections::HashSet<Key> = [999_991].into_iter().collect();
+        let referenced: std::collections::BTreeSet<Key> = [999_991].into_iter().collect();
         store.put(999_991, &vars("legacy")).unwrap();
         let collected = store
             .gc_orphans(&live, &referenced, 0)
@@ -2188,10 +2188,10 @@ mod tests {
         // referenced (a legacy snapshot's still-set `variables_spilled` flag).
         store.put(key, &vars("legacy")).unwrap();
         store.put_cold(key, &snapshot_for(key)).unwrap();
-        let referenced: std::collections::HashSet<Key> = [key].into_iter().collect();
+        let referenced: std::collections::BTreeSet<Key> = [key].into_iter().collect();
 
         let collected = store
-            .gc_orphans(&std::collections::HashSet::new(), &referenced, 0)
+            .gc_orphans(&std::collections::BTreeSet::new(), &referenced, 0)
             .expect("sweep succeeds");
 
         assert_eq!(collected, 1, "exactly the orphaned cold row is reaped");
@@ -2231,13 +2231,13 @@ mod tests {
             store.put(key, &vars("x")).unwrap();
             store.put_cold(key, &snapshot_for(key)).unwrap();
         }
-        let live: std::collections::HashSet<Key> = [high_live].into_iter().collect();
+        let live: std::collections::BTreeSet<Key> = [high_live].into_iter().collect();
 
         // Sweep as partition 4096: its own high keys are in range, the
         // low-partition orphan is NOT (it is reaped by its own partition's
         // sweep, not this one).
         let collected = store
-            .gc_orphans(&live, &std::collections::HashSet::new(), 4096)
+            .gc_orphans(&live, &std::collections::BTreeSet::new(), 4096)
             .expect("sweep succeeds");
 
         assert_eq!(
@@ -2268,8 +2268,8 @@ mod tests {
         // Sweeping as partition 0 then reaps the low orphan.
         let collected = store
             .gc_orphans(
-                &std::collections::HashSet::new(),
-                &std::collections::HashSet::new(),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 0,
             )
             .expect("sweep succeeds");
@@ -2308,9 +2308,9 @@ mod tests {
         store.put(foreign, &vars("foreign")).unwrap();
         store.put_cold(foreign, &snapshot_for(foreign)).unwrap();
 
-        let live: std::collections::HashSet<Key> = [own_live].into_iter().collect();
+        let live: std::collections::BTreeSet<Key> = [own_live].into_iter().collect();
         let collected = store
-            .gc_orphans(&live, &std::collections::HashSet::new(), 1)
+            .gc_orphans(&live, &std::collections::BTreeSet::new(), 1)
             .expect("sweep succeeds");
 
         assert_eq!(collected, 2, "exactly the in-band orphan's 2 rows reaped");
@@ -2353,8 +2353,8 @@ mod tests {
 
         let err = store
             .gc_orphans(
-                &std::collections::HashSet::new(),
-                &std::collections::HashSet::new(),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 0,
             )
             .expect_err("enumerating a dropped table fails");

@@ -6,7 +6,7 @@
 //! produce [`ProcessDefinition`]s); here processes are built programmatically via
 //! [`ProcessBuilder`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Serde default for boundary-event `interrupting` flags: older serialized
 /// definitions (before non-interrupting boundaries existed) carried only
@@ -132,7 +132,10 @@ impl Condition {
     /// error on a parse/type failure or a non-boolean result. A condition-routed
     /// gateway (exclusive or inclusive) turns such an error into an
     /// `ExpressionEvaluation` incident.
-    pub fn eval(&self, variables: &HashMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
+    pub fn eval(
+        &self,
+        variables: &BTreeMap<String, Value>,
+    ) -> Result<bool, crate::feel::FeelError> {
         crate::feel::eval_bool(&self.expression, variables)
     }
 }
@@ -1619,7 +1622,7 @@ pub struct AdHocActivateElement {
     pub element_id: ElementId,
     /// Local variables to seed into the activated element's scope.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
 }
 
 /// Corrections a task listener may return to user-task data when it completes
@@ -1726,7 +1729,7 @@ pub struct ProcessDefinition {
     /// when deserializing journals/snapshots written before this field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
-    pub elements: HashMap<ElementId, Element>,
+    pub elements: BTreeMap<ElementId, Element>,
     pub start_event: ElementId,
     /// The original BPMN XML this definition was parsed from, retained verbatim
     /// so it can be served back (e.g. Camunda's `getProcessDefinitionXML`, the
@@ -1904,9 +1907,9 @@ impl ProcessDefinition {
     /// is missing from `library` or a call cycle is detected.
     pub fn inline_call_activities(
         &self,
-        library: &HashMap<String, ProcessDefinition>,
+        library: &BTreeMap<String, ProcessDefinition>,
     ) -> Result<ProcessDefinition, String> {
-        let mut elements = HashMap::new();
+        let mut elements = BTreeMap::new();
         let mut stack = vec![self.id.clone()];
         splice_call_activities(&mut elements, &self.elements, "", None, library, &mut stack)?;
         Ok(ProcessDefinition {
@@ -1930,11 +1933,11 @@ impl ProcessDefinition {
 /// underneath the sub-process that replaced its call activity. `stack` holds the
 /// process ids on the current call path for cycle detection.
 fn splice_call_activities(
-    out: &mut HashMap<ElementId, Element>,
-    src: &HashMap<ElementId, Element>,
+    out: &mut BTreeMap<ElementId, Element>,
+    src: &BTreeMap<ElementId, Element>,
     prefix: &str,
     parent_override: Option<&str>,
-    library: &HashMap<String, ProcessDefinition>,
+    library: &BTreeMap<String, ProcessDefinition>,
     stack: &mut Vec<String>,
 ) -> Result<(), String> {
     let pfx = |id: &str| format!("{prefix}{id}");
@@ -3103,7 +3106,7 @@ impl ProcessBuilder {
     /// Fails if there is not exactly one start event, or if a sequence flow
     /// references an unknown element.
     pub fn build(self) -> Result<ProcessDefinition, BuildError> {
-        let mut elements: HashMap<ElementId, Element> = HashMap::new();
+        let mut elements: BTreeMap<ElementId, Element> = BTreeMap::new();
         for e in self.elements {
             if elements.contains_key(&e.id) {
                 return Err(BuildError::DuplicateElement(e.id));
@@ -3271,7 +3274,7 @@ impl ProcessBuilder {
 /// incoming or outgoing sequence flow; its `start_event` must name a start
 /// event directly contained in it; and an error trigger must be interrupting.
 pub(crate) fn validate_event_subprocesses(
-    elements: &HashMap<ElementId, Element>,
+    elements: &BTreeMap<ElementId, Element>,
 ) -> Result<(), BuildError> {
     let mut esps: Vec<&Element> = elements
         .values()

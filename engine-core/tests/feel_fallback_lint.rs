@@ -355,22 +355,22 @@ fn engine_has_no_unlisted_silent_feel_fallbacks() {
 fn seeded_violation_fails_the_lint() {
     // The #1390 shape: a failed job-type expression replaced by its own text.
     let seeded = r#"
-fn resolve(vars: &HashMap<String, Value>, job_type: &str) -> String {
+fn resolve(vars: &BTreeMap<String, Value>, job_type: &str) -> String {
     crate::feel::eval_string(job_type, vars).unwrap_or_else(|_| job_type.to_string())
 }
-fn assignee(vars: &HashMap<String, Value>) -> Option<String> {
+fn assignee(vars: &BTreeMap<String, Value>) -> Option<String> {
     let a = expression::evaluate_string("=assignee", vars)
         .ok();
     a
 }
-fn multiline(vars: &HashMap<String, Value>, raw: &str) -> String {
+fn multiline(vars: &BTreeMap<String, Value>, raw: &str) -> String {
     expression::evaluate_string(
         raw,
         vars,
     )
     .unwrap_or_else(|_| raw.to_string())
 }
-fn clean(vars: &HashMap<String, Value>, raw: &str) -> Result<String, Failure> {
+fn clean(vars: &BTreeMap<String, Value>, raw: &str) -> Result<String, Failure> {
     let s = expression::evaluate_string(raw, vars)?;
     let fallback = other.unwrap_or_default();
     Ok(s)

@@ -50,7 +50,7 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     let def = input.def;
 
     // Deterministic order so the reported gateway is stable when several are
-    // invalid (`elements` is a HashMap).
+    // invalid (`elements` is a BTreeMap).
     let mut gateways: Vec<&crate::model::Element> = def
         .elements
         .values()

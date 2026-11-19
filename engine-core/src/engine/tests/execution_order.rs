@@ -8,7 +8,7 @@ use super::*;
 
 fn deploy_and_run(
     def: ProcessDefinition,
-    vars_in: HashMap<String, Value>,
+    vars_in: BTreeMap<String, Value>,
 ) -> (Engine, Key, Vec<Event>) {
     let mut log = Vec::new();
     let id = def.id.clone();
@@ -80,7 +80,7 @@ fn fork_join(join_inclusive: bool) -> ProcessDefinition {
 /// that order: the last-declared branch activates first.
 #[test]
 fn parallel_fork_takes_flows_in_reverse_document_order() {
-    let (_, _, log) = deploy_and_run(fork_join(false), HashMap::new());
+    let (_, _, log) = deploy_and_run(fork_join(false), BTreeMap::new());
     assert_eq!(taken_from(&log, "fork"), vec!["b", "a"]);
     let activations: Vec<&str> = log
         .iter()
@@ -184,7 +184,7 @@ fn gateway_completes_inline_before_queued_siblings() {
         .connect("g", "after_g")
         .build()
         .unwrap();
-    let (_, _, log) = deploy_and_run(def, HashMap::new());
+    let (_, _, log) = deploy_and_run(def, BTreeMap::new());
     let position = |pred: &dyn Fn(&Event) -> bool| log.iter().position(pred).unwrap();
     let g_completed =
         position(&|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "g"));
@@ -209,7 +209,7 @@ fn gateway_completes_inline_before_queued_siblings() {
 #[test]
 fn join_writes_no_lifecycle_until_ready() {
     for inclusive in [false, true] {
-        let (mut engine, inst, log) = deploy_and_run(fork_join(inclusive), HashMap::new());
+        let (mut engine, inst, log) = deploy_and_run(fork_join(inclusive), BTreeMap::new());
         assert!(lifecycle_of(&log, "join").is_empty());
         let first = complete_one(&mut engine, "ja");
         assert!(
@@ -270,7 +270,7 @@ fn scope_teardown_writes_no_lifecycle_for_a_parked_join() {
         .connect("sub", "done")
         .build()
         .unwrap();
-    let (mut engine, inst, _) = deploy_and_run(def, HashMap::new());
+    let (mut engine, inst, _) = deploy_and_run(def, BTreeMap::new());
     complete_one(&mut engine, "ja");
     let events = engine
         .apply_command(Command::ModifyInstance {
@@ -297,7 +297,7 @@ fn scope_teardown_writes_no_lifecycle_for_a_parked_join() {
 /// terminate instruction.
 #[test]
 fn a_parked_join_key_cannot_be_terminated_by_key() {
-    let (mut engine, inst, _) = deploy_and_run(fork_join(false), HashMap::new());
+    let (mut engine, inst, _) = deploy_and_run(fork_join(false), BTreeMap::new());
     let events = complete_one(&mut engine, "ja");
     let parked = events
         .iter()
@@ -330,7 +330,7 @@ fn a_parked_join_key_cannot_be_terminated_by_key() {
 /// without activating a second time.
 #[test]
 fn legacy_visibly_opened_join_replays_and_fires_once() {
-    let (mut engine, inst, mut log) = deploy_and_run(fork_join(false), HashMap::new());
+    let (mut engine, inst, mut log) = deploy_and_run(fork_join(false), BTreeMap::new());
     log.extend(complete_one(&mut engine, "ja"));
     let legacy: Vec<Event> = log
         .into_iter()
@@ -417,7 +417,7 @@ fn resetting_a_seeded_parked_join_clears_its_variable_scope() {
         .connect("join", "done")
         .build()
         .unwrap();
-    let (mut engine, inst, _) = deploy_and_run(def, HashMap::new());
+    let (mut engine, inst, _) = deploy_and_run(def, BTreeMap::new());
     complete_one(&mut engine, "ja");
     let parked = engine
         .instance(inst)
@@ -435,7 +435,7 @@ fn resetting_a_seeded_parked_join_clears_its_variable_scope() {
             activate_instructions: vec![ActivateElementInstruction {
                 element_id: "join".into(),
                 variable_instructions: vec![crate::command::VariableInstruction {
-                    variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                    variables: BTreeMap::from([("l".to_string(), Value::Int(1))]),
                     scope_id: Some("join".into()),
                 }],
                 ..Default::default()

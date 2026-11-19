@@ -256,7 +256,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 // A whole-scope fan-out consumes every nested subscription, so
                 // index it once: a per-subscription linear scan would make this
                 // reducer quadratic in the number of compensable children.
-                let consumed: std::collections::HashSet<Key> = consumed.iter().copied().collect();
+                let consumed: std::collections::BTreeSet<Key> = consumed.iter().copied().collect();
                 instance
                     .compensable
                     .retain(|c| !consumed.contains(&c.element_instance_key));
@@ -376,7 +376,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             scopes,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+                let scope_set: std::collections::BTreeSet<Key> = scopes.iter().copied().collect();
                 instance
                     .compensable
                     .retain(|c| !scope_set.contains(&c.scope));

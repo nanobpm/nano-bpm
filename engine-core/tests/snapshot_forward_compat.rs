@@ -106,7 +106,7 @@ fn agent_job_type_survives_snapshot_and_legacy_snapshots_default_to_element_id()
         engine
             .apply_command(Command::create_instance_with(
                 "external-agent-routing",
-                std::collections::HashMap::from([(
+                std::collections::BTreeMap::from([(
                     "route".into(),
                     nanobpmn_engine_core::Value::Str("senior:rebase".into()),
                 )]),
@@ -154,7 +154,7 @@ fn historical_agent_deployment_frames_replay_through_the_canonical_job_model() {
             let events = restored
                 .apply_command(Command::create_instance_with(
                     "external-agent-routing",
-                    std::collections::HashMap::from([(
+                    std::collections::BTreeMap::from([(
                         "route".into(),
                         Value::Str("senior:rebase".into()),
                     )]),

@@ -147,7 +147,7 @@ fn assert_joins_count_per_scope_instance(engine: &mut Engine, key: Key) {
     );
 }
 
-fn start(engine: &mut Engine, def: ProcessDefinition, vars: HashMap<String, Value>) -> Key {
+fn start(engine: &mut Engine, def: ProcessDefinition, vars: BTreeMap<String, Value>) -> Key {
     let id = def.id.clone();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     engine
@@ -158,8 +158,8 @@ fn start(engine: &mut Engine, def: ProcessDefinition, vars: HashMap<String, Valu
         .unwrap()
 }
 
-fn two_items() -> HashMap<String, Value> {
-    let mut vars = HashMap::new();
+fn two_items() -> BTreeMap<String, Value> {
+    let mut vars = BTreeMap::new();
     vars.insert(
         "items".to_string(),
         Value::List(vec![Value::Int(1), Value::Int(2)]),
@@ -191,7 +191,7 @@ fn parallel_join_in_concurrently_reentered_subprocess_counts_per_instance() {
     let key = start(
         &mut engine,
         reentered_subprocess_with_inner_join(false),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert_joins_count_per_scope_instance(&mut engine, key);
     assert!(engine.is_completed(key));
@@ -203,7 +203,7 @@ fn inclusive_join_in_concurrently_reentered_subprocess_counts_per_instance() {
     let key = start(
         &mut engine,
         reentered_subprocess_with_inner_join(true),
-        HashMap::new(),
+        BTreeMap::new(),
     );
     assert_joins_count_per_scope_instance(&mut engine, key);
     assert!(engine.is_completed(key));
@@ -220,7 +220,7 @@ fn inclusive_join_in_concurrently_reentered_subprocess_counts_per_instance() {
 fn legacy_scopeless_join_events_replay_into_scoped_bookkeeping() {
     for inclusive in [false, true] {
         let mut engine = Engine::new();
-        let mut one = HashMap::new();
+        let mut one = BTreeMap::new();
         one.insert("items".to_string(), Value::List(vec![Value::Int(1)]));
         let mut journal = Vec::new();
         let mut boundaries = Vec::new();
@@ -278,7 +278,7 @@ fn legacy_scopeless_join_events_replay_into_scoped_bookkeeping() {
 fn legacy_element_keyed_join_maps_load_into_scoped_bookkeeping() {
     let mut engine = Engine::new();
     let key = start(&mut engine, mi_body_with_inner_join(false), {
-        let mut one = HashMap::new();
+        let mut one = BTreeMap::new();
         one.insert("items".to_string(), Value::List(vec![Value::Int(1)]));
         one
     });

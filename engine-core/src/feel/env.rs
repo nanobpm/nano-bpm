@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn installed_env_pins_now_and_seeds_random() {
-        let ctx = std::collections::HashMap::new();
+        let ctx = std::collections::BTreeMap::new();
         let run = || {
             let mut env = EvalEnv::new(1_700_000_000_000, 42);
             with_env(&mut env, || {
@@ -164,7 +164,7 @@ mod tests {
     /// builtins fail closed instead of reading the host clock / entropy.
     #[test]
     fn missing_env_fails_closed() {
-        let ctx = std::collections::HashMap::new();
+        let ctx = std::collections::BTreeMap::new();
         for expr in ["now()", "today()", "random number()", "uuid()"] {
             let err = crate::feel::eval(expr, &ctx).expect_err(expr);
             assert!(
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn host_env_is_an_explicit_opt_in() {
-        let ctx = std::collections::HashMap::new();
+        let ctx = std::collections::BTreeMap::new();
         let v = with_host_env(|| crate::feel::eval("now()", &ctx)).unwrap();
         assert!(matches!(v, Value::Str(_)), "{v:?}");
         let a = with_host_env(|| crate::feel::eval("uuid()", &ctx)).unwrap();

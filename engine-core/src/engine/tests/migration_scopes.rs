@@ -1222,7 +1222,7 @@ fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
             element_instance_key: eik,
             element_id: stale_eid,
             kind: stale_kind,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             delivery_key: 0,
         })
         .unwrap();
@@ -1570,7 +1570,7 @@ fn gateway_paused_on_listener(gateway: SplitGw) -> (Engine, Key, Key) {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()
@@ -1690,7 +1690,7 @@ fn assert_migration_rejects_a_missing_carried_route(gateway: SplitGw) {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()
@@ -1781,7 +1781,7 @@ fn exclusive_gateway_migration_rejects_a_reordered_carried_route() {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()

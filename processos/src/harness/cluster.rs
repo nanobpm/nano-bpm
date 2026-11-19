@@ -254,7 +254,7 @@ pub async fn build_cluster_summary_over(
 ) -> Result<ClusterRunSummary, String> {
     let mut summaries: Vec<TraceSummary> = Vec::new();
     let mut owner: Vec<usize> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (i, c) in clients.iter().enumerate() {
         for s in c.list_traces(limit).await? {
             if seen.insert(s.instance_key.clone()) {
@@ -353,7 +353,7 @@ fn base_scheme_host(base_url: &str) -> (String, String) {
 
 /// The process id with the most rows in `summaries`.
 fn busiest_process(summaries: &[TraceSummary]) -> Option<String> {
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for s in summaries {
         *counts.entry(s.process_id.as_str()).or_default() += 1;
     }
@@ -519,7 +519,7 @@ mod tests {
         };
         let summaries = vec![summary("1", "order", "completed", 0, 160, 160)];
         let s = summarize_run("order", &summaries, &[detail]);
-        let by: std::collections::HashMap<_, _> = s
+        let by: std::collections::BTreeMap<_, _> = s
             .by_job_type
             .iter()
             .map(|j| (j.job_type.as_str(), j))

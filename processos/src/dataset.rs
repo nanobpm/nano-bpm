@@ -11,7 +11,7 @@
 //! `&TraceSource` and is agnostic to whether the bytes came from a live gateway or
 //! a directory on disk.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ pub struct DatasetSource {
     summaries: Vec<TraceSummary>,
     /// `instance_key` -> index into `traces`, so per-key reads are O(1) even on
     /// full-population folds over large captured datasets.
-    by_key: HashMap<String, usize>,
+    by_key: BTreeMap<String, usize>,
     metrics: Option<Metrics>,
 }
 

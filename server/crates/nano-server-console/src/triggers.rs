@@ -26,7 +26,7 @@
 //! Node-only (ADR 0065). The dispatcher itself is pure in-process Rust; it
 //! carries no JS-runtime dependency.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -643,7 +643,7 @@ fn parse_action(action: &Json, trigger_id: &str) -> Result<Action, TriggerError>
 /// Evaluate a trigger `action`'s FEEL over `body` to produce the engine call.
 /// The FEEL scope is `{ body: <event body> }` (ADR 0029 §5 / 0025 §1).
 pub(crate) fn plan_call(action: &Action, body: &Json) -> Result<EngineCall, TriggerError> {
-    let mut ctx: HashMap<String, nanobpmn_engine_core::Value> = HashMap::new();
+    let mut ctx: BTreeMap<String, nanobpmn_engine_core::Value> = BTreeMap::new();
     ctx.insert("body".to_string(), nanobpmn_read_model::json_to_value(body));
     match action {
         Action::Start { process, variables } => Ok(EngineCall::Start {
@@ -678,7 +678,7 @@ pub(crate) fn plan_call(action: &Action, body: &Json) -> Result<EngineCall, Trig
 /// instance / published message needs a variable context, not a scalar.
 fn eval_variables(
     expr: Option<&str>,
-    ctx: &HashMap<String, nanobpmn_engine_core::Value>,
+    ctx: &BTreeMap<String, nanobpmn_engine_core::Value>,
 ) -> Result<Json, TriggerError> {
     let Some(expr) = expr else {
         return Ok(json!({}));
