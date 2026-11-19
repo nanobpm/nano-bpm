@@ -3883,8 +3883,6 @@ impl RaftPartition {
         // promptly (no peers means no real heartbeating), and the shared config
         // also carries the (jittered) snapshot policy so a solo replica compacts
         // its log on the same env-tunable cadence as a group member.
-        let config = Arc::new(raft_config(partition_id).validate()?);
-
         let log_store = MemLogStore::default();
         let stamp_engine = engine.clone();
         let engine_for_orphans = engine.clone();
@@ -3900,6 +3898,8 @@ impl RaftPartition {
             partition_id,
         )
         .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -3958,8 +3958,6 @@ impl RaftPartition {
         engine: DeepthiHandle,
         log_dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(raft_config(partition_id).validate()?);
-
         let log_dir = log_dir.as_ref().to_path_buf();
         let snapshot_dir = log_dir.join("snapshots");
         let journal_durable_dir = journal_durable_dir(&engine).await;
@@ -3973,6 +3971,8 @@ impl RaftPartition {
             partition_id,
         )
         .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
         let stamp_engine = engine.clone();
@@ -4050,7 +4050,6 @@ impl RaftPartition {
         log_dir: Option<std::path::PathBuf>,
         evict_eligible: bool,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(raft_config(partition_id).validate()?);
         let journal_durable_dir = journal_durable_dir(&engine).await;
         // Anchor snapshots next to the durable log when there is one, else a temp
         // dir for the volatile (in-memory-log) deployments.
@@ -4075,6 +4074,8 @@ impl RaftPartition {
             partition_id,
         )
         .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
