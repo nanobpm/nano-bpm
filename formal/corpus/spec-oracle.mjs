@@ -53,13 +53,38 @@ import { diffObservations, emptyObservation } from "../parity/runtime/observatio
  * completedElements, takenFlows, jobsCreated, joinsFired }`. The taken-flow ids
  * are collapsed to their `(from, to)` endpoints through the graph's edge map —
  * the same endpoint-keyed form the nano observation uses.
+ *
+ * EVENT-BASED GATEWAYS are projected to the SPEC's vocabulary, not the
+ * reference's raw record: `Reference.apply()` records every outgoing flow of a
+ * correlated gateway (the engine arms every catch, then withdraws the losers —
+ * each losing catch's gateway flow IS taken on the wire), while
+ * `ZeebeTokenFlow.CorrelateEvent` records only the ONE selected flow `g`
+ * (`taken' = RecordTaken(taken, {g})`). Comparing the raw `takenFlows` against
+ * a backend observation would therefore ACCEPT a trace that takes the losing
+ * flows — the spec forbids them — as long as the run did (the #1676
+ * divergence shape). The run's own `steps` say which flow each correlation
+ * selected; every other flow OUT OF a correlated event-based gateway is a
+ * losing-catch artefact and is dropped here, so the expectation is the spec's
+ * projection. (The raw, engine-shaped multiset remains what the scenario's
+ * `expect.sequenceFlows` pins — that oracle asserts the backends reproduce the
+ * REFERENCE record exactly, withdrawal flows included; this oracle asserts the
+ * trace is a behaviour of the SPEC.)
  */
 export function referenceMilestones(graph, run) {
   const byId = Object.fromEntries(graph.edges.map((e) => [e.id, e]));
+  // The flows ZeebeTokenFlow's CorrelateEvent records: exactly the selected
+  // flow of each correlation step. Any OTHER taken flow out of an event-based
+  // gateway is a losing-catch withdrawal the spec never takes.
+  const selected = new Set(
+    (run.steps ?? [])
+      .filter((s) => s.op === "correlate")
+      .map((s) => s.flow),
+  );
   const sequenceFlows = {};
   for (const [fid, count] of Object.entries(run.takenFlows ?? {})) {
     const e = byId[fid];
     if (!e) continue;
+    if (graph.nodes[e.from] === "evt" && !selected.has(fid)) continue;
     const key = `${e.from}->${e.to}`;
     sequenceFlows[key] = (sequenceFlows[key] ?? 0) + count;
   }

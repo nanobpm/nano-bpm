@@ -320,6 +320,26 @@ export function judge(survivors, allIds, equivalent) {
   return problems;
 }
 
+/**
+ * The mutants an `--only` substring selects. A nonempty filter that matches NO
+ * mutant is a defect (a typo in the manual workflow input, or a rename of the
+ * guard the PR slice selects), not an empty success: running zero mutants and
+ * reporting "0 survived" would validate nothing. Throws naming the closest
+ * ids so the typo is obvious.
+ */
+export function selectMutants(mutants, only) {
+  if (!only) return mutants;
+  const selected = mutants.filter((m) => m.id.includes(only));
+  if (selected.length === 0) {
+    const ids = mutants.map((m) => m.id);
+    const near = ids.filter((id) => id.toLowerCase().includes(only.toLowerCase().slice(0, 6))).slice(0, 5);
+    throw new Error(
+      `--only ${JSON.stringify(only)} matched no mutant (${ids.length} known). ` +
+      (near.length ? `Closest: ${near.join(', ')}` : `e.g. ${ids.slice(0, 5).join(', ')}`));
+  }
+  return selected;
+}
+
 async function main(argv) {
   const only = argv.includes('--only') ? argv[argv.indexOf('--only') + 1] : null;
   const mutants = [];
@@ -331,7 +351,7 @@ async function main(argv) {
     console.log(`${mutants.length} mutant(s)`);
     return 0;
   }
-  const selected = only ? mutants.filter((m) => m.id.includes(only)) : mutants;
+  const selected = selectMutants(mutants, only);
   const jar = tlaJar();
   const families = Object.fromEntries(['TokenFlow', 'ZeebeTokenFlow'].map((f) => [f, readExpected(f)]));
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'nanobpm-mutate-'));

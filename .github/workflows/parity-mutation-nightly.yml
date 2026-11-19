@@ -104,7 +104,29 @@ jobs:
           # a bounded slice; the full run is nightly.
           if [[ "$IS_PR" == true ]]; then
             cargo mutants --list
-            cargo mutants --in-place -F 'Engine::activate_join' -F 'Engine::has_active_path_to'
+            # cargo-mutants ORs CLI -F patterns WITH the configured examine_re
+            # set (options.rs chains both into one RegexSet), so a bare -F runs
+            # the full nightly scope, not the slice. A PR-specific config
+            # REPLACES the scope instead: --config reads this file instead of
+            # .cargo/mutants.toml, so its examine_re is the whole filter.
+            # Keep it in sync with .cargo/mutants.toml's features and
+            # additional_cargo_test_args (the parity corpus the mutants run
+            # against) — those are the shared parts the nightly scope needs.
+            # The two engine-core functions named here are the guard surface
+            # this PR touches; a PR touching a different guard edits this list.
+            {
+              echo 'examine_globs = ["src/engine/mod.rs"]'
+              echo "examine_re = ['Engine::activate_join', 'Engine::has_active_path_to']"
+              # StructField mutants (a `delete field … from struct … expression`
+              # inside a function) bypass the name filter — cargo-mutants pushes
+              # them without allows_mutant (visit.rs) — so the two glob-admitted
+              # functions outside the slice are excluded by name even though the
+              # examine_re above does not select them.
+              echo "exclude_re = ['Engine::plan_command_inner', 'Engine::adhoc_completion_after_tool']"
+              echo 'features = ["serde"]'
+              echo 'additional_cargo_test_args = ["--test", "trace_validation", "--test", "zeebe_token_flow_trace_validation", "--test", "conformance"]'
+            } > /tmp/mutants-pr.toml
+            cargo mutants --in-place --config /tmp/mutants-pr.toml
           else
             cargo mutants --in-place
           fi
