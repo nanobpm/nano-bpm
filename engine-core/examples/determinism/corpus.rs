@@ -24,7 +24,7 @@
 //! release — which stops at the first command it cannot decode — still
 //! replays the longest possible compatible prefix.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::{Command, Engine, EventSubProcessTrigger, ProcessBuilder, Value};
 use serde_json::{json, Value as Json};
@@ -32,12 +32,23 @@ use serde_json::{json, Value as Json};
 /// Epoch the corpus clock starts at (fixed: the clock is corpus data).
 const T0: u64 = 1_700_000_000_000;
 
+/// A built corpus: `(now, command)` entries in order.
+pub type Corpus = Vec<(u64, Command)>;
+
 /// A corpus under construction, applied to a live engine as it grows.
 pub struct Gen {
     engine: Engine,
     now: u64,
     entries: Vec<(u64, Command)>,
     rng: u64,
+    /// Corpus positions to leave out (a previous release cannot decode them).
+    /// Excluded commands are neither recorded nor applied, so every LATER key
+    /// is harvested from the engine the filtered corpus actually builds.
+    exclude: BTreeSet<u64>,
+    /// Position in the UNFILTERED corpus of the next push.
+    position: u64,
+    /// Per unfiltered position: `Some(accepted?)`, or `None` when excluded.
+    outcomes: Vec<Option<bool>>,
 }
 
 impl Default for Gen {
@@ -53,6 +64,9 @@ impl Gen {
             now: T0,
             entries: Vec::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
+            exclude: BTreeSet::new(),
+            position: 0,
+            outcomes: Vec::new(),
         }
     }
 
@@ -72,21 +86,47 @@ impl Gen {
 
     /// Records `command` at the current clock and returns its events as JSON.
     fn push(&mut self, command: Command) -> Vec<Json> {
+        self.try_push(command).unwrap_or_default()
+    }
+
+    /// Records `command` at the current clock; `Err` carries its rejection.
+    fn try_push(&mut self, command: Command) -> Result<Vec<Json>, String> {
         self.tick(1);
+        let position = self.position;
+        self.position += 1;
+        if self.exclude.contains(&position) {
+            self.outcomes.push(None);
+            return Err(EXCLUDED.into());
+        }
         self.entries.push((self.now, command.clone()));
-        match self.engine.apply_command_at(command, self.now) {
-            Ok(events) => events
+        let result = match self.engine.apply_command_at(command, self.now) {
+            Ok(events) => Ok(events
                 .iter()
                 .map(|e| serde_json::to_value(e).unwrap_or(Json::Null))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+                .collect()),
+            Err(e) => Err(e.to_string()),
+        };
+        self.outcomes.push(Some(result.is_ok()));
+        result
     }
 
     fn push_json(&mut self, command: Json) -> Vec<Json> {
-        match serde_json::from_value::<Command>(command.clone()) {
-            Ok(c) => self.push(c),
-            Err(e) => panic!("corpus command does not decode: {e}: {command}"),
+        self.push(decode(command))
+    }
+
+    /// Like [`Self::push_json`], but the command is **meant to succeed**: a
+    /// rejection panics while the corpus is built, so a success-path entry can
+    /// never silently degrade into exercising only a rejection (e.g. a stale
+    /// or wrong key harvested from an earlier entry).
+    fn push_ok_json(&mut self, command: Json) -> Vec<Json> {
+        let command = decode(command);
+        let kind = command.kind();
+        match self.try_push(command) {
+            Ok(events) => events,
+            // A filtered build is checked against the unfiltered one instead
+            // (`build_excluding`): an outcome change is reported, not panicked.
+            Err(_) if !self.exclude.is_empty() => Vec::new(),
+            Err(e) => panic!("corpus success-path {kind} was rejected: {e}"),
         }
     }
 
@@ -94,6 +134,23 @@ impl Gen {
     pub fn into_entries(self) -> Vec<(u64, Command)> {
         self.entries
     }
+}
+
+fn decode(command: Json) -> Command {
+    match serde_json::from_value::<Command>(command.clone()) {
+        Ok(c) => c,
+        Err(e) => panic!("corpus command does not decode: {e}: {command}"),
+    }
+}
+
+/// The `element_instance_key` of the `ElementActivated` event for
+/// `element_id` in `events`.
+fn activated(events: &[Json], element_id: &str) -> Option<u64> {
+    events
+        .iter()
+        .filter_map(|e| e.get("ElementActivated"))
+        .find(|v| v.get("element_id").and_then(Json::as_str) == Some(element_id))
+        .and_then(|v| v.get("element_instance_key").and_then(Json::as_u64))
 }
 
 /// The first `field` of an event of `variant` in `events`.
@@ -158,9 +215,105 @@ const DMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     clippy::too_many_lines,
     reason = "one linear scenario script; splitting it would scatter the corpus"
 )]
+/// An external (job-backed) agent task plus a job-worker ad-hoc container,
+/// side by side, both left running for the ad-hoc / agent commands.
+const AGENTS_BPMN: &str = r#"
+  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+    <bpmn:process id="agents" isExecutable="true">
+      <bpmn:startEvent id="s" />
+      <bpmn:parallelGateway id="fork" />
+      <bpmn:serviceTask id="agent">
+        <bpmn:extensionElements>
+          <zeebe:agentDefinition agentType="external" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:adHocSubProcess id="adhoc">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="adhoc-worker" />
+        </bpmn:extensionElements>
+        <bpmn:serviceTask id="toolA">
+          <bpmn:extensionElements>
+            <zeebe:taskDefinition type="tool" />
+          </bpmn:extensionElements>
+        </bpmn:serviceTask>
+      </bpmn:adHocSubProcess>
+      <bpmn:endEvent id="e1" />
+      <bpmn:endEvent id="e2" />
+      <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />
+      <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="agent" />
+      <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="adhoc" />
+      <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="e1" />
+      <bpmn:sequenceFlow id="f5" sourceRef="adhoc" targetRef="e2" />
+    </bpmn:process>
+  </bpmn:definitions>"#;
+
+const EXCLUDED: &str = "excluded from this corpus";
+
 /// Builds the full corpus. `random_instances` sizes the randomized workload.
 pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
+    generate(random_instances, BTreeSet::new()).0
+}
+
+/// Builds the corpus WITHOUT the commands at the unfiltered positions in
+/// `exclude` (those a previous release cannot decode). Keys are harvested
+/// from the engine the filtered corpus builds, so later commands still
+/// address real entities. A kept command whose outcome (accepted vs
+/// rejected) would change depends on an excluded one, so it is excluded too
+/// (returned in the set) rather than silently compared as a degraded
+/// execution both builds agree on; fails if more than 10% of the corpus is
+/// lost that way.
+pub fn build_excluding(
+    random_instances: usize,
+    exclude: BTreeSet<u64>,
+) -> Result<(Corpus, BTreeSet<u64>), String> {
+    let (_, full) = generate(random_instances, BTreeSet::new());
+    let mut excluded = exclude;
+    // Fixpoint: a kept command whose outcome flips depends on an excluded one
+    // (e.g. a create of a process whose deployment the old release cannot
+    // decode) — that scenario is unreachable for the old release, so it is
+    // excluded too, and the corpus regenerated, until nothing flips.
+    for _ in 0..64 {
+        let (entries, filtered) = generate(random_instances, excluded.clone());
+        if full.len() != filtered.len() {
+            return Err(format!(
+                "excluding entries changed the corpus shape: {} vs {} positions",
+                full.len(),
+                filtered.len()
+            ));
+        }
+        let flipped: Vec<u64> = full
+            .iter()
+            .zip(&filtered)
+            .enumerate()
+            .filter(|(_, (f, k))| matches!((f, k), (Some(f), Some(k)) if f != k))
+            .map(|(p, _)| p as u64)
+            .collect();
+        if flipped.is_empty() {
+            // Bound the silent loss: the compatible corpus must keep the bulk
+            // of the scenarios, or the cross-release gate proves little.
+            if entries.len() * 10 < full.len() * 9 {
+                return Err(format!(
+                    "only {} of {} corpus entries survive the exclusions ({:?}); \
+                     isolate newer variants so they do not take core scenarios with them",
+                    entries.len(),
+                    full.len(),
+                    excluded
+                ));
+            }
+            return Ok((entries, excluded));
+        }
+        excluded.extend(flipped);
+    }
+    Err("exclusions did not reach a fixpoint".into())
+}
+
+fn generate(
+    random_instances: usize,
+    exclude: BTreeSet<u64>,
+) -> (Vec<(u64, Command)>, Vec<Option<bool>>) {
     let mut g = Gen::new();
+    g.exclude = exclude;
 
     // ---- Deployments -------------------------------------------------------
     let order = ProcessBuilder::new("order")
@@ -201,20 +354,6 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
         .parallel_gateway("join")
         .service_task("ship", "shipping")
         .end_event("e")
-        .event_sub_process(
-            "esp",
-            "esp-s",
-            EventSubProcessTrigger::Message {
-                message_name: "cancel-request".into(),
-                correlation_key: "orderId".into(),
-            },
-            false,
-        )
-        .start_event("esp-s")
-        .end_event("esp-e")
-        .contained_in("esp-s", "esp")
-        .contained_in("esp-e", "esp")
-        .connect("esp-s", "esp-e")
         .connect("s", "fork")
         .connect("fork", "m")
         .connect("fork", "sig")
@@ -234,10 +373,35 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
         .connect("w", "e")
         .build()
         .expect("starters");
-    g.push(Command::DeployResources(vec![timers, starters]));
-    // Its own entry: a build that cannot decode the event sub-process skips
-    // only this deployment in the previous-release cell.
-    g.push(Command::DeployProcess(messaging));
+    // Newer model shapes (conditional start, event sub-process) each get their
+    // OWN entry, apart from the core processes: a previous release that cannot
+    // decode them excludes only that deployment (and its dependents), never a
+    // core process the rest of the corpus runs on.
+    let escalation = ProcessBuilder::new("escalation")
+        .start_event("s")
+        .service_task("hold", "hold-work")
+        .end_event("e")
+        .connect("s", "hold")
+        .connect("hold", "e")
+        .event_sub_process(
+            "esp",
+            "esp-s",
+            EventSubProcessTrigger::Message {
+                message_name: "cancel-request".into(),
+                correlation_key: "orderId".into(),
+            },
+            false,
+        )
+        .start_event("esp-s")
+        .end_event("esp-e")
+        .contained_in("esp-s", "esp")
+        .contained_in("esp-e", "esp")
+        .connect("esp-s", "esp-e")
+        .build()
+        .expect("escalation");
+    g.push(Command::DeployResources(vec![timers, messaging]));
+    g.push(Command::DeployProcess(starters));
+    g.push(Command::DeployProcess(escalation));
 
     let order_v2 = ProcessBuilder::new("order")
         .start_event("s")
@@ -379,6 +543,10 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
         vars(&[("orderId", Value::Str("o-1".into()))]),
     ));
     let m1_instance = find(&m1, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    g.push(create(
+        "escalation",
+        vars(&[("orderId", Value::Str("o-1".into()))]),
+    ));
     g.push_json(json!({"CorrelateMessage": {
         "message_name": "cancel-request", "correlation_key": "o-1", "variables": {}
     }}));
@@ -456,25 +624,39 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
     }}));
 
     // ---- Ad-hoc, agents, orphan quarantine --------------------------------
-    g.push_json(json!({"ActivateAdHocActivities": {
-        "ad_hoc_instance_key": modi_instance,
-        "activate_elements": [{"element_id": "calc"}],
+    // A running ad-hoc container and an active external agent task, so both
+    // command families exercise their SUCCESS paths (push_ok_json), not only
+    // rejections against an unrelated key.
+    let agents = nanobpmn_engine_core::bpmn::parse_bpmn(AGENTS_BPMN)
+        .expect("agents model")
+        .remove(0);
+    g.push(Command::DeployProcess(agents));
+    let ag = g.push(create("agents", BTreeMap::new()));
+    // `unwrap_or(0)`: unfiltered, a 0 key makes push_ok_json panic below.
+    let ag_instance = find(&ag, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    let container = activated(&ag, "adhoc").unwrap_or(0);
+    let agent_ei = activated(&ag, "agent").unwrap_or(0);
+    g.push_ok_json(json!({"ActivateAdHocActivities": {
+        "ad_hoc_instance_key": container,
+        "activate_elements": [{"element_id": "toolA"}],
         "cancel_remaining": false
     }}));
-    let agent = g.push_json(json!({"CreateAgentInstance": {
-        "element_instance_key": modi_instance, "definition": {"model": "det-model"}
+    let agent = g.push_ok_json(json!({"CreateAgentInstance": {
+        "element_instance_key": agent_ei, "definition": {"model": "det-model"}
     }}));
     let agent_key = agent
         .iter()
-        .find_map(|e| e.as_object().and_then(|o| o.values().next().cloned()))
-        .and_then(|v| v.get("agent_instance_key").and_then(Json::as_u64))
+        .find_map(|e| e.get("AgentInstanceCreated"))
+        .and_then(|v| v.get("agent_instance"))
+        .and_then(|v| v.get("agent_instance_key"))
+        .and_then(Json::as_u64)
         .unwrap_or(0);
-    g.push_json(json!({"UpdateAgentInstance": {
-        "agent_instance_key": agent_key, "status": "Thinking"
+    g.push_ok_json(json!({"UpdateAgentInstance": {
+        "agent_instance_key": agent_key, "element_instance_key": agent_ei,
+        "element_id": "agent", "process_instance_key": ag_instance,
+        "status": "Thinking"
     }}));
-    g.push(Command::CompleteAgentInstance {
-        agent_instance_key: agent_key,
-    });
+    g.push_ok_json(json!({"CompleteAgentInstance": {"agent_instance_key": agent_key}}));
     g.push(Command::QuarantineOffheapOrphan {
         instance_key: 9_100_000,
         stamp: None,
@@ -544,7 +726,8 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
     g.push(Command::SetLenientCompletion { lenient: true });
     g.push(create("order", vars(&[("amount", Value::Int(42))])));
 
-    g.into_entries()
+    let outcomes = std::mem::take(&mut g.outcomes);
+    (g.into_entries(), outcomes)
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

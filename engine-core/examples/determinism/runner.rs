@@ -6,9 +6,14 @@
 //!
 //! * `{"i":N,"events":[…]}` — the events entry `N` emitted;
 //! * `{"i":N,"err":"…"}` — the typed rejection entry `N` produced;
-//! * `{"i":N,"state":{…}}` — the full `EngineSnapshot` after entry `N`, at
-//!   every `--state-every` checkpoint (the canonical durable-state digest
-//!   input; snapshot encoding is canonical since slice 3, #1662);
+//! * `{"i":N,"format":V,"state":{…}}` — the full `EngineSnapshot` after
+//!   entry `N` (`V` = this build's `SNAPSHOT_FORMAT_VERSION`), at every
+//!   `--state-every` checkpoint **and** after the corpus's last entry (so the
+//!   trailing partial interval is state-compared too; a `--stop-after` split
+//!   that ends before the corpus does emits no extra checkpoint, keeping a
+//!   split run byte-identical to an uninterrupted one). The canonical
+//!   durable-state digest input; snapshot encoding is canonical since slice 3,
+//!   #1662;
 //! * `{"i":N,"undecodable":"…"}` — this build cannot decode entry `N` (a
 //!   command variant newer than the build); the run stops there, or with
 //!   `--skip-undecodable` continues without applying it.
@@ -24,7 +29,7 @@
 
 use std::io::{BufRead, Write};
 
-use nanobpmn_engine_core::{Command, Engine, EngineSnapshot};
+use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, SNAPSHOT_FORMAT_VERSION};
 
 /// Options for one runner invocation.
 #[derive(Default)]
@@ -93,10 +98,8 @@ pub fn run(
     if opts.canary {
         canary_permute(&mut entries);
     }
-    let end = opts
-        .stop_after
-        .unwrap_or(entries.len() as u64)
-        .min(entries.len() as u64);
+    let total = entries.len() as u64;
+    let end = opts.stop_after.unwrap_or(total).min(total);
     let mut i = opts.start_at;
     for entry in entries
         .into_iter()
@@ -120,13 +123,23 @@ pub fn run(
         };
         writeln!(out, "{record}")?;
         i += 1;
-        if opts.state_every > 0 && i.is_multiple_of(opts.state_every) {
-            let state = serde_json::to_value(engine.snapshot())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            writeln!(out, "{}", serde_json::json!({ "i": i - 1, "state": state }))?;
+        let at_cadence = i.is_multiple_of(opts.state_every);
+        let at_corpus_end = i == total;
+        if opts.state_every > 0 && (at_cadence || at_corpus_end) {
+            write_state(engine, i - 1, out)?;
         }
     }
     Ok(i)
+}
+
+fn write_state(engine: &Engine, i: u64, out: &mut dyn Write) -> std::io::Result<()> {
+    let state = serde_json::to_value(engine.snapshot())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    writeln!(
+        out,
+        "{}",
+        serde_json::json!({ "i": i, "format": SNAPSHOT_FORMAT_VERSION, "state": state })
+    )
 }
 
 /// Serializes the engine for a process restart.

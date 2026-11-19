@@ -17,6 +17,9 @@
     reason = "non-production target (integration tests / examples)"
 )]
 
+#[path = "../examples/determinism/compare.rs"]
+#[allow(dead_code)]
+mod compare;
 #[path = "../examples/determinism/corpus.rs"]
 #[allow(dead_code)]
 mod corpus;
@@ -156,4 +159,85 @@ fn seeded_hashmap_nondeterminism_is_detected() {
     let a = full_run(&jsonl, true);
     let b = full_run(&jsonl, true);
     assert_ne!(a, b, "canary non-determinism escaped the comparison");
+}
+
+/// Every full run ends with a state checkpoint at the last entry, so the
+/// trailing partial interval (the newest config commands) is state-compared;
+/// a `--stop-after` split adds none (restart test above stays byte-equal).
+#[test]
+fn full_run_checkpoints_final_state() {
+    let jsonl = corpus_jsonl();
+    let last = jsonl.lines().count() as u64 - 1;
+    let records = full_run(&jsonl, false);
+    let tail: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(tail.get("i").and_then(|v| v.as_u64()), Some(last));
+    assert!(tail.get("state").is_some() && tail.get("format").is_some());
+}
+
+fn records(text: &str) -> Vec<serde_json::Value> {
+    compare::parse_records(text).unwrap()
+}
+
+#[test]
+fn cross_release_compares_durable_state() {
+    let jsonl = corpus_jsonl();
+    let head = records(&full_run(&jsonl, false));
+    let report = compare::cross_release(&head, &head).unwrap();
+    assert!(report.states_compared > 0);
+    assert_eq!(report.states_skipped_format_bump, 0);
+
+    // Identical events, divergent durable state at the same format: caught.
+    let mut prev = head.clone();
+    let state = prev
+        .iter_mut()
+        .rev()
+        .find(|r| r.get("state").is_some())
+        .unwrap();
+    state["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let err = compare::cross_release(&head, &prev).unwrap_err();
+    assert!(err.contains("durable state diverges"), "{err}");
+
+    // A snapshot-format bump is the explicit shape-change decision: skipped.
+    for r in prev.iter_mut().filter(|r| r.get("state").is_some()) {
+        r["format"] = serde_json::json!(0);
+    }
+    let report = compare::cross_release(&head, &prev).unwrap();
+    assert_eq!(report.states_compared, 0);
+    assert!(report.states_skipped_format_bump > 0);
+
+    // Missing checkpoints are not a silent pass.
+    let no_state: Vec<_> = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .cloned()
+        .collect();
+    assert!(compare::cross_release(&no_state, &no_state).is_err());
+}
+
+/// Excluding entries a previous release cannot decode regenerates the corpus
+/// with re-harvested keys; kept entries that depend on an excluded one are
+/// excluded too (never silently compared as degraded executions), and losing
+/// a core dependency is a hard failure.
+#[test]
+fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
+    let full = corpus::build(RANDOM);
+    let last = full.len() as u64 - 1;
+
+    // A self-contained tail entry: exactly one fewer entry, rest intact.
+    let (tail, excluded) = corpus::build_excluding(RANDOM, [last].into()).unwrap();
+    assert_eq!(tail.len(), full.len() - 1);
+    assert_eq!(excluded, [last].into());
+
+    // A key-allocating, self-contained entry (DeployForms, position 5)
+    // shifts every later key; re-harvesting keeps every kept outcome.
+    let (_, excluded) = corpus::build_excluding(RANDOM, [5].into()).unwrap();
+    assert_eq!(excluded, [5].into());
+
+    // A newer model shape (the event sub-process deployment, position 3):
+    // its dependents go with it, the core corpus survives.
+    let (_, excluded) = corpus::build_excluding(RANDOM, [3].into()).unwrap();
+    assert!(excluded.len() > 1, "dependents excluded: {excluded:?}");
+
+    // The core order-process deployment: most of the corpus depends on it.
+    assert!(corpus::build_excluding(RANDOM, [0].into()).is_err());
 }

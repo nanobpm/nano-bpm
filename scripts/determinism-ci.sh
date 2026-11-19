@@ -124,10 +124,13 @@ cmd_prev_release() {
 
   # Probe which entries the old build cannot decode (newer command variants
   # or model shapes), drop them, then replay the same filtered corpus on both.
+  # Regenerate (not line-filter) the corpus without them so later keys are
+  # re-harvested; it fails if a kept entry's outcome would change. State
+  # checkpoints are compared too whenever the snapshot format matches.
   "$prev_bin" "$out/corpus.jsonl" --out "$out/probe.jsonl" --skip-undecodable
-  "$BIN/determinism_corpus" filter "$out/corpus.jsonl" "$out/probe.jsonl" "$out/compat.jsonl"
-  "$prev_bin" "$out/compat.jsonl" --out "$out/prev.jsonl"
-  "$BIN/determinism_replay" "$out/compat.jsonl" --out "$out/head.jsonl"
+  "$BIN/determinism_corpus" emit-compatible "$out/probe.jsonl" "$out/compat.jsonl" --random "$RANDOM_INSTANCES"
+  "$prev_bin" "$out/compat.jsonl" --out "$out/prev.jsonl" --state-every "$STATE_EVERY"
+  "$BIN/determinism_replay" "$out/compat.jsonl" --out "$out/head.jsonl" --state-every "$STATE_EVERY"
   "$BIN/determinism_corpus" cross-release "$out/head.jsonl" "$out/prev.jsonl"
 }
 

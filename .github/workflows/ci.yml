@@ -393,6 +393,12 @@ jobs:
         with:
           workspaces: engine-core
           key: determinism-debug
+      - name: Install mold linker
+        # The canary and previous-release steps build the examples on this
+        # x86_64 runner, where .cargo/config.toml sets `-fuse-ld=mold`.
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - uses: actions/download-artifact@v4
         with:
           pattern: determinism-digest-*
