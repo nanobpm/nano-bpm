@@ -1435,7 +1435,10 @@ fn later_end_listener_failure_restarts_the_chain_and_reprojects_outputs() {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn first_start_listener_failure_retry_mints_the_listener_then_the_work() {
-    let (mut engine, inst) = start(task_with_start_listener(r#"type="=audit""#), BTreeMap::new());
+    let (mut engine, inst) = start(
+        task_with_start_listener(r#"type="=audit""#),
+        BTreeMap::new(),
+    );
     let incident = extract_value_incident(&engine, "work", "audit");
     set_and_resolve(
         &mut engine,

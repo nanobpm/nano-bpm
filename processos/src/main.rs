@@ -6184,7 +6184,8 @@ async fn distil_recorded_dataset(
 ) {
     let mut dataset: Vec<RecordedInstance> = Vec::new();
     let mut skipped = 0u32;
-    let mut skip_reasons: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut skip_reasons: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
     let mut matched = 0u32;
     for s in summaries.iter().filter(|s| s.process_id == process_id) {
         matched += 1;

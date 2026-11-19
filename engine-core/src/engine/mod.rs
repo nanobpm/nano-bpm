@@ -5625,8 +5625,7 @@ impl Engine {
                 //    exists; each mapped pair keeps the same BPMN type (compared
                 //    by discriminant only, so a service task may map to one with a
                 //    different job type — Zeebe parity).
-                let mut mapped: BTreeMap<String, String> =
-                    BTreeMap::new();
+                let mut mapped: BTreeMap<String, String> = BTreeMap::new();
                 for (src, tgt) in &mapping_instructions {
                     if mapped.contains_key(src) {
                         return Err(EngineError::DuplicateMappingSourceElement {

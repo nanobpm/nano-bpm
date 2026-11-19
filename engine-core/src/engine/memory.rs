@@ -160,7 +160,9 @@ impl Engine {
                 upserts.push((key, Arc::clone(&instance.variables)));
             }
         }
-        let forgets: Vec<Key> = std::mem::take(&mut self.forgotten_vars).into_iter().collect();
+        let forgets: Vec<Key> = std::mem::take(&mut self.forgotten_vars)
+            .into_iter()
+            .collect();
         (upserts, forgets)
     }
 

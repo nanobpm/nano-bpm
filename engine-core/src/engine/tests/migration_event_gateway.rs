@@ -426,7 +426,8 @@ fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
         .build()
         .unwrap();
     let target = two_timer_race("target");
-    let mapped: BTreeMap<String, String> = pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
+    let mapped: BTreeMap<String, String> =
+        pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
     let active = vec![
         (10, "a1".to_string()),
         (11, "a2".to_string()),

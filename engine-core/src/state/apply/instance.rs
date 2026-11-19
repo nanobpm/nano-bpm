@@ -581,8 +581,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // merge deterministically instead: sum the arrival counts, and
                 // keep the smallest element-instance key for the open join.
                 if !instance.join_counts.is_empty() {
-                    let mut remapped: BTreeMap<JoinKey, usize> =
-                        BTreeMap::new();
+                    let mut remapped: BTreeMap<JoinKey, usize> = BTreeMap::new();
                     for (mut eid, count) in std::mem::take(&mut instance.join_counts) {
                         remap_id(&mut eid.element_id);
                         *remapped.entry(eid).or_insert(0) += count;
@@ -593,9 +592,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // source element, so both ids are remapped (the migration guard
                 // has already checked every flow exists in the target).
                 if !instance.join_flow_arrivals.is_empty() {
-                    let mut remapped: BTreeMap<JoinKey, FlowArrivals> =
-                        BTreeMap::new();
-                    for (mut eid, mut arrivals) in std::mem::take(&mut instance.join_flow_arrivals) {
+                    let mut remapped: BTreeMap<JoinKey, FlowArrivals> = BTreeMap::new();
+                    for (mut eid, mut arrivals) in std::mem::take(&mut instance.join_flow_arrivals)
+                    {
                         remap_id(&mut eid.element_id);
                         arrivals.remap(remap_id);
                         let merged = remapped.entry(eid).or_default();
@@ -606,8 +605,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     instance.join_flow_arrivals = remapped;
                 }
                 if !instance.join_instances.is_empty() {
-                    let mut remapped: BTreeMap<JoinKey, Key> =
-                        BTreeMap::new();
+                    let mut remapped: BTreeMap<JoinKey, Key> = BTreeMap::new();
                     for (mut eid, eik) in std::mem::take(&mut instance.join_instances) {
                         remap_id(&mut eid.element_id);
                         remapped

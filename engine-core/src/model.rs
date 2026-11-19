@@ -132,7 +132,10 @@ impl Condition {
     /// error on a parse/type failure or a non-boolean result. A condition-routed
     /// gateway (exclusive or inclusive) turns such an error into an
     /// `ExpressionEvaluation` incident.
-    pub fn eval(&self, variables: &BTreeMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
+    pub fn eval(
+        &self,
+        variables: &BTreeMap<String, Value>,
+    ) -> Result<bool, crate::feel::FeelError> {
         crate::feel::eval_bool(&self.expression, variables)
     }
 }

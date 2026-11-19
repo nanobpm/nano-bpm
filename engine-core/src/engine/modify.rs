@@ -974,14 +974,15 @@ impl Engine {
         // writes are layered per scope while descending the created chain
         // (in `plan_modification`), never merged into the root here.
         let instance_root = instance.key;
-        let mut land =
-            |target: Key, variables: &BTreeMap<String, Value>, root: &mut BTreeMap<String, Value>| {
-                if target == instance_root || target == 0 {
-                    root.extend(variables.clone());
-                } else if let Some(local) = locals.get_mut(&target) {
-                    local.extend(variables.clone());
-                }
-            };
+        let mut land = |target: Key,
+                        variables: &BTreeMap<String, Value>,
+                        root: &mut BTreeMap<String, Value>| {
+            if target == instance_root || target == 0 {
+                root.extend(variables.clone());
+            } else if let Some(local) = locals.get_mut(&target) {
+                local.extend(variables.clone());
+            }
+        };
         let mut own = StagedWrites::default();
         self.stage_writes(instance_key, planned, &mut own);
         for staged_write in staged.writes.iter().chain(own.writes.iter()) {

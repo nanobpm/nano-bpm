@@ -947,7 +947,9 @@ fn flatten_flow_kinds(ann: &SemanticAnnotations) -> BTreeMap<String, FlowKind> {
     out
 }
 
-fn flatten_cluster_membership(ann: &SemanticAnnotations) -> BTreeMap<String, BTreeMap<String, f64>> {
+fn flatten_cluster_membership(
+    ann: &SemanticAnnotations,
+) -> BTreeMap<String, BTreeMap<String, f64>> {
     let mut out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for c in &ann.clusters {
         for n in &c.nodes {

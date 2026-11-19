@@ -140,7 +140,10 @@ fn type_failure(raw: &str, expected: &str, actual_kind: &str) -> Failure {
 
 /// Zeebe `evaluateStringExpression`: the result must be a `STRING` (a `null`
 /// result is a failure).
-pub(crate) fn evaluate_string(raw: &str, vars: &BTreeMap<String, Value>) -> Result<String, Failure> {
+pub(crate) fn evaluate_string(
+    raw: &str,
+    vars: &BTreeMap<String, Value>,
+) -> Result<String, Failure> {
     match evaluate_or_failure(raw, vars)? {
         Evaluated {
             value: Value::Str(s),
