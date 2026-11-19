@@ -83,6 +83,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold every crate link fails with `cannot find 'ld'`.
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - name: Cache cargo-mutants + build
         uses: actions/cache@v4
         with:
@@ -109,23 +115,35 @@ jobs:
             # the full nightly scope, not the slice. A PR-specific config
             # REPLACES the scope instead: --config reads this file instead of
             # .cargo/mutants.toml, so its examine_re is the whole filter.
-            # Keep it in sync with .cargo/mutants.toml's features and
-            # additional_cargo_test_args (the parity corpus the mutants run
-            # against) — those are the shared parts the nightly scope needs.
-            # The two engine-core functions named here are the guard surface
-            # this PR touches; a PR touching a different guard edits this list.
-            {
-              echo 'examine_globs = ["src/engine/mod.rs"]'
-              echo "examine_re = ['Engine::activate_join', 'Engine::has_active_path_to']"
-              # StructField mutants (a `delete field … from struct … expression`
-              # inside a function) bypass the name filter — cargo-mutants pushes
-              # them without allows_mutant (visit.rs) — so the two glob-admitted
-              # functions outside the slice are excluded by name even though the
-              # examine_re above does not select them.
-              echo "exclude_re = ['Engine::plan_command_inner', 'Engine::adhoc_completion_after_tool']"
-              echo 'features = ["serde"]'
-              echo 'additional_cargo_test_args = ["--lib", "--test", "trace_validation", "--test", "zeebe_token_flow_trace_validation", "--test", "conformance"]'
-            } > /tmp/mutants-pr.toml
+            # The PR config is DERIVED from the canonical .cargo/mutants.toml
+            # (features / additional_cargo_test_args — the parity corpus the
+            # mutants run against — can never drift from the nightly); only the
+            # scope keys are overridden with the guard surface this PR touches
+            # (a PR touching a different guard edits the three override lines).
+            #
+            # StructField mutants (a `delete field … from struct … expression`
+            # inside a function) bypass the name filter — cargo-mutants pushes
+            # them without allows_mutant (visit.rs) — so the two glob-admitted
+            # functions outside the slice are excluded by name even though the
+            # examine_re below does not select them.
+            awk '
+              /^examine_globs = / {
+                print "examine_globs = [\"src/engine/mod.rs\"]"; skip = 0; next
+              }
+              /^examine_re = \[/ { print "examine_re = [\x27Engine::activate_join\x27, \x27Engine::has_active_path_to\x27]"; skip = 1; next }
+              /^exclude_re = \[/ { print "exclude_re = [\x27Engine::plan_command_inner\x27, \x27Engine::adhoc_completion_after_tool\x27]"; skip = 1; next }
+              skip && /^[[:space:]]*\]/ { skip = 0; next }
+              skip { next }
+              { print }
+            ' .cargo/mutants.toml > /tmp/mutants-pr.toml
+            # The derivation must keep the canonical test selection: if the
+            # canonical file drifts (a key renamed, a multi-line array
+            # reformatted), fail here rather than validate the wrong suite.
+            for key in features additional_cargo_test_args; do
+              diff <(awk -v k="$key" 'index($0, k" = [") {f=1} f {print; if ($0 ~ /\]/) exit}' .cargo/mutants.toml) \
+                   <(awk -v k="$key" 'index($0, k" = [") {f=1} f {print; if ($0 ~ /\]/) exit}' /tmp/mutants-pr.toml) \
+                || { echo "PR mutants config lost the canonical $key"; exit 1; }
+            done
             cargo mutants --in-place --config /tmp/mutants-pr.toml
           else
             cargo mutants --in-place

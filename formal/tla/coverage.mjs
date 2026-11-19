@@ -23,9 +23,17 @@
 //   - actions: every disjunct of `Next`, and transitively every action
 //     operator (a definition that primes a variable or says UNCHANGED) it
 //     calls. Each Next disjunct must FIRE (found > 0) in at least one model.
+//     A Next disjunct must NAME its action: an inline one (e.g. a bare
+//     `UNCHANGED vars`) is silently dropped here, so specs name it instead
+//     (SnapshotReplay's `RecoverAsIs`).
 //   - disjuncts: every line of an action body that begins a conjunct, a
 //     disjunct, a CASE arm, or an IF branch (`/\`, `\/`, `[]`, `CASE`, `THEN`,
 //     `ELSE`). Each must be evaluated (TLC count > 0) in at least one model.
+//     Line obligations follow EVERY definition reachable from a Next disjunct
+//     (including pure guard helpers such as `ZeebeInclusiveReady` or
+//     `TokenFlow.JoinFires`), not only the action closure: an action's guard
+//     is evaluated exactly when the action is, so a guard branch TLC never
+//     evaluated is a real coverage gap.
 //
 // Coverage is aggregated over all of a spec's models: an action need only fire
 // in one of them. Every registered spec (formal/tla/specs/*.spec) is gated, so a
@@ -126,6 +134,21 @@ function actionClosure(name, defs) {
   return seen;
 }
 
+// Every definition reachable from `name`, whether or not it primes a variable:
+// the line obligations of an action include the pure guard helpers it calls
+// (an action's guard is evaluated exactly when the action is).
+function reachableClosure(name, defs) {
+  const seen = new Set();
+  const stack = [name];
+  while (stack.length) {
+    const n = stack.pop();
+    if (seen.has(n)) continue;
+    seen.add(n);
+    for (const r of refs(defs.get(n), defs)) stack.push(r);
+  }
+  return seen;
+}
+
 // The expected coverage obligations of a spec module.
 export function expectations(src) {
   const defs = parseDefs(src);
@@ -143,10 +166,14 @@ export function expectations(src) {
   }
   const actions = new Set();
   for (const d of disjuncts) for (const a of actionClosure(d, defs)) actions.add(a);
+  // Line obligations come from the FULL reachable closure (guards included);
+  // firing obligations stay on the action closure (`actions` above).
+  const obligated = new Set();
+  for (const d of disjuncts) for (const a of reachableClosure(d, defs)) obligated.add(a);
   const lines = new Map(); // line number -> "Action: text"
   const extent = new Map(); // line number -> last line of that conjunct/disjunct
   const alias = new Map(); // line number -> [start, end] of a bare operator it references
-  for (const a of actions) {
+  for (const a of obligated) {
     const def = defs.get(a);
     def.lines.forEach(({ no, text }, i) => {
       const t = text.trim();

@@ -22,10 +22,10 @@ Next ==
 ====
 `;
 
-const header = (name, line, found) =>
-  `<${name} line ${line}, col 1 to line ${line}, col 3 of module Toy>: ${found}:${found}`;
-const loc = (from, to, n, depth = 0) =>
-  `  ${'|'.repeat(depth)}line ${from}, col 5 to line ${to}, col 9 of module Toy: ${n}`;
+const header = (name, line, found, mod = 'Toy') =>
+  `<${name} line ${line}, col 1 to line ${line}, col 3 of module ${mod}>: ${found}:${found}`;
+const loc = (from, to, n, depth = 0, mod = 'Toy') =>
+  `  ${'|'.repeat(depth)}line ${from}, col 5 to line ${to}, col 9 of module ${mod}: ${n}`;
 const log = (...rows) => ['The coverage statistics at now', ...rows, 'End of statistics.'].join('\n');
 
 test('stripComments keeps line structure', () => {
@@ -38,7 +38,9 @@ test('stripComments keeps line structure', () => {
 test('expectations derive Next disjuncts and action lines', () => {
   const exp = expectations(SPEC);
   assert.deepEqual(exp.disjuncts, ['Inc', 'Never']);
-  assert.deepEqual([...exp.lines.keys()].sort((a, b) => a - b), [5, 6, 8, 9]);
+  // Line 3 (`Guard == x < 3`) is obligated too: line obligations follow every
+  // reachable definition, including the pure guard helper.
+  assert.deepEqual([...exp.lines.keys()].sort((a, b) => a - b), [3, 5, 6, 8, 9]);
   // `/\\ Guard` is a bare reference: TLC reports it at Guard's definition.
   assert.deepEqual(exp.alias.get(5), [3, 3]);
 });
@@ -93,4 +95,53 @@ Next ==
   assert.deepEqual(exp.disjuncts, ['Wrap']);
   assert.deepEqual([...exp.closures.get('Wrap')].sort(), ['Step', 'Wrap']);
   assert.ok(exp.lines.has(4) && exp.lines.has(5));
+});
+
+test('an inline Next disjunct (no named action) is dropped — specs must name it', () => {
+  // SnapshotReplay's `\/ UNCHANGED vars` stutter: the gate cannot track an
+  // anonymous disjunct, so the spec names it (`RecoverAsIs`). This pins the
+  // drop so a future inline disjunct is a deliberate, visible choice.
+  const src = `---- MODULE Inline ----
+VARIABLE x
+Inc ==
+    /\\ x < 3
+    /\\ x' = x + 1
+Next ==
+    \\/ Inc
+    \\/ UNCHANGED x
+====
+`;
+  const exp = expectations(src);
+  assert.deepEqual(exp.disjuncts, ['Inc']);
+  // The named form IS tracked:
+  const named = src.replace('Next ==\n    \\/ Inc\n    \\/ UNCHANGED x',
+    'Stutter == UNCHANGED x\nNext ==\n    \\/ Inc\n    \\/ Stutter');
+  assert.deepEqual(expectations(named).disjuncts, ['Inc', 'Stutter']);
+});
+
+test('line obligations include pure guard helpers reachable from an action', () => {
+  const src = `---- MODULE Guarded ----
+VARIABLE x
+Ready ==
+    \\/ x > 10
+    \\/ x < 0
+Inc ==
+    /\\ Ready
+    /\\ x' = x + 1
+Next ==
+    \\/ Inc
+====
+`;
+  const exp = expectations(src);
+  // Ready's disjuncts (lines 4-5) are obligations even though Ready is not an
+  // action; the firing closure stays action-only.
+  assert.deepEqual([...exp.lines.keys()].sort((a, b) => a - b), [4, 5, 7, 8]);
+  const l = log(header('Inc', 6, 2, 'Guarded'), loc(7, 8, 2, 0, 'Guarded'));
+  const problems = checkSpec({ name: 'Guarded', src, logs: [['M', l]] });
+  assert.ok(problems.some((p) => p.startsWith('line 4 ')));
+  assert.ok(problems.some((p) => p.startsWith('line 5 ')));
+  // `/\\ Ready` (line 7) is a bare reference: TLC attributes it to Ready's
+  // definition (lines 4-5), so covering 4-5 + the primed line satisfies Inc.
+  const covered = log(header('Inc', 6, 2, 'Guarded'), loc(4, 5, 1, 0, 'Guarded'), loc(8, 8, 2, 0, 'Guarded'));
+  assert.deepEqual(checkSpec({ name: 'Guarded', src, logs: [['M', covered]] }), []);
 });
