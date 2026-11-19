@@ -6151,7 +6151,7 @@ fn check_legacy_recovery_attribution(p: u64, num_partitions: usize) -> std::io::
 /// How a rebuild reconstructs an engine that is dead or fenced (#1473): a
 /// PROMOTION needs an authoritative durable baseline (never an empty replica),
 /// while a RECEIVER can start from a fresh replica the leader backfills.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RebuildEngineMode {
     Promote,
     Receiver,
@@ -20121,6 +20121,22 @@ impl ServerImpl {
         p: u64,
         mode: RebuildEngineMode,
     ) -> Option<DeepthiHandle> {
+        // A member latched on a replica DIVERGENCE (ADR 0066 slice 5, #1664)
+        // must never be PROMOTED: its engine and journal are its own diverged
+        // lineage, and reconstructing from them would clear the fence and lead
+        // without the fail-stop latch. Only an authoritative resync (the
+        // Receiver path, which rebuilds as a fresh learner of the leader) may
+        // replace it. Refuse BEFORE retiring so the latched core stays in place.
+        if mode == RebuildEngineMode::Promote
+            && let Some(d) = self.raft.get(p).and_then(|old| old.divergence())
+        {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED ({d}) — refusing to PROMOTE it from its own diverged \
+                 lineage; it stays fail-stopped until resynced from an authoritative leader"
+            );
+            return None;
+        }
         let mut guards = Vec::with_capacity(2);
         let mut retired_engine: Option<DeepthiHandle> = None;
         if let Some(old) = self.raft.get(p) {
@@ -43570,6 +43586,42 @@ mod clustered_startup_tests {
 
         part0.raft.shutdown().await.ok();
         rebuilt.raft.shutdown().await.ok();
+    }
+
+    /// #1664 review: a diverged follower is never PROMOTED (e.g. by the
+    /// leader-durable recovery tick after its incumbent vanishes) — promotion
+    /// would rebuild from its own diverged lineage and drop the latch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_diverged_follower_is_never_promoted() {
+        // Latch a divergence on the OWNING node's member with a still-healthy
+        // engine: without the promotion guard, `retire_and_resolve_engine`
+        // would carry that engine into a fresh leader with no latch.
+        let (node0, _node1, part0, _part1) =
+            two_node_p0_group(ReplicationMode::LeaderDurable).await;
+        part0
+            .propose(deploy_cmd("d-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        let chain = nano_server_storage::digest::ChainDigest::genesis(0);
+        part0.latch_divergence_for_test(crate::raft::Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain,
+        });
+        part0.raft.shutdown().await.ok();
+
+        node0.promote_partition(0, 1).await;
+
+        let cur = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition still registered");
+        assert!(
+            Arc::ptr_eq(&cur, &part0) && cur.divergence().is_some(),
+            "promotion must not replace the latched, fail-stopped core"
+        );
+        assert!(!node0.i_lead_raft(0), "a diverged member must never lead");
     }
 
     /// #1664 review: a diverged quorum VOTER is never resynced onto an empty

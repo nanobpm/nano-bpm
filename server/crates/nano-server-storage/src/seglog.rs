@@ -3218,7 +3218,8 @@ pub fn recover_multi_scoped(
                         engine
                     }
                     None => {
-                        verify_replayed_chain(None, &p_events, crate::digest::Coverage::Window)?;
+                        // `base_p == 0`: `p_events` is the partition's COMPLETE history.
+                        verify_replayed_chain(None, &p_events, crate::digest::Coverage::Complete)?;
                         Engine::replay_partition(p, p_events)
                     }
                 }
@@ -7716,6 +7717,46 @@ mod tests {
         match crate::journal::Journal::replay_verified(0, events) {
             Err(e) => assert!(e.to_string().contains("index 2"), "names the entry: {e}"),
             Ok(_) => panic!("a tampered legacy stream must fail closed"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1664 review: multi-partition recovery with NO snapshot replays each
+    /// partition's COMPLETE history (`base_p == 0`), so it verifies with
+    /// `Coverage::Complete` — a first digest-bearing entry whose chain does not
+    /// derive from genesis (e.g. a lost prefix event) fails CLOSED instead of
+    /// being adopted as an unchecked anchor.
+    #[test]
+    fn multi_partition_full_replay_rejects_an_unanchored_first_entry() {
+        let dir = temp_dir("multi-digest-prefix");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            // The first digest-bearing entry claims a chain that does not
+            // start at genesis (based below its own index): the shape a lost
+            // prefix leaves behind. A window would adopt it as its anchor.
+            let mut forged = crate::digest::next_entry_digest(None, 1, 0, &[]);
+            forged.chain.base = 0;
+            j0.begin_raft_entry();
+            let state = serde_json::json!({ "digest": forged }).to_string();
+            let (_, commit) = j0.commit_raft_entry(1, state).unwrap();
+            commit.blocking_wait();
+            digest_entry(&mut j0, 2, Command::DeployProcess(demo()));
+        }
+        match recover_multi(&dir, &[0, 1], 2, None) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}"),
+            Ok(_) => panic!("an unanchored complete history must fail closed"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

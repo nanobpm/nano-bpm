@@ -4073,6 +4073,14 @@ impl RaftPartition {
         self.digest.divergence()
     }
 
+    /// TEST-ONLY (#1664): latch a divergence on this member without the
+    /// apply-path fail-stop, so a test can drive the rebuild/promotion paths
+    /// against a diverged member whose engine is otherwise healthy.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn latch_divergence_for_test(&self, d: Divergence) {
+        self.digest.set_diverged(d);
+    }
+
     /// This member's latest recorded chain digest claim (#1664): the chain
     /// after its last applied entry. Two replicas that applied the same log
     /// prefix report equal claims.
