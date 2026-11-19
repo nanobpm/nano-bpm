@@ -1242,6 +1242,16 @@ pub struct PartitionStateMachine {
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
+    /// The STABLE per-partition directory the crash-durable divergence marker
+    /// (#1691) is anchored to: the engine journal's durable segmented-log
+    /// directory when it has one, independently of whether this member's RAFT
+    /// log is durable — a fresh receiver (`log_dir = None`) anchors its
+    /// snapshots in a per-boot temp dir, but its engine journal may still be
+    /// durable (an owned partition), and a marker written to the temp dir
+    /// would be missed by the next durable boot. `None` when the engine
+    /// journal is in-memory: the marker then lives in `snapshot_dir` (a
+    /// volatile replica has no durable state to fence).
+    marker_dir: Option<PathBuf>,
     /// This node's id, compared against [`leader`](Self::leader) so `apply` can
     /// tell whether it is currently the leader of this partition.
     node_id: NodeId,
@@ -1291,6 +1301,7 @@ impl PartitionStateMachine {
         engine: DeepthiHandle,
         partition_id: u64,
         snapshot_dir: PathBuf,
+        marker_dir: Option<PathBuf>,
         node_id: NodeId,
         evict_eligible: bool,
         leader: Arc<AtomicU64>,
@@ -1362,6 +1373,7 @@ impl PartitionStateMachine {
             current_snapshot: Mutex::new(restored),
             in_flight_snapshots: Arc::default(),
             snapshot_dir,
+            marker_dir,
             node_id,
             evict_eligible,
             leader,
@@ -1379,6 +1391,13 @@ impl PartitionStateMachine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .partition_id
+    }
+
+    /// The directory the crash-durable divergence marker (#1691) lives in: the
+    /// engine journal's durable dir when there is one ([`marker_dir`](Self::marker_dir)),
+    /// else this member's snapshot dir.
+    fn marker_dir(&self) -> &Path {
+        self.marker_dir.as_deref().unwrap_or(&self.snapshot_dir)
     }
 
     /// A unique per-process, per-partition snapshot directory under the system
@@ -1441,6 +1460,7 @@ impl PartitionStateMachine {
             engine,
             partition_id,
             Self::temp_snapshot_dir(partition_id),
+            None,
             0,
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
@@ -1460,6 +1480,7 @@ impl PartitionStateMachine {
             engine,
             self.partition_id(),
             self.snapshot_dir.clone(),
+            self.marker_dir.clone(),
             self.node_id,
             false,
             Arc::clone(&self.leader),
@@ -1477,7 +1498,19 @@ impl PartitionStateMachine {
     /// and openraft only has to replay the post-snapshot log tail on top. A no-op
     /// when there is no durable snapshot (the unpurged log replays in full, the
     /// original recovery path).
+    ///
+    /// A VOLATILE-log member (a fresh receiver) boots through here. It has no
+    /// durable snapshot of its own, but its engine journal may still be durable
+    /// (an owned partition), so the crash-durable divergence marker (#1691) is
+    /// checked here too — a refused boot fences the engine exactly like the
+    /// durable path ([`restore_newest_boot_state`](Self::restore_newest_boot_state)).
     async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
+        if let Err(refused) = self.refuse_diverged_local_state() {
+            // Fail closed exactly like the durable boot path: fence the engine
+            // so no write path can append to the known-diverged journal.
+            self.engine.with(|journal| journal.abort_raft_entry()).await;
+            return Err(refused);
+        }
         let path = {
             let guard = self
                 .current_snapshot
@@ -1603,10 +1636,14 @@ impl PartitionStateMachine {
             self.digest.set_diverged(divergence.clone());
             // Crash-durable marker (#1691) BEFORE the quarantine: a restart
             // must never resume the diverged journal, and a self-consistent
-            // diverged chain passes replay verification on its own.
-            if let Err(e) = persist_divergence_fence(&self.snapshot_dir, &divergence) {
+            // diverged chain passes replay verification on its own. Anchored
+            // at the engine journal's durable dir when it has one, so a
+            // volatile-LOG member over a durable journal (a fresh receiver)
+            // is still fenced at its stable per-partition location.
+            let marker_dir = self.marker_dir().to_path_buf();
+            if let Err(e) = persist_divergence_fence(&marker_dir, &divergence) {
                 tracing::error!(
-                    dir = ?self.snapshot_dir,
+                    dir = ?marker_dir,
                     error = %e,
                     "could not persist the divergence marker (#1691)"
                 );
@@ -1673,7 +1710,7 @@ impl PartitionStateMachine {
     /// never runs, and a latch would refuse the very leader install that
     /// clears the marker.
     fn refuse_diverged_local_state(&self) -> anyhow::Result<()> {
-        match read_divergence_marker(&self.snapshot_dir) {
+        match read_divergence_marker(self.marker_dir()) {
             None => Ok(()),
             Some(Ok(d)) => {
                 anyhow::bail!(
@@ -1681,14 +1718,14 @@ impl PartitionStateMachine {
                      the durable divergence marker {:?} is cleared only by an authoritative \
                      leader resync (#1691)",
                     self.partition_id(),
-                    divergence_marker_path(&self.snapshot_dir)
+                    divergence_marker_path(self.marker_dir())
                 )
             }
             Some(Err(e)) => anyhow::bail!(
                 "partition {}: refusing to boot from known-diverged local state (unreadable \
                  divergence marker {:?}: {e}); resync from the leader (#1691)",
                 self.partition_id(),
-                divergence_marker_path(&self.snapshot_dir)
+                divergence_marker_path(self.marker_dir())
             ),
         }
     }
@@ -1957,7 +1994,7 @@ impl PartitionStateMachine {
                 )
                 .into());
             }
-            clear_divergence_marker(&self.snapshot_dir)
+            clear_divergence_marker(self.marker_dir())
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         }
         {
@@ -3797,6 +3834,7 @@ impl RaftPartition {
             engine,
             partition_id,
             log_dir.join("snapshots"),
+            None,
             node_id,
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
@@ -3865,6 +3903,34 @@ impl RaftPartition {
         log_dir: Option<std::path::PathBuf>,
         evict_eligible: bool,
     ) -> anyhow::Result<Self> {
+        Self::bootstrap_member_with_marker_dir(
+            node_id,
+            partition_id,
+            engine,
+            transport,
+            log_dir,
+            evict_eligible,
+            None,
+        )
+        .await
+    }
+
+    /// [`bootstrap_member`](Self::bootstrap_member) with an explicit override
+    /// for the divergence-marker directory (#1691 review): a fresh receiver
+    /// (`log_dir = None`) anchors its snapshots in a per-boot temp dir, but
+    /// its engine journal may still be durable (an owned partition), so the
+    /// marker must live at the journal's stable per-partition dir — a marker
+    /// in the temp dir would be missed by the next durable boot.
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_member_with_marker_dir(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        log_dir: Option<std::path::PathBuf>,
+        evict_eligible: bool,
+        marker_dir: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
         let config = Arc::new(raft_config(partition_id).validate()?);
         // Anchor snapshots next to the durable log when there is one, else a temp
         // dir for the volatile (in-memory-log) deployments.
@@ -3883,6 +3949,7 @@ impl RaftPartition {
             engine,
             partition_id,
             snapshot_dir,
+            marker_dir,
             node_id,
             evict_eligible,
             leader.clone(),
@@ -3997,13 +4064,22 @@ impl RaftPartition {
         // No durable log dir: a receiver never resumes an on-disk lineage, and a
         // volatile member anchors its snapshots in a fresh per-boot temp dir, so
         // no prior snapshot can seed its applied state either.
-        let part = Self::bootstrap_member(
+        //
+        // The divergence marker (#1691 review) is anchored at the ENGINE
+        // journal's durable dir instead: that dir is stable per partition
+        // across boots, so a divergence detected by this volatile member still
+        // fences the next durable boot of the same journal.
+        let marker_dir = engine
+            .with(|j| j.durable_dir().map(|d| d.to_path_buf()))
+            .await;
+        let part = Self::bootstrap_member_with_marker_dir(
             node_id,
             partition_id,
             engine,
             transport,
             None,
             evict_eligible,
+            marker_dir,
         )
         .await?;
         if let Err(e) = part.ensure_fresh_receiver_state().await {
@@ -5357,10 +5433,20 @@ mod tests {
     /// diverged replica's dir refuses to adopt its local state (a diverged
     /// chain can be self-consistent, so replay verification alone would pass),
     /// and only an authoritative leader snapshot install clears the marker.
+    ///
+    /// #1691 review (round 4): this runs on an INDEPENDENT durable journal —
+    /// reopened from its directory after a deterministic shutdown — so the
+    /// boot-time fence is the only thing between the refusal and the diverged
+    /// journal (the old fixture shared one in-memory journal between both
+    /// state machines, so `fail_stop_divergence` had already fenced the
+    /// "restarted" engine before the boot attempt), and the resync's
+    /// `checkpoint_base` really publishes the adopted base (an in-memory
+    /// journal no-ops it).
     #[tokio::test]
     async fn a_restart_after_a_divergence_refuses_local_state_until_resync() {
-        let (mut restarted, dir, leader_meta, diverged, received) =
-            publication_race_fixture().await;
+        let journal_dir = unique_log_dir("1691-resync");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let snap_dir = journal_dir.join("snapshots");
         let chain = ChainDigest::genesis(1);
         let divergence = Divergence {
             index: 1,
@@ -5368,14 +5454,95 @@ mod tests {
             leader: chain,
             local: chain.fold(1, 0, &[]),
         };
-        let _ = diverged.fail_stop_divergence(divergence.clone()).await;
-        assert_eq!(
-            read_divergence_marker(&dir).and_then(Result::ok),
-            Some(divergence),
-            "the divergence is persisted"
+        // The leader's authoritative snapshot (an in-memory donor), to be
+        // "received" by the diverged replica below. Written in the real
+        // streaming on-disk format (#1337), the bytes `install_snapshot`
+        // actually consumes.
+        let donor = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        donor
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("donor deploy applies");
+            })
+            .await;
+        let (capture, cold_keys, stores) = donor
+            .with(|j| j.streaming_snapshot_parts().expect("donor capture"))
+            .await;
+        let donor_body = journal_dir.join("leader-snapshot.bin");
+        {
+            let header = nano_server_storage::seglog::snapshot_envelope_header_line(&journal_dir)
+                .expect("snapshot header");
+            nano_server_storage::snapstream::write_streaming_snapshot_from_stores(
+                &donor_body,
+                &header,
+                0,
+                None,
+                capture,
+                &cold_keys,
+                stores,
+                false,
+            )
+            .expect("write leader snapshot body");
+        }
+        let leader_bytes = std::fs::read(&donor_body).expect("read leader snapshot body");
+        let leader_meta = SnapshotMeta {
+            last_log_id: Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 7)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "leader-7".to_string(),
+        };
+
+        // Phase 1: a DURABLE replica applies an entry, detects a divergence,
+        // and fail-stops — persisting the marker at its stable journal dir.
+        {
+            let engine = durable_engine(&journal_dir);
+            engine
+                .with(|j| {
+                    let _ = j
+                        .apply_command_at(deploy_command(), 1)
+                        .expect("deploy applies");
+                })
+                .await;
+            let sm = PartitionStateMachine::new(
+                engine.clone(),
+                0,
+                snap_dir.clone(),
+                Some(journal_dir.clone()),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("state machine");
+            let _ = sm.fail_stop_divergence(divergence.clone()).await;
+            assert_eq!(
+                read_divergence_marker(&journal_dir).and_then(Result::ok),
+                Some(divergence),
+                "the divergence is persisted at the stable per-partition dir"
+            );
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+
+        // Phase 2: RESTART over the same durable journal. The reopened journal
+        // starts UNFENCED (the fence is in-memory only) — the crash-durable
+        // marker is the only thing refusing the boot.
+        let engine2 = durable_engine(&journal_dir);
+        assert!(
+            !engine2.with(|j| j.is_fenced()).await,
+            "a reopened journal starts unfenced: only the marker fences the boot"
         );
-        // `restarted` shares the dir but none of the in-memory latch/fence:
-        // exactly what a process restart sees.
+        let mut restarted = Arc::new(
+            PartitionStateMachine::new(
+                engine2.clone(),
+                0,
+                snap_dir.clone(),
+                Some(journal_dir.clone()),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("restarted state machine"),
+        );
         assert!(restarted.digest.divergence().is_none());
         let refused = restarted
             .restore_newest_boot_state()
@@ -5383,22 +5550,96 @@ mod tests {
             .expect_err("a diverged replica must not resume its local state");
         assert!(refused.to_string().contains("#1691"), "{refused}");
         assert!(
-            restarted.engine.with(|j| j.is_fenced()).await,
+            engine2.with(|j| j.is_fenced()).await,
             "a refused boot fences the engine against direct writes"
         );
+        assert!(
+            engine2
+                .with(|j| j.apply_command_at(deploy_command(), 2).map(|_| ()))
+                .await
+                .is_err(),
+            "the fenced journal rejects commands after the refused boot"
+        );
         // A corrupt marker still fails closed.
-        std::fs::write(divergence_marker_path(&dir), b"{not json").expect("corrupt");
+        std::fs::write(divergence_marker_path(&journal_dir), b"{not json").expect("corrupt");
         assert!(restarted.restore_newest_boot_state().await.is_err());
-        // Authoritative leader resync: the install durably clears the marker.
+
+        // Phase 3: authoritative leader resync. The install ADOPTS the leader's
+        // state over the fence (an authoritative adoption supersedes it) and
+        // checkpoints it as the journal's durable recovery base, then durably
+        // clears the marker.
+        let mut received = restarted
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&leader_bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
         restarted
             .install_snapshot(&leader_meta, received)
             .await
-            .expect("leader resync installs");
-        assert!(read_divergence_marker(&dir).is_none(), "cleared by resync");
-        restarted
+            .expect("leader resync installs over the fence");
+        assert!(
+            read_divergence_marker(&journal_dir).is_none(),
+            "cleared by resync"
+        );
+        assert!(
+            !engine2.with(|j| j.is_fenced()).await,
+            "the adopted authoritative state supersedes the fence"
+        );
+        // The adopted state serves commands...
+        engine2
+            .with(|j| {
+                let (_, commit) = j
+                    .apply_command_at(deploy_command(), 3)
+                    .expect("a command applies after the resync");
+                commit
+            })
+            .await
+            .wait()
+            .await;
+        // ...and the journal's recovery base now covers the adopted snapshot:
+        // a SECOND restart (another independent reopen) boots clean and still
+        // serves commands.
+        drop(restarted);
+        shutdown_engine(engine2).await;
+        let engine3 = durable_engine(&journal_dir);
+        assert!(
+            !engine3.with(|j| j.is_fenced()).await,
+            "the resync left no fence behind"
+        );
+        let rebooted = PartitionStateMachine::new(
+            engine3.clone(),
+            0,
+            snap_dir.clone(),
+            Some(journal_dir.clone()),
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )
+        .expect("rebooted state machine");
+        rebooted
             .restore_newest_boot_state()
             .await
             .expect("boots after resync");
+        engine3
+            .with(|j| {
+                let (_, commit) = j
+                    .apply_command_at(deploy_command(), 4)
+                    .expect("a command applies after the second restart");
+                commit
+            })
+            .await
+            .wait()
+            .await;
+        drop(rebooted);
+        shutdown_engine(engine3).await;
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     /// #1691 review: the marker must survive until the leader's state is
@@ -5526,6 +5767,7 @@ mod tests {
             engine.clone(),
             0,
             dir.clone(),
+            None,
             0,
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
@@ -5662,6 +5904,7 @@ mod tests {
                 dst.clone(),
                 0,
                 PartitionStateMachine::temp_snapshot_dir(0),
+                None,
                 DST_NODE,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -6461,6 +6704,7 @@ mod tests {
                     src,
                     0,
                     snap_dir.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -6494,6 +6738,7 @@ mod tests {
                 dst.clone(),
                 0,
                 snap_dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -7194,6 +7439,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snap_dir.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -7270,6 +7516,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -7354,6 +7601,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -7444,6 +7692,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -7523,6 +7772,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -7610,6 +7860,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -8660,6 +8911,7 @@ mod tests {
                 engine,
                 0,
                 snap_dir,
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -9026,6 +9278,7 @@ mod tests {
                 engine.clone(),
                 0,
                 dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -9087,6 +9340,7 @@ mod tests {
                 engine.clone(),
                 0,
                 dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),

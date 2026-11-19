@@ -1319,6 +1319,16 @@ impl Journal {
     /// hot state on a reclaiming owner. Shed them here so the installed hot state
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
+    ///
+    /// The adopted state is AUTHORITATIVE, so it supersedes the #1405 abort
+    /// fence (#1691 review): a journal fenced by an aborted entry or a refused
+    /// diverged boot can otherwise never resync — its `checkpoint_base` refuses
+    /// while fenced, the leader's snapshot is rejected, and the durable
+    /// divergence marker is never cleared. Clearing the fence here is safe
+    /// because the fence exists to retire the SUPERSEDED state, and this
+    /// function has just replaced that state wholesale; the caller
+    /// (`adopt_engine_snapshot`) still fails closed when the subsequent
+    /// checkpoint of the adopted base fails.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
         // The REPLICATED lenient flag (#1661) is in the snapshot body; only the
         // pre-cutover legacy host flag is config to re-apply.
@@ -1348,6 +1358,13 @@ impl Journal {
         }
         self.discard_orphan_reports();
         self.fresh = false;
+        // The adopted snapshot IS the authoritative state: the #1405 fence
+        // (an aborted entry, or a refused diverged boot, #1691) retired the
+        // state this replaces, so it must not outlive the adoption — a fenced
+        // journal would refuse the `checkpoint_base` that makes the adopted
+        // state the durable recovery base, wedging the resync.
+        self.raft_entry = None;
+        self.fenced = false;
     }
 
     /// Replaces this journal's engine with one rebuilt from authoritative
@@ -5027,6 +5044,15 @@ impl Journal {
     /// [`checkpoint_base`](Journal::checkpoint_base) requires.
     pub fn seg_shared(&self) -> Option<Arc<SegShared>> {
         self.seg.clone()
+    }
+
+    /// The directory of this journal's durable segmented log, when it has one
+    /// (#1691 review): the STABLE per-partition location a crash-durable fence
+    /// (the divergence marker) is anchored to, independent of whether the
+    /// partition's Raft log is durable this boot. `None` for in-memory and
+    /// legacy single-file journals.
+    pub fn durable_dir(&self) -> Option<&Path> {
+        self.seg.as_ref().map(|seg| seg.dir.as_path())
     }
 
     /// The lean-snapshot counterpart of
