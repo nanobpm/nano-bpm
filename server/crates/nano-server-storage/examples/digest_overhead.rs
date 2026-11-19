@@ -45,7 +45,7 @@ fn main() {
     let mut prev: Option<String> = None;
     let started = Instant::now();
     for (i, events) in entries.iter().enumerate() {
-        let d = next_entry_digest(prev.as_deref(), i as u64 + 1, events);
+        let d = next_entry_digest(prev.as_deref(), i as u64 + 1, 0, events);
         prev = Some(serde_json::json!({ "digest": d }).to_string());
     }
     let fold = started.elapsed();

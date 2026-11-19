@@ -82,9 +82,11 @@ impl ChainDigest {
         self.version == other.version && self.base == other.base
     }
 
-    /// Folds Raft entry `index`, whose journaled command events are `events`,
-    /// into this chain.
-    pub fn fold<'a, I>(&self, index: u64, events: I) -> Self
+    /// Folds Raft entry `index`, whose journaled command events are `events`
+    /// and whose journaled start-dispatch cursor (`RaftEntryApplied.
+    /// start_dispatch_rr`, replayed state that routes future starts) is
+    /// `start_dispatch_rr`, into this chain.
+    pub fn fold<'a, I>(&self, index: u64, start_dispatch_rr: u64, events: I) -> Self
     where
         I: IntoIterator<Item = &'a Event>,
         I::IntoIter: ExactSizeIterator,
@@ -94,6 +96,7 @@ impl ChainDigest {
         hasher.update(DOMAIN_V1);
         hasher.update(self.hash);
         hasher.update(index.to_le_bytes());
+        hasher.update(start_dispatch_rr.to_le_bytes());
         hasher.update((events.len() as u64).to_le_bytes());
         let mut sink = HashSink(&mut hasher);
         for event in events {
@@ -180,6 +183,7 @@ pub fn try_chain_of_raft_state(raft_state: &str) -> Result<Option<ChainDigest>, 
 pub fn next_entry_digest(
     prev_raft_state: Option<&str>,
     index: u64,
+    start_dispatch_rr: u64,
     events: &[Event],
 ) -> EntryDigest {
     let prev = prev_raft_state
@@ -187,7 +191,7 @@ pub fn next_entry_digest(
         .filter(|c| c.version == CHAIN_VERSION)
         .unwrap_or_else(|| ChainDigest::genesis(index));
     EntryDigest {
-        chain: prev.fold(index, events),
+        chain: prev.fold(index, start_dispatch_rr, events),
         events: events.len() as u64,
     }
 }
@@ -217,16 +221,34 @@ impl std::fmt::Display for ChainVerifyError {
 
 impl std::error::Error for ChainVerifyError {}
 
+/// How much of a partition's history a replayed event window holds (#1664
+/// review) — it decides how strictly [`verify_journal_chain`] may anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// The window is the partition's COMPLETE history (from event 0, or the
+    /// exact continuation of a complete window whose chain is the seed), so
+    /// every frame lies wholly inside it and no record may be adopted as an
+    /// unchecked anchor: a chain starts only at genesis (the first record, or
+    /// the first after a pre-digest / other-version record, based at its own
+    /// index) and never changes base under a known same-version predecessor.
+    Complete,
+    /// The window may start after a snapshot base (possibly mid-frame) whose
+    /// chain is unknown: the first record with an unknown predecessor is
+    /// adopted as the anchor.
+    Window,
+}
+
 /// Re-derives every recorded chain digest in a replayed event stream and fails
 /// closed on the first mismatch (migration-by-replay, #1071 / #1664).
 ///
 /// `events` is the flattened journal in log order. Each `RaftEntryApplied`
 /// record carrying a digest names how many command events precede it in its
-/// frame; the verifier folds exactly those. The chain is anchored at the first
-/// digest-bearing record whose predecessor is unknown to this window (a replay
-/// that starts after a snapshot base, or the first post-upgrade record):
-/// a record based at its own index is verified from genesis; one based earlier
-/// is adopted as the anchor. Returns how many records were verified and the
+/// frame; the verifier folds exactly those, plus the record's journaled
+/// `start_dispatch_rr`. Under [`Coverage::Window`] the chain is anchored at the
+/// first digest-bearing record whose predecessor is unknown to this window: a
+/// record based at its own index is verified from genesis; one based earlier
+/// is adopted as the anchor. Under [`Coverage::Complete`] nothing is adopted
+/// unchecked (see the variant). Returns how many records were verified and the
 /// chain after the window's last digest-bearing record (the seed for a
 /// following window).
 ///
@@ -235,12 +257,16 @@ impl std::error::Error for ChainVerifyError {}
 pub fn verify_journal_chain(
     seed: Option<ChainDigest>,
     events: &[Event],
+    coverage: Coverage,
 ) -> Result<(u64, Option<ChainDigest>), ChainVerifyError> {
+    let complete = coverage == Coverage::Complete;
     let mut prev: Option<ChainDigest> = seed;
     let mut verified = 0u64;
     for (pos, event) in events.iter().enumerate() {
         let Event::RaftEntryApplied {
-            index, raft_state, ..
+            index,
+            raft_state,
+            start_dispatch_rr,
         } = event
         else {
             continue;
@@ -260,28 +286,41 @@ pub fn verify_journal_chain(
             continue;
         }
         let n = rec.events as usize;
+        let reject = |why: String| ChainVerifyError {
+            index: *index,
+            recorded: rec.chain.to_string(),
+            derived: why,
+        };
         let start = match prev {
             Some(p) if p.comparable(&rec.chain) => Some(p),
+            // A same-version record never re-bases under a known
+            // predecessor: the live fold always continues it.
+            Some(p) if complete => {
+                return Err(reject(format!("<unexpected re-base from {p}>")));
+            }
             // Unknown predecessor: verifiable only when the record is the
             // chain's own base (it folded from genesis) AND its whole frame
             // lies inside this window (a window can open mid-frame).
             _ if rec.chain.base == *index && n <= pos => Some(ChainDigest::genesis(*index)),
+            // A complete history has no unknown predecessor to adopt: an
+            // anchor that is not a whole genesis frame is altered history.
+            _ if complete => {
+                return Err(reject(format!(
+                    "<no verifiable anchor: {n} events claimed, {pos} present>"
+                )));
+            }
             _ => None,
         };
         if let Some(start) = start {
             let derived = if n <= pos {
-                Some(start.fold(*index, events[pos - n..pos].iter()))
+                Some(start.fold(*index, *start_dispatch_rr, events[pos - n..pos].iter()))
             } else {
                 None
             };
             if derived.map(|d| d.hash) != Some(rec.chain.hash) {
-                return Err(ChainVerifyError {
-                    index: *index,
-                    recorded: rec.chain.to_string(),
-                    derived: derived
-                        .map(|d| d.to_string())
-                        .unwrap_or_else(|| format!("<{n} events missing before the record>")),
-                });
+                return Err(reject(derived.map(|d| d.to_string()).unwrap_or_else(
+                    || format!("<{n} events missing before the record>"),
+                )));
             }
             verified += 1;
         }
@@ -345,6 +384,12 @@ mod tests {
         }
     }
 
+    /// The start-dispatch cursor the fixture journals for entry `index`
+    /// (non-zero, so the fold's cursor input is exercised).
+    fn rr(index: u64) -> u64 {
+        index * 3
+    }
+
     fn record(index: u64, digest: Option<EntryDigest>) -> Event {
         let mut state = serde_json::json!({ "log_id": index });
         if let Some(d) = digest {
@@ -353,7 +398,7 @@ mod tests {
         Event::RaftEntryApplied {
             index,
             raft_state: state.to_string(),
-            start_dispatch_rr: 0,
+            start_dispatch_rr: rr(index),
         }
     }
 
@@ -365,7 +410,7 @@ mod tests {
         for (i, keys) in entries.iter().enumerate() {
             let index = first_index + i as u64;
             let events: Vec<Event> = keys.iter().map(|k| ev(*k)).collect();
-            let d = next_entry_digest(prev.as_deref(), index, &events);
+            let d = next_entry_digest(prev.as_deref(), index, rr(index), &events);
             out.extend(events);
             let rec = record(index, Some(d));
             if let Event::RaftEntryApplied { raft_state, .. } = &rec {
@@ -378,7 +423,7 @@ mod tests {
 
     #[test]
     fn digest_round_trips_through_raft_state_additively() {
-        let d = next_entry_digest(None, 3, &[ev(1)]);
+        let d = next_entry_digest(None, 3, 0, &[ev(1)]);
         let state = serde_json::json!({"log_id": 3, "membership": null, "digest": d}).to_string();
         assert_eq!(entry_digest_of(&state), Some(d));
         // A pre-#1664 record has none.
@@ -390,14 +435,14 @@ mod tests {
     #[test]
     fn fold_is_stable_and_sensitive_to_every_input() {
         let g = ChainDigest::genesis(1);
-        let a = g.fold(1, [ev(1), ev(2)].iter());
+        let a = g.fold(1, 0, [ev(1), ev(2)].iter());
         // Pinned: the hash is a stable function of its inputs (never
         // DefaultHasher) — the same value on every platform and release.
-        assert_eq!(a, g.fold(1, [ev(1), ev(2)].iter()));
-        assert_ne!(a.hash, g.fold(2, [ev(1), ev(2)].iter()).hash, "index");
-        assert_ne!(a.hash, g.fold(1, [ev(2), ev(1)].iter()).hash, "order");
-        assert_ne!(a.hash, g.fold(1, [ev(1)].iter()).hash, "count");
-        assert_ne!(a.hash, a.fold(1, [ev(1), ev(2)].iter()).hash, "chained");
+        assert_eq!(a, g.fold(1, 0, [ev(1), ev(2)].iter()));
+        assert_ne!(a.hash, g.fold(2, 0, [ev(1), ev(2)].iter()).hash, "index");
+        assert_ne!(a.hash, g.fold(1, 0, [ev(2), ev(1)].iter()).hash, "order");
+        assert_ne!(a.hash, g.fold(1, 0, [ev(1)].iter()).hash, "count");
+        assert_ne!(a.hash, a.fold(1, 0, [ev(1), ev(2)].iter()).hash, "chained");
         assert!(a.comparable(&g));
         assert!(!a.comparable(&ChainDigest::genesis(2)));
     }
@@ -405,7 +450,10 @@ mod tests {
     #[test]
     fn replay_of_a_journal_with_recorded_digests_passes() {
         let j = journal(1, &[&[1, 2], &[], &[3]]);
-        assert_eq!(verify_journal_chain(None, &j).map(|v| v.0), Ok(3));
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map(|v| v.0),
+            Ok(3)
+        );
     }
 
     #[test]
@@ -414,15 +462,23 @@ mod tests {
         // Drop the first entry (as if covered by a snapshot base): the first
         // surviving record anchors, the next one is verified against it.
         let tail = &j[3..];
-        assert_eq!(verify_journal_chain(None, tail).map(|v| v.0), Ok(1));
+        assert_eq!(
+            verify_journal_chain(None, tail, Coverage::Window).map(|v| v.0),
+            Ok(1)
+        );
         // Seeded with the snapshot base's chain, every record verifies.
         let seed = match &j[2] {
             Event::RaftEntryApplied { raft_state, .. } => chain_of_raft_state(raft_state),
             _ => None,
         };
-        assert_eq!(verify_journal_chain(seed, tail).map(|v| v.0), Ok(2));
+        assert_eq!(
+            verify_journal_chain(seed, tail, Coverage::Complete).map(|v| v.0),
+            Ok(2)
+        );
         // A wrong seed fails closed.
-        assert!(verify_journal_chain(Some(ChainDigest::genesis(1)), tail).is_err());
+        assert!(
+            verify_journal_chain(Some(ChainDigest::genesis(1)), tail, Coverage::Window).is_err()
+        );
     }
 
     #[test]
@@ -430,12 +486,12 @@ mod tests {
         let mut j = journal(1, &[&[1, 2], &[3], &[4]]);
         // Alter one journaled event's bytes after its digest was recorded.
         j[3] = ev(99);
-        let err = verify_journal_chain(None, &j).unwrap_err();
+        let err = verify_journal_chain(None, &j, Coverage::Complete).unwrap_err();
         assert_eq!(err.index, 2);
         // Dropping a whole event also fails closed.
         let mut j = journal(1, &[&[1, 2], &[3, 4]]);
         j.remove(3);
-        assert!(verify_journal_chain(None, &j).is_err());
+        assert!(verify_journal_chain(None, &j, Coverage::Complete).is_err());
     }
 
     fn malformed(hash: &str) -> String {
@@ -464,9 +520,9 @@ mod tests {
         j[3] = Event::RaftEntryApplied {
             index: 2,
             raft_state: malformed(&"z".repeat(64)),
-            start_dispatch_rr: 0,
+            start_dispatch_rr: rr(2),
         };
-        let err = verify_journal_chain(None, &j).unwrap_err();
+        let err = verify_journal_chain(None, &j, Coverage::Complete).unwrap_err();
         assert_eq!(err.index, 2);
     }
 
@@ -474,10 +530,95 @@ mod tests {
     fn pre_digest_records_rebase_instead_of_failing() {
         let mut j = vec![ev(7), record(1, None)];
         // Post-upgrade entries re-base at index 2.
-        let d = next_entry_digest(Some(r#"{"log_id":1}"#), 2, &[ev(8)]);
+        let d = next_entry_digest(Some(r#"{"log_id":1}"#), 2, rr(2), &[ev(8)]);
         assert_eq!(d.chain.base, 2);
         j.push(ev(8));
         j.push(record(2, Some(d)));
-        assert_eq!(verify_journal_chain(None, &j).map(|v| v.0), Ok(1));
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map(|v| v.0),
+            Ok(1)
+        );
+    }
+
+    /// #1664 review: the v1 hash is pinned to a LITERAL, so an accidental
+    /// change to the domain, integer encoding or event serialization cannot
+    /// stay green by re-deriving its own expectation — it would otherwise make
+    /// every existing v1 journal fail recovery.
+    #[test]
+    fn v1_fold_is_pinned_to_a_literal() {
+        let d = next_entry_digest(None, 3, 7, &[ev(1), ev(2)]);
+        assert_eq!(
+            d.chain.to_string(),
+            "v1@3:89f55a23e7edcde77955e5cd0824e48c3c6ada2e9c9b90e9b60ca5adabd9d06b",
+            "the v1 chain definition changed; existing journals would no longer verify"
+        );
+        // A fixed digest-bearing record (as journaled on disk), verified
+        // without re-generating its expected digest.
+        let fixture = vec![
+            ev(1),
+            ev(2),
+            Event::RaftEntryApplied {
+                index: 3,
+                raft_state: r#"{"log_id":3,"digest":{"v":1,"base":3,"hash":"89f55a23e7edcde77955e5cd0824e48c3c6ada2e9c9b90e9b60ca5adabd9d06b","events":2}}"#
+                    .into(),
+                start_dispatch_rr: 7,
+            },
+        ];
+        assert_eq!(
+            verify_journal_chain(None, &fixture, Coverage::Complete).map(|v| v.0),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn the_start_dispatch_cursor_is_part_of_the_chain() {
+        let g = ChainDigest::genesis(1);
+        assert_ne!(
+            g.fold(1, 0, [ev(1)].iter()).hash,
+            g.fold(1, 1, [ev(1)].iter()).hash
+        );
+        // Altering ONLY a journaled cursor fails replay closed.
+        let mut j = journal(1, &[&[1], &[2]]);
+        if let Event::RaftEntryApplied {
+            start_dispatch_rr, ..
+        } = &mut j[1]
+        {
+            *start_dispatch_rr += 1;
+        }
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map_err(|e| e.index),
+            Err(1)
+        );
+    }
+
+    #[test]
+    fn complete_history_rejects_an_event_missing_from_the_first_entry() {
+        let mut j = journal(1, &[&[1, 2], &[3]]);
+        j.remove(0);
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map_err(|e| e.index),
+            Err(1)
+        );
+        // A window (which may open mid-frame) still anchors there.
+        assert!(verify_journal_chain(None, &j, Coverage::Window).is_ok());
+    }
+
+    #[test]
+    fn complete_history_rejects_a_rebase_under_a_known_predecessor() {
+        // Entry 2 re-based at its own index (with its event re-folded from
+        // genesis) although entry 1 recorded a same-version chain.
+        let mut j = journal(1, &[&[1], &[2]]);
+        let forged = next_entry_digest(None, 2, rr(2), &[ev(2)]);
+        j[3] = record(2, Some(forged));
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map_err(|e| e.index),
+            Err(2)
+        );
+        // An earlier-based forged chain (an unchecked-anchor candidate) too.
+        let mut j = journal(1, &[&[1], &[2], &[3]]);
+        let mut forged = next_entry_digest(None, 2, rr(2), &[ev(2)]);
+        forged.chain.base = 0;
+        j[3] = record(2, Some(forged));
+        assert!(verify_journal_chain(None, &j, Coverage::Complete).is_err());
     }
 }

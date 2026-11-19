@@ -1416,7 +1416,7 @@ impl Journal {
     /// recorded chain. Every legacy recovery path goes through here, so
     /// verification can never be skipped by one of them.
     pub fn replay_verified(partition_id: u64, events: Vec<Event>) -> io::Result<Engine> {
-        crate::seglog::verify_replayed_chain(None, &events)?;
+        crate::seglog::verify_replayed_chain(None, &events, crate::digest::Coverage::Complete)?;
         Ok(Engine::replay_partition(partition_id, events))
     }
 
@@ -3212,7 +3212,9 @@ impl Journal {
             .as_ref()
             .map(|(events, _)| events.as_slice())
             .unwrap_or(&[]);
-        crate::digest::next_entry_digest(prev, index, events)
+        // The cursor `commit_raft_entry` journals in the same frame (#1664
+        // review): it is replayed state, so it is part of the chain.
+        crate::digest::next_entry_digest(prev, index, self.engine.start_dispatch_rr(), events)
     }
 
     /// TEST-ONLY divergence injection (#1664): perturbs THIS replica's
@@ -3225,7 +3227,7 @@ impl Journal {
         if let Some((index, state)) = self.engine.raft_applied().cloned()
             && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&state)
         {
-            let mut d = crate::digest::next_entry_digest(Some(&state), index, &[]);
+            let mut d = crate::digest::next_entry_digest(Some(&state), index, 0, &[]);
             d.chain.hash[0] ^= 0xff;
             if let Ok(dv) = serde_json::to_value(d) {
                 v["digest"] = dv;

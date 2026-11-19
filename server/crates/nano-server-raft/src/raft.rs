@@ -802,18 +802,40 @@ fn snapshot_ptr_path(dir: &Path) -> PathBuf {
     dir.join("current-snapshot.json")
 }
 
-/// Moves a diverged replica's snapshot pointer aside (#1664) so a rebuild
-/// cannot restore its possibly diverged snapshot: the pointer is renamed to
-/// `current-snapshot.json.diverged-<index>` (kept for forensics, with the
-/// `.bin` it names), never deleted.
+/// Moves a diverged replica's snapshot aside (#1664) so a rebuild cannot
+/// restore its possibly diverged state, while keeping it for forensics: BOTH
+/// the pointer and the `.bin` body it names are renamed under a
+/// `diverged-<index>-` prefix. Every reclamation path (the constructor sweep,
+/// [`reap_superseded_snapshots`], the `incoming-*` sweep) only touches
+/// `snap-*` / `incoming-*` / the live pointer, so quarantined artifacts are
+/// never reclaimed in a durable snapshot dir. (A VOLATILE member's whole dir is
+/// throwaway by definition and is removed on retirement; forensics retention
+/// is a durable-dir guarantee.)
 fn quarantine_snapshot_ptr(dir: &Path, index: u64) {
     let ptr = snapshot_ptr_path(dir);
-    if ptr.is_file() {
-        let aside = dir.join(format!("current-snapshot.json.diverged-{index}"));
-        if let Err(e) = std::fs::rename(&ptr, &aside) {
-            tracing::error!(?ptr, error = %e, "could not quarantine a diverged snapshot pointer");
+    if !ptr.is_file() {
+        return;
+    }
+    // Body first: once the pointer is gone a sweep may treat the body as an
+    // unreferenced `snap-*` file.
+    if let Some(stored) = read_snapshot_ptr(dir)
+        && let Some(name) = stored.path.file_name().and_then(|n| n.to_str())
+    {
+        let aside = dir.join(quarantined_name(index, name));
+        if let Err(e) = std::fs::rename(&stored.path, &aside) {
+            tracing::error!(path = ?stored.path, error = %e, "could not quarantine a diverged snapshot body");
         }
     }
+    let aside = dir.join(quarantined_name(index, "current-snapshot.json"));
+    if let Err(e) = std::fs::rename(&ptr, &aside) {
+        tracing::error!(?ptr, error = %e, "could not quarantine a diverged snapshot pointer");
+    }
+}
+
+/// The name a diverged snapshot artifact is quarantined under (#1664): a
+/// prefix no reclamation sweep matches.
+fn quarantined_name(index: u64, original: &str) -> String {
+    format!("diverged-{index}-{original}")
 }
 
 /// The generation a snapshot file name belongs to (#1473): the `g<N>` infix a
@@ -5153,7 +5175,7 @@ mod tests {
                 index: 1,
                 detected_at: 2,
                 leader: chain,
-                local: chain.fold(1, &[]),
+                local: chain.fold(1, 0, &[]),
             })
             .await;
         barrier.wait().await;
@@ -5163,6 +5185,68 @@ mod tests {
             read_snapshot_ptr(&dir).is_none(),
             "no boot-baseline pointer is published after the latch"
         );
+    }
+
+    /// #1664 review: a divergence quarantine keeps BOTH the pointer and the
+    /// snapshot body it names, and neither is reclaimed by the next
+    /// constructor sweep on the same durable dir (forensics retention).
+    #[tokio::test]
+    async fn a_quarantined_snapshot_survives_the_next_constructor_sweep() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let mut builder = Arc::clone(&sm).get_snapshot_builder().await;
+        builder.build_snapshot().await.expect("build publishes");
+        let body = read_snapshot_ptr(&dir).expect("pointer published").path;
+        let body_name = body
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("body name")
+            .to_owned();
+        let chain = ChainDigest::genesis(1);
+        let _ = sm
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 7,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            })
+            .await;
+        drop(sm);
+        // The next member on the same dir runs the constructor sweep.
+        let next = PartitionStateMachine::new(
+            engine.clone(),
+            0,
+            dir.clone(),
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )
+        .expect("next member");
+        assert!(
+            read_snapshot_ptr(&dir).is_none(),
+            "no live baseline remains"
+        );
+        assert!(
+            dir.join(quarantined_name(7, "current-snapshot.json"))
+                .is_file(),
+            "the quarantined pointer is retained"
+        );
+        assert!(
+            dir.join(quarantined_name(7, &body_name)).is_file(),
+            "the quarantined body survives the constructor sweep"
+        );
+        assert!(!body.exists(), "the body left the reclaimable namespace");
+        drop(next);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -7453,7 +7537,7 @@ mod tests {
             !legacy.contains("digest"),
             "no digest -> legacy shape: {legacy}"
         );
-        let d = nano_server_storage::digest::next_entry_digest(None, 17, &[]);
+        let d = nano_server_storage::digest::next_entry_digest(None, 17, 0, &[]);
         let json = journaled_raft_state(log_id, &StoredMembership::default(), Some(d)).expect("e");
         let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.digest, Some(d));
@@ -7469,7 +7553,7 @@ mod tests {
         assert_eq!(legacy.digest, None);
         let claim = DigestClaim {
             index: 9,
-            chain: nano_server_storage::digest::next_entry_digest(None, 9, &[]).chain,
+            chain: nano_server_storage::digest::next_entry_digest(None, 9, 0, &[]).chain,
         };
         let json = serde_json::to_string(&ReplicatedBatch::new(vec![]).with_digest(Some(claim)))
             .expect("encode");
@@ -7490,7 +7574,7 @@ mod tests {
     fn digest_ledger_flags_only_real_divergence() {
         use nano_server_storage::digest::next_entry_digest;
         let ledger = DigestLedger::default();
-        let a = next_entry_digest(None, 5, &[]).chain;
+        let a = next_entry_digest(None, 5, 0, &[]).chain;
         ledger.record(5, a);
         let same = DigestClaim { index: 5, chain: a };
         assert_eq!(ledger.check(&same), None, "equal chains agree");
@@ -7511,7 +7595,7 @@ mod tests {
             None,
             "unknown index"
         );
-        let rebased = next_entry_digest(None, 3, &[]).chain;
+        let rebased = next_entry_digest(None, 3, 0, &[]).chain;
         assert_eq!(
             ledger.check(&DigestClaim {
                 index: 5,

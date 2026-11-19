@@ -46005,6 +46005,28 @@ mod clustered_startup_tests {
             installed.is_some_and(|i| i >= snap),
             "the rebuilt learner caught up by snapshot install (installed {installed:?}, purged to {snap})"
         );
+        // #1664 review: the installed snapshot carried the leader's chain, so
+        // the learner's claims are NOT silently disabled (a lost digest reads
+        // as `None` / a different base, which `assert_no_divergence` skips):
+        // at a common applied index both claims are present and equal.
+        let mut common = None;
+        for _ in 0..500 {
+            let lead = node0.raft_registry().get(0).and_then(|p| p.digest_claim());
+            let learner = node1.raft_registry().get(0).and_then(|p| p.digest_claim());
+            if let (Some(l), Some(r)) = (lead, learner)
+                && l.index == r.index
+            {
+                common = Some((l, r));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (lead, learner) =
+            common.expect("leader and learner both claim a digest at a common applied index");
+        assert_eq!(
+            lead, learner,
+            "the learner continues the leader's chain after the snapshot install"
+        );
         assert!(
             tally.shed > 0
                 && tally.var_shed > 0

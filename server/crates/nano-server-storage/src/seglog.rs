@@ -1869,7 +1869,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
                     .transpose()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                     .flatten();
-                verify_replayed_chain(seed, &events[skip..])?;
+                verify_replayed_chain(seed, &events[skip..], crate::digest::Coverage::Window)?;
                 engine.apply_replayed_events(events[skip..].iter().cloned());
             }
             (engine, false)
@@ -1882,7 +1882,8 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         // as an unreadable snapshot.
         Ok(None) if first_index == 0 => {
             let fresh = total_events == 0;
-            verify_replayed_chain(None, &events)?;
+            // `first_index == 0`: the surviving events ARE the whole history.
+            verify_replayed_chain(None, &events, crate::digest::Coverage::Complete)?;
             (Engine::replay_partition(0, events.iter().cloned()), fresh)
         }
         Ok(None) => match migrate_by_replay(dir, 0, first_index, total_events, &events)? {
@@ -2460,8 +2461,9 @@ fn migrate_by_replay(
     // #1664): a journal whose bytes no longer reproduce them fails closed.
     // Cold and hot are split at a segment seal, which is always a frame
     // boundary, so the hot window continues from the cold one's chain.
-    let cold_chain = verify_replayed_chain(None, &cold_events)?;
-    verify_replayed_chain(cold_chain, hot_events)?;
+    // Validated contiguous `[0, total_events)`: a complete history.
+    let cold_chain = verify_replayed_chain(None, &cold_events, crate::digest::Coverage::Complete)?;
+    verify_replayed_chain(cold_chain, hot_events, crate::digest::Coverage::Complete)?;
     let engine = Engine::replay_partition(
         partition_id,
         cold_events.into_iter().chain(hot_events.iter().cloned()),
@@ -2476,8 +2478,9 @@ fn migrate_by_replay(
 pub(crate) fn verify_replayed_chain(
     seed: Option<crate::digest::ChainDigest>,
     events: &[Event],
+    coverage: crate::digest::Coverage,
 ) -> io::Result<Option<crate::digest::ChainDigest>> {
-    crate::digest::verify_journal_chain(seed, events)
+    crate::digest::verify_journal_chain(seed, events, coverage)
         .map(|(_, last)| last)
         .map_err(|e| {
             tracing::error!(error = %e, "replay: journal chain digest verification failed");
@@ -3184,7 +3187,7 @@ pub fn recover_multi_scoped(
                     .filter(|(tag, _)| *tag == p)
                     .map(|(_, e)| e.clone())
                     .collect();
-                verify_replayed_chain(None, &p_full)?;
+                verify_replayed_chain(None, &p_full, crate::digest::Coverage::Complete)?;
                 Engine::replay_partition(p, p_full)
             } else {
                 match combined.as_ref().and_then(|m| m.get(&p)) {
@@ -3205,13 +3208,17 @@ pub fn recover_multi_scoped(
                                 .transpose()
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                                 .flatten();
-                            verify_replayed_chain(seed, &p_events[skip..])?;
+                            verify_replayed_chain(
+                                seed,
+                                &p_events[skip..],
+                                crate::digest::Coverage::Window,
+                            )?;
                             engine.apply_replayed_events(p_events[skip..].iter().cloned());
                         }
                         engine
                     }
                     None => {
-                        verify_replayed_chain(None, &p_events)?;
+                        verify_replayed_chain(None, &p_events, crate::digest::Coverage::Window)?;
                         Engine::replay_partition(p, p_events)
                     }
                 }
