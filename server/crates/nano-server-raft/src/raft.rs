@@ -1009,6 +1009,41 @@ async fn journal_durable_dir(engine: &DeepthiHandle) -> Option<PathBuf> {
         .await
 }
 
+/// The boot-time divergence gate (#1691), run by EVERY bootstrap constructor
+/// BEFORE any fallible setup (snapshot-dir creation, log-store open): a setup
+/// failure must never abort construction before a known-diverged journal is
+/// fenced. Resolves the partition's canonical marker
+/// ([`divergence_marker_path`]) and, when it is present, fences the engine
+/// (`abort_raft_entry`) and fails closed with a typed [`DivergedBootRefused`]
+/// — a refused member is never hosted, and with no Raft member registered the
+/// server's direct (non-Raft) write paths would otherwise append to the very
+/// known-diverged journal this refusal protects. The journal's fence fails
+/// every command closed until the operator remedy (wipe + rejoin, or a leader
+/// resync). No marker → `Ok(())` and construction proceeds.
+///
+/// This is the pre-construction half of the gate; [`PartitionStateMachine`]'s
+/// own `refuse_diverged_boot` re-checks the same marker at boot-state restore
+/// (a no-op by then), so the gate also holds for any construction path that
+/// does not call here first.
+async fn refuse_diverged_boot_before_setup(
+    engine: &DeepthiHandle,
+    journal_durable_dir: Option<&Path>,
+    snapshot_dir: &Path,
+    partition_id: u64,
+) -> anyhow::Result<()> {
+    let marker = divergence_marker_path(journal_durable_dir, snapshot_dir, partition_id);
+    if let Some(divergence) = read_divergence_marker(&marker) {
+        engine.with(|journal| journal.abort_raft_entry()).await;
+        return Err(DivergedBootRefused {
+            partition_id,
+            marker,
+            divergence,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// The name a diverged snapshot artifact is quarantined under (#1664): a
 /// prefix no reclamation sweep matches.
 fn quarantined_name(index: u64, original: &str) -> String {
@@ -3854,10 +3889,21 @@ impl RaftPartition {
         let stamp_engine = engine.clone();
         let engine_for_orphans = engine.clone();
         let journal_durable_dir = journal_durable_dir(&engine).await;
+        let snapshot_dir = PartitionStateMachine::temp_snapshot_dir(partition_id);
+        // The divergence gate runs BEFORE the fallible state-machine
+        // construction below: a snapshot-setup failure must not abort the boot
+        // before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
+            partition_id,
+        )
+        .await?;
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
-            PartitionStateMachine::temp_snapshot_dir(partition_id),
+            snapshot_dir,
             journal_durable_dir,
             0,
             false,
@@ -3915,15 +3961,26 @@ impl RaftPartition {
         let config = Arc::new(raft_config(partition_id).validate()?);
 
         let log_dir = log_dir.as_ref().to_path_buf();
+        let snapshot_dir = log_dir.join("snapshots");
+        let journal_durable_dir = journal_durable_dir(&engine).await;
+        // The divergence gate runs BEFORE the fallible log-store open and
+        // state-machine construction below: a setup failure must not abort the
+        // boot before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
+            partition_id,
+        )
+        .await?;
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
         let stamp_engine = engine.clone();
         let engine_for_orphans = engine.clone();
-        let journal_durable_dir = journal_durable_dir(&engine).await;
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
-            log_dir.join("snapshots"),
+            snapshot_dir,
             journal_durable_dir,
             node_id,
             false,
@@ -4008,6 +4065,16 @@ impl RaftPartition {
         let leader = Arc::new(AtomicU64::new(u64::MAX));
         let stamp_engine = engine.clone();
         let engine_for_orphans = engine.clone();
+        // The divergence gate runs BEFORE the fallible state-machine
+        // construction below: a snapshot-setup failure must not abort the boot
+        // before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
+            partition_id,
+        )
+        .await?;
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -5865,6 +5932,91 @@ mod tests {
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&journal_dir);
         let _ = std::fs::remove_dir_all(&raft_dir);
+    }
+
+    /// The divergence gate runs BEFORE any fallible bootstrap setup (#1691
+    /// review): with a valid marker AND an unusable snapshot directory (a
+    /// regular file where `create_dir_all` must fail), every constructor still
+    /// refuses with the typed [`DivergedBootRefused`] and fences the engine —
+    /// a snapshot-setup failure must never abort the boot before the
+    /// known-diverged journal is fenced.
+    #[tokio::test]
+    async fn a_marked_partition_is_fenced_even_when_snapshot_setup_fails() {
+        let journal_dir = unique_log_dir("1691-fence-before-setup");
+        let raft_dir = unique_log_dir("1691-fence-before-setup-raft");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let marker = divergence_marker_path(Some(&journal_dir), Path::new("/ignored"), 0);
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        persist_divergence_fence(&marker, &d).expect("persist marker");
+
+        // An unusable snapshot/log dir: a regular FILE, so `create_dir_all` and
+        // the log-store open both fail on it.
+        let blocker = unique_log_dir("1691-fence-before-setup-blocker");
+        std::fs::write(&blocker, b"not a dir").expect("blocker file");
+
+        for what in ["single_durable", "member", "fresh_receiver", "single"] {
+            let engine = durable_engine(&journal_dir);
+            let r = match what {
+                "single_durable" => {
+                    RaftPartition::bootstrap_single_durable(
+                        0,
+                        0,
+                        "n0".to_string(),
+                        engine.clone(),
+                        &blocker,
+                    )
+                    .await
+                }
+                "member" => {
+                    RaftPartition::bootstrap_member(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        Some(blocker.clone()),
+                        false,
+                    )
+                    .await
+                }
+                "fresh_receiver" => {
+                    RaftPartition::bootstrap_fresh_receiver(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        false,
+                    )
+                    .await
+                }
+                _ => RaftPartition::bootstrap_single(0, 0, "n0".to_string(), engine.clone()).await,
+            };
+            let err = match r {
+                Ok(_) => panic!("{what}: a marked partition must not boot"),
+                Err(e) => e,
+            };
+            let refused = err
+                .downcast_ref::<DivergedBootRefused>()
+                .unwrap_or_else(|| {
+                    panic!("{what}: the gate must fire before setup fails: {err:#}")
+                });
+            assert_eq!(refused.partition_id, 0, "{what}");
+            assert_eq!(refused.marker, marker, "{what}: one canonical marker");
+            assert!(
+                engine.with(|j| j.is_fenced()).await,
+                "{what}: a known-diverged journal is fenced even when snapshot setup would fail"
+            );
+            shutdown_engine(engine).await;
+        }
+
+        let _ = std::fs::remove_dir_all(&journal_dir);
+        let _ = std::fs::remove_dir_all(&raft_dir);
+        let _ = std::fs::remove_file(&blocker);
     }
 
     /// A per-test scratch dir under the system temp dir, removed on drop.
