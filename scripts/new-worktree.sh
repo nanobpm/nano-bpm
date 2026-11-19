@@ -88,10 +88,12 @@ seed_target() {
 seed_target &
 seed_pid=$!
 
-make -C "$wt" generate \
-    "$wt/generated-console/Cargo.toml" \
-    "$wt/server/src/stub_impls.rs" \
-    "$wt/server/src/response_contract_schema.json"
+# Request only `generate`: it already produces both generated crates, the
+# server stubs, and the response schema. Naming the individual file targets
+# alongside it would re-run a generator per target, and under an inherited
+# parallel MAKEFLAGS (e.g. -j4) those recipes run concurrently and overwrite
+# the same output dirs / JAR temp file.
+make -C "$wt" generate
 
 # Mirror CI's "Stub console assets" step: `console` embeds console/dist and
 # `console-observe` embeds console/dist-observe, so stub both.
