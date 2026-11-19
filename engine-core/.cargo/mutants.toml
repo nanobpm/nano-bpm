@@ -1,0 +1,61 @@
+# cargo-mutants configuration for the engine-guard mutation suite (#1248).
+#
+# Scope: the join / gateway / teardown paths of `src/engine` — the guards whose
+# mutation must be killed by the parity corpus (the trace-validation replay of
+# the TLA+ model corpus, `tests/trace_validation.rs` +
+# `tests/zeebe_token_flow_trace_validation.rs`, and the conformance corpus).
+#
+# Run (nightly — `parity-mutation-nightly.yml`; locally the same):
+#
+#   cargo mutants          # from engine-core/ (this file is .cargo/mutants.toml)
+#
+# A surviving mutant is a guard no corpus scenario distinguishes: kill it with a
+# new scenario (a graph under formal/corpus/graphs + its regenerated traces), or
+# justify it as equivalent in the run report. The spec-side analogue is
+# formal/tla/mutate.mjs.
+
+# Joins (parallel + inclusive arrival guards), gateway routing/completion, and
+# instance teardown. These regexps match the mutant description ("… in
+# Engine::<fn>"), keeping the scope at the guard surface rather than the whole
+# 19k-line module. boundary.rs and flow_scope.rs are included whole (they are
+# the boundary-event and flow-scope guard modules).
+examine_globs = ["src/engine/mod.rs", "src/engine/boundary.rs", "src/engine/flow_scope.rs"]
+examine_re = [
+    'Engine::\w*join\w*',
+    'Engine::\w*gateway\w*',
+    'Engine::\w*inclusive\w*',
+    'Engine::select_exclusive_flow\w*',
+    'Engine::take_flow',
+    'Engine::take_all_flows',
+    'Engine::has_active_path_to',
+    'Engine::completes_inline',
+    'Engine::complete_drained_subprocesses',
+    'Engine::complete_finished_instances',
+    'Engine::\w*teardown\w*',
+    'Engine::cascade_cancel_children',
+    'Engine::revoke_dropped_join_arrival',
+    'boundary\.rs',
+    'flow_scope\.rs',
+]
+# Pure getters / debug assertions carry no guard a mutant could weaken
+# observably; `plan_command_inner` matches `*gateway*` only because a deployment
+# plan carries gateway metadata — it is command planning, not a runtime guard.
+exclude_re = [
+    'Engine::debug_assert_\w*',
+    'Engine::join_arrivals',       # read-only accessor over the join map
+    'Engine::is_parked_join',      # read-only accessor
+    'Engine::join_kind',           # read-only classifier
+    'Engine::plan_command_inner',
+]
+
+# The parity corpus: spec-trace replay (TokenFlow + ZeebeTokenFlow milestones)
+# plus the deploy-conformance corpus. This is the suite the issue charges with
+# killing every mutant. `serde` matches the engine-core CI test invocation
+# (`cargo nextest run --features serde`): several inline engine tests build only
+# under it, and cargo-mutants builds the whole lib test harness.
+features = ["serde"]
+additional_cargo_test_args = [
+    "--test", "trace_validation",
+    "--test", "zeebe_token_flow_trace_validation",
+    "--test", "conformance",
+]

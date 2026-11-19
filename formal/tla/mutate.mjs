@@ -296,14 +296,17 @@ async function main(argv) {
       evt: Object.values(graph.nodes).includes('evt'),
       cfg: families[family].cfg, properties: families[family].properties,
     })));
-    const base = fs.mkdtempSync(path.join(work, 'base-'));
-    fs.mkdirSync(path.join(base, 'tmp'));
-    for (const f of fs.readdirSync(here)) if (f.endsWith('.tla')) fs.copyFileSync(path.join(here, f), path.join(base, f));
     await pool(models, Math.max(1, Math.floor(os.availableParallelism() / 2)), async (m) => {
+      // Own directory (and JVM temp dir) per concurrent TLC run: sharing one
+      // clobbers the extracted standard modules.
+      const base = fs.mkdtempSync(path.join(work, 'base-'));
+      fs.mkdirSync(path.join(base, 'tmp'));
+      for (const f of fs.readdirSync(here)) if (f.endsWith('.tla')) fs.copyFileSync(path.join(here, f), path.join(base, f));
       fs.writeFileSync(path.join(base, `${m.model}.tla`), m.src);
       const { code, log } = await runTlc(jar, base, m.model, m.cfg, true);
       m.want = verdict(log, m.properties, code);
       if (m.want === 'error') throw new Error(`TLC failed on unmutated ${m.model}:\n${log}`);
+      fs.rmSync(base, { recursive: true, force: true });
     });
     console.log(`  tier 2: ${models.length} bounded-exhaustive model(s) baselined`);
     return models;
