@@ -154,6 +154,71 @@ fn is_field_name(key: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The engine source files whose types reach the serialized `Command` /
+/// `Event` / `EngineSnapshot` shapes the gate compares. The String-keyed map
+/// fields they declare are DERIVED from this source (never hand-listed), so a
+/// new map field is protected the moment it is declared;
+/// `data_map_fields_cover_every_engine_map_field` (tests) fails if a map
+/// field is declared in a file missing from this list.
+pub const MAP_FIELD_SOURCES: &[&str] = &[
+    include_str!("../../src/command.rs"),
+    include_str!("../../src/event.rs"),
+    include_str!("../../src/model.rs"),
+    include_str!("../../src/state/types.rs"),
+    include_str!("../../src/engine/mod.rs"),
+    include_str!("../../src/cluster_vars.rs"),
+    include_str!("../../src/engine/call_activity.rs"),
+    include_str!("../../src/bpmn/build.rs"),
+    include_str!("../../src/validate/mod.rs"),
+];
+
+/// The String-keyed map field names (`name: BTreeMap<String, _>`, also
+/// `HashMap`/`IndexMap`, optionally wrapped in `Option<…>`) declared in
+/// `source`. A superset is safe: a name wrongly treated as a map only stops
+/// erasure under it, so a real difference still surfaces (fail closed).
+pub fn map_fields_in(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in source.lines() {
+        let line = line.trim_start();
+        let line = line
+            .strip_prefix("pub(crate) ")
+            .or_else(|| line.strip_prefix("pub(super) "))
+            .or_else(|| line.strip_prefix("pub "))
+            .unwrap_or(line);
+        let Some((name, ty)) = line.split_once(':') else {
+            continue;
+        };
+        if name.is_empty() || !is_field_name(name) {
+            continue;
+        }
+        let ty = ty.trim_start();
+        let ty = ty.strip_prefix("Option<").unwrap_or(ty);
+        let ty = ty.strip_prefix("std::collections::").unwrap_or(ty);
+        if ["BTreeMap<String", "HashMap<String", "IndexMap<String"]
+            .iter()
+            .any(|p| ty.starts_with(p))
+        {
+            out.insert(name.to_owned());
+        }
+    }
+    out
+}
+
+/// Every String-keyed map field of the compared engine types (see
+/// [`MAP_FIELD_SOURCES`]). Under such a field the object's keys are DATA
+/// (variable names, header names, process ids) — never struct fields — so
+/// they are neither shape tokens nor erasable, whatever their values hold
+/// (`Value`s, plain strings like `ServiceTask.custom_headers`, or structs).
+pub fn data_map_fields() -> &'static BTreeSet<String> {
+    static FIELDS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| {
+        MAP_FIELD_SOURCES
+            .iter()
+            .flat_map(|s| map_fields_in(s))
+            .collect()
+    })
+}
+
 /// Whether `map` is a `BTreeMap<String, Value>` of variable/metadata entries
 /// rather than a struct. Every such map in `Command`/`Event`/`EngineSnapshot`
 /// holds a typed [`Value`] per key, and a `Value` serializes as an
@@ -202,6 +267,12 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
                     if is_field_name(k) {
                         out.insert(format!("{ctx}.{k}"));
                     }
+                    if is_field_name(k) && data_map_fields().contains(k) {
+                        // A String-keyed map field: its keys are DATA. Only
+                        // its values (which may be structs) carry shapes.
+                        walk_map_values(v, ctx, out);
+                        continue;
+                    }
                     // Propagate the context through a snake_case struct field
                     // (serde flattens nested structs, e.g. `multi_instance`'s
                     // fields stay under the variant). Map DATA keys — a
@@ -219,6 +290,17 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
             out.insert(s.clone());
         }
         _ => {}
+    }
+}
+
+/// Walks the VALUES of a data map (never its keys), keeping `ctx`.
+fn walk_map_values(value: &Json, ctx: &str, out: &mut Vocab) {
+    match value {
+        Json::Object(map) if !is_value_map(map) => {
+            map.values().for_each(|v| walk_tokens(v, ctx, out));
+        }
+        Json::Object(_) => {}
+        other => walk_tokens(other, ctx, out),
     }
 }
 
@@ -390,6 +472,33 @@ pub struct Allowlist {
     pub divergences: Vec<Divergence>,
 }
 
+/// How a release containing a ratified divergence may be upgraded to. Raft
+/// members RE-EXECUTE committed commands (ADR 0066, "Rolling upgrade",
+/// option C), so any allowlisted divergence makes mixed-version members
+/// disagree unless the new behaviour is gated. Every entry must say which of
+/// exactly two cases applies; there is no default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpgradeMode {
+    /// The new behaviour runs only once every voter AND learner advertises
+    /// the capability (#1661 cluster-join feature advertisement); the old
+    /// behaviour runs until then, so mixed-version clusters stay consistent.
+    FeatureGated,
+    /// The release requires an all-nodes-same-version (quiesced) upgrade: no
+    /// rolling upgrade across it. Must be called out in the release notes.
+    UpgradeBoundary,
+}
+
+impl UpgradeMode {
+    /// The literal the allowlist (and its rationale) uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FeatureGated => "feature-gated",
+            Self::UpgradeBoundary => "upgrade-boundary",
+        }
+    }
+}
+
 /// A ratified new event variant.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -399,8 +508,9 @@ pub struct ObservationalVariant {
     /// release is at or past it (both builds emit it; nothing to declare).
     pub introduced_in: String,
     pub issue: String,
-    /// Why a mixed old/new cluster stays correct while only new replicas
-    /// emit it.
+    /// How a cluster may upgrade across it (required, no default).
+    pub upgrade: UpgradeMode,
+    /// Why the declared [`UpgradeMode`] applies; must name it.
     pub rationale: String,
 }
 
@@ -554,37 +664,118 @@ fn canonicalize_keys(value: &mut Json, ids: &std::collections::BTreeMap<u64, Str
     }
 }
 
-/// Whether `head` and `prev` (one entry's canonical events) differ only as
-/// `expected` allows.
-fn diverges_only_as(expected: &Expected, head: &[String], prev: &[String]) -> bool {
-    let normalize = |events: &[String], drop: &[EventPattern]| -> Option<Vec<String>> {
-        // Fail closed: a structurally inconsistent mint (a collision, or two
-        // keys for one element) is not the declared remint, whatever the
-        // allowlist says.
-        let ids = if expected.remint_keys {
-            Some(key_identities(events)?)
-        } else {
-            None
+/// Key → entity identity accumulated over the WHOLE corpus for one side
+/// (the corpus runs one engine, so a key minted in an earlier entry is still
+/// referenced by later ones). A ratified remint swaps which entity a raw key
+/// names on each side; without carrying that mapping forward, a later entry
+/// whose raw events are byte-identical on both sides (e.g. an
+/// `ElementCompleted` naming key 11, which is element `m` on one side and a
+/// signal subscription on the other) would pass the equality shortcut.
+type KeyIds = std::collections::BTreeMap<u64, String>;
+
+/// Folds an entry's minted keys into the corpus-wide `ids`. Fails on a key
+/// minted for two different entities across the corpus (fail closed).
+fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> {
+    let entry = key_identities_lenient(events);
+    for (key, identity) in entry {
+        if let Some(prev) = ids.insert(key, identity.clone()) {
+            if prev != identity {
+                return Err(format!(
+                    "key {key} minted for two entities across the corpus ({prev} vs {identity})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`key_identities`] without the per-entry clean-remint checks (an element
+/// legitimately mints several keys across a corpus: loops, multi-instance).
+fn key_identities_lenient(events: &[String]) -> KeyIds {
+    let mut out = KeyIds::new();
+    for e in events {
+        let Ok(v) = serde_json::from_str::<Json>(e) else {
+            continue;
         };
-        let mut out = Vec::with_capacity(events.len());
-        for e in events {
-            let mut v: Json = serde_json::from_str(e).ok()?;
-            if drop.iter().any(|p| p.matches(&v)) {
-                continue;
+        let Some((variant, body)) = v.as_object().and_then(|o| o.iter().next()) else {
+            continue;
+        };
+        let u64_of = |f: &str| body.get(f).and_then(Json::as_u64);
+        let str_of = |f: &str| body.get(f).and_then(Json::as_str);
+        let minted = match variant.as_str() {
+            "ElementActivating" | "ElementActivated" => u64_of("element_instance_key")
+                .zip(str_of("element_id").map(|id| format!("element:{id}"))),
+            "JobCreated" => {
+                u64_of("job_key").zip(str_of("element_id").map(|id| format!("job:{id}")))
             }
-            if let Some(ids) = &ids {
+            "MessageSubscriptionCreated" | "SignalSubscriptionCreated" => {
+                u64_of("subscription_key")
+                    .zip(str_of("element_id").map(|id| format!("subscription:{id}")))
+            }
+            _ => None,
+        };
+        if let Some((k, id)) = minted {
+            out.insert(k, id);
+        }
+    }
+    out
+}
+
+/// `events` with every key reference rewritten to its corpus-wide identity.
+fn canonical_by_identity(events: &[String], ids: &KeyIds) -> Vec<String> {
+    events
+        .iter()
+        .map(|e| match serde_json::from_str::<Json>(e) {
+            Ok(mut v) => {
                 canonicalize_keys(&mut v, ids);
+                v.to_string()
             }
-            out.push(v.to_string());
-        }
-        if expected.reorder {
-            out.sort();
-        }
-        Some(out)
-    };
+            Err(_) => e.clone(),
+        })
+        .collect()
+}
+
+/// Whether `head` and `prev` (one entry's canonical events) differ only as
+/// `expected` allows. Keys are canonicalized through the corpus-wide
+/// identity maps (`head_ids` / `prev_ids`), so a reference to a key minted in
+/// an EARLIER entry resolves to its entity rather than an orphan token.
+fn diverges_only_as(
+    expected: &Expected,
+    head: &[String],
+    prev: &[String],
+    head_ids: &KeyIds,
+    prev_ids: &KeyIds,
+) -> bool {
+    let normalize =
+        |events: &[String], drop: &[EventPattern], corpus_ids: &KeyIds| -> Option<Vec<String>> {
+            // Fail closed: a structurally inconsistent mint (a collision, or two
+            // keys for one element) is not the declared remint, whatever the
+            // allowlist says.
+            let ids = if expected.remint_keys {
+                key_identities(events)?;
+                Some(corpus_ids)
+            } else {
+                None
+            };
+            let mut out = Vec::with_capacity(events.len());
+            for e in events {
+                let mut v: Json = serde_json::from_str(e).ok()?;
+                if drop.iter().any(|p| p.matches(&v)) {
+                    continue;
+                }
+                if let Some(ids) = ids {
+                    canonicalize_keys(&mut v, ids);
+                }
+                out.push(v.to_string());
+            }
+            if expected.reorder {
+                out.sort();
+            }
+            Some(out)
+        };
     match (
-        normalize(head, &expected.only_in_head),
-        normalize(prev, &expected.only_in_prev),
+        normalize(head, &expected.only_in_head, head_ids),
+        normalize(prev, &expected.only_in_prev, prev_ids),
     ) {
         (Some(h), Some(p)) => h == p,
         _ => false,
@@ -601,8 +792,28 @@ pub struct Divergence {
     /// previous release is at or past it.
     pub introduced_in: String,
     pub issue: String,
-    /// Why a rolling upgrade (old and new replicas side by side) is safe.
+    /// How a cluster may upgrade across it (required, no default).
+    pub upgrade: UpgradeMode,
+    /// Why the declared [`UpgradeMode`] applies; must name it.
     pub rationale: String,
+}
+
+impl Allowlist {
+    /// Every entry that makes its release an `upgrade-boundary` (no rolling
+    /// upgrade across it) — what the release notes must call out.
+    pub fn upgrade_boundaries(&self) -> Vec<String> {
+        self.observational_variants
+            .iter()
+            .filter(|o| o.upgrade == UpgradeMode::UpgradeBoundary)
+            .map(|o| format!("observational variant {} ({})", o.variant, o.issue))
+            .chain(
+                self.divergences
+                    .iter()
+                    .filter(|d| d.upgrade == UpgradeMode::UpgradeBoundary)
+                    .map(|d| format!("scenario {} divergence ({})", d.scenario, d.issue)),
+            )
+            .collect()
+    }
 }
 
 /// Parses the allowlist file.
@@ -644,6 +855,7 @@ fn check_expiry(ctx: &CrossReleaseContext<'_>) -> Result<(), String> {
             (
                 format!("observational variant {}", o.variant),
                 &o.introduced_in,
+                o.upgrade,
                 &o.rationale,
             )
         })
@@ -651,12 +863,20 @@ fn check_expiry(ctx: &CrossReleaseContext<'_>) -> Result<(), String> {
             (
                 format!("scenario {} divergence", d.scenario),
                 &d.introduced_in,
+                d.upgrade,
                 &d.rationale,
             )
         }));
-    for (what, introduced, rationale) in entries {
+    for (what, introduced, upgrade, rationale) in entries {
         if rationale.trim().is_empty() {
-            return Err(format!("allowlist {what} has no rolling-upgrade rationale"));
+            return Err(format!("allowlist {what} has no upgrade rationale"));
+        }
+        if !rationale.contains(upgrade.as_str()) {
+            return Err(format!(
+                "allowlist {what} declares upgrade `{}` but its rationale does not say so — \
+                 the rationale must state which upgrade mode applies and why",
+                upgrade.as_str()
+            ));
         }
         if parse_release(introduced)? <= prev {
             return Err(format!(
@@ -695,7 +915,7 @@ fn event_tag(event: &Json) -> Option<&str> {
 /// ([`is_value_map`]): its keys are variable names, never struct fields, so
 /// erasure never removes one — a variable the previous stream omits stays a
 /// divergence even when the golden records a same-named field as added.
-fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
+pub fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
     match value {
         Json::Object(map) => {
             if is_value_map(map) {
@@ -705,6 +925,19 @@ fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
                 map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
             }
             for (k, v) in map.iter_mut() {
+                if is_field_name(k) && data_map_fields().contains(k) {
+                    // A String-keyed map field: its keys are DATA, never
+                    // erased; only its values (which may be structs) are
+                    // descended into.
+                    if let Json::Object(entries) = v {
+                        if !is_value_map(entries) {
+                            entries
+                                .values_mut()
+                                .for_each(|e| erase_fields(e, ctx, erasable));
+                        }
+                    }
+                    continue;
+                }
                 let next = if is_variant_tag(k) {
                     // An externally-tagged variant: it becomes the context.
                     k.as_str()
@@ -806,6 +1039,7 @@ pub fn cross_release_checked(
     let mut observed: BTreeSet<String> = BTreeSet::new();
     let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
     let (mut filtered, mut ratified_entries) = (0, 0);
+    let (mut head_ids, mut prev_ids) = (KeyIds::new(), KeyIds::new());
     for (i, (h, p)) in head_entries.iter().zip(&prev_entries).enumerate() {
         let scenario = ctx.scenarios[i].as_str();
         // Ratified observational variants leave the head stream; any OTHER
@@ -839,7 +1073,23 @@ pub fn cross_release_checked(
             canonical_events(&h, &erasable)?,
             canonical_events(p, &erasable)?,
         );
-        if hc == pc {
+        for (side, events, ids) in [("head", &hc, &mut head_ids), ("prev", &pc, &mut prev_ids)] {
+            if let Some(events) = events {
+                extend_identities(events, ids)
+                    .map_err(|e| format!("entry {i} (scenario {scenario}), {side}: {e}"))?;
+            }
+        }
+        // Equal raw events are equal only if every key also names the SAME
+        // entity on both sides (a ratified remint earlier in the corpus can
+        // make the same raw key mean different entities).
+        let same_identity = |a: &Option<Vec<String>>, b: &Option<Vec<String>>| match (a, b) {
+            (Some(a), Some(b)) => {
+                canonical_by_identity(a, &head_ids) == canonical_by_identity(b, &prev_ids)
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if hc == pc && same_identity(&hc, &pc) {
             continue;
         }
         let declared = ctx
@@ -848,7 +1098,9 @@ pub fn cross_release_checked(
             .iter()
             .find(|d| d.scenario == scenario);
         let explained = match (declared, &hc, &pc) {
-            (Some(d), Some(hs), Some(ps)) => diverges_only_as(&d.expected, hs, ps),
+            (Some(d), Some(hs), Some(ps)) => {
+                diverges_only_as(&d.expected, hs, ps, &head_ids, &prev_ids)
+            }
             _ => false,
         };
         if explained {

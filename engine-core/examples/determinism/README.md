@@ -27,8 +27,19 @@ ignored silently:
      `only_in_head` event patterns). An entry still differing after them is
      an *undeclared extra divergence* and fails.
 
-   Every entry names its `issue`, the `introduced_in` release and a
-   rolling-upgrade `rationale`. An entry **expires** (must be removed) once the
+   Every entry names its `issue`, the `introduced_in` release, an `upgrade`
+   mode and a `rationale` that names that mode and says why it applies.
+   Raft members **re-execute** committed commands (ADR 0066, "Rolling
+   upgrade", option C), so an allowlisted divergence makes mixed-version
+   members disagree unless gated. `upgrade` is required and is exactly one of:
+   * `feature-gated` — the new behaviour runs only once every voter AND
+     learner advertises the capability (#1661 cluster-join feature
+     advertisement); the old behaviour runs until then.
+   * `upgrade-boundary` — the release requires an all-nodes-same-version
+     (quiesced) upgrade; no rolling upgrade across it. Every such entry must
+     be called out in the release notes.
+
+   An entry **expires** (must be removed) once the
    previous release is at or past `introduced_in`, and a **stale** entry —
    one the run never needs — fails too, so the file cannot drift.
 

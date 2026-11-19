@@ -397,7 +397,7 @@ fn prev_release_gate_undeclared_new_variant_fails_declared_observational_passes(
 
     let allow = serde_json::json!({"observational_variants": [{
         "variant": "JobCanceled", "introduced_in": "v0.0.2", "issue": "#0",
-        "rationale": "test"
+        "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
     }]});
     let report = checked(&head, &prev, allow.clone(), &["JobCanceled"]).unwrap();
     assert!(report.observational_filtered > 0);
@@ -439,7 +439,7 @@ fn prev_release_gate_allowlisted_scenario_admits_only_the_declared_divergence() 
     let declare = |expected: serde_json::Value, introduced: &str| {
         serde_json::json!({"divergences": [{
             "scenario": scenario, "expected": expected, "introduced_in": introduced,
-            "issue": "#0", "rationale": "test"
+            "issue": "#0", "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
         }]})
     };
     let reorder = serde_json::json!({"reorder": true});
@@ -491,7 +491,7 @@ fn prev_release_gate_remint_keys_preserves_entity_relationships() {
     let allow = serde_json::json!({"divergences": [{
         "scenario": scenario,
         "expected": {"reorder": true, "remint_keys": true},
-        "introduced_in": "v0.0.2", "issue": "#0", "rationale": "test"
+        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
     }]});
 
     // A pure reorder (same keys, different order): declared, passes.
@@ -578,7 +578,7 @@ fn prev_release_gate_remint_keys_preserves_entity_relationships() {
     let sub_allow = serde_json::json!({"divergences": [{
         "scenario": sub_scenario,
         "expected": {"reorder": true, "remint_keys": true},
-        "introduced_in": "v0.0.2", "issue": "#0", "rationale": "test"
+        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
     }]});
     let keyonly = key_only(
         sub_scenario,
@@ -823,4 +823,195 @@ fn position_of(full: &[(u64, Command)], kind: &str) -> Vec<u64> {
         .filter(|(_, (_, c))| c.kind() == kind)
         .map(|(i, _)| i as u64)
         .collect()
+}
+
+/// #1700 review: a ratified remint swaps which entity a raw key names on
+/// each side. A LATER entry whose raw events are byte-identical on both
+/// sides but reference a swapped key names DIFFERENT entities — the
+/// key-identity mapping is carried across the whole corpus, so it diverges.
+#[test]
+fn prev_release_gate_remint_identity_carries_across_entries() {
+    let head = head_records();
+    let scenarios = labels();
+    let entries: Vec<&serde_json::Value> =
+        head.iter().filter(|r| r.get("state").is_none()).collect();
+    let activations = |r: &serde_json::Value| -> Vec<(u64, String)> {
+        r.get("events")
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.get("ElementActivating"))
+            .filter_map(|b| {
+                Some((
+                    b.get("element_instance_key")?.as_u64()?,
+                    b.get("element_id")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    };
+    let referenced_later = |from: usize, key: u64| {
+        entries[from + 1..].iter().any(|r| {
+            r.get("events")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.as_object())
+                .flat_map(|o| o.values())
+                .any(|b| b.get("element_instance_key").and_then(|k| k.as_u64()) == Some(key))
+        })
+    };
+    // An entry in `scenario` minting two distinct elements, the first of
+    // which a later entry references.
+    let (x, scenario, k1, k2) = entries
+        .iter()
+        .enumerate()
+        .find_map(|(i, r)| {
+            let acts = activations(r);
+            let (k1, e1) = acts.iter().find(|(k, _)| referenced_later(i, *k))?.clone();
+            let (k2, _) = acts.iter().find(|(k, e)| *k != k1 && *e != e1)?.clone();
+            Some((i, scenarios[i].clone(), k1, k2))
+        })
+        .expect("an entry minting two elements, one referenced later");
+    // prev = head with k1 <-> k2 swapped in entry X ONLY: a clean, ratified
+    // remint there, but later entries' raw references to k1 now name the
+    // other element on the prev side.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[x].get_mut("events") {
+        for e in events.iter_mut() {
+            for body in e.as_object_mut().into_iter().flat_map(|o| o.values_mut()) {
+                if let Some(k) = body.get_mut("element_instance_key") {
+                    if *k == serde_json::json!(k1) {
+                        *k = serde_json::json!(k2);
+                    } else if *k == serde_json::json!(k2) {
+                        *k = serde_json::json!(k1);
+                    }
+                }
+            }
+        }
+    }
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#0",
+        "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
+    }]});
+    let err = checked(&head, &prev, allow, &[]).unwrap_err();
+    assert!(err.contains("entry"), "{err}");
+}
+
+/// #1700 review: the keys of ANY String-keyed map field (here the plain
+/// `String`-valued `ServiceTask.custom_headers`, which `is_value_map` does
+/// not recognise) are DATA — never shape tokens, never erased.
+#[test]
+fn string_valued_map_keys_are_never_fields() {
+    let v = serde_json::json!({"ServiceTask": {
+        "job_type": "t", "custom_headers": {"retry_policy": "x"}
+    }});
+    let mut vocab = compare::Vocab::new();
+    compare::shape_tokens(&v, &mut vocab);
+    assert!(vocab.contains("ServiceTask.custom_headers"), "{vocab:?}");
+    assert!(!vocab.contains("ServiceTask.retry_policy"), "{vocab:?}");
+
+    let mut erased = v.clone();
+    let erasable: compare::Vocab = ["ServiceTask.retry_policy".to_owned()].into();
+    compare::erase_fields(&mut erased, "$", &erasable);
+    assert_eq!(erased, v, "a header named like an added field must survive");
+
+    // Struct-valued maps are still descended (their values ARE structs).
+    let mut nested = serde_json::json!({"Snap": {"processes": {"p1": {"gone": 1, "kept": 2}}}});
+    let erasable: compare::Vocab = ["Snap.gone".to_owned()].into();
+    compare::erase_fields(&mut nested, "$", &erasable);
+    assert_eq!(
+        nested,
+        serde_json::json!({"Snap": {"processes": {"p1": {"kept": 2}}}})
+    );
+}
+
+/// Drift guard: every String-keyed map field declared ANYWHERE in
+/// engine-core/src is covered by `compare::data_map_fields` (derived from
+/// `MAP_FIELD_SOURCES`); a map declared in an unlisted file fails here.
+#[test]
+fn data_map_fields_cover_every_engine_map_field() {
+    fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "tests") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.extend(compare::map_fields_in(
+                    &std::fs::read_to_string(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut all = BTreeSet::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut all,
+    );
+    let missing: Vec<_> = all.difference(compare::data_map_fields()).collect();
+    assert!(
+        missing.is_empty(),
+        "map fields not covered by MAP_FIELD_SOURCES (add their file): {missing:?}"
+    );
+}
+
+/// #1700: every allowlist entry declares how a cluster may upgrade across it
+/// — exactly `feature-gated` or `upgrade-boundary`, no default — and its
+/// rationale names that mode.
+#[test]
+fn allowlist_entries_declare_upgrade_mode() {
+    let base = |upgrade: Option<&str>, rationale: &str| {
+        let mut d = serde_json::json!({
+            "scenario": "s", "expected": {}, "introduced_in": "v0.0.2",
+            "issue": "#0", "rationale": rationale
+        });
+        if let Some(u) = upgrade {
+            d["upgrade"] = serde_json::json!(u);
+        }
+        serde_json::json!({"divergences": [d]}).to_string()
+    };
+    assert!(
+        compare::parse_allowlist(&base(None, "x")).is_err(),
+        "missing mode"
+    );
+    assert!(
+        compare::parse_allowlist(&base(Some("rolling"), "x")).is_err(),
+        "unknown mode"
+    );
+    for mode in ["feature-gated", "upgrade-boundary"] {
+        let a = compare::parse_allowlist(&base(Some(mode), &format!("{mode}: why"))).unwrap();
+        assert_eq!(
+            a.upgrade_boundaries().len(),
+            usize::from(mode == "upgrade-boundary")
+        );
+    }
+
+    // A rationale that does not name its mode is rejected by the gate.
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    let i = reorderable_entry(&head, scenario);
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        events.reverse();
+    }
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario, "expected": {"reorder": true}, "introduced_in": "v0.0.2",
+        "issue": "#0", "upgrade": "feature-gated", "rationale": "safe for a rolling upgrade"
+    }]});
+    let err = checked(&head, &prev, allow, &[]).unwrap_err();
+    assert!(err.contains("rationale does not say so"), "{err}");
+
+    // The checked-in allowlist: every current entry is an upgrade boundary
+    // (none is feature-gated yet) — what the release notes must call out.
+    let real = compare::parse_allowlist(include_str!(
+        "../examples/determinism/divergence-allowlist.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        real.upgrade_boundaries().len(),
+        real.observational_variants.len() + real.divergences.len()
+    );
 }

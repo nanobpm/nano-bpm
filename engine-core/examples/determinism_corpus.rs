@@ -187,6 +187,12 @@ fn main() {
                 prev_tag: required(&args, "--prev-tag"),
                 added: &added,
             };
+            for b in allowlist.upgrade_boundaries() {
+                eprintln!(
+                    "determinism_corpus: UPGRADE BOUNDARY (no rolling upgrade across this \
+                     release; call out in the release notes): {b}"
+                );
+            }
             match compare::cross_release_checked(&head, &prev, &ctx) {
                 Ok(r) => eprintln!(
                     "determinism_corpus: {} entries agree with the previous release \
