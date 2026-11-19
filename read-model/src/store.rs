@@ -2824,7 +2824,7 @@ impl ReadStore {
     /// transitions the row, the other is a no-op, so the instance is counted
     /// exactly once. Returns the number of rows reconciled — the amount by which
     /// the in-flight gauge was over-counting.
-    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::BTreeSet<Key>) -> usize {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let active: Vec<i64> = {
             let mut stmt = match conn.prepare("SELECT key FROM process_instances WHERE state = 0") {
@@ -9962,7 +9962,7 @@ mod definition_xml_tests {
         // Engine truth: only 11 is genuinely live (e.g. cold-spilled). 10 and 12
         // are orphans — their CREATE was projected but the terminal event never
         // was — so the engine holds no such instance.
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         live.insert(11u64);
 
         let reconciled = store.reconcile_orphaned_active(&live);

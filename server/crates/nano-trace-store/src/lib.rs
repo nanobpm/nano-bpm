@@ -32,7 +32,7 @@
 //!   command-commit/ack path. The default (no-`console`) build never compiles this
 //!   module.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 use nanobpmn_engine_core::{Event, Value};
@@ -90,8 +90,8 @@ impl VarSnapshot {
 
 /// Serializes a variable map to JSON and either retains it (within the cap) or
 /// records only its size (over the cap). Never panics on a non-serializable map
-/// — `serde_json` cannot fail for a `HashMap<String, Value>`.
-fn snapshot_vars(vars: &HashMap<String, Value>, max_bytes: usize) -> VarSnapshot {
+/// — `serde_json` cannot fail for a `BTreeMap<String, Value>`.
+fn snapshot_vars(vars: &BTreeMap<String, Value>, max_bytes: usize) -> VarSnapshot {
     // Render natural JSON (e.g. `5`, not `{"Int":5}`) to match the console's
     // existing variable wire shape — the engine `Value` enum serializes
     // externally-tagged, which is not what consumers expect.
@@ -141,18 +141,18 @@ struct Inner {
     /// is flagged truncated.
     stimuli_max: usize,
     /// Trace per instance key.
-    instances: HashMap<u64, InstanceTrace>,
+    instances: BTreeMap<u64, InstanceTrace>,
     /// Instance keys in insertion order (oldest at the front) for ring eviction.
     order: VecDeque<u64>,
     /// Latest deployed version per process id (best-effort; an instance's exact
     /// definition version is not carried on `ProcessInstanceCreated`).
-    versions: HashMap<String, i32>,
+    versions: BTreeMap<String, i32>,
     /// Activations observed before their `JobCreated` was folded. Job activation
     /// is not journaled/exported (see module docs), so it is fed directly from the
     /// activation chokepoint via [`TraceStore::record_activations`]; because the
     /// exporter is async, a fast worker can activate before the create batch
     /// projects. Buffered here (keyed by job key) and drained on fold.
-    pending_acts: HashMap<u64, PendingAct>,
+    pending_acts: BTreeMap<u64, PendingAct>,
     /// Optional durability sink (`NANOBPMN_TRACE_FILE`). When present, a finished
     /// instance is appended to the file as one NDJSON line and dropped from the
     /// ring (keeping at most `sink.tail()` recently-finished ones), so memory is
@@ -201,8 +201,8 @@ struct InstanceTrace {
     last_at: u64,
     outcome: Outcome,
     elements: Vec<ElementTrace>,
-    by_eik: HashMap<u64, usize>,
-    by_job: HashMap<u64, usize>,
+    by_eik: BTreeMap<u64, usize>,
+    by_job: BTreeMap<u64, usize>,
     incidents: Vec<IncidentRec>,
     path: Vec<String>,
     /// The instance's creation inputs (`ProcessInstanceCreated.variables`), kept
@@ -212,7 +212,7 @@ struct InstanceTrace {
     /// Running merged instance variables, maintained only while capture is on so
     /// an incident can snapshot the state the failing expression saw. Not
     /// serialized directly — only sampled into `IncidentRec::variables`.
-    current_variables: Option<HashMap<String, Value>>,
+    current_variables: Option<BTreeMap<String, Value>>,
     /// Ordered recorded-input log (Tier 2), kept only when stimulus capture is on.
     /// Each entry is one external stimulus the instance consumed; replaying the
     /// creation inputs then these deltas in order reproduces the run's inputs.
@@ -357,10 +357,10 @@ impl TraceStore {
                 capture_stimuli,
                 vars_max_bytes,
                 stimuli_max: stimuli_max.max(1),
-                instances: HashMap::new(),
+                instances: BTreeMap::new(),
                 order: VecDeque::new(),
-                versions: HashMap::new(),
-                pending_acts: HashMap::new(),
+                versions: BTreeMap::new(),
+                pending_acts: BTreeMap::new(),
                 sink,
                 finished_tail: VecDeque::new(),
             }),
@@ -585,8 +585,8 @@ impl Inner {
                     last_at: now,
                     outcome: Outcome::Active,
                     elements: Vec::new(),
-                    by_eik: HashMap::new(),
-                    by_job: HashMap::new(),
+                    by_eik: BTreeMap::new(),
+                    by_job: BTreeMap::new(),
                     incidents: Vec::new(),
                     path: Vec::new(),
                     creation_variables,
@@ -610,7 +610,7 @@ impl Inner {
                 }
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    let running = t.current_variables.get_or_insert_with(HashMap::new);
+                    let running = t.current_variables.get_or_insert_with(BTreeMap::new);
                     for (k, v) in variables {
                         running.insert(k.clone(), v.clone());
                     }

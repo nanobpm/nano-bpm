@@ -714,7 +714,7 @@ pub fn write_multi_streaming_snapshot(
     path: &Path,
     header_line: &str,
     entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
-    base_ids: &std::collections::HashMap<u64, u64>,
+    base_ids: &std::collections::BTreeMap<u64, u64>,
 ) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries, base_ids);
@@ -742,7 +742,7 @@ fn write_multi_streaming_snapshot_inner(
     tmp: &Path,
     header_line: &str,
     entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
-    base_ids: &std::collections::HashMap<u64, u64>,
+    base_ids: &std::collections::BTreeMap<u64, u64>,
 ) -> std::io::Result<()> {
     let file = File::create(tmp)?;
     let mut w = BufWriter::new(file);
@@ -958,13 +958,13 @@ fn resolve_spilled_from_stores(
 /// Fail-closed on a torn write (no terminal `end` frame).
 pub fn read_multi_streaming_snapshot(
     path: &Path,
-) -> std::io::Result<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
+) -> std::io::Result<std::collections::BTreeMap<u64, (u64, EngineSnapshot)>> {
     read_multi_streaming_snapshot_based(path).map(|(map, _)| map)
 }
 
 /// Per-partition rebase-floor identities read from a combined snapshot's
 /// control frames (#1405); a partition without one is absent.
-pub type MultiBaseIds = std::collections::HashMap<u64, u64>;
+pub type MultiBaseIds = std::collections::BTreeMap<u64, u64>;
 
 /// [`read_multi_streaming_snapshot`] plus each partition's control-frame
 /// rebase-floor identity.
@@ -972,7 +972,7 @@ pub type MultiBaseIds = std::collections::HashMap<u64, u64>;
 pub fn read_multi_streaming_snapshot_based(
     path: &Path,
 ) -> std::io::Result<(
-    std::collections::HashMap<u64, (u64, EngineSnapshot)>,
+    std::collections::BTreeMap<u64, (u64, EngineSnapshot)>,
     MultiBaseIds,
 )> {
     let mut bases = MultiBaseIds::new();
@@ -987,8 +987,8 @@ pub fn read_multi_streaming_snapshot_based(
         ));
     }
 
-    let mut map: std::collections::HashMap<u64, (u64, EngineSnapshot)> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::BTreeMap<u64, (u64, EngineSnapshot)> =
+        std::collections::BTreeMap::new();
     let mut saw_end = false;
     let mut line = String::new();
     loop {
@@ -1048,7 +1048,7 @@ pub fn read_multi_streaming_snapshot_based(
     reason = "non-production target (unit tests)"
 )]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1077,7 +1077,7 @@ mod tests {
             .apply_command(Command::DeployProcess(demo()))
             .expect("deploy");
         for i in 0..n {
-            let mut vars = HashMap::new();
+            let mut vars = BTreeMap::new();
             vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
             engine
                 .apply_command(Command::create_instance_with("demo", vars))
@@ -1263,7 +1263,7 @@ mod tests {
         // Simulate "all three instances are cold": the resident decomposition is
         // empty, and the cold keys are served by a store closure.
         let cold_keys: Vec<Key> = instances.iter().map(|s| s.instance.key).collect();
-        let cold_store: HashMap<Key, InstanceSnapshot> =
+        let cold_store: BTreeMap<Key, InstanceSnapshot> =
             instances.into_iter().map(|s| (s.instance.key, s)).collect();
 
         // The cold set must be read LAZILY — interleaved with the stream, not
@@ -1342,7 +1342,7 @@ mod tests {
             Some(Value::Str(s)) => s.clone(),
             other => panic!("missing payload: {other:?}"),
         };
-        cold_snap.instance.variables = Arc::new(HashMap::new());
+        cold_snap.instance.variables = Arc::new(BTreeMap::new());
         cold_snap.instance.variables_spilled = true;
 
         let cold_keys: Vec<Key> = vec![key];
@@ -1503,7 +1503,7 @@ mod tests {
 
         // Mark the resident instance variable-spilled (empty placeholder + flag).
         let stale_vars = (*snap.instance.variables).clone();
-        snap.instance.variables = Arc::new(HashMap::new());
+        snap.instance.variables = Arc::new(BTreeMap::new());
         snap.instance.variables_spilled = true;
 
         // Stores: a lean var store with NO row for `key`, and a legacy spill
@@ -1561,7 +1561,7 @@ mod tests {
         let key = snap.instance.key;
 
         // Mark the resident instance variable-spilled (empty placeholder + flag).
-        snap.instance.variables = Arc::new(HashMap::new());
+        snap.instance.variables = Arc::new(BTreeMap::new());
         snap.instance.variables_spilled = true;
 
         // Stores: a lean var store with NO row for `key`, NO legacy spill store,
