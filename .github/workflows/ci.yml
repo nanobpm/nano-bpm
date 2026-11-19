@@ -329,6 +329,88 @@ jobs:
         working-directory: engine-core
         run: cargo test --doc --features serde
 
+  # Determinism CI (ADR 0066 slice 6, #1665). Re-executes the command corpus
+  # (engine-core/examples/determinism/: every Command variant + a seeded
+  # workload) and compares generated records + canonical state checkpoints
+  # across hash seeds and process restarts (inside each cell), build profiles
+  # and platforms (across cells), and the previous release (aggregate job).
+  # The logic lives in scripts/determinism-ci.sh so a cell reproduces locally.
+  determinism-cell:
+    name: determinism cell (${{ matrix.os }}, ${{ matrix.profile }})
+    needs: changes
+    if: *code_gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+        profile: [debug, release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+          key: determinism-${{ matrix.profile }}
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold the ubuntu-24.04 (x86_64) cells fail at link time.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - name: Seed/restart cell
+        run: scripts/determinism-ci.sh cell "$RUNNER_TEMP/det" ${{ matrix.profile }}
+      - name: Name the cell digest
+        run: cp "$RUNNER_TEMP/det/digest.txt" "$RUNNER_TEMP/det/digest-${{ matrix.os }}-${{ matrix.profile }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: determinism-digest-${{ matrix.os }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/det/digest-*.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  # The single required check: cross-cell digest comparison, the canary (the
+  # gate must detect a seeded HashMap non-determinism) and the
+  # previous-release replay. `always()` so a FAILED cell fails this job
+  # instead of skipping it — a skipped required check counts as passing.
+  determinism:
+    name: determinism (seed/profile/platform/previous-release)
+    runs-on: ubuntu-24.04
+    needs: [changes, determinism-cell]
+    if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true') }}
+    steps:
+      - name: Every cell passed
+        if: ${{ needs.determinism-cell.result != 'success' }}
+        run: |
+          echo "::error::determinism cell result: ${{ needs.determinism-cell.result }}"
+          exit 1
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+          key: determinism-debug
+      - name: Install mold linker
+        # The canary and previous-release steps build the examples on this
+        # x86_64 runner, where .cargo/config.toml sets `-fuse-ld=mold`.
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: determinism-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - name: Profiles and platforms agree
+        run: scripts/determinism-ci.sh compare "$RUNNER_TEMP"/digests/digest-*.txt
+      - name: Canary (seeded HashMap non-determinism must be detected)
+        run: scripts/determinism-ci.sh canary "$RUNNER_TEMP/canary"
+      - name: Previous release replays identically
+        run: scripts/determinism-ci.sh prev-release "$RUNNER_TEMP/prev"
+
   engine-wasm-ffi-dist:
     name: engine-wasm-ffi (dist + verify)
     runs-on: ubuntu-24.04

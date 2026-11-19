@@ -131,6 +131,11 @@ merge_protections:
       - or:
           - check-success=formal (tlc)
           - check-skipped=formal (tlc)
+      # Determinism CI (ADR 0066 slice 6, #1665): seed/restart/profile/platform
+      # digest matrix + previous-release replay. Change-gated on `code`.
+      - or:
+          - check-success=determinism (seed/profile/platform/previous-release)
+          - check-skipped=determinism (seed/profile/platform/previous-release)
       # Promoted to a required gate by #1127: the guided-journey browser guards
       # (incl. the modeler agent-task regression guard) were previously
       # non-required, which is how the #1127 properties-panel crash regressed
