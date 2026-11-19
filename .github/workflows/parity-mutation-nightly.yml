@@ -82,7 +82,7 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Cache cargo-mutants + build
         uses: actions/cache@v4
         with:
