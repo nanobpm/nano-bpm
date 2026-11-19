@@ -76,3 +76,19 @@ disallowed-methods = [
     { path = "f32::acosh", reason = "platform libm (#1663): use libm::acoshf" },
     { path = "f32::atanh", reason = "platform libm (#1663): use libm::atanhf" },
 ]
+
+# Ordered-collection lint (#1662, ADR 0066 slice 3, audit #6). Engine state is
+# replicated and snapshotted: its iteration order drives event emission order
+# and its serialized order must be canonical (byte-identical across replicas
+# holding equal state — the divergence digest hashes those bytes). std
+# `HashMap`/`HashSet` order depends on the per-process `RandomState` seed and on
+# the table's capacity/mutation history (a snapshot-restored replica differs
+# from one that applied the log), so a fixed-seed hasher is NOT sufficient. Use
+# `BTreeMap`/`BTreeSet`. There are no exceptions in engine-core today; a future
+# off-apply-path cache must carry a narrow, reasoned
+# `#[allow(clippy::disallowed_types, reason = …)]`. `tests/purity_lint.rs`
+# proves the lint fires on a seeded violation.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "replica determinism (#1662): engine state must use BTreeMap (canonical order)" },
+    { path = "std::collections::HashSet", reason = "replica determinism (#1662): engine state must use BTreeSet (canonical order)" },
+]
