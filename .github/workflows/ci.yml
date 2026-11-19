@@ -1137,6 +1137,8 @@ jobs:
         with:
           mold: 'true'
       - uses: taiki-e/install-action@nextest
+      - name: Restore the cached openapi-generator JAR (#1684)
+        uses: ./.github/actions/openapi-generator-cache
       - name: Generate REST layer + stub impls
         # The server depends on the path crate ../generated and on
         # server/src/stub_impls.rs, both produced by codegen (gitignored). Mirror
