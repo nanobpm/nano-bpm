@@ -161,3 +161,53 @@ Next ==
     assert.ok(exp.lines.has(3), `Ready's line lost its obligation with trailer ${JSON.stringify(trailer)}`);
   }
 });
+
+// TLC never instruments constant-level definitions (folded at startup or
+// evaluated outside the coverage counters), a variable tuple used only as an
+// UNCHANGED / subscript operand, nor a one-line Next-disjunct wrapper (its
+// coverage is the firing obligation). Obligating those lines made every real
+// spec report false gaps (`InitFlow == "<create>"`, `vars == <<..>>`, ...).
+test('constant-level defs, variable tuples and one-line disjunct wrappers carry no line obligation', () => {
+  const src = `---- MODULE Lvl ----
+CONSTANT N
+VARIABLES x, y
+Zero == 0
+
+Bound == N + 1
+Bump(p) == [p EXCEPT ![1] = @ + 1]
+vars == <<x, y>>
+Ready == x > Zero
+
+Step(k) ==
+    /\\ Ready
+    /\\ x' = x + k
+    /\\ UNCHANGED y
+Wrap == \\E k \\in {1} : Step(k)
+
+Next ==
+    \\/ Wrap
+    \\/ UNCHANGED vars
+====
+`;
+  const exp = expectations(src);
+  for (const n of [4, 6, 7, 8, 15]) assert.ok(!exp.lines.has(n), `line ${n} must carry no obligation`);
+  assert.ok(exp.lines.has(9), 'a state-level one-line guard keeps its obligation');
+  assert.ok(exp.lines.has(12) && exp.lines.has(13), 'action conjuncts keep their obligations');
+});
+
+test('VARIABLE declarations spanning lines are all recognised', () => {
+  const src = `---- MODULE Multi ----
+VARIABLES
+    a,   \\* first
+    b
+Ready == b > 0
+Inc ==
+    /\\ Ready
+    /\\ a' = a + 1
+    /\\ UNCHANGED b
+Next ==
+    \\/ Inc
+====
+`;
+  assert.ok(expectations(src).lines.has(5));
+});

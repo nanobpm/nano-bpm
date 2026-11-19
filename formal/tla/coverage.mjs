@@ -33,7 +33,10 @@
 //     (including pure guard helpers such as `ZeebeInclusiveReady` or
 //     `TokenFlow.JoinFires`), not only the action closure: an action's guard
 //     is evaluated exactly when the action is, so a guard branch TLC never
-//     evaluated is a real coverage gap.
+//     evaluated is a real coverage gap. Constant-level definitions (no
+//     transitive state-variable read), a bare variable tuple (`vars`), and a
+//     one-line Next-disjunct wrapper carry no line obligation: TLC never
+//     instruments the first two, and the third is covered by its firing.
 //
 // Coverage is aggregated over all of a spec's models: an action need only fire
 // in one of them. Every registered spec (formal/tla/specs/*.spec) is gated, so a
@@ -149,9 +152,48 @@ function reachableClosure(name, defs) {
   return seen;
 }
 
+// The spec's state variables (every `VARIABLE(S)` declaration, which may span
+// several indented lines).
+export function parseVariables(src) {
+  const vars = new Set();
+  let inDecl = false;
+  for (const text of stripComments(src).split('\n')) {
+    const m = text.match(/^VARIABLES?\b(.*)$/);
+    if (m) inDecl = true;
+    else if (text.trim() && !/^\s/.test(text)) inDecl = false;
+    if (!inDecl) continue;
+    for (const w of (m ? m[1] : text).match(/[A-Za-z_]\w*/g) ?? []) vars.add(w);
+  }
+  return vars;
+}
+
+// A definition is state-level when it (transitively) reads a state variable.
+// TLC never instruments constant-level definitions in its coverage report
+// (they are folded at startup or evaluated outside the per-state counters), so
+// they carry no line obligation.
+function stateLevelIn(defs, vars) {
+  const memo = new Map();
+  const visit = (n, onPath) => {
+    if (memo.has(n)) return memo.get(n);
+    const def = defs.get(n);
+    const words = def.lines.flatMap(({ text }) => text.match(/[A-Za-z_]\w*/g) ?? []);
+    let res = words.some((w) => vars.has(w));
+    if (!res) {
+      onPath.add(n);
+      for (const r of refs(def, defs)) if (!onPath.has(r) && visit(r, onPath)) { res = true; break; }
+      onPath.delete(n);
+    }
+    if (res || onPath.size === 0) memo.set(n, res);
+    return res;
+  };
+  return (n) => visit(n, new Set());
+}
+
 // The expected coverage obligations of a spec module.
 export function expectations(src) {
   const defs = parseDefs(src);
+  const stateVars = parseVariables(src);
+  const isStateLevel = stateLevelIn(defs, stateVars);
   const next = defs.get('Next');
   if (!next) throw new Error('spec has no Next definition');
   // Next's disjuncts: split on top-level `\/` (one per line or inline).
@@ -173,10 +215,19 @@ export function expectations(src) {
   const lines = new Map(); // line number -> "Action: text"
   const extent = new Map(); // line number -> last line of that conjunct/disjunct
   const alias = new Map(); // line number -> [start, end] of a bare operator it references
+  const disjunctSet = new Set(disjuncts);
   for (const a of obligated) {
     const def = defs.get(a);
+    if (!isStateLevel(a)) continue;
+    // A bare variable tuple (`vars == <<x, y>>`) is only ever an UNCHANGED /
+    // subscript operand, which TLC attributes to the use site.
+    const body = def.lines.map(({ text }) => text).join(' ').trim();
+    const tuple = body.match(/^<<([\w\s,]*)>>$/);
+    if (tuple && tuple[1].split(',').every((w) => stateVars.has(w.trim()))) continue;
     // Blank / comment-only lines must not change whether a definition is a
-    // single-line body (formatting must never remove an obligation).
+    // single-line body (formatting must never remove an obligation). A
+    // one-line Next disjunct (`Drain(f) == \E S : DrainVia(f, S)`) is a
+    // wrapper whose coverage is its firing obligation, not a line.
     const substantive = def.lines.filter(({ text }) => {
       const t = text.trim();
       return t && !t.startsWith('\\*') && !t.startsWith('(*');
@@ -184,7 +235,7 @@ export function expectations(src) {
     def.lines.forEach(({ no, text }, i) => {
       const t = text.trim();
       if (!t) return;
-      if (/^(\/\\|\\\/|\[\]|CASE\b|THEN\b|ELSE\b)/.test(t) || (i === 0 && substantive === 1)) {
+      if (/^(\/\\|\\\/|\[\]|CASE\b|THEN\b|ELSE\b)/.test(t) || (i === 0 && substantive === 1 && !disjunctSet.has(a))) {
         lines.set(no, `${a}: ${t}`);
         // TLC attributes a bare operator reference (`/\ Settled`) to the
         // operator's DEFINITION, not the call site.
