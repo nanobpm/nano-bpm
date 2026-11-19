@@ -8566,6 +8566,82 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1691 review: an authoritative adoption lifts the #1405 fence only once
+    /// its base checkpoint SUCCEEDS. A checkpoint failure re-arms the fence in
+    /// the same call, so a refused (fenced) journal never accepts commands
+    /// over an adopted state whose recovery base was never published; a later
+    /// successful adoption lifts it.
+    #[test]
+    fn a_failed_adoption_checkpoint_keeps_the_journal_fenced() {
+        let dir = temp_dir("adopt-fence-rearm");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+        let (snap, _) = donor_snapshot("adopt-fence-rearm-donor");
+        let (writer, recovery) =
+            crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                .expect("open multi");
+        let mut engines: std::collections::BTreeMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let mut j0 = crate::journal::Journal::from_engine_shared(
+            0,
+            engines.remove(&0).unwrap(),
+            true,
+            &writer,
+        );
+        j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+        j0.set_varstore(Arc::clone(&varstore));
+        j0.abort_raft_entry();
+        assert!(j0.is_fenced());
+        let seg = j0.seg_shared().expect("segmented");
+        {
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(true));
+            let res = j0.adopt_snapshot_as_base(snap.clone(), Some(&permit));
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(false));
+            assert!(res.is_err(), "injected checkpoint failure");
+        }
+        assert!(
+            j0.is_fenced(),
+            "a failed adoption checkpoint re-arms the fence"
+        );
+        assert!(
+            j0.apply_command(Command::DeployProcess(demo())).is_err(),
+            "the re-armed journal rejects commands"
+        );
+        // An UNFENCED journal whose adoption checkpoint fails is fenced too.
+        let mut j1 = crate::journal::Journal::from_engine_shared(
+            1,
+            engines.remove(&1).unwrap(),
+            true,
+            &writer,
+        );
+        j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+        j1.set_varstore(Arc::clone(&varstore));
+        {
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(true));
+            let res = j1.adopt_snapshot_as_base(snap.clone(), Some(&permit));
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(false));
+            assert!(res.is_err(), "injected checkpoint failure");
+        }
+        assert!(
+            j1.is_fenced(),
+            "a failed adoption never leaves the journal writable"
+        );
+        // A successful authoritative adoption lifts the fence.
+        {
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            j0.adopt_snapshot_as_base(snap, Some(&permit))
+                .expect("adoption succeeds");
+        }
+        assert!(!j0.is_fenced(), "a published adoption supersedes the fence");
+        let _ = j0
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("the adopted journal accepts commands");
+        drop((j0, j1, writer));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #1405: upserting partition B must NOT re-stamp partition A's untouched
     /// entry with A's current floor. If A published a new floor (same boundary)
     /// but its base write failed, re-stamping would certify A's pre-adoption

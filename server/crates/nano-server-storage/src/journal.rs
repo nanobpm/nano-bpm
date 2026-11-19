@@ -1320,15 +1320,9 @@ impl Journal {
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
     ///
-    /// The adopted state is AUTHORITATIVE, so it supersedes the #1405 abort
-    /// fence (#1691 review): a journal fenced by an aborted entry or a refused
-    /// diverged boot can otherwise never resync — its `checkpoint_base` refuses
-    /// while fenced, the leader's snapshot is rejected, and the durable
-    /// divergence marker is never cleared. Clearing the fence here is safe
-    /// because the fence exists to retire the SUPERSEDED state, and this
-    /// function has just replaced that state wholesale; the caller
-    /// (`adopt_engine_snapshot`) still fails closed when the subsequent
-    /// checkpoint of the adopted base fails.
+    /// This does NOT lift the #1405 abort fence: only
+    /// [`adopt_snapshot_as_base`](Self::adopt_snapshot_as_base) may, and only
+    /// once the adopted state is durably checkpointed (#1691).
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
         // The REPLICATED lenient flag (#1661) is in the snapshot body; only the
         // pre-cutover legacy host flag is config to re-apply.
@@ -1358,13 +1352,34 @@ impl Journal {
         }
         self.discard_orphan_reports();
         self.fresh = false;
-        // The adopted snapshot IS the authoritative state: the #1405 fence
-        // (an aborted entry, or a refused diverged boot, #1691) retired the
-        // state this replaces, so it must not outlive the adoption — a fenced
-        // journal would refuse the `checkpoint_base` that makes the adopted
-        // state the durable recovery base, wedging the resync.
+    }
+
+    /// Adopts an AUTHORITATIVE snapshot (a leader's Raft snapshot) and
+    /// publishes it as this journal's durable recovery base, in ONE call so it
+    /// runs in one engine-actor turn (#1405, #1691).
+    ///
+    /// The adopted state supersedes the #1405 abort fence — the fence retires
+    /// the state this replaces — but the fence is lifted only for the
+    /// duration of [`checkpoint_base`](Self::checkpoint_base) (which refuses a
+    /// fenced journal) and stays lifted only if that checkpoint SUCCEEDS. On
+    /// any checkpoint failure the fence is re-armed before returning, so a
+    /// previously refused journal never becomes writable over a state whose
+    /// recovery base was never published. A failed adoption of an UNFENCED
+    /// journal fences it too: the live state is then not what the durable
+    /// journal would recover, so it must be rebuilt rather than extended.
+    pub fn adopt_snapshot_as_base(
+        &mut self,
+        snapshot: nanobpmn_engine_core::EngineSnapshot,
+        permit: Option<&crate::seglog::CheckpointPermit>,
+    ) -> io::Result<()> {
+        self.restore_engine_from_snapshot(snapshot);
         self.raft_entry = None;
         self.fenced = false;
+        let published = self.checkpoint_base(permit);
+        if published.is_err() {
+            self.fenced = true;
+        }
+        published
     }
 
     /// Replaces this journal's engine with one rebuilt from authoritative
