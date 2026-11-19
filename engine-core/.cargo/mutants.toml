@@ -54,7 +54,12 @@ exclude_re = [
 # (`cargo nextest run --features serde`): several inline engine tests build only
 # under it, and cargo-mutants builds the whole lib test harness.
 features = ["serde"]
+# `--lib` adds the inline engine tests (src/engine/tests/: join_scopes,
+# execution_order, …) — the replay corpus only has parallel-diamond traces, so
+# without them nothing exercises the inclusive-join path of
+# `has_active_path_to` and its mutants survive (cargo-mutants exits 2).
 additional_cargo_test_args = [
+    "--lib",
     "--test", "trace_validation",
     "--test", "zeebe_token_flow_trace_validation",
     "--test", "conformance",

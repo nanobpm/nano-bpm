@@ -172,23 +172,62 @@ test("an event-based gateway's expectation is the SPEC projection, not the engin
     // No "G->M2": the spec never takes the losing catch's flow.
   });
 
-  // Red/Green: a backend observation that DID take the losing flow is not a
-  // behaviour of ZeebeTokenFlow and must fail the oracle.
-  const tookLoser = {
+  // The engine's WIRE record takes both gateway flows (arm all, withdraw the
+  // loser) — exactly what `expect.sequenceFlows` pins. The spec oracle must
+  // ACCEPT it (both oracles see the same observation; a contradiction would
+  // fail every event-gateway scenario in CI).
+  const wire = {
     completed: true,
     sequenceFlows: { "S->G": 1, "G->M1": 1, "G->M2": 1, "M1->E": 1 },
     jobsCreated: {},
   };
-  const r1 = checkSpecOracle(graph, run, tookLoser);
-  assert.ok(!r1.ok, "taking the losing gateway flow must fail the spec oracle");
-  assert.ok(r1.mismatches.some((m) => m.field === "sequenceFlows"));
+  const ok = checkSpecOracle(graph, run, wire);
+  assert.ok(ok.ok, JSON.stringify(ok.mismatches));
 
-  // And the spec-conformant observation (only the selected flow) passes.
-  const specShaped = {
+  // Red/Green: a backend that continued down the LOSING catch is not a
+  // behaviour of the spec's selection and must fail.
+  const wrongCatch = {
     completed: true,
-    sequenceFlows: { "S->G": 1, "G->M1": 1, "M1->E": 1 },
+    sequenceFlows: { "S->G": 1, "G->M1": 1, "G->M2": 1, "M2->E": 1 },
     jobsCreated: {},
   };
-  const r2 = checkSpecOracle(graph, run, specShaped);
-  assert.ok(r2.ok, JSON.stringify(r2.mismatches));
+  const bad = checkSpecOracle(graph, run, wrongCatch);
+  assert.ok(!bad.ok, "continuing down the losing catch must fail the spec oracle");
+  assert.ok(bad.mismatches.some((m) => m.field === "sequenceFlows"));
+});
+
+test("event-gateway selections are counted per correlation step", () => {
+  // Gateway activated twice (loop), selecting each alternative once: the spec
+  // takes G->M1 once and G->M2 once — not the raw withdrawal-inclusive 2/2.
+  const graph = {
+    id: "EvtLoop",
+    nodes: { S: "start", G: "evt", M1: "msg", M2: "msg", E: "end" },
+    edges: [
+      { id: "f0", from: "S", to: "G" },
+      { id: "f1", from: "G", to: "M1" },
+      { id: "f2", from: "G", to: "M2" },
+      { id: "f3", from: "M1", to: "E" },
+      { id: "f4", from: "M2", to: "E" },
+    ],
+  };
+  const run = {
+    steps: [
+      { op: "correlate", node: "G", flow: "f1", catch: "M1" },
+      { op: "correlate", node: "G", flow: "f2", catch: "M2" },
+    ],
+    completed: true,
+    jobsCreated: {},
+    takenFlows: { f0: 2, f1: 2, f2: 2, f3: 1, f4: 1 },
+    joinsFired: {},
+  };
+  const ms = referenceMilestones(graph, run);
+  assert.equal(ms.sequenceFlows["G->M1"], 1);
+  assert.equal(ms.sequenceFlows["G->M2"], 1);
+  const wire = {
+    completed: true,
+    sequenceFlows: { "S->G": 2, "G->M1": 2, "G->M2": 2, "M1->E": 1, "M2->E": 1 },
+    jobsCreated: {},
+  };
+  const r = checkSpecOracle(graph, run, wire);
+  assert.ok(r.ok, JSON.stringify(r.mismatches));
 });

@@ -124,7 +124,7 @@ jobs:
               # examine_re above does not select them.
               echo "exclude_re = ['Engine::plan_command_inner', 'Engine::adhoc_completion_after_tool']"
               echo 'features = ["serde"]'
-              echo 'additional_cargo_test_args = ["--test", "trace_validation", "--test", "zeebe_token_flow_trace_validation", "--test", "conformance"]'
+              echo 'additional_cargo_test_args = ["--lib", "--test", "trace_validation", "--test", "zeebe_token_flow_trace_validation", "--test", "conformance"]'
             } > /tmp/mutants-pr.toml
             cargo mutants --in-place --config /tmp/mutants-pr.toml
           else
