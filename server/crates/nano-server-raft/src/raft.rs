@@ -832,6 +832,62 @@ fn quarantine_snapshot_ptr(dir: &Path, index: u64) {
     }
 }
 
+/// The crash-durable divergence marker (#1691), next to the snapshot pointer.
+/// Its name matches no reclamation sweep (`snap-*` / `incoming-*` / the live
+/// pointer), so it survives every reap until an authoritative leader resync
+/// is durably installed.
+fn divergence_marker_path(dir: &Path) -> PathBuf {
+    dir.join("divergence-marker.json")
+}
+
+/// Durably records `d` (#1691): tmp write + fsync + rename + dir fsync, so a
+/// crash after the fail-stop can never resume the diverged journal.
+fn write_divergence_marker(dir: &Path, d: &Divergence) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(d)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("divergence-marker.json.tmp-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, divergence_marker_path(dir))?;
+    if let Ok(dirf) = std::fs::File::open(dir) {
+        let _ = dirf.sync_all();
+    }
+    Ok(())
+}
+
+/// Reads the durable divergence marker (#1691). An unreadable/undecodable
+/// marker still means "diverged": it fails closed as a marker of unknown
+/// detail rather than being ignored.
+fn read_divergence_marker(dir: &Path) -> Option<Result<Divergence, String>> {
+    let path = divergence_marker_path(dir);
+    if !path.exists() {
+        return None;
+    }
+    Some(
+        std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())),
+    )
+}
+
+/// Clears the divergence marker (#1691) once an authoritative leader snapshot
+/// is durably installed, fsyncing the directory so the unlink is durable.
+fn clear_divergence_marker(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(divergence_marker_path(dir)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    if let Ok(dirf) = std::fs::File::open(dir) {
+        let _ = dirf.sync_all();
+    }
+    Ok(())
+}
+
 /// The name a diverged snapshot artifact is quarantined under (#1664): a
 /// prefix no reclamation sweep matches.
 fn quarantined_name(index: u64, original: &str) -> String {
@@ -1012,7 +1068,8 @@ pub struct DigestClaim {
 
 /// A detected replica divergence (#1664): the follower's chain at `index`
 /// disagreed with the leader's claim, so it fail-stopped its apply.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Serializable: persisted as the crash-durable divergence marker (#1691).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Divergence {
     /// The log index whose chains disagreed.
     pub index: u64,
@@ -1510,6 +1567,16 @@ impl PartitionStateMachine {
         {
             let _publish = self.engine.snapshot_publish_lock().await;
             self.digest.set_diverged(divergence.clone());
+            // Crash-durable marker (#1691) BEFORE the quarantine: a restart
+            // must never resume the diverged journal, and a self-consistent
+            // diverged chain passes replay verification on its own.
+            if let Err(e) = write_divergence_marker(&self.snapshot_dir, &divergence) {
+                tracing::error!(
+                    dir = ?self.snapshot_dir,
+                    error = %e,
+                    "could not persist the divergence marker (#1691)"
+                );
+            }
             quarantine_snapshot_ptr(&self.snapshot_dir, divergence.detected_at);
         }
         self.engine.with(|journal| journal.abort_raft_entry()).await;
@@ -1531,7 +1598,13 @@ impl PartitionStateMachine {
     /// Only a snapshot strictly ahead of the journal (or a journal with no
     /// applied-entry record at all) is restored. The single canonical boot-state
     /// rule for every durable bootstrap path.
+    ///
+    /// Fails closed when the crash-durable divergence marker (#1691) is
+    /// present: the local journal/snapshot is known-diverged and must not be
+    /// adopted — the member resyncs from the leader (fresh receiver, or an
+    /// installed leader snapshot, which clears the marker).
     async fn restore_newest_boot_state(&self) -> anyhow::Result<()> {
+        self.refuse_diverged_local_state()?;
         let journaled = self.journaled_applied().await?;
         let snapshot = self
             .current_snapshot
@@ -1551,6 +1624,31 @@ impl PartitionStateMachine {
         }?;
         self.reseed_digest_from_journal().await;
         Ok(())
+    }
+
+    /// Refuses to adopt local state when the durable divergence marker
+    /// (#1691) is present. It does not re-latch in memory: the refused member
+    /// never runs, and a latch would refuse the very leader install that
+    /// clears the marker.
+    fn refuse_diverged_local_state(&self) -> anyhow::Result<()> {
+        match read_divergence_marker(&self.snapshot_dir) {
+            None => Ok(()),
+            Some(Ok(d)) => {
+                anyhow::bail!(
+                    "partition {}: refusing to boot from known-diverged local state ({d}); \
+                     the durable divergence marker {:?} is cleared only by an authoritative \
+                     leader resync (#1691)",
+                    self.partition_id(),
+                    divergence_marker_path(&self.snapshot_dir)
+                )
+            }
+            Some(Err(e)) => anyhow::bail!(
+                "partition {}: refusing to boot from known-diverged local state (unreadable \
+                 divergence marker {:?}: {e}); resync from the leader (#1691)",
+                self.partition_id(),
+                divergence_marker_path(&self.snapshot_dir)
+            ),
+        }
     }
 
     /// Acquires the journal's checkpoint permit for an adoption (#1405), off
@@ -1743,6 +1841,10 @@ impl PartitionStateMachine {
             path: current_path,
         };
         write_snapshot_ptr(&self.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // The leader's snapshot is now the durable boot baseline (#1691):
+        // only an authoritative resync clears the divergence marker.
+        clear_divergence_marker(&self.snapshot_dir)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         // #1488: publish the installed snapshot's per-partition/per-replica size
         // (+ the oversize alert) and promptly reap every OTHER superseded
@@ -5193,6 +5295,49 @@ mod tests {
             read_snapshot_ptr(&dir).is_none(),
             "no boot-baseline pointer is published after the latch"
         );
+    }
+
+    /// #1691: the divergence latch is crash-durable. A member restarted on a
+    /// diverged replica's dir refuses to adopt its local state (a diverged
+    /// chain can be self-consistent, so replay verification alone would pass),
+    /// and only an authoritative leader snapshot install clears the marker.
+    #[tokio::test]
+    async fn a_restart_after_a_divergence_refuses_local_state_until_resync() {
+        let (restarted, dir, leader_meta, diverged, received) = publication_race_fixture().await;
+        let chain = ChainDigest::genesis(1);
+        let divergence = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        let _ = diverged.fail_stop_divergence(divergence.clone()).await;
+        assert_eq!(
+            read_divergence_marker(&dir).and_then(Result::ok),
+            Some(divergence),
+            "the divergence is persisted"
+        );
+        // `restarted` shares the dir but none of the in-memory latch/fence:
+        // exactly what a process restart sees.
+        assert!(restarted.digest.divergence().is_none());
+        let refused = restarted
+            .restore_newest_boot_state()
+            .await
+            .expect_err("a diverged replica must not resume its local state");
+        assert!(refused.to_string().contains("#1691"), "{refused}");
+        // A corrupt marker still fails closed.
+        std::fs::write(divergence_marker_path(&dir), b"{not json").expect("corrupt");
+        assert!(restarted.restore_newest_boot_state().await.is_err());
+        // Authoritative leader resync: the install durably clears the marker.
+        restarted
+            .install_snapshot_skip_adoption_for_test(&leader_meta, received)
+            .await
+            .expect("leader resync installs");
+        assert!(read_divergence_marker(&dir).is_none(), "cleared by resync");
+        restarted
+            .restore_newest_boot_state()
+            .await
+            .expect("boots after resync");
     }
 
     /// #1664 review: a divergence quarantine keeps BOTH the pointer and the
