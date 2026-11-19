@@ -753,11 +753,18 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
 /// token, so it diverges unless the raw key is identical on both sides
 /// (`instance_key`/`scope_key`: the process instance is not re-minted by
 /// fork order).
+///
+/// The bare `scope` field is a key too: `ElementActivating`/`ElementActivated`
+/// (and `ExecutionListenerJobCreated`, the `ParallelJoin*` events) name their
+/// enclosing element instance as `scope` — an element-instance key, not
+/// application data (a `scope` key inside a `variables`/`custom_headers` map
+/// is never reached: those maps are `BTreeMap<String, Value>`/string data,
+/// and a numeric `scope` value only ever appears at an event-body key).
 fn canonicalize_keys(value: &mut Json, ids: &KeyIds) {
     match value {
         Json::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if (k == "key" || k.ends_with("_key")) && v.is_u64() {
+                if (k == "key" || k == "scope" || k.ends_with("_key")) && v.is_u64() {
                     let raw = v.as_u64().unwrap_or(0);
                     let token = match ids.get(&raw) {
                         Some(identity) => Json::String(identity.clone()),
@@ -957,11 +964,16 @@ fn event_tag(event: &Json) -> Option<&str> {
     }
 }
 
-/// Erases `erasable` fields. A field token is always variant-qualified
-/// (`Variant.field`), and a snake_case key is only a struct FIELD under an
-/// externally-tagged variant — so erasure happens at every non-root context
-/// and propagates through a snake_case struct field (serde flattens nested
-/// structs, e.g. `multi_instance`'s fields stay erasable under the variant).
+/// Erases `erasable` fields. A field token is variant-qualified
+/// (`Variant.field`) for the externally-tagged `Command`/`Event` shapes, or
+/// `$`-qualified (`$.field`) for the untagged `EngineSnapshot`/`State`
+/// structs, whose fields keep the root context. Erasure therefore happens at
+/// every context — the root included, but only for a token explicitly
+/// listing that `$`-qualified field (an event token never starts with `$`,
+/// so root erasure can never touch an event field, and a `$` token never
+/// names a variant-qualified one) — and propagates through a snake_case
+/// struct field (serde flattens nested structs, e.g. `multi_instance`'s
+/// fields stay erasable under the variant).
 /// A `BTreeMap<String, Value>` of variables/metadata is a DATA boundary
 /// ([`is_value_map`]): its keys are variable names, never struct fields, so
 /// erasure never removes one — a variable the previous stream omits stays a
@@ -972,9 +984,7 @@ pub fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
             if is_value_map(map) {
                 return; // variable/metadata map: keys are data, never fields
             }
-            if ctx != "$" {
-                map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
-            }
+            map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
             for (k, v) in map.iter_mut() {
                 if is_field_name(k) && data_map_fields().contains(k) {
                     // A map field: its keys are DATA, never

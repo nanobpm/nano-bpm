@@ -1113,6 +1113,205 @@ fn nested_unit_variants_are_shape_tokens() {
     assert!(!vocab.contains("Hello"), "{vocab:?}");
 }
 
+/// #1700 review: `ElementActivating`/`ElementActivated.scope` is an
+/// element-instance key, so it is canonicalized to its entity identity like
+/// any `*_key` field. A cross-entry ratified remint reconciles a scope
+/// reference whose raw value changed with its mint; an un-minted scope still
+/// diverges (fail closed).
+#[test]
+fn prev_release_gate_remint_normalizes_scope_across_entries() {
+    let head = head_records();
+    let scenarios = labels();
+    let entries: Vec<&serde_json::Value> =
+        head.iter().filter(|r| r.get("state").is_none()).collect();
+    let events_of = |r: &serde_json::Value| -> Vec<serde_json::Value> {
+        r.get("events")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    // (referencing entry, scope key): an `ElementActivating` whose non-root
+    // `scope` was minted by an EARLIER entry.
+    let mut found = None;
+    'outer: for (i, r) in entries.iter().enumerate() {
+        for e in events_of(r) {
+            let Some(b) = e.get("ElementActivating") else {
+                continue;
+            };
+            let Some(scope) = b.get("scope").and_then(|s| s.as_u64()) else {
+                continue;
+            };
+            if scope == 0 {
+                continue;
+            }
+            let minted_earlier = entries[..i].iter().any(|r| {
+                events_of(r).iter().any(|e| {
+                    e.get("ElementActivating")
+                        .or_else(|| e.get("ElementActivated"))
+                        .and_then(|b| b.get("element_instance_key"))
+                        .and_then(|k| k.as_u64())
+                        == Some(scope)
+                })
+            });
+            if minted_earlier {
+                found = Some((i, scope));
+                break 'outer;
+            }
+        }
+    }
+    let (i, scope) = found.expect("an entry whose scope an earlier entry minted");
+    let scenario = scenarios[i].as_str();
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#0",
+        "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
+    }]});
+
+    // A clean remint on the prev side: a fresh key namespace for the
+    // PROCESS-INSTANCE keys of the referencing entry and its minting entry —
+    // every non-zero element-instance key reference (`element_instance_key`,
+    // `scope`, `scope_key`, `container_key`, …) offset by the same delta, so
+    // the raw scope differs from head's while naming the SAME entity.
+    // Without scope normalization this diverges.
+    let mint_entry = |entries: &[&serde_json::Value], scope: u64| {
+        entries.iter().position(|r| {
+            events_of(r).iter().any(|e| {
+                e.get("ElementActivating")
+                    .or_else(|| e.get("ElementActivated"))
+                    .and_then(|b| b.get("element_instance_key"))
+                    .and_then(|k| k.as_u64())
+                    == Some(scope)
+            })
+        })
+    };
+    let j = mint_entry(&entries, scope).expect("the scope's minting entry");
+    // The process instance the scope's element instance belongs to.
+    let instance_key = entries[j]
+        .get("events")
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            e.get("ElementActivating")
+                .or_else(|| e.get("ElementActivated"))
+        })
+        .find(|b| b.get("element_instance_key").and_then(|k| k.as_u64()) == Some(scope))
+        .and_then(|b| b.get("instance_key"))
+        .and_then(|k| k.as_u64())
+        .expect("the minting event's instance_key");
+    let mut prev = head.clone();
+    for r in entries_mut(&mut prev).into_iter().skip(j) {
+        if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+            for e in events.iter_mut() {
+                for body in e.as_object_mut().into_iter().flat_map(|o| o.values_mut()) {
+                    // Only this instance's own events: another instance's
+                    // keys are not re-minted here.
+                    if body.get("instance_key").and_then(|k| k.as_u64()) != Some(instance_key) {
+                        continue;
+                    }
+                    for (k, v) in body.as_object_mut().into_iter().flat_map(|o| o.iter_mut()) {
+                        let is_instance_ref = k == "element_instance_key"
+                            || k == "scope"
+                            || k == "scope_key"
+                            || k == "parent_scope_key"
+                            || k == "container_key"
+                            || k == "child_key";
+                        if is_instance_ref && v.as_u64().is_some_and(|n| n != 0) {
+                            *v = serde_json::json!(v.as_u64().unwrap() + 500_000);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let report = checked(&head, &prev, allow.clone(), &[]).unwrap();
+    assert!(
+        report.ratified_divergent_entries > 0,
+        "a clean remint with a cross-entry scope reference must reconcile"
+    );
+
+    // The fail-closed half: point entry i's scope at a key the corpus never
+    // minted. Identity canonicalization turns it into a distinct orphan
+    // token, so the gate fails.
+    let mut broken = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut broken)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            for body in e.as_object_mut().into_iter().flat_map(|o| o.values_mut()) {
+                if body.get("scope").and_then(|s| s.as_u64()) == Some(scope) {
+                    body["scope"] = serde_json::json!(9_999_999u64);
+                }
+            }
+        }
+    }
+    let err = checked(&head, &broken, allow, &[]).unwrap_err();
+    assert!(
+        err.contains("entry"),
+        "an un-minted scope must diverge: {err}"
+    );
+}
+
+/// #1700 review: `EngineSnapshot`/`State` are untagged structs, so their
+/// fields keep the `$` context. An explicitly listed `$`-qualified field
+/// (e.g. `$.raft_applied`, additive since snapshot v2) IS erased — while
+/// the map-data boundaries (variable names, element ids) still are not.
+#[test]
+fn prev_release_gate_erases_listed_root_state_fields() {
+    // Unit: a `$`-qualified token erases at the root; it does NOT erase a
+    // same-named field under a variant (event fields are variant-qualified,
+    // so no `$` token ever names one).
+    let mut snap = serde_json::json!({"raft_applied": [7, "s"], "now": 3});
+    let erasable: compare::Vocab = ["$.raft_applied".to_owned()].into();
+    compare::erase_fields(&mut snap, "$", &erasable);
+    assert_eq!(snap, serde_json::json!({"now": 3}));
+    let mut ev = serde_json::json!({"JobCanceled": {"raft_applied": 9}});
+    compare::erase_fields(&mut ev, "$", &erasable);
+    assert_eq!(ev, serde_json::json!({"JobCanceled": {"raft_applied": 9}}));
+
+    // Snapshot regression: a populated golden-added non-default field on the
+    // head side, absent on the prev side, reconciles when listed; a
+    // NON-listed divergence still fails.
+    let mut engine = Engine::new();
+    engine.set_raft_applied(7, "opaque".to_owned());
+    let head_state = serde_json::to_value(engine.snapshot()).unwrap();
+    assert!(head_state.get("raft_applied").is_some());
+    let mut prev_state = head_state.clone();
+    prev_state.as_object_mut().unwrap().remove("raft_applied");
+    let rec = |state: serde_json::Value| serde_json::json!({"i": 0, "format": nanobpmn_engine_core::SNAPSHOT_FORMAT_VERSION, "state": state});
+    let one_entry = serde_json::json!({"i": 0, "err": "boom"});
+    let head = vec![one_entry.clone(), rec(head_state)];
+    let prev = vec![one_entry, rec(prev_state)];
+    let one_scenario = |added: &[&str]| {
+        let scenarios = vec!["synthetic".to_owned()];
+        let allowlist = compare::parse_allowlist("{}").unwrap();
+        let added: compare::Vocab = added.iter().map(|t| (*t).to_owned()).collect();
+        let ctx = compare::CrossReleaseContext {
+            scenarios: &scenarios,
+            allowlist: &allowlist,
+            prev_tag: "v0.0.1",
+            added: &added,
+        };
+        compare::cross_release_checked(&head, &prev, &ctx)
+    };
+    let err = one_scenario(&[]).unwrap_err();
+    assert!(err.contains("durable state diverges"), "{err}");
+    let report = one_scenario(&["$.raft_applied"]).unwrap();
+    assert_eq!(report.base.states_compared, 1);
+    assert_eq!(report.erased_fields, ["$.raft_applied".to_owned()]);
+
+    // Map-data boundaries are retained at the root too: a `$`-qualified
+    // token never erases a same-named map KEY (e.g. a process id `now`
+    // inside the `processes` map).
+    let mut with_map = serde_json::json!({"processes": {"now": {"key": 1}}, "now": 3});
+    let erasable_now: compare::Vocab = ["$.now".to_owned()].into();
+    compare::erase_fields(&mut with_map, "$", &erasable_now);
+    assert_eq!(
+        with_map,
+        serde_json::json!({"processes": {"now": {"key": 1}}}),
+        "the listed root field is erased but the same-named map key survives"
+    );
+}
+
 /// Drift guard: every unit variant declared anywhere in engine-core/src is
 /// covered by `compare::unit_variants` (derived from `ENGINE_TYPE_SOURCES`).
 #[test]
