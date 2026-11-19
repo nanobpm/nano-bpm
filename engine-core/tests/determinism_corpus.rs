@@ -109,13 +109,35 @@ fn corpus_exercises_the_engine_not_just_rejections() {
 /// path rather than only its rejection.
 #[test]
 fn corpus_scenarios_emit_their_events() {
-    let records = full_run(&corpus_jsonl(), false);
+    let records_text = full_run(&corpus_jsonl(), false);
+    let parsed = records(&records_text);
+    let records = records_text.as_str();
 
     // Transcendental floats (ADR 0066 audit #7): the script results persist
     // into variables, so platform-dependent bits would reach the records.
-    assert!(
-        records.contains("ln:") && records.contains("exp:") && records.contains("pow:"),
-        "transcendental FEEL results (log/exp/**) never persisted into variables"
+    // Inspect `VariablesUpdated` events only — the deployed script text also
+    // contains `ln:`/`exp:`/`pow:`, so a whole-log substring search would pass
+    // on deployment alone. Require a persisted result for BOTH instances.
+    let persisted: BTreeSet<u64> = parsed
+        .iter()
+        .filter_map(|r| r.get("events")?.as_array().cloned())
+        .flatten()
+        .filter_map(|e| {
+            let u = e.get("VariablesUpdated")?;
+            let s = u
+                .get("variables")?
+                .get("transcendental")?
+                .get("Str")?
+                .as_str()?;
+            let ok = ["ln:", ",exp:", ",pow:"].iter().all(|p| s.contains(p)) && !s.contains("null");
+            ok.then(|| u.get("instance_key")?.as_u64()).flatten()
+        })
+        .collect();
+    assert_eq!(
+        persisted.len(),
+        2,
+        "transcendental FEEL results (log/exp/**) must persist via VariablesUpdated \
+         for both `floats` instances, got {persisted:?}"
     );
 
     // Selective expiry: both durabilities must release locks — no expiry
