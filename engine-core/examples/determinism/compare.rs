@@ -174,6 +174,13 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
                     if is_field_name(k) {
                         out.insert(format!("{ctx}.{k}"));
                     }
+                    // Propagate the context through a snake_case struct field
+                    // (serde flattens nested structs, e.g. `multi_instance`'s
+                    // fields stay under the variant). Map DATA keys — a
+                    // variable name like `receipt`, a camelCase key — are not
+                    // `is_field_name`, so they contribute no token; only a
+                    // snake_case map key is indistinguishable from a field,
+                    // and erasure guards those (see [`erase_fields`]).
                     walk_tokens(v, ctx, out);
                 }
             }
@@ -246,18 +253,32 @@ pub fn lossy_tokens(error: &str) -> Option<Vec<String>> {
 }
 
 /// Whether the fields a previous release ignores in `command` (`tokens`, from
-/// [`lossy_tokens`]) all hold the HEAD build's default: removing them and
-/// round-tripping through the head `Command` type reproduces `command`
-/// exactly. Ignoring a defaulted additive field is the field's own
-/// back-compatible meaning, so such an entry is kept, not dropped.
+/// [`lossy_tokens`]) all hold the HEAD build's default. Compared as the
+/// DECODED command, not raw JSON: the raw line omits every field the
+/// serializer defaults, so a raw comparison cannot tell an omitted field
+/// from an explicit one. The corpus line decodes to the typed command (the
+/// ignored fields simply absent), and it is benign iff that typed value
+/// equals the typed value with the fields removed — i.e. the head build's
+/// defaults for those fields reproduce the line's explicit values. An
+/// explicit value against a non-empty default (e.g.
+/// `cancel_remaining_instances: false`, default `true`) is NOT benign.
 pub fn lossy_is_benign(command: &Json, tokens: &[String]) -> bool {
+    // Decode the full line first; a line the head build cannot decode is not
+    // a benign lossy case at all.
+    let Ok(full) = serde_json::from_value::<nanobpmn_engine_core::Command>(command.clone()) else {
+        return false;
+    };
+    // Re-encode, drop the named fields from the canonical (fully-defaulted)
+    // form, and decode again: the result is the command with those fields at
+    // their head defaults. Benign iff that equals the full decode.
+    let Ok(mut canonical) = serde_json::to_value(&full) else {
+        return false;
+    };
     let erasable: Vocab = tokens.iter().cloned().collect();
-    let mut stripped = command.clone();
-    erase_fields(&mut stripped, "$", &erasable);
-    serde_json::from_value::<nanobpmn_engine_core::Command>(stripped)
+    erase_fields(&mut canonical, "$", &erasable);
+    serde_json::from_value::<nanobpmn_engine_core::Command>(canonical)
         .ok()
-        .and_then(|c| serde_json::to_value(&c).ok())
-        .is_some_and(|round_tripped| &round_tripped == command)
+        .is_some_and(|stripped| stripped == full)
 }
 
 /// Why the previous release could not decode an entry, if the golden-derived
@@ -366,6 +387,11 @@ pub struct Expected {
     pub reorder: bool,
     /// The engine keys the events mint (`key` / `*_key` fields) may differ —
     /// the footprint of minting in a different order (#1244 fork order).
+    /// Normalization zeroes the keys but keeps each event's structure
+    /// (`element_id`, kind, …), so a reference inconsistent with its entity's
+    /// creation event still differs; and an entry whose minting is not a
+    /// clean one-key-per-element (two keys for one element, or one key for
+    /// two) fails closed rather than reconcile.
     #[serde(default)]
     pub remint_keys: bool,
     /// Events only the previous release emits (dropped from its side).
@@ -396,6 +422,11 @@ impl EventPattern {
     }
 }
 
+/// Zeroes every `key`/`*_key` field of `value`, preserving the event's
+/// structure (its `element_id`, its other fields). Two events that reference
+/// the same entity zero to the same shape only when their OTHER fields
+/// (element_id, kind, …) also agree — so a reference inconsistent with the
+/// entity's creation event still differs.
 fn mask_keys(value: &mut Json) {
     match value {
         Json::Object(map) => {
@@ -412,10 +443,54 @@ fn mask_keys(value: &mut Json) {
     }
 }
 
+/// Fails (returns `false`) when an entry's key usage is structurally
+/// inconsistent — the failure mode zeroing would hide: two *distinct*
+/// element-instance keys minted for the same `element_id` by the entry's
+/// creation events (`ElementActivating`/`ElementActivated`), or the same key
+/// minted for two different `element_id`s (a collision). Both mean the
+/// entry's key↔entity relationship is not a clean per-entity remint, so the
+/// declared `remint_keys` normalization must not reconcile it. Returns
+/// `true` when the entry's minting is one-key-per-element.
+fn consistent_mint(events: &[String]) -> bool {
+    let mut by_element: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_key: std::collections::BTreeMap<u64, String> = Default::default();
+    for e in events {
+        let Ok(v) = serde_json::from_str::<Json>(e) else {
+            return false;
+        };
+        let body = v
+            .get("ElementActivating")
+            .or_else(|| v.get("ElementActivated"));
+        let Some(body) = body else { continue };
+        let (Some(id), Some(key)) = (
+            body.get("element_id").and_then(Json::as_str),
+            body.get("element_instance_key").and_then(Json::as_u64),
+        ) else {
+            continue;
+        };
+        if let Some(prev_key) = by_element.insert(id.to_owned(), key) {
+            if prev_key != key {
+                return false; // one element minted under two distinct keys
+            }
+        }
+        if let Some(prev_id) = by_key.insert(key, id.to_owned()) {
+            if prev_id != id {
+                return false; // one key minted for two elements (collision)
+            }
+        }
+    }
+    true
+}
+
 /// Whether `head` and `prev` (one entry's canonical events) differ only as
 /// `expected` allows.
 fn diverges_only_as(expected: &Expected, head: &[String], prev: &[String]) -> bool {
     let normalize = |events: &[String], drop: &[EventPattern]| -> Option<Vec<String>> {
+        // Fail closed: a structurally inconsistent mint is not the declared
+        // remint, whatever the allowlist says.
+        if expected.remint_keys && !consistent_mint(events) {
+            return None;
+        }
         let mut out = Vec::with_capacity(events.len());
         for e in events {
             let mut v: Json = serde_json::from_str(e).ok()?;
@@ -536,17 +611,30 @@ fn event_tag(event: &Json) -> Option<&str> {
     }
 }
 
+/// Erases `erasable` fields. A field token is always variant-qualified
+/// (`Variant.field`), and a snake_case key is only a struct FIELD under an
+/// externally-tagged variant — so erasure happens at every non-root context
+/// and propagates through a snake_case struct field (serde flattens nested
+/// structs, e.g. `multi_instance`'s fields stay erasable under the variant).
+/// A map's data keys are only erased if the (mis-)recorded token names them,
+/// which the golden vocabulary avoids for non-`is_field_name` data (a
+/// variable named `receipt`); a snake_case variable name is
+/// indistinguishable from a struct field under serde flattening and is the
+/// documented residual risk of a value-only shape vocabulary.
 fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
     match value {
         Json::Object(map) => {
-            map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
+            if ctx != "$" {
+                map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
+            }
             for (k, v) in map.iter_mut() {
                 let next = if is_variant_tag(k) {
-                    k.clone()
+                    // An externally-tagged variant: it becomes the context.
+                    k.as_str()
                 } else {
-                    ctx.to_owned()
+                    ctx
                 };
-                erase_fields(v, &next, erasable);
+                erase_fields(v, next, erasable);
             }
         }
         Json::Array(items) => items

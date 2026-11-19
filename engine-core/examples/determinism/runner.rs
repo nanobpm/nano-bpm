@@ -63,8 +63,11 @@ pub enum Entry {
     Ok {
         now: u64,
         command: Box<Command>,
-        /// Non-empty fields of the corpus line this build's decode dropped
-        /// (`Variant.field` shape tokens).
+        /// Fields of the corpus line this build's decode dropped
+        /// (`Variant.field` shape tokens) — whatever value they hold: an
+        /// explicit `false`/`0`/`""` against a non-empty HEAD default is a
+        /// behavioural difference, so emptiness is classified later by
+        /// `lossy_is_benign`'s default-aware round trip, never here (#1698).
         lost: Vec<String>,
     },
     Undecodable(String),
@@ -116,9 +119,12 @@ fn is_field_name(key: &str) -> bool {
 }
 
 /// `raw` fields absent from `decoded` (the same value after a decode +
-/// re-encode round trip), as `Variant.field` tokens. An empty value (`null`,
-/// `false`, `0`, `""`, `[]`, `{}`) is not counted: ignoring it is the
-/// additive field's default behaviour.
+/// re-encode round trip), as `Variant.field` tokens. Every missing field is
+/// reported, empty-valued ones included: whether ignoring a field is benign
+/// depends on the HEAD default (`lossy_is_benign`'s default-aware round trip
+/// through the head `Command` type), which a value-side check cannot see —
+/// an explicit `false` against a default-`true` field (e.g.
+/// `MultiInstance.cancel_remaining_instances`) is a behavioural difference.
 fn lost_fields(
     raw: &serde_json::Value,
     decoded: &serde_json::Value,
@@ -126,14 +132,6 @@ fn lost_fields(
     out: &mut Vec<String>,
 ) {
     use serde_json::Value as J;
-    let empty = |v: &J| match v {
-        J::Null => true,
-        J::Bool(b) => !b,
-        J::Number(n) => n.as_f64() == Some(0.0),
-        J::String(s) => s.is_empty(),
-        J::Array(a) => a.is_empty(),
-        J::Object(o) => o.is_empty(),
-    };
     match (raw, decoded) {
         (J::Object(r), J::Object(d)) => {
             for (k, rv) in r {
@@ -141,12 +139,11 @@ fn lost_fields(
                 let next = if variant { k.as_str() } else { ctx };
                 match d.get(k) {
                     Some(dv) => lost_fields(rv, dv, next, out),
-                    None if !empty(rv) => out.push(if variant || !is_field_name(k) {
+                    None => out.push(if variant || !is_field_name(k) {
                         k.clone()
                     } else {
                         format!("{ctx}.{k}")
                     }),
-                    None => {}
                 }
             }
         }

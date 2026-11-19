@@ -458,6 +458,129 @@ fn prev_release_gate_allowlisted_scenario_admits_only_the_declared_divergence() 
     assert!(err.contains("STALE") && err.contains("at or past"), "{err}");
 }
 
+/// #1698 (review): `remint_keys` zeroes the minted keys but keeps each
+/// event's structure, so a reference inconsistent with its entity's creation
+/// event still differs, and an entry whose minting is not a clean
+/// one-key-per-element (two keys for one `element_id`, or one key for two)
+/// fails closed rather than reconcile.
+#[test]
+fn prev_release_gate_remint_keys_preserves_entity_relationships() {
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    let i = reorderable_entry(&head, scenario);
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#0", "rationale": "test"
+    }]});
+
+    // A pure reorder (same keys, different order): declared, passes.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        events.reverse();
+    }
+    let report = checked(&head, &prev, allow.clone(), &[]).unwrap();
+    assert_eq!(report.ratified_divergent_entries, 1);
+
+    // A completion event naming a DIFFERENT key than its element's creation
+    // event: zeroing hides the key, but the event's `element_id` no longer
+    // matches any event referencing that entity — an inconsistent reference.
+    let mut broken = prev.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut broken)[i].get_mut("events") {
+        // Point one ElementCompleted at a different element_id than its key's
+        // creation event: the completion's (element_id, key) pair no longer
+        // matches, so it diverges even after zeroing.
+        let mut completion = events
+            .iter_mut()
+            .find(|e| e.get("ElementCompleted").is_some());
+        if let Some(c) = completion.as_deref_mut() {
+            c["ElementCompleted"]["element_id"] = serde_json::json!("no-such-element");
+        }
+        assert!(completion.is_some());
+    }
+    let err = checked(&head, &broken, allow.clone(), &[]).unwrap_err();
+    assert!(err.contains("UNDECLARED extra divergence"), "{err}");
+
+    // An entry whose creation events mint TWO distinct keys for one
+    // element_id is not a clean remint: fails closed.
+    let mut colliding = prev.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut colliding)[i].get_mut("events")
+    {
+        let mut seen: std::collections::BTreeMap<String, u64> = Default::default();
+        for e in events.iter_mut() {
+            for variant in ["ElementActivating", "ElementActivated"] {
+                if let Some(body) = e.get_mut(variant) {
+                    let id = body
+                        .get("element_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let key = body
+                        .get("element_instance_key")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    if let Some(prev_key) = seen.get(id) {
+                        // Mint a fresh, distinct key for the same element.
+                        body["element_instance_key"] = serde_json::json!(prev_key + 10_000);
+                    } else {
+                        seen.insert(id.to_owned(), key);
+                    }
+                }
+            }
+        }
+    }
+    let err = checked(&head, &colliding, allow, &[]).unwrap_err();
+    assert!(err.contains("UNDECLARED extra divergence"), "{err}");
+}
+
+/// #1698 (review): a snake_case key inside a map-typed field (a variable
+/// name like `variables.receipt`) is map DATA, not a struct field — the
+/// golden-added erasure must never remove it, so a variable the previous
+/// stream omits stays a divergence even when the golden corpus records a
+/// same-named field as added.
+#[test]
+fn prev_release_gate_never_erases_map_data() {
+    let head = head_records();
+    // Give one entry a snake_case variable (`receipt`) in head only: the
+    // previous stream omits it.
+    let mut prev = head.clone();
+    let mut head_with_var = head.clone();
+    let mut touched = false;
+    for (h, p) in entries_mut(&mut head_with_var)
+        .into_iter()
+        .zip(entries_mut(&mut prev))
+    {
+        if let Some(serde_json::Value::Array(events)) = h.get_mut("events") {
+            for e in events {
+                if let Some(vars) = e
+                    .get_mut("VariablesUpdated")
+                    .and_then(|b| b.get_mut("variables"))
+                    .and_then(|v| v.as_object_mut())
+                {
+                    vars.insert("receipt".to_owned(), serde_json::json!({"Bool": true}));
+                    touched = true;
+                }
+            }
+        }
+        let _ = p;
+        if touched {
+            break;
+        }
+    }
+    assert!(touched, "the corpus must emit a VariablesUpdated event");
+    // The golden records `VariablesUpdated.receipt` as added since the
+    // previous release. If erasure wrongly treated the variable map's
+    // snake_case key as that struct field, the missing variable would be
+    // normalized away and the gate would pass — it must FAIL.
+    let err = checked(
+        &head_with_var,
+        &prev,
+        no_allowlist(),
+        &["VariablesUpdated.receipt"],
+    )
+    .unwrap_err();
+    assert!(err.contains("scenario"), "{err}");
+}
+
 /// #1698: every entry the previous release cannot decode must be explained
 /// by the golden-derived additive set; an unexplained drop fails.
 #[test]
@@ -519,6 +642,52 @@ fn prev_release_gate_detects_lossy_decode() {
         out.contains("lossy decode: drops field `CancelInstance.from_the_future`"),
         "{out}"
     );
+
+    // An EMPTY-valued unknown field is reported too: whether ignoring it is
+    // benign is `lossy_is_benign`'s default-aware call, not the runner's —
+    // an explicit `false` against a default-`true` field (e.g.
+    // `MultiInstance.cancel_remaining_instances`) changes behaviour.
+    let line = format!(
+        "{}\n",
+        serde_json::json!({"now": 1, "command": {"CancelInstance": {
+            "instance_key": 1, "from_the_future": false
+        }}})
+    );
+    let out = run(&line, &opts, &mut Engine::new());
+    assert!(
+        out.contains("lossy decode: drops field `CancelInstance.from_the_future`"),
+        "{out}"
+    );
+
+    // `lossy_is_benign` does the classifying: an empty-valued field whose
+    // HEAD default is non-empty is NOT benign (dropped), while one whose
+    // default is the empty value is (kept). A `MultiInstance` field's golden
+    // token is qualified by the enclosing COMMAND variant (`DeployProcess`),
+    // and `cancel_remaining_instances` defaults to `true` (model.rs), so an
+    // explicit `false` the old build ignores changes behaviour.
+    let deploy_with_mi = |mi: serde_json::Value| {
+        serde_json::json!({"DeployProcess": {
+            "id": "p", "start_event": "s",
+            "elements": {"s": {
+                "id": "s",
+                "kind": {"ServiceTask": {"job_type": "t"}},
+                "outgoing": [],
+                "multi_instance": mi
+            }}
+        }})
+    };
+    assert!(!compare::lossy_is_benign(
+        &deploy_with_mi(serde_json::json!({
+            "input_collection": "xs", "cancel_remaining_instances": false
+        })),
+        &["DeployProcess.cancel_remaining_instances".to_owned()]
+    ));
+    assert!(compare::lossy_is_benign(
+        &deploy_with_mi(serde_json::json!({
+            "input_collection": "xs", "sequential": false
+        })),
+        &["DeployProcess.sequential".to_owned()]
+    ));
 }
 
 /// Excluding entries a previous release cannot decode regenerates the corpus
