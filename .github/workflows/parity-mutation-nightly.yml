@@ -1,0 +1,150 @@
+# Nightly mutation testing of the parity guards (#1248).
+#
+# "Show the suite can catch real defects": a guard that no test distinguishes is
+# a guard that does not exist. Two halves, one job each:
+#
+#   1. Spec — `formal/tla/mutate.mjs` flips one guard operator in TokenFlow.tla /
+#      ZeebeTokenFlow.tla at a time and requires some model (the registered
+#      corpus, then the CI-bound exhaustive graphs) to change its verdict. A
+#      survivor must be justified in formal/tla/mutation/equivalent.json, which
+#      is itself ratcheted (a now-killed or nonexistent entry fails the run).
+#   2. Engine — `cargo-mutants` over the join / gateway / teardown paths of
+#      engine-core/src/engine (engine-core/mutants.toml), tested by the parity
+#      corpus: the TLA+ trace-validation replay (trace_validation +
+#      zeebe_token_flow_trace_validation) and the deploy-conformance corpus.
+#
+# Not a PR gate — never a required check. No retries: a red run is a defect.
+# A PR touching this workflow or either suite validates it on a small budget.
+
+name: Parity (mutation, nightly)
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Spec mutants: only ids containing this substring'
+        default: ''
+  pull_request:
+    paths:
+      - '.github/workflows/parity-mutation-nightly.yml'
+      - 'formal/tla/mutate.mjs'
+      - 'formal/tla/mutation/**'
+      - 'engine-core/.cargo/mutants.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-mutation-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  spec-mutants:
+    name: spec guard mutants (TokenFlow + ZeebeTokenFlow)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Resolve pinned TLC version
+        id: tla
+        run: echo "version=$(sed -n 's/^TLA_VERSION="\(.*\)"$/\1/p' formal/tla/check.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nanobpm-formal
+          key: tla2tools-${{ steps.tla.outputs.version }}
+      - name: Fetch the pinned TLC (and model-check the hand-written corpus)
+        run: formal/tla/check.sh
+      - name: Spec guard mutants — every survivor killed or justified
+        env:
+          ONLY: ${{ github.event.inputs.only }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          args=()
+          if [[ -n "$ONLY" ]]; then args+=(--only "$ONLY"); fi
+          # A PR touching this workflow validates the harness on a bounded
+          # slice (the inclusive-join guard whose in-transit mutant survived
+          # until MCInclusiveInTransit, #1243) rather than the full set.
+          if [[ "$IS_PR" == true && -z "$ONLY" ]]; then args+=(--only InclusiveReady); fi
+          node formal/tla/mutate.mjs "${args[@]}"
+
+  engine-mutants:
+    name: engine guard mutants (join / gateway / teardown vs parity corpus)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold every crate link fails with `cannot find 'ld'`.
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - name: Cache cargo-mutants + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            engine-core/target
+          key: mutants-${{ runner.os }}-${{ hashFiles('engine-core/.cargo/mutants.toml', 'engine-core/Cargo.lock') }}
+      - name: Install cargo-mutants
+        run: command -v cargo-mutants >/dev/null || cargo install cargo-mutants --locked
+      - name: Engine guard mutants — killed by the parity corpus
+        working-directory: engine-core
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          # --in-place: cargo-mutants otherwise copies only the engine-core
+          # tree, losing the ../formal/tla/traces fixtures the trace-validation
+          # suites read (this checkout is disposable).
+          # PR validation budget: list the mutants (config drift guard) and run
+          # a bounded slice; the full run is nightly.
+          if [[ "$IS_PR" == true ]]; then
+            cargo mutants --list
+            # cargo-mutants ORs CLI -F patterns WITH the configured examine_re
+            # set (options.rs chains both into one RegexSet), so a bare -F runs
+            # the full nightly scope, not the slice. A PR-specific config
+            # REPLACES the scope instead: --config reads this file instead of
+            # .cargo/mutants.toml, so its examine_re is the whole filter.
+            # The PR config is DERIVED from the canonical .cargo/mutants.toml
+            # (features / additional_cargo_test_args — the parity corpus the
+            # mutants run against — can never drift from the nightly); only the
+            # scope keys are overridden with the guard surface this PR touches
+            # (a PR touching a different guard edits the three override lines).
+            #
+            # StructField mutants (a `delete field … from struct … expression`
+            # inside a function) bypass the name filter — cargo-mutants pushes
+            # them without allows_mutant (visit.rs) — so glob-admitted functions
+            # outside the slice are excluded by name even though the examine_re
+            # below does not select them.
+            awk '
+              /^examine_globs = / {
+                print "examine_globs = [\"src/engine/mod.rs\"]"; skip = 0; next
+              }
+              /^examine_re = \[/ { print "examine_re = [\x27Engine::activate_join\x27, \x27Engine::has_active_path_to\x27]"; skip = 1; next }
+              /^exclude_re = \[/ { print "exclude_re = [\x27Engine::plan_command_inner\x27]"; skip = 1; next }
+              skip && /^[[:space:]]*\]/ { skip = 0; next }
+              skip { next }
+              { print }
+            ' .cargo/mutants.toml > /tmp/mutants-pr.toml
+            # The derivation must keep the canonical test selection: if the
+            # canonical file drifts (a key renamed, a multi-line array
+            # reformatted), fail here rather than validate the wrong suite.
+            for key in features additional_cargo_test_args; do
+              diff <(awk -v k="$key" 'index($0, k" = [") {f=1} f {print; if ($0 ~ /\]/) exit}' .cargo/mutants.toml) \
+                   <(awk -v k="$key" 'index($0, k" = [") {f=1} f {print; if ($0 ~ /\]/) exit}' /tmp/mutants-pr.toml) \
+                || { echo "PR mutants config lost the canonical $key"; exit 1; }
+            done
+            cargo mutants --in-place --config /tmp/mutants-pr.toml
+          else
+            cargo mutants --in-place
+          fi

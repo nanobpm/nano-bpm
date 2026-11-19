@@ -2741,6 +2741,99 @@ fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
 }
 
 #[test]
+fn adhoc_completion_condition_eval_failure_raises_incident_with_message() {
+    // A `<completionCondition>` that fails to evaluate (here: a FEEL type error,
+    // `done + 1` over a boolean) is an EXTRACT_VALUE_ERROR incident on the
+    // completing tool — never a silent "not yet" (#1398). The incident reason
+    // must carry the wrapped failure MESSAGE ("Failed to evaluate completion
+    // condition. …"): a regression that drops the message (e.g. deleting the
+    // `message` field of the `expression::Failure` built in
+    // `Engine::adhoc_completion_after_tool`) leaves operators an empty reason.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done + 1</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // Turn 1: activate toolA.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Complete toolA: evaluating `=done + 1` against its output (`done` a
+    // boolean) fails, so the tool completion halts on an incident.
+    let tool_a = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let events = engine
+        .apply_command(Command::complete_job_with(
+            tool_a.key,
+            BTreeMap::from([("done".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+
+    let reasons: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::IncidentRaised { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one incident, got {events:?}");
+    assert!(
+        reasons[0].starts_with("Failed to evaluate completion condition. "),
+        "the incident reason carries the wrapped completion-condition failure \
+         message, got {:?}",
+        reasons[0]
+    );
+    assert!(
+        reasons[0].contains("=done + 1"),
+        "the incident reason keeps the underlying evaluation failure (which \
+         names the offending expression), got {:?}",
+        reasons[0]
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the failed tool completion parks"
+    );
+}
+
+#[test]
 fn adhoc_completion_condition_cancel_remaining_defaults_true() {
     // The BPMN `cancelRemainingInstances` attribute defaults to `true`, so a
     // container that omits it cancels remaining tools on a fulfilled condition.

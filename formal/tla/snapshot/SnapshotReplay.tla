@@ -265,6 +265,12 @@ DamageHotFrame ==
   /\ UNCHANGED <<total, firstIndex, snapPresent, snapCovered, snapVersion,
                  snapCorrupt, coldEnd, coldOk>>
 
+\* A durable world may be recovered as-is (no-deadlock stutter). Named (rather
+\* than an inline `UNCHANGED vars` disjunct in `Next`) so the TLC
+\* action-coverage gate (#1248) tracks it: the gate derives obligations from
+\* `Next`'s NAMED disjuncts and silently drops an inline one.
+RecoverAsIs == UNCHANGED vars
+
 Next ==
   \/ AppendEvent
   \/ TakeSnapshot
@@ -276,7 +282,7 @@ Next ==
   \/ ResurfaceStaleSnapshot
   \/ DamageColdFrame
   \/ DamageHotFrame
-  \/ UNCHANGED vars   \* a durable world may be recovered as-is (no-deadlock stutter)
+  \/ RecoverAsIs
 
 Spec == Init /\ [][Next]_vars
 ====

@@ -134,3 +134,100 @@ test("observationMilestones projects only the shared token-flow fields", () => {
     jobsCreated: { A: 1 },
   });
 });
+
+test("an event-based gateway's expectation is the SPEC projection, not the engine record", () => {
+  // #1248 review: `Reference.apply()` records every outgoing flow of a
+  // correlated event-based gateway (the engine arms every catch and withdraws
+  // the losers, taking each losing catch's gateway flow), while
+  // `ZeebeTokenFlow.CorrelateEvent` takes only the selected flow. The oracle
+  // must expect the spec's projection, or a backend that takes the losing
+  // flows passes as "a behaviour of the spec" (the #1676 divergence shape).
+  const graph = {
+    id: "EvtChoice",
+    nodes: { S: "start", G: "evt", M1: "msg", M2: "msg", E: "end" },
+    edges: [
+      { id: "f0", from: "S", to: "G" },
+      { id: "f1", from: "G", to: "M1" },
+      { id: "f2", from: "G", to: "M2" },
+      { id: "f3", from: "M1", to: "E" },
+      { id: "f4", from: "M2", to: "E" },
+    ],
+  };
+  // The run correlates M1 (selecting f1): the engine-shaped record also takes
+  // the losing f2 and completes M2 (withdrawn).
+  const run = {
+    steps: [{ op: "correlate", node: "G", flow: "f1", catch: "M1" }],
+    route: {},
+    completed: true,
+    jobsCreated: {},
+    completedElements: { S: 1, G: 1, M1: 1, M2: 1, E: 1 },
+    takenFlows: { f0: 1, f1: 1, f2: 1, f3: 1 },
+    joinsFired: {},
+  };
+  const ms = referenceMilestones(graph, run);
+  assert.deepEqual(ms.sequenceFlows, {
+    "S->G": 1,
+    "G->M1": 1,
+    "M1->E": 1,
+    // No "G->M2": the spec never takes the losing catch's flow.
+  });
+
+  // The engine's WIRE record takes both gateway flows (arm all, withdraw the
+  // loser) — exactly what `expect.sequenceFlows` pins. The spec oracle must
+  // ACCEPT it (both oracles see the same observation; a contradiction would
+  // fail every event-gateway scenario in CI).
+  const wire = {
+    completed: true,
+    sequenceFlows: { "S->G": 1, "G->M1": 1, "G->M2": 1, "M1->E": 1 },
+    jobsCreated: {},
+  };
+  const ok = checkSpecOracle(graph, run, wire);
+  assert.ok(ok.ok, JSON.stringify(ok.mismatches));
+
+  // Red/Green: a backend that continued down the LOSING catch is not a
+  // behaviour of the spec's selection and must fail.
+  const wrongCatch = {
+    completed: true,
+    sequenceFlows: { "S->G": 1, "G->M1": 1, "G->M2": 1, "M2->E": 1 },
+    jobsCreated: {},
+  };
+  const bad = checkSpecOracle(graph, run, wrongCatch);
+  assert.ok(!bad.ok, "continuing down the losing catch must fail the spec oracle");
+  assert.ok(bad.mismatches.some((m) => m.field === "sequenceFlows"));
+});
+
+test("event-gateway selections are counted per correlation step", () => {
+  // Gateway activated twice (loop), selecting each alternative once: the spec
+  // takes G->M1 once and G->M2 once — not the raw withdrawal-inclusive 2/2.
+  const graph = {
+    id: "EvtLoop",
+    nodes: { S: "start", G: "evt", M1: "msg", M2: "msg", E: "end" },
+    edges: [
+      { id: "f0", from: "S", to: "G" },
+      { id: "f1", from: "G", to: "M1" },
+      { id: "f2", from: "G", to: "M2" },
+      { id: "f3", from: "M1", to: "E" },
+      { id: "f4", from: "M2", to: "E" },
+    ],
+  };
+  const run = {
+    steps: [
+      { op: "correlate", node: "G", flow: "f1", catch: "M1" },
+      { op: "correlate", node: "G", flow: "f2", catch: "M2" },
+    ],
+    completed: true,
+    jobsCreated: {},
+    takenFlows: { f0: 2, f1: 2, f2: 2, f3: 1, f4: 1 },
+    joinsFired: {},
+  };
+  const ms = referenceMilestones(graph, run);
+  assert.equal(ms.sequenceFlows["G->M1"], 1);
+  assert.equal(ms.sequenceFlows["G->M2"], 1);
+  const wire = {
+    completed: true,
+    sequenceFlows: { "S->G": 2, "G->M1": 2, "G->M2": 2, "M1->E": 1, "M2->E": 1 },
+    jobsCreated: {},
+  };
+  const r = checkSpecOracle(graph, run, wire);
+  assert.ok(r.ok, JSON.stringify(r.mismatches));
+});
