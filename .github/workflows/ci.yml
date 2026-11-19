@@ -1009,6 +1009,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # the llvm-cov build below links host build scripts / the test binary,
+        # so the job fails at the link without it (same as every other
+        # host-compiling job). No apt (#1546).
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Report + ratchet unit tests
         run: node --test formal/parity/coverage/*.test.mjs
