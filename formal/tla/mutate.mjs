@@ -375,6 +375,12 @@ async function main(argv) {
       const { code, log } = await runTlc(jar, base, m.model, m.cfg, true);
       m.want = verdict(log, m.properties, code);
       if (m.want === 'error') throw new Error(`TLC failed on unmutated ${m.model}:\n${log}`);
+      // A baseline-PASSING model runs its mutant WITHOUT -continue: TLC then
+      // stops at the first violation, so a mutant that breaks an invariant
+      // (e.g. dropping `waiting[n] > 0` from TokenFlow.CorrelateEvent) is a
+      // kill at the first bad state instead of continuing into unbounded
+      // error traces until resource exhaustion / timeout (#1682 review).
+      m.stopsAtFirst = m.want === 'pass';
       fs.rmSync(base, { recursive: true, force: true });
     });
     console.log(`  tier 2: ${models.length} bounded-exhaustive model(s) baselined`);

@@ -28,6 +28,11 @@ examine_re = [
     'Engine::take_flow',
     'Engine::take_all_flows',
     'Engine::has_active_path_to',
+    # `path_reaches_join` is a FREE function (the graph-search half of the
+    # inclusive-join guard, delegated to by `has_active_path_to`), so no
+    # `Engine::` pattern reaches it — the name filter requires a regex match
+    # on the mutant description ("… in path_reaches_join").
+    'path_reaches_join',
     'Engine::completes_inline',
     'Engine::complete_drained_subprocesses',
     'Engine::complete_finished_instances',

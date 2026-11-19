@@ -123,15 +123,15 @@ jobs:
             #
             # StructField mutants (a `delete field … from struct … expression`
             # inside a function) bypass the name filter — cargo-mutants pushes
-            # them without allows_mutant (visit.rs) — so the two glob-admitted
-            # functions outside the slice are excluded by name even though the
-            # examine_re below does not select them.
+            # them without allows_mutant (visit.rs) — so glob-admitted functions
+            # outside the slice are excluded by name even though the examine_re
+            # below does not select them.
             awk '
               /^examine_globs = / {
                 print "examine_globs = [\"src/engine/mod.rs\"]"; skip = 0; next
               }
               /^examine_re = \[/ { print "examine_re = [\x27Engine::activate_join\x27, \x27Engine::has_active_path_to\x27]"; skip = 1; next }
-              /^exclude_re = \[/ { print "exclude_re = [\x27Engine::plan_command_inner\x27, \x27Engine::adhoc_completion_after_tool\x27]"; skip = 1; next }
+              /^exclude_re = \[/ { print "exclude_re = [\x27Engine::plan_command_inner\x27]"; skip = 1; next }
               skip && /^[[:space:]]*\]/ { skip = 0; next }
               skip { next }
               { print }

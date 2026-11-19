@@ -97,6 +97,36 @@ Next ==
   assert.ok(exp.lines.has(4) && exp.lines.has(5));
 });
 
+test('a collapsed multi-line leaf covers its span — a documented gate limitation', () => {
+  // #1682 review (declined): TLC omits zero-count unprimed children and
+  // collapses subtrees, so a guard `\/ x > 10` followed by `\/ x < 0` can
+  // surface as ONE positive leaf spanning both arms while the second arm
+  // short-circuited and never ran. The gate deliberately treats the leaf's
+  // span as per-line coverage: TLC's own report does not distinguish the
+  // collapse, and obligating folded arms makes the gate unsatisfiable (a
+  // VariableScopes CASE inside a collapsed IF leaf reports no per-arm rows
+  // even when the arm DID run). The branch-level gap is instead closed by the
+  // spec-side mutation suite (formal/tla/mutate.mjs), which flips guard
+  // operators and requires a verdict change. This pins the leaf-spread
+  // behaviour so a future tightening is a deliberate, visible choice.
+  const src = `---- MODULE ShortCircuit ----
+VARIABLE x
+Ready ==
+    \\/ x > 10
+    \\/ x < 0
+Inc ==
+    /\\ Ready
+    /\\ x' = x + 1
+Next ==
+    \\/ Inc
+====
+`;
+  // TLC's report: Ready's two disjunct arms collapsed into a single positive
+  // leaf (lines 4-5), with NO per-arm rows.
+  const collapsed = log(header('Inc', 6, 2, 'ShortCircuit'), loc(4, 5, 2, 0, 'ShortCircuit'), loc(8, 8, 2, 0, 'ShortCircuit'));
+  assert.deepEqual(checkSpec({ name: 'ShortCircuit', src, logs: [['M', collapsed]] }), []);
+});
+
 test('an inline Next disjunct (no named action) is dropped — specs must name it', () => {
   // SnapshotReplay's `\/ UNCHANGED vars` stutter: the gate cannot track an
   // anonymous disjunct, so the spec names it (`RecoverAsIs`). This pins the
@@ -193,6 +223,50 @@ Next ==
   for (const n of [4, 6, 7, 8, 15]) assert.ok(!exp.lines.has(n), `line ${n} must carry no obligation`);
   assert.ok(exp.lines.has(9), 'a state-level one-line guard keeps its obligation');
   assert.ok(exp.lines.has(12) && exp.lines.has(13), 'action conjuncts keep their obligations');
+});
+
+test('a guard receiving state through a PARAMETER keeps its line obligations', () => {
+  // #1682 review: `TokenFlow.PathReaches(src, j, blocked)` reads no state
+  // variable itself — its state dependence arrives through the `blocked`
+  // argument from `HasActivePathTo`. The gate therefore cannot obligate the
+  // helper's own lines (TLC folds a parameterized operator's subexpressions
+  // into the caller's instrumentation — PathReaches' lines never appear in a
+  // coverage report even when the caller's guard runs), so this pins the
+  // CURRENT contract: no per-line obligation on the helper, and the guard is
+  // instead covered through the caller's bare-reference alias (the caller's
+  // line obligation is satisfied only when the helper's span was evaluated).
+  const src = `---- MODULE Param ----
+VARIABLES waiting, joinTokens
+Nodes == {"t", "j"}
+In(n) == {}
+Out(n) == {}
+Tgt == [f \\in {} |-> "t"]
+Succ(n, blocked) == {Tgt[g] : g \\in Out(n) \\ blocked}
+PathReaches(src, j, blocked) ==
+    LET R[k \\in 0..1] ==
+            IF k = 0 THEN {src}
+            ELSE UNION {{n} \\cup Succ(n, blocked) : n \\in R[k-1]}
+    IN  j \\in R[1]
+HasActivePathTo(j) ==
+    \\E m \\in {n \\in Nodes : waiting[n] > 0} : PathReaches(m, j, {})
+JoinFires(j) ==
+    \\/ \\A g \\in {} : joinTokens[j][g] >= 1
+    \\/ ~HasActivePathTo(j)
+ArriveJoin(j) ==
+    /\\ JoinFires(j)
+    /\\ waiting' = waiting
+    /\\ UNCHANGED joinTokens
+Next ==
+    \\/ \\E j \\in {"j"} : ArriveJoin(j)
+====
+`;
+  const exp = expectations(src);
+  const obligated = [...exp.lines.keys()].sort((a, b) => a - b);
+  assert.ok(!obligated.includes(10) && !obligated.includes(11) && !obligated.includes(12),
+    `PathReaches' own lines carry no obligation (TLC folds them into the caller), got ${JSON.stringify(obligated)}`);
+  // The caller-side guard branches ARE obligated.
+  assert.ok(obligated.includes(16) && obligated.includes(17),
+    `JoinFires' disjunct arms stay obligated, got ${JSON.stringify(obligated)}`);
 });
 
 test('VARIABLE declarations spanning lines are all recognised', () => {
