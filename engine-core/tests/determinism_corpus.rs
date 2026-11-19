@@ -29,7 +29,7 @@ mod runner;
 
 use std::collections::BTreeSet;
 
-use nanobpmn_engine_core::Engine;
+use nanobpmn_engine_core::{Command, Engine};
 
 const RANDOM: usize = 64;
 
@@ -100,6 +100,62 @@ fn corpus_exercises_the_engine_not_just_rejections() {
         "corpus is mostly rejections: ok={ok} err={err}"
     );
     assert!(!records.contains("\"undecodable\""));
+}
+
+/// A corpus entry that passes variant coverage while emitting NOTHING leaves
+/// the path it names untested — the defect class behind the review findings
+/// that each of these scenarios was a silent no-op. Assert each scenario's
+/// expected events actually appear in the records, so the gate exercises the
+/// path rather than only its rejection.
+#[test]
+fn corpus_scenarios_emit_their_events() {
+    let records = full_run(&corpus_jsonl(), false);
+
+    // Transcendental floats (ADR 0066 audit #7): the script results persist
+    // into variables, so platform-dependent bits would reach the records.
+    assert!(
+        records.contains("ln:") && records.contains("exp:") && records.contains("pow:"),
+        "transcendental FEEL results (log/exp/**) never persisted into variables"
+    );
+
+    // Selective expiry: both durabilities must release locks — no expiry
+    // entry may be an empty no-op behind the unfiltered sweep.
+    let expired = records.matches("JobLockExpired").count();
+    assert!(
+        expired >= 4,
+        "selective + unfiltered expiry released {expired} locks, expected >= 4 \
+         (2 durable by key + soft activations + unfiltered sweep)"
+    );
+
+    // Routed subscription protocol: the generator's `routed_protocol_entries`
+    // asserts at BUILD time that a real two-partition pair opens, correlates
+    // and advances a harvested `Opening` subscription (a no-op there panics
+    // the corpus build). The routed commands are recorded as corpus entries;
+    // in the runner they replay against the single engine, which holds the
+    // subscription records by their (partition-0-local) keys, so the open and
+    // close emit their events and the continuation is deduped by its
+    // `delivery_key` (the at-least-once path, #1497).
+    for variant in [
+        "MessageSubscriptionCreated",
+        "RoutedDeliveryRecorded",
+        "MessageSubscriptionCanceled",
+    ] {
+        assert!(
+            records.contains(variant),
+            "routed subscription protocol never emitted {variant}"
+        );
+    }
+
+    // Orphan quarantine, both forms against live instances: the local form's
+    // `VariablesLost` incident and the replicated form's dedup tombstone.
+    assert!(
+        records.matches("VariablesLost").count() >= 2,
+        "quarantine incidents missing (local + replicated + cold forms)"
+    );
+    assert!(
+        records.contains("VariablesLostQuarantined"),
+        "the replicated (stamped) quarantine form never emitted its tombstone"
+    );
 }
 
 #[test]
@@ -228,16 +284,32 @@ fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
     assert_eq!(tail.len(), full.len() - 1);
     assert_eq!(excluded, [last].into());
 
-    // A key-allocating, self-contained entry (DeployForms, position 5)
-    // shifts every later key; re-harvesting keeps every kept outcome.
-    let (_, excluded) = corpus::build_excluding(RANDOM, [5].into()).unwrap();
-    assert_eq!(excluded, [5].into());
+    // A key-allocating, self-contained entry (DeployForms) shifts every later
+    // key; re-harvesting keeps every kept outcome.
+    let deploy_forms = position_of(&full, "deploy_forms");
+    assert_eq!(deploy_forms.len(), 1, "one DeployForms entry");
+    let (_, excluded) =
+        corpus::build_excluding(RANDOM, deploy_forms.iter().copied().collect()).unwrap();
+    assert_eq!(excluded, deploy_forms.into_iter().collect());
 
-    // A newer model shape (the event sub-process deployment, position 3):
-    // its dependents go with it, the core corpus survives.
-    let (_, excluded) = corpus::build_excluding(RANDOM, [3].into()).unwrap();
+    // A newer model shape (the event sub-process deployment): its dependents
+    // go with it, the core corpus survives.
+    let esp_deploy = position_of(&full, "deploy_process")
+        .into_iter()
+        .find(|&p| matches!(&full[p as usize].1, Command::DeployProcess(d) if d.id == "escalation"))
+        .expect("escalation deploy");
+    let (_, excluded) = corpus::build_excluding(RANDOM, [esp_deploy].into()).unwrap();
     assert!(excluded.len() > 1, "dependents excluded: {excluded:?}");
 
     // The core order-process deployment: most of the corpus depends on it.
     assert!(corpus::build_excluding(RANDOM, [0].into()).is_err());
+}
+
+/// Positions of every corpus entry whose command kind is `kind`.
+fn position_of(full: &[(u64, Command)], kind: &str) -> Vec<u64> {
+    full.iter()
+        .enumerate()
+        .filter(|(_, (_, c))| c.kind() == kind)
+        .map(|(i, _)| i as u64)
+        .collect()
 }

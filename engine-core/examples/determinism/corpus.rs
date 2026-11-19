@@ -3,11 +3,14 @@
 //! Builds a representative, fully deterministic command corpus covering every
 //! [`Command`] variant — deployments (process, DMN, forms, generic resources,
 //! bundles), instance lifecycle, jobs (activate, complete, fail, error, retry,
-//! timeout, **expiry**), user tasks, **timers**, messages and signals,
-//! conditional starts, **event sub-processes**, **migration**,
-//! **modification**, ad-hoc activities, agents, orphan quarantine, **cluster
-//! variables** and the **config commands** — plus a seeded randomized workload
-//! (a fixed-seed xorshift, never host entropy) over the same processes.
+//! timeout, **expiry** — soft and durable locks), user tasks, **timers**,
+//! messages and signals (including the **cross-partition routed subscription
+//! protocol** against a real harvested `Opening` subscription), conditional
+//! starts, **event sub-processes**, **migration**, **modification**, ad-hoc
+//! activities, agents, orphan quarantine (**local and replicated-stamped**),
+//! **transcendental FEEL floats** (ADR 0066 audit #7), **cluster variables**
+//! and the **config commands** — plus a seeded randomized workload (a
+//! fixed-seed xorshift, never host entropy) over the same processes.
 //!
 //! Keys are harvested by applying each command to a live engine while the
 //! corpus is built, so later commands address real instances, jobs and user
@@ -26,11 +29,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nanobpmn_engine_core::{Command, Engine, EventSubProcessTrigger, ProcessBuilder, Value};
+use nanobpmn_engine_core::{
+    Command, Engine, EventSubProcessTrigger, OrphanKind, ProcessBuilder, Value,
+};
 use serde_json::{json, Value as Json};
 
 /// Epoch the corpus clock starts at (fixed: the clock is corpus data).
 const T0: u64 = 1_700_000_000_000;
+
+/// Cluster width the corpus engine is configured with. The engine mints every
+/// key in partition 0's namespace (single-writer: the corpus IS the log), but
+/// a `> 1` width makes `hash(correlation_key) % N != 0` keys route their
+/// message subscriptions "off-partition", so the corpus exercises the
+/// cross-partition subscription protocol (`MessageSubscriptionOpening` →
+/// `OpenMessageSubscription` → `CorrelateMessageSubscription`) against real
+/// harvested keys instead of only its hand-issued, no-op form.
+const NUM_PARTITIONS: u64 = 3;
 
 /// A built corpus: `(now, command)` entries in order.
 pub type Corpus = Vec<(u64, Command)>;
@@ -333,6 +347,21 @@ fn generate(
         .expect("order");
     g.push(Command::DeployProcess(order.clone()));
 
+    // Transcendental floats (ADR 0066 audit #7): `log`, `exp` and `**` are the
+    // platform-libm-sensitive surface, routed through the pinned pure-Rust
+    // `libm` so every platform/arch cell must agree on the persisted bits.
+    // The script results persist into instance variables, so they reach the
+    // compared records AND the durable-state checkpoints.
+    let floats = ProcessBuilder::new("floats")
+        .start_event("s")
+        .script_task("calc", "=\"ln:\" + string(log(base)) + \",exp:\" + string(exp(base)) + \",pow:\" + string(base ** 0.5)", "transcendental")
+        .end_event("e")
+        .connect("s", "calc")
+        .connect("calc", "e")
+        .build()
+        .expect("floats");
+    g.push(Command::DeployProcess(floats));
+
     let timers = ProcessBuilder::new("timers")
         .start_event("s")
         .service_task("slow", "slow-work")
@@ -450,6 +479,12 @@ fn generate(
     });
 
     // ---- Jobs and user tasks ----------------------------------------------
+    // Transcendental-float instances (ADR 0066 audit #7): the results persist
+    // into instance variables, so the platform matrix compares their bits.
+    let fl = g.push(create("floats", vars(&[("base", Value::Int(2))])));
+    let _fl_instance = find(&fl, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    let fl2 = g.push(create("floats", vars(&[("base", Value::Double(0.1))])));
+    let fl2_instance = find(&fl2, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     let big = g.push(create("order", vars(&[("amount", Value::Int(500))])));
     let big_instance = find(&big, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     let small = g.push(create("order", vars(&[("amount", Value::Int(5))])));
@@ -528,11 +563,58 @@ fn generate(
     g.push(Command::TriggerTimers { now });
     let now = g.now;
     g.push(activate("slow-work", 3, now));
+    // Selective expiry must have locks of BOTH durabilities live at once, or
+    // it degenerates into a no-op behind the unfiltered `ExpireJobs`. The
+    // `activate` above took soft locks (`with_lease: false`); take DURABLE
+    // locks (a lease token) on two fresh `slow-work` jobs by key, so
+    // `ExpireJobsByDurability { durable: true }` releases exactly them and
+    // `durable: false` exactly the soft ones — each emitting `JobLockExpired`.
+    // The fresh instances park on the `wait` timer first, so their `slow`
+    // jobs exist only after a timer tick — harvest them from the TICK's
+    // events, not the creates' (the earlier instances' jobs were created by
+    // the first tick, so this tick's `JobCreated`s are exactly the two fresh
+    // ones).
+    let _fresh = g.push(create("timers", BTreeMap::new()));
+    let _fresh2 = g.push(create("timers", BTreeMap::new()));
+    g.tick(2_500);
+    let now = g.now;
+    let ticked = g.push(Command::TriggerTimers { now });
+    let durable_jobs: Vec<u64> = all(&ticked, "JobCreated", "job_key");
+    let now = g.now;
+    g.push_json(json!({"ActivateJobsByKey": {
+        "job_keys": durable_jobs, "worker": "det-worker", "timeout": 30_000,
+        "now": now, "with_lease": true
+    }}));
     g.tick(31_000);
     let now = g.now;
-    g.push(Command::ExpireJobs { now });
+    let expired_durable = g.push(Command::ExpireJobsByDurability { now, durable: true });
     let now = g.now;
-    g.push(Command::ExpireJobsByDurability { now, durable: true });
+    let expired_soft = g.push(Command::ExpireJobsByDurability {
+        now,
+        durable: false,
+    });
+    let now = g.now;
+    g.push(Command::ExpireJobs { now });
+    if g.exclude.is_empty() {
+        // The selective expiries must each release exactly their own domain —
+        // an empty batch here is the silent no-op this scenario exists to
+        // prevent (a later engine change that stops `ActivateJobsByKey` from
+        // taking durable locks must fail the corpus build, not pass it
+        // degraded).
+        assert_eq!(
+            all(&expired_durable, "JobLockExpired", "job_key"),
+            {
+                let mut d = durable_jobs.clone();
+                d.sort_unstable();
+                d
+            },
+            "durable selective expiry released the wrong locks"
+        );
+        assert!(
+            all(&expired_soft, "JobLockExpired", "job_key").len() >= 3,
+            "soft selective expiry released nothing (the soft activations were due)"
+        );
+    }
     g.tick(6_000);
     let now = g.now;
     g.push(Command::TriggerTimers { now });
@@ -562,32 +644,22 @@ fn generate(
         "variables": {"go": {"Bool": true}}
     }}));
     // Partition-routed subscription/start commands (the cross-partition
-    // protocol), addressed at real keys where they exist.
-    let m2 = g.push(create(
-        "messaging",
-        vars(&[("orderId", Value::Str("o-2".into()))]),
-    ));
-    let m2_instance = find(&m2, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
-    let m2_ei = m2
-        .iter()
-        .filter_map(|e| e.get("ElementActivated"))
-        .find(|v| v.get("element_id").and_then(Json::as_str) == Some("m"))
-        .and_then(|v| v.get("element_instance_key").and_then(Json::as_u64))
-        .unwrap_or(0);
-    g.push_json(json!({"OpenMessageSubscription": {
-        "subscription_key": 9_000_001u64, "instance_key": m2_instance,
-        "element_instance_key": m2_ei, "element_id": "m", "message_name": "paid",
-        "correlation_key": "o-2", "kind": "IntermediateCatch"
-    }}));
-    g.push_json(json!({"CorrelateMessageSubscription": {
-        "subscription_key": 9_000_001u64, "message_key": 9_000_002u64,
-        "instance_key": m2_instance, "element_instance_key": m2_ei, "element_id": "m",
-        "kind": "IntermediateCatch", "variables": {}
-    }}));
-    g.push_json(json!({"CloseMessageSubscription": {
-        "subscription_key": 9_000_001u64, "instance_key": m2_instance,
-        "element_instance_key": m2_ei, "element_id": "m"
-    }}));
+    // protocol). The MAIN corpus engine stays single-partition (so the bulk
+    // of the corpus keeps exercising the local paths); this self-contained
+    // segment stands up a two-partition pair — an instance partition and a
+    // message partition — and plays the host's routing between them. The
+    // ROUTED commands (`OpenMessageSubscription`, `CorrelateMessageSubscription`,
+    // `CloseMessageSubscription`, `DispatchStartInstance`) are recorded as
+    // corpus entries, applied to the partition that owns them, so the
+    // compared records cover both partitions' halves of the protocol against
+    // real harvested keys. The intra-partition triggers (deploy, create,
+    // publish) are NOT corpus entries: they belong to the stand-in engines'
+    // own logs, and recording them would make the runner re-apply them to the
+    // wrong (single-partition) engine.
+    let routed = routed_protocol_entries();
+    for command in routed {
+        g.push(command);
+    }
     g.push_json(json!({"DispatchStartInstance": {
         "process_id": "starters", "start_element_id": "ms", "variables": {},
         "tags": [], "business_id": null
@@ -600,8 +672,14 @@ fn generate(
     g.push(Command::ResumeInstance {
         instance_key: m1_instance,
     });
+    let to_cancel = g.push(create(
+        "messaging",
+        vars(&[("orderId", Value::Str("o-2".into()))]),
+    ));
+    let to_cancel_instance =
+        find(&to_cancel, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     g.push(Command::CancelInstance {
-        instance_key: m2_instance,
+        instance_key: to_cancel_instance,
     });
 
     // ---- Migration and modification ---------------------------------------
@@ -657,12 +735,38 @@ fn generate(
         "status": "Thinking"
     }}));
     g.push_ok_json(json!({"CompleteAgentInstance": {"agent_instance_key": agent_key}}));
+    // Orphan quarantine, BOTH forms, against LIVE harvested instances (a
+    // never-created key makes the local form a no-op, and the replicated form
+    // would go entirely unexercised). The agent instance is still running
+    // (its scope is open until the ad-hoc container finishes), so the local
+    // form (`stamp: None`) raises the resident-orphan `VariablesLost`
+    // incident. The replicated form (`stamp: Some`, #1447) is stamped the way
+    // a leader stamps it — `orphan_incident_stamp` against a second live
+    // instance parked on a job — so its episode matches the allocator and it
+    // emits its `IncidentRaised` plus the `VariablesLostQuarantined` dedup
+    // tombstone.
     g.push(Command::QuarantineOffheapOrphan {
-        instance_key: 9_100_000,
+        instance_key: ag_instance,
         stamp: None,
     });
     g.push(Command::QuarantineColdOrphan {
         instance_key: 9_100_001,
+    });
+    let held = g.push(create(
+        "escalation",
+        vars(&[("orderId", Value::Str("o-q".into()))]),
+    ));
+    let held_instance = find(&held, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    let stamp = g
+        .engine
+        .orphan_incident_stamp(held_instance, OrphanKind::Resident)
+        .expect("a live instance stamps a quarantine report");
+    g.push(Command::QuarantineOffheapOrphan {
+        instance_key: held_instance,
+        stamp: Some(stamp),
+    });
+    g.push(Command::QuarantineColdOrphan {
+        instance_key: fl2_instance,
     });
 
     // ---- Seeded randomized workload ---------------------------------------
@@ -728,6 +832,159 @@ fn generate(
 
     let outcomes = std::mem::take(&mut g.outcomes);
     (g.into_entries(), outcomes)
+}
+
+/// Plays the cross-partition message-subscription protocol across a real
+/// two-partition engine pair and returns the ROUTED commands, in order, for
+/// the corpus to record. Self-contained: the pair deploys its own process and
+/// parks its own instance, so no key collides with the main corpus engine's
+/// namespace (partition-encoded), and the segment cannot regress the main
+/// corpus's local-path coverage by widening the main engine's cluster.
+///
+/// The protocol, exactly as a host drives it (#1497):
+/// 1. instance partition (0): deploy + create parks the token on an
+///    `Opening` record (the correlation key hashes to partition 1);
+/// 2. host routes `OpenMessageSubscription` to the message partition (1),
+///    which opens the canonical record — RETURNED (corpus entry);
+/// 3. message partition publishes the message, settling the canonical record
+///    and emitting a `RemoteMessageCorrelation`;
+/// 4. host routes the `CorrelateMessageSubscription` continuation back to the
+///    instance partition, advancing the parked token — RETURNED;
+/// 5. host routes `CloseMessageSubscription` to the message partition —
+///    RETURNED (a no-op there: the canonical record already settled, which is
+///    the idempotent-close path).
+fn routed_protocol_entries() -> Vec<Command> {
+    let process = ProcessBuilder::new("routed")
+        .start_event("s")
+        .message_intermediate_catch_event("m", "paid", "=orderId")
+        .service_task("ship", "shipping")
+        .end_event("e")
+        .connect("s", "m")
+        .connect("m", "ship")
+        .connect("ship", "e")
+        .build()
+        .expect("routed");
+    let mut instance_partition = Engine::with_partition(0);
+    instance_partition.set_num_partitions(NUM_PARTITIONS);
+    let mut message_partition = Engine::with_partition(1);
+    message_partition.set_num_partitions(NUM_PARTITIONS);
+    instance_partition
+        .apply_command_at(Command::DeployProcess(process), T0)
+        .expect("deploy on the instance partition");
+
+    // A correlation key that hashes off partition 0, so the subscription's
+    // canonical record lives on partition 1. Derived, not hard-coded, so a
+    // stable-hash change cannot silently re-local it.
+    let order_id = (0u64..)
+        .map(|n| format!("routed-{n}"))
+        .find(|k| nanobpmn_engine_core::subscription_partition(k, NUM_PARTITIONS) == 1)
+        .expect("some key hashes to partition 1");
+    let created = instance_partition
+        .apply_command_at(
+            create("routed", vars(&[("orderId", Value::Str(order_id.clone()))])),
+            T0 + 1,
+        )
+        .expect("create on the instance partition");
+    let opening = created
+        .iter()
+        .find_map(|e| match e {
+            nanobpmn_engine_core::Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key,
+            } => Some(Command::OpenMessageSubscription {
+                subscription_key: *subscription_key,
+                instance_key: *instance_key,
+                element_instance_key: *element_instance_key,
+                element_id: element_id.clone(),
+                message_name: message_name.clone(),
+                correlation_key: correlation_key.clone(),
+                kind: kind.clone(),
+                delivery_key: *delivery_key,
+            }),
+            _ => None,
+        })
+        .expect("an off-partition catch emits a routable Opening");
+
+    // (2): the routed open lands on the message partition.
+    message_partition
+        .apply_command_at(opening.clone(), T0 + 2)
+        .expect("the routed open applies on the message partition");
+
+    // (3): publishing on the message partition routes a continuation back.
+    let published = message_partition
+        .apply_command_at(
+            Command::correlate_message_with("paid", order_id, BTreeMap::new()),
+            T0 + 3,
+        )
+        .expect("publish on the message partition");
+    let continuation = published
+        .iter()
+        .find_map(|e| match e {
+            nanobpmn_engine_core::Event::RemoteMessageCorrelation {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                variables,
+                delivery_key,
+            } => Some(Command::CorrelateMessageSubscription {
+                subscription_key: *subscription_key,
+                message_key: *message_key,
+                instance_key: *instance_key,
+                element_instance_key: *element_instance_key,
+                element_id: element_id.clone(),
+                kind: kind.clone(),
+                variables: variables.clone(),
+                delivery_key: *delivery_key,
+            }),
+            _ => None,
+        })
+        .expect("publishing on the message partition routes a continuation back");
+
+    // (4): the continuation lands on the instance partition and advances the
+    // token. Assert it here (build-time), so a regression in the routed
+    // continuation fails the corpus build, not only the digest comparison.
+    let advanced = instance_partition
+        .apply_command_at(continuation.clone(), T0 + 4)
+        .expect("the continuation applies on the instance partition");
+    assert!(
+        advanced
+            .iter()
+            .any(|e| matches!(e, nanobpmn_engine_core::Event::MessageCorrelated { .. })),
+        "the routed continuation advanced the parked token"
+    );
+
+    // (5): the routed close lands on the message partition.
+    let Command::CorrelateMessageSubscription {
+        subscription_key,
+        instance_key,
+        element_instance_key,
+        element_id,
+        ..
+    } = continuation.clone()
+    else {
+        unreachable!("continuation is a CorrelateMessageSubscription");
+    };
+    let close = Command::CloseMessageSubscription {
+        subscription_key,
+        instance_key,
+        element_instance_key,
+        element_id,
+        delivery_key: 0,
+    };
+    message_partition
+        .apply_command_at(close.clone(), T0 + 5)
+        .expect("the routed close applies on the message partition");
+
+    vec![opening, continuation, close]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).
