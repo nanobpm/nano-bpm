@@ -15,6 +15,7 @@ export { default as InstanceDetail } from "./InstanceDetail.tsx";
 // Building blocks the views are made of, for hosts that compose their own.
 export { default as BpmnViewer, type ElementBadge } from "./BpmnViewer.tsx";
 export { default as AgentSessionPanel } from "./AgentSessionPanel.tsx";
+export { AGENT_HISTORY_FILTER, isPendingItem } from "./agentHistory.ts";
 export {
   foldTranscript,
   type LiveBlock,

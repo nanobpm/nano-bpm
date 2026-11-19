@@ -1,7 +1,10 @@
 // The console's Process Explorer data source: the generated `/console/api`
 // client (src/gen) and the Camunda REST subset (src/gen-c8) behind the
 // `@nanobpm/process-explorer` seam. Every operator action is available here.
-import type { ExplorerDataSource } from "@nanobpm/process-explorer";
+import {
+  AGENT_HISTORY_FILTER,
+  type ExplorerDataSource,
+} from "@nanobpm/process-explorer";
 import {
   cancelInstance,
   getInstance,
@@ -69,8 +72,9 @@ export const consoleExplorerSource: ExplorerDataSource = {
         after = data.page.endCursor;
       }
     },
-    // Committed items only: PENDING (an in-flight job's uncommitted writes) and
-    // DISCARDED (a failed job's) are not part of the agent's history.
+    // PENDING and COMMITTED items: a running agent's turns stay PENDING until
+    // its job completes, so leaving them out hid the whole transcript of a
+    // long-running agent (nano-bpm#1686). DISCARDED (a failed attempt's) stay out.
     getAgentHistory: async (agentInstanceKey) => {
       const out: AgentInstanceHistoryItemResult[] = [];
       let after: string | undefined;
@@ -79,7 +83,7 @@ export const consoleExplorerSource: ExplorerDataSource = {
           throwOnError: true,
           path: { agentInstanceKey },
           body: {
-            filter: { commitStatus: "COMMITTED" },
+            filter: AGENT_HISTORY_FILTER,
             sort: [
               { field: "loopIteration", order: "ASC" },
               { field: "producedAt", order: "ASC" },

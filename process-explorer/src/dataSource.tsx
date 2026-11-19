@@ -74,7 +74,8 @@ export interface ExplorerDataSource {
     listAgentInstances(
       processInstanceKey: string,
     ): Promise<AgentInstanceResult[]>;
-    /** The committed turn log of one AgentInstance (any order). */
+    /** The turn log of one AgentInstance (any order): COMMITTED and PENDING
+     *  items, as selected by `AGENT_HISTORY_FILTER` (nano-bpm#1686). */
     getAgentHistory(
       agentInstanceKey: string,
     ): Promise<AgentInstanceHistoryItemResult[]>;
