@@ -8,6 +8,7 @@ import {
   chapters as chaptersOf,
   initialPlayhead,
   isAgentActive,
+  isPendingItem,
   onHistoryChanged,
   pctIn,
   scrub,
@@ -25,8 +26,8 @@ import { useAgentHistory, useLiveTranscript } from "./useAgentSessions";
 import type { LiveBlock } from "./liveTranscript";
 import { Badge, Button, Spinner } from "./ui.tsx";
 
-/// The agent-session scrubber (nano-bpm#1314): one AgentInstance's committed
-/// turn log from the engine, with a scrub bar chaptered by loop iteration, a
+/// The agent-session scrubber (nano-bpm#1314): one AgentInstance's turn log
+/// (committed, plus the pending turns of a running job, nano-bpm#1686) from the engine, with a scrub bar chaptered by loop iteration, a
 /// model/tool span timeline, the transcript up to the playhead and running
 /// totals. "Live at turn": the history query is refetched on every SSE edge
 /// (InstanceDetail's useLiveInvalidation) and a playhead parked at the end
@@ -119,7 +120,7 @@ export default function AgentSessionPanel({
       ) : items.length === 0 ? (
         <p className="p-4 text-sm text-fg-muted">
           {active
-            ? "No committed turns yet. They appear here as the agent commits them."
+            ? "No turns yet. They appear here as the agent records them."
             : "This agent run recorded no history."}
         </p>
       ) : (
@@ -458,7 +459,8 @@ function TranscriptItem({
       aria-current={current ? "step" : undefined}
       className={`rounded border-l-4 bg-surface text-sm ${ROLE_STYLE[item.role] ?? "border-edge"} ${
         current ? "ring-2 ring-accent/50" : "opacity-80 hover:opacity-100"
-      }`}
+      } ${isPendingItem(item) ? "border-dashed" : ""}`}
+      data-commit-status={item.commitStatus}
     >
       {/* Semantic select affordance: keyboard users get the same "jump to this
           step" interaction pointer users have. The <details> blocks below stay
@@ -474,6 +476,11 @@ function TranscriptItem({
             {item.role.toLowerCase().replace("_", " ")}
           </span>
           <span>iteration {item.loopIteration}</span>
+          {isPendingItem(item) && (
+            <span title="Not committed yet: the agent's job is still running">
+              in progress
+            </span>
+          )}
           {item.model && <span>{item.model}</span>}
           {item.metrics?.durationMs != null && (
             <span>{fmtMs(item.metrics.durationMs)}</span>

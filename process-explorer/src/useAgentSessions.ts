@@ -26,9 +26,9 @@ export function useAgentInstances(processInstanceKey: string | undefined) {
   });
 }
 
-/// The committed turn log of one AgentInstance, in engine order. PENDING items
-/// (an in-flight job's uncommitted writes) and DISCARDED ones (a failed job's)
-/// are not part of the agent's history; the data source leaves them out.
+/// The turn log of one AgentInstance, in engine order: COMMITTED items plus the
+/// PENDING ones a running job has written so far (nano-bpm#1686). DISCARDED
+/// ones (a failed attempt's) are left out by the data source.
 export function useAgentHistory(agentInstanceKey: string | undefined) {
   const agents = useExplorerData().agents;
   return useQuery({
