@@ -352,6 +352,13 @@ jobs:
         with:
           workspaces: engine-core
           key: determinism-${{ matrix.profile }}
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold the ubuntu-24.04 (x86_64) cells fail at link time.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       - name: Seed/restart cell
         run: scripts/determinism-ci.sh cell "$RUNNER_TEMP/det" ${{ matrix.profile }}
       - name: Name the cell digest
