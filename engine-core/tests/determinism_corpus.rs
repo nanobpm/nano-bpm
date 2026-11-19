@@ -331,6 +331,23 @@ fn reorderable_entry(records: &[serde_json::Value], scenario: &str) -> usize {
         .expect("a multi-event entry in the scenario")
 }
 
+/// The first entry index of `scenario` whose events emit `variant`.
+fn entry_emitting(records: &[serde_json::Value], scenario: &str, variant: &str) -> usize {
+    let scenarios = labels();
+    records
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .enumerate()
+        .find(|(i, r)| {
+            scenarios[*i] == scenario
+                && r.get("events")
+                    .and_then(|e| e.as_array())
+                    .is_some_and(|evs| evs.iter().any(|e| e.get(variant).is_some()))
+        })
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("an entry emitting {variant} in scenario {scenario}"))
+}
+
 #[test]
 fn cross_release_compares_durable_state() {
     let head = head_records();
@@ -458,11 +475,14 @@ fn prev_release_gate_allowlisted_scenario_admits_only_the_declared_divergence() 
     assert!(err.contains("STALE") && err.contains("at or past"), "{err}");
 }
 
-/// #1698 (review): `remint_keys` zeroes the minted keys but keeps each
-/// event's structure, so a reference inconsistent with its entity's creation
-/// event still differs, and an entry whose minting is not a clean
-/// one-key-per-element (two keys for one `element_id`, or one key for two)
-/// fails closed rather than reconcile.
+/// #1698 (review): `remint_keys` rewrites every key reference to the identity
+/// of the entity it references (from that side's own creation events), so a
+/// clean re-mint (a bijection on keys, the #1244 fork order) reconciles while
+/// a reference to the wrong or an un-minted entity still diverges — including
+/// a KEY-ONLY change (the `element_id` untouched) to a completion, a job, or
+/// a subscription reference, which zeroing the keys would hide. An entry
+/// whose minting is not a clean one-key-per-entity (two keys for one
+/// `element_id`, or one key for two) fails closed rather than reconcile.
 #[test]
 fn prev_release_gate_remint_keys_preserves_entity_relationships() {
     let head = head_records();
@@ -482,14 +502,10 @@ fn prev_release_gate_remint_keys_preserves_entity_relationships() {
     let report = checked(&head, &prev, allow.clone(), &[]).unwrap();
     assert_eq!(report.ratified_divergent_entries, 1);
 
-    // A completion event naming a DIFFERENT key than its element's creation
-    // event: zeroing hides the key, but the event's `element_id` no longer
-    // matches any event referencing that entity — an inconsistent reference.
+    // A completion event naming a DIFFERENT element_id than its key's creation
+    // event: the (element_id, key) pair no longer matches, so it diverges.
     let mut broken = prev.clone();
     if let Some(serde_json::Value::Array(events)) = entries_mut(&mut broken)[i].get_mut("events") {
-        // Point one ElementCompleted at a different element_id than its key's
-        // creation event: the completion's (element_id, key) pair no longer
-        // matches, so it diverges even after zeroing.
         let mut completion = events
             .iter_mut()
             .find(|e| e.get("ElementCompleted").is_some());
@@ -500,6 +516,81 @@ fn prev_release_gate_remint_keys_preserves_entity_relationships() {
     }
     let err = checked(&head, &broken, allow.clone(), &[]).unwrap_err();
     assert!(err.contains("UNDECLARED extra divergence"), "{err}");
+
+    // KEY-ONLY reference changes (the element_id untouched): point a
+    // completion, a job, and a subscription reference at a key the entry never
+    // minted. Zeroing the keys would hide all three; canonicalizing each key
+    // to its referenced entity turns the un-minted key into a distinct orphan
+    // token, so each still diverges. Each case mutates one event in an entry
+    // of an allowlisted `remint_keys` scenario and asserts the gate fails.
+    //
+    // `key_only` returns a `prev` that is `head` with one `variant.field`
+    // (a u64 key) in the `pos`-th entry of `scenario` set to an un-minted key.
+    let key_only = |scenario: &str, pos: usize, variant: &str, field: &str| {
+        let mut p = head.clone();
+        let scenarios = labels();
+        let mut touched = false;
+        for (entry_idx, r) in entries_mut(&mut p).into_iter().enumerate() {
+            if scenarios[entry_idx] == scenario && entry_idx == pos {
+                if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+                    for e in events.iter_mut() {
+                        if let Some(body) = e.get_mut(variant) {
+                            if body.get(field).and_then(|x| x.as_u64()).is_some() {
+                                body[field] = serde_json::json!(9_999_999u64); // never minted
+                                touched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if touched {
+                break;
+            }
+        }
+        assert!(touched, "{scenario}[{pos}] must emit {variant}.{field}");
+        p
+    };
+    // Completion + completing references on the reordered entry.
+    for field_variant in ["ElementCompleted", "ElementCompleting"] {
+        let keyonly = key_only(scenario, i, field_variant, "element_instance_key");
+        let err = checked(&head, &keyonly, allow.clone(), &[]).unwrap_err();
+        assert!(
+            err.contains("UNDECLARED extra divergence"),
+            "key-only {field_variant}.element_instance_key change must diverge: {err}"
+        );
+    }
+    // A job reference on a job-COMPLETING entry of the same scenario:
+    // `JobCompleted.job_key` refers to the key `JobCreated` minted, so
+    // pointing it at an un-minted key is an inconsistent reference.
+    let job_pos = entry_emitting(&head, scenario, "JobCompleted");
+    let keyonly = key_only(scenario, job_pos, "JobCompleted", "job_key");
+    let err = checked(&head, &keyonly, allow.clone(), &[]).unwrap_err();
+    assert!(
+        err.contains("UNDECLARED extra divergence"),
+        "key-only JobCompleted.job_key change must diverge: {err}"
+    );
+    // A subscription reference on the messages scenario (allowlisted below):
+    // `MessageCorrelated.subscription_key` refers to the key the subscription
+    // was created under, so pointing it at an un-minted key is inconsistent.
+    let sub_scenario = "messages-signals-conditional";
+    let sub_pos = entry_emitting(&head, sub_scenario, "MessageCorrelated");
+    let sub_allow = serde_json::json!({"divergences": [{
+        "scenario": sub_scenario,
+        "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#0", "rationale": "test"
+    }]});
+    let keyonly = key_only(
+        sub_scenario,
+        sub_pos,
+        "MessageCorrelated",
+        "subscription_key",
+    );
+    let err = checked(&head, &keyonly, sub_allow, &[]).unwrap_err();
+    assert!(
+        err.contains("UNDECLARED extra divergence"),
+        "key-only MessageCorrelated.subscription_key change must diverge: {err}"
+    );
 
     // An entry whose creation events mint TWO distinct keys for one
     // element_id is not a clean remint: fails closed.
@@ -536,19 +627,20 @@ fn prev_release_gate_remint_keys_preserves_entity_relationships() {
 /// name like `variables.receipt`) is map DATA, not a struct field — the
 /// golden-added erasure must never remove it, so a variable the previous
 /// stream omits stays a divergence even when the golden corpus records a
-/// same-named field as added.
+/// same-named field as added. The variable must be absent from the ENTIRE
+/// previous stream: a `BTreeMap<String, Value>` is a data boundary
+/// (`is_value_map`), so its keys are never treated as struct fields in
+/// vocabulary extraction or erasure.
 #[test]
 fn prev_release_gate_never_erases_map_data() {
     let head = head_records();
-    // Give one entry a snake_case variable (`receipt`) in head only: the
-    // previous stream omits it.
-    let mut prev = head.clone();
+    // A snake_case variable name absent from the ENTIRE corpus (so the
+    // previous stream never emits it anywhere).
+    let var = "zz_novel_receipt";
+    let prev = head.clone(); // previous stream: never emits `var`
     let mut head_with_var = head.clone();
     let mut touched = false;
-    for (h, p) in entries_mut(&mut head_with_var)
-        .into_iter()
-        .zip(entries_mut(&mut prev))
-    {
+    for h in entries_mut(&mut head_with_var) {
         if let Some(serde_json::Value::Array(events)) = h.get_mut("events") {
             for e in events {
                 if let Some(vars) = e
@@ -556,26 +648,25 @@ fn prev_release_gate_never_erases_map_data() {
                     .and_then(|b| b.get_mut("variables"))
                     .and_then(|v| v.as_object_mut())
                 {
-                    vars.insert("receipt".to_owned(), serde_json::json!({"Bool": true}));
+                    vars.insert(var.to_owned(), serde_json::json!({"Bool": true}));
                     touched = true;
                 }
             }
         }
-        let _ = p;
         if touched {
             break;
         }
     }
     assert!(touched, "the corpus must emit a VariablesUpdated event");
-    // The golden records `VariablesUpdated.receipt` as added since the
-    // previous release. If erasure wrongly treated the variable map's
+    // The golden records `VariablesUpdated.zz_novel_receipt` as added since
+    // the previous release. If erasure wrongly treated the variable map's
     // snake_case key as that struct field, the missing variable would be
     // normalized away and the gate would pass — it must FAIL.
     let err = checked(
         &head_with_var,
         &prev,
         no_allowlist(),
-        &["VariablesUpdated.receipt"],
+        &["VariablesUpdated.zz_novel_receipt"],
     )
     .unwrap_err();
     assert!(err.contains("scenario"), "{err}");

@@ -154,6 +154,27 @@ fn is_field_name(key: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Whether `map` is a `BTreeMap<String, Value>` of variable/metadata entries
+/// rather than a struct. Every such map in `Command`/`Event`/`EngineSnapshot`
+/// holds a typed [`Value`] per key, and a `Value` serializes as an
+/// externally-tagged object (`{"Bool": …}`, `{"Str": …}`, `{"Map": {…}}`) or
+/// the bare string `"Null"` — a shape no flattened struct field has. This is
+/// the discriminator that keeps a snake_case VARIABLE name (e.g. a
+/// `variables.receipt` key) from being mistaken for a same-named struct field
+/// under serde flattening: inside a variable map, keys are DATA, never
+/// erasable fields.
+fn is_value_map(map: &serde_json::Map<String, Json>) -> bool {
+    !map.is_empty()
+        && map.values().all(|v| match v {
+            // `Value::Null` serializes as the bare string "Null".
+            Json::String(s) => s == "Null",
+            // Every other `Value` variant is a single-key externally-tagged
+            // object (`{"Bool": …}`, `{"List": […]}`, …).
+            Json::Object(inner) => inner.len() == 1 && is_variant_tag(inner.keys().next().unwrap()),
+            _ => false,
+        })
+}
+
 /// Adds `value`'s shape tokens to `out`. An object key starting with an
 /// upper-case letter is an externally-tagged variant (token = the name, and
 /// it becomes the context of everything below it); any other key is a field,
@@ -166,6 +187,13 @@ pub fn shape_tokens(value: &Json, out: &mut Vocab) {
 fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
     match value {
         Json::Object(map) => {
+            // A `BTreeMap<String, Value>` of variables/metadata is DATA: its
+            // keys are variable names, not fields, so it contributes no tokens
+            // and is not descended into (a snake_case variable name would
+            // otherwise be misread as a struct field).
+            if is_value_map(map) {
+                return;
+            }
             for (k, v) in map {
                 if is_variant_tag(k) {
                     out.insert(k.clone());
@@ -178,9 +206,9 @@ fn walk_tokens(value: &Json, ctx: &str, out: &mut Vocab) {
                     // (serde flattens nested structs, e.g. `multi_instance`'s
                     // fields stay under the variant). Map DATA keys — a
                     // variable name like `receipt`, a camelCase key — are not
-                    // `is_field_name`, so they contribute no token; only a
-                    // snake_case map key is indistinguishable from a field,
-                    // and erasure guards those (see [`erase_fields`]).
+                    // `is_field_name`, so they contribute no token; a
+                    // snake_case map key is guarded by the `is_value_map`
+                    // boundary above (see [`erase_fields`]).
                     walk_tokens(v, ctx, out);
                 }
             }
@@ -386,12 +414,15 @@ pub struct Expected {
     #[serde(default)]
     pub reorder: bool,
     /// The engine keys the events mint (`key` / `*_key` fields) may differ —
-    /// the footprint of minting in a different order (#1244 fork order).
-    /// Normalization zeroes the keys but keeps each event's structure
-    /// (`element_id`, kind, …), so a reference inconsistent with its entity's
-    /// creation event still differs; and an entry whose minting is not a
-    /// clean one-key-per-element (two keys for one element, or one key for
-    /// two) fails closed rather than reconcile.
+    /// the footprint of minting in a different order (#1244 fork order), a
+    /// bijection on keys. Normalization rewrites every key reference to the
+    /// identity of the entity it references (from that side's own creation
+    /// events), so a clean re-mint reconciles while a reference to the wrong
+    /// or an un-minted entity (a completion/job/subscription naming a key its
+    /// entry never created) canonicalizes to a distinct orphan token and still
+    /// diverges; and an entry whose minting is not a clean one-key-per-entity
+    /// (a collision, or two keys for one element) fails closed rather than
+    /// reconcile.
     #[serde(default)]
     pub remint_keys: bool,
     /// Events only the previous release emits (dropped from its side).
@@ -422,83 +453,127 @@ impl EventPattern {
     }
 }
 
-/// Zeroes every `key`/`*_key` field of `value`, preserving the event's
-/// structure (its `element_id`, its other fields). Two events that reference
-/// the same entity zero to the same shape only when their OTHER fields
-/// (element_id, kind, …) also agree — so a reference inconsistent with the
-/// entity's creation event still differs.
-fn mask_keys(value: &mut Json) {
+/// The entity a minted key refers to, built from an entry's own creation
+/// events. `remint_keys` declares the keys may be re-minted in a different
+/// order (#1244 fork order) — a bijection on keys — so the comparison must
+/// normalize each key to *which entity it references*, not erase it. Erasing
+/// (zeroing) hides an inconsistent reference: a completion/job/subscription
+/// pointing at the wrong entity zeroes to the same shape as the correct one.
+///
+/// The map is keyed by the raw `u64` key and valued by a stable identity
+/// token for the entity that key was minted for:
+/// * `ElementActivating`/`ElementActivated` mint an element-instance key →
+///   `element:<element_id>`;
+/// * `JobCreated` mints a `job_key` → `job:<element_id>`;
+/// * `MessageSubscriptionCreated`/`SignalSubscriptionCreated` mint a
+///   `subscription_key` → `subscription:<element_id>`.
+///
+/// A key minted for two different entities (a collision), or two distinct
+/// keys minted for one element, is not a clean per-entity remint: the entry
+/// fails closed ([`key_identities`] returns `None`) rather than reconcile.
+fn key_identities(events: &[String]) -> Option<std::collections::BTreeMap<u64, String>> {
+    let mut key_to_id: std::collections::BTreeMap<u64, String> = Default::default();
+    let mut element_to_key: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut record = |key: u64, identity: String, element: Option<&str>| -> Option<()> {
+        if let Some(prev) = key_to_id.get(&key) {
+            if *prev != identity {
+                return None; // one key minted for two entities (collision)
+            }
+        }
+        if let Some(el) = element {
+            if let Some(prev_key) = element_to_key.insert(el.to_owned(), key) {
+                if prev_key != key {
+                    return None; // one element minted under two distinct keys
+                }
+            }
+        }
+        key_to_id.insert(key, identity);
+        Some(())
+    };
+    for e in events {
+        let v = serde_json::from_str::<Json>(e).ok()?;
+        // Every event is a single-key externally-tagged object; skip anything
+        // else (a bare unit-variant string carries no keys to canonicalize).
+        let Some((variant, body)) = v.as_object().and_then(|o| o.iter().next()) else {
+            continue;
+        };
+        let get = |f: &str| body.get(f);
+        let u64_of = |f: &str| get(f).and_then(Json::as_u64);
+        let str_of = |f: &str| get(f).and_then(Json::as_str);
+        match variant.as_str() {
+            "ElementActivating" | "ElementActivated" => {
+                if let (Some(id), Some(key)) =
+                    (str_of("element_id"), u64_of("element_instance_key"))
+                {
+                    record(key, format!("element:{id}"), Some(id))?;
+                }
+            }
+            "JobCreated" => {
+                if let (Some(key), Some(id)) = (u64_of("job_key"), str_of("element_id")) {
+                    record(key, format!("job:{id}"), None)?;
+                }
+            }
+            "MessageSubscriptionCreated" | "SignalSubscriptionCreated" => {
+                if let (Some(key), Some(id)) = (u64_of("subscription_key"), str_of("element_id")) {
+                    record(key, format!("subscription:{id}"), None)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(key_to_id)
+}
+
+/// Rewrites every `key`/`*_key` reference of `value` to the identity of the
+/// entity it references (`ids`, from [`key_identities`]), preserving the
+/// event's structure. A clean remint is a bijection, so both sides
+/// canonicalize every reference to the same per-entity token and reconcile;
+/// a reference to a key the entry never minted (an inconsistent or colliding
+/// reference) rewrites to a distinct `?orphan` token that cannot match the
+/// other side, so it diverges. `instance_key`/`scope_key` name the process
+/// instance / variable scope, not a re-minted element entity, so they are
+/// left as-is (the instance is not re-minted by fork order).
+fn canonicalize_keys(value: &mut Json, ids: &std::collections::BTreeMap<u64, String>) {
     match value {
         Json::Object(map) => {
             for (k, v) in map.iter_mut() {
                 if (k == "key" || k.ends_with("_key")) && v.is_u64() {
-                    *v = Json::from(0);
+                    let raw = v.as_u64().unwrap_or(0);
+                    let token = match ids.get(&raw) {
+                        Some(identity) => Json::String(identity.clone()),
+                        None => Json::String(format!("?orphan:{raw}")),
+                    };
+                    *v = token;
                 } else {
-                    mask_keys(v);
+                    canonicalize_keys(v, ids);
                 }
             }
         }
-        Json::Array(items) => items.iter_mut().for_each(mask_keys),
+        Json::Array(items) => items.iter_mut().for_each(|v| canonicalize_keys(v, ids)),
         _ => {}
     }
-}
-
-/// Fails (returns `false`) when an entry's key usage is structurally
-/// inconsistent — the failure mode zeroing would hide: two *distinct*
-/// element-instance keys minted for the same `element_id` by the entry's
-/// creation events (`ElementActivating`/`ElementActivated`), or the same key
-/// minted for two different `element_id`s (a collision). Both mean the
-/// entry's key↔entity relationship is not a clean per-entity remint, so the
-/// declared `remint_keys` normalization must not reconcile it. Returns
-/// `true` when the entry's minting is one-key-per-element.
-fn consistent_mint(events: &[String]) -> bool {
-    let mut by_element: std::collections::BTreeMap<String, u64> = Default::default();
-    let mut by_key: std::collections::BTreeMap<u64, String> = Default::default();
-    for e in events {
-        let Ok(v) = serde_json::from_str::<Json>(e) else {
-            return false;
-        };
-        let body = v
-            .get("ElementActivating")
-            .or_else(|| v.get("ElementActivated"));
-        let Some(body) = body else { continue };
-        let (Some(id), Some(key)) = (
-            body.get("element_id").and_then(Json::as_str),
-            body.get("element_instance_key").and_then(Json::as_u64),
-        ) else {
-            continue;
-        };
-        if let Some(prev_key) = by_element.insert(id.to_owned(), key) {
-            if prev_key != key {
-                return false; // one element minted under two distinct keys
-            }
-        }
-        if let Some(prev_id) = by_key.insert(key, id.to_owned()) {
-            if prev_id != id {
-                return false; // one key minted for two elements (collision)
-            }
-        }
-    }
-    true
 }
 
 /// Whether `head` and `prev` (one entry's canonical events) differ only as
 /// `expected` allows.
 fn diverges_only_as(expected: &Expected, head: &[String], prev: &[String]) -> bool {
     let normalize = |events: &[String], drop: &[EventPattern]| -> Option<Vec<String>> {
-        // Fail closed: a structurally inconsistent mint is not the declared
-        // remint, whatever the allowlist says.
-        if expected.remint_keys && !consistent_mint(events) {
-            return None;
-        }
+        // Fail closed: a structurally inconsistent mint (a collision, or two
+        // keys for one element) is not the declared remint, whatever the
+        // allowlist says.
+        let ids = if expected.remint_keys {
+            Some(key_identities(events)?)
+        } else {
+            None
+        };
         let mut out = Vec::with_capacity(events.len());
         for e in events {
             let mut v: Json = serde_json::from_str(e).ok()?;
             if drop.iter().any(|p| p.matches(&v)) {
                 continue;
             }
-            if expected.remint_keys {
-                mask_keys(&mut v);
+            if let Some(ids) = &ids {
+                canonicalize_keys(&mut v, ids);
             }
             out.push(v.to_string());
         }
@@ -616,14 +691,16 @@ fn event_tag(event: &Json) -> Option<&str> {
 /// externally-tagged variant — so erasure happens at every non-root context
 /// and propagates through a snake_case struct field (serde flattens nested
 /// structs, e.g. `multi_instance`'s fields stay erasable under the variant).
-/// A map's data keys are only erased if the (mis-)recorded token names them,
-/// which the golden vocabulary avoids for non-`is_field_name` data (a
-/// variable named `receipt`); a snake_case variable name is
-/// indistinguishable from a struct field under serde flattening and is the
-/// documented residual risk of a value-only shape vocabulary.
+/// A `BTreeMap<String, Value>` of variables/metadata is a DATA boundary
+/// ([`is_value_map`]): its keys are variable names, never struct fields, so
+/// erasure never removes one — a variable the previous stream omits stays a
+/// divergence even when the golden records a same-named field as added.
 fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
     match value {
         Json::Object(map) => {
+            if is_value_map(map) {
+                return; // variable/metadata map: keys are data, never fields
+            }
             if ctx != "$" {
                 map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
             }
