@@ -12,7 +12,7 @@
 //! under the data dir, append-only (crash-friendly), with an in-memory index in
 //! front so reads don't touch disk on the hot path.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ pub struct Message {
 /// An append-only, file-backed conversation store keyed by experiment instance key.
 pub struct ConversationStore {
     dir: PathBuf,
-    mem: RwLock<HashMap<String, Vec<Message>>>,
+    mem: RwLock<BTreeMap<String, Vec<Message>>>,
 }
 
 impl ConversationStore {
@@ -52,7 +52,7 @@ impl ConversationStore {
         }
         Self {
             dir,
-            mem: RwLock::new(HashMap::new()),
+            mem: RwLock::new(BTreeMap::new()),
         }
     }
 

@@ -48,7 +48,7 @@
 //!   [`escalation_flows`], which emits [`FlowKind::Escalation`].)
 //! * Provenance / confidence per annotation — slice 5/6 workbench feature.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{ElementKind, ProcessDefinition};
@@ -108,7 +108,7 @@ pub fn infer(def: &ProcessDefinition) -> SemanticAnnotations {
 fn trace_primary(def: &ProcessDefinition) -> Option<Vec<String>> {
     let start = def.element(&def.start_event)?;
     let mut order: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut stack: VecDeque<String> = VecDeque::new();
     stack.push_back(start.id.clone());
     while let Some(id) = stack.pop_front() {
@@ -225,7 +225,7 @@ fn escalation_flows(def: &ProcessDefinition) -> Vec<AnnotatedFlow> {
 /// returning them in visitation order and including `from` itself.
 fn reachable_from(def: &ProcessDefinition, from: &str) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     queue.push_back(from.to_string());
     while let Some(id) = queue.pop_front() {
@@ -276,7 +276,7 @@ fn infer_roles(def: &ProcessDefinition) -> std::collections::BTreeMap<String, Ro
 /// dependency.
 fn heuristic_roles_and_clusters(
     def: &ProcessDefinition,
-    names: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, Role>, Vec<Cluster>) {
     let mut roles: BTreeMap<String, Role> = BTreeMap::new();
     // job_type → list of element ids sharing that type. We build it while
@@ -312,7 +312,7 @@ fn heuristic_roles_and_clusters(
         .into_iter()
         .filter(|(_, ids)| ids.len() >= 2)
         .map(|(jt, mut ids)| {
-            ids.sort(); // Determinism across HashMap iteration orders.
+            ids.sort(); // Determinism across BTreeMap iteration orders.
             Cluster {
                 id: format!("cluster.{jt}"),
                 nodes: ids,

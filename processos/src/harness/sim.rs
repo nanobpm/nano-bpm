@@ -8,7 +8,7 @@
 //! studies per-instance output/latency/cost, not cross-instance throughput —
 //! that is the ClusterRunner's job, M3).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{
     Command, Engine, Event, IncidentState, JobState, ProcessDefinition, ProcessInstanceState,
@@ -34,7 +34,7 @@ pub struct InstanceRun {
     /// Final instance variables (the process output) as natural JSON. Retained
     /// for inspection/debugging; aggregation reads correctness/latency/cost.
     #[allow(dead_code)]
-    pub output: HashMap<String, Json>,
+    pub output: BTreeMap<String, Json>,
 }
 
 /// Run a single input through the model under the given effective assignment
@@ -43,9 +43,9 @@ pub struct InstanceRun {
 pub fn run_instance(
     defs: &[ProcessDefinition],
     process_id: &str,
-    input_vars: &HashMap<String, Json>,
-    expected: &HashMap<String, Json>,
-    assignment: &HashMap<String, String>,
+    input_vars: &BTreeMap<String, Json>,
+    expected: &BTreeMap<String, Json>,
+    assignment: &BTreeMap<String, String>,
     scenario: &Scenario,
     seed: u64,
 ) -> InstanceRun {
@@ -58,7 +58,7 @@ pub fn run_instance(
     // the creation inputs. The engine drops a terminal instance's variable
     // payload on completion (ADR 0012), so correctness must be checked against
     // the event-projected output rather than cleared hot state.
-    let mut output: HashMap<String, Json> = input_vars.clone();
+    let mut output: BTreeMap<String, Json> = input_vars.clone();
 
     // Deploy + create. Errors here would indicate a malformed model; the caller
     // validates the BPMN up front, so we surface failure as a non-completing run.
@@ -68,7 +68,7 @@ pub fn run_instance(
         Command::DeployResources(defs.to_vec()),
         clock,
     );
-    let vars: HashMap<String, Value> = input_vars
+    let vars: BTreeMap<String, Value> = input_vars
         .iter()
         .map(|(k, v)| (k.clone(), json_to_value(v)))
         .collect();
@@ -164,7 +164,7 @@ pub fn run_instance(
                     clock,
                 );
             } else {
-                let out: HashMap<String, Value> = worker
+                let out: BTreeMap<String, Value> = worker
                     .output
                     .iter()
                     .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -207,7 +207,7 @@ pub fn run_instance(
 /// to the scenario default, then to a free no-op so unmapped tasks never stall.
 fn resolve_worker(
     scenario: &Scenario,
-    assignment: &HashMap<String, String>,
+    assignment: &BTreeMap<String, String>,
     job_type: &str,
 ) -> WorkerModel {
     let worker_id = assignment
@@ -224,7 +224,7 @@ fn resolve_worker(
         cost: 0.0,
         latency_ms: 0,
         failure_rate: 0.0,
-        output: HashMap::new(),
+        output: BTreeMap::new(),
     }
 }
 
@@ -237,7 +237,7 @@ fn resolve_worker(
 /// prior `let _ =` behaviour.
 fn apply_and_fold(
     engine: &mut Engine,
-    output: &mut HashMap<String, Json>,
+    output: &mut BTreeMap<String, Json>,
     cmd: Command,
     clock: u64,
 ) {

@@ -17,7 +17,7 @@
 //! answer (`flows[kind=primary]`), so we don't need the bake-off's
 //! `pathClass` propagation — we already have it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::layout::geom::{proper_intersect, segment_intersects_rect, Geom, NodeKind};
 use crate::layout::schema::{FlowKind, SemanticAnnotations};
@@ -122,8 +122,8 @@ pub fn score(geom: &Geom, ann: &SemanticAnnotations) -> ConformanceReport {
     }
 }
 
-fn happy_path_ids(ann: &SemanticAnnotations) -> HashSet<String> {
-    let mut out = HashSet::new();
+fn happy_path_ids(ann: &SemanticAnnotations) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
     for f in &ann.flows {
         if f.kind == FlowKind::Primary {
             for id in &f.nodes {
@@ -157,7 +157,7 @@ pub fn flow_direction(geom: &Geom) -> f64 {
 }
 
 /// Happy-path nodes should share one horizontal baseline (within ½ROW).
-pub fn happy_path_straight(geom: &Geom, happy: &HashSet<String>) -> f64 {
+pub fn happy_path_straight(geom: &Geom, happy: &BTreeSet<String>) -> f64 {
     if happy.is_empty() {
         return 1.0;
     }
@@ -187,8 +187,8 @@ pub fn gateway_alignment(geom: &Geom) -> f64 {
     if gateways.is_empty() {
         return 1.0;
     }
-    let mut out: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut inc: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut inc: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for e in geom.edges.iter().filter(|e| e.is_sequence_flow) {
         out.entry(e.source.as_str())
             .or_default()

@@ -4077,7 +4077,7 @@ fn upsert_variables(
     tx: &rusqlite::Transaction,
     instance_key: Key,
     scope_key: Key,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> rusqlite::Result<()> {
     if variables.is_empty() {
         return Ok(());
@@ -10597,7 +10597,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -10620,7 +10620,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: process_id.to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -10642,7 +10642,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -11436,7 +11436,7 @@ mod definition_xml_tests {
             .export(&[
                 &Event::VariablesUpdated {
                     instance_key,
-                    variables: std::collections::HashMap::from([(
+                    variables: std::collections::BTreeMap::from([(
                         "amount".to_string(),
                         Value::Int(10),
                     )]),
@@ -11444,7 +11444,7 @@ mod definition_xml_tests {
                 &Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key,
-                    variables: std::collections::HashMap::from([
+                    variables: std::collections::BTreeMap::from([
                         ("amount".to_string(), Value::Int(20)),
                         ("item".to_string(), Value::Int(7)),
                     ]),
@@ -11483,7 +11483,7 @@ mod definition_xml_tests {
             .export(&[&Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key,
-                variables: std::collections::HashMap::from([(
+                variables: std::collections::BTreeMap::from([(
                     "amount".to_string(),
                     Value::Int(99),
                 )]),
@@ -11787,7 +11787,7 @@ mod decision_deletion_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -11933,7 +11933,7 @@ mod decision_deletion_tests {
 
 #[cfg(test)]
 mod element_instance_tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use nanobpmn_engine_core::{Event, JobKind, JobState, Key, ProcessBuilder};
 
@@ -11967,7 +11967,7 @@ mod element_instance_tests {
         Event::ProcessInstanceCreated {
             instance_key: INST,
             process_id: "p".to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             created_at: 1,
             tags: Vec::new(),
             business_id: None,
@@ -11995,7 +11995,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: CHILD,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 2,
                     tags: Vec::new(),
                     business_id: None,
@@ -12205,7 +12205,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: COMP_INST,
                     process_id: "comp".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12271,7 +12271,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: ESC_INST,
                     process_id: "esc".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12345,7 +12345,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: INST + 100,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12478,7 +12478,7 @@ mod element_instance_tests {
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
                 kind: MessageSubscriptionKind::IntermediateCatch,
-                variables: std::collections::HashMap::new(),
+                variables: std::collections::BTreeMap::new(),
                 delivery_key: 0,
             }])
             .unwrap();
@@ -14540,7 +14540,7 @@ mod element_instance_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7001,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: Some("biz-7".into()),
@@ -14742,7 +14742,7 @@ mod read_surface_tests {
         let top_instance = Event::ProcessInstanceCreated {
             instance_key: 10,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -14754,7 +14754,7 @@ mod read_surface_tests {
         let child_instance = Event::ProcessInstanceCreated {
             instance_key: 20,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -16696,7 +16696,7 @@ mod try_query_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -16812,7 +16812,7 @@ mod job_position_gate_tests {
 
 #[cfg(test)]
 mod adhoc_migration_export_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::{
         AdHocActivateElement, AdHocJobResult, Command, Engine, Event, ProcessDefinition,
@@ -16892,11 +16892,11 @@ mod adhoc_migration_export_tests {
         let ev = engine
             .apply_command(Command::complete_job_with_result(
                 agent[0].key,
-                HashMap::new(),
+                BTreeMap::new(),
                 AdHocJobResult {
                     activate_elements: vec![AdHocActivateElement {
                         element_id: "toolA".to_string(),
-                        variables: HashMap::new(),
+                        variables: BTreeMap::new(),
                     }],
                     ..Default::default()
                 },

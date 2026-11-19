@@ -16,7 +16,7 @@
 //! [`parse_bpmn`](nanobpmn_engine_core::bpmn::parse_bpmn) — exactly the parser production
 //! uses — so the structural view never drifts from executable semantics.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
@@ -209,12 +209,12 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
 /// resolution library a multi-stage orchestrator needs to inline its phases.
 fn definition_library(
     xml: &str,
-) -> Result<(Vec<ProcessDefinition>, HashMap<String, ProcessDefinition>), String> {
+) -> Result<(Vec<ProcessDefinition>, BTreeMap<String, ProcessDefinition>), String> {
     let defs = parse_bpmn(xml).map_err(|e| format!("model failed to parse: {e:?}"))?;
     if defs.is_empty() {
         return Err("model contained no process definitions".to_string());
     }
-    let library: HashMap<String, ProcessDefinition> =
+    let library: BTreeMap<String, ProcessDefinition> =
         defs.iter().map(|d| (d.id.clone(), d.clone())).collect();
     Ok((defs, library))
 }
@@ -485,8 +485,8 @@ pub fn read_model_xml(xml: &str, target: Option<&str>) -> Result<Value, String> 
 /// Structural edges used for reachability and loop detection: outgoing sequence flows,
 /// sub-process entry (container -> inner start), and boundary attachment (activity ->
 /// boundary event). The returned map is keyed by element id.
-fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+fn adjacency(def: &ProcessDefinition) -> BTreeMap<String, Vec<String>> {
+    let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, el) in &def.elements {
         let entry = adj.entry(id.clone()).or_default();
         for flow in &el.outgoing {
@@ -511,9 +511,9 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
 /// The set of element ids reachable from the start event over [`adjacency`].
 fn reachable_from_start(
     def: &ProcessDefinition,
-    adj: &HashMap<String, Vec<String>>,
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
+    adj: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
     let mut stack = vec![def.start_event.clone()];
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
@@ -531,8 +531,8 @@ fn reachable_from_start(
 }
 
 /// Reverse adjacency (predecessors) for ancestor queries.
-fn predecessors(adj: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
-    let mut rev: HashMap<String, Vec<String>> = HashMap::new();
+fn predecessors(adj: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    let mut rev: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (from, tos) in adj {
         for to in tos {
             rev.entry(to.clone()).or_default().push(from.clone());
@@ -542,8 +542,8 @@ fn predecessors(adj: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<Strin
 }
 
 /// All ancestors of `node` over the reverse graph (nodes that can reach it).
-fn ancestors(node: &str, rev: &HashMap<String, Vec<String>>) -> HashSet<String> {
-    let mut seen = HashSet::new();
+fn ancestors(node: &str, rev: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = rev.get(node).cloned().unwrap_or_default();
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
@@ -564,7 +564,7 @@ fn ancestors(node: &str, rev: &HashMap<String, Vec<String>>) -> HashSet<String> 
 /// that constitute a loop (size > 1, or a single self-looping node).
 fn loop_components(
     def: &ProcessDefinition,
-    adj: &HashMap<String, Vec<String>>,
+    adj: &BTreeMap<String, Vec<String>>,
 ) -> Vec<Vec<String>> {
     // Index the nodes deterministically.
     let ids: Vec<String> = {
@@ -572,7 +572,7 @@ fn loop_components(
         v.sort();
         v
     };
-    let index_of: HashMap<&str, usize> = ids
+    let index_of: BTreeMap<&str, usize> = ids
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -663,14 +663,14 @@ fn loop_components(
 pub(crate) struct ModelTaskGraph {
     pub process_id: String,
     /// Every service/user task id in the model.
-    pub tasks: HashSet<String>,
+    pub tasks: BTreeSet<String>,
     /// For each task, the set of tasks reachable next via paths of only non-task nodes
     /// (gateways, events, subprocess/boundary edges) — i.e. the transitions the model permits.
-    pub allowed: HashMap<String, HashSet<String>>,
+    pub allowed: BTreeMap<String, BTreeSet<String>>,
     /// Tasks the model can reach first from the start event (legal opening tasks).
-    pub start_tasks: HashSet<String>,
+    pub start_tasks: BTreeSet<String>,
     /// Tasks from which an end event is reachable without an intervening task (legal closing tasks).
-    pub end_tasks: HashSet<String>,
+    pub end_tasks: BTreeSet<String>,
 }
 
 /// Build the [`ModelTaskGraph`] by collapsing the structural graph onto its task nodes.
@@ -691,7 +691,7 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
             _ => false,
         })
     };
-    let tasks: HashSet<String> = def
+    let tasks: BTreeSet<String> = def
         .elements
         .iter()
         .filter(|(_, e)| is_task(&e.kind))
@@ -700,10 +700,10 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
 
     // From a starting frontier, walk forward through only non-task nodes, recording the
     // first task reached on each path (and whether any path reaches an end event).
-    let next_tasks = |frontier: Vec<String>| -> (HashSet<String>, bool) {
-        let mut found = HashSet::new();
+    let next_tasks = |frontier: Vec<String>| -> (BTreeSet<String>, bool) {
+        let mut found = BTreeSet::new();
         let mut reached_end = false;
-        let mut visited = HashSet::new();
+        let mut visited = BTreeSet::new();
         let mut stack = frontier;
         while let Some(n) = stack.pop() {
             if !visited.insert(n.clone()) {
@@ -726,8 +726,8 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
         (found, reached_end)
     };
 
-    let mut allowed = HashMap::new();
-    let mut end_tasks = HashSet::new();
+    let mut allowed = BTreeMap::new();
+    let mut end_tasks = BTreeSet::new();
     for t in &tasks {
         let frontier = adj.get(t).cloned().unwrap_or_default();
         let (succ, reached_end) = next_tasks(frontier);
@@ -1482,8 +1482,8 @@ fn tag_attr(tag: &str, key: &str) -> Option<String> {
 /// Harvest a map of `element id -> human label` from a BPMN document by scanning every start tag
 /// that carries both `id=` and a non-empty `name=`. The engine model drops names (it is purely
 /// semantic), so `edit_model` re-reads them here to preserve operator-facing labels across an edit.
-pub(crate) fn parse_element_names(xml: &str) -> HashMap<String, String> {
-    let mut names = HashMap::new();
+pub(crate) fn parse_element_names(xml: &str) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
     let mut i = 0usize;
     while let Some(rel) = xml[i..].find('<') {
         let start = i + rel;
@@ -1543,8 +1543,8 @@ pub const NANO_NAMESPACE_URI: &str = "http://nano.camunda.io/schema/semantic/1.0
 /// parent). This is a lightweight XML scan — no full parser — because the
 /// serialiser we're pairing with is also lightweight and BPMN documents in
 /// this codebase are small.
-pub(crate) fn extract_nano_extensions(xml: &str) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
+pub(crate) fn extract_nano_extensions(xml: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
     // A stack of open elements: (id, whether we already recorded a nano
     // block for this element). We only ever need the id of the immediate
     // parent of a `<bpmn:extensionElements>` block.
@@ -1717,7 +1717,7 @@ fn collect_nano_children(block: &str, buf: &mut String) {
 /// Returns `emitted` unchanged when `extensions` is empty.
 pub(crate) fn preserve_nano_extensions_in(
     emitted: String,
-    extensions: &HashMap<String, String>,
+    extensions: &BTreeMap<String, String>,
 ) -> String {
     if extensions.is_empty() {
         return emitted;
@@ -1958,7 +1958,7 @@ fn millis_to_iso8601(ms: u64) -> String {
 /// would reparse both refs onto the last declaration's code and misroute the throw).
 fn collect_error_ids(
     def: &ProcessDefinition,
-    reserved: &HashSet<String>,
+    reserved: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
@@ -1986,7 +1986,7 @@ fn collect_error_ids(
             _ => {}
         }
     }
-    let mut used: HashSet<String> = reserved.clone();
+    let mut used: BTreeSet<String> = reserved.clone();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
         let id = alloc_unique_id(format!("Error_{}", id_fragment(&code)), &mut used);
@@ -2004,13 +2004,13 @@ struct MessageDecl {
 
 /// The message declarations a model needs, paired with a lookup from `(name, correlation_key)`
 /// to the declaration id (so events differing only in correlation get distinct declarations).
-type MessageCollection = (Vec<MessageDecl>, HashMap<(String, Option<String>), String>);
+type MessageCollection = (Vec<MessageDecl>, BTreeMap<(String, Option<String>), String>);
 
 /// Collect the `<bpmn:message>` declarations a model needs, keyed for lookup by
 /// `(name, correlation_key)` so events that differ in correlation get distinct declarations.
 fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
     let mut decls: Vec<MessageDecl> = Vec::new();
-    let mut lookup: HashMap<(String, Option<String>), String> = HashMap::new();
+    let mut lookup: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
     let mut want: Vec<(String, Option<String>)> = Vec::new();
     let mut ids: Vec<&String> = def.elements.keys().collect();
     ids.sort();
@@ -2102,7 +2102,7 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 /// or an earlier escalation id.
 fn collect_escalations(
     def: &ProcessDefinition,
-    reserved: &HashSet<String>,
+    reserved: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
@@ -2133,7 +2133,7 @@ fn collect_escalations(
     // — so a generated `Escalation_…` declaration id can never shadow one of
     // them (a process/flow literally named `Escalation_OVERLOAD` would otherwise
     // duplicate a `<bpmn:escalation id>`; #1173).
-    let mut used: HashSet<String> = reserved.clone();
+    let mut used: BTreeSet<String> = reserved.clone();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
         let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
@@ -2146,7 +2146,7 @@ fn collect_escalations(
 /// inserting the chosen id into `used`. Keeps synthesized declaration ids collision-free against
 /// each other and against reserved (model element) ids, since the id-deriving `id_fragment` is not
 /// injective.
-fn alloc_unique_id(base: String, used: &mut HashSet<String>) -> String {
+fn alloc_unique_id(base: String, used: &mut BTreeSet<String>) -> String {
     if used.insert(base.clone()) {
         return base;
     }
@@ -2284,12 +2284,12 @@ fn emit_element(
     def: &ProcessDefinition,
     id: &str,
     errors: &BTreeMap<String, String>,
-    messages: &HashMap<(String, Option<String>), String>,
+    messages: &BTreeMap<(String, Option<String>), String>,
     signals: &BTreeMap<String, String>,
     escalations: &BTreeMap<String, String>,
-    children_by_parent: &HashMap<String, Vec<String>>,
-    labels: &HashMap<String, String>,
-    default_flows: &HashMap<String, String>,
+    children_by_parent: &BTreeMap<String, Vec<String>>,
+    labels: &BTreeMap<String, String>,
+    default_flows: &BTreeMap<String, String>,
     out: &mut String,
 ) {
     let el = &def.elements[id];
@@ -3176,10 +3176,10 @@ fn emit_esp_start_event(
     trigger: &nanobpmn_engine_core::EventSubProcessTrigger,
     interrupting: bool,
     errors: &BTreeMap<String, String>,
-    messages: &HashMap<(String, Option<String>), String>,
+    messages: &BTreeMap<(String, Option<String>), String>,
     signals: &BTreeMap<String, String>,
     escalations: &BTreeMap<String, String>,
-    labels: &HashMap<String, String>,
+    labels: &BTreeMap<String, String>,
     out: &mut String,
 ) {
     use nanobpmn_engine_core::EventSubProcessTrigger as T;
@@ -3265,19 +3265,19 @@ struct PreservedDi {
     /// The verbatim `<bpmndi:BPMNDiagram>…</bpmndi:BPMNDiagram>` block.
     diagram_block: String,
     /// Node ids that carry a `<bpmndi:BPMNShape>`.
-    shape_ids: HashSet<String>,
+    shape_ids: BTreeSet<String>,
     /// `(sourceRef, targetRef)` pairs that carry a `<bpmndi:BPMNEdge>` (via their sequence flow).
-    edge_keys: HashSet<(String, String)>,
+    edge_keys: BTreeSet<(String, String)>,
     /// `(sourceRef, targetRef) -> original sequence-flow id`, so the reused body can adopt the same
     /// ids the preserved edges already reference.
-    flow_ids: HashMap<(String, String), String>,
+    flow_ids: BTreeMap<(String, String), String>,
     /// Every `id="…"` attribute declared INSIDE the verbatim diagram block — the
     /// `<bpmndi:BPMNDiagram>`/`<bpmndi:BPMNPlane>`/`<bpmndi:BPMNShape>`/`<bpmndi:BPMNEdge>`
     /// own ids (NOT their `bpmnElement` refs). The block is re-attached
     /// byte-for-byte, so a generated declaration id (`Escalation_…`, `Signal_…`)
     /// must be reserved against these too, or a legal DI id like
     /// `Escalation_OVERLOAD` could duplicate a `<bpmn:escalation id>` (#1173).
-    di_ids: HashSet<String>,
+    di_ids: BTreeSet<String>,
 }
 
 impl PreservedDi {
@@ -3293,7 +3293,7 @@ impl PreservedDi {
     /// duplicate parallel edge the `(src,to)` key can't disambiguate — fails the check and forces a
     /// clean auto-layout instead.
     fn covers(&self, def: &ProcessDefinition) -> bool {
-        let def_nodes: HashSet<&str> = def.elements.keys().map(String::as_str).collect();
+        let def_nodes: BTreeSet<&str> = def.elements.keys().map(String::as_str).collect();
         if def_nodes.len() != self.shape_ids.len()
             || !self
                 .shape_ids
@@ -3308,7 +3308,7 @@ impl PreservedDi {
                 def_flows.push((src.clone(), f.to.clone()));
             }
         }
-        let def_set: HashSet<(String, String)> = def_flows.iter().cloned().collect();
+        let def_set: BTreeSet<(String, String)> = def_flows.iter().cloned().collect();
         if def_set.len() != def_flows.len() {
             return false; // duplicate parallel edge — can't key layout by (src,to)
         }
@@ -3324,7 +3324,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     let diagram_block = xml[ds..de].to_string();
 
     // Map every sequence flow's id to its endpoints (flows live in the process body, not the DI).
-    let mut flow_endpoints: HashMap<String, (String, String)> = HashMap::new();
+    let mut flow_endpoints: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(xml, "sequenceFlow", from) {
         let span = &xml[s..e];
@@ -3338,7 +3338,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
         from = e;
     }
 
-    let mut shape_ids: HashSet<String> = HashSet::new();
+    let mut shape_ids: BTreeSet<String> = BTreeSet::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(&diagram_block, "BPMNShape", from) {
         if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
@@ -3347,8 +3347,8 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
         from = e;
     }
 
-    let mut edge_keys: HashSet<(String, String)> = HashSet::new();
-    let mut flow_ids: HashMap<(String, String), String> = HashMap::new();
+    let mut edge_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut flow_ids: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(&diagram_block, "BPMNEdge", from) {
         if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
@@ -3363,7 +3363,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     if shape_ids.is_empty() {
         return None;
     }
-    let di_ids: HashSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
+    let di_ids: BTreeSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
     Some(PreservedDi {
         diagram_block,
         shape_ids,
@@ -3384,7 +3384,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
 /// reproduces `def`'s structure (the engine ignores both `name=` and the DI).
 pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
 ) -> String {
     let emitted = serialize_definition(def, overrides, None, None);
     let extensions = extract_nano_extensions(&def.xml);
@@ -3399,7 +3399,7 @@ pub fn definition_to_xml_labeled(
 /// identical to `definition_to_xml_labeled`. This is the DI-preservation lens of ADR 0001 Phase 5.
 pub fn definition_to_xml_preserving_di(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
     di_source: Option<&str>,
 ) -> String {
     let di = di_source.and_then(extract_preserved_di);
@@ -3419,8 +3419,8 @@ pub fn definition_to_xml_preserving_di(
 /// always regenerated — the point of running it is to relay out to the new bands).
 pub fn definition_to_xml_with_row_bias(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
-    row_bias: &HashMap<String, f64>,
+    overrides: &BTreeMap<String, String>,
+    row_bias: &BTreeMap<String, f64>,
 ) -> String {
     let emitted = serialize_definition(def, overrides, None, Some(row_bias));
     let extensions = extract_nano_extensions(&def.xml);
@@ -3493,9 +3493,9 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
 fn flow_id_resolution(
     def: &ProcessDefinition,
     preserve: Option<&PreservedDi>,
-) -> (Vec<String>, HashMap<String, String>) {
+) -> (Vec<String>, BTreeMap<String, String>) {
     let mut flow_ids: Vec<String> = Vec::new();
-    let mut default_flows: HashMap<String, String> = HashMap::new();
+    let mut default_flows: BTreeMap<String, String> = BTreeMap::new();
     let mut sources: Vec<&String> = def.elements.keys().collect();
     sources.sort();
     let mut k = 0usize;
@@ -3516,9 +3516,9 @@ fn flow_id_resolution(
 
 fn serialize_definition(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
     di: Option<&PreservedDi>,
-    row_bias: Option<&HashMap<String, f64>>,
+    row_bias: Option<&BTreeMap<String, f64>>,
 ) -> String {
     let mut normalized = def.clone();
     normalized.normalize_legacy_agent_tasks();
@@ -3535,7 +3535,7 @@ fn serialize_definition(
     // reused verbatim when the flows are emitted below.
     let preserve = di.filter(|d| d.covers(def));
     let (flow_ids, default_flows) = flow_id_resolution(def, preserve);
-    let mut reserved_ids: HashSet<String> = def.elements.keys().cloned().collect();
+    let mut reserved_ids: BTreeSet<String> = def.elements.keys().cloned().collect();
     reserved_ids.insert(def.id.clone());
     reserved_ids.extend(flow_ids.iter().cloned());
     // Reserve every id declared inside a preserved `<bpmndi:BPMNDiagram>` block:
@@ -3553,7 +3553,7 @@ fn serialize_definition(
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
-    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
     for id in def.elements.keys() {
         let label = overrides
             .get(id)
@@ -3570,7 +3570,7 @@ fn serialize_definition(
     }
 
     // Group sub-process children by parent so a container emits its contents inline.
-    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, el) in &def.elements {
         if let Some(parent) = &el.parent {
             children_by_parent
@@ -3802,9 +3802,9 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
 /// (primary→0, exception→+H, escalation→−H, …) instead of drifting toward their predecessors.
 fn desired_row(
     id: &str,
-    preds: &HashMap<String, Vec<String>>,
-    row_of: &HashMap<String, f64>,
-    bias: Option<&HashMap<String, f64>>,
+    preds: &BTreeMap<String, Vec<String>>,
+    row_of: &BTreeMap<String, f64>,
+    bias: Option<&BTreeMap<String, f64>>,
 ) -> f64 {
     if let Some(b) = bias.and_then(|m| m.get(id).copied()) {
         return b;
@@ -4000,14 +4000,14 @@ fn append_diagram(
     def: &ProcessDefinition,
     flows: &[FlowEdge],
     out: &mut String,
-    bias: Option<&HashMap<String, f64>>,
+    bias: Option<&BTreeMap<String, f64>>,
 ) {
     let mut ids: Vec<String> = def.elements.keys().cloned().collect();
     ids.sort();
     let n = ids.len();
 
     // --- Column (rank) per node: longest path from any source, boundary pinned to its host. ---
-    let mut rank: HashMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
+    let mut rank: BTreeMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
     for _ in 0..(n + 2) {
         for id in &ids {
             if let Some(host) = def.elements[id].kind.attached_to() {
@@ -4026,7 +4026,7 @@ fn append_diagram(
     }
 
     // --- Row per (non-boundary) node, biased toward the mean of its main-flow predecessors. ---
-    let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut preds: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in flows {
         if !is_boundary(&def.elements[&f.src].kind) {
             preds.entry(f.to.clone()).or_default().push(f.src.clone());
@@ -4037,7 +4037,7 @@ fn append_diagram(
         .filter(|id| !is_boundary(&def.elements[*id].kind))
         .collect();
     let max_rank = grid_ids.iter().map(|id| rank[*id]).max().unwrap_or(0);
-    let mut row_of: HashMap<String, f64> = HashMap::new();
+    let mut row_of: BTreeMap<String, f64> = BTreeMap::new();
     for r in 0..=max_rank {
         let mut here: Vec<String> = grid_ids
             .iter()
@@ -4070,7 +4070,7 @@ fn append_diagram(
     const OY: f64 = 100.0;
     const COL: f64 = 190.0;
     const ROW: f64 = 110.0;
-    let mut rects: HashMap<String, Rect> = HashMap::new();
+    let mut rects: BTreeMap<String, Rect> = BTreeMap::new();
     for id in &ids {
         let kind = &def.elements[id].kind;
         if is_boundary(kind) {
@@ -4211,7 +4211,7 @@ fn req_str<'a>(op: &'a Value, field: &str, op_name: &str) -> Result<&'a str, Str
 /// can correct the *operation* rather than re-typing raw XML.
 fn apply_edit_op(
     def: &mut ProcessDefinition,
-    names: &mut HashMap<String, String>,
+    names: &mut BTreeMap<String, String>,
     op: &Value,
 ) -> Result<String, String> {
     let op_name = op
@@ -4568,7 +4568,7 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
 /// `write_model_ir` path so both assemble multi-phase models identically.
 pub(crate) fn assemble_model(
     defs: &[ProcessDefinition],
-    names: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
 ) -> String {
     if defs.len() == 1 {
         definition_to_xml_labeled(&defs[0], names)
@@ -5104,7 +5104,7 @@ mod tests {
         // The serializer synthesizes humanized `name=` diagram labels that are
         // not part of the structural model, so compare elements ignoring the
         // (display-only) `name` field.
-        let strip = |els: &std::collections::HashMap<String, Element>| {
+        let strip = |els: &std::collections::BTreeMap<String, Element>| {
             let mut m = els.clone();
             for el in m.values_mut() {
                 el.name = None;
@@ -5116,7 +5116,7 @@ mod tests {
 
     /// Serialize with no operator label overrides (humanized fallbacks only).
     fn definition_to_xml(def: &ProcessDefinition) -> String {
-        definition_to_xml_labeled(def, &HashMap::new())
+        definition_to_xml_labeled(def, &BTreeMap::new())
     }
 
     #[test]
@@ -5140,7 +5140,7 @@ mod tests {
             let xml = definition_to_xml(&def);
             assert!(xml.contains("<zeebe:taskDefinition"));
             assert!(xml.contains(expected_declaration), "{xml}");
-            let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
+            let ir = crate::model_ir::definition_to_ir(&def, &BTreeMap::new());
             assert!(ir.contains("jobType"), "{ir}");
             let restored = crate::model_ir::ir_to_definition(&ir).unwrap();
             let xml = definition_to_xml(&restored.definition);
@@ -5298,7 +5298,7 @@ mod tests {
             }
             assert!(emitted.contains("bpmnElement=\"ToolWork\""));
             let preserved =
-                definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source));
+                definition_to_xml_preserving_di(&original, &BTreeMap::new(), Some(&source));
             let authored_di = extract_preserved_di(&source).unwrap();
             assert!(preserved.contains(&authored_di.diagram_block));
             assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
@@ -5458,7 +5458,7 @@ mod tests {
         );
         for emitted in [
             definition_to_xml(&original),
-            definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source)),
+            definition_to_xml_preserving_di(&original, &BTreeMap::new(), Some(&source)),
         ] {
             let container_extensions = emitted
                 .split("<bpmn:adHocSubProcess")
@@ -6286,10 +6286,10 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Split", "Throw2")
             .build()
             .unwrap();
-        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
         let errors = collect_error_ids(&def, &reserved);
         assert_eq!(errors.len(), 2, "both codes get a declaration");
-        let ids: std::collections::HashSet<&String> = errors.values().collect();
+        let ids: std::collections::BTreeSet<&String> = errors.values().collect();
         assert_eq!(
             ids.len(),
             2,
@@ -6314,7 +6314,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Error_OOPS", "Throw")
             .build()
             .unwrap();
-        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
         let errors = collect_error_ids(&def, &reserved);
         assert_ne!(errors["OOPS"], "Error_OOPS");
         let xml = definition_to_xml(&def);
@@ -6346,10 +6346,10 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
         let escalations = collect_escalations(&def, &reserved);
         assert_eq!(escalations.len(), 2, "both codes get a declaration");
-        let ids: std::collections::HashSet<&String> = escalations.values().collect();
+        let ids: std::collections::BTreeSet<&String> = escalations.values().collect();
         assert_eq!(
             ids.len(),
             2,
@@ -6385,7 +6385,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let mut reserved: std::collections::HashSet<String> =
+        let mut reserved: std::collections::BTreeSet<String> =
             def.elements.keys().cloned().collect();
         // A preserved sequence-flow id (or the process id) that happens to equal
         // the escalation base id.
@@ -6466,7 +6466,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             di_source.contains("id=\"Escalation_OVERLOAD\""),
             "the DI source carries the colliding plane id"
         );
-        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        let xml = definition_to_xml_preserving_di(&def, &BTreeMap::new(), Some(&di_source));
         assert!(
             xml.contains("id=\"Escalation_OVERLOAD\""),
             "the preserved DI plane id survives verbatim, got:\n{xml}"
@@ -6577,7 +6577,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             di_source.contains("id = 'Escalation_OVERLOAD'"),
             "the DI source carries the alternate-spelling colliding plane id"
         );
-        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        let xml = definition_to_xml_preserving_di(&def, &BTreeMap::new(), Some(&di_source));
         assert!(
             xml.contains("id = 'Escalation_OVERLOAD'"),
             "the preserved DI plane id survives verbatim, got:\n{xml}"
@@ -7377,7 +7377,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .into_iter()
             .next()
             .expect("one process");
-        let emitted = definition_to_xml_labeled(&def, &HashMap::new());
+        let emitted = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             emitted.contains("xmlns:nano="),
             "definitions root re-declares nano namespace: {emitted}"
@@ -7406,7 +7406,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .into_iter()
             .next()
             .expect("one process");
-        let out = definition_to_xml_with_row_bias(&def, &HashMap::new(), &HashMap::new());
+        let out = definition_to_xml_with_row_bias(&def, &BTreeMap::new(), &BTreeMap::new());
         assert!(
             out.contains("<nano:cost"),
             "row-bias emit preserves nano:cost"
@@ -7416,7 +7416,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
 
     #[test]
     fn preserve_nano_extensions_in_is_a_no_op_when_map_is_empty() {
-        let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &HashMap::new());
+        let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &BTreeMap::new());
         assert_eq!(same, "<bpmn:definitions/>");
     }
 
@@ -7440,7 +7440,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             "fixture start event carries tool properties"
         );
 
-        let emitted = definition_to_xml_labeled(&def, &HashMap::new());
+        let emitted = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             emitted.contains(
                 "<zeebe:property name=\"io.camunda.tool:name\" value=\"mcp-process-with-inputs\""
@@ -7484,7 +7484,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         let expected = def.elements[&start_id].properties.clone();
         assert!(!expected.is_empty());
 
-        let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
+        let ir = crate::model_ir::definition_to_ir(&def, &BTreeMap::new());
         assert!(
             ir.contains("property \"io.camunda.tool:name\" \"mcp-process-with-inputs\""),
             "IR carries the tool-name property: {ir}"
@@ -7498,7 +7498,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
 
         // And the re-lowered definition still serializes the markers to BPMN.
-        let emitted = definition_to_xml_labeled(&redef, &HashMap::new());
+        let emitted = definition_to_xml_labeled(&redef, &BTreeMap::new());
         assert!(
             emitted.contains("<zeebe:property name=\"io.camunda.tool:name\""),
             "IR → BPMN re-emits the tool markers: {emitted}"
@@ -7528,7 +7528,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .expect("build");
 
-        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             xml.contains(r#"externalReference="https://forms.example/x""#),
             "external reference is emitted:\n{xml}"
@@ -7573,7 +7573,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .expect("build");
 
-        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             xml.contains(
                 r#"<zeebe:formDefinition formId="review-form" bindingType="versionTag" versionTag="v2"/>"#
@@ -7611,7 +7611,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .expect("build");
 
-        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             xml.contains(r#"<zeebe:formDefinition formId="review-form"/>"#),
             "no binding attributes on the default binding:\n{xml}"

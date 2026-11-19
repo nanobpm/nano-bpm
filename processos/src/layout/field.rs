@@ -44,7 +44,7 @@
 //! seeded RNG (currently unseeded — the init is deterministic-by-construction
 //! since we only jitter zero-degree ties).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{Element, ProcessDefinition};
 
@@ -186,7 +186,7 @@ pub struct Charges {
     /// can be fractional so a node can be, e.g., 70% primary + 30% exception.
     pub flow_kind: [f64; 4],
     /// Membership share per cluster id (0..1).
-    pub cluster: HashMap<String, f64>,
+    pub cluster: BTreeMap<String, f64>,
     /// Normalized longest-path distance from a source event, 0..1. Higher =
     /// further right (a constant +x drift is applied proportional to this).
     #[allow(dead_code)] // retained for future force-tuning experiments
@@ -211,13 +211,13 @@ impl Charges {
 /// DI emitter or the debug SVG.
 #[derive(Debug, Clone)]
 pub struct FieldOutput {
-    pub nodes: HashMap<String, (f64, f64)>,
+    pub nodes: BTreeMap<String, (f64, f64)>,
     /// `edge_id -> polyline of waypoints`. First and last waypoints sit on
     /// the source/target node perimeter respectively.
-    pub edges: HashMap<String, Vec<(f64, f64)>>,
+    pub edges: BTreeMap<String, Vec<(f64, f64)>>,
     /// Per-node net force from the *last* integrator step. Used by the debug
     /// SVG force-vector overlay.
-    pub node_forces: HashMap<String, (f64, f64)>,
+    pub node_forces: BTreeMap<String, (f64, f64)>,
     /// Diagnostic — steps until convergence, kinetic energy trace, pinned particle ids.
     pub diagnostics: SimDiagnostics,
 }
@@ -238,7 +238,7 @@ pub fn simulate(def: &ProcessDefinition, ann: &SemanticAnnotations) -> FieldOutp
     // indices) once — used by the directional order penalty in
     // compute_all_forces to keep successors right of their predecessors.
     let edge_order: Vec<(usize, usize)> = {
-        let idx_of: HashMap<&str, usize> = particles
+        let idx_of: BTreeMap<&str, usize> = particles
             .iter()
             .enumerate()
             .filter(|(_, p)| p.kind == ParticleKind::Node)
@@ -323,7 +323,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
     // Assign a lane offset per (rank, band) group. Iteration over
     // `def.elements` is stable (BTreeMap in engine-core), and we sort within
     // each group by id, so the whole init is deterministic.
-    let mut lane_offset: HashMap<String, f64> = HashMap::new();
+    let mut lane_offset: BTreeMap<String, f64> = BTreeMap::new();
     {
         let mut buckets: std::collections::BTreeMap<(i64, i64), Vec<&String>> =
             std::collections::BTreeMap::new();
@@ -407,7 +407,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
             let edge_kind = edge_flow_kind(&edge_id, src_id, &f.to, ann);
             let charges = Charges {
                 flow_kind: Charges::flow_kind_from(edge_kind),
-                cluster: HashMap::new(),
+                cluster: BTreeMap::new(),
                 graph_dist: 0.0,
             };
             let chain_len = EDGE_SEGMENTS + 1;
@@ -633,7 +633,7 @@ fn project_endpoints(particles: &mut [Particle]) {
     // Snapshot node rects (Node particles) so we can perimeter-project edge
     // endpoints against them without an aliasing borrow. The shape is
     // captured too so gateways and events use diamond/circle projection.
-    let node_rects: HashMap<String, (f64, f64, f64, f64, NodeShape)> = particles
+    let node_rects: BTreeMap<String, (f64, f64, f64, f64, NodeShape)> = particles
         .iter()
         .filter(|p| p.kind == ParticleKind::Node)
         .map(|p| {
@@ -652,7 +652,7 @@ fn project_endpoints(particles: &mut [Particle]) {
     // fallback branch below), which is exactly the "both flows leave the
     // gateway from the same point" bug.
     // Key: (edge_id, endpoint_index). Value: interior neighbour position.
-    let mut neighbour_pos: HashMap<(String, usize), (f64, f64)> = HashMap::new();
+    let mut neighbour_pos: BTreeMap<(String, usize), (f64, f64)> = BTreeMap::new();
     for p in particles.iter() {
         if let ParticleKind::EdgeSegment { index, chain_len } = p.kind {
             let is_endpoint = index == 0 || index == chain_len - 1;
@@ -798,11 +798,11 @@ fn mean(pts: &[(f64, f64)]) -> (f64, f64) {
 // --- Extraction ------------------------------------------------------------
 
 fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldOutput {
-    let mut nodes = HashMap::new();
-    let mut node_forces = HashMap::new();
+    let mut nodes = BTreeMap::new();
+    let mut node_forces = BTreeMap::new();
     // Snapshot node rects so we can clip edge polylines out of source/target
     // rectangles below.
-    let mut node_rects: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+    let mut node_rects: BTreeMap<String, (f64, f64, f64, f64)> = BTreeMap::new();
     for p in particles {
         if p.kind == ParticleKind::Node {
             nodes.insert(p.id.clone(), p.pos);
@@ -814,7 +814,7 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
     // Collect edge segments keyed by parent edge id, then sort by segment
     // index so waypoint order matches the chain direction (source → target).
     type EdgeBucket = (Vec<(usize, (f64, f64))>, Option<EdgeAnchors>);
-    let mut per_edge: HashMap<String, EdgeBucket> = HashMap::new();
+    let mut per_edge: BTreeMap<String, EdgeBucket> = BTreeMap::new();
     for p in particles {
         if let ParticleKind::EdgeSegment { index, .. } = p.kind {
             if let Some(a) = &p.edge_anchors {
@@ -825,7 +825,7 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
             }
         }
     }
-    let mut edges: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let mut edges: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
     for (edge_id, (mut list, anchors)) in per_edge {
         list.sort_by_key(|&(i, _)| i);
         let raw: Vec<(f64, f64)> = list.into_iter().map(|(_, p)| p).collect();
@@ -854,7 +854,7 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
 fn clip_edge_polyline(
     raw: &[(f64, f64)],
     anchors: Option<&EdgeAnchors>,
-    node_rects: &HashMap<String, (f64, f64, f64, f64)>,
+    node_rects: &BTreeMap<String, (f64, f64, f64, f64)>,
 ) -> Vec<(f64, f64)> {
     if raw.len() < 2 {
         return raw.to_vec();
@@ -934,8 +934,8 @@ fn node_dims(el: &Element) -> (f64, f64) {
     }
 }
 
-fn flatten_flow_kinds(ann: &SemanticAnnotations) -> HashMap<String, FlowKind> {
-    let mut out: HashMap<String, FlowKind> = HashMap::new();
+fn flatten_flow_kinds(ann: &SemanticAnnotations) -> BTreeMap<String, FlowKind> {
+    let mut out: BTreeMap<String, FlowKind> = BTreeMap::new();
     for f in &ann.flows {
         for n in &f.nodes {
             let take = out.get(n).is_none_or(|k| f.kind.priority() > k.priority());
@@ -947,8 +947,8 @@ fn flatten_flow_kinds(ann: &SemanticAnnotations) -> HashMap<String, FlowKind> {
     out
 }
 
-fn flatten_cluster_membership(ann: &SemanticAnnotations) -> HashMap<String, HashMap<String, f64>> {
-    let mut out: HashMap<String, HashMap<String, f64>> = HashMap::new();
+fn flatten_cluster_membership(ann: &SemanticAnnotations) -> BTreeMap<String, BTreeMap<String, f64>> {
+    let mut out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for c in &ann.clusters {
         for n in &c.nodes {
             out.entry(n.clone())
@@ -982,10 +982,10 @@ fn edge_flow_kind(
 /// Longest-path distance from any source event to each node — used as the
 /// LTR drift charge. Cyclic graphs cap at `n` (same as `append_diagram`'s
 /// rank fixpoint).
-fn compute_graph_distance(def: &ProcessDefinition) -> HashMap<String, f64> {
+fn compute_graph_distance(def: &ProcessDefinition) -> BTreeMap<String, f64> {
     let ids: Vec<&String> = def.elements.keys().collect();
     let n = ids.len();
-    let mut dist: HashMap<String, f64> = ids.iter().map(|s| ((*s).clone(), 0.0)).collect();
+    let mut dist: BTreeMap<String, f64> = ids.iter().map(|s| ((*s).clone(), 0.0)).collect();
     for _ in 0..(n + 2) {
         for (id, el) in &def.elements {
             let cur = dist.get(id).copied().unwrap_or(0.0);
