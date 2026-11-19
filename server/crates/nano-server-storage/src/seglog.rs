@@ -1861,6 +1861,15 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             // Replay only events after the snapshot boundary.
             let skip = covered.saturating_sub(first_index) as usize;
             if skip < events.len() {
+                // ADR 0066 #1664: the replayed tail must re-derive the chain
+                // digests it recorded, continuing from the snapshot base's.
+                let seed = engine
+                    .raft_applied()
+                    .map(|(_, state)| crate::digest::try_chain_of_raft_state(state))
+                    .transpose()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    .flatten();
+                verify_replayed_chain(seed, &events[skip..], crate::digest::Coverage::Window)?;
                 engine.apply_replayed_events(events[skip..].iter().cloned());
             }
             (engine, false)
@@ -1873,6 +1882,8 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         // as an unreadable snapshot.
         Ok(None) if first_index == 0 => {
             let fresh = total_events == 0;
+            // `first_index == 0`: the surviving events ARE the whole history.
+            verify_replayed_chain(None, &events, crate::digest::Coverage::Complete)?;
             (Engine::replay_partition(0, events.iter().cloned()), fresh)
         }
         Ok(None) => match migrate_by_replay(dir, 0, first_index, total_events, &events)? {
@@ -2446,11 +2457,35 @@ fn migrate_by_replay(
     }
 
     // Replay cold prefix then hot tail, in global order, from an empty engine.
+    // The migration must re-derive every recorded chain digest (ADR 0066
+    // #1664): a journal whose bytes no longer reproduce them fails closed.
+    // Cold and hot are split at a segment seal, which is always a frame
+    // boundary, so the hot window continues from the cold one's chain.
+    // Validated contiguous `[0, total_events)`: a complete history.
+    let cold_chain = verify_replayed_chain(None, &cold_events, crate::digest::Coverage::Complete)?;
+    verify_replayed_chain(cold_chain, hot_events, crate::digest::Coverage::Complete)?;
     let engine = Engine::replay_partition(
         partition_id,
         cold_events.into_iter().chain(hot_events.iter().cloned()),
     );
     Ok(Some(engine))
+}
+
+/// Re-derives the chain digests recorded in a replayed event window (ADR 0066
+/// slice 5, #1664) and fails closed — a typed `InvalidData` carrying the
+/// [`ChainVerifyError`](crate::digest::ChainVerifyError) — when the journal no
+/// longer reproduces them (altered bytes, or a fold that changed).
+pub(crate) fn verify_replayed_chain(
+    seed: Option<crate::digest::ChainDigest>,
+    events: &[Event],
+    coverage: crate::digest::Coverage,
+) -> io::Result<Option<crate::digest::ChainDigest>> {
+    crate::digest::verify_journal_chain(seed, events, coverage)
+        .map(|(_, last)| last)
+        .map_err(|e| {
+            tracing::error!(error = %e, "replay: journal chain digest verification failed");
+            io::Error::new(io::ErrorKind::InvalidData, e)
+        })
 }
 
 /// The multi-partition migrator's shared "can we soundly replay the FULL
@@ -3152,6 +3187,7 @@ pub fn recover_multi_scoped(
                     .filter(|(tag, _)| *tag == p)
                     .map(|(_, e)| e.clone())
                     .collect();
+                verify_replayed_chain(None, &p_full, crate::digest::Coverage::Complete)?;
                 Engine::replay_partition(p, p_full)
             } else {
                 match combined.as_ref().and_then(|m| m.get(&p)) {
@@ -3166,11 +3202,26 @@ pub fn recover_multi_scoped(
                         }
                         let skip = covered.saturating_sub(base_p) as usize;
                         if skip < p_events.len() {
+                            let seed = engine
+                                .raft_applied()
+                                .map(|(_, st)| crate::digest::try_chain_of_raft_state(st))
+                                .transpose()
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                                .flatten();
+                            verify_replayed_chain(
+                                seed,
+                                &p_events[skip..],
+                                crate::digest::Coverage::Window,
+                            )?;
                             engine.apply_replayed_events(p_events[skip..].iter().cloned());
                         }
                         engine
                     }
-                    None => Engine::replay_partition(p, p_events),
+                    None => {
+                        // `base_p == 0`: `p_events` is the partition's COMPLETE history.
+                        verify_replayed_chain(None, &p_events, crate::digest::Coverage::Complete)?;
+                        Engine::replay_partition(p, p_events)
+                    }
                 }
             };
             // Install partition-agnostic replicated deployments produced under
@@ -3184,9 +3235,9 @@ pub fn recover_multi_scoped(
             if !broadcast_for_p.is_empty() {
                 engine.install_deployment_if_newer(&broadcast_for_p);
             }
-            (p, engine)
+            Ok((p, engine))
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
 
     // Persist the migrated engines as a fresh new-format combined snapshot (each
     // partition covering its full per-partition history), then prune the cold
@@ -7567,6 +7618,146 @@ mod tests {
         let err = frame_atomic_capped(&entry, 2, false, entry.len() - 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(frame_atomic_capped(&entry, 2, false, entry.len()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Journals one digest-bearing Raft entry (#1664) the way the state
+    /// machine does: the command events, then the entry's chain digest in the
+    /// `RaftEntryApplied` record of the same frame.
+    fn digest_entry(journal: &mut crate::journal::Journal, index: u64, cmd: Command) {
+        journal.begin_raft_entry();
+        let _ = journal.apply_command(cmd).unwrap();
+        let digest = journal.raft_entry_digest(index);
+        let state = serde_json::json!({ "digest": digest }).to_string();
+        let (_, commit) = journal.commit_raft_entry(index, state).unwrap();
+        commit.blocking_wait();
+    }
+
+    /// ADR 0066 slice 5 (#1664): replaying a journal re-derives the chain
+    /// digests it recorded — a faithful journal recovers (from scratch and
+    /// from a snapshot + tail), while a journal whose events no longer
+    /// reproduce a recorded digest fails CLOSED (typed `InvalidData`) instead
+    /// of booting a replica on state that disagrees with its own record.
+    #[test]
+    fn replay_verifies_recorded_chain_digests_and_a_tampered_journal_fails_closed() {
+        // Faithful: three entries, recover from scratch.
+        let dir = temp_dir("digest-ok");
+        {
+            let (mut journal, _r) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+            digest_entry(&mut journal, 3, Command::create_instance("demo"));
+        }
+        recover(&dir).expect("a faithful journal replays and verifies");
+        // Snapshot + tail: the tail continues from the snapshot base's chain.
+        {
+            let (mut journal, _r) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            digest_entry(&mut journal, 4, Command::create_instance("demo"));
+        }
+        recover(&dir).expect("snapshot + tail verifies against the base's chain");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Tampered: the journal records a chain its events do not reproduce
+        // (the replica's live chain was perturbed between entries — the
+        // test-only stand-in for altered journal bytes or a changed fold).
+        let dir = temp_dir("digest-tampered");
+        {
+            let (mut journal, _r) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            journal.perturb_chain_for_test();
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        match recover(&dir) {
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains("index 2"), "names the entry: {e}");
+            }
+            Ok(_) => panic!("a tampered journal must fail closed"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1664 review: LEGACY (non-segmented) recovery verifies the recorded
+    /// chain too — `Journal::open_partition` and the canonical
+    /// `Journal::replay_verified` (used by `from_events_shared` and the
+    /// server's legacy rebuild) accept a faithful journal and fail CLOSED on a
+    /// tampered one, never silently replaying it unverified.
+    #[test]
+    fn legacy_recovery_verifies_recorded_chain_digests() {
+        let dir = temp_dir("digest-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.jsonl");
+        {
+            let mut journal = crate::journal::Journal::open_partition(&ok, 0).expect("open legacy");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        crate::journal::Journal::open_partition(&ok, 0)
+            .expect("a faithful legacy journal verifies");
+        let events = crate::journal::Journal::read_events(&ok).expect("read");
+        crate::journal::Journal::replay_verified(0, events).expect("verified replay");
+
+        let bad = dir.join("bad.jsonl");
+        {
+            let mut journal =
+                crate::journal::Journal::open_partition(&bad, 0).expect("open legacy");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            journal.perturb_chain_for_test();
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        match crate::journal::Journal::open_partition(&bad, 0) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}"),
+            Ok(_) => panic!("a tampered legacy journal must fail closed"),
+        }
+        let events = crate::journal::Journal::read_events(&bad).expect("read");
+        match crate::journal::Journal::replay_verified(0, events) {
+            Err(e) => assert!(e.to_string().contains("index 2"), "names the entry: {e}"),
+            Ok(_) => panic!("a tampered legacy stream must fail closed"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1664 review: multi-partition recovery with NO snapshot replays each
+    /// partition's COMPLETE history (`base_p == 0`), so it verifies with
+    /// `Coverage::Complete` — a first digest-bearing entry whose chain does not
+    /// derive from genesis (e.g. a lost prefix event) fails CLOSED instead of
+    /// being adopted as an unchecked anchor.
+    #[test]
+    fn multi_partition_full_replay_rejects_an_unanchored_first_entry() {
+        let dir = temp_dir("multi-digest-prefix");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            // The first digest-bearing entry claims a chain that does not
+            // start at genesis (based below its own index): the shape a lost
+            // prefix leaves behind. A window would adopt it as its anchor.
+            let mut forged = crate::digest::next_entry_digest(None, 1, 0, &[]);
+            forged.chain.base = 0;
+            j0.begin_raft_entry();
+            let state = serde_json::json!({ "digest": forged }).to_string();
+            let (_, commit) = j0.commit_raft_entry(1, state).unwrap();
+            commit.blocking_wait();
+            digest_entry(&mut j0, 2, Command::DeployProcess(demo()));
+        }
+        match recover_multi(&dir, &[0, 1], 2, None) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}"),
+            Ok(_) => panic!("an unanchored complete history must fail closed"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

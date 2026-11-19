@@ -1409,6 +1409,17 @@ impl Journal {
         Self::open_partition(path, 0)
     }
 
+    /// The canonical legacy (non-segmented) replay (#1664 review): re-derives
+    /// every recorded chain digest in the partition's COMPLETE event stream
+    /// before replaying it, and fails closed (`InvalidData`) on a mismatch —
+    /// never replaying a journal whose bytes no longer reproduce their
+    /// recorded chain. Every legacy recovery path goes through here, so
+    /// verification can never be skipped by one of them.
+    pub fn replay_verified(partition_id: u64, events: Vec<Event>) -> io::Result<Engine> {
+        crate::seglog::verify_replayed_chain(None, &events, crate::digest::Coverage::Complete)?;
+        Ok(Engine::replay_partition(partition_id, events))
+    }
+
     /// Like [`Journal::open`] but the engine owns `partition_id`'s key namespace.
     /// Replay only advances this partition's local key counter (foreign keys, e.g.
     /// a deployment replicated from partition 0, are applied to state but do not
@@ -1420,7 +1431,7 @@ impl Journal {
 
         let events = Self::read_events(path)?;
         if !events.is_empty() {
-            engine = Engine::replay_partition(partition_id, events);
+            engine = Self::replay_verified(partition_id, events)?;
             fresh = false;
         }
 
@@ -1507,18 +1518,21 @@ impl Journal {
     /// each event to `partition_of(key)`); they reconstruct the engine exactly as
     /// [`Journal::open_partition`] would. The journal owns a cloned sender into
     /// the shared writer, so the writer thread stays alive as long as it does.
+    ///
+    /// Fails closed (`InvalidData`) when the events' recorded chain digests do
+    /// not re-derive (#1664) — see [`Journal::replay_verified`].
     pub fn from_events_shared(
         partition_id: u64,
         events: Vec<Event>,
         shared: &SharedWriter,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let fresh = events.is_empty();
         let engine = if fresh {
             Engine::with_partition(partition_id)
         } else {
-            Engine::replay_partition(partition_id, events)
+            Self::replay_verified(partition_id, events)?
         };
-        Self {
+        Ok(Self {
             engine,
             partition_id,
             writer: Some(shared.sender()),
@@ -1543,7 +1557,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        }
+        })
     }
 
     /// Builds a partition journal that persists through a segmented
@@ -3183,6 +3197,43 @@ impl Journal {
         self.engine.set_raft_applied(index, raft_state);
         self.maybe_spill();
         Ok((events, commit))
+    }
+
+    /// The chain digest (ADR 0066 slice 5, #1664) the armed Raft entry at
+    /// `index` will record: this replica's chain after its last applied record
+    /// folded with exactly the command events the entry buffered — the events
+    /// [`commit_raft_entry`](Self::commit_raft_entry) journals ahead of the
+    /// `RaftEntryApplied` record. Pure: call it between the entry's commands
+    /// and its commit, then carry the result in that commit's `raft_state`.
+    pub fn raft_entry_digest(&self, index: u64) -> crate::digest::EntryDigest {
+        let prev = self.engine.raft_applied().map(|(_, state)| state.as_str());
+        let events: &[Event] = self
+            .raft_entry
+            .as_ref()
+            .map(|(events, _)| events.as_slice())
+            .unwrap_or(&[]);
+        // The cursor `commit_raft_entry` journals in the same frame (#1664
+        // review): it is replayed state, so it is part of the chain.
+        crate::digest::next_entry_digest(prev, index, self.engine.start_dispatch_rr(), events)
+    }
+
+    /// TEST-ONLY divergence injection (#1664): perturbs THIS replica's
+    /// recorded chain, as if a non-deterministic input had made it journal
+    /// different bytes for its last applied entry. The next entry's digest then
+    /// folds from the perturbed value, so a peer comparing at that index sees a
+    /// mismatch — exactly what a real divergence looks like on the wire.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn perturb_chain_for_test(&mut self) {
+        if let Some((index, state)) = self.engine.raft_applied().cloned()
+            && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&state)
+        {
+            let mut d = crate::digest::next_entry_digest(Some(&state), index, 0, &[]);
+            d.chain.hash[0] ^= 0xff;
+            if let Ok(dv) = serde_json::to_value(d) {
+                v["digest"] = dv;
+                self.engine.set_raft_applied(index, v.to_string());
+            }
+        }
     }
 
     /// Disarms the Raft entry WITHOUT journaling anything (#1405): the entry

@@ -23,6 +23,9 @@ flate2 = "1.1.9"
 # Plaintext CRC-32 on journal frames (#1405): detects a torn frame whose
 # damaged bytes still parse (already in the tree via flate2).
 crc32fast = "1"
+# Replica divergence chain digest (ADR 0066 slice 5, #1664): a stable,
+# versioned hash pinned in the server (already in the tree via other deps).
+sha2 = "0.10"
 # Async HTTP client for `remote_sink`'s remote read-model export sink. rustls
 # matches the gateway bin's reqwest build (feature unification makes the union
 # in the full workspace build; declared here so this crate is correct when
