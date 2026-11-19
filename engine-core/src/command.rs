@@ -1077,7 +1077,7 @@ impl Command {
     /// entry — so live apply, full replay, snapshot+tail recovery and every
     /// follower compute the same value with no extra persisted state. Hashes
     /// the [`Command::kind`] plus the command's target key(s) / names with a
-    /// fixed FNV-1a (never `RandomState`, never `BTreeMap` iteration order).
+    /// fixed FNV-1a (never `RandomState`, never `HashMap` iteration order).
     /// The match is exhaustive so a new variant must decide its identity.
     pub fn seed_fingerprint(&self) -> u64 {
         let mut h = Fnv::new();

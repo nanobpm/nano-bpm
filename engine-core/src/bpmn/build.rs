@@ -1096,7 +1096,7 @@ impl ProcessAcc {
             // non-existent element and hard-fail at runtime. More than one makes
             // the injection target ambiguous. Reject both at parse/deploy time
             // with a clear error rather than defaulting. Iterate in document
-            // order (over `self.nodes`, not the `BTreeSet`) so the error is
+            // order (over `self.nodes`, not the set) so the error is
             // deterministic when several tools are malformed.
             for n in self
                 .nodes

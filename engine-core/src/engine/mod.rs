@@ -5700,12 +5700,12 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
+                // `active` is a BTreeMap (#1662): already in key order.
                 let mut active_elements: Vec<(Key, String)> = instance
                     .active
                     .iter()
                     .map(|(k, e)| (*k, e.clone()))
                     .collect();
-                active_elements.sort();
                 let mut active_ids: Vec<String> =
                     active_elements.iter().map(|(_, e)| e.clone()).collect();
                 active_ids.sort();
@@ -5952,9 +5952,9 @@ impl Engine {
                     .expect("instance existence checked above");
                 // Joins are keyed per flow-scope instance (#1580): every open
                 // join of every scope instance is checked.
-                let mut open_joins: Vec<state::JoinKey> =
+                // `join_instances` is a BTreeMap (#1662): keys iterate in order.
+                let open_joins: Vec<state::JoinKey> =
                     instance.join_instances.keys().cloned().collect();
-                open_joins.sort();
                 for join in open_joins {
                     let src = join.element_id.clone();
                     let join_kind = source_def.definition.elements.get(&src).map(|e| &e.kind);
@@ -18153,11 +18153,10 @@ fn path_reaches_join(
 }
 
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
-    let mut vars: Vec<String> = crate::feel::referenced_variables(condition)
+    // `referenced_variables` is a BTreeSet (#1662): already sorted.
+    crate::feel::referenced_variables(condition)
         .into_iter()
-        .collect();
-    vars.sort();
-    vars
+        .collect()
 }
 
 /// The postfix Zeebe appends to an ad-hoc sub-process id to form its

@@ -11,7 +11,7 @@
 //!   chains imply equal state under a deterministic fold.
 //! * **full** — a periodic hash of the whole `EngineSnapshot`, canonicalised
 //!   through `serde_json::Value` (sorted object keys) with every array also
-//!   sorted, so neither `BTreeMap` key order nor serialized `BTreeSet` element
+//!   sorted, so neither `HashMap` key order nor serialized `HashSet` element
 //!   order can leak into the digest. Sorting *all* arrays also discards the
 //!   order of genuine vectors, so this is a **cost stand-in**, not a correct
 //!   production canonicalisation: the ADR requires ordered collections
@@ -119,8 +119,8 @@ fn drive(engine: &mut Engine, n: usize) -> Probe {
 }
 
 /// Canonical bytes: through `serde_json::Value`, whose object keys are
-/// sorted, so a `BTreeMap`'s per-process `RandomState` order cannot reach the
-/// digest (plain `to_vec` of a `BTreeMap` would differ between replicas).
+/// sorted, so a `HashMap`'s per-process `RandomState` order cannot reach the
+/// digest (plain `to_vec` of a `HashMap` would differ between replicas).
 fn canonical<T: serde::Serialize>(v: &T) -> Vec<u8> {
     serde_json::to_vec(&serde_json::to_value(v).unwrap()).unwrap()
 }

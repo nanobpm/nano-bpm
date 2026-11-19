@@ -730,13 +730,13 @@ impl Engine {
         mapped: &BTreeMap<String, String>,
     ) -> Result<MigrationPlan, (ElementId, ElementId, expression::Failure)> {
         let mut plan = MigrationPlan::default();
-        let mut active: Vec<(Key, ElementId)> = self
+        // `active` is a BTreeMap (#1662): collected already in key order.
+        let active: Vec<(Key, ElementId)> = self
             .state
             .instances
             .get(&instance_key)
             .map(|i| i.active.iter().map(|(k, e)| (*k, e.clone())).collect())
             .unwrap_or_default();
-        active.sort();
         // Index triggers and lifecycle blockers once per migration so the
         // per-element loop below is a lookup, not a partition-wide scan.
         let hosts: BTreeMap<Key, ElementId> = active.iter().cloned().collect();

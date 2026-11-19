@@ -101,9 +101,9 @@ fn event_witnesses_golden_name() -> String {
 /// Serialize `value` to a **canonical**, deterministic, human-readable JSON
 /// string: routed through [`serde_json::Value`] (whose object is a `BTreeMap`,
 /// so every object's keys are emitted in sorted order regardless of the source
-/// `BTreeMap`'s per-process iteration order) and pretty-printed with a trailing
+/// (pre-#1662) `HashMap`'s per-process iteration order) and pretty-printed with a trailing
 /// newline. The scenario in [`build_golden_corpus`] is deliberately kept so that
-/// every set-valued (`BTreeSet`) field holds at most one element, so the only
+/// every set-valued (pre-#1662 `HashSet`, now `BTreeSet`) field holds at most one element, so the only
 /// remaining source of non-determinism — array order — cannot bite.
 fn canonical_json<T: serde::Serialize>(value: &T) -> String {
     let canonical: serde_json::Value =
@@ -170,10 +170,10 @@ fn assert_or_update_golden(name: &str, actual: &str) {
 /// full ordered event journal.
 ///
 /// Determinism contract (so the serialized bytes are stable across processes):
-/// the scenario keeps every `BTreeSet`-valued `State` field to at most one
+/// the scenario keeps every (pre-#1662 `HashSet`, now `BTreeSet`)-valued `State` field to at most one
 /// element — at snapshot time no job is left in the `Activated` set and each
-/// instance owns at most one job — so the only non-`BTreeMap` collections that
-/// serialize to JSON arrays are trivially ordered. All `BTreeMap`s are canonically
+/// instance owns at most one job — so the only non-`HashMap` collections that
+/// serialize to JSON arrays are trivially ordered. All `HashMap`s are canonically
 /// key-sorted by [`canonical_json`]. Do not add multi-job instances or leave
 /// several jobs activated here without re-checking cross-process stability.
 fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
@@ -451,7 +451,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // the drift guard. The handler parks WITHOUT a job (its job is never
     // created behind the activation incident), and `book` is a pass-through
     // task (no job either), keeping the one-job-per-instance determinism
-    // contract (`jobs_by_instance` is a `BTreeSet`; a job's serialized order in
+    // contract (`jobs_by_instance` was a `HashSet` before #1662; a job's serialized order in
     // a two-job instance would be nondeterministic).
     let trip: ProcessDefinition = ProcessBuilder::new("trip")
         .start_event("s")
@@ -697,7 +697,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // frame incl. its additive `migrated_flow_scopes` / `subscriptions` /
     // `child_instances`. No modify step here: a modification that re-activates
     // `charge` leaves a second (canceled) job on D, and `jobs_by_instance` is a
-    // `BTreeSet` — that would break the one-job-per-instance determinism
+    // `HashSet` before #1662 — that would break the one-job-per-instance determinism
     // contract above. The populated modify shape is pinned by
     // `build_event_witnesses` instead.
     let created_d = engine
@@ -1319,14 +1319,14 @@ fn golden_serialization_is_deterministic() {
     assert_eq!(canonical_json(&journal), canonical_json(&journal));
 
     // And a fresh, independently-built corpus serializes identically — catches
-    // any accidental dependence on per-process BTreeMap/BTreeSet iteration order.
+    // any accidental dependence on per-process HashMap/HashSet iteration order.
     let (snapshot2, journal2) = build_golden_corpus();
     assert_eq!(canonical_json(&snapshot), canonical_json(&snapshot2));
     assert_eq!(canonical_json(&journal), canonical_json(&journal2));
 }
 
 /// Directly exercises the property the whole corpus relies on: `canonical_json`
-/// must be **insensitive to BTreeMap insertion/iteration order**, emitting object
+/// must be **insensitive to HashMap insertion/iteration order**, emitting object
 /// keys in sorted order. The `_is_deterministic` test above rebuilds the *same*
 /// corpus, so within one process its HashMaps share a RandomState seed and can
 /// end up in identical iteration order regardless of insertion — meaning it would

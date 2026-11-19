@@ -150,3 +150,31 @@ fn different_mutation_histories_encode_identically() {
         "equal state reached through different mutation histories must encode byte-identically"
     );
 }
+
+/// Order guard for the sorts #1662 removed: the engine relies on these
+/// collections iterating in ascending order (open joins, an instance's active
+/// element instances, a condition's referenced variables). Pin them to ordered
+/// types at compile time and check the observed order, so swapping one back to
+/// a hash container fails here rather than silently reordering events.
+#[test]
+fn collections_relied_on_for_order_are_ordered() {
+    fn ordered_map<K: Ord, V>(_: &BTreeMap<K, V>) {}
+    fn ordered_set<T: Ord>(_: &std::collections::BTreeSet<T>) {}
+
+    let (engine, _, instances) = populated(4);
+    let instance = &engine.state().instances[&instances[0]];
+    ordered_map(&instance.active);
+    ordered_map(&instance.join_instances);
+    let keys: Vec<u64> = instance.active.keys().copied().collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        keys, sorted,
+        "active element instances iterate in key order"
+    );
+
+    let referenced = nanobpmn_engine_core::feel::referenced_variables("zeta > 1 and alpha < mid");
+    ordered_set(&referenced);
+    let names: Vec<&str> = referenced.iter().map(String::as_str).collect();
+    assert_eq!(names, ["alpha", "mid", "zeta"]);
+}
