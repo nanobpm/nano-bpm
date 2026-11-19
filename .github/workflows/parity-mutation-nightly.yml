@@ -31,7 +31,7 @@ on:
       - '.github/workflows/parity-mutation-nightly.yml'
       - 'formal/tla/mutate.mjs'
       - 'formal/tla/mutation/**'
-      - 'engine-core/mutants.toml'
+      - 'engine-core/.cargo/mutants.toml'
 
 permissions:
   contents: read
@@ -97,11 +97,14 @@ jobs:
         env:
           IS_PR: ${{ github.event_name == 'pull_request' }}
         run: |
+          # --in-place: cargo-mutants otherwise copies only the engine-core
+          # tree, losing the ../formal/tla/traces fixtures the trace-validation
+          # suites read (this checkout is disposable).
           # PR validation budget: list the mutants (config drift guard) and run
           # a bounded slice; the full run is nightly.
           if [[ "$IS_PR" == true ]]; then
             cargo mutants --list
-            cargo mutants -F 'Engine::activate_join' -F 'Engine::has_active_path_to'
+            cargo mutants --in-place -F 'Engine::activate_join' -F 'Engine::has_active_path_to'
           else
-            cargo mutants
+            cargo mutants --in-place
           fi

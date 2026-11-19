@@ -87,6 +87,36 @@ function reachableDefs(defs) {
   return seen;
 }
 
+// Is the `=` at `at` an assignment — `x' = e` or an `EXCEPT ![k][j] = e` /
+// `EXCEPT !.f = e` update target — rather than a guard comparison such as
+// `Tgt[f] = n` or `pending[g] = 0`?
+export function isAssignmentLhs(text, at) {
+  let i = at - 1;
+  while (i >= 0 && /\s/.test(text[i])) i--;
+  if (text[i] === "'") return true;
+  // Walk back over a selector chain: `[...]` groups (nested-aware) and `.field`.
+  let sawSelector = false;
+  for (;;) {
+    if (text[i] === ']') {
+      let depth = 0;
+      for (; i >= 0; i--) {
+        if (text[i] === ']') depth++;
+        else if (text[i] === '[' && --depth === 0) break;
+      }
+      if (i < 0) return false;
+      i--;
+      sawSelector = true;
+    } else if (/\w/.test(text[i] ?? '')) {
+      let j = i;
+      while (j >= 0 && /\w/.test(text[j])) j--;
+      if (text[j] !== '.') return false;
+      i = j - 1;
+      sawSelector = true;
+    } else break;
+  }
+  return sawSelector && text[i] === '!';
+}
+
 export function mutantsOf(file, src) {
   const defs = parseDefs(src);
   const raw = src.split('\n');
@@ -116,7 +146,7 @@ export function mutantsOf(file, src) {
       for (const [op, re, rep] of OPERATORS) {
         for (const m of masked.matchAll(re)) {
           // `x' = e` and `[f EXCEPT ![k] = e]` are assignments, not guards.
-          if (op === 'eq->neq' && /['\]]\s*$/.test(masked.slice(0, m.index))) continue;
+          if (op === 'eq->neq' && isAssignmentLhs(masked, m.index)) continue;
           const at = offset + m.index;
           const line = raw[no - 1];
           push(op, no, line.slice(0, at) + rep + line.slice(at + m[0].length));
@@ -200,6 +230,17 @@ function runTlc(jar, dir, model, cfg, violating) {
 
 // Run one mutant: returns { killed, by } — `by` names the model whose verdict
 // changed (or 'invalid' when TLC rejects the mutated module).
+// TLC evaluation errors caused by the mutated definitions (e.g. applying a
+// function outside its domain): the mutant changed behaviour, so it is killed.
+const EVAL_ERROR = /^Error: (?:Attempted to|The (?:first|second) argument|TLC threw an unexpected exception|Evaluating )|^Error: .*(?:not in the domain|is not enumerable|was not a)/m;
+
+/** 'invalid' | 'eval' | null — null means the error says nothing about the mutant. */
+export function classifyError(log) {
+  if (INVALID.test(log)) return 'invalid';
+  if (EVAL_ERROR.test(log)) return 'eval';
+  return null;
+}
+
 const INVALID = /\*\*\* Parse Error \*\*\*|Semantic errors:|Unknown operator|Parsing or semantic analysis failed/;
 
 async function runMutant(jar, work, mutant, families, tier2 = null) {
@@ -239,7 +280,15 @@ async function runMutant(jar, work, mutant, families, tier2 = null) {
       // A `pass` model runs without -continue, so TLC stops at the first
       // violation (the queue is not drained): any violation is a kill.
       const got = verdict(log, m.properties, code, m.stopsAtFirst);
-      if (got === 'error' && INVALID.test(log)) return { killed: true, by: 'invalid', got };
+      if (got === 'error') {
+        const cls = classifyError(log);
+        if (!cls) {
+          // Warning-only output, a JVM killed before a verdict, a truncated
+          // -continue run: none says anything about the mutant.
+          throw new Error(`unclassified TLC error on ${m.model} for mutant ${mutant.id}:\n${log.slice(-2000)}`);
+        }
+        return { killed: true, by: cls === 'invalid' ? 'invalid' : `${m.model}(${cls})`, got };
+      }
       if (got !== m.want) return { killed: true, by: m.model, got };
     }
     return { killed: false };

@@ -74,3 +74,23 @@ test('a log without coverage statistics is reported', () => {
   const problems = checkSpec({ name: 'Toy', src: SPEC, logs: [['A', 'Model checking completed.']] });
   assert.ok(problems.includes('A: TLC log has no coverage statistics'));
 });
+
+test('a wrapper action (no prime of its own) is followed to the actions it calls', () => {
+  const src = `---- MODULE Wrap ----
+VARIABLE x
+Step(n) ==
+    /\\ n > 0
+    /\\ x' = n
+Wrap(f) == \\E n \\in {f} : Step(n)
+Loop == Loop2
+Loop2 == Loop
+Next ==
+    \\/ Wrap(1)
+    \\/ Loop
+====
+`;
+  const exp = expectations(src);
+  assert.deepEqual(exp.disjuncts, ['Wrap']);
+  assert.deepEqual([...exp.closures.get('Wrap')].sort(), ['Step', 'Wrap']);
+  assert.ok(exp.lines.has(4) && exp.lines.has(5));
+});

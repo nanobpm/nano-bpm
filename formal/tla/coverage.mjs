@@ -79,7 +79,30 @@ export function parseDefs(src) {
   return defs;
 }
 
-const isAction = (def) => def.lines.some(({ text }) => /'|\bUNCHANGED\b/.test(text));
+const isDirectAction = (def) => def.lines.some(({ text }) => /'|\bUNCHANGED\b/.test(text));
+
+// An operator is an action if it primes/UNCHANGEDs a variable itself or
+// references (transitively) one that does — e.g. `Drain(f) == \E S : DrainVia(f, S)`.
+// Memoised per definition map; cycles resolve to the direct answer.
+const actionMemo = new WeakMap();
+export function isActionIn(name, defs) {
+  let memo = actionMemo.get(defs);
+  if (!memo) actionMemo.set(defs, (memo = new Map()));
+  const visit = (n, onPath) => {
+    if (memo.has(n)) return memo.get(n);
+    const def = defs.get(n);
+    if (isDirectAction(def)) { memo.set(n, true); return true; }
+    onPath.add(n);
+    let res = false;
+    for (const r of refs(def, defs)) {
+      if (!onPath.has(r) && visit(r, onPath)) { res = true; break; }
+    }
+    onPath.delete(n);
+    if (res || onPath.size === 0) memo.set(n, res);
+    return res;
+  };
+  return visit(name, new Set());
+}
 
 function refs(def, defs) {
   const out = new Set();
@@ -98,7 +121,7 @@ function actionClosure(name, defs) {
     const n = stack.pop();
     if (seen.has(n)) continue;
     seen.add(n);
-    for (const r of refs(defs.get(n), defs)) if (isAction(defs.get(r))) stack.push(r);
+    for (const r of refs(defs.get(n), defs)) if (isActionIn(r, defs)) stack.push(r);
   }
   return seen;
 }
@@ -113,7 +136,7 @@ export function expectations(src) {
   for (const { text } of next.lines) {
     for (const part of text.split('\\/')) {
       const called = (part.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []).filter(
-        (w) => defs.has(w) && isAction(defs.get(w)),
+        (w) => defs.has(w) && isActionIn(w, defs),
       );
       if (called.length) disjuncts.push(called[called.length - 1]);
     }

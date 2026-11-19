@@ -802,7 +802,7 @@ jobs:
       - name: TLC action coverage (#1248) — every spec action and disjunct fires in some model
         run: |
           set -o pipefail
-          node --test formal/tla/coverage.test.mjs
+          node --test formal/tla/coverage.test.mjs formal/tla/mutate.test.mjs
           node formal/tla/coverage.mjs "$RUNNER_TEMP/tlc-logs" --extra "$RUNNER_TEMP/tlc-exhaustive-logs" | tee "$RUNNER_TEMP/coverage.txt"
           { echo '### TLC action coverage'; echo '```'; cat "$RUNNER_TEMP/coverage.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
