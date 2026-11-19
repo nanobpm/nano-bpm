@@ -44,10 +44,12 @@ UV := uv
 REST_SPEC_SRCS := $(wildcard $(PROJECT_ROOT)/spec/*.yaml) \
 	$(wildcard $(PROJECT_ROOT)/spec-patches/*.yaml) \
 	$(PROJECT_ROOT)/openapi-generator-config.yaml \
-	$(PROJECT_ROOT)/scripts/generate.sh
+	$(PROJECT_ROOT)/scripts/generate.sh \
+	$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh
 CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
 	$(PROJECT_ROOT)/openapi-generator-config-console.yaml \
-	$(PROJECT_ROOT)/scripts/generate-console.sh
+	$(PROJECT_ROOT)/scripts/generate-console.sh \
+	$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh
 
 # Canonical formatter: pinned nightly rustfmt. The repo's rustfmt.toml uses
 # unstable options (group_imports), which stable `cargo fmt` silently ignores —

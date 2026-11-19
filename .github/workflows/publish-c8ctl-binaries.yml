@@ -110,6 +110,9 @@ jobs:
         # on a live GitHub Releases download on a warm cache.
         uses: ./.github/actions/wasm-pack-cache
 
+      - name: Restore the cached openapi-generator JAR (#1684)
+        uses: ./.github/actions/openapi-generator-cache
+
       - name: Generate REST layer + stubs
         shell: bash
         run: |
