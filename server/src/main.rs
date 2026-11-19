@@ -20633,6 +20633,26 @@ impl ServerImpl {
             return false;
         }
 
+        // A member that fail-stopped on a replica DIVERGENCE (ADR 0066 slice 5,
+        // #1664) must never resume its own state: neither its engine (fenced,
+        // so reconstructed below) nor its local log/snapshot lineage. It is
+        // rebuilt as a FRESH receiver so the leader resyncs it (snapshot
+        // install or full backfill) — the purge-hole precedent (#111). An
+        // OWNED partition's only reconstruction baseline is its own (diverged)
+        // journal, so it is left down for the operator rather than resumed.
+        let divergence = self.raft.get(p).and_then(|old| old.divergence());
+        if let Some(d) = &divergence
+            && self.engine.local_for_partition(p).is_some()
+        {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED ({d}) on an owned partition whose only local baseline \
+                 is its own diverged journal — NOT auto-recovering; restore this node's \
+                 partition from the leader (wipe its data dir and rejoin)"
+            );
+            return false;
+        }
+
         let transport = self.raft_transport_for_start().await;
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
@@ -20658,7 +20678,7 @@ impl ServerImpl {
         // `leader-durable` mode is a follower a disposable non-voting learner
         // whose sole durability point is the leader, safe to rebuild fresh.
         let voter_must_resume = self.replication_mode == ReplicationMode::Quorum;
-        let log_dir = if fresh_receiver && !voter_must_resume {
+        let log_dir = if divergence.is_some() || (fresh_receiver && !voter_must_resume) {
             None
         } else {
             raft_log_dir_for(p)
@@ -20670,7 +20690,7 @@ impl ServerImpl {
         // review). Refuse, loudly, and leave the partition down for an operator
         // restart. Only leader-durable learners (non-voting, the leader is their
         // sole durability point) and durable voters are rebuilt in place.
-        if voter_must_resume && log_dir.is_none() {
+        if voter_must_resume && log_dir.is_none() && divergence.is_none() {
             tracing::error!(
                 partition = p,
                 "raft partition core is SHUTDOWN on an in-memory quorum voter; \
@@ -20721,7 +20741,9 @@ impl ServerImpl {
                 self.raft.insert(Arc::new(part));
                 tracing::info!(
                     "raft: node {me} auto-recovered shutdown partition {p} ({})",
-                    if rebuilt_fresh {
+                    if divergence.is_some() {
+                        "DIVERGED: resyncing from the leader as a fresh receiver (#1664)"
+                    } else if rebuilt_fresh {
                         "fresh receiver; the leader will backfill/snapshot it"
                     } else {
                         "resumed its durable on-disk lineage"
@@ -43364,6 +43386,136 @@ mod clustered_startup_tests {
         part0.raft.shutdown().await.ok();
     }
 
+    /// ADR 0066 slice 5 (#1664) false-positive guard: no hosted member of
+    /// partitions `0..partitions` on `nodes` fail-stopped on a divergence, and
+    /// every two members that applied the same index carry the same chain.
+    fn assert_no_divergence(nodes: &[&ServerImpl], partitions: u64) {
+        for p in 0..partitions {
+            let mut by_index: std::collections::BTreeMap<u64, crate::raft::DigestClaim> =
+                std::collections::BTreeMap::new();
+            for (n, node) in nodes.iter().enumerate() {
+                let Some(part) = node.raft_registry().get(p) else {
+                    continue;
+                };
+                assert!(
+                    part.divergence().is_none(),
+                    "false-positive divergence on node {n} p{p}: {:?}",
+                    part.divergence()
+                );
+                if let Some(claim) = part.digest_claim() {
+                    let seen = by_index.entry(claim.index).or_insert(claim);
+                    if seen.chain.comparable(&claim.chain) {
+                        assert_eq!(*seen, claim, "node {n} p{p} chain disagrees at {}", claim.index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits (bounded) until node's p0 member has applied at least the
+    /// leader's current applied index; returns whether it did.
+    async fn wait_follower_applied(node: &ServerImpl, leader: &crate::raft::RaftPartition) -> bool {
+        let target = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for _ in 0..500 {
+            let idx = node
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn deploy_cmd(id: &str) -> Command {
+        Command::DeployProcess(
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid process"),
+        )
+    }
+
+    /// ADR 0066 slice 5 (#1664): a follower whose state DIVERGES from the
+    /// leader's is detected at the next digest point, fail-stops its apply
+    /// (never continuing on the diverged state), raises the operator metric,
+    /// and — via the recovery supervisor — resyncs from the leader as a fresh
+    /// receiver, after which its chain matches the leader's again (no false
+    /// positive after the resync).
+    #[tokio::test]
+    async fn a_diverged_follower_fail_stops_and_resyncs_from_the_leader() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+        part0.propose(deploy_cmd("d-1"), 1_000).await.expect("deploy 1");
+        assert!(wait_follower_applied(&node1, &part0).await, "follower catches up");
+        // Healthy replicas agree on the chain: no false positive so far.
+        assert!(part1.divergence().is_none());
+        assert_eq!(part0.digest_claim(), part1.digest_claim(), "chains agree");
+        let before = nano_server_storage::metrics::raft_divergence_count(0, 1);
+
+        // Inject the divergence on the FOLLOWER only (test hook): its chain
+        // now differs from the leader's from the next entry on.
+        part1
+            .sm_engine()
+            .with(|journal| journal.perturb_chain_for_test())
+            .await;
+        // Entry A folds from the perturbed chain on the follower; entry B
+        // carries the leader's claim for A, so the follower detects it there.
+        part0.propose(deploy_cmd("d-2"), 2_000).await.expect("deploy A");
+        part0.propose(deploy_cmd("d-3"), 3_000).await.expect("deploy B");
+
+        let mut stopped = false;
+        for _ in 0..500 {
+            if part1.is_shutdown() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "the diverged follower must fail-stop its apply");
+        let d = part1.divergence().expect("divergence latched");
+        assert!(d.detected_at > d.index, "detected at a later entry: {d}");
+        assert_ne!(d.leader, d.local);
+        assert_eq!(
+            nano_server_storage::metrics::raft_divergence_count(0, 1),
+            before + 1,
+            "the operator-visible divergence metric is raised"
+        );
+        assert!(part0.divergence().is_none(), "the leader never diverges on its own claims");
+
+        // Resync: the supervisor rebuilds the member fresh from the leader.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(recovered.contains(&0), "diverged partition is resynced: {recovered:?}");
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(!rebuilt.is_shutdown());
+        assert!(rebuilt.divergence().is_none(), "the resynced member starts clean");
+
+        part0.propose(deploy_cmd("d-4"), 4_000).await.expect("deploy after resync");
+        part0.propose(deploy_cmd("d-5"), 5_000).await.expect("deploy after resync");
+        assert!(wait_follower_applied(&node1, &part0).await, "resynced follower catches up");
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(!rebuilt.is_shutdown(), "no false positive after the resync");
+        assert!(rebuilt.divergence().is_none());
+        assert_eq!(
+            part0.digest_claim(),
+            rebuilt.digest_claim(),
+            "the resynced follower's chain matches the leader's"
+        );
+
+        part0.raft.shutdown().await.ok();
+        rebuilt.raft.shutdown().await.ok();
+    }
+
     /// Issue #53: a partition whose Raft core enters `Shutdown` must be
     /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
     /// not left dead until a manual process restart.
@@ -44748,6 +44900,8 @@ mod clustered_startup_tests {
             completed,
             "the instance completes on the NEW leader after the original leader was killed"
         );
+        // #1664: no false-positive divergence across the leader failover.
+        assert_no_divergence(&[&node1, &node2], 3);
 
         for node in [&node1, &node2] {
             for p in 0..3u64 {
@@ -45530,6 +45684,9 @@ mod clustered_startup_tests {
     /// diverging keys. Returns the total number of Active instances (so callers
     /// can prove the comparison is non-vacuous).
     async fn assert_replica_parity(nodes: [&ServerImpl; 3]) -> usize {
+        // #1664: parity also means no replica fail-stopped on a (false)
+        // divergence, and replicas at the same applied index agree on the chain.
+        assert_no_divergence(&nodes, 3);
         let mut total_active = 0;
         for p in 0..3u64 {
             let leader = replica_view(nodes[p as usize], p).await;

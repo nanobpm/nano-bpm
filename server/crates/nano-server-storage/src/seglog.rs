@@ -7607,6 +7607,67 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Journals one digest-bearing Raft entry (#1664) the way the state
+    /// machine does: the command events, then the entry's chain digest in the
+    /// `RaftEntryApplied` record of the same frame.
+    fn digest_entry(journal: &mut crate::journal::Journal, index: u64, cmd: Command) {
+        journal.begin_raft_entry();
+        let _ = journal.apply_command(cmd).unwrap();
+        let digest = journal.raft_entry_digest(index);
+        let state = serde_json::json!({ "digest": digest }).to_string();
+        let (_, commit) = journal.commit_raft_entry(index, state).unwrap();
+        commit.blocking_wait();
+    }
+
+    /// ADR 0066 slice 5 (#1664): replaying a journal re-derives the chain
+    /// digests it recorded — a faithful journal recovers (from scratch and
+    /// from a snapshot + tail), while a journal whose events no longer
+    /// reproduce a recorded digest fails CLOSED (typed `InvalidData`) instead
+    /// of booting a replica on state that disagrees with its own record.
+    #[test]
+    fn replay_verifies_recorded_chain_digests_and_a_tampered_journal_fails_closed() {
+        // Faithful: three entries, recover from scratch.
+        let dir = temp_dir("digest-ok");
+        {
+            let (mut journal, _r) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+            digest_entry(&mut journal, 3, Command::create_instance("demo"));
+        }
+        recover(&dir).expect("a faithful journal replays and verifies");
+        // Snapshot + tail: the tail continues from the snapshot base's chain.
+        {
+            let (mut journal, _r) =
+                crate::journal::Journal::open_segmented(&dir).expect("reopen");
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            digest_entry(&mut journal, 4, Command::create_instance("demo"));
+        }
+        recover(&dir).expect("snapshot + tail verifies against the base's chain");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Tampered: the journal records a chain its events do not reproduce
+        // (the replica's live chain was perturbed between entries — the
+        // test-only stand-in for altered journal bytes or a changed fold).
+        let dir = temp_dir("digest-tampered");
+        {
+            let (mut journal, _r) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            journal.perturb_chain_for_test();
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        match recover(&dir) {
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains("index 2"), "names the entry: {e}");
+            }
+            Ok(_) => panic!("a tampered journal must fail closed"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Serialized event lines for the #1405 frame-integrity tests: a real
     /// command event followed by its entry's applied-entry marker.
     fn entry_lines(index: u64) -> (Vec<u8>, Vec<u8>) {

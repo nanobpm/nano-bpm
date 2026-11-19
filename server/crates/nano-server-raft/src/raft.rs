@@ -7334,6 +7334,73 @@ mod tests {
         assert_eq!(back.log_id, log_id);
     }
 
+    /// #1664: the chain digest rides ADDITIVELY in the journaled raft state —
+    /// a pre-#1664 record (no `digest`) still decodes, and a digest-free
+    /// record serializes exactly as before.
+    #[test]
+    fn journaled_raft_state_digest_is_additive() {
+        use openraft::CommittedLeaderId;
+        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
+        let legacy = journaled_raft_state(log_id, &StoredMembership::default(), None).expect("e");
+        assert!(!legacy.contains("digest"), "no digest -> legacy shape: {legacy}");
+        let d = nano_server_storage::digest::next_entry_digest(None, 17, &[]);
+        let json = journaled_raft_state(log_id, &StoredMembership::default(), Some(d)).expect("e");
+        let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.digest, Some(d));
+        assert_eq!(entry_digest_of(&json), Some(d));
+    }
+
+    /// #1664: the leader's digest claim rides ADDITIVELY in the replicated
+    /// batch — a pre-#1664 batch (no `digest`) decodes as `None` (never
+    /// compared), and a claim round-trips.
+    #[test]
+    fn replicated_batch_digest_claim_is_additive() {
+        let legacy: ReplicatedBatch = serde_json::from_str(r#"{"items":[]}"#).expect("decode");
+        assert_eq!(legacy.digest, None);
+        let claim = DigestClaim {
+            index: 9,
+            chain: nano_server_storage::digest::next_entry_digest(None, 9, &[]).chain,
+        };
+        let json = serde_json::to_string(&ReplicatedBatch::new(vec![]).with_digest(Some(claim)))
+            .expect("encode");
+        let back: ReplicatedBatch = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.digest, Some(claim));
+        let plain = serde_json::to_string(&ReplicatedBatch::new(vec![])).expect("encode");
+        assert!(!plain.contains("digest"), "no claim -> legacy shape: {plain}");
+    }
+
+    /// #1664: the ledger reports a divergence ONLY for a recorded, comparable
+    /// chain that differs — an unknown index (snapshot restore, learner
+    /// catch-up, an evicted window) or an incomparable chain (a different
+    /// base, e.g. a pre-#1664 replica that re-based) is never a false positive.
+    #[test]
+    fn digest_ledger_flags_only_real_divergence() {
+        use nano_server_storage::digest::next_entry_digest;
+        let ledger = DigestLedger::default();
+        let a = next_entry_digest(None, 5, &[]).chain;
+        ledger.record(5, a);
+        let same = DigestClaim { index: 5, chain: a };
+        assert_eq!(ledger.check(&same), None, "equal chains agree");
+        let mut other = a;
+        other.hash[0] ^= 1;
+        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: other }), Some(a));
+        assert_eq!(ledger.check(&DigestClaim { index: 4, chain: other }), None, "unknown index");
+        let rebased = next_entry_digest(None, 3, &[]).chain;
+        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: rebased }), None, "other base");
+        // A Blank entry keeps the chain; a gap does not invent one.
+        ledger.record_unchanged(6);
+        assert_eq!(ledger.latest_claim(), Some(DigestClaim { index: 6, chain: a }));
+        ledger.record_unchanged(8);
+        assert_eq!(ledger.latest_claim().map(|c| c.index), Some(6));
+        // The window is bounded.
+        for i in 10..(10 + DIGEST_WINDOW as u64 + 5) {
+            ledger.record(i, a);
+        }
+        assert_eq!(ledger.check(&DigestClaim { index: 5, chain: other }), None, "evicted");
+        ledger.reset();
+        assert_eq!(ledger.latest_claim(), None);
+    }
+
     /// Polls `cond` until it holds or `timeout_ms` elapses.
     async fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
