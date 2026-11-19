@@ -36,11 +36,18 @@ pub const FEATURE_REPLICATED_LENIENT_COMPLETION: &str = "replicated-lenient-comp
 /// when every voter and learner advertises this (ADR 0066 rolling-upgrade gate).
 pub const FEATURE_CLUSTER_VARIABLES: &str = "cluster-variables-v1";
 
+/// Replica divergence digests (ADR 0066 slice 5, #1664): this binary records a
+/// chain digest per applied Raft entry and compares the leader's claim. A
+/// leader stamps claims only while EVERY other member advertises this, so a
+/// mixed-version cluster never compares (and never false-positives).
+pub const FEATURE_REPLICA_DIGEST: &str = "replica-digest-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_REPLICATED_LENIENT_COMPLETION,
     FEATURE_CLUSTER_VARIABLES,
+    FEATURE_REPLICA_DIGEST,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.

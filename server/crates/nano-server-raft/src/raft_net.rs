@@ -142,6 +142,15 @@ pub trait RaftTransport: Send + Sync + 'static {
         partition: u64,
         req: RaftRpcRequest,
     ) -> BoxFuture<'a, Result<RaftRpcResponse, TransportError>>;
+
+    /// Whether member `target` is KNOWN to support cluster `feature` (#1664):
+    /// the gate a leader consults before emitting data only a feature-aware
+    /// member interprets. Unknown must answer `false` (fail toward "not
+    /// supported"). In-process transports route to this same binary, so the
+    /// default is `true`.
+    fn peer_supports<'a>(&'a self, _target: NodeId, _feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
 }
 
 /// Feeds an inbound RPC into a local Raft instance and returns its response. The
@@ -454,6 +463,10 @@ impl RaftTransport for PeerTransport {
                 .ok_or_else(|| TransportError("peer raft rpc returned no body".into()))?;
             serde_json::from_value(body).map_err(|e| TransportError(e.to_string()))
         })
+    }
+
+    fn peer_supports<'a>(&'a self, target: NodeId, feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async move { self.peers.peer_advertises(target as u32, feature).await })
     }
 }
 

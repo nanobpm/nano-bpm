@@ -56,3 +56,9 @@ warnings = "deny"
 # propagate typed errors, infallible invariants carry a scoped `#[allow]`.
 unwrap_used = "deny"
 expect_used = "deny"
+
+[features]
+# Test-only hooks (e.g. `RaftPartition::latch_divergence_for_test`) for the
+# gateway binary's inline tests, which link this crate as a normal library.
+# Production builds never enable it.
+test-hooks = []

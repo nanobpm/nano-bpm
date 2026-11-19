@@ -1432,6 +1432,20 @@ impl PeerSet {
             .all(|f| link.supports(f))
     }
 
+    /// Whether `peer`'s CURRENT cached link advertised `feature` on its join
+    /// handshake (#1664). Never dials: no link (unknown) answers `false`, so a
+    /// gate built on it fails toward "not supported".
+    pub async fn peer_advertises(&self, peer: u32, feature: &str) -> bool {
+        if let Some(link) = self.links.lock().await.get(&peer) {
+            return link.supports(feature);
+        }
+        self.retired_raft
+            .lock()
+            .await
+            .get(&peer)
+            .is_some_and(|link| link.supports(feature))
+    }
+
     /// Whether [`require_feature`](Self::require_feature) recorded `feature`.
     pub fn requires_feature(&self, feature: &str) -> bool {
         self.required_features
