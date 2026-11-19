@@ -145,3 +145,19 @@ Next ==
   const covered = log(header('Inc', 6, 2, 'Guarded'), loc(4, 5, 1, 0, 'Guarded'), loc(8, 8, 2, 0, 'Guarded'));
   assert.deepEqual(checkSpec({ name: 'Guarded', src, logs: [['M', covered]] }), []);
 });
+
+test('trailing blank / comment-only lines never remove a one-line guard obligation', () => {
+  for (const trailer of ['\n', '\n\n', '\n\\* trailing comment\n', '\n(* block *)\n']) {
+    const src = `---- MODULE Spaced ----
+VARIABLE x
+Ready == x > 10${trailer}Inc ==
+    /\\ Ready
+    /\\ x' = x + 1
+Next ==
+    \\/ Inc
+====
+`;
+    const exp = expectations(src);
+    assert.ok(exp.lines.has(3), `Ready's line lost its obligation with trailer ${JSON.stringify(trailer)}`);
+  }
+});

@@ -175,10 +175,16 @@ export function expectations(src) {
   const alias = new Map(); // line number -> [start, end] of a bare operator it references
   for (const a of obligated) {
     const def = defs.get(a);
+    // Blank / comment-only lines must not change whether a definition is a
+    // single-line body (formatting must never remove an obligation).
+    const substantive = def.lines.filter(({ text }) => {
+      const t = text.trim();
+      return t && !t.startsWith('\\*') && !t.startsWith('(*');
+    }).length;
     def.lines.forEach(({ no, text }, i) => {
       const t = text.trim();
       if (!t) return;
-      if (/^(\/\\|\\\/|\[\]|CASE\b|THEN\b|ELSE\b)/.test(t) || (i === 0 && def.lines.length === 1)) {
+      if (/^(\/\\|\\\/|\[\]|CASE\b|THEN\b|ELSE\b)/.test(t) || (i === 0 && substantive === 1)) {
         lines.set(no, `${a}: ${t}`);
         // TLC attributes a bare operator reference (`/\ Settled`) to the
         // operator's DEFINITION, not the call site.
