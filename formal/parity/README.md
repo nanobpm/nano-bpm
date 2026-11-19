@@ -117,6 +117,7 @@ exists, while `failure:` records every site that raises it.
 | `zeebe-surface.json` | **derived, committed** — every cell + its source lines; never hand-edit |
 | `coverage.json` | ordered rules mapping each cell to evidence; `reviewedAt` pins the reviewed sha |
 | `gaps.json` | **derived, committed** ratchet baseline of `gap` cells; may only shrink |
+| `coverage/` | dual-engine branch coverage of the parity corpus (llvm-cov + JaCoCo), tagged against this matrix and ratcheted — see `coverage/README.md` (#1247) |
 | `nano-tested.json` | **derived, committed** ratchet baseline of `nano-tested` cells; may only shrink |
 | `check.mjs` | the guard: mapping, evidence, ratchets, per-site wildcard ban, parity-requires-trace |
 | `*.test.mjs` | extractor and guard tests (`node --test formal/parity/*.test.mjs`) |

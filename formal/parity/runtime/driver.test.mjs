@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import {
@@ -490,6 +491,18 @@ test("job activation cap is shared, finite, and identical across backends", () =
   // unbounded nano activation (MAX_SAFE_INTEGER) would diverge from Camunda.
   assert.equal(Number.isSafeInteger(MAX_JOBS_TO_ACTIVATE), true);
   assert.ok(MAX_JOBS_TO_ACTIVATE > 0 && MAX_JOBS_TO_ACTIVATE < Number.MAX_SAFE_INTEGER);
+});
+
+test("the native replay activation cap matches the runtime cap (no cross-runner drift)", () => {
+  // engine-core/tests/parity_corpus.rs replays the same corpus natively for
+  // LLVM coverage and must activate with the same cap, or a scenario with more
+  // ready jobs of one type than the smaller cap completes a different number
+  // of jobs per `activateAndComplete` step on each runner. Parse the constant
+  // out of the Rust source so the two cannot drift apart silently.
+  const rs = readFileSync(new URL("../../../engine-core/tests/parity_corpus.rs", import.meta.url), "utf8");
+  const m = rs.match(/const MAX_JOBS_TO_ACTIVATE: usize = (\d+);/);
+  assert.ok(m, "parity_corpus.rs no longer declares MAX_JOBS_TO_ACTIVATE");
+  assert.equal(Number(m[1]), MAX_JOBS_TO_ACTIVATE);
 });
 
 test("a failed scenario aborts the in-flight awaitCompletion create (no hang until its deadline)", async () => {
