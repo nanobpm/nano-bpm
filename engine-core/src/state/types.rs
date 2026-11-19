@@ -5,7 +5,7 @@
 //! module: it **never references [`crate::event`]**, so both `event` and the
 //! applier ([`super::apply`]) can depend on it without forming a cycle.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
@@ -210,14 +210,14 @@ impl JoinKey {
 /// into a running engine.
 pub const UNRESOLVED_JOIN_SCOPE: Key = Key::MAX;
 
-/// Serde for the `HashMap<JoinKey, V>` join maps (#1580). Serializes as a list
+/// Serde for the `BTreeMap<JoinKey, V>` join maps (#1580). Serializes as a list
 /// of `{scope, element_id, value}` entries sorted by key (deterministic bytes).
 /// Deserializes either that list or the legacy (pre-#1580) JSON object keyed
 /// by element id, whose entries take [`UNRESOLVED_JOIN_SCOPE`] until
 /// [`ProcessInstance::resolve_legacy_join_scopes`] runs.
 #[cfg(feature = "serde")]
 pub mod join_map_serde {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::fmt;
     use std::marker::PhantomData;
 
@@ -242,7 +242,7 @@ pub mod join_map_serde {
     }
 
     pub fn serialize<S: Serializer, V: Serialize>(
-        map: &HashMap<JoinKey, V>,
+        map: &BTreeMap<JoinKey, V>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         let mut entries: Vec<_> = map.iter().collect();
@@ -258,19 +258,19 @@ pub mod join_map_serde {
         seq.end()
     }
 
-    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<HashMap<JoinKey, V>, D::Error>
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<JoinKey, V>, D::Error>
     where
         D: Deserializer<'de>,
         V: Deserialize<'de>,
     {
         struct JoinMapVisitor<V>(PhantomData<V>);
         impl<'de, V: Deserialize<'de>> Visitor<'de> for JoinMapVisitor<V> {
-            type Value = HashMap<JoinKey, V>;
+            type Value = BTreeMap<JoinKey, V>;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a list of join entries or a legacy element-keyed join map")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
                 while let Some(Entry {
                     scope,
                     element_id,
@@ -282,7 +282,7 @@ pub mod join_map_serde {
                 Ok(map)
             }
             fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
                 while let Some((element_id, value)) = access.next_entry::<ElementId, V>()? {
                     map.insert(
                         JoinKey {
@@ -625,6 +625,32 @@ pub struct Job {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub terminal_end: Option<JobTerminalEnd>,
+    /// Mapping-time secret-reference provenance (#1640): which value paths of
+    /// the job's input-mapping targets hold a TRUSTED `camunda.secrets.<name>`
+    /// reference, and which names. Copied from [`crate::Event::JobCreated`].
+    /// Only paths and secret NAMES are stored — never plaintext. Empty (resolve
+    /// nothing — fail closed) for jobs created before this field existed.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub secret_provenance: Vec<SecretProvenance>,
+}
+
+/// One trusted secret-reference site of a job's input mappings (#1640): the
+/// dotted input-mapping target `path` (e.g. `token`, `payload.auth`) and the
+/// secret names whose `camunda.secrets.<name>` references the mapping
+/// structurally delivered there from a trusted source (a literal
+/// `camunda.secrets.<name>` path or a direct read of a `SECRET_REFERENCE`
+/// cluster variable — [`crate::feel::eval_with_provenance`]). Host-side
+/// activation resolves only these names, only inside this path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SecretProvenance {
+    /// The dotted input-mapping target path.
+    pub path: String,
+    /// The trusted secret names (sorted).
+    pub secrets: Vec<String>,
 }
 
 /// See [`Job::terminal_end`] (#1440).
@@ -728,7 +754,7 @@ pub struct PendingUserTaskTransition {
     /// Completion variables for a `Completing` transition, applied to the
     /// instance when the chain drains. Ignored otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// Corrections accumulated from listeners completed so far.
     #[cfg_attr(feature = "serde", serde(default))]
     pub corrections: crate::model::UserTaskCorrections,
@@ -876,35 +902,35 @@ pub struct ProcessInstance {
     /// task therefore stays here while its job is pending, as does a token parked
     /// on an incident. When this becomes empty the instance has no remaining
     /// tokens and is complete.
-    pub active: HashMap<Key, ElementId>,
+    pub active: BTreeMap<Key, ElementId>,
     /// Maps each active element instance to the element instance of the embedded
     /// sub-process that encloses it. Element instances in the process-level
     /// (root) scope are absent. Used to detect when a sub-process scope has
     /// drained (all its inner tokens consumed) and to terminate a scope when an
     /// error boundary interrupts it.
-    pub scopes: HashMap<Key, Key>,
+    pub scopes: BTreeMap<Key, Key>,
     /// Process variables (used by exclusive-gateway conditions). Shared via `Arc`
     /// so activating a job (which snapshots the instance's variables) is a cheap
     /// refcount bump rather than a deep clone of the (up to 50 KB) decoded value
     /// tree. A mutation (`VariablesUpdated`) copies-on-write via `Arc::make_mut`.
-    pub variables: Arc<HashMap<String, Value>>,
+    pub variables: Arc<BTreeMap<String, Value>>,
     /// For each open join: how many tokens have arrived over an *unidentified*
     /// flow (see [`Event::ParallelJoinTokenArrived`](crate::Event)'s `flow`):
     /// arrivals journaled before #1233 (#1237 for inclusive joins) and
     /// activations that did not come over a flow. A join counts each of these
     /// as one taken incoming flow; a firing clears them all.
     #[cfg_attr(feature = "serde", serde(with = "join_map_serde"))]
-    pub join_counts: HashMap<JoinKey, usize>,
+    pub join_counts: BTreeMap<JoinKey, usize>,
     /// For each open parallel- or inclusive-gateway join: arrivals per
     /// identified incoming flow (Zeebe's "number of taken sequence flows",
     /// #1233, #1237). Absent from
     /// pre-#1233 snapshots, hence `serde(default)`.
     #[cfg_attr(feature = "serde", serde(default, with = "join_map_serde"))]
-    pub join_flow_arrivals: HashMap<JoinKey, FlowArrivals>,
+    pub join_flow_arrivals: BTreeMap<JoinKey, FlowArrivals>,
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     #[cfg_attr(feature = "serde", serde(with = "join_map_serde"))]
-    pub join_instances: HashMap<JoinKey, Key>,
+    pub join_instances: BTreeMap<JoinKey, Key>,
     /// The [`join_instances`](Self::join_instances) that are **parked**: they
     /// hold waiting tokens but have not activated (#1244). Zeebe keeps a join's
     /// waiting tokens as active sequence flows on the flow scope and writes no
@@ -916,7 +942,7 @@ pub struct ProcessInstance {
     /// `active` when the join is reset. Absent from pre-#1244 snapshots (whose
     /// open joins were activated visibly), hence `serde(default)`.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub parked_joins: std::collections::HashSet<Key>,
+    pub parked_joins: std::collections::BTreeSet<Key>,
     /// Element instances that are ACTIVATING but not yet ACTIVATED: inserted by
     /// `ElementActivating`, removed by `ElementActivated` (and on completion /
     /// teardown). The single source of truth for "is `ElementActivated` still
@@ -926,7 +952,7 @@ pub struct ProcessInstance {
     /// marker before the chain), never gets a second one. Absent from older
     /// snapshots (`serde(default)`), which therefore owe no marker.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub activating: std::collections::HashSet<Key>,
+    pub activating: std::collections::BTreeSet<Key>,
     /// The outgoing-flow selection a split gateway (exclusive, or an inclusive
     /// fork) made while ACTIVATING (#1402), keyed by the gateway's element
     /// instance. Completion takes exactly these flows instead of re-evaluating
@@ -939,7 +965,7 @@ pub struct ProcessInstance {
     /// (a legacy journal, or an incident retry) re-selects from the current
     /// variables exactly as before.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub gateway_routes: HashMap<Key, Vec<usize>>,
+    pub gateway_routes: BTreeMap<Key, Vec<usize>>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -960,7 +986,7 @@ pub struct ProcessInstance {
     /// support existed. Rides along in [`InstanceSnapshot::instance`] on spill,
     /// so it needs no separate drain/rehydrate wiring.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub multi_instances: HashMap<Key, MultiInstanceState>,
+    pub multi_instances: BTreeMap<Key, MultiInstanceState>,
     /// Active ad-hoc sub-process containers in this instance, keyed by the
     /// container element instance (which is also the ad-hoc token scope). Empty
     /// (the default) for instances with no ad-hoc activity and when
@@ -968,7 +994,7 @@ pub struct ProcessInstance {
     /// Rides along in [`InstanceSnapshot::instance`] on spill like
     /// `multi_instances`, so it needs no separate drain/rehydrate wiring.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub adhoc_instances: HashMap<Key, AdHocState>,
+    pub adhoc_instances: BTreeMap<Key, AdHocState>,
     /// Non-root variable scopes: each scope-owning element instance (embedded
     /// sub-process, multi-instance body, multi-instance child) mapped to its
     /// parent scope-owner. The root (process-instance) scope is implicit — its
@@ -977,7 +1003,7 @@ pub struct ProcessInstance {
     /// Zeebe-style hierarchical variable tree (Part C). `serde(default)` so
     /// snapshots written before scoping deserialize as root-only.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub scope_parents: HashMap<Key, Key>,
+    pub scope_parents: BTreeMap<Key, Key>,
     /// Local variables held directly by each non-root scope (keyed by the
     /// scope-owning element instance). This includes a multi-instance child's
     /// `inputElement`/`loopCounter` bindings and a multi-instance body's
@@ -986,14 +1012,14 @@ pub struct ProcessInstance {
     /// write follows Zeebe variable propagation. Empty for root-only instances,
     /// keeping the flat fast path unchanged.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub scope_variables: HashMap<Key, HashMap<String, Value>>,
+    pub scope_variables: BTreeMap<Key, BTreeMap<String, Value>>,
     /// Message / signal payloads held for event sub-process start events with
     /// output mappings, keyed by the event sub-process container instance
     /// (see [`crate::Event::EventSubProcessPayloadHeld`]). Seeded LOCAL to the
     /// container's start event when it activates; dropped with the
     /// container's scope.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub esp_held_payloads: HashMap<Key, HashMap<String, Value>>,
+    pub esp_held_payloads: BTreeMap<Key, BTreeMap<String, Value>>,
     /// Compensable activities that completed successfully and carry a
     /// compensation boundary event, in completion order (oldest first). A
     /// [`crate::model::ElementKind::CompensationThrowEvent`] in the same scope
@@ -1007,14 +1033,14 @@ pub struct ProcessInstance {
     /// when a throw's `pending_handlers` empties the throw completes. Empty for
     /// instances with no active compensation and for pre-compensation snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub compensation_waits: HashMap<Key, CompensationWait>,
+    pub compensation_waits: BTreeMap<Key, CompensationWait>,
     /// Engine-native AgentInstance objects owned by this process instance, keyed
     /// by their dedicated `agent_instance_key` (Camunda 8.10 AgentInstance, ADR
     /// Stage 3). Empty for instances with no agent element and for snapshots
     /// written before agent support existed (`serde(default)`). Rides along in
     /// [`InstanceSnapshot::instance`] on spill like `adhoc_instances`.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub agent_instances: HashMap<Key, crate::agent::AgentInstance>,
+    pub agent_instances: BTreeMap<Key, crate::agent::AgentInstance>,
     /// Append-only AgentHistory turn log, keyed by the owning
     /// `agent_instance_key` (Camunda 8.10 AgentHistory, ADR Stage 3 / slice S2).
     /// Each value is the ordered list of turns for that agent instance, sorted
@@ -1025,7 +1051,7 @@ pub struct ProcessInstance {
     /// Rides along in [`InstanceSnapshot::instance`] on spill like
     /// `agent_instances`.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub agent_history: HashMap<Key, Vec<crate::agent::AgentHistoryRecord>>,
+    pub agent_history: BTreeMap<Key, Vec<crate::agent::AgentHistoryRecord>>,
 }
 
 /// An instance's compensable subscriptions, in completion order (oldest
@@ -1051,7 +1077,7 @@ pub struct ProcessInstance {
 )]
 pub struct CompensationSubscriptions {
     items: Vec<CompensationSubscription>,
-    by_scope: HashMap<Key, usize>,
+    by_scope: BTreeMap<Key, usize>,
 }
 
 impl CompensationSubscriptions {
@@ -1153,7 +1179,7 @@ mod compensation_subscriptions_tests {
     /// The derived index must agree with a brute-force scan of the list after
     /// every kind of mutation.
     fn assert_index_consistent(subs: &CompensationSubscriptions) {
-        let mut expected: HashMap<Key, usize> = HashMap::new();
+        let mut expected: BTreeMap<Key, usize> = BTreeMap::new();
         for c in subs.iter() {
             *expected.entry(c.scope).or_default() += 1;
         }
@@ -1493,7 +1519,7 @@ pub enum IoMappingRedrive {
     /// pass, so re-activation is a clean retry).
     AdHocToolActivation {
         element_id: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// A call-activity **input**-mapping failure: re-attempt spawning the child
     /// process for the already-activated call activity (its boundary events were
@@ -1513,7 +1539,7 @@ pub enum IoMappingRedrive {
     /// `y -> z`) is not idempotent across the retry. Mirrors the "project once,
     /// reuse verbatim" pattern PR #1171 introduced for the output side. Additive
     /// brand-new variant — old journals never carry it.
-    AdHocCallActivitySpawn { child_seed: HashMap<String, Value> },
+    AdHocCallActivitySpawn { child_seed: BTreeMap<String, Value> },
     /// An ad-hoc **call-activity tool** output-collection *type* incident (#1176):
     /// the tool's completion parked because the container `outputCollection`
     /// target is not a list (Zeebe `EXTRACT_VALUE_ERROR`). Carries the tool's
@@ -1525,7 +1551,7 @@ pub enum IoMappingRedrive {
     /// the clean path by threading `precomputed_output` through
     /// `continue_adhoc_inner_flow`. Additive brand-new variant.
     AdHocToolOutputCollection {
-        precomputed_output: HashMap<String, Value>,
+        precomputed_output: BTreeMap<String, Value>,
     },
     /// An ad-hoc container's completion was deferred because its
     /// `outputCollection` binding is missing from the container scope (a
@@ -1587,7 +1613,7 @@ pub enum IoMappingRedrive {
     /// child variables are captured here because the completed child instance
     /// that produced them is gone by resolution time.
     CallActivityCompletion {
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     },
     /// An ad-hoc **tool** job-type failure (#1390, `EXTRACT_VALUE_ERROR`): the
     /// tool child was never created, so resolution re-activates the tool with
@@ -1595,7 +1621,7 @@ pub enum IoMappingRedrive {
     /// [`Self::AdHocToolActivation`]. Additive brand-new variant.
     AdHocToolJobType {
         element_id: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// A task-listener job's `type` / `retries` expression failed (#1398): the
     /// user task rests with its deferred transition and no listener job; the
@@ -1673,7 +1699,7 @@ pub enum IoMappingRedrive {
     /// carry it.
     MiChildCompletion {
         body_key: Key,
-        output_overlay: Option<HashMap<String, Value>>,
+        output_overlay: Option<BTreeMap<String, Value>>,
     },
 }
 
@@ -2223,10 +2249,10 @@ pub struct RoutedDeliveries {
     /// eviction order and the serialized source of truth.
     order: std::collections::VecDeque<RoutedDelivery>,
     /// `delivery_key` membership index (derived from `order`).
-    keys: std::collections::HashSet<Key>,
+    keys: std::collections::BTreeSet<Key>,
     /// `subscription_key -> delivery_key` of the live close tombstone (derived
     /// from `order`): an O(1) lookup instead of a ledger scan per open.
-    tombstones: std::collections::HashMap<Key, Key>,
+    tombstones: std::collections::BTreeMap<Key, Key>,
 }
 
 impl RoutedDeliveries {
@@ -2338,7 +2364,7 @@ pub struct State {
     /// Latest deployed version of each process, keyed by BPMN process id. New
     /// instances created by id (with no explicit version) start the latest
     /// version. This is a fast latest-by-id index over `process_versions`.
-    pub processes: HashMap<String, DeployedProcess>,
+    pub processes: BTreeMap<String, DeployedProcess>,
     /// Every deployed process definition ever seen, keyed by its unique
     /// process-definition key (so historical versions are retained, not
     /// overwritten by a redeploy). A running instance resolves *its* definition
@@ -2348,9 +2374,9 @@ pub struct State {
     /// snapshots written before version retention deserialize empty and fall
     /// back to the latest-by-id index via [`State::definition_for`].
     #[cfg_attr(feature = "serde", serde(default))]
-    pub process_versions: HashMap<Key, DeployedProcess>,
-    pub instances: HashMap<Key, ProcessInstance>,
-    pub jobs: HashMap<Key, Job>,
+    pub process_versions: BTreeMap<Key, DeployedProcess>,
+    pub instances: BTreeMap<Key, ProcessInstance>,
+    pub jobs: BTreeMap<Key, Job>,
     /// The **settlement ledger** (#1181): for each *leased* job, every recorded
     /// settlement — the lease token (per-activation fence) and the outcome it
     /// produced. A replayed `CompleteJob`/`FailJob`/`ThrowJobError` bearing a
@@ -2389,38 +2415,52 @@ pub struct State {
         serde(default, skip_serializing_if = "RoutedDeliveries::is_empty")
     )]
     pub routed_deliveries: RoutedDeliveries,
+    /// The **cluster variables** (#1657): global + per-tenant configuration
+    /// values FEEL resolves beneath instance variables. Replicated engine state,
+    /// derived only from the `ClusterVariableCreated` / `Updated` / `Deleted`
+    /// events, so every replica and every replay reads the same values (and
+    /// `SECRET_REFERENCE` kinds) at the same log position. `serde(default)`:
+    /// snapshots written before #1657 load with none.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "crate::cluster_vars::ClusterVariableState::is_unused"
+        )
+    )]
+    pub cluster_variables: crate::cluster_vars::ClusterVariableState,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.
-    pub user_tasks: HashMap<Key, UserTask>,
+    pub user_tasks: BTreeMap<Key, UserTask>,
     /// All incidents ever raised, keyed by incident key, retained after
     /// resolution as an audit trail (each carries its [`IncidentState`]).
-    pub incidents: HashMap<Key, Incident>,
+    pub incidents: BTreeMap<Key, Incident>,
     /// Armed and fired timers, keyed by timer key. A fired timer is retained
     /// (transitioned to [`TimerState::Triggered`]) so a clock tick never fires
     /// it twice.
-    pub timers: HashMap<Key, Timer>,
+    pub timers: BTreeMap<Key, Timer>,
     /// Open and settled message subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) so a later message never
     /// correlates it twice.
-    pub message_subscriptions: HashMap<Key, MessageSubscription>,
+    pub message_subscriptions: BTreeMap<Key, MessageSubscription>,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.
-    pub signal_subscriptions: HashMap<Key, SignalSubscription>,
+    pub signal_subscriptions: BTreeMap<Key, SignalSubscription>,
     /// Open and settled **conditional** subscriptions, keyed by subscription key.
     /// A fired interrupting subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) so it never fires twice; a
     /// non-interrupting boundary stays [`MessageSubscriptionState::Open`].
-    pub conditional_subscriptions: HashMap<Key, ConditionalSubscription>,
+    pub conditional_subscriptions: BTreeMap<Key, ConditionalSubscription>,
     /// Process-level message start subscriptions, keyed by message name. A
     /// correlating message whose name matches creates a new instance.
-    pub message_start_subscriptions: HashMap<String, MessageStartSubscription>,
+    pub message_start_subscriptions: BTreeMap<String, MessageStartSubscription>,
     /// Process-level timer start events, keyed by timer key. Each creates a new
     /// instance when due; a cycle re-arms, a one-shot is retained with
     /// `due_at = None`.
-    pub start_timers: HashMap<Key, StartTimer>,
+    pub start_timers: BTreeMap<Key, StartTimer>,
     /// Index of jobs eligible to be *considered* for activation, grouped by job
     /// type and ordered by `(−priority, key)` (priority negated in `i64`, so
     /// every accepted `i32` priority keeps a distinct slot) — highest priority
@@ -2432,7 +2472,7 @@ pub struct State {
     /// system — critical when a large backlog of pending jobs accumulates under
     /// load. It is fully derived from `jobs` and kept in lockstep by
     /// [`resync_job_index`].
-    pub activatable_jobs: HashMap<String, BTreeSet<(i64, Key)>>,
+    pub activatable_jobs: BTreeMap<String, BTreeSet<(i64, Key)>>,
     /// Jobs deferred by a Camunda 8 v2 `retryBackOff` (#933), ordered by their
     /// eligibility deadline (`retry_backoff_until`) then key. A job is a member
     /// iff it is `Created` with a pending (future) backoff. Keeping deferred
@@ -2449,12 +2489,12 @@ pub struct State {
     /// and guarantees a re-deferred job never leaves a stale `(old, key)` tuple
     /// behind. In-memory only, rebuilt with `deferred_jobs` on restore.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub deferred_job_deadlines: HashMap<Key, u64>,
+    pub deferred_job_deadlines: BTreeMap<Key, u64>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
     /// every job. Derived from `jobs`, kept in lockstep by [`resync_job_index`].
-    pub activated_jobs: std::collections::HashSet<Key>,
+    pub activated_jobs: std::collections::BTreeSet<Key>,
     /// Reverse index of instance key → the keys of every job that instance owns,
     /// regardless of job state. Jobs are only removed from `jobs` in bulk when
     /// their owning instance is evicted, so this index lets eviction drop an
@@ -2463,7 +2503,7 @@ pub struct State {
     /// eviction under sustained overload. Derived from `jobs`: a key is inserted
     /// when a job is created and the whole entry is removed when the instance is
     /// evicted.
-    pub jobs_by_instance: HashMap<Key, std::collections::HashSet<Key>>,
+    pub jobs_by_instance: BTreeMap<Key, std::collections::BTreeSet<Key>>,
     /// Per-process-definition **in-flight instance count** (created but not yet
     /// terminal), keyed by BPMN process id. Maintained by [`apply_event`] at
     /// `ProcessInstanceCreated` (+1) and the terminal transitions
@@ -2473,18 +2513,18 @@ pub struct State {
     /// bounds each definition's e2e instance sojourn `W_P = L_P/λ_P`. A definition
     /// drops out of the map once its count returns to zero.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub inflight_by_process: HashMap<String, u64>,
+    pub inflight_by_process: BTreeMap<String, u64>,
     /// Per-process-definition cumulative **created** count (monotonic), keyed by
     /// BPMN process id. The monitor differences it across ticks to get each
     /// definition's create rate `λ_P` for the Tier-2 throughput-scaled band
     /// `L*_P = W_target·λ_P`.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub created_by_process: HashMap<String, u64>,
+    pub created_by_process: BTreeMap<String, u64>,
     /// Latest deployed decision requirements graph (parsed `.dmn`), keyed by DRG
     /// id. Versioned per DRG id across deployments, like processes. A fast
     /// latest-by-id index over [`State::decision_requirements_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
-    pub decision_requirements: HashMap<String, DeployedDrg>,
+    pub decision_requirements: BTreeMap<String, DeployedDrg>,
     /// Every deployed DRG version ever seen, keyed by its unique
     /// decision-requirements key (so historical versions are retained, not
     /// overwritten by a redeploy). A `businessRuleTask` binding pinned to a
@@ -2492,29 +2532,29 @@ pub struct State {
     /// resolves through here. `serde(default)` so pre-retention snapshots
     /// deserialize empty and fall back to the latest-by-id index.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub decision_requirements_versions: HashMap<Key, DeployedDrg>,
+    pub decision_requirements_versions: BTreeMap<Key, DeployedDrg>,
     /// Latest deployed decision, keyed by decision id, for
     /// `businessRuleTask`/EvaluateDecision lookup. Points at the DRG it belongs
     /// to so required-decision chains resolve. A fast latest-by-id index over
     /// [`State::decision_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
-    pub decisions: HashMap<String, DeployedDecision>,
+    pub decisions: BTreeMap<String, DeployedDecision>,
     /// Every deployed decision version ever seen, keyed by its unique decision
     /// key, so an EvaluateDecision request pinned to an older decision key can
     /// still resolve the exact version. `serde(default)` for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub decision_versions: HashMap<Key, DeployedDecision>,
+    pub decision_versions: BTreeMap<Key, DeployedDecision>,
     /// Latest deployed form (`form-js` `.form` JSON), keyed by form id. Versioned
     /// per form id across deployments, like processes. The engine does not execute
     /// forms; it retains them so `GetFormByKey` can serve the stored schema. A
     /// fast latest-by-id index over [`State::form_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
-    pub forms: HashMap<String, DeployedForm>,
+    pub forms: BTreeMap<String, DeployedForm>,
     /// Every deployed form version ever seen, keyed by its unique form key, so a
     /// `userTask` form binding pinned to a specific version resolves the exact
     /// schema. `serde(default)` for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub form_versions: HashMap<Key, DeployedForm>,
+    pub form_versions: BTreeMap<Key, DeployedForm>,
     /// Latest deployed generic resource (any non-BPMN/DMN/form file, e.g. a
     /// Markdown agent prompt), keyed by `resource_id` (the filename). Versioned
     /// per `resource_id` across deployments, like forms. The engine does not
@@ -2522,13 +2562,13 @@ pub struct State {
     /// `searchResources` can serve the stored content. A fast latest-by-id index
     /// over [`State::resource_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
-    pub resources: HashMap<String, DeployedResource>,
+    pub resources: BTreeMap<String, DeployedResource>,
     /// Every deployed generic-resource version ever seen, keyed by its unique
     /// resource key, so a `zeebe:linkedResource` binding pinned to a specific
     /// version (or an older key) resolves the exact content. `serde(default)`
     /// for legacy snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub resource_versions: HashMap<Key, DeployedResource>,
+    pub resource_versions: BTreeMap<Key, DeployedResource>,
     /// Instance key → the [`VariablesLostTombstone`] of its active loss
     /// episode (`Event::VariablesLostQuarantined`), retained as a **replicated dedup
     /// tombstone** (#1574 review). The `VariablesLost` incident record itself
@@ -2574,6 +2614,23 @@ pub struct State {
     /// command, so no stamped proposal can be outstanding against them).
     #[cfg_attr(feature = "serde", serde(default))]
     pub terminal_epoch: u64,
+    /// Lenient completion (#1661, ADR 0066 slice 2): when `true`, a
+    /// `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a job that was
+    /// never activated on this replica (the `activated` latch is not required).
+    /// This supports a clustered mode where the activation lock is
+    /// *leader-local* (not replicated through Raft): a follower never observes
+    /// the `JobActivated` event, so a replicated completion would otherwise fail
+    /// `JobNotActivated` and diverge from the leader. Possession of the job key
+    /// *is* the capability (keys are only handed out by activation), so this
+    /// stays within the at-least-once contract.
+    ///
+    /// Replicated engine state, derived only from
+    /// [`crate::Event::LenientCompletionSet`] (emitted by the replicated
+    /// [`crate::Command::SetLenientCompletion`]), so every replica flips it at
+    /// the same log index — never host config a node changes on its own clock.
+    /// `serde(default)`: older snapshots load strict (`false`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lenient_completion: bool,
 }
 
 /// Bound on [`State::recently_terminated`]. The window it must cover is one
@@ -3023,8 +3080,8 @@ impl State {
     /// deadline has been reached. Each job is counted once (a job is in exactly
     /// one of the two indices). The single canonical waiting-count derivation
     /// for monitors, so the deferred index can never be silently omitted.
-    pub fn waiting_job_counts(&self, now: u64) -> HashMap<String, u64> {
-        let mut counts: HashMap<String, u64> = self
+    pub fn waiting_job_counts(&self, now: u64) -> BTreeMap<String, u64> {
+        let mut counts: BTreeMap<String, u64> = self
             .activatable_jobs
             .iter()
             .filter(|(_, set)| !set.is_empty())
@@ -3339,7 +3396,33 @@ mod job_attribution_worker_tests {
             retry_backoff_until: None,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
         }
+    }
+
+    /// #1640: a job's mapping-time secret provenance survives the snapshot
+    /// round-trip (paths + names only), and a pre-#1640 job record without
+    /// the field decodes to EMPTY provenance (resolve nothing — fail closed).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn secret_provenance_snapshot_round_trip() {
+        let mut job = job_with_worker(Some("w"));
+        job.secret_provenance = vec![super::SecretProvenance {
+            path: "payload.auth".to_string(),
+            secrets: vec!["TOKEN".to_string()],
+        }];
+        let json = serde_json::to_string(&job).expect("serialize");
+        assert!(json.contains("\"secret_provenance\""));
+        let back: Job = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, job);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("secret_provenance");
+        let old: Job = serde_json::from_value(legacy).expect("legacy record decodes");
+        assert!(old.secret_provenance.is_empty());
     }
 
     /// #1191 — the single-source capture helper the three terminal sites use must

@@ -5,7 +5,7 @@ use super::*;
 /// The variable upserts produced by [`Engine::drain_dirty_vars`]: each dirty,
 /// resident (non-spilled) instance's key paired with a cheap `Arc` clone of its
 /// current variable map, for the host to serialize into the durable var store.
-pub type VarUpserts = Vec<(Key, Arc<HashMap<String, Value>>)>;
+pub type VarUpserts = Vec<(Key, Arc<BTreeMap<String, Value>>)>;
 
 impl Engine {
     /// Captures a complete, compact snapshot of this engine: the materialized
@@ -53,7 +53,7 @@ impl Engine {
         // incident map once, grouping each owed element-instance key under its
         // owning instance, so restore stays O(instances + incidents) rather than
         // rescanning every incident per instance.
-        let mut owed: HashMap<Key, Vec<Key>> = HashMap::new();
+        let mut owed: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
         for incident in snapshot.state.incidents.values() {
             if let Some(element_key) = incident.owed_activation() {
                 owed.entry(incident.instance_key)
@@ -97,16 +97,15 @@ impl Engine {
             now: snapshot.now,
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: snapshot.start_dispatch_rr,
-            lenient_completion: false,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
             track_dirty_vars: false,
-            dirty_vars: std::collections::HashSet::new(),
-            forgotten_vars: std::collections::HashSet::new(),
-            retired_tombstones: std::collections::HashSet::new(),
-            torn_down_scopes: std::collections::HashSet::new(),
-            esp_start_payloads: std::collections::HashMap::new(),
-            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            dirty_vars: std::collections::BTreeSet::new(),
+            forgotten_vars: std::collections::BTreeSet::new(),
+            retired_tombstones: std::collections::BTreeSet::new(),
+            torn_down_scopes: std::collections::BTreeSet::new(),
+            esp_start_payloads: std::collections::BTreeMap::new(),
             raft_applied: snapshot.raft_applied,
         }
     }
@@ -153,7 +152,7 @@ impl Engine {
     /// thread when the host serializes them into the store.
     pub fn drain_dirty_vars(&mut self) -> (VarUpserts, Vec<Key>) {
         let mut upserts = Vec::with_capacity(self.dirty_vars.len());
-        for key in self.dirty_vars.drain() {
+        for key in std::mem::take(&mut self.dirty_vars) {
             if let Some(instance) = self.state.instances.get(&key) {
                 if instance.variables_spilled {
                     continue;
@@ -161,7 +160,9 @@ impl Engine {
                 upserts.push((key, Arc::clone(&instance.variables)));
             }
         }
-        let forgets: Vec<Key> = self.forgotten_vars.drain().collect();
+        let forgets: Vec<Key> = std::mem::take(&mut self.forgotten_vars)
+            .into_iter()
+            .collect();
         (upserts, forgets)
     }
 
@@ -178,7 +179,7 @@ impl Engine {
         let mut state = self.state.clone();
         for instance in state.instances.values_mut() {
             if !instance.variables.is_empty() {
-                instance.variables = Arc::new(HashMap::new());
+                instance.variables = Arc::new(BTreeMap::new());
             }
         }
         EngineSnapshot {
@@ -196,7 +197,7 @@ impl Engine {
     /// recovered instance (control state came from a lean snapshot + journal
     /// tail). Clears the spilled flag: after recovery the payload is resident.
     /// A no-op if the instance is not present (already terminal/evicted).
-    pub fn install_variables(&mut self, key: Key, variables: HashMap<String, Value>) {
+    pub fn install_variables(&mut self, key: Key, variables: BTreeMap<String, Value>) {
         if let Some(instance) = self.state.instances.get_mut(&key) {
             instance.variables = Arc::new(variables);
             instance.variables_spilled = false;
@@ -282,7 +283,7 @@ impl Engine {
     /// instances evicted. Does **not** shrink the maps — capacity is reused by
     /// the next instances, which is exactly what is wanted under sustained load.
     pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
-        let terminal: HashSet<Key> = keys
+        let terminal: BTreeSet<Key> = keys
             .iter()
             .copied()
             .filter(|k| {
@@ -313,7 +314,7 @@ impl Engine {
         // (drained the moment that create applies), so it stays tiny; the cap only
         // guards a pathological stream of retirements for keys that never arrive.
         const MAX_TOMBSTONES: usize = 1 << 20;
-        let mut victims: HashSet<Key> = HashSet::new();
+        let mut victims: BTreeSet<Key> = BTreeSet::new();
         for &k in keys {
             if self.state.instances.contains_key(&k) {
                 victims.insert(k);
@@ -335,7 +336,7 @@ impl Engine {
         if self.retired_tombstones.is_empty() {
             return 0;
         }
-        let hit: HashSet<Key> = created
+        let hit: BTreeSet<Key> = created
             .iter()
             .copied()
             .filter(|k| self.retired_tombstones.remove(k))
@@ -397,7 +398,7 @@ impl Engine {
         if !self.retired_tombstones.is_empty() {
             self.retired_tombstones.retain(|&k| k >= low_water);
         }
-        let set: HashSet<Key> = victims.iter().copied().collect();
+        let set: BTreeSet<Key> = victims.iter().copied().collect();
         self.remove_instance_set(&set);
         victims
     }
@@ -409,7 +410,7 @@ impl Engine {
     /// incidents. Does **not** shrink the maps — capacity is reused by the next
     /// instances, which is exactly what is wanted under sustained load. Returns the
     /// number of instances removed.
-    fn remove_instance_set(&mut self, victims: &HashSet<Key>) -> usize {
+    fn remove_instance_set(&mut self, victims: &BTreeSet<Key>) -> usize {
         if victims.is_empty() {
             return 0;
         }
@@ -475,16 +476,9 @@ impl Engine {
     /// never shrink on their own, so removal alone does not lower the resident
     /// footprint until this is called.)
     pub fn shrink(&mut self) {
-        self.state.instances.shrink_to_fit();
-        self.state.jobs.shrink_to_fit();
-        self.state.timers.shrink_to_fit();
-        self.state.message_subscriptions.shrink_to_fit();
-        self.state.signal_subscriptions.shrink_to_fit();
-        self.state.conditional_subscriptions.shrink_to_fit();
-        self.state.incidents.shrink_to_fit();
-        self.state.activatable_jobs.shrink_to_fit();
-        self.state.activated_jobs.shrink_to_fit();
-        self.state.jobs_by_instance.shrink_to_fit();
+        // Engine-state maps are B-trees (#1662): nodes are freed as entries are
+        // removed, so there is no retained hash-table capacity to release.
+        // Kept as a stable host API.
     }
 
     // --- Variable spill: host-managed hot-state memory reclamation. ---
@@ -522,7 +516,7 @@ impl Engine {
     /// they ride with the control snapshot and are typically small, and keeping
     /// them in place means a rehydrate need only restore the root before the host
     /// recomputes the merged view via [`Engine::element_variables`].
-    pub fn spill_variables(&mut self, key: Key) -> Option<Arc<HashMap<String, Value>>> {
+    pub fn spill_variables(&mut self, key: Key) -> Option<Arc<BTreeMap<String, Value>>> {
         let instance = self.state.instances.get_mut(&key)?;
         if instance.variables_spilled || instance.variables.is_empty() {
             return None;
@@ -534,7 +528,7 @@ impl Engine {
     /// Restores previously [spilled](Engine::spill_variables) variables into hot
     /// state. A no-op if the instance is gone. Idempotent with respect to the
     /// spilled flag (clears it regardless).
-    pub fn rehydrate_variables(&mut self, key: Key, variables: Arc<HashMap<String, Value>>) {
+    pub fn rehydrate_variables(&mut self, key: Key, variables: Arc<BTreeMap<String, Value>>) {
         if let Some(instance) = self.state.instances.get_mut(&key) {
             instance.variables = variables;
             instance.variables_spilled = false;
@@ -555,7 +549,7 @@ impl Engine {
         &self,
         instance_key: Key,
         element_instance_key: Key,
-    ) -> Arc<HashMap<String, Value>> {
+    ) -> Arc<BTreeMap<String, Value>> {
         self.variables_for_element(instance_key, element_instance_key)
     }
 
@@ -677,7 +671,7 @@ impl Engine {
         &self,
         key: &Key,
         instance: &state::ProcessInstance,
-        guarded: &std::collections::HashSet<Key>,
+        guarded: &std::collections::BTreeSet<Key>,
     ) -> bool {
         instance.state == ProcessInstanceState::Active
             && !instance.variables_spilled
@@ -694,8 +688,8 @@ impl Engine {
     /// job activation: an armed (`Created`) timer or an open message
     /// subscription. Empty (and allocation-free on the fast path) when no timers
     /// or subscriptions exist — the common case under a create-heavy backlog.
-    pub(crate) fn instances_with_async_token(&self) -> std::collections::HashSet<Key> {
-        let mut guarded = std::collections::HashSet::new();
+    pub(crate) fn instances_with_async_token(&self) -> std::collections::BTreeSet<Key> {
+        let mut guarded = std::collections::BTreeSet::new();
         if self.state.timers.is_empty()
             && self.state.message_subscriptions.is_empty()
             && self.state.conditional_subscriptions.is_empty()
@@ -878,7 +872,7 @@ impl Engine {
         // Group every owned-entity map by owning instance in ONE pass each, so
         // decomposition is linear in (instances + entities) — a per-instance
         // `drain_owned` rescan would be quadratic with a backlog (#1476).
-        let owners: HashSet<Key> = keys.iter().copied().collect();
+        let owners: BTreeSet<Key> = keys.iter().copied().collect();
         let mut timers_by = group_owned(&mut state.timers, &owners);
         let mut msg_by = group_owned(&mut state.message_subscriptions, &owners);
         let mut sig_by = group_owned(&mut state.signal_subscriptions, &owners);

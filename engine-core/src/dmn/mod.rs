@@ -11,7 +11,7 @@
 //! first:
 //!
 //! ```
-//! use std::collections::HashMap;
+//! use std::collections::BTreeMap;
 //! use nanobpmn_engine_core::Value;
 //! use nanobpmn_engine_core::dmn;
 //!
@@ -29,7 +29,7 @@
 //! </definitions>"#;
 //!
 //! let drg = dmn::parse_dmn(xml).unwrap();
-//! let ctx = HashMap::from([("lang".to_string(), Value::Str("de".into()))]);
+//! let ctx = BTreeMap::from([("lang".to_string(), Value::Str("de".into()))]);
 //! let result = dmn::evaluate(&drg, "greeting", &ctx);
 //! assert!(!result.is_failure());
 //! assert_eq!(result.decision_output, Value::Str("hallo".into()));

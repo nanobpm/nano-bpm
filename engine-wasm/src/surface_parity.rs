@@ -166,6 +166,11 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
+        Command::CreateClusterVariable { .. }
+        | Command::UpdateClusterVariable { .. }
+        | Command::DeleteClusterVariable { .. } => Surface::NotSurfaced {
+            reason: "operator-managed cluster variables (REST cluster-variables surface); not exposed by the in-browser test engine",
+        },
         Command::EvaluateDecision { .. } => Surface::Surfaced {
             js_method: "evaluateDecision",
         },
@@ -230,6 +235,12 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::QuarantineOffheapOrphan { .. }
         | Command::QuarantineColdOrphan { .. } => Surface::NotSurfaced {
             reason: "host-internal durability command raised by the storage layer, not a public worker/JS API",
+        },
+        // Proposed by a clustered host's partition leader (#1661) to flip the
+        // replicated lenient-completion mode; a single in-browser engine has
+        // no leader-local activation to tolerate.
+        Command::SetLenientCompletion { .. } => Surface::NotSurfaced {
+            reason: "host-internal cluster replication command proposed by the partition leader, not a public worker/JS API",
         },
     }
 }

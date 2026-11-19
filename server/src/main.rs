@@ -23,6 +23,7 @@ mod query;
 #[cfg(test)]
 mod request_field_guard;
 mod response_contract;
+mod secrets;
 mod stub_impls;
 
 // Cross-crate peer-uplink integration tests. `peer` moved into
@@ -73,10 +74,9 @@ use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, AdHocActivateElement, AdHocJobResult, ClusterVariableSnapshot, ClusterVariables,
-    Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
-    ProcessBuilder, ProcessDefinition, ProcessInstanceState, TaskListenerJobResult,
-    UserTaskCorrections, Value, partition_of,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
+    IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
+    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -378,36 +378,19 @@ impl BatchOperationStore {
     }
 }
 
-/// #906 cluster-variables state (epic #903).
+/// #906 cluster-variables REST surface (epic #903), backed by REPLICATED engine
+/// state since #1657 (ADR 0066 option C).
 ///
 /// A cluster variable is an operator-managed value resolvable from FEEL at
 /// runtime. It is either **global** (visible to every tenant) or bound to a
-/// specific **tenant**; a global and a tenant variable may share a name without
-/// clashing, so the store keys each entry by `(tenant, name)` where `tenant` is
-/// `None` for global scope.
-///
-/// The store is the source of truth for the v2 `/cluster-variables` REST
-/// surface. Every mutation also refreshes `runtime` — the shared
-/// [`ClusterVariables`] snapshot the embedded engine overlays *underneath*
-/// instance variables during FEEL evaluation (see `engine-core`
-/// `overlay_cluster_variables`) — so REST state and runtime resolution never
-/// drift. The value is stored as an engine [`Value`] (not the JSON wire string),
-/// which is exactly what both the FEEL overlay and the REST projection need.
-#[derive(Clone)]
-pub struct ClusterVariableStore {
-    entries: Arc<std::sync::RwLock<ClusterVariableEntries>>,
-    runtime: ClusterVariables,
-}
-
-/// The stored entries plus a monotonic id counter. `by_key` is keyed by
-/// `(tenant, name)` (`None` tenant = global); `next_id` hands each entry a
-/// unique, stable id used as the search pagination cursor.
-#[derive(Default)]
-struct ClusterVariableEntries {
-    by_key: std::collections::HashMap<(Option<String>, String), StoredClusterVariable>,
-    next_id: u64,
-}
-
+/// specific **tenant**. The single source of truth is the engine's
+/// [`nanobpmn_engine_core::ClusterVariableState`], mutated only by the
+/// replicated `Create`/`Update`/`DeleteClusterVariable` commands: partition 0
+/// is authoritative (it validates — 409 / 404) and the resulting record is then
+/// fanned out to every other partition as an idempotent `distributed` copy, so
+/// each partition's FEEL resolution reads its own log-derived state and every
+/// replica of a partition agrees at every log position. There is no host-side
+/// store; the REST reads below project the engine state.
 /// A cluster variable's Camunda 8.10 metadata bag: string/number values keyed by
 /// name. Opaque to the engine (never overlaid into FEEL); stored and projected
 /// verbatim for the REST surface.
@@ -436,133 +419,415 @@ struct StoredClusterVariable {
     metadata: ClusterVariableMetadata,
 }
 
-impl ClusterVariableStore {
-    /// Builds a store backed by the shared runtime snapshot the engine reads for
-    /// FEEL resolution. The two stay in lock-step: every mutation rebuilds the
-    /// snapshot from the current entries.
-    fn new(runtime: ClusterVariables) -> Self {
+impl StoredClusterVariable {
+    /// Projects one engine-state cluster variable into the REST record.
+    fn from_engine(
+        tenant_id: Option<&str>,
+        name: &str,
+        v: &nanobpmn_engine_core::ClusterVariable,
+    ) -> Self {
         Self {
-            entries: Arc::new(std::sync::RwLock::new(ClusterVariableEntries::default())),
-            runtime,
+            id: v.id,
+            name: name.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            value: v.value.clone(),
+            kind: match v.kind {
+                nanobpmn_engine_core::ClusterVariableKind::Json => {
+                    models::ClusterVariableKindEnum::Json
+                }
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference => {
+                    models::ClusterVariableKindEnum::SecretReference
+                }
+            },
+            metadata: v
+                .metadata
+                .iter()
+                .filter_map(|(k, val)| {
+                    serde_json::from_value(value_to_json(val))
+                        .ok()
+                        .map(|m| (k.clone(), m))
+                })
+                .collect(),
         }
     }
+}
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, ClusterVariableEntries> {
-        self.entries.read().unwrap_or_else(|p| p.into_inner())
+/// The engine kind for a REST kind (`JSON` when the request omits it — Camunda
+/// 8.10: "Defaults to JSON if not specified").
+fn cluster_variable_engine_kind(
+    kind: Option<models::ClusterVariableKindEnum>,
+) -> nanobpmn_engine_core::ClusterVariableKind {
+    match kind {
+        Some(models::ClusterVariableKindEnum::SecretReference) => {
+            nanobpmn_engine_core::ClusterVariableKind::SecretReference
+        }
+        _ => nanobpmn_engine_core::ClusterVariableKind::Json,
+    }
+}
+
+/// The engine metadata bag for a REST metadata bag (string/number scalars).
+fn cluster_variable_engine_metadata(
+    metadata: &ClusterVariableMetadata,
+) -> std::collections::BTreeMap<String, Value> {
+    metadata
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                json_to_value(&serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
+            )
+        })
+        .collect()
+}
+
+/// The `(tenant, name)` a cluster-variable command addresses.
+fn cluster_variable_target(command: &Command) -> Option<(Option<String>, String)> {
+    match command {
+        Command::CreateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::UpdateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::DeleteClusterVariable {
+            tenant_id, name, ..
+        } => Some((tenant_id.clone(), name.clone())),
+        _ => None,
+    }
+}
+
+impl ServerImpl {
+    /// The local engine actor whose replicated state serves cluster-variable
+    /// reads: the authoritative partition 0 when hosted here, else any local
+    /// partition (each holds the fanned-out copy).
+    fn cluster_variable_read_handle(&self) -> &DeepthiHandle {
+        self.engine
+            .local_for_partition(0)
+            .unwrap_or_else(|| &self.engine.all()[0])
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, ClusterVariableEntries> {
-        self.entries.write().unwrap_or_else(|p| p.into_inner())
+    /// A clone of the replicated cluster-variable state (the REST read source).
+    async fn cluster_variable_state(&self) -> nanobpmn_engine_core::ClusterVariableState {
+        self.cluster_variable_read_handle()
+            .with(|j| j.engine().cluster_variables().clone())
+            .await
     }
 
-    /// Returns the stored variable for `(tenant, name)`, if any.
-    fn get(&self, tenant: Option<&str>, name: &str) -> Option<StoredClusterVariable> {
-        self.read()
-            .by_key
-            .get(&(tenant.map(str::to_string), name.to_string()))
-            .cloned()
+    /// Returns the variable for `(tenant, name)`, if any. The lookup runs
+    /// INSIDE the engine actor turn and clones only the matching record —
+    /// cloning the whole state here would make a single-variable GET cost
+    /// grow with the entire configuration store and block the actor on the
+    /// copy (PR #1670 review). The full-state clone is reserved for search
+    /// and expression snapshots ([`Self::cluster_variable_state`]).
+    async fn cluster_variable_get(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> Option<StoredClusterVariable> {
+        let (t, n) = (tenant.map(str::to_string), name.to_string());
+        self.cluster_variable_read_handle()
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(t.as_deref(), &n)
+                    .map(|v| StoredClusterVariable::from_engine(t.as_deref(), &n, v))
+            })
+            .await
     }
 
-    /// Creates a new variable, returning a snapshot of the stored record taken
-    /// while the write lock is still held. Returns `None` (creating nothing)
-    /// when one already exists for `(tenant, name)` — the caller maps that to
-    /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
-    /// is race-free: a concurrent DELETE cannot make the caller's response
-    /// construction observe a missing record. `kind` defaults to `JSON` when the
-    /// request omits it (Camunda 8.10: "Defaults to JSON if not specified").
-    fn create(
+    /// Every cluster variable (for search).
+    async fn cluster_variable_all(&self) -> Vec<StoredClusterVariable> {
+        let state = self.cluster_variable_state().await;
+        state
+            .iter()
+            .map(|(t, n, v)| StoredClusterVariable::from_engine(t, n, v))
+            .collect()
+    }
+
+    /// Creates a variable: 409 when `(tenant, name)` already exists.
+    async fn cluster_variable_create(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         kind: Option<models::ClusterVariableKindEnum>,
         metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            if e.by_key.contains_key(&key) {
-                return None;
-            }
-            e.next_id += 1;
-            let id = e.next_id;
-            let stored = StoredClusterVariable {
-                id,
-                name: name.to_string(),
-                tenant_id: tenant.map(str::to_string),
-                value,
-                kind: kind.unwrap_or(models::ClusterVariableKindEnum::Json),
-                metadata,
-            };
-            e.by_key.insert(key, stored.clone());
-            stored
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::CreateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            kind: cluster_variable_engine_kind(kind),
+            metadata: cluster_variable_engine_metadata(&metadata),
+            distributed: false,
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after create".to_string()))
     }
 
-    /// Updates an existing variable's value and metadata in place, preserving
-    /// its id, and returns a snapshot of the updated record taken while the
-    /// write lock is still held. The metadata bag is REPLACED, not merged
-    /// (Camunda: an update that omits it clears it). Returns `None` when none
-    /// exists for `(tenant, name)` — the caller maps that to 404. Returning the
-    /// snapshot (rather than a separate post-mutation `get`) is race-free: a
-    /// concurrent DELETE cannot make the caller's response construction observe
-    /// a missing record.
-    fn update(
+    /// Replaces a variable's value and metadata (id and kind preserved): 404
+    /// when absent. An omitted metadata bag clears it (Camunda parity).
+    async fn cluster_variable_update(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            let entry = e.by_key.get_mut(&key)?;
-            entry.value = value;
-            entry.metadata = metadata;
-            entry.clone()
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::UpdateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            metadata: cluster_variable_engine_metadata(&metadata),
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after update".to_string()))
     }
 
-    /// Deletes a variable. Returns `false` when none exists — the caller maps
-    /// that to 404.
-    fn delete(&self, tenant: Option<&str>, name: &str) -> bool {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let removed = self.write().by_key.remove(&key).is_some();
-        if removed {
-            self.sync_runtime();
-        }
-        removed
+    /// Deletes a variable: 404 when absent.
+    async fn cluster_variable_delete(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> Result<(), (u16, String)> {
+        self.cluster_variable_mutate(Command::DeleteClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            distributed: false,
+        })
+        .await
+        .map(|_| ())
     }
 
-    /// Snapshots every stored variable (for search).
-    fn all(&self) -> Vec<StoredClusterVariable> {
-        self.read().by_key.values().cloned().collect()
-    }
-
-    /// Rebuilds the shared runtime snapshot from the current entries so the
-    /// engine's FEEL overlay reflects the latest state after every mutation.
-    fn sync_runtime(&self) {
-        let mut snap = ClusterVariableSnapshot::default();
-        for entry in self.read().by_key.values() {
-            match &entry.tenant_id {
-                None => {
-                    snap.global.insert(entry.name.clone(), entry.value.clone());
-                }
-                Some(tenant) => {
-                    snap.tenants
-                        .entry(tenant.clone())
-                        .or_default()
-                        .insert(entry.name.clone(), entry.value.clone());
-                }
+    /// The single cluster-variable write funnel (#1657). Applies `command` on
+    /// the authoritative partition 0 (which validates), then fans the
+    /// resulting record out to every other partition as an idempotent
+    /// `distributed` upsert / delete, each through that partition's replicated
+    /// command path. Returns the post-apply record (`None` once deleted).
+    ///
+    /// Rolling-upgrade gate (ADR 0066): the new command variants are Raft
+    /// entries an older binary cannot decode, so nothing is emitted unless
+    /// every peer advertises [`falcon::cluster_join::FEATURE_CLUSTER_VARIABLES`]
+    /// on its `/cluster` join handshake (#1661); otherwise
+    /// the write fails closed with 503 and no partition is touched. Writes from
+    /// this gateway are serialized so its fan-outs never interleave.
+    ///
+    /// Consistency contract (slice 1 — Zeebe parity): partition 0 is the sole
+    /// authority — every mutation validates and commits there first, and the
+    /// fan-out copies carry the full resulting record, so concurrent writes
+    /// (possibly through different gateways) converge **last-writer-wins by
+    /// authoritative commit order**: a stale copy can only overwrite a newer
+    /// value on a follower partition when its own authoritative commit was
+    /// later, in which case it IS the newest value. Revisions/tombstones and a
+    /// durable, restart-resuming distributor (so a fan-out interrupted by a
+    /// gateway failure is retried to completion independently of the REST
+    /// request) are follow-up slices; an interrupted fan-out surfaces as the
+    /// request's error and is logged (`cluster variable fan-out incomplete`)
+    /// so an operator can re-issue the write — a create retries as 409 and a
+    /// delete as 404, so the recovery write is an UPDATE (or a re-create after
+    /// a delete).
+    ///
+    /// Untagged legacy journal (ADR 0066): with `NANOBPMN_JOURNAL_SEGMENTED=0`
+    /// and more than one partition the journal records no producing
+    /// partition, so an interrupted fan-out could not be told apart on restart
+    /// (broadcasting would install a copy that never committed; key routing
+    /// would lose it). There the rule is FAIL CLOSED, not "re-issue the write":
+    /// every create/update/delete is rejected with 503 before any partition is
+    /// touched ([`check_cluster_variable_journal_mode`], warned once at
+    /// startup), and recovery refuses any such record
+    /// ([`seglog::check_cluster_variable_attribution`]). Remedy: segmented
+    /// journals, or a single partition.
+    async fn cluster_variable_mutate(
+        &self,
+        command: Command,
+    ) -> Result<Option<StoredClusterVariable>, (u16, String)> {
+        let _serialized = self.cluster_variable_writes.lock().await;
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
+        for node in self.engine.peer_nodes() {
+            let link = self.peer_link(node).await.map_err(|(_, m)| {
+                (
+                    503,
+                    format!("cluster variables unavailable: peer {node} unreachable: {m}"),
+                )
+            })?;
+            if !link.supports(falcon::cluster_join::FEATURE_CLUSTER_VARIABLES) {
+                return Err((
+                    503,
+                    format!(
+                        "cluster variables unavailable: peer {node} does not support \
+                         replicated cluster variables yet (rolling upgrade in progress)"
+                    ),
+                ));
             }
         }
-        let mut guard = self.runtime.write().unwrap_or_else(|p| p.into_inner());
-        *guard = snap;
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (500, "not a cluster-variable command".to_string()))?;
+        let record = self.apply_cluster_variable_on(0, command).await?;
+        let copy = match &record {
+            Some(v) => Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: v.value.clone(),
+                kind: v.kind,
+                metadata: v.metadata.clone(),
+                distributed: true,
+            },
+            None => Command::DeleteClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                distributed: true,
+            },
+        };
+        let partition_count = self.engine.partition_count() as u64;
+        for p in 1..partition_count {
+            if let Err(e) = self.apply_cluster_variable_on(p, copy.clone()).await {
+                // Partition 0 has already committed; the remaining copies are
+                // best-effort (slice 1 — see the consistency contract above).
+                // Log loudly so an interrupted fan-out is diagnosable, then
+                // surface the failure to the caller.
+                tracing::error!(
+                    partition = p,
+                    error = %e.1,
+                    "cluster variable fan-out incomplete: partition {p} did not receive \
+                     the copy of {tenant:?}/{name}; re-issue the write to converge it \
+                     (a create retries as 409, a delete as 404 — re-issue as an update)"
+                );
+                return Err(e);
+            }
+        }
+        Ok(record.map(|v| StoredClusterVariable::from_engine(tenant.as_deref(), &name, &v)))
+    }
+
+    /// Applies a cluster-variable command on global partition `p`: locally
+    /// when this node leads it, else forwarded to the leader.
+    async fn apply_cluster_variable_on(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let Some(node) = self.route_by_leader(key) else {
+            return self.apply_cluster_variable_local(p, command).await;
+        };
+        let link = self.peer_link(node).await?;
+        match link.apply_cluster_variable(p, command).await {
+            Ok(r) if r.status == 200 => serde_json::from_value(r.body.unwrap_or_default())
+                .map_err(|e| (502, format!("malformed cluster-variable reply: {e}"))),
+            Ok(r) => Err((r.status, peer_detail(&r))),
+            Err(e) => Err((503, e.to_string())),
+        }
+    }
+
+    /// Applies a cluster-variable command on local partition `p` through its
+    /// replicated funnel and returns the post-apply record. Also the handler
+    /// behind the intra-cluster `ApplyClusterVariable` frame.
+    ///
+    /// The returned record is the one THIS proposal committed: it is derived
+    /// from the proposal's own events (a create/update event carries the full
+    /// post-mutation record — value, kind, and metadata; a delete event
+    /// carries none), never from a re-read of live state — a re-read runs in
+    /// a separate actor turn, so a concurrent mutation from another gateway
+    /// could land in between and the response (and the fan-out copy built
+    /// from it) would carry the OTHER write's value, or combine this write's
+    /// value with a delete/recreate's replacement kind (PR #1670 review). The
+    /// record's `id` is the one field the events do not carry; it is read
+    /// back best-effort through [`Self::engine_handle_for`] — which also
+    /// reaches a partition this node only LEADS after a failover (its Raft
+    /// replica actor), where `local_for_partition` would report the committed
+    /// write as an error — and defaults to `0` when the partition is not
+    /// hosted here (the fan-out copy does not use the id; the REST `id` is a
+    /// search-pagination cursor only).
+    pub(crate) async fn apply_cluster_variable_local(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (400, "not a cluster-variable command".to_string()))?;
+        // The journal-mode guard must hold on the node that PERSISTS the
+        // record, not only on the originating gateway: a forwarded
+        // `ApplyClusterVariable` from a segmented peer lands here, and a
+        // legacy multi-partition node must refuse it rather than journal an
+        // untagged record it could never recover (PR #1670 review). This is
+        // the single funnel for local and forwarded applies.
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let (events, _commit) = self.apply_partition_command(key, command).await?;
+        // At most one lifecycle event per applied command (an idempotent
+        // distributed delete of an already-absent variable emits none). Both
+        // create and update events carry the complete post-mutation record
+        // (an update's `kind` is the preserved kind, captured by the engine
+        // in the committing turn), so the response record below is exactly
+        // what THIS proposal committed.
+        let mut applied: Option<nanobpmn_engine_core::ClusterVariable> = None;
+        let mut deleted = false;
+        for e in events.iter() {
+            match e {
+                Event::ClusterVariableCreated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
+                }
+                | Event::ClusterVariableUpdated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
+                } => {
+                    applied = Some(nanobpmn_engine_core::ClusterVariable {
+                        id: 0,
+                        value: value.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                    });
+                }
+                Event::ClusterVariableDeleted { .. } => deleted = true,
+                _ => {}
+            }
+        }
+        if deleted {
+            return Ok(None);
+        }
+        let Some(mut record) = applied else {
+            return Ok(None);
+        };
+        // Fill in the id — the one field the events do not carry — from the
+        // applying partition's state. Reaching that state must use
+        // [`Self::engine_handle_for`] — which also reaches a partition this
+        // node only LEADS after a failover (its Raft replica actor) — never
+        // `local_for_partition`, which returns `None` for a promoted partition
+        // and would report the committed write as an error (PR #1670 review).
+        // A partition this node neither owns nor replicates is unreachable:
+        // fail the read-back rather than return a placeholder id. A concurrent
+        // delete landing before this turn only loses the (cursor-only) id —
+        // the record's value/kind/metadata above are already the committed
+        // ones, never re-read.
+        let Some(handle) = self.engine_handle_for(p) else {
+            return Err((
+                503,
+                format!("partition {p} committed but is not hosted here for the read-back"),
+            ));
+        };
+        let (t, n) = (tenant.clone(), name.clone());
+        let id = handle
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(t.as_deref(), &n)
+                    .map(|v| v.id)
+            })
+            .await;
+        if let Some(id) = id {
+            record.id = id;
+        }
+        Ok(Some(record))
     }
 }
 
@@ -630,6 +895,18 @@ fn cluster_variable_kind(v: &StoredClusterVariable) -> models::ClusterVariableKi
     v.kind
 }
 
+/// The 500 `ProblemDetail` for a cluster-variable write that failed for a
+/// reason other than its documented 404 / 409 (e.g. a peer that cannot yet take
+/// the replicated commands during a rolling upgrade, or a quorum loss). The
+/// underlying status is kept in the detail.
+fn cluster_variable_internal((status, detail): (u16, String)) -> models::ProblemDetail {
+    problem(
+        "Cluster variable write failed",
+        500,
+        format!("({status}) {detail}"),
+    )
+}
+
 /// Validates a create/update metadata bag against the serialized-size cap
 /// ([`CLUSTER_VARIABLE_MAX_METADATA_BYTES`]); the 100-entry cap is enforced by
 /// the generated `maxProperties` validator before the handler runs. An omitted
@@ -671,15 +948,14 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) = self
-            .cluster_variables
-            .create(None, &body.name, value, body.kind, metadata)
+        match self
+            .cluster_variable_create(None, &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
+            )),
+            Err((409, _)) => Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
                 problem(
                     "Cluster variable already exists",
                     409,
@@ -688,7 +964,12 @@ impl ServerImpl {
                         body.name
                     ),
                 ),
-            ))
+            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -707,15 +988,14 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .create(Some(tenant), &body.name, value, body.kind, metadata)
+        match self
+            .cluster_variable_create(Some(tenant), &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(
+            )),
+            Err((409, _)) => Ok(
                 Resp::Status409_AClusterVariableWithThisNameAlreadyExistsForTheGivenTenant(
                     problem(
                         "Cluster variable already exists",
@@ -726,7 +1006,12 @@ impl ServerImpl {
                         ),
                     ),
                 ),
-            )
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -743,19 +1028,23 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(None, &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(None, &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -774,22 +1063,26 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(Some(tenant), &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(Some(tenant), &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -800,7 +1093,7 @@ impl ServerImpl {
         path_params: &models::GetGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::GetGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::GetGlobalClusterVariableResponse as Resp;
-        match self.cluster_variables.get(None, &path_params.name) {
+        match self.cluster_variable_get(None, &path_params.name).await {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -820,7 +1113,10 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::GetTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::GetTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        match self.cluster_variables.get(Some(tenant), &path_params.name) {
+        match self
+            .cluster_variable_get(Some(tenant), &path_params.name)
+            .await
+        {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -842,14 +1138,18 @@ impl ServerImpl {
         path_params: &models::DeleteGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::DeleteGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Resp;
-        if self.cluster_variables.delete(None, &path_params.name) {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+        match self.cluster_variable_delete(None, &path_params.name).await {
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -861,20 +1161,24 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::DeleteTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        if self
-            .cluster_variables
-            .delete(Some(tenant), &path_params.name)
+        match self
+            .cluster_variable_delete(Some(tenant), &path_params.name)
+            .await
         {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -895,8 +1199,8 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
 
         let mut matched: Vec<StoredClusterVariable> = self
-            .cluster_variables
-            .all()
+            .cluster_variable_all()
+            .await
             .into_iter()
             .filter(|v| match filter {
                 None => true,
@@ -960,47 +1264,53 @@ mod cluster_variable_tests {
 
     use super::*;
 
-    fn store() -> ClusterVariableStore {
-        ClusterVariableStore::new(ClusterVariables::default())
+    fn store() -> ServerImpl {
+        ServerImpl::default()
     }
 
     fn val(j: serde_json::Value) -> Value {
         json_to_value(&j)
     }
 
-    #[test]
-    fn create_rejects_a_duplicate_scope_and_name() {
+    #[tokio::test]
+    async fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         // Same (scope, name) again -> false, which the handler maps to 409.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("APAC")),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_none()
         );
         // The rejected create left the stored value untouched.
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"EMEA\""
         );
     }
 
-    #[test]
-    fn create_and_update_return_a_race_free_snapshot() {
+    #[tokio::test]
+    async fn create_and_update_return_a_race_free_snapshot() {
         // Regression: the create/update handlers used to re-`get` the record
         // after releasing the mutation lock, so a concurrent DELETE between the
         // mutation and the lookup made `expect("just created"/"just updated")`
@@ -1010,13 +1320,14 @@ mod cluster_variable_tests {
         let s = store();
 
         let created = s
-            .create(
+            .cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("EMEA")),
                 None,
                 ClusterVariableMetadata::new(),
             )
+            .await
             .expect("create of a fresh (scope, name) returns the stored snapshot");
         assert_eq!(created.name, "region");
         assert_eq!(created.tenant_id.as_deref(), Some("acme"));
@@ -1024,203 +1335,317 @@ mod cluster_variable_tests {
 
         // A delete landing right after the mutation cannot invalidate the
         // snapshot already returned to the handler.
-        assert!(s.delete(Some("acme"), "region"));
-        assert!(s.get(Some("acme"), "region").is_none());
+        assert!(
+            s.cluster_variable_delete(Some("acme"), "region")
+                .await
+                .is_ok()
+        );
+        assert!(
+            s.cluster_variable_get(Some("acme"), "region")
+                .await
+                .is_none()
+        );
         assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
 
         // Update returns its own post-mutation snapshot the same way.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "flag",
                 val(json!(false)),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         let updated = s
-            .update(
+            .cluster_variable_update(
                 None,
                 "flag",
                 val(json!(true)),
                 ClusterVariableMetadata::new(),
             )
+            .await
             .expect("update of an existing (scope, name) returns the stored snapshot");
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
-        assert!(s.delete(None, "flag"));
+        assert!(s.cluster_variable_delete(None, "flag").await.is_ok());
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
     }
 
-    #[test]
-    fn global_and_tenant_scopes_are_isolated() {
+    #[tokio::test]
+    async fn global_and_tenant_scopes_are_isolated() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("global")),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("acme")),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
-        assert_eq!(s.all().len(), 2);
+        assert_eq!(s.cluster_variable_all().await.len(), 2);
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"global\""
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(Some("acme"), "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(Some("acme"), "region")
+                    .await
+                    .unwrap()
+                    .value
+            ),
             "\"acme\""
         );
         // A lookup never crosses scopes.
-        assert!(s.get(Some("other"), "region").is_none());
+        assert!(
+            s.cluster_variable_get(Some("other"), "region")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn update_requires_an_existing_entry() {
+    #[tokio::test]
+    async fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
         assert!(
-            s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_none()
         );
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "ghost",
                 val(json!(1)),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         assert!(
-            s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "ghost").await.unwrap().value
+            ),
             "2"
         );
     }
 
-    #[test]
-    fn delete_reports_absence() {
+    #[tokio::test]
+    async fn delete_reports_absence() {
         let s = store();
-        assert!(!s.delete(None, "nope"));
+        assert!(!s.cluster_variable_delete(None, "nope").await.is_ok());
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "nope",
                 val(json!(true)),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
-        assert!(s.delete(None, "nope"));
-        assert!(s.get(None, "nope").is_none());
+        assert!(s.cluster_variable_delete(None, "nope").await.is_ok());
+        assert!(s.cluster_variable_get(None, "nope").await.is_none());
     }
 
-    #[test]
-    fn empty_object_value_round_trips() {
+    #[tokio::test]
+    async fn empty_object_value_round_trips() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "cfg",
                 val(json!({})),
                 None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "cfg").await.unwrap().value
+            ),
             "{}"
         );
     }
 
-    #[test]
-    fn mutations_sync_the_shared_runtime_snapshot() {
-        let runtime = ClusterVariables::default();
-        let s = ClusterVariableStore::new(runtime.clone());
-        s.create(
-            None,
-            "region",
-            val(json!("EMEA")),
-            None,
-            ClusterVariableMetadata::new(),
+    /// #1657: a REST mutation is a replicated command on EVERY partition —
+    /// the authoritative partition 0 plus an idempotent copy on each other one
+    /// — so each partition's FEEL resolution reads the same log-derived state
+    /// (no node-local host store), and a delete clears every copy.
+    #[tokio::test]
+    async fn mutations_land_in_every_partition_engine_state() {
+        let s = build_server_in_memory(
+            vec![
+                Journal::in_memory_partition(0),
+                Journal::in_memory_partition(1),
+            ],
+            cluster::Topology::single(2),
         );
-        s.create(
-            Some(DEFAULT_TENANT),
-            "tier",
-            val(json!(2)),
-            None,
-            ClusterVariableMetadata::new(),
+        assert!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
         );
-        {
-            let snap = runtime.read().unwrap();
-            assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
+        assert!(
+            s.cluster_variable_create(
+                Some(DEFAULT_TENANT),
+                "tier",
+                val(json!(2)),
+                Some(models::ClusterVariableKindEnum::SecretReference),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            s.cluster_variable_update(
+                None,
+                "region",
+                val(json!("APAC")),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        let states: Vec<_> = futures_util::future::join_all(
+            s.engine
+                .all()
+                .iter()
+                .map(|h| h.with(|j| j.engine().cluster_variables().clone())),
+        )
+        .await;
+        assert_eq!(states.len(), 2);
+        for state in &states {
             assert_eq!(
-                snap.tenants.get(DEFAULT_TENANT).and_then(|m| m.get("tier")),
-                Some(&val(json!(2)))
+                state.get(None, "region").map(|v| v.value.clone()),
+                Some(val(json!("APAC")))
+            );
+            let tier = state.get(Some(DEFAULT_TENANT), "tier").expect("fanned out");
+            assert_eq!(tier.value, val(json!(2)));
+            assert_eq!(
+                tier.kind,
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+                "the kind is replicated with the value"
             );
         }
-        s.delete(None, "region");
-        assert!(!runtime.read().unwrap().global.contains_key("region"));
+        // The fanned-out copy is never a 409 source: a second create is
+        // validated only on the authoritative partition.
+        assert_eq!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .0,
+            409
+        );
+        assert!(s.cluster_variable_delete(None, "region").await.is_ok());
+        for h in s.engine.all() {
+            assert!(
+                h.with(|j| j.engine().cluster_variables().get(None, "region").is_none())
+                    .await
+            );
+        }
+        assert_eq!(
+            s.cluster_variable_delete(None, "region")
+                .await
+                .unwrap_err()
+                .0,
+            404
+        );
     }
 
-    #[test]
-    fn result_projection_reports_scope_and_tenant() {
+    #[tokio::test]
+    async fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(
+        s.cluster_variable_create(
             None,
             "g",
             val(json!("x")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        s.create(
+        )
+        .await
+        .ok();
+        s.cluster_variable_create(
             Some("acme"),
             "t",
             val(json!("y")),
             None,
             ClusterVariableMetadata::new(),
-        );
-        let g = cluster_variable_result(&s.get(None, "g").unwrap());
+        )
+        .await
+        .ok();
+        let g = cluster_variable_result(&s.cluster_variable_get(None, "g").await.unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
         assert_eq!(g.value, "\"x\"");
-        let t = cluster_variable_result(&s.get(Some("acme"), "t").unwrap());
+        let t = cluster_variable_result(&s.cluster_variable_get(Some("acme"), "t").await.unwrap());
         assert_eq!(t.scope, models::ClusterVariableScopeEnum::Tenant);
         assert_eq!(t.tenant_id, types::Nullable::Present("acme".to_string()));
     }
 
-    #[test]
-    fn search_result_truncates_long_values() {
+    #[tokio::test]
+    async fn search_result_truncates_long_values() {
         let s = store();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        s.create(
+        s.cluster_variable_create(
             None,
             "big",
             val(json!(long)),
             None,
             ClusterVariableMetadata::new(),
-        );
-        let stored = s.get(None, "big").unwrap();
+        )
+        .await
+        .ok();
+        let stored = s.cluster_variable_get(None, "big").await.unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
     }
@@ -1365,7 +1790,7 @@ mod cluster_variable_tests {
             Create::Status400_TheProvidedDataIsNotValid(_)
         ));
         assert!(
-            server.cluster_variables.get(None, "big").is_none(),
+            server.cluster_variable_get(None, "big").await.is_none(),
             "nothing stored"
         );
         assert!(matches!(
@@ -1387,7 +1812,11 @@ mod cluster_variable_tests {
         ));
         assert_eq!(
             cluster_variable_value_string(
-                &server.cluster_variables.get(None, "small").unwrap().value
+                &server
+                    .cluster_variable_get(None, "small")
+                    .await
+                    .unwrap()
+                    .value
             ),
             "\"v\"",
             "a rejected update leaves the variable untouched"
@@ -1452,13 +1881,303 @@ mod cluster_variable_tests {
             models::ClusterVariableKindEnum::SecretReference
         );
 
-        // The runtime FEEL overlay carries the reference text through
+        // The replicated engine state carries the reference text through
         // unchanged — nothing resolved is ever handed to the engine.
-        let snap = server.cluster_variables.runtime.read().unwrap();
+        let state = server.cluster_variable_state().await;
         assert_eq!(
-            snap.global.get("api_token"),
-            Some(&val(json!("camunda.secrets.API_TOKEN"))),
-            "the engine overlay sees the reference text verbatim"
+            state.get(None, "api_token").map(|v| v.value.clone()),
+            Some(val(json!("camunda.secrets.API_TOKEN"))),
+            "the engine state sees the reference text verbatim"
+        );
+    }
+
+    /// PR #1670 review: an update's response (and the fan-out copy built from
+    /// it) must carry the variable's PRESERVED kind from the proposal's own
+    /// commit — never a live-state re-read, which a concurrent delete/recreate
+    /// could swap under it (combining the new value with a replacement's
+    /// kind). Pin the observable contract: updating a SECRET_REFERENCE
+    /// variable returns `kind: SECRET_REFERENCE` with the new value, and a
+    /// delete-then-recreate as JSON leaves the PRIOR update's response kind
+    /// untouched.
+    #[tokio::test]
+    async fn update_response_preserves_the_committed_kind() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Delete;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let mut req = create_req("api_token", None);
+        req.value = types::Object(json!("camunda.secrets.API_TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        let Create::Status200_ClusterVariableCreated(_) = server
+            .create_global_cluster_variable_impl(&req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a SECRET_REFERENCE create");
+        };
+
+        // The update response carries the preserved SECRET_REFERENCE kind with
+        // the new value — derived from the update's own commit, not re-read.
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let mut update = update_req(None);
+        update.value = types::Object(json!("camunda.secrets.ROTATED"));
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(&upd, &update)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the update");
+        };
+        assert_eq!(
+            r.kind,
+            models::ClusterVariableKindEnum::SecretReference,
+            "an update preserves the stored kind"
+        );
+        assert_eq!(r.value, "\"camunda.secrets.ROTATED\"");
+
+        // A delete/recreate as JSON changes the STORED kind, but the already
+        // returned update response above is immutable — and the new state is
+        // what later reads see.
+        let del = models::DeleteGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let Delete::Status204_ClusterVariableDeletedSuccessfully = server
+            .delete_global_cluster_variable_impl(&del)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 204 for the delete");
+        };
+        let mut recreate = create_req("api_token", None);
+        recreate.value = types::Object(json!({"endpoint": "https://api"}));
+        let Create::Status200_ClusterVariableCreated(r) = server
+            .create_global_cluster_variable_impl(&recreate)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the recreate");
+        };
+        assert_eq!(r.kind, models::ClusterVariableKindEnum::Json);
+        assert_eq!(r.value, "{\"endpoint\":\"https://api\"}");
+    }
+
+    /// #1640 harness: a server with an in-memory secret store, a
+    /// SECRET_REFERENCE cluster variable `apiCfg` and a JSON-kind `jsonCfg`
+    /// (both holding `camunda.secrets.TOKEN`), and a deployed service task
+    /// whose input mappings read them, a literal `camunda.secrets.<direct>`
+    /// path, and a process variable carrying reference text.
+    async fn secret_job_server(direct: &str) -> ServerImpl {
+        secret_job_server_with(direct, Vec::new()).await
+    }
+
+    /// [`secret_job_server`] with extra process variables layered over the
+    /// default `bodyRef` request-body variable.
+    async fn secret_job_server_with(
+        direct: &str,
+        extra_vars: Vec<(&str, serde_json::Value)>,
+    ) -> ServerImpl {
+        use nanobpmn_engine_core::{IoMapping, Mapping};
+        let server = ServerImpl {
+            secret_store: Arc::new(crate::secrets::MapSecretStore(
+                std::collections::BTreeMap::from([
+                    ("TOKEN".to_string(), "s3cr3t".to_string()),
+                    ("DIRECT".to_string(), "direct-value".to_string()),
+                ]),
+            )),
+            ..ServerImpl::default()
+        };
+        for (name, kind) in [
+            ("apiCfg", models::ClusterVariableKindEnum::SecretReference),
+            ("jsonCfg", models::ClusterVariableKindEnum::Json),
+        ] {
+            let mut req = create_req(name, None);
+            req.value = types::Object(json!("camunda.secrets.TOKEN"));
+            req.kind = Some(kind);
+            assert!(matches!(
+                server
+                    .create_global_cluster_variable_impl(&req)
+                    .await
+                    .unwrap(),
+                apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+            ));
+        }
+        let m = |source: &str, target: &str| Mapping {
+            source: source.to_string(),
+            target: target.to_string(),
+        };
+        let process = ProcessBuilder::new("secrets")
+            .start_event("s")
+            .service_task("call", "call-api")
+            .end_event("e")
+            .connect("s", "call")
+            .connect("call", "e")
+            .with_io(
+                "call",
+                IoMapping {
+                    inputs: vec![
+                        m("=apiCfg", "token"),
+                        m(&format!("=camunda.secrets.{direct}"), "direct"),
+                        m("=jsonCfg", "fromJson"),
+                        m("=bodyRef", "fromBody"),
+                        m("=apiCfg", "payload.auth"),
+                        m("=bodyRef", "payload.other"),
+                        m("=apiCfg", "overwritten"),
+                        m("=bodyRef", "overwritten"),
+                    ],
+                    outputs: Vec::new(),
+                },
+            )
+            .build()
+            .unwrap();
+        let names =
+            std::collections::HashMap::from([("secrets".to_string(), "secrets.bpmn".to_string())]);
+        server
+            .deploy_resources_locally(
+                vec![process],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .unwrap();
+        server
+            .create_for_stream(
+                Some("secrets".into()),
+                None,
+                std::iter::once(("bodyRef", json!("camunda.secrets.TOKEN")))
+                    .chain(extra_vars)
+                    .map(|(name, value)| (name.to_string(), val(value)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        server
+    }
+
+    async fn activate_secret_jobs(server: &ServerImpl) -> Vec<models::ActivatedJobResult> {
+        use apis::job::ActivateJobsResponse as ActR;
+        let mut req = models::JobActivationRequest::new("call-api".into(), 60_000, 10);
+        req.request_timeout = Some(-1);
+        match server.activate_jobs_impl(&req).await.unwrap() {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// #1640: at job activation, trusted references (a SECRET_REFERENCE
+    /// cluster variable read by an input mapping, a literal
+    /// `camunda.secrets.<name>` path) are resolved into the worker payload;
+    /// untrusted ones (a JSON-kind cluster variable, a process variable) keep
+    /// their reference text; and nothing resolved reaches engine state.
+    #[tokio::test]
+    async fn job_activation_resolves_only_trusted_secret_references() {
+        let server = secret_job_server("DIRECT").await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        let vars = &jobs[0].variables;
+        assert_eq!(vars["token"].0, json!("s3cr3t"));
+        assert_eq!(vars["direct"].0, json!("direct-value"));
+        assert_eq!(vars["fromJson"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(vars["fromBody"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(
+            vars["payload"].0,
+            json!({"auth": "s3cr3t", "other": "camunda.secrets.TOKEN"}),
+            "only the trusted path resolves — never a sibling holding equal text"
+        );
+        assert_eq!(
+            vars["overwritten"].0,
+            json!("camunda.secrets.TOKEN"),
+            "a trusted target overwritten by a later untrusted mapping stays unresolved"
+        );
+        assert_eq!(
+            vars["apiCfg"].0,
+            json!("camunda.secrets.TOKEN"),
+            "the bare cluster-variable overlay is not an input mapping: never resolved"
+        );
+
+        // Engine state (and so the journal/snapshot) still holds only the
+        // reference text — the plaintext lives in the worker payload alone.
+        let leaked = server.engine.all()[0]
+            .with(|j| {
+                format!(
+                    "{:?}",
+                    j.state()
+                        .instances
+                        .values()
+                        .map(|i| (i.variables.clone(), i.scope_variables.clone()))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .await;
+        assert!(leaked.contains("camunda.secrets.TOKEN"));
+        assert!(
+            !leaked.contains("s3cr3t") && !leaked.contains("direct-value"),
+            "a resolved secret must never be persisted in engine state: {leaked}"
+        );
+    }
+
+    /// #1640: trust is fixed when the input mappings run. Deleting the
+    /// SECRET_REFERENCE cluster variable afterwards neither withholds the job
+    /// nor raises an incident; recreating a deleted root as JSON-kind cannot
+    /// retroactively distrust or trust anything either.
+    #[tokio::test]
+    async fn job_activation_uses_mapping_time_provenance_not_live_cluster_variables() {
+        let server = secret_job_server("DIRECT").await;
+        assert!(server.cluster_variable_delete(None, "apiCfg").await.is_ok());
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].variables["token"].0, json!("s3cr3t"));
+    }
+
+    /// #1640: a process variable shadowing the trusted cluster root (same
+    /// name, same reference text) is untrusted — the mapping read the
+    /// caller-supplied value, so it is never resolved.
+    #[tokio::test]
+    async fn job_activation_does_not_resolve_a_shadowing_process_variable() {
+        let server =
+            secret_job_server_with("DIRECT", vec![("apiCfg", json!("camunda.secrets.TOKEN"))])
+                .await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        let vars = &jobs[0].variables;
+        assert_eq!(vars["token"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(vars["payload"].0["auth"], json!("camunda.secrets.TOKEN"));
+        assert_eq!(
+            vars["direct"].0,
+            json!("direct-value"),
+            "a literal camunda.secrets path is unaffected by the shadow"
+        );
+    }
+
+    /// #1640: an unresolvable trusted secret raises an incident on the element
+    /// with Zeebe's message instead of handing the worker the literal.
+    #[tokio::test]
+    async fn job_activation_with_missing_secret_raises_an_incident() {
+        let server = secret_job_server("MISSING").await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert!(jobs.is_empty(), "the job is withheld from the worker");
+        let incidents = server.engine.all()[0]
+            .with(|j| {
+                j.state()
+                    .incidents
+                    .values()
+                    .map(|i| (i.element_id.clone(), i.reason.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        assert_eq!(
+            incidents,
+            vec![(
+                "call".to_string(),
+                "Failed to resolve secret 'MISSING' from default. Ensure the secret exists and the store is available, then resolve the incident to retry.".to_string()
+            )]
+        );
+        assert!(
+            activate_secret_jobs(&server).await.is_empty(),
+            "the failed job is no longer activatable"
         );
     }
 
@@ -1468,13 +2187,16 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_kind_filter_distinguishes_secret_references() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
-            None,
-            "plain",
-            val(json!(1)),
-            None,
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "plain",
+                val(json!(1)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
         let mut req = create_req("token", None);
         req.value = types::Object(json!("camunda.secrets.TOKEN"));
         req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
@@ -1518,27 +2240,36 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_kind_and_metadata() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
-            None,
-            "a",
-            val(json!(1)),
-            None,
-            meta(json!({"owner": "team-a", "ttl": 30})),
-        );
-        server.cluster_variables.create(
-            None,
-            "b",
-            val(json!(2)),
-            None,
-            meta(json!({"owner": "team-b", "ttl": "30"})),
-        );
-        server.cluster_variables.create(
-            None,
-            "c",
-            val(json!(3)),
-            None,
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "a",
+                val(json!(1)),
+                None,
+                meta(json!({"owner": "team-a", "ttl": 30})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "b",
+                val(json!(2)),
+                None,
+                meta(json!({"owner": "team-b", "ttl": "30"})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "c",
+                val(json!(3)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         let kind =
             |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
@@ -1606,27 +2337,36 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
-            None,
-            "region",
-            val(json!("global")),
-            None,
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            Some("acme"),
-            "region",
-            val(json!("acme")),
-            None,
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            Some("beta"),
-            "tier",
-            val(json!(2)),
-            None,
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("global")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("acme"),
+                "region",
+                val(json!("acme")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("beta"),
+                "tier",
+                val(json!(2)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -1675,20 +2415,26 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server.cluster_variables.create(
-            None,
-            "big",
-            val(json!(long)),
-            None,
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            None,
-            "small",
-            val(json!("x")),
-            None,
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "big",
+                val(json!(long)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "small",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -1736,13 +2482,16 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server.cluster_variables.create(
-                None,
-                n,
-                val(json!(n)),
-                None,
-                ClusterVariableMetadata::new(),
-            );
+            server
+                .cluster_variable_create(
+                    None,
+                    n,
+                    val(json!(n)),
+                    None,
+                    ClusterVariableMetadata::new(),
+                )
+                .await
+                .ok();
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -1800,6 +2549,125 @@ mod cluster_variable_tests {
         )
         .await;
         assert_eq!(names(&page2_again), names(&page2));
+    }
+
+    /// PR #1670 review: the mutation response must be the record THIS command
+    /// committed, derived from its own events — not a re-read of live state a
+    /// concurrent mutation could have changed in between.
+    #[tokio::test]
+    async fn mutation_returns_the_committed_record_from_its_own_events() {
+        let s = store();
+        let created = s
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .expect("create succeeds");
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+        assert_eq!(created.kind, models::ClusterVariableKindEnum::Json);
+        assert_ne!(created.id, 0, "the id is filled in from the apply");
+
+        let mut metadata = ClusterVariableMetadata::new();
+        metadata.insert(
+            "owner".to_string(),
+            models::ClusterVariableResultBaseMetadataValue::String("ops".to_string()),
+        );
+        let updated = s
+            .cluster_variable_update(None, "region", val(json!("APAC")), metadata)
+            .await
+            .expect("update succeeds");
+        assert_eq!(cluster_variable_value_string(&updated.value), "\"APAC\"");
+        assert_eq!(
+            updated.id, created.id,
+            "an update preserves the id (and the response carries it)"
+        );
+
+        // A delete commits and reports `None` without any post-commit lookup.
+        s.cluster_variable_delete(None, "region")
+            .await
+            .expect("delete succeeds");
+        assert!(s.cluster_variable_get(None, "region").await.is_none());
+    }
+
+    /// PR #1670 review: after a failover this node can LEAD a partition it does
+    /// not statically own, and the post-apply read-back must reach that
+    /// partition's Raft replica actor via `engine_handle_for` — not
+    /// `local_for_partition`, which returns `None` for a promoted partition and
+    /// would report the committed write as an error. The non-Raft apply funnel
+    /// cannot target a non-owned partition in a test (its `by_key` falls back to
+    /// an owned actor), so this pins the accessor contract the fix relies on:
+    /// `engine_handle_for` serves a led-but-not-owned partition from its replica
+    /// actor where `local_for_partition` does not.
+    #[tokio::test]
+    async fn engine_handle_for_reaches_a_promoted_partitions_replica_actor() {
+        // This node owns partition 0 and merely REPLICATES partition 1.
+        let owned = Journal::in_memory_partition(0);
+        let mut replica = Journal::in_memory_partition(1);
+        // Seed the replica (as its replicated apply would) with the variable the
+        // promoted partition holds, so the read-back has something to find.
+        let (_events, seed_commit) = replica
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "promoted".to_string(),
+                    value: val(json!(42)),
+                    kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+                    metadata: Default::default(),
+                    distributed: true,
+                },
+                1,
+            )
+            .expect("seed the replica's cluster variable");
+        seed_commit.blocking_wait();
+        let replica_id = replica
+            .engine()
+            .cluster_variables()
+            .get(None, "promoted")
+            .map(|v| v.id);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![owned], topology);
+        // As raft_bootstrap would: host the follower replica engine for p1.
+        let replica_handle = DeepthiHandle::spawn(replica, 1, None);
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1, replica_handle);
+
+        // The pre-fix accessor finds nothing for the non-owned partition…
+        assert!(
+            server.engine.local_for_partition(1).is_none(),
+            "partition 1 is not statically owned here"
+        );
+        // …but the F5 accessor reaches its replica actor and reads the value.
+        let handle = server
+            .engine_handle_for(1)
+            .expect("engine_handle_for serves a led-but-not-owned partition");
+        let read = handle
+            .with(|j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(None, "promoted")
+                    .map(|v| (v.id, cluster_variable_value_string(&v.value)))
+            })
+            .await;
+        assert_eq!(
+            read,
+            replica_id.map(|id| (id, "42".to_string())),
+            "the replica actor serves partition 1's cluster variable"
+        );
     }
 }
 
@@ -2779,6 +3647,13 @@ pub struct ServerImpl {
     // (s1-broadcast / s1-bykey-forward); constructed and tested now.
     #[allow(dead_code)]
     peers: peer::PeerSet,
+    /// Whether this node's `/cluster` handshake response advertises its
+    /// replicated-command features (#1661). Always `true` in production; a
+    /// mixed-version test clears it to model a pre-#1661 binary, which sends
+    /// no feature header at all and never proposes `SetLenientCompletion`
+    /// (`reconcile_lenient_completion_via_raft` honours it as the leader's own
+    /// feature support).
+    advertise_cluster_features: Arc<std::sync::atomic::AtomicBool>,
     /// The Raft groups this node hosts (one per partition it replicates), empty
     /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
@@ -2817,9 +3692,12 @@ pub struct ServerImpl {
     /// do NOT propose `ActivateJobs`: the leader
     /// locks jobs in its own engine actor only and lock-expiry stays local, so each
     /// job costs 2 quorum commits and per-worker activation stops fragmenting the
-    /// commit budget. Replicas then run with lenient completion (see
-    /// [`Engine::set_lenient_completion`]) so a replicated completion applies even
-    /// though they never saw the activation.
+    /// commit budget. Replicas then run with lenient completion — replicated
+    /// engine state set by `Command::SetLenientCompletion` at one log index on
+    /// every replica (#1661, see [`Self::reconcile_lenient_completion_via_raft`])
+    /// — so a replicated completion applies even though they never saw the
+    /// activation. Until that flag is committed (the ADR 0066 rolling-upgrade
+    /// window), every node runs the pre-#1661 LEGACY host flag from this policy.
     ///
     /// No effect on a single node / RF=1 (no Raft). DURABILITY TRADE-OFF in the
     /// leader-local variants: the lease is leader-RAM-only and does NOT survive
@@ -2960,9 +3838,13 @@ pub struct ServerImpl {
     /// Batch-operations read model (#905). Empty until that slice fills it.
     #[allow(dead_code)]
     batch_operations: BatchOperationStore,
-    /// Cluster-variables store, global + per-tenant (#906). Empty until that slice fills it.
-    #[allow(dead_code)]
-    cluster_variables: ClusterVariableStore,
+    /// Serializes this gateway's cluster-variable writes (#1657) so the
+    /// authoritative apply and its per-partition fan-out of one write never
+    /// interleave with another's. The state itself lives in the engine.
+    cluster_variable_writes: Arc<tokio::sync::Mutex<()>>,
+    /// The secret provider trusted `camunda.secrets.<name>` references resolve
+    /// against at job activation (#1640, env-pointer store — ADR 0027 §5).
+    secret_store: Arc<dyn secrets::SecretStore>,
     /// Job-statistics aggregation state (#907). Empty until that slice fills it.
     #[allow(dead_code)]
     job_statistics: JobStatisticsState,
@@ -3069,13 +3951,34 @@ impl ServerImpl {
         let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
-            // Leader-local activation (any policy that can lock leader-only): replicas
-            // must accept a replicated completion for a job they never saw activated
-            // (the lock is not replicated). Harmless on a single node (no follower
-            // ever applies a completion for an un-activated job in practice, but the
-            // relaxed check is still correct there).
-            if activation_policy.may_be_leader_local() {
-                journal.set_lenient_completion(true);
+            // Leader-local activation (any policy that can lock leader-only) needs
+            // lenient completion: a completion for a job whose (unreplicated) lock
+            // was lost must still apply. It is replicated engine state (#1661), so
+            // it is set by a journaled command — directly here on a single node
+            // (no Raft log can exist), through the Raft log on a cluster
+            // (`reconcile_lenient_completion_via_raft`), never as host config.
+            //
+            // ROLLING UPGRADE (ADR 0066): until the replicated flag is committed,
+            // every node keeps today's behaviour — the LEGACY host flag from the
+            // activation policy, set identically on every node at startup.
+            journal.set_legacy_lenient_completion(activation_policy.may_be_leader_local());
+            // One-way (ADR 0002 notes): once replicated state is lenient it
+            // stays lenient — state wins over config.
+            if journal.engine().replicated_lenient_completion()
+                && !activation_policy.may_be_leader_local()
+            {
+                tracing::warn!(
+                    "partition state has replicated lenient completion enabled, but the \
+                     activation policy {activation_policy:?} does not need it; lenient \
+                     completion is one-way and stays on (replicated state wins over config)"
+                );
+            }
+            if topology.is_single_node() {
+                reconcile_lenient_completion_local(
+                    journal,
+                    activation_policy.may_be_leader_local(),
+                    now_millis(),
+                );
             }
         }
         // The deployment partition (id 0) is the only one that seeds the demo
@@ -3127,7 +4030,7 @@ impl ServerImpl {
         // set (hot ∪ cold across every replayed partition) and mark every Active
         // read row absent from it as Completed, then seed the gauge from the
         // reconciled (true) count.
-        let mut live_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live_keys: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for journal in journals.iter() {
             journal.collect_live_instance_keys(&mut live_keys);
         }
@@ -3422,18 +4325,12 @@ impl ServerImpl {
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
         let owned_count = journals.len();
-        // Shared cluster-variable handle: one snapshot the gateway's REST layer
-        // mutates and every owned engine reads while resolving FEEL expressions.
-        // Installed on each journal before it is moved onto its engine thread; the
-        // same handle backs `ServerImpl.cluster_variables` below.
-        let cluster_variables = ClusterVariables::default();
         let handles: Vec<DeepthiHandle> = journals
             .into_iter()
             .enumerate()
-            .map(|(i, mut journal)| {
+            .map(|(i, journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
                 let partition = journal.partition_id();
-                journal.set_cluster_variables(cluster_variables.clone());
                 DeepthiHandle::spawn(journal, partition, ctrl)
             })
             .collect();
@@ -3494,6 +4391,7 @@ impl ServerImpl {
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
+            advertise_cluster_features: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             )),
@@ -3532,7 +4430,8 @@ impl ServerImpl {
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
             batch_operations: BatchOperationStore::default(),
-            cluster_variables: ClusterVariableStore::new(cluster_variables),
+            cluster_variable_writes: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store: Arc::new(secrets::EnvSecretStore::from_env()),
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(nano_trace_store::TraceStore::from_env()),
@@ -3567,8 +4466,8 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 /// definitions through the index fallback, so the seed must include them too
 /// (otherwise a freshly-seeded peer cannot resolve what the owner can).
 fn seed_versions<'a, T>(
-    versions: &'a std::collections::HashMap<Key, T>,
-    latest: &'a std::collections::HashMap<String, T>,
+    versions: &'a std::collections::BTreeMap<Key, T>,
+    latest: &'a std::collections::BTreeMap<String, T>,
     key: impl Fn(&T) -> Key,
 ) -> std::collections::BTreeMap<Key, &'a T> {
     let mut all: std::collections::BTreeMap<Key, &'a T> =
@@ -3859,6 +4758,17 @@ impl ServerImpl {
         Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
     }
 
+    /// [`Self::raft_transport`] for a Raft group about to START replicating
+    /// (#1661): first installs the outbound feature requirement derived from
+    /// this node's recovered / snapshot-restored state, so a restarted leader
+    /// whose enabling `SetLenientCompletion` entry was compacted into a snapshot
+    /// can never stream that snapshot to a legacy peer before the periodic
+    /// requirement sync. Every production Raft start path goes through here.
+    async fn raft_transport_for_start(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
+        let _required = self.required_cluster_features().await;
+        self.raft_transport()
+    }
+
     /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
     /// replica of `partition`, and return its serialized response. `Err((status,
     /// message))` maps to the falcon `CommandResult` status (400 malformed,
@@ -3881,9 +4791,22 @@ impl ServerImpl {
                 format!("no raft group for partition {partition} on this node"),
             )
         })?;
+        // #1661: lenient state can reach this node over the wire, and a later
+        // leadership change could ship it onward (AppendEntries or, once the
+        // enabling entry is compacted, InstallSnapshot) before the periodic
+        // requirement sync. Record the requirement on receipt: inbound entries
+        // by their payload, an inbound snapshot by the state it restored.
+        let inbound_requirements = crate::raft_net::required_features_for(&req);
+        let is_snapshot = matches!(req, crate::raft_net::RaftRpcRequest::InstallSnapshot(_));
+        for feature in inbound_requirements {
+            self.peers.require_feature(feature).await;
+        }
         let resp = crate::raft_net::dispatch(&part.raft, req)
             .await
             .map_err(|e| (500u16, format!("raft dispatch failed: {e}")))?;
+        if is_snapshot {
+            let _required = self.required_cluster_features().await;
+        }
         serde_json::to_value(resp).map_err(|e| (500u16, format!("encode raft response: {e}")))
     }
 }
@@ -3932,6 +4855,207 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
         // loudly rather than serve a stale read model.
         if let Err(e) = seglog::catch_up_shard(shard, base_p, &p_events, reseed_state) {
             panic!("failed to catch up read-model shard {pid} from the segmented journal: {e}");
+        }
+    }
+}
+
+/// Demultiplexes a legacy (non-segmented, untagged) shared journal into the
+/// events each of `owned` partitions replays on recovery — the single canonical
+/// demux for every legacy multi-partition boot path (single-node, where `owned`
+/// is every partition, and clustered, where it is this node's subset).
+///
+/// Routing contract:
+///
+/// * A **partition-agnostic definition** event (`ProcessDeployed` and the other
+///   resource deployments) mints no instance state and its key belongs to the
+///   deployment partition (0), which a clustered peer may not own — so it is
+///   replayed into *every* owned partition, reconstructing the definition
+///   cluster-wide from a single durable copy (see
+///   `Journal::install_deployment_durable`). Start subscriptions / timers keep
+///   their partition-0 keys and demux normally.
+/// * A **cluster-variable lifecycle** event ([`Event::is_cluster_variable_lifecycle`])
+///   is NEVER routed: the legacy format records no producing partition, so a
+///   broadcast would install a value into partitions whose fan-out copy never
+///   committed, and a key route would lose it everywhere but partition 0. With
+///   more than one partition the demux fails closed with the typed
+///   [`seglog::UnattributedClusterVariableError`] (#1657, ADR 0066 — the
+///   #1473 rule); writes are refused in that mode
+///   ([`check_cluster_variable_journal_mode`]), so such a record only exists if
+///   an unguarded build wrote it. Single-partition journals are unaffected.
+/// * Every other event goes to its [`Event::owning_partition`]. A key whose
+///   partition is out of range (e.g. a log from a larger partition layout)
+///   falls back to the lowest owned partition so replay never panics and no
+///   durable record is dropped; in the clustered layout a partition id this
+///   node does not own is dropped — its owner replays it from its own journal.
+fn demux_legacy_shared_log(
+    events: Vec<Event>,
+    owned: Vec<u64>,
+    partitions: u64,
+) -> std::io::Result<std::collections::HashMap<u64, Vec<Event>>> {
+    let mut per_partition: std::collections::HashMap<u64, Vec<Event>> =
+        owned.iter().map(|p| (*p, Vec::new())).collect();
+    let fallback = owned.first().copied();
+    for event in events {
+        seglog::check_cluster_variable_attribution(&event, false, partitions as usize)?;
+        if matches!(
+            event,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
+        ) {
+            for bucket in per_partition.values_mut() {
+                bucket.push(event.clone());
+            }
+            continue;
+        }
+        let p = event.owning_partition();
+        if let Some(bucket) = per_partition.get_mut(&p) {
+            bucket.push(event);
+        } else if p >= partitions
+            && let Some(fallback) = fallback
+            && let Some(bucket) = per_partition.get_mut(&fallback)
+        {
+            // Genuinely out of range (a log from a larger partition layout):
+            // keep the record on the lowest owned partition rather than
+            // dropping durable state.
+            bucket.push(event);
+        }
+        // else: a valid partition this node does not own — dropped; its owner
+        // replays it from its own journal.
+    }
+    Ok(per_partition)
+}
+
+#[cfg(test)]
+mod legacy_demux_tests {
+    use super::*;
+
+    fn cv_created(name: &str) -> Event {
+        Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: name.to_string(),
+            value: Value::Int(1),
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+            metadata: Default::default(),
+        }
+    }
+
+    fn is_unattributed(err: &std::io::Error) -> bool {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<seglog::UnattributedClusterVariableError>())
+            .is_some()
+    }
+
+    /// PR #1670 review (#1657, ADR 0066): an untagged cluster-variable record
+    /// in a multi-partition legacy journal has no producing partition. The
+    /// demux must fail closed with the typed error — never broadcast it into
+    /// partitions whose fan-out copy may never have committed — in BOTH the
+    /// single-node (every partition owned) and clustered (subset) layouts.
+    #[test]
+    fn legacy_demux_fails_closed_on_multi_partition_cluster_variables() {
+        for owned in [vec![0, 1, 2], vec![0, 2]] {
+            let err = demux_legacy_shared_log(vec![cv_created("x")], owned, 3)
+                .expect_err("unattributable cluster-variable record must fail closed");
+            assert!(is_unattributed(&err), "{err}");
+        }
+    }
+
+    /// Single-partition legacy is unaffected: every record is partition 0's.
+    #[test]
+    fn legacy_demux_single_partition_keeps_cluster_variables() {
+        let demuxed = demux_legacy_shared_log(vec![cv_created("x")], vec![0], 1)
+            .expect("single-partition legacy is attributable");
+        assert_eq!(demuxed[&0].len(), 1);
+    }
+
+    /// An instance-keyed event routes to its owning partition only.
+    #[test]
+    fn legacy_demux_routes_keyed_events_to_their_owning_partition() {
+        let keyed = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(2, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![keyed], vec![0, 1, 2], 3).expect("demux");
+        assert!(demuxed[&0].is_empty() && demuxed[&1].is_empty());
+        assert_eq!(demuxed[&2].len(), 1);
+    }
+
+    /// Clustered layout: a keyed event for a partition this node does not own
+    /// is dropped (its owner replays it from its own journal).
+    #[test]
+    fn legacy_demux_clustered_drops_unowned() {
+        let keyed_unowned = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(1, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![keyed_unowned], vec![0, 2], 3).expect("demux");
+        assert!(
+            demuxed.values().all(Vec::is_empty),
+            "the unowned partition's keyed event is dropped"
+        );
+    }
+
+    /// PR #1670 review (journal ordering): the legacy single-node
+    /// multi-partition boot must emit its journals in ASCENDING partition-id
+    /// order — `Partitions::new` requires `handles[i]` to own partition `i`,
+    /// and the engine actors spawn from that vector in order. Collecting the
+    /// demux HashMap directly orders the journals arbitrarily, so a restart
+    /// could route every keyed command to the wrong engine. This pins the
+    /// ordering contract the boot loop relies on: mapping partition ids
+    /// `0..partitions` through the demuxed map yields each partition's own
+    /// events at its own index, for every partition, regardless of map
+    /// iteration order.
+    #[test]
+    fn legacy_recovery_journals_are_indexed_by_partition_id() {
+        let keyed = |p: u64| Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(p, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let partitions = 4u64;
+        let events = vec![keyed(3), keyed(0), keyed(2), keyed(1)];
+        let mut per_partition =
+            demux_legacy_shared_log(events, (0..partitions).collect(), partitions).expect("demux");
+        // The exact construction the boot path performs: index i must hold
+        // partition i's events.
+        let journals: Vec<(u64, Vec<Event>)> = (0..partitions)
+            .map(|p| (p, per_partition.remove(&p).unwrap_or_default()))
+            .collect();
+        for (i, (p, evs)) in journals.iter().enumerate() {
+            assert_eq!(*p, i as u64, "handles[{i}] must own partition {i}");
+            let keyed_count = evs
+                .iter()
+                .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+                .count();
+            assert_eq!(
+                keyed_count, 1,
+                "partition {i} replays exactly its own keyed event"
+            );
         }
     }
 }
@@ -7992,7 +9116,7 @@ impl ServerImpl {
         // error-throw, keeping that path unchanged.
         let variables = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
         if let Some(node) = self.route_by_leader(job_key) {
@@ -9148,7 +10272,7 @@ impl ServerImpl {
             };
         }
 
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .iter()
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
@@ -9526,7 +10650,7 @@ impl ServerImpl {
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
@@ -9606,7 +10730,7 @@ impl ServerImpl {
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
         operation_reference: Option<i64>,
@@ -9660,7 +10784,7 @@ impl ServerImpl {
         business_id: Option<String>,
         operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
             .map(|m| {
                 m.iter()
@@ -10783,7 +11907,7 @@ impl ServerImpl {
     pub(crate) async fn set_variables_local(
         &self,
         scope_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         local: bool,
     ) -> Result<(), (u16, String)> {
         self.apply_partition_command(
@@ -11619,7 +12743,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         await_completion: bool,
@@ -17072,7 +18196,7 @@ impl ServerImpl {
         tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
-            let transport = server.raft_transport();
+            let transport = server.raft_transport_for_start().await;
             // ADR 0003 replication tier: in `leader-durable` mode a non-owned
             // replica is a NON-VOTING async learner (the leader's on-disk log is
             // the sole durability point); in `quorum` mode it is a voter whose
@@ -18126,7 +19250,7 @@ impl ServerImpl {
         // own journal remains the local durability source). Initialize with this
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // No local exporter unless this node statically owns `p`; a promoted
         // replica must evict terminal shells itself (see bootstrap_member).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -19421,7 +20545,7 @@ impl ServerImpl {
             );
             return false;
         };
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -19509,7 +20633,7 @@ impl ServerImpl {
             return false;
         }
 
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
         // leak guard); an owned partition keeps shells for its read path.
@@ -19704,6 +20828,127 @@ impl ServerImpl {
         }
     }
 
+    /// The replicated-command features this node's replicated state already
+    /// depends on (#1661): a `/cluster` join from a binary lacking any of them is
+    /// refused, and (via [`peer::PeerSet::require_feature`]) so is every
+    /// OUTBOUND dial to such a binary. Lenient completion becomes a requirement
+    /// as soon as any hosted partition (owned or replica) has applied the
+    /// REPLICATED `LenientCompletionSet` — an older binary could not decode that
+    /// command in the log. One-way, like the flag itself (the legacy host flag
+    /// never counts: it is what a pre-#1661 cluster already runs). Likewise
+    /// `cluster-variables-v1` (#1657) once any hosted partition has EVER applied
+    /// a cluster-variable create — sticky even after every variable is deleted,
+    /// because the retained log/snapshot still carries those records.
+    ///
+    /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
+    /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
+    /// `try_with` (never the panicking `with`), because it runs on the
+    /// partition-recovery path (`raft_transport_for_start`) BEFORE a failed
+    /// actor is replaced — a panic there would unwind the recovery supervisor,
+    /// a wedged actor would block it. Callers that admit peers must fail closed
+    /// on `None`; best-effort syncs simply retry on the next tick.
+    async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
+        use nano_falcon_protocol::cluster_join::{
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+        };
+        // A single node never replicates its log to anyone, so its local state
+        // places no requirement on a peer.
+        if self.engine.topology().is_single_node() {
+            return Some(Vec::new());
+        }
+        // Every feature the recovered/replicated state can depend on, each
+        // with its one-way state predicate (sticky once observed).
+        const FEATURES: [&str; 2] = [LC, CV];
+        let mut required: Vec<&'static str> = FEATURES
+            .into_iter()
+            .filter(|f| self.peers.requires_feature(f))
+            .collect();
+        if required.len() == FEATURES.len() {
+            return Some(required);
+        }
+        let mut unknown = false;
+        for p in 0..self.engine.topology().num_partitions {
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if !handle.is_alive() {
+                unknown = true;
+                continue;
+            }
+            match tokio::time::timeout(
+                ENGINE_HEALTH_PROBE_BOUND,
+                handle.try_with(|journal| {
+                    let engine = journal.engine();
+                    [
+                        engine.replicated_lenient_completion(),
+                        engine.cluster_variables_ever_used(),
+                    ]
+                }),
+            )
+            .await
+            {
+                Ok(Some(flags)) => {
+                    for (feature, set) in FEATURES.into_iter().zip(flags) {
+                        if set && !required.contains(&feature) {
+                            self.peers.require_feature(feature).await;
+                            required.push(feature);
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => unknown = true,
+            }
+        }
+        // The order is canonical (FEATURES order) regardless of discovery order.
+        required.sort_by_key(|f| FEATURES.iter().position(|g| g == f));
+        if unknown { None } else { Some(required) }
+    }
+
+    /// Leader-side reconciliation of partition `p`'s replicated lenient-completion
+    /// flag with this node's activation policy (#1661). When the policy needs
+    /// lenience and the replicated flag is not yet set, the leader proposes
+    /// `Command::SetLenientCompletion { lenient: true }` through the Raft log, so
+    /// every replica flips the flag at the same log index — never as a per-node
+    /// host config that a racing policy change could apply between a completion's
+    /// commit and its apply. ROLLING UPGRADE (ADR 0066): the command is proposed
+    /// only once every cluster member advertised the feature on its join
+    /// handshake; until then the flag stays put and activation stays replicated
+    /// (`prepare_activation` only grants a leader-local lock under a committed
+    /// lenient flag), which is correct, just slower.
+    ///
+    /// ONE-WAY (ADR 0002 notes): the flag is never proposed back to `false` — a
+    /// replica may hold a leader-local activation its peers never saw, so
+    /// clearing lenience would make them reject its completion. Until the
+    /// cutover, the legacy host flag keeps today's (pre-#1661) behaviour.
+    async fn reconcile_lenient_completion_via_raft(
+        &self,
+        part: &crate::raft::RaftPartition,
+        replicated_lenient: bool,
+        now: u64,
+    ) {
+        if replicated_lenient
+            || !self.activation_policy.may_be_leader_local()
+            || !self
+                .advertise_cluster_features
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || !self
+                .peers
+                .all_peers_support(
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION,
+                )
+                .await
+        {
+            return;
+        }
+        if let Err(e) = part
+            .propose_result(Command::SetLenientCompletion { lenient: true }, now)
+            .await
+        {
+            tracing::warn!(
+                "raft: proposing SetLenientCompletion {{ lenient: true }} failed: {e}; retrying next tick"
+            );
+        }
+    }
+
     /// Returns (building if necessary) the dedicated engine actor for a partition
     /// this node **replicates but does not own**. The Raft state machine drives it
     /// to apply the replicated log on a follower; it is not part of the read-model
@@ -19733,9 +20978,11 @@ impl ServerImpl {
         };
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
-        if self.activation_policy.may_be_leader_local() {
-            journal.set_lenient_completion(true);
-        }
+        // The REPLICATED lenient flag is not configured here (#1661): this
+        // replica learns it from the Raft log / snapshot at exactly the index
+        // the leader committed it. Only the pre-cutover LEGACY host flag (ADR
+        // 0066 rolling upgrade: today's behaviour, identical on every node) is.
+        journal.set_legacy_lenient_completion(self.activation_policy.may_be_leader_local());
         // Wire the same spill tiers the owned engines got, so this follower
         // replica reclaims hot RAM under pressure instead of pinning the whole
         // replicated working set resident. Spill is local memory management (no
@@ -19875,14 +21122,14 @@ impl ServerImpl {
             return 0;
         }
         let num = self.engine.topology().num_partitions;
-        let mut live: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for p in 0..num {
             let Some(handle) = self.engine_handle_for(p) else {
                 continue;
             };
             let keys = handle
                 .with(|journal| {
-                    let mut s = std::collections::HashSet::new();
+                    let mut s = std::collections::BTreeSet::new();
                     journal.collect_live_instance_keys(&mut s);
                     s
                 })
@@ -20427,6 +21674,7 @@ impl ServerImpl {
                 .into_iter()
                 .flatten()
                 .collect();
+            let activated = self.resolve_activated_secrets(activated).await;
             return activated
                 .into_iter()
                 .map(|activated| activated_job_result(activated, fetch_variable))
@@ -20486,10 +21734,63 @@ impl ServerImpl {
                 .collect()
         };
 
-        activated
+        self.resolve_activated_secrets(activated)
+            .await
             .into_iter()
             .map(|activated| activated_job_result(activated, fetch_variable))
             .collect()
+    }
+
+    /// Activation-time resolution of trusted `camunda.secrets.<name>`
+    /// references (#1640) — the single choke point every activation path (REST,
+    /// stream, Raft, peer-served) funnels through. Substitutes into each job's
+    /// worker-facing variable copy only; engine state, the journal and
+    /// snapshots keep the reference text. A job whose trusted secret cannot be
+    /// resolved is failed with no retries — an incident on the element with
+    /// Zeebe's message — and withheld from the worker.
+    async fn resolve_activated_secrets(
+        &self,
+        activated: Vec<ActivatedJobWithIdentity>,
+    ) -> Vec<ActivatedJobWithIdentity> {
+        if activated.iter().all(|a| a.secret_provenance.is_empty()) {
+            return activated;
+        }
+        let mut out = Vec::with_capacity(activated.len());
+        for mut a in activated {
+            if a.secret_provenance.is_empty() {
+                out.push(a);
+                continue;
+            }
+            match secrets::resolve_job_variables(
+                &a.job.variables,
+                &a.secret_provenance,
+                self.secret_store.as_ref(),
+            ) {
+                Ok(None) => out.push(a),
+                Ok(Some(resolved)) => {
+                    a.job.variables = Arc::new(resolved);
+                    out.push(a);
+                }
+                Err(missing) => {
+                    // Best-effort: if the fail is rejected (e.g. the lease
+                    // already moved on), the job is still withheld — it never
+                    // reaches a worker with the reference unresolved.
+                    if let Ok((_, commit)) = self
+                        .fail_job_for_stream_with_lease(
+                            a.job.key,
+                            a.job.lease_token.clone(),
+                            0,
+                            missing.incident_message(),
+                            0,
+                        )
+                        .await
+                    {
+                        commit.wait().await;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Activates up to `want` jobs of `job_type` on a single partition's engine
@@ -20708,7 +22009,7 @@ impl ServerImpl {
             .await;
         // One read on the leader: variable/cold spill + what (if anything) is due
         // now. Only the leader runs this gate; followers never propose, so safe.
-        let (timers_due, jobs_due) = handle
+        let (timers_due, jobs_due, lenient_now) = handle
             .with(move |journal| {
                 // The tick pre-check gate runs on the single-writer engine actor
                 // every tick per led partition; profiled here to attribute its
@@ -20740,8 +22041,14 @@ impl ServerImpl {
                         .is_some_and(|d| d <= now)
                 });
                 cmd_profile::finish(timer, "tick_precheck");
-                (timers_due, jobs_due)
+                (
+                    timers_due,
+                    jobs_due,
+                    journal.engine().replicated_lenient_completion(),
+                )
             })
+            .await;
+        self.reconcile_lenient_completion_via_raft(&part, lenient_now, now)
             .await;
 
         let mut produced = false;
@@ -20846,7 +22153,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
         // is saturated — the global bottleneck that hits every definition at once.
@@ -21101,7 +22408,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
@@ -21283,7 +22590,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
         tags: Vec<String>,
         business_id: Option<String>,
@@ -21399,7 +22706,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
     ) -> Result<
@@ -21592,7 +22899,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         use apis::process_instance::CreateProcessInstanceResponse as R;
         let wire_vars = if variables.is_empty() {
@@ -21764,7 +23071,7 @@ impl ServerImpl {
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
@@ -21784,7 +23091,7 @@ impl ServerImpl {
         &self,
         job_key: u64,
         lease_token: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
         business_id: Option<String>,
@@ -21887,7 +23194,7 @@ impl ServerImpl {
         lease_token: Option<String>,
         error_code: String,
         error_message: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
@@ -23492,28 +24799,28 @@ fn next_stateless_key() -> u64 {
 /// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
 /// durable keys.
 impl ServerImpl {
-    /// One immutable snapshot of every cluster variable, captured under a single
-    /// lock acquisition so the values an expression evaluates against and the
-    /// kinds its provenance is derived from are always consistent (#1296). The
-    /// overlay for a tenant layers globals first, then that tenant's variables
-    /// (which shadow a same-named global), matching the engine's resolution.
+    /// One immutable snapshot of every cluster variable, read from the
+    /// replicated engine state in a single actor turn (#1657), so the values an
+    /// expression evaluates against and the kinds its provenance is derived
+    /// from are always consistent (#1296). The overlay for a tenant layers
+    /// globals first, then that tenant's variables (which shadow a same-named
+    /// global), matching the engine's resolution.
     #[allow(clippy::type_complexity)]
-    fn cluster_variable_snapshot(
+    async fn cluster_variable_snapshot(
         &self,
     ) -> (
-        std::collections::HashMap<String, Value>,
+        std::collections::BTreeMap<String, Value>,
         std::collections::HashMap<String, models::ClusterVariableKindEnum>,
         std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
     ) {
-        let entries = self.cluster_variables.read();
-        let mut globals: std::collections::HashMap<String, Value> = Default::default();
+        let mut globals: std::collections::BTreeMap<String, Value> = Default::default();
         let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
             Default::default();
         let mut tenants: std::collections::HashMap<
             String,
             Vec<(String, Value, models::ClusterVariableKindEnum)>,
         > = Default::default();
-        for v in entries.by_key.values() {
+        for v in self.cluster_variable_all().await {
             match &v.tenant_id {
                 None => {
                     globals.insert(v.name.clone(), v.value.clone());
@@ -23543,15 +24850,15 @@ impl ServerImpl {
         // kinds together, under a single lock) so the evaluated values and the
         // provenance derived from them can never race a concurrent
         // create/update/delete (#1296).
-        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot();
+        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot().await;
 
         // The request body's `variables` are the topmost context: these
         // endpoints are stateless, so no process-instance / element-instance
         // scope is resolved here. `Nullable::Null` (an explicit `"variables":
         // null`) and an omitted map both mean "no variables".
-        let mut ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
+        let mut ctx: std::collections::BTreeMap<String, Value> = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
         // Layer the cluster variables UNDERNEATH the request-body variables (a
@@ -23602,11 +24909,12 @@ impl ServerImpl {
             .map(|(name, _)| name.clone())
             .collect();
 
-        match nanobpmn_engine_core::feel::eval_with_provenance(
-            &body.expression,
-            &ctx,
-            trusted_roots,
-        ) {
+        // Ad-hoc evaluation is off the replicated apply path, so it opts into
+        // the host clock/entropy explicitly (#1663); the builtins fail closed
+        // without an installed environment.
+        match nanobpmn_engine_core::feel::with_host_env(|| {
+            nanobpmn_engine_core::feel::eval_with_provenance(&body.expression, &ctx, trusted_roots)
+        }) {
             Ok(evaluated) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
                 models::ExpressionEvaluationResult {
                     expression: body.expression.clone(),
@@ -26471,11 +27779,38 @@ struct ActivatedJobWithIdentity {
     process_id: String,
     version: i32,
     process_definition_key: String,
+    /// The job's mapping-time secret-reference provenance (#1640), read from
+    /// engine state on the engine thread: the only input activation-time
+    /// secret resolution trusts.
+    secret_provenance: Vec<nanobpmn_engine_core::SecretProvenance>,
 }
 
 enum PreparedActivation {
     Durable(Box<Command>),
     Soft(Vec<ActivatedJobWithIdentity>),
+}
+
+/// Brings a journal that is its partition's ONLY replica (no Raft log: a single
+/// node, or the non-Raft tick) to the activation policy's lenient-completion
+/// flag by applying the journaled `Command::SetLenientCompletion` (#1661). A
+/// no-op once the replicated flag is set, so it journals at most one event.
+/// ONE-WAY: a policy that does not need lenience never clears it.
+/// Whether the non-Raft tick may journal the irreversible replicated lenient
+/// flag directly (#1661). Only a genuinely single-node deployment: an empty
+/// Raft registry is also what a multi-node node looks like mid-bootstrap, and
+/// a multi-node non-Raft deployment has no peer-compatibility gate on that
+/// path — both keep the per-node legacy host flag instead.
+fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolicy) -> bool {
+    topology.is_single_node() && policy.may_be_leader_local()
+}
+
+fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
+    if !lenient || journal.engine().replicated_lenient_completion() {
+        return;
+    }
+    if let Err(e) = journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
+        tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+    }
 }
 
 fn prepare_activation(
@@ -26499,7 +27834,13 @@ fn prepare_activation(
     if job_keys.is_empty() {
         return PreparedActivation::Soft(Vec::new());
     }
+    // A leader-local (soft, unreplicated) lock is only safe while every replica
+    // will accept its completion: the partition's REPLICATED lenient flag
+    // (#1661, committed before the lock, one-way), or — before the ADR 0066
+    // cutover — the legacy host flag every node sets identically from the
+    // activation policy. Otherwise the activation must go through the log.
     if force_durable
+        || !journal.engine().lenient_completion()
         || with_lease
         || job_keys
             .iter()
@@ -26545,11 +27886,20 @@ fn activated_jobs_with_identity(
                     )
                 })
                 .unwrap_or_else(|| (String::new(), 1, String::new()));
+            // Mapping-time secret provenance journaled on `JobCreated`
+            // (#1640) — never re-derived from the live cluster variables.
+            let secret_provenance = journal
+                .state()
+                .jobs
+                .get(&job.key)
+                .map(|j| j.secret_provenance.clone())
+                .unwrap_or_default();
             ActivatedJobWithIdentity {
                 job,
                 process_id,
                 version,
                 process_definition_key,
+                secret_provenance,
             }
         })
         .collect()
@@ -26594,7 +27944,7 @@ pub(crate) struct JobCompletion {
 
 fn completion_command(
     job_key: u64,
-    variables: std::collections::HashMap<String, Value>,
+    variables: std::collections::BTreeMap<String, Value>,
     adhoc_result: Option<AdHocJobResult>,
     task_result: Option<TaskListenerJobResult>,
     lease_token: Option<String>,
@@ -26743,6 +28093,7 @@ fn activated_job_result(
         process_id,
         version,
         process_definition_key,
+        secret_provenance: _,
     } = activated;
 
     // Project the job's variables into the REST object map off the engine
@@ -26750,7 +28101,7 @@ fn activated_job_result(
     // here neither blocks the command thread nor deep-clones the value tree.
     let variables = match fetch_variable {
         Some(names) => {
-            let filtered: std::collections::HashMap<String, Value> = job
+            let filtered: std::collections::BTreeMap<String, Value> = job
                 .variables
                 .iter()
                 .filter(|(name, _)| names.iter().any(|n| n == *name))
@@ -26819,7 +28170,7 @@ fn activated_job_result(
 /// Converts engine variables into the generated `Object` (JSON) map used by the
 /// REST models.
 fn to_object_map(
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> std::collections::HashMap<String, types::Object> {
     variables
         .iter()
@@ -26851,7 +28202,7 @@ fn adhoc_result_from_completion(
                     element_id: el.element_id.clone().unwrap_or_default(),
                     variables: match el.variables.as_ref() {
                         Some(types::Nullable::Present(map)) => from_object_map(map),
-                        _ => std::collections::HashMap::new(),
+                        _ => std::collections::BTreeMap::new(),
                     },
                 })
                 .collect()
@@ -26904,7 +28255,7 @@ fn adhoc_activation_command(
 /// the drop. Returns `Some((400, detail))` to reject, `None` to allow.
 fn reject_task_result_with_variables(
     task_result: &Option<TaskListenerJobResult>,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> Option<(u16, String)> {
     if task_result.is_some() && !variables.is_empty() {
         Some((
@@ -27013,7 +28364,7 @@ fn user_task_corrections_from_model(c: &models::JobResultCorrections) -> UserTas
 
 fn from_object_map(
     variables: &std::collections::HashMap<String, types::Object>,
-) -> std::collections::HashMap<String, Value> {
+) -> std::collections::BTreeMap<String, Value> {
     variables
         .iter()
         .map(|(name, object)| (name.clone(), json_to_value(&object.0)))
@@ -27071,7 +28422,7 @@ enum ForwardCreateOutcome {
 /// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
 /// meter in-flight create payloads for byte-aware admission control. Sums each
 /// key's length plus its value's [`Value::approx_bytes`].
-fn engine_vars_bytes(vars: &std::collections::HashMap<String, Value>) -> u64 {
+fn engine_vars_bytes(vars: &std::collections::BTreeMap<String, Value>) -> u64 {
     vars.iter()
         .map(|(k, v)| k.len() as u64 + v.approx_bytes())
         .sum()
@@ -27219,7 +28570,7 @@ fn modify_instructions_from_rest(
         };
         out.activate_instructions.push(ActivateElementInstruction {
             element_id: a.element_id.clone(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             ancestor_element_instance_key,
             variable_instructions: variable_instructions_from_rest(
                 a.variable_instructions.as_ref(),
@@ -28317,6 +29668,47 @@ fn boot_backoff_rearm_at_spawn(raft: bool) -> bool {
 /// (`partition_of(max_key)`) and cannot attribute that record to its
 /// partition, so a Raft node on them would lose or cross-apply its applied
 /// index. Fail at startup with an operator-actionable error instead.
+/// Logs and exits with an operator-actionable message when boot-time recovery
+/// fails closed (e.g. [`seglog::UnattributedClusterVariableError`]).
+fn refuse_to_start(e: &dyn std::fmt::Display) -> ! {
+    tracing::error!("{e}");
+    eprintln!("nanobpm: refusing to start: {e}");
+    std::process::exit(2);
+}
+
+/// `true` when this process persists to the untagged legacy journal: a
+/// durable journal is configured AND `NANOBPMN_JOURNAL_SEGMENTED=0`.
+fn legacy_journal_in_use() -> bool {
+    resolve_data_paths().0.is_some() && !seglog::segmented_enabled()
+}
+
+/// Cluster variables are unavailable on the untagged legacy journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`) with more than one partition (#1657, ADR
+/// 0066): that format records no producing partition, so recovery could not
+/// tell which partitions committed an (possibly interrupted) fan-out copy.
+/// Writes fail closed with 503 naming the mode and the remedy (the same status
+/// as the other "cluster variables unavailable" gates); recovery fails closed
+/// via [`seglog::check_cluster_variable_attribution`]. Single-partition legacy,
+/// segmented and in-memory runs are unaffected.
+fn check_cluster_variable_journal_mode(
+    legacy_journal: bool,
+    partitions: u64,
+) -> Result<(), (u16, String)> {
+    if legacy_journal && partitions > 1 {
+        return Err((
+            503,
+            format!(
+                "cluster variables unavailable: the journal is unsegmented \
+                 (NANOBPMN_JOURNAL_SEGMENTED=0) with {partitions} partitions, and that legacy \
+                 format cannot attribute a replicated cluster-variable record to the partition \
+                 that committed it — enable segmented journals (unset \
+                 NANOBPMN_JOURNAL_SEGMENTED or set it to 1) or run single-partition"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn check_raft_journal_mode(raft: bool, segmented: bool) -> Result<(), String> {
     if raft && !segmented {
         return Err("NANOBPMN_RAFT is enabled but the journal is unsegmented \
@@ -29518,6 +30910,11 @@ async fn main() {
             // serving. Each branch opens its shards (file-backed under `db_path`)
             // and yields the assembled `ReadModel`.
             let partitions = partition_count_from_env();
+            if let Err((_, msg)) =
+                check_cluster_variable_journal_mode(legacy_journal_in_use(), partitions as u64)
+            {
+                tracing::warn!("{msg}");
+            }
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
             // Bounded-disk state for the single-node multi-partition segmented
@@ -29684,16 +31081,14 @@ async fn main() {
                         open_sharded_read_model(db_path.as_deref(), &owned, false);
                     rebuild_read_model_legacy(&shards, &events, partitions);
 
-                    // Split the shared log into each partition's own events by the
-                    // owning partition encoded in every event's key. A key whose
-                    // partition is out of range (e.g. a log from a larger partition
-                    // layout) falls back to partition 0 so replay never panics.
-                    let mut per_partition: Vec<Vec<Event>> =
-                        (0..partitions).map(|_| Vec::new()).collect();
-                    for event in events {
-                        let p = event.owning_partition() as usize;
-                        per_partition[p.min(partitions - 1)].push(event);
-                    }
+                    // Split the shared log into each partition's own events (see
+                    // [`demux_legacy_shared_log`] for the routing contract).
+                    let mut per_partition = demux_legacy_shared_log(
+                        events,
+                        (0..partitions as u64).collect(),
+                        partitions as u64,
+                    )
+                    .unwrap_or_else(|e| refuse_to_start(&e));
 
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
@@ -29701,11 +31096,19 @@ async fn main() {
                             journal_path.display()
                         )
                     });
-                    let recovered = per_partition.iter().any(|evs| !evs.is_empty());
-                    let journals: Vec<Journal> = per_partition
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
+                    let recovered = per_partition.values().any(|evs| !evs.is_empty());
+                    // Emit the journals in ASCENDING partition-id order:
+                    // `Partitions::new` requires `handles[i]` to own partition
+                    // `i` (`partition.rs`), and the engine actors are spawned
+                    // from this vector in order. Collecting the demux HashMap
+                    // directly would order the journals arbitrarily and route
+                    // every keyed command to the wrong engine (PR #1670
+                    // review).
+                    let journals: Vec<Journal> = (0..partitions as u64)
+                        .map(|p| {
+                            let evs = per_partition.remove(&p).unwrap_or_default();
+                            Journal::from_events_shared(p, evs, &shared)
+                        })
                         .collect();
                     (journals, recovered, read_model)
                 }
@@ -29786,41 +31189,14 @@ async fn main() {
                     // partition a peer may not own) into every owned shard; other
                     // events to `partition_of(key)`'s shard.
                     rebuild_read_model_legacy(&shards, &events, partitions);
-                    // Demultiplex the node's log into its owned partitions by the
-                    // partition id encoded in every key. Any event for a partition
-                    // this node does not own (a stray from a re-sharded layout) is
-                    // dropped — its owner replays it from its own journal.
-                    //
-                    // `ProcessDeployed` is the exception: a deployment definition is
-                    // partition-agnostic (it mints no instance state and arms no
-                    // subscriptions) and its key belongs to the deployment partition
-                    // (0), which a peer node does not own. So every `ProcessDeployed`
-                    // is replayed into *every* owned partition, reconstructing the
-                    // definition cluster-wide from a single durable copy (see
-                    // `Journal::install_deployment_durable`). Start subscriptions /
-                    // timers keep their partition-0 keys and demux normally, so they
-                    // are only ever rebuilt on the deployment partition's owner.
-                    let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
-                        owned.iter().map(|p| (*p, Vec::new())).collect();
-                    for event in events {
-                        if matches!(
-                            event,
-                            Event::ProcessDeployed { .. }
-                                | Event::DecisionRequirementsDeployed { .. }
-                                | Event::DecisionDeployed { .. }
-                                | Event::FormDeployed { .. }
-                                | Event::GenericResourceDeployed { .. }
-                        ) {
-                            for bucket in per_owned.values_mut() {
-                                bucket.push(event.clone());
-                            }
-                            continue;
-                        }
-                        let p = event.owning_partition();
-                        if let Some(bucket) = per_owned.get_mut(&p) {
-                            bucket.push(event);
-                        }
-                    }
+                    // Demultiplex the node's log into its owned partitions (see
+                    // [`demux_legacy_shared_log`] for the routing contract; an
+                    // event for a partition this node does not own — a stray from
+                    // a re-sharded layout — is dropped: its owner replays it from
+                    // its own journal).
+                    let mut per_owned =
+                        demux_legacy_shared_log(events, owned.clone(), partitions as u64)
+                            .unwrap_or_else(|e| refuse_to_start(&e));
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
                             "failed to open shared journal {}: {e}",
@@ -30811,14 +32187,32 @@ async fn main() {
                         })
                     }))
                     .await;
+                    // Keep the outbound-dial feature requirement in step with
+                    // replicated state on EVERY node (#1661) — leader or
+                    // follower — so no link opens to an older binary once the
+                    // log carries an entry it cannot decode. One-way, so a
+                    // single cheap check per tick after it first fires.
+                    let _required = tick_server.required_cluster_features().await;
                     futures_util::future::join_all(
                         led.iter()
                             .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
                     )
                     .await
                 } else {
+                    // Only a genuinely single-node deployment may journal the
+                    // irreversible flag locally (#1661): an empty Raft registry
+                    // is also what a multi-node node looks like mid-bootstrap,
+                    // and a multi-node non-Raft deployment has no compatibility
+                    // gate here — both keep the legacy host flag instead.
+                    let lenient = local_lenient_reconcile(
+                        tick_server.engine.topology(),
+                        tick_server.activation_policy,
+                    );
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
+                            // Without Raft this journal is the partition's only
+                            // replica: reconcile the lenient flag directly (#1661).
+                            reconcile_lenient_completion_local(journal, lenient, now);
                             let (fired, _commit) = journal.trigger_timers(now);
                             #[allow(
                                 clippy::expect_used,
@@ -32436,6 +33830,117 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #1661: a restarted multi-node leader whose enabling `SetLenientCompletion`
+    /// entry was compacted into its snapshot holds the replicated flag ONLY in
+    /// recovered state. Starting Raft must install the outbound requirement from
+    /// that state before any transfer, so the snapshot can never be streamed to
+    /// a legacy peer ahead of the periodic requirement sync.
+    #[tokio::test]
+    async fn raft_start_installs_feature_requirement_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let mut journal = Journal::in_memory();
+        let _applied = journal
+            .apply_command_at(Command::SetLenientCompletion { lenient: true }, 1)
+            .expect("apply");
+        assert!(journal.engine().replicated_lenient_completion());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(
+            !server.peers.requires_feature(F),
+            "precondition: no tick has synced the requirement yet"
+        );
+        let _transport = server.raft_transport_for_start().await;
+        assert!(
+            server.peers.requires_feature(F),
+            "Raft start must derive the requirement from recovered state"
+        );
+    }
+
+    /// PR #1670 review: a node whose recovered state holds (or ever held) a
+    /// cluster variable must require `cluster-variables-v1` from every peer,
+    /// even after every variable was deleted, so an incompatible binary can
+    /// neither join nor be streamed the retained log/snapshot.
+    #[tokio::test]
+    async fn raft_start_requires_cluster_variables_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES as F;
+        let mut journal = Journal::in_memory();
+        let _ = journal
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    value: nanobpmn_engine_core::Value::Int(1),
+                    kind: Default::default(),
+                    metadata: Default::default(),
+                    distributed: false,
+                },
+                1,
+            )
+            .expect("create");
+        let _ = journal
+            .apply_command_at(
+                Command::DeleteClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    distributed: false,
+                },
+                2,
+            )
+            .expect("delete");
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #1661 review finding: the requirement probe runs on the partition-recovery
+    /// path BEFORE a failed actor is replaced, so a DEAD engine actor must yield
+    /// `None` (unknown — join admission fails closed) instead of panicking the
+    /// recovery supervisor via `with()`; and Raft start must not panic either.
+    #[tokio::test]
+    async fn required_features_probe_is_unknown_not_panic_on_a_dead_actor() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![Journal::in_memory()], topology);
+        assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
+        let handle = server.engine_handle_for(0).expect("partition 0 hosted");
+        handle.spawn_job(|_journal| panic!("kill the engine actor"));
+        for _ in 0..200 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!handle.is_alive(), "precondition: actor is dead");
+        assert_eq!(server.required_cluster_features().await, None);
+        let _transport = server.raft_transport_for_start().await;
+    }
+
     /// #1479 review finding: when a hosted partition's recovery FAILS at boot
     /// (a Raft `bootstrap_member` error — e.g. its durable snapshot failed to
     /// restore — after `replica_engine_for` already registered the fresh,
@@ -33858,7 +35363,7 @@ mod clustered_startup_tests {
 
         // Create the instance via node 0; it lands on a node-0 partition (0 or 2)
         // and parks at the catch. The create path routes the Opening to node 1.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         let (instance_key, completed) = node0
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -33963,7 +35468,7 @@ mod clustered_startup_tests {
 
         // Creating an instance evaluates the decision synchronously: the
         // businessRuleTask has no job to wait on, so the instance completes.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (_instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -34801,7 +36306,7 @@ mod clustered_startup_tests {
             .await
             .expect("mixed dmn+bpmn deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -34898,7 +36403,7 @@ mod clustered_startup_tests {
                 "hallo",
             )]))
             .expect("deploy the DRG");
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert(
             "lang".to_string(),
             nanobpmn_engine_core::Value::Str("de".into()),
@@ -35007,7 +36512,7 @@ mod clustered_startup_tests {
 
     /// Starts a `greeter` instance with `lang`, returning its key.
     async fn start_greeter(server: &ServerImpl, lang: &str) -> u64 {
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str(lang.into()));
         server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -35716,7 +37221,7 @@ mod clustered_startup_tests {
             .expect("deploy succeeds");
         let mut instances = Vec::new();
         for tier in tiers {
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert(
                 "tier".to_string(),
                 nanobpmn_engine_core::Value::Str((*tier).into()),
@@ -35861,7 +37366,7 @@ mod clustered_startup_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -35886,6 +37391,7 @@ mod clustered_startup_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let job_failed = |job_key: u64, instance_key: u64, retries: i32| Event::JobFailed {
             job_key,
@@ -36112,7 +37618,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the approval instance");
@@ -36224,7 +37730,7 @@ mod clustered_startup_tests {
                 .await
                 .expect("create charger");
         }
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -36326,11 +37832,11 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -36565,7 +38071,7 @@ mod clustered_startup_tests {
         let mut keys = std::collections::HashMap::new();
         for id in ["timed", "signalled", "gated"] {
             // `approved = false` keeps the conditional catch parked.
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("approved".to_string(), Value::Bool(false));
             let (key, _) = server
                 .create_for_stream(Some(id.into()), None, vars)
@@ -36669,7 +38175,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create approval");
@@ -36829,7 +38335,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
@@ -36906,7 +38412,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -37316,7 +38822,7 @@ mod clustered_startup_tests {
             .expect("deploy succeeds");
 
         // Start an instance of the waiter so a PROCESS_EVENT row exists too.
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -37587,7 +39093,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -37899,7 +39405,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
         let (instance_key, _) = server
-            .create_for_stream(Some("fork".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("fork".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create the fork instance");
 
@@ -38037,7 +39543,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the failer instance");
@@ -38178,7 +39684,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("scripted-fail".into()),
                 None,
-                std::collections::HashMap::from([("n".to_string(), Value::Str("oops".into()))]),
+                std::collections::BTreeMap::from([("n".to_string(), Value::Str("oops".into()))]),
             )
             .await
             .expect("create the instance");
@@ -38287,7 +39793,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("job-failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -38415,7 +39921,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("waits-forever".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -38534,7 +40040,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["order-v1", "order-v1", "audit-v1"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "audit-v1" {
@@ -38763,7 +40269,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["move-me", "move-me", "other"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "other" {
@@ -39052,7 +40558,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("order-v1".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -39170,7 +40676,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("modify-me".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -40203,7 +41709,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("feature".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the feature instance");
@@ -42292,6 +43798,20 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1657 / ADR 0066: cluster-variable writes fail closed on the untagged
+    /// multi-partition legacy journal with a 503 naming the mode and remedy;
+    /// single-partition legacy, segmented and in-memory runs are unaffected.
+    #[test]
+    fn cluster_variable_writes_refused_on_untagged_multi_partition_journal() {
+        let (status, msg) = check_cluster_variable_journal_mode(true, 3)
+            .expect_err("untagged multi-partition refused");
+        assert_eq!(status, 503);
+        assert!(msg.contains("NANOBPMN_JOURNAL_SEGMENTED=0"), "{msg}");
+        assert!(msg.contains("single-partition"), "{msg}");
+        check_cluster_variable_journal_mode(true, 1).expect("single-partition legacy ok");
+        check_cluster_variable_journal_mode(false, 3).expect("segmented / in-memory ok");
+    }
+
     #[test]
     fn raft_refuses_unsegmented_journal() {
         // #1405: a Raft node on the legacy unsegmented journal fails at startup.
@@ -43338,19 +44858,12 @@ mod clustered_startup_tests {
 
         // Digest mode = leader-local activation PLUS the soft lease broadcast.
         // Configure the policy directly (the env reader can't be used safely under
-        // parallel tests) and relax the completion check on every owned engine
-        // actor, exactly as `ServerImpl::new` would have for a leader-local policy.
-        // The follower replica engines built during `raft_bootstrap` then pick up
-        // lenient completion automatically (they read the now-leader-local policy).
+        // parallel tests). Lenient completion is replicated engine state (#1661):
+        // each partition leader proposes it through the Raft log on its tick.
         if digest {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = ActivationPolicy::Digest;
                 node.lease_digest = true;
-                for handle in node.engine.all() {
-                    handle
-                        .with(|journal| journal.set_lenient_completion(true))
-                        .await;
-                }
             }
         }
 
@@ -43369,12 +44882,6 @@ mod clustered_startup_tests {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = policy;
                 node.lease_digest = policy.broadcasts_lease_digest();
-                let lenient = policy.may_be_leader_local();
-                for handle in node.engine.all() {
-                    handle
-                        .with(move |journal| journal.set_lenient_completion(lenient))
-                        .await;
-                }
             }
         }
 
@@ -43480,6 +44987,22 @@ mod clustered_startup_tests {
             ok,
             "every partition must have its owning node as leader before creates"
         );
+        // A leader-local policy needs the partition's REPLICATED lenient flag
+        // before any leader-local lock is granted (#1661). In production the
+        // first clock tick proposes it; run that tick here so the cluster starts
+        // in the steady state the activation-policy tests exercise.
+        if node0.activation_policy.may_be_leader_local() {
+            for node in nodes {
+                for p in 0..3u64 {
+                    node.tick_partition_via_raft(p, now_millis(), true).await;
+                }
+            }
+            let flags = await_lenient_flags(nodes, true).await;
+            assert!(
+                flags.iter().all(|f| *f),
+                "every replica applied the replicated lenient flag: {flags:?}"
+            );
+        }
         (node0, node1, node2, serve_handles)
     }
 
@@ -43538,6 +45061,242 @@ mod clustered_startup_tests {
             vec![parity_timed_process()],
         )
         .await
+    }
+
+    /// Every hosted engine's (owned + replica) replicated lenient flag, per node.
+    async fn lenient_flags(nodes: [&ServerImpl; 3]) -> Vec<bool> {
+        let mut flags = Vec::new();
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    flags.push(h.with(|j| j.engine().replicated_lenient_completion()).await);
+                }
+            }
+        }
+        flags
+    }
+
+    /// Polls until every hosted replica reports `want` (followers apply the
+    /// committed entry asynchronously). Returns the final flags.
+    async fn await_lenient_flags(nodes: [&ServerImpl; 3], want: bool) -> Vec<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let flags = lenient_flags(nodes).await;
+            if flags.iter().all(|f| *f == want) || std::time::Instant::now() > deadline {
+                return flags;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #1661: lenient completion is replicated engine state, not host config.
+    /// No replica is lenient until the partition leader commits
+    /// `SetLenientCompletion` through the Raft log (so a leader-local lock is
+    /// never granted before every replica will accept its completion), after
+    /// which EVERY replica — leader and followers — holds the flag; a policy
+    /// flip back never clears it (one-way).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_lenient_completion_is_replicated_through_the_log() {
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        let before = lenient_flags([&n0, &n1, &n2]).await;
+        assert_eq!(before.len(), 9, "3 partitions x RF3 replicas");
+        assert!(
+            before.iter().all(|f| !f),
+            "strict under `always`: {before:?}"
+        );
+
+        // Switching to a leader-local policy configures nothing locally: the
+        // flag only arrives through the log, proposed by each partition leader
+        // on its tick, and then holds on EVERY replica.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+        }
+        assert!(lenient_flags([&n0, &n1, &n2]).await.iter().all(|f| !f));
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let after = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            after.iter().all(|f| *f),
+            "every replica applied the flag: {after:?}"
+        );
+
+        // One-way (ADR 0002 notes): flipping the policy back never clears the
+        // flag — a replica may hold a leader-local activation its peers never
+        // saw. Nothing is proposed; every replica stays lenient.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::Always;
+        }
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let kept = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            kept.iter().all(|f| *f),
+            "lenience is one-way on every replica: {kept:?}"
+        );
+    }
+
+    /// #1661 rolling upgrade (ADR 0066): with ONE pre-#1661 member (it
+    /// advertises no features), the leader never emits `SetLenientCompletion`
+    /// — every node runs today's legacy lenient flag from its policy, and
+    /// leader-local completions still apply. Once every member advertises the
+    /// feature, the command is emitted and lenience becomes log-derived on every
+    /// replica; from then on a featureless (old) binary is refused at join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_mixed_version_cutover_gates_replicated_lenience() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        // Re-dial every link so the handshakes observe the current advertisement.
+        async fn redial(nodes: [&ServerImpl; 3]) {
+            for (i, node) in nodes.iter().enumerate() {
+                for peer in 0..3u32 {
+                    if peer as usize != i {
+                        node.peers.fail_node(peer).await;
+                        node.peers.heal_node(peer).await;
+                    }
+                }
+            }
+        }
+
+        // Node 2 is an old binary. Every node starts under a leader-local policy
+        // with the legacy host flag, exactly as `ServerImpl::new` sets it.
+        n2.advertise_cluster_features
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    h.with(|j| j.set_legacy_lenient_completion(true)).await;
+                }
+            }
+        }
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mixed = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            mixed.iter().all(|f| !f),
+            "no SetLenientCompletion while an old member is present: {mixed:?}"
+        );
+        assert!(!n0.peers.requires_feature(F));
+        // Leader-local completions still apply under the legacy flag.
+        for node in [&n0, &n1, &n2] {
+            node.create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("create commits");
+        }
+        let mut completed = 0;
+        for node in [&n0, &n1, &n2] {
+            completed += parity_activate_complete(node, "do-work", 4).await;
+        }
+        assert!(completed >= 1, "completions apply in the mixed cluster");
+
+        // Every member upgraded: the leader emits the command; lenience is now
+        // log-derived on every replica.
+        n2.advertise_cluster_features
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let upgraded = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            upgraded.iter().all(|f| *f),
+            "every replica holds the replicated flag: {upgraded:?}"
+        );
+
+        // A featureless (pre-#1661) binary is now refused at join.
+        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
+        assert!(
+            n0.peers.requires_feature(F),
+            "outbound dials require it too"
+        );
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let url = format!(
+            "{}/cluster",
+            n0.engine.topology().peers[0].replacen("http://", "ws://", 1)
+        );
+        let err =
+            match tokio_tungstenite::connect_async(url.into_client_request().expect("req")).await {
+                Ok(_) => panic!("an old binary must be refused once the feature is in use"),
+                Err(e) => e,
+            };
+        assert!(format!("{err:?}").contains("409"), "got {err:?}");
+    }
+
+    /// #1661: `prepare_activation` grants a leader-local (soft, unjournaled)
+    /// lock only once the partition's REPLICATED state is lenient; before that
+    /// the activation is forced through the log even under a leader-local policy.
+    /// #1661: the non-Raft tick may journal the irreversible replicated flag
+    /// only on a genuinely single-node deployment — never on a multi-node node
+    /// (mid-bootstrap with an empty Raft registry, or explicit non-Raft), where
+    /// it would diverge replicas / bypass the peer-compatibility gate.
+    #[test]
+    fn local_lenient_reconcile_only_on_single_node() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://a".into(), "http://b".into()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        for policy in [
+            ActivationPolicy::LeaderLocal,
+            ActivationPolicy::Digest,
+            ActivationPolicy::Auto,
+            ActivationPolicy::Always,
+        ] {
+            assert!(!local_lenient_reconcile(&multi, policy), "{policy:?}");
+            assert_eq!(
+                local_lenient_reconcile(&cluster::Topology::single(1), policy),
+                policy.may_be_leader_local()
+            );
+        }
+    }
+
+    #[test]
+    fn soft_activation_requires_replicated_lenient_completion() {
+        let mut journal = Journal::in_memory();
+        let process = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "soft")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid");
+        let (_, _commit) = journal
+            .apply_command_at(Command::DeployProcess(process), 1)
+            .expect("deploy");
+        let (_, _commit) = journal
+            .apply_command_at(Command::create_instance("p"), 1)
+            .expect("create");
+        let activate = || Command::activate_jobs("soft", "w", 1, 60_000, 2);
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Durable(_)
+            ),
+            "strict replicated state forces a journaled activation"
+        );
+        reconcile_lenient_completion_local(&mut journal, true, 2);
+        assert!(journal.engine().lenient_completion());
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Soft(ref jobs) if jobs.len() == 1
+            ),
+            "a committed lenient flag permits the leader-local lock"
+        );
     }
 
     /// Spill tally for one [`parity_force_spill`] sweep: the per-command
@@ -43601,7 +45360,7 @@ mod clustered_startup_tests {
         let n = jobs.len();
         for job in jobs {
             let key = job.job_key.0.parse::<u64>().expect("numeric job key");
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("result".to_string(), Value::Str("r".repeat(512)));
             node.complete_job_for_stream(key, vars, None, None)
                 .await
@@ -43632,7 +45391,7 @@ mod clustered_startup_tests {
     async fn parity_workload_round(nodes: [&ServerImpl; 3], tally: &mut ParityTally) {
         for node in nodes {
             for i in 0..6 {
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert(
                     "payload".to_string(),
                     Value::Str(format!("{i}").repeat(256)),
@@ -43735,7 +45494,7 @@ mod clustered_startup_tests {
         node.engine_handle_for(p)
             .expect("replica engine exists")
             .with(|journal| {
-                let mut live = std::collections::HashSet::new();
+                let mut live = std::collections::BTreeSet::new();
                 journal.collect_live_instance_keys(&mut live);
                 let (_restored, unreadable) = journal.rehydrate_all_cold();
                 let state = journal.engine().state();
@@ -44075,7 +45834,7 @@ mod clustered_startup_tests {
         } else {
             let still_live = follower
                 .with(move |j| {
-                    let mut live = std::collections::HashSet::new();
+                    let mut live = std::collections::BTreeSet::new();
                     j.collect_live_instance_keys(&mut live);
                     live.contains(&instance_key)
                 })
@@ -44851,7 +46610,7 @@ mod clustered_startup_tests {
         let p1_before =
             leader_applied(&all, sub_partition).expect("partition 1 has a leader at boot");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
         let (instance_key, _) = node0
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -45033,7 +46792,7 @@ mod clustered_startup_tests {
             let node = node0.clone();
             let order = order_id.clone();
             tokio::spawn(async move {
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert("orderId".to_string(), Value::Str(order));
                 node.create_for_stream(Some("waiter".into()), None, vars)
                     .await
@@ -49867,7 +51626,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -49892,7 +51651,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -49970,7 +51729,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -49997,7 +51756,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 Some(REF),
@@ -50108,7 +51867,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("cancel-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -50145,7 +51904,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -50177,7 +51936,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("gate-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, _) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -50289,7 +52048,7 @@ mod subscription_placement_tests {
         }
         let order = chosen.expect("a cross-partition correlation key exists");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         // The caller is CANCELLED immediately: it never observes the outcome.
         let accounting = CreateAccounting::enter(&server, 0);
@@ -50357,7 +52116,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -50402,7 +52161,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -50498,7 +52257,7 @@ mod subscription_placement_tests {
                 engine,
                 Command::create_instance_versioned(
                     process_id.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     Vec::new(),
                     None,
                     sel_key,
@@ -50583,7 +52342,7 @@ mod subscription_placement_tests {
             }
         }
         let order = chosen.expect("a cross-partition correlation key exists");
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
 
         // The durability gate the test holds open: the create's commit is
@@ -50638,7 +52397,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".to_string(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -50900,7 +52659,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("abort-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("guarded".into()), None, variables)
@@ -50925,7 +52684,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "abort-order".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -50983,7 +52742,7 @@ mod subscription_placement_tests {
                 .correlate_message_everywhere(
                     "order-placed".into(),
                     format!("order-{i}"),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     None,
                     None,
                     None,
@@ -51058,7 +52817,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("svc-order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, _completed) = server
                 .create_for_stream(Some("work-then-wait".into()), None, variables)
@@ -51085,7 +52844,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None, None)
+            .complete_job_for_stream(job_key, std::collections::BTreeMap::new(), None, None)
             .await
             .expect("complete succeeds")
             .wait()
@@ -51100,7 +52859,7 @@ mod subscription_placement_tests {
                 .correlate_message_local(
                     "payment-received".into(),
                     order.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
                     None,
                     None,
                     None,
@@ -51167,7 +52926,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "order-placed".into(),
                 key,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -51196,7 +52955,7 @@ mod subscription_placement_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str("order-x".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -51208,7 +52967,7 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 "order-x".into(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 None,
                 None,
                 None,
@@ -51717,7 +53476,7 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
 
         let rejection = reject_task_result_with_variables(&task_result, &variables)
@@ -51736,10 +53495,10 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let empty = std::collections::HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         assert!(reject_task_result_with_variables(&task_result, &empty).is_none());
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
         assert!(reject_task_result_with_variables(&None, &variables).is_none());
     }
@@ -51938,13 +53697,15 @@ mod expression_conditional_tests {
         let srv = server();
         // A JSON-kind cluster variable carrying a reference-shaped string is
         // NOT a trusted source.
-        srv.cluster_variables.create(
+        srv.cluster_variable_create(
             None,
             "plain_ref",
             super::json_to_value(&serde_json::json!("camunda.secrets.UNTRUSTED")),
             None,
             super::ClusterVariableMetadata::new(),
-        );
+        )
+        .await
+        .expect("create plain_ref");
         // A SECRET_REFERENCE-kind cluster variable IS trusted when read.
         let mut req = models::CreateClusterVariableRequest {
             name: "token_ref".to_string(),
@@ -52507,7 +54268,7 @@ mod batch_operation_tests {
             .create_for_stream(
                 Some("to-cancel".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -53123,7 +54884,7 @@ mod search_process_instances_tags_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -53232,7 +54993,7 @@ mod search_process_instances_tenant_suspended_unprojected_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -53398,7 +55159,7 @@ mod search_process_instances_suspend_resume_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 1_700_000_000_000,
             tags: Vec::new(),
             business_id: None,
@@ -53582,7 +55343,7 @@ mod search_filter_honesty_tests {
             Event::ProcessInstanceCreated {
                 instance_key: key,
                 process_id: process_id.to_string(),
-                variables: std::collections::HashMap::new(),
+                variables: std::collections::BTreeMap::new(),
                 created_at: 1_700_000_000_000,
                 tags: tags.iter().map(|t| (*t).to_string()).collect(),
                 business_id: business_id.map(str::to_string),
@@ -55886,7 +57647,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ca-top".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ca-top");
@@ -56056,7 +57817,7 @@ mod call_activity_hierarchy_read_model_tests {
         let server = ServerImpl::default();
         deploy(&server, vec![parking_process("solo", "work")]).await;
         let (solo_key, _) = server
-            .create_for_stream(Some("solo".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("solo".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create solo");
 
@@ -56133,7 +57894,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-parent");
@@ -56141,7 +57902,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-solo".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-solo");
@@ -56209,7 +57970,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-parent");
@@ -56288,7 +58049,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-state".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-state");
@@ -56418,7 +58179,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -56501,7 +58262,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -56618,7 +58379,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -56729,7 +58490,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -56985,6 +58746,11 @@ mod no_direct_engine_apply_guard {
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
         "ServerImpl::apply_partition_command_ref",
+        // #1661: reconciles the lenient-completion flag on a journal that is its
+        // partition's ONLY replica — called solely on a single node (boot) and
+        // from the non-Raft tick branch; the Raft path proposes the same command
+        // through the log (`reconcile_lenient_completion_via_raft`).
+        "reconcile_lenient_completion_local",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -57248,7 +59014,11 @@ mod no_direct_engine_apply_guard {
         // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
-        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
+        const BARE_FREE_FNS: &[&str] = &[
+            "main",
+            "apply_create_instance_direct",
+            "reconcile_lenient_completion_local",
+        ];
         for entry in ALLOWED {
             if BARE_FREE_FNS.contains(entry) {
                 continue;

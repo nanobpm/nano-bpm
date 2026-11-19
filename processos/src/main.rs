@@ -76,12 +76,12 @@ use crate::harness::{
 
 /// Per-session steering queues: an operator instruction stack drained into the running turn.
 type SteerQueues =
-    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>;
+    std::sync::Mutex<std::collections::BTreeMap<String, Arc<std::sync::Mutex<Vec<String>>>>>;
 
 /// Per-session live completion ids (`chatcmpl-…`): the in-flight turn's id, used to target it
 /// with the reasoning-control endpoint (end its thinking mid-generation).
 type CompletionIds =
-    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Option<String>>>>>;
+    std::sync::Mutex<std::collections::BTreeMap<String, Arc<std::sync::Mutex<Option<String>>>>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -136,7 +136,7 @@ struct AppState {
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        std::sync::Mutex<std::collections::BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     >,
     /// Steering queues for in-flight chat turns, keyed by session. The cockpit's "Steer …"
     /// control appends an operator instruction; the agent loop drains it at the next round
@@ -156,13 +156,13 @@ struct AppState {
     /// (`GET .../chat/stream/live`, used after a page reload) replay the buffer then follow along.
     /// This decouples the running investigation from the fetch that started it, so reloading the
     /// page no longer loses the live view. Removed once the turn ends.
-    chat_live: Arc<std::sync::Mutex<std::collections::HashMap<String, LiveTurn>>>,
+    chat_live: Arc<std::sync::Mutex<std::collections::BTreeMap<String, LiveTurn>>>,
     /// The supervised local llama.cpp `llama-server` sidecar (start/stop/status/logs). Optional at
     /// runtime — nothing runs until the operator presses Start for a `sidecar:true` profile.
     llama: llama::LlamaManager,
     /// The previous `/metrics` scrape per live-instance base URL, so the worker-scaling advisor
     /// (`GET /api/advisor`) can measure backlog growth and per-job-type drain rate across polls.
-    advisor_prev: Arc<std::sync::Mutex<std::collections::HashMap<String, advisor::Snapshot>>>,
+    advisor_prev: Arc<std::sync::Mutex<std::collections::BTreeMap<String, advisor::Snapshot>>>,
 }
 
 impl AppState {
@@ -451,13 +451,13 @@ async fn main() {
         tools: Arc::new(tools::ToolStore::open(
             settings::config_dir().join("tools.json"),
         )),
-        chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        chat_steers: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         chat_debug: Arc::new(chat::DebugStore::open(cfg.data_dir.join("chat"))),
-        chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_live: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         llama: llama::LlamaManager::new(),
-        advisor_prev: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        advisor_prev: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
     };
 
     // A handle to stop the llama sidecar on shutdown (the router takes ownership of `state`).
@@ -4415,8 +4415,8 @@ async fn cockpit_workbench_review(
 /// Scan a finished transcript for the agent's most recent `edit_model` tool call and its result,
 /// returning the ops it applied and the resulting XML (so the canvas can offer "Apply suggestion").
 fn last_edit_model(messages: &[agent::Msg]) -> (serde_json::Value, Option<String>) {
-    use std::collections::HashMap;
-    let mut results: HashMap<&str, &str> = HashMap::new();
+    use std::collections::BTreeMap;
+    let mut results: BTreeMap<&str, &str> = BTreeMap::new();
     for m in messages {
         if let agent::Msg::Tool { call_id, content } = m {
             results.insert(call_id.as_str(), content.as_str());
@@ -6180,11 +6180,12 @@ async fn distil_recorded_dataset(
     Vec<RecordedInstance>,
     u32,
     u32,
-    std::collections::HashMap<String, u32>,
+    std::collections::BTreeMap<String, u32>,
 ) {
     let mut dataset: Vec<RecordedInstance> = Vec::new();
     let mut skipped = 0u32;
-    let mut skip_reasons: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut skip_reasons: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
     let mut matched = 0u32;
     for s in summaries.iter().filter(|s| s.process_id == process_id) {
         matched += 1;

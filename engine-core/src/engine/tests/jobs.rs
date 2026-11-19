@@ -12,7 +12,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -32,7 +32,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
     // The `work` job completes writing `scoped = 99` (a name owned by the
     // sub-process scope). It must update the sub-process scope, not root.
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("scoped".to_string(), Value::Int(99));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -179,7 +179,7 @@ fn variable_spill_selects_only_job_parked_instances() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -218,7 +218,7 @@ fn spilling_a_nested_scope_instance_preserves_the_merged_job_view() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -263,7 +263,7 @@ fn leased_job_instance_is_still_spillable() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -352,7 +352,7 @@ fn cold_spill_round_trips_a_job_parked_instance() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -418,7 +418,7 @@ fn cold_spill_excludes_instances_with_a_locked_job() {
 
 #[test]
 fn static_retries_declaration_sets_initial_job_retries() {
-    let engine = deploy_and_create_retryable(Some("5"), HashMap::new());
+    let engine = deploy_and_create_retryable(Some("5"), BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, 5);
 }
@@ -433,7 +433,7 @@ fn feel_retries_expression_resolves_against_variables() {
 
 #[test]
 fn missing_retries_declaration_defaults_to_three() {
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, state::DEFAULT_JOB_RETRIES);
 }
@@ -468,7 +468,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
     engine
         .apply_command(Command::create_instance_full(
             "p",
-            HashMap::new(),
+            BTreeMap::new(),
             vec!["vip".to_string(), "eu".to_string()],
             Some("order-42".to_string()),
         ))
@@ -507,7 +507,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
 fn activated_job_has_empty_custom_headers_when_task_declares_none() {
     // A service task without zeebe:taskHeaders yields an empty header map — the
     // conservative default, never a borrowed or synthesised set.
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let mut engine = engine;
     let activated = engine.activate_jobs("do-work", "w1", 10, 60_000, 0);
     assert_eq!(activated.len(), 1);
@@ -720,7 +720,7 @@ fn should_route_on_variables_returned_by_a_completed_job() {
 
     // when the worker completes the job, returning decision=yes
     let job_key = engine.activate_jobs("decision", "w", 1, 60_000, 0)[0].key;
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::complete_job_with(job_key, vars))
         .unwrap();
@@ -1045,7 +1045,7 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // when an instance is created with jobType bound to a concrete value
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("jobType".to_string(), Value::Str("payment".to_string()));
     engine
         .apply_command(Command::create_instance_with("dynamic", vars))
@@ -1122,7 +1122,9 @@ fn lenient_completion_accepts_a_job_that_was_never_activated() {
     // given a replica engine in lenient-completion mode (leader-local
     // activation: this replica never saw the job activated)
     let mut engine = Engine::new();
-    engine.set_lenient_completion(true);
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
     assert!(engine.lenient_completion());
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
@@ -1359,7 +1361,7 @@ fn should_dispatch_jobs_to_a_callback_worker() {
     let mut seen = Vec::new();
     let handled = engine.poll_jobs("payment", "cb", 10, 60_000, 0, |job| {
         seen.push(job.job_type.clone());
-        Some(HashMap::new())
+        Some(BTreeMap::new())
     });
 
     // then the job was dispatched and completed, finishing the instance
@@ -1406,7 +1408,7 @@ fn poll_jobs_does_not_panic_when_a_batch_entry_cancels_a_sibling() {
     // A single batch poll activates both jobs, then completes each in turn.
     // Completing the trigger entry terminates the instance and cancels the work
     // entry, so the work entry is no longer completable when its turn comes.
-    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(HashMap::new()));
+    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(BTreeMap::new()));
 
     // No panic; the instance completed (terminate end, Zeebe parity), and at
     // least the trigger job was completed. The cancelled sibling is simply not
@@ -1540,7 +1542,7 @@ fn input_mapping_merges_before_job_activation() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let inst = engine
         .apply_command(Command::create_instance_with("io-in", vars))
@@ -1586,7 +1588,7 @@ fn output_mapping_projects_job_result() {
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
     let mut result = std::collections::BTreeMap::new();
     result.insert("ok".to_string(), Value::Bool(true));
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("result".to_string(), Value::Map(result));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -1671,7 +1673,7 @@ fn business_rule_task_evaluates_decision_and_binds_result_variable() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1758,7 +1760,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
             Some("out".to_string()),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1836,7 +1838,7 @@ fn evaluated_decisions_are_stamped_within_the_evaluated_drg() {
     assert_ne!(deployed_decision_key(&second, "base"), own_base);
     let first_root = deployed_decision_key(&first, "root");
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::EvaluateDecision {
@@ -1877,7 +1879,7 @@ fn standalone_evaluation_records_failures_and_rejects_unknown_decisions() {
             "drg",
         )]))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     // A failed evaluation is recorded (with its failure), not rejected.
     let events = engine
@@ -1924,7 +1926,7 @@ fn business_rule_task_resolves_decision_id_via_feel_expression() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("en".into()));
     vars.insert("decisionToCall".to_string(), Value::Str("greeting".into()));
     let events = engine
@@ -1985,7 +1987,7 @@ fn business_rule_task_spreads_map_output_without_result_variable() {
         .apply_command(Command::DeployProcess(brt_process("scores", None)))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("tier".to_string(), Value::Str("gold".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -2792,7 +2794,7 @@ fn job_parked_instance(business_id: Option<&str>) -> (Engine, Key, Key) {
     let created = engine
         .apply_command(Command::create_instance_full(
             "biz",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             business_id.map(str::to_string),
         ))
@@ -2964,7 +2966,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         let err = engine
             .apply_command(Command::create_instance_full(
                 "biz",
-                HashMap::new(),
+                BTreeMap::new(),
                 Vec::new(),
                 Some(id),
             ))
@@ -2982,7 +2984,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "k".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: Some(over),
         })
         .unwrap_err();
@@ -3764,4 +3766,184 @@ fn deferred_job_is_selectable_at_expiry_and_poll_keeps_durable_deadline() {
         1
     );
     assert!(engine.state().deferred_jobs.is_empty());
+}
+
+/// #1661 (ADR 0066 slice 2): lenient completion is replicated engine state,
+/// flipped by a command at a log index — never host config a node changes on
+/// its own clock. Two replicas applying the same committed log, with the
+/// policy flip racing a `CompleteJob` (the completion ordered BEFORE the flip
+/// in the log, a second one AFTER it), produce byte-identical events: both
+/// reject the early completion and both accept the late one.
+#[test]
+fn replicas_agree_on_a_completion_racing_a_lenient_policy_flip() {
+    let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+    for replica in &mut replicas {
+        replica
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        for _ in 0..2 {
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+        }
+    }
+    let mut jobs: Vec<Key> = replicas[0].pending_jobs().iter().map(|j| j.key).collect();
+    jobs.sort_unstable();
+    let (early, late) = (jobs[0], jobs[1]);
+
+    let committed = [
+        Command::complete_job(early),
+        Command::SetLenientCompletion { lenient: true },
+        Command::complete_job(late),
+    ];
+    let outcomes: Vec<Vec<Result<Vec<Event>, EngineError>>> = replicas
+        .iter_mut()
+        .map(|replica| {
+            committed
+                .iter()
+                .cloned()
+                .map(|c| replica.apply_command(c))
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "replicas must agree on every entry"
+    );
+    assert_eq!(
+        outcomes[0][0],
+        Err(EngineError::JobNotActivated { job_key: early }),
+        "a completion committed before the flip is strict everywhere"
+    );
+    assert_eq!(
+        outcomes[0][1],
+        Ok(vec![Event::LenientCompletionSet { lenient: true }])
+    );
+    assert!(
+        outcomes[0][2].is_ok(),
+        "a completion after the flip is lenient everywhere"
+    );
+    assert!(replicas.iter().all(Engine::lenient_completion));
+}
+
+/// #1661: the replicated flag survives every recovery path — a full journal
+/// replay, and a snapshot taken before the flip plus the tail carrying it
+/// (and a snapshot taken after it) — so a restarted replica never silently
+/// reverts to strict completion.
+#[cfg(feature = "serde")]
+#[test]
+fn lenient_completion_survives_replay_and_snapshot_plus_tail() {
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    let before_flip = engine.snapshot();
+    let tail = engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    journal.extend(tail.clone());
+    assert!(engine.lenient_completion());
+
+    let replayed = Engine::replay_partition(0, journal.clone());
+    assert!(
+        replayed.lenient_completion(),
+        "full replay restores the flag"
+    );
+
+    let mut restored = Engine::from_snapshot(before_flip);
+    assert!(!restored.lenient_completion());
+    restored.apply_replayed_events(tail);
+    assert!(
+        restored.lenient_completion(),
+        "snapshot + tail restores the flag"
+    );
+
+    let after = Engine::from_snapshot(engine.snapshot());
+    assert!(after.lenient_completion(), "a snapshot carries the flag");
+
+    // and it is one-way: a `false` command emits nothing and clears nothing
+    let off = engine
+        .apply_command(Command::SetLenientCompletion { lenient: false })
+        .unwrap();
+    assert!(off.is_empty(), "disabling is a no-op: {off:?}");
+    assert!(engine.lenient_completion());
+    journal.extend(off);
+    assert!(Engine::replay_partition(0, journal).lenient_completion());
+}
+
+/// #1661 (one-way lenience): after a leader-local activation — `activated` on
+/// the leader's replica only — a committed `SetLenientCompletion { false }`
+/// must not strand the job: every replica still accepts its completion /
+/// failure / error identically. A clearable flag would let the leader succeed
+/// and the followers fail `JobNotActivated`.
+#[test]
+fn disabling_lenience_cannot_strand_a_soft_activated_job() {
+    for terminal in 0..3 {
+        let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+        for replica in &mut replicas {
+            replica
+                .apply_command(Command::DeployProcess(linear_with_task()))
+                .unwrap();
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+            replica
+                .apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+        }
+        // The leader (replica 0) activates locally; the follower never sees it.
+        let job = replicas[0].pending_jobs()[0].key;
+        replicas[0]
+            .apply_command(Command::activate_jobs("payment", "w", 1, 60_000, 0))
+            .unwrap();
+        let terminal_cmd = match terminal {
+            0 => Command::complete_job(job),
+            1 => Command::fail_job(job, 0, "boom"),
+            _ => Command::throw_job_error(job, "E", "boom"),
+        };
+        let committed = [
+            Command::SetLenientCompletion { lenient: false },
+            terminal_cmd,
+        ];
+        let outcomes: Vec<Vec<bool>> = replicas
+            .iter_mut()
+            .map(|r| {
+                committed
+                    .iter()
+                    .cloned()
+                    .map(|c| r.apply_command(c).is_ok())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(outcomes[0], outcomes[1], "replicas agree (case {terminal})");
+        assert!(
+            outcomes[0][1],
+            "the terminal command applies (case {terminal})"
+        );
+        assert!(replicas.iter().all(Engine::replicated_lenient_completion));
+    }
+}
+
+/// #1661 rolling upgrade: before the replicated flag is committed, the legacy
+/// host flag (set from the activation policy, identically on every node, as
+/// before #1661) still grants lenient completion — without counting as
+/// replicated state.
+#[test]
+fn legacy_lenient_flag_applies_before_cutover_without_replicated_state() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    engine.set_legacy_lenient_completion(true);
+    assert!(engine.lenient_completion());
+    assert!(!engine.replicated_lenient_completion());
+    let job = engine.pending_jobs()[0].key;
+    assert!(engine.apply_command(Command::complete_job(job)).is_ok());
 }

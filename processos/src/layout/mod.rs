@@ -45,7 +45,7 @@ pub mod polish;
 pub mod schema;
 pub mod solver;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 #[allow(unused_imports)] // re-exported public API
@@ -98,7 +98,7 @@ pub fn layout_with(
         Solver::RowBias => {
             let bias = solver::compute_row_bias(ann);
             let xml =
-                definition_to_xml_with_row_bias(&def, &std::collections::HashMap::new(), &bias);
+                definition_to_xml_with_row_bias(&def, &std::collections::BTreeMap::new(), &bias);
             (xml, None, None)
         }
         Solver::Field => {
@@ -155,15 +155,15 @@ fn emit_bpmn_from_field(
     //    auto-generated DI we're about to replace.
     let base = definition_to_xml_with_row_bias(
         def,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
     );
 
     // 2) Extract the serializer's `(sourceRef, targetRef) -> flow_id` map so
     //    we can rewrite our synthesized `SRC__TGT` edge ids to match. Without
     //    this the DI would reference edges the model doesn't declare and
     //    Modeler would show `unresolved reference` warnings.
-    let mut flow_id_by_pair: HashMap<(String, String), String> = HashMap::new();
+    let mut flow_id_by_pair: BTreeMap<(String, String), String> = BTreeMap::new();
     for chunk in base.split("<bpmn:sequenceFlow ").skip(1) {
         let attrs_end = chunk.find(['>', '/']).unwrap_or(chunk.len());
         let attrs = &chunk[..attrs_end];
@@ -296,7 +296,7 @@ pub struct LayoutOutput {
     /// Present only when the field solver was used — the last-step net force
     /// vector per node. Sourced from [`field::FieldOutput::node_forces`].
     #[allow(dead_code)] // exposed for library consumers; not read by CLI directly
-    pub node_forces: Option<std::collections::HashMap<String, (f64, f64)>>,
+    pub node_forces: Option<std::collections::BTreeMap<String, (f64, f64)>>,
 }
 
 #[cfg(test)]

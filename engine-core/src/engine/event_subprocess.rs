@@ -33,7 +33,7 @@
 //! parity), which weighs a scope's hosted event sub-processes against the
 //! boundary events attached to it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use super::{expression, Engine, Step};
 use crate::{
@@ -111,7 +111,7 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
         scope_element: Option<&str>,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<Vec<Event>, expression::Failure> {
         let esps = self.armable_event_subprocesses(instance_key, scope_element);
         self.arm_event_subprocess_triggers(instance_key, scope_eik, esps, vars)
@@ -127,7 +127,7 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
         esps: Vec<ArmableEsp>,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<Vec<Event>, expression::Failure> {
         if esps.is_empty() {
             return Ok(Vec::new());
@@ -244,7 +244,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         scope_element: Option<&str>,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<(), expression::Failure> {
         let mark = self.next_local;
         let result = self
@@ -620,7 +620,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         kind: &state::MessageSubscriptionKind,
-        variables: &HashMap<String, Value>,
+        variables: &BTreeMap<String, Value>,
     ) {
         if variables.is_empty() {
             return;

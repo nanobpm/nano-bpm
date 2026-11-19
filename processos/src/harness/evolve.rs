@@ -225,14 +225,14 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use serde_json::json;
 
     use super::*;
     use crate::harness::replay::{RecordedInstance, RecordedStimulus};
 
-    fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
+    fn map(pairs: &[(&str, Json)]) -> BTreeMap<String, Json> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))

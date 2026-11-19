@@ -47,7 +47,7 @@
 //! [`crate::bpmn`]'s streaming parser, `validate/mod.rs`, or the `ParseError`
 //! enum.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::ParseError;
 use super::ValidationInput;
@@ -64,7 +64,7 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     // with the ad-hoc catalog so a boundary attached to an ad-hoc inner element
     // (pruned from the graph but genuinely declared) is not mistaken for a
     // dangling reference.
-    let mut activity_ids: HashSet<&str> = input
+    let mut activity_ids: BTreeSet<&str> = input
         .def
         .elements
         .iter()
@@ -106,7 +106,7 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     // deploy (Zeebe `ModelUtil.verifyLinkIntermediateEvents`). An empty link
     // name is malformed and rejected outright (Zeebe requires a non-empty
     // `name`), so a missing/blank name can never route silently under "".
-    let mut catch_scopes: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut catch_scopes: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for (catch_name, catch_scope) in &capture.link_catches {
         if catch_name.trim().is_empty() {
             return Err(ParseError::InvalidProcess {
@@ -169,7 +169,7 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     // mis-execute (a throw's downstream would be dropped, a catch could be
     // double-triggered). Reject the structural mistake at deploy, matching the
     // documented link-event semantics.
-    let mut flow_targets: HashSet<&str> = HashSet::new();
+    let mut flow_targets: BTreeSet<&str> = BTreeSet::new();
     for element in input.def.elements.values() {
         for flow in &element.outgoing {
             flow_targets.insert(flow.to.as_str());

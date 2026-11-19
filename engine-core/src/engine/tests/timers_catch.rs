@@ -210,14 +210,14 @@ fn should_park_on_signal_catch_then_broadcast() {
     assert_eq!(engine.signal_subscriptions().len(), 2);
 
     // A non-matching signal correlates nothing.
-    let fired = engine.broadcast_signal("other", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("other", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
     assert!(!engine.is_completed(a_key));
 
     // The matching broadcast fans out to BOTH instances, completing them.
-    let fired = engine.broadcast_signal("all-clear", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("all-clear", BTreeMap::new(), 0);
     assert_eq!(
         fired
             .iter()
@@ -229,7 +229,7 @@ fn should_park_on_signal_catch_then_broadcast() {
     assert!(engine.is_completed(b_key));
 
     // A repeat broadcast never re-correlates a settled subscription.
-    let fired = engine.broadcast_signal("all-clear", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("all-clear", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
@@ -261,14 +261,14 @@ fn should_park_on_message_catch_then_correlate() {
     assert_eq!(subs[0].correlation_key, "A");
 
     // A non-matching correlation key correlates nothing.
-    let fired = engine.correlate_message("payment-received", "B", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-received", "B", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
     assert!(!engine.is_completed(instance_key));
 
     // The matching message releases the token and completes the instance.
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -279,7 +279,7 @@ fn should_park_on_message_catch_then_correlate() {
     );
 
     // A repeat message never correlates the now-settled subscription twice.
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -310,14 +310,14 @@ fn feel_signal_name_resolves_on_activation() {
     assert_eq!(engine.signal_subscriptions().len(), 1);
 
     // A broadcast for a different zone does not correlate.
-    let fired = engine.broadcast_signal("clear-south", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("clear-south", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
     assert!(!engine.is_completed(key));
 
     // The resolved name completes the instance.
-    let fired = engine.broadcast_signal("clear-north", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("clear-north", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
@@ -516,7 +516,7 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             element_instance_key: r_eik,
             element_id: "await".into(),
             kind: state::MessageSubscriptionKind::IntermediateCatch,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             delivery_key: 0,
         })
         .unwrap();
@@ -574,7 +574,7 @@ fn catch_event_output_mapping_applies_on_correlation() {
     // Triggering the catch event runs its output mapping. The instance then
     // completes and drops hot state (ADR 0012), so assert the incremented value
     // on the durable `VariablesUpdated` event rather than hot state.
-    let fired = engine.correlate_message("review-ready", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("review-ready", "A", BTreeMap::new(), 0);
     let bumped = fired
         .iter()
         .find_map(|e| match e {
@@ -700,7 +700,7 @@ fn should_take_default_flow_even_when_listed_before_the_conditional() {
     engine
         .apply_command(Command::DeployProcess(process.clone()))
         .unwrap();
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -718,7 +718,7 @@ fn should_take_default_flow_even_when_listed_before_the_conditional() {
     engine
         .apply_command(Command::DeployProcess(process))
         .unwrap();
-    let vars = HashMap::from([("decision".to_string(), Value::Str("no".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("no".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -743,7 +743,7 @@ fn should_seed_thrown_error_variables_at_the_catch_scope() {
     let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
 
     // when the worker throws the caught error WITH variables
-    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    let vars = BTreeMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
     engine
         .apply_command(Command::throw_job_error_with(
             job_key,
@@ -785,7 +785,7 @@ fn should_create_an_instance_when_a_message_start_correlates() {
         .unwrap();
 
     // A non-matching message creates nothing.
-    engine.correlate_message("other", "", HashMap::new(), 0);
+    engine.correlate_message("other", "", BTreeMap::new(), 0);
     assert!(engine.state().instances.is_empty());
 
     // The matching message creates and runs a fresh instance to completion,
@@ -824,7 +824,7 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
             Command::CorrelateMessage {
                 message_name: "order-placed".into(),
                 correlation_key: String::new(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 business_id: Some("order-42".into()),
             },
             0,
@@ -859,7 +859,7 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
             Command::CorrelateMessage {
                 message_name: "payment-received".into(),
                 correlation_key: "A".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 business_id: Some("ignored".into()),
             },
             0,
@@ -901,7 +901,7 @@ fn feel_message_start_name_resolves_at_deploy() {
         .contains_key("order-placed"));
 
     // A message under the resolved name creates an instance.
-    let fired = engine.correlate_message("order-placed", "", HashMap::new(), 0);
+    let fired = engine.correlate_message("order-placed", "", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })));
@@ -915,8 +915,8 @@ fn should_create_one_instance_per_matching_message_start() {
         .unwrap();
 
     // Each matching message creates a distinct instance.
-    engine.correlate_message("order-placed", "", HashMap::new(), 0);
-    engine.correlate_message("order-placed", "", HashMap::new(), 0);
+    engine.correlate_message("order-placed", "", BTreeMap::new(), 0);
+    engine.correlate_message("order-placed", "", BTreeMap::new(), 0);
     assert_eq!(engine.state().instances.len(), 2);
 }
 
@@ -936,7 +936,7 @@ fn message_start_distributes_created_instances_across_partitions() {
     let mut dispatched_targets = Vec::new();
     let mut inline_instances = 0;
     for _ in 0..N {
-        let fired = engine.correlate_message("order-placed", "", HashMap::new(), 0);
+        let fired = engine.correlate_message("order-placed", "", BTreeMap::new(), 0);
         for e in &fired {
             match e {
                 Event::ProcessInstanceCreated { .. } => inline_instances += 1,
@@ -978,7 +978,7 @@ fn should_recover_a_message_start_subscription_via_replay() {
     // Replay: the process-level subscription survives and still fires.
     let mut recovered = Engine::replay(log);
     assert_eq!(recovered.state().message_start_subscriptions.len(), 1);
-    let fired = recovered.correlate_message("order-placed", "", HashMap::new(), 0);
+    let fired = recovered.correlate_message("order-placed", "", BTreeMap::new(), 0);
     let instance_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
     assert!(recovered.is_completed(instance_key));
 }
@@ -1175,8 +1175,8 @@ fn two_message_starts_open_two_subscriptions() {
     );
 
     // Each name fires its own start; a non-matching name fires nothing.
-    engine.correlate_message("msg-a", "", HashMap::new(), 0);
-    engine.correlate_message("msg-b", "", HashMap::new(), 0);
+    engine.correlate_message("msg-a", "", BTreeMap::new(), 0);
+    engine.correlate_message("msg-b", "", BTreeMap::new(), 0);
     assert_eq!(engine.state().instances.len(), 2);
 }
 
@@ -1200,7 +1200,7 @@ fn message_and_timer_starts_wire_both_triggers() {
     assert_eq!(engine.state().message_start_subscriptions.len(), 1);
     assert_eq!(engine.state().start_timers.len(), 1);
 
-    engine.correlate_message("kick", "", HashMap::new(), 2_000);
+    engine.correlate_message("kick", "", BTreeMap::new(), 2_000);
     engine.trigger_timers(6_000);
     assert_eq!(engine.state().instances.len(), 2);
 }
@@ -1264,7 +1264,7 @@ fn feel_duration_timer_evaluates_variable() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("waitFor".to_string(), Value::Str("PT5S".to_string()));
     let events = engine
         .apply_command_at(Command::create_instance_with("feel-timer", vars), 1_000)
@@ -1318,7 +1318,7 @@ fn feel_date_timer_fires_at_absolute_instant() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert(
         "dueAt".to_string(),
         Value::Str("2030-01-01T00:00:00Z".to_string()),
@@ -1423,7 +1423,7 @@ fn event_based_gateway_arms_all_catch_events_then_timer_wins() {
         .apply_command(Command::DeployProcess(event_gateway_race()))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command_at(Command::create_instance_with("race", vars), 1_000)
@@ -1468,7 +1468,7 @@ fn event_based_gateway_message_wins_and_withdraws_the_timer_sibling() {
         .apply_command(Command::DeployProcess(event_gateway_race()))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command_at(Command::create_instance_with("race", vars), 1_000)
@@ -1495,7 +1495,7 @@ fn event_based_gateway_ambiguous_owner_withdraws_nothing() {
         .apply_command(Command::DeployProcess(ambiguous_event_gateway_race()))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command_at(Command::create_instance_with("ambig", vars), 1_000)
@@ -1535,7 +1535,7 @@ fn event_based_gateway_never_force_completes_non_catch_sibling() {
         ))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command_at(Command::create_instance_with("malformed", vars), 1_000)

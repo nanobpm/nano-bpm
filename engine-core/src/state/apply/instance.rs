@@ -1,6 +1,6 @@
 //! Instance-family appliers: process-instance lifecycle, variables, scopes and agent records.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::event::Event;
@@ -23,6 +23,61 @@ fn non_terminal_process_id(state: &State, instance_key: &Key) -> Option<String> 
         }
         _ => None,
     }
+}
+
+/// Drops the mapping-time secret provenance (#1640) of every job of
+/// `instance_key` whose variable view the write to `scope_key` can change.
+/// Provenance attests the value a trusted input mapping wrote; a later write
+/// visible to the job may replace that value (even with equal reference text
+/// from an untrusted source), so trust is revoked — fail closed: the reference
+/// text then passes through unresolved.
+///
+/// A job sees its own element-instance scope and every ancestor scope up to the
+/// root, so a write is relevant iff it targets the root (`None`, `0` or the
+/// instance key) or one of those scopes. A write to a sibling branch (e.g. a
+/// parallel task's own input mappings) cannot reach the job and keeps its
+/// trust. Jobs without provenance are skipped before any scope walk.
+fn revoke_secret_provenance(state: &mut State, instance_key: &Key, scope_key: Option<Key>) {
+    let Some(keys) = state.jobs_by_instance.get(instance_key) else {
+        return;
+    };
+    let scope = scope_key.filter(|s| *s != 0 && s != instance_key);
+    let scopes = state.instances.get(instance_key).map(|i| &i.scopes);
+    for key in keys {
+        let Some(job) = state.jobs.get_mut(key) else {
+            continue;
+        };
+        if job.secret_provenance.is_empty() {
+            continue;
+        }
+        let visible = match scope {
+            None => true,
+            Some(target) => sees_scope(scopes, job.element_instance_key, target),
+        };
+        if visible {
+            job.secret_provenance.clear();
+        }
+    }
+}
+
+/// Whether `target` is `element_instance_key` itself or one of its ancestor
+/// scopes in the instance's element-instance tree. Cycle-safe; an unknown tree
+/// answers `true` (fail closed).
+fn sees_scope(scopes: Option<&BTreeMap<Key, Key>>, element_instance_key: Key, target: Key) -> bool {
+    let Some(scopes) = scopes else {
+        return true;
+    };
+    let mut current = element_instance_key;
+    for _ in 0..=scopes.len() {
+        if current == target {
+            return true;
+        }
+        match scopes.get(&current) {
+            Some(&parent) if parent != 0 => current = parent,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Decrements a definition's in-flight instance count on a terminal transition,
@@ -82,26 +137,26 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     business_id: business_id.clone(),
                     parent_process_instance_key: *parent_process_instance_key,
                     parent_element_instance_key: *parent_element_instance_key,
-                    active: HashMap::new(),
-                    scopes: HashMap::new(),
+                    active: BTreeMap::new(),
+                    scopes: BTreeMap::new(),
                     variables: Arc::new(variables.clone()),
-                    join_counts: HashMap::new(),
-                    join_flow_arrivals: HashMap::new(),
-                    join_instances: HashMap::new(),
+                    join_counts: BTreeMap::new(),
+                    join_flow_arrivals: BTreeMap::new(),
+                    join_instances: BTreeMap::new(),
                     parked_joins: Default::default(),
                     activating: Default::default(),
-                    gateway_routes: HashMap::new(),
+                    gateway_routes: BTreeMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
-                    multi_instances: HashMap::new(),
-                    adhoc_instances: HashMap::new(),
-                    scope_parents: HashMap::new(),
-                    scope_variables: HashMap::new(),
-                    esp_held_payloads: HashMap::new(),
+                    multi_instances: BTreeMap::new(),
+                    adhoc_instances: BTreeMap::new(),
+                    scope_parents: BTreeMap::new(),
+                    scope_variables: BTreeMap::new(),
+                    esp_held_payloads: BTreeMap::new(),
                     compensable: Default::default(),
-                    compensation_waits: HashMap::new(),
-                    agent_instances: HashMap::new(),
-                    agent_history: HashMap::new(),
+                    compensation_waits: BTreeMap::new(),
+                    agent_instances: BTreeMap::new(),
+                    agent_history: BTreeMap::new(),
                 },
             );
         }
@@ -116,6 +171,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     map.insert(k.clone(), v.clone());
                 }
             }
+            revoke_secret_provenance(state, instance_key, None);
         }
 
         Event::ScopedVariablesUpdated {
@@ -138,6 +194,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     }
                 }
             }
+            revoke_secret_provenance(state, instance_key, Some(*scope_key));
         }
 
         Event::VariableScopeCreated {
@@ -230,7 +287,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
-                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                let keys: BTreeSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     // Only PENDING turns transition; a committed/discarded turn
                     // is immutable (append-only).
@@ -253,7 +310,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
-                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                let keys: BTreeSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
                         && keys.contains(&record.agent_history_key)
@@ -337,7 +394,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // The instance shell stays resident until eviction so status
                 // queries still resolve during the read-model projection gap.
                 if !instance.variables.is_empty() {
-                    instance.variables = Arc::new(HashMap::new());
+                    instance.variables = Arc::new(BTreeMap::new());
                 }
                 instance.variables_spilled = false;
                 instance.scope_variables.clear();
@@ -389,7 +446,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             compensation_migrated,
             ..
         } => {
-            let remap: HashMap<&str, &str> = element_mappings
+            let remap: BTreeMap<&str, &str> = element_mappings
                 .iter()
                 .map(|(s, t)| (s.as_str(), t.as_str()))
                 .collect();
@@ -465,10 +522,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     // (element instance, element, source handler, source boundary id);
                     // duplicates
                     // (boundaries sharing a handler) are consumed one each.
-                    let mut plan: HashMap<
+                    let mut plan: BTreeMap<
                         (Key, &str, &str, &str),
                         std::collections::VecDeque<&crate::event::MigratedCompensationSubscription>,
-                    > = HashMap::new();
+                    > = BTreeMap::new();
                     for c in compensation_subscriptions {
                         plan.entry((
                             c.source_element_instance_key,
@@ -524,9 +581,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // merge deterministically instead: sum the arrival counts, and
                 // keep the smallest element-instance key for the open join.
                 if !instance.join_counts.is_empty() {
-                    let mut remapped: HashMap<JoinKey, usize> =
-                        HashMap::with_capacity(instance.join_counts.len());
-                    for (mut eid, count) in instance.join_counts.drain() {
+                    let mut remapped: BTreeMap<JoinKey, usize> = BTreeMap::new();
+                    for (mut eid, count) in std::mem::take(&mut instance.join_counts) {
                         remap_id(&mut eid.element_id);
                         *remapped.entry(eid).or_insert(0) += count;
                     }
@@ -536,9 +592,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // source element, so both ids are remapped (the migration guard
                 // has already checked every flow exists in the target).
                 if !instance.join_flow_arrivals.is_empty() {
-                    let mut remapped: HashMap<JoinKey, FlowArrivals> =
-                        HashMap::with_capacity(instance.join_flow_arrivals.len());
-                    for (mut eid, mut arrivals) in instance.join_flow_arrivals.drain() {
+                    let mut remapped: BTreeMap<JoinKey, FlowArrivals> = BTreeMap::new();
+                    for (mut eid, mut arrivals) in std::mem::take(&mut instance.join_flow_arrivals)
+                    {
                         remap_id(&mut eid.element_id);
                         arrivals.remap(remap_id);
                         let merged = remapped.entry(eid).or_default();
@@ -549,9 +605,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     instance.join_flow_arrivals = remapped;
                 }
                 if !instance.join_instances.is_empty() {
-                    let mut remapped: HashMap<JoinKey, Key> =
-                        HashMap::with_capacity(instance.join_instances.len());
-                    for (mut eid, eik) in instance.join_instances.drain() {
+                    let mut remapped: BTreeMap<JoinKey, Key> = BTreeMap::new();
+                    for (mut eid, eik) in std::mem::take(&mut instance.join_instances) {
                         remap_id(&mut eid.element_id);
                         remapped
                             .entry(eid)
@@ -737,7 +792,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // Drop the variable payload on the terminal transition — see
                 // `ProcessInstanceCompleted` above (ADR 0012).
                 if !instance.variables.is_empty() {
-                    instance.variables = Arc::new(HashMap::new());
+                    instance.variables = Arc::new(BTreeMap::new());
                 }
                 instance.variables_spilled = false;
                 instance.scope_variables.clear();

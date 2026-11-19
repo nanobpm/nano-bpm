@@ -1529,18 +1529,81 @@ fn read_segment_events_tagged_with(
     num_partitions: usize,
     tail: TailPolicy,
 ) -> io::Result<Vec<(u64, Event)>> {
-    read_segment_with(path, tail, |line| {
+    // The attribution check runs after the read so a fail-closed rejection is
+    // never mistaken for (and dropped as) a torn tail by `read_segment_with`.
+    let mut unattributed: Option<io::Error> = None;
+    let events = read_segment_with(path, tail, |line| {
         let (tag, json) = match line.split_once('\t') {
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
         };
         let event = decode_journal_event(json)?;
+        if unattributed.is_none()
+            && let Err(e) =
+                check_cluster_variable_attribution(&event, tag.is_some(), num_partitions)
+        {
+            unattributed = Some(e);
+        }
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
         Ok((tag, event))
     })
-    .map(|(events, _)| events)
+    .map(|(events, _)| events)?;
+    match unattributed {
+        Some(e) => Err(e),
+        None => Ok(events),
+    }
+}
+
+/// An UNTAGGED (legacy, `NANOBPMN_JOURNAL_SEGMENTED=0`) cluster-variable
+/// lifecycle record found in a journal shared by more than one partition
+/// (#1657, ADR 0066). The legacy format records no producing partition, and a
+/// cluster variable is replicated per partition by a fan-out that may have
+/// been interrupted — so neither routing is faithful: broadcasting installs a
+/// value into partitions whose own copy never committed, and the key fallback
+/// loses it everywhere but partition 0. Recovery therefore fails closed (the
+/// #1473 / #1066 rule) instead of guessing. The server refuses cluster-variable
+/// writes in that mode, so such a record only exists if written by a build
+/// without that guard. Downcastable from the returned `io::Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattributedClusterVariableError {
+    /// Partitions sharing the journal (always `> 1`).
+    pub num_partitions: usize,
+}
+
+impl std::fmt::Display for UnattributedClusterVariableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to recover: the journal holds an untagged (NANOBPMN_JOURNAL_SEGMENTED=0) \
+             cluster-variable record shared by {} partitions; the legacy format records no \
+             producing partition, so it cannot be replayed without guessing which partitions \
+             committed it (#1657, ADR 0066 — fail closed per #1066/#1473). Operator action: \
+             remove the record from the journal (or restore a backup) and re-create the \
+             variable with segmented journals enabled, or run single-partition.",
+            self.num_partitions
+        )
+    }
+}
+
+impl std::error::Error for UnattributedClusterVariableError {}
+
+/// The single canonical cluster-variable attribution guard (#1657): `Err`
+/// ([`UnattributedClusterVariableError`]) iff `event` is a cluster-variable
+/// lifecycle record WITHOUT a producing-partition tag in a journal shared by
+/// more than one partition. Single-partition journals are always attributable.
+pub fn check_cluster_variable_attribution(
+    event: &Event,
+    tagged: bool,
+    num_partitions: usize,
+) -> io::Result<()> {
+    if !tagged && num_partitions > 1 && event.is_cluster_variable_lifecycle() {
+        return Err(io::Error::other(UnattributedClusterVariableError {
+            num_partitions,
+        }));
+    }
+    Ok(())
 }
 
 /// Loads the latest persisted snapshot in `dir`.
@@ -2211,6 +2274,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
         };
         let event = decode_journal_event(json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        check_cluster_variable_attribution(&event, tag.is_some(), num_partitions)?;
         let tag = tag.unwrap_or_else(|| {
             (event.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64
         });
@@ -2636,10 +2700,10 @@ fn load_multi_snapshot(dir: &Path) -> io::Result<Option<MultiEngines>> {
 
 /// Per-partition `(covered, base_id)` of a combined snapshot (see
 /// [`PersistedSnapshot::base_id`]).
-type MultiBases = std::collections::HashMap<u64, (u64, Option<u64>)>;
+type MultiBases = std::collections::BTreeMap<u64, (u64, Option<u64>)>;
 
 /// A decoded combined snapshot: global partition id -> `(covered, snapshot)`.
-type MultiEngines = std::collections::HashMap<u64, (u64, EngineSnapshot)>;
+type MultiEngines = std::collections::BTreeMap<u64, (u64, EngineSnapshot)>;
 
 /// [`load_multi_snapshot`] plus each entry's `(covered, base_id)`.
 fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, MultiBases)>> {
@@ -3912,7 +3976,7 @@ mod tests {
             .unwrap();
         let mut keys = Vec::new();
         for i in 0..4 {
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
             let (events, _) = journal
                 .apply_command(Command::create_instance_with("demo", vars))
@@ -4003,7 +4067,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("lost".to_string()));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("demo", vars))
@@ -4058,7 +4122,7 @@ mod tests {
             let (writer, recovery) =
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4078,13 +4142,13 @@ mod tests {
             let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
-            let mut vars0 = std::collections::HashMap::new();
+            let mut vars0 = std::collections::BTreeMap::new();
             vars0.insert("data".to_string(), Value::Str("p0-payload".to_string()));
             let (e0, _) = j0
                 .apply_command(Command::create_instance_with("demo", vars0))
                 .unwrap();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
-            let mut vars1 = std::collections::HashMap::new();
+            let mut vars1 = std::collections::BTreeMap::new();
             vars1.insert("data".to_string(), Value::Str("p1-payload".to_string()));
             let (e1, _) = j1
                 .apply_command(Command::create_instance_with("demo", vars1))
@@ -4121,7 +4185,7 @@ mod tests {
         // Reopen: both partitions restore from the streamed combined snapshot.
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         let inst0 = engines[&0]
             .instance(key0)
@@ -4428,7 +4492,7 @@ mod tests {
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
             assert!(recovery.fresh);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4489,7 +4553,7 @@ mod tests {
         // sealed prefix was compacted off disk).
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&0].instance(key0).is_some(),
@@ -4520,7 +4584,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4578,7 +4642,7 @@ mod tests {
             let (writer, recovery) =
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4620,7 +4684,7 @@ mod tests {
 
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&0].instance(pre0).is_some(),
@@ -4642,7 +4706,7 @@ mod tests {
     /// AFTER the checkpoint (which merges onto the store's base on replay).
     #[test]
     fn lean_snapshot_recovery_matches_full_replay() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use nanobpmn_engine_core::Value;
 
@@ -4657,7 +4721,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
                     .expect("open multi");
             assert!(recovery.fresh);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4683,13 +4747,13 @@ mod tests {
             // Create with initial variables, then merge a second batch — all
             // BEFORE the checkpoint (so they live only in the store + control
             // snapshot, never in a variable-bearing snapshot).
-            let mut init = HashMap::new();
+            let mut init = BTreeMap::new();
             init.insert("a".to_string(), Value::Int(1i64));
             let (e0, _) = j0
                 .apply_command(Command::create_instance_with("demo", init))
                 .unwrap();
             let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
-            let mut pre = HashMap::new();
+            let mut pre = BTreeMap::new();
             pre.insert("b".to_string(), Value::Int(2i64));
             let _ = j0.apply_command(Command::set_variables(key, pre)).unwrap();
 
@@ -4699,7 +4763,7 @@ mod tests {
             for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
                 let (snap, covered, upserts, forgets) =
                     j.snapshot_and_rotate_lean().expect("lean checkpoint");
-                let ups: Vec<(nanobpmn_engine_core::Key, &HashMap<String, Value>)> =
+                let ups: Vec<(nanobpmn_engine_core::Key, &BTreeMap<String, Value>)> =
                     upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
                 varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
                 entries.push((pid, covered, snap));
@@ -4711,7 +4775,7 @@ mod tests {
             // merge-onto-base case recovery must get right. Await its commit so
             // the write is durable in the segment before we drop the writer and
             // recover (otherwise it races the background group-commit thread).
-            let mut post = HashMap::new();
+            let mut post = BTreeMap::new();
             post.insert("c".to_string(), Value::Int(3i64));
             let (_, commit) = j0.apply_command(Command::set_variables(key, post)).unwrap();
             commit.blocking_wait();
@@ -4723,7 +4787,7 @@ mod tests {
         // store, then the tail `SetVariables` merged on top.
         let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         let inst = engines[&0].instance(key).expect("instance restored");
         assert_eq!(
@@ -4757,7 +4821,7 @@ mod tests {
     /// the partition it swaps in.
     #[test]
     fn scoped_recovery_discards_pending_spills_only_for_rebuilt_partitions() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use nanobpmn_engine_core::Value;
 
@@ -4770,7 +4834,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
                     .expect("open multi");
             assert!(recovery.fresh);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4796,14 +4860,14 @@ mod tests {
             // post-checkpoint spills below are genuinely PENDING (never promoted).
             // Each carries an initial variable so the checkpointed `vars` row is
             // distinguishable from the pending spill row.
-            let mut init0 = HashMap::new();
+            let mut init0 = BTreeMap::new();
             init0.insert("base".to_string(), Value::Int(0i64));
             let (e0, c0) = j0
                 .apply_command(Command::create_instance_with("demo", init0))
                 .unwrap();
             c0.blocking_wait();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
-            let mut init1 = HashMap::new();
+            let mut init1 = BTreeMap::new();
             init1.insert("base".to_string(), Value::Int(0i64));
             let (e1, c1) = j1
                 .apply_command(Command::create_instance_with("demo", init1))
@@ -4815,7 +4879,7 @@ mod tests {
             for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
                 let (snap, covered, upserts, forgets) =
                     j.snapshot_and_rotate_lean().expect("lean checkpoint");
-                let ups: Vec<(nanobpmn_engine_core::Key, &HashMap<String, Value>)> =
+                let ups: Vec<(nanobpmn_engine_core::Key, &BTreeMap<String, Value>)> =
                     upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
                 varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
                 entries.push((pid, covered, snap));
@@ -4827,14 +4891,14 @@ mod tests {
             // spill write-through itself is `Journal`-internal, so the test
             // stages the same pending row directly, exactly as
             // `Journal::shed_variables` does via `VarStore::put_current`.)
-            let mut v0 = HashMap::new();
+            let mut v0 = BTreeMap::new();
             v0.insert("p0".to_string(), Value::Int(10i64));
             let (_, c) = j0
                 .apply_command(Command::set_variables(key0, v0.clone()))
                 .unwrap();
             c.blocking_wait();
             varstore.put_current(0, key0, &v0).unwrap();
-            let mut v1 = HashMap::new();
+            let mut v1 = BTreeMap::new();
             v1.insert("p1".to_string(), Value::Int(11i64));
             let (_, c) = j1
                 .apply_command(Command::set_variables(key1, v1.clone()))
@@ -4851,7 +4915,7 @@ mod tests {
         // live spilled payload and must survive.
         let recovery =
             recover_multi_scoped(&dir, &[0, 1], 2, Some(&varstore), &[0]).expect("scoped recover");
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         let rebuilt0 = engines[&0].instance(key0).expect("partition 0 instance");
         assert_eq!(
@@ -4879,7 +4943,7 @@ mod tests {
         // A COLD boot rebuilds every owned engine, so the full-scope wrapper
         // still discards both partitions' pending rows.
         let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("cold recover");
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert_eq!(
             engines[&1]
@@ -4922,7 +4986,7 @@ mod tests {
             let (writer, recovery) =
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
                     .expect("open multi");
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -4948,7 +5012,7 @@ mod tests {
 
             let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert(
                 "data".to_string(),
                 Value::Str("spilled-payload".to_string()),
@@ -4969,7 +5033,7 @@ mod tests {
                     j.snapshot_and_rotate_lean().expect("lean checkpoint");
                 let ups: Vec<(
                     nanobpmn_engine_core::Key,
-                    &std::collections::HashMap<String, Value>,
+                    &std::collections::BTreeMap<String, Value>,
                 )> = upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
                 varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
                 entries.push((pid, covered, snap));
@@ -4986,7 +5050,7 @@ mod tests {
         // authoritative store (the spilled payload is durable there).
         let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         let inst = engines[&0].instance(key).expect("instance restored");
         assert_eq!(
@@ -5024,7 +5088,7 @@ mod tests {
             let (writer, recovery) =
                 crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
                     .expect("open clustered");
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
@@ -5067,7 +5131,7 @@ mod tests {
         // their instances.
         let recovery = recover_multi(&dir, &[1, 2], 3, None).expect("reopen clustered");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&1].instance(inst1).is_some(),
@@ -5232,7 +5296,7 @@ mod tests {
             n_events += 1;
         }
         for _ in 0..80 {
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert(
                 "payload".to_string(),
                 nanobpmn_engine_core::Value::Str("y".repeat(16384)),
@@ -5334,7 +5398,7 @@ mod tests {
         let (create, _) = j
             .apply_command(Command::create_instance_with(
                 "demo",
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             ))
             .unwrap();
         let mut good = Vec::new();
@@ -5649,7 +5713,7 @@ mod tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 999,
             process_id: "demo".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -6498,7 +6562,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -6548,7 +6612,7 @@ mod tests {
         // Boot: replay-migrate every owned partition from the cold archive.
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("migrating reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&0].instance(key0).is_some(),
@@ -6577,7 +6641,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -6623,7 +6687,7 @@ mod tests {
 
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reconstructing reopen multi");
         assert!(!recovery.fresh);
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&0].instance(key0).is_some(),
@@ -6917,6 +6981,98 @@ mod tests {
     /// The tagged multi-partition reader applies the same discipline: an unknown
     /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
     /// dropped record.
+    fn cluster_var_created_json(name: &str) -> String {
+        serde_json::to_string(&Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: name.to_string(),
+            value: nanobpmn_engine_core::Value::Int(1),
+            kind: Default::default(),
+            metadata: Default::default(),
+        })
+        .unwrap()
+    }
+
+    fn is_unattributed_cluster_variable(err: &io::Error) -> bool {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<UnattributedClusterVariableError>())
+            .is_some()
+    }
+
+    /// PR #1670 review (#1657, ADR 0066): an UNTAGGED cluster-variable record
+    /// in a multi-partition journal has no producing partition, so segmented
+    /// recovery must fail closed with the typed error — never broadcast it into
+    /// partitions whose fan-out copy may never have committed.
+    #[test]
+    fn segmented_recovery_fails_closed_on_untagged_cluster_variable() {
+        let dir = temp_dir("untagged-cluster-vars");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!("{}\n", cluster_var_created_json("legacy")),
+        )
+        .unwrap();
+        let err = recover_multi(&dir, &[0, 1, 2], 3, None)
+            .err()
+            .expect("an unattributable cluster-variable record must fail closed");
+        assert!(is_unattributed_cluster_variable(&err), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same guard covers the cold archive reader.
+    #[test]
+    fn parse_cold_file_tagged_fails_closed_on_untagged_cluster_variable() {
+        let dir = temp_dir("cold-untagged-cluster-var");
+        fs::create_dir_all(&dir).unwrap();
+        let path = cold_name(&dir, 0, 1);
+        let plaintext = format!("{}\n", cluster_var_created_json("legacy"));
+        fs::write(&path, deflate_all(plaintext.as_bytes()).unwrap()).unwrap();
+        let err = parse_cold_file_tagged(&path, 2).expect_err("must fail closed");
+        assert!(is_unattributed_cluster_variable(&err), "{err}");
+        // Single-partition: every record is attributable to partition 0.
+        let ok = parse_cold_file_tagged(&path, 1).expect("single-partition is attributable");
+        assert_eq!(ok.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unaffected paths: a TAGGED cluster-variable record stays routed by its
+    /// write tag, and a single-partition journal recovers untagged records.
+    #[test]
+    fn tagged_and_single_partition_cluster_variables_still_recover() {
+        let dir = temp_dir("tagged-cluster-vars");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!(
+                "0\t{}\n2\t{}\n",
+                cluster_var_created_json("a"),
+                cluster_var_created_json("a")
+            ),
+        )
+        .unwrap();
+        let recovery = recover_multi(&dir, &[0, 1, 2], 3, None).expect("recover");
+        for (p, engine) in &recovery.engines {
+            assert_eq!(
+                engine.cluster_variables().get(None, "a").is_some(),
+                *p != 1,
+                "tagged record routed by its write tag (p={p})"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("single-untagged-cluster-var");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(ACTIVE_NAME),
+            format!("{}\n", cluster_var_created_json("solo")),
+        )
+        .unwrap();
+        let recovery = recover_multi(&dir, &[0], 1, None).expect("single-partition recovers");
+        for (_, engine) in &recovery.engines {
+            assert!(engine.cluster_variables().get(None, "solo").is_some());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn read_segment_events_tagged_rejects_unknown_variant() {
         let dir = temp_dir("unknown-variant-tagged");
@@ -7202,7 +7358,7 @@ mod tests {
                 let (writer, recovery) =
                     SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
                 let seg = Arc::clone(&recovery.shared);
-                let mut engines: std::collections::HashMap<u64, Engine> =
+                let mut engines: std::collections::BTreeMap<u64, Engine> =
                     recovery.engines.into_iter().collect();
                 let mut j0 =
                     Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
@@ -7252,7 +7408,7 @@ mod tests {
                 !recovery.fresh,
                 "recovered multi state must not read as fresh"
             );
-            let engines: std::collections::HashMap<u64, Engine> =
+            let engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             assert!(
                 engines[&0].instance(key0).is_some(),
@@ -7841,7 +7997,7 @@ mod tests {
         let event = Event::ProcessInstanceCreated {
             instance_key: 1,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -7981,7 +8137,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -8114,7 +8270,7 @@ mod tests {
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
                     .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,
@@ -8165,7 +8321,7 @@ mod tests {
             periodic.join().unwrap();
         }
         let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("recover");
-        let engines: std::collections::HashMap<u64, Engine> =
+        let engines: std::collections::BTreeMap<u64, Engine> =
             recovery.engines.into_iter().collect();
         assert!(
             engines[&0].instance(donor_key).is_some(),
@@ -8188,7 +8344,7 @@ mod tests {
             let (writer, recovery) =
                 crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
                     .expect("open multi");
-            let mut engines: std::collections::HashMap<u64, Engine> =
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
                 0,

@@ -15,7 +15,7 @@
 //! e.g. containers legitimately enclose leaves (so they don't count as node
 //! overlap) and only leaves matter for the `canonicalSizing` rule.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A single shape lifted from `<bpmndi:BPMNShape>` — top-left origin, width
 /// and height in BPMN coordinate units. Coordinates are `f64` because the
@@ -101,7 +101,7 @@ impl NodeKind {
 pub struct Geom {
     pub nodes: Vec<GeomNode>,
     pub edges: Vec<GeomEdge>,
-    pub by_id: HashMap<String, usize>,
+    pub by_id: BTreeMap<String, usize>,
     #[allow(dead_code)] // exposed for future callers (report writer, refinement passes)
     pub bounds: Bounds,
 }
@@ -209,7 +209,7 @@ pub fn parse(xml: &str) -> Geom {
         }
     }
 
-    let by_id: HashMap<String, usize> = nodes
+    let by_id: BTreeMap<String, usize> = nodes
         .iter()
         .enumerate()
         .map(|(i, n)| (n.id.clone(), i))
@@ -258,8 +258,8 @@ fn compute_bounds(nodes: &[GeomNode], edges: &[GeomEdge]) -> Bounds {
 /// need the leading prefix of the tag name (an `event`-suffixed tag → Event,
 /// `gateway`-suffixed → Gateway, etc.) — this keeps the scanner independent
 /// of the specific event / gateway variant (start / end / exclusive / …).
-fn parse_element_kinds(xml: &str) -> HashMap<String, NodeKind> {
-    let mut out = HashMap::new();
+fn parse_element_kinds(xml: &str) -> BTreeMap<String, NodeKind> {
+    let mut out = BTreeMap::new();
     let mut cursor = 0;
     while let Some(rel) = xml[cursor..].find("<bpmn:") {
         let s = cursor + rel;
@@ -308,8 +308,8 @@ fn classify_tag(tag: &str) -> NodeKind {
     }
 }
 
-fn parse_flow_refs(xml: &str) -> HashMap<String, (String, String)> {
-    let mut out = HashMap::new();
+fn parse_flow_refs(xml: &str) -> BTreeMap<String, (String, String)> {
+    let mut out = BTreeMap::new();
     for candidate in [
         "<bpmn:sequenceFlow",
         "<bpmn:messageFlow",
@@ -336,8 +336,8 @@ fn parse_flow_refs(xml: &str) -> HashMap<String, (String, String)> {
     out
 }
 
-fn parse_sequence_flow_ids(xml: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+fn parse_sequence_flow_ids(xml: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
     let mut cursor = 0;
     while let Some(rel) = xml[cursor..].find("<bpmn:sequenceFlow") {
         let s = cursor + rel;

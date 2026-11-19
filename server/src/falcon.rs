@@ -32,7 +32,7 @@
 //! The engine core is untouched: this is purely a new ingress to the existing
 //! command path and a new consumer of `activate_jobs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -587,8 +587,54 @@ async fn cluster_ws_handler(
                 .into_response();
         }
     }
+    // Join handshake (#1661): refuse a peer whose `NANOBPMN_PARTITIONS`
+    // differs, or whose binary lacks a replicated-command feature this node's
+    // replicated state already depends on (an incompatible, older binary).
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let local_partitions = state.server.engine.topology().num_partitions;
+    // Fail closed (#1661): if the requirement is UNKNOWN (an engine actor is
+    // dead/wedged mid-recovery) refuse with a retryable 503 rather than treat
+    // it as "no requirement" and admit a possibly-incompatible binary.
+    let Some(required) = state.server.required_cluster_features().await else {
+        use axum::response::IntoResponse as _;
+        tracing::warn!(
+            "refusing /cluster join: feature requirements unavailable (engine recovering)"
+        );
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature requirements temporarily unavailable; retry",
+        )
+            .into_response();
+    };
+    if let Err(rejection) = cluster_join::check_join(
+        local_partitions,
+        header(cluster_join::CLUSTER_PARTITIONS_HEADER),
+        header(cluster_join::CLUSTER_FEATURES_HEADER),
+        &required,
+    ) {
+        use axum::response::IntoResponse as _;
+        tracing::warn!("refusing /cluster join: {rejection}");
+        return (axum::http::StatusCode::CONFLICT, rejection.to_string()).into_response();
+    }
+    let advertise_features = state
+        .server
+        .advertise_cluster_features
+        .load(std::sync::atomic::Ordering::Relaxed);
     let worker = params.worker.unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, worker))
+    let mut response = ws.on_upgrade(move |socket| handle_socket(socket, state, worker));
+    // Answer with our own partition count + features so the dialer can refuse
+    // a mismatch from its side and learn what we can decode.
+    let response_headers = response.headers_mut();
+    if advertise_features
+        && let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_features_header())
+    {
+        response_headers.insert(cluster_join::CLUSTER_FEATURES_HEADER, value);
+    }
+    response_headers.insert(
+        cluster_join::CLUSTER_PARTITIONS_HEADER,
+        axum::http::HeaderValue::from(local_partitions),
+    );
+    response
 }
 
 /// Length-independent byte comparison, so a peer secret mismatch cannot be
@@ -825,6 +871,7 @@ async fn handle_client_frame(
         ClientFrame::UpdateJob { .. } => "update_job",
         ClientFrame::ForwardAgentInstance { .. } => "forward_agent_instance",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
+        ClientFrame::ApplyClusterVariable { .. } => "apply_cluster_variable",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
         ClientFrame::GetByKey { .. } => "get_by_key",
@@ -1603,6 +1650,28 @@ async fn handle_client_frame(
             })
             .await;
         }
+        ClientFrame::ApplyClusterVariable {
+            corr,
+            partition,
+            command,
+        } => {
+            let reply = match server
+                .apply_cluster_variable_local(partition, command)
+                .await
+            {
+                Ok(record) => ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(serde_json::to_value(record).unwrap_or(Value::Null)),
+                },
+                Err((status, message)) => ServerFrame::CommandResult {
+                    corr,
+                    status,
+                    body: Some(Value::String(message)),
+                },
+            };
+            conn.send(reply);
+        }
         ClientFrame::SetVariables {
             corr,
             scope_key,
@@ -2178,7 +2247,7 @@ where
     };
 }
 
-fn to_engine_vars(variables: Option<Map<String, Value>>) -> HashMap<String, crate::Value> {
+fn to_engine_vars(variables: Option<Map<String, Value>>) -> BTreeMap<String, crate::Value> {
     variables
         .map(|map| {
             map.iter()

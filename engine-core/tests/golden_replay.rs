@@ -157,8 +157,8 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // journal BEFORE the journal is consumed by replay: the Nth terminal
         // event (1-based) sets its instance's `terminated_epoch = N`. Live
         // instances keep `0`.
-        let mut terminal_epoch_by_instance: std::collections::HashMap<Key, u64> =
-            std::collections::HashMap::new();
+        let mut terminal_epoch_by_instance: std::collections::BTreeMap<Key, u64> =
+            std::collections::BTreeMap::new();
         {
             let mut epoch = 0u64;
             for event in &journal {
@@ -220,7 +220,7 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // field and load it `0` via `serde(default)`, so normalize them to the
         // deployment key the archived journal itself carries for each
         // definition (computed from the journal, not the replayed state).
-        let deployment_key_by_definition: std::collections::HashMap<Key, Key> = journal
+        let deployment_key_by_definition: std::collections::BTreeMap<Key, Key> = journal
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessDeployed {
@@ -283,6 +283,34 @@ fn legacy_record_missing_a_defaulted_field_replays() {
     // tolerates an unmatched job-failed as a no-op; the point is that decode +
     // replay of the legacy shape succeed).
     let _engine = Engine::replay(std::iter::once(decoded));
+}
+
+/// **Pre-#1640 `JobCreated`.** A job journaled before mapping-time secret
+/// provenance existed has no `secret_provenance` key: it must decode to EMPTY
+/// provenance and replay into a job that resolves nothing (fail closed) — an
+/// old job is never retroactively trusted.
+#[test]
+fn pre_1640_job_created_replays_with_empty_secret_provenance() {
+    let legacy_line = r#"{"JobCreated":{"job_key":7,"instance_key":1,"element_instance_key":2,"element_id":"call","job_type":"call-api"}}"#;
+    let decoded = decode_event_json(legacy_line).expect("pre-#1640 JobCreated decodes");
+    match &decoded {
+        Event::JobCreated {
+            secret_provenance, ..
+        } => assert!(secret_provenance.is_empty()),
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
+    let engine = Engine::replay(std::iter::once(decoded));
+    let job = engine
+        .snapshot()
+        .state
+        .jobs
+        .get(&7)
+        .cloned()
+        .expect("the replayed job exists");
+    assert!(
+        job.secret_provenance.is_empty(),
+        "a pre-#1640 job must carry no provenance (resolve nothing)"
+    );
 }
 
 /// **Pre-#1233 parallel join, upgraded mid-flight.** Before #1233 a

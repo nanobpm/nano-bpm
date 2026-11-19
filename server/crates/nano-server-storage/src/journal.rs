@@ -16,7 +16,7 @@
 //! only durable business facts keeps the log small and gives a clean recovery
 //! semantic — after a restart, workers simply re-activate.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,8 +26,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key, OrphanKind,
-    ProcessInstance, State, Value, encode_record_json,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, OrphanKind, ProcessInstance,
+    State, Value, encode_record_json,
 };
 use tokio::sync::oneshot;
 
@@ -39,7 +39,7 @@ use crate::varstore::VarStore;
 /// A variable-upsert delta: each changed instance's current variable map as a
 /// cheap `Arc` clone (the deep read happens off the engine thread when the host
 /// serializes it into the durable var store).
-type VarUpsertDelta = Vec<(Key, Arc<HashMap<String, Value>>)>;
+type VarUpsertDelta = Vec<(Key, Arc<BTreeMap<String, Value>>)>;
 
 /// The result of a lean-snapshot checkpoint (see
 /// [`Journal::snapshot_and_rotate_lean`]): the control-only snapshot, the event
@@ -74,7 +74,7 @@ type LeanCheckpoint = (
 /// steer creates away from — and, once every local shard is saturated, shed —
 /// so the resident exporter backlog stays bounded under a large-variable flood
 /// (see `ExporterBackpressure`).
-type ExporterCell = Arc<Mutex<HashMap<u64, (Sender<ExportBatch>, Arc<AtomicU64>)>>>;
+type ExporterCell = Arc<Mutex<BTreeMap<u64, (Sender<ExportBatch>, Arc<AtomicU64>)>>>;
 
 /// A read-model export item handed to an exporter thread: a command's events
 /// plus `bytes`, an estimate of their resident cost (the serialized journal
@@ -339,7 +339,7 @@ struct SnapshotBlockers {
     /// Blockers of the most recent fold attempt (empty after a success).
     current: Mutex<Vec<Key>>,
     /// Keys already logged during the ongoing outage.
-    logged: Mutex<HashSet<Key>>,
+    logged: Mutex<BTreeSet<Key>>,
     /// Repeat blocker log lines suppressed so far.
     suppressed: AtomicU64,
 }
@@ -416,13 +416,9 @@ pub struct Journal {
     /// resident set drops back within budget so the next overflow is caught
     /// immediately.
     spill_check_skip: u32,
-    /// Host-injected [`ClusterVariables`] handle shared with this journal's
-    /// engine. Held here (in addition to being installed on the engine) so it can
-    /// be re-installed whenever the engine is rebuilt from a snapshot — cluster
-    /// variables are external configuration, so a `from_snapshot`/replay engine
-    /// starts with an empty set and must be re-linked to the live host handle,
-    /// exactly as `lenient_completion` is preserved across a snapshot load.
-    cluster_variables: ClusterVariables,
+    /// Pre-cutover legacy lenient-completion host flag (#1661), re-applied to
+    /// every rebuilt engine (it is not in the snapshot body).
+    legacy_lenient_completion: bool,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -430,7 +426,7 @@ pub struct Journal {
     /// failing closed forever (which blocked every snapshot — and so all
     /// compaction — for 23 days on merlin). Held only to log each orphan once
     /// rather than on every snapshot tick.
-    quarantined: Mutex<HashSet<Key>>,
+    quarantined: Mutex<BTreeSet<Key>>,
     /// Count of off-heap rehydration reads that failed as **unreadable**
     /// (SQLite/IO error or an undecodable row, #1388). The row and routing entry
     /// are kept for a retry; this makes each such failure observable.
@@ -451,7 +447,7 @@ pub struct Journal {
     /// Per-job-type rotation cursor for cold activation candidates (#1388): the
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
-    activation_cursor: HashMap<String, Key>,
+    activation_cursor: BTreeMap<String, Key>,
     /// The Raft entry currently being applied (#1405): `Some(buffer)` between
     /// [`begin_raft_entry`](Self::begin_raft_entry) and
     /// [`commit_raft_entry`](Self::commit_raft_entry) /
@@ -1186,7 +1182,7 @@ impl SharedWriter {
         let shared = Arc::clone(&recovery.shared);
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let exporter: ExporterCell = Arc::new(Mutex::new(HashMap::new()));
+        let exporter: ExporterCell = Arc::new(Mutex::new(BTreeMap::new()));
         spawn_writer(seg_active, rx, Some(Arc::clone(&exporter)))?;
         Ok((
             Self {
@@ -1247,13 +1243,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1285,13 +1281,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1324,14 +1320,11 @@ impl Journal {
     /// holds only in-flight instances — the same invariant the boot replay
     /// establishes with its post-catch-up `evict_completed` sweep.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
-        // Config the snapshot body does not carry, re-applied onto the new engine.
-        let lenient = self.engine.lenient_completion();
+        // The REPLICATED lenient flag (#1661) is in the snapshot body; only the
+        // pre-cutover legacy host flag is config to re-apply.
+        let legacy = self.legacy_lenient_completion;
         self.engine = Engine::from_snapshot(snapshot);
-        self.engine.set_lenient_completion(lenient);
-        // Cluster variables are host-injected external config, absent from the
-        // snapshot body: re-link the fresh engine to the live shared handle.
-        self.engine
-            .set_cluster_variables(self.cluster_variables.clone());
+        self.engine.set_legacy_lenient_completion(legacy);
         // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
         // fresh engine and re-seed the dirty set so the next checkpoint rewrites
         // the full resident variable state into the authoritative store
@@ -1366,17 +1359,17 @@ impl Journal {
     ///
     /// Like [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot),
     /// this preserves everything the journal carries that is NOT engine state:
-    /// the writer/exporter/seg wiring, the spill tiers, the var store, and the
-    /// host-injected cluster variables are all re-linked onto the fresh engine.
+    /// the writer/exporter/seg wiring, the spill tiers, and the var store are
+    /// all re-linked onto the fresh engine.
     /// The cold routing index is cleared (the rebuilt engine is fully resident
     /// from its durable replay; any stale cold rows are reaped by the
     /// post-recovery GC).
     pub fn replace_engine(&mut self, engine: Engine) {
-        let lenient = self.engine.lenient_completion();
+        // The REPLICATED lenient flag (#1661) is rebuilt with the durable
+        // replay; only the pre-cutover legacy host flag is re-applied.
         self.engine = engine;
-        self.engine.set_lenient_completion(lenient);
         self.engine
-            .set_cluster_variables(self.cluster_variables.clone());
+            .set_legacy_lenient_completion(self.legacy_lenient_completion);
         if self.varstore.is_some() {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
@@ -1454,13 +1447,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         })
     }
 
@@ -1496,13 +1489,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         };
         Ok((journal, recovery))
     }
@@ -1543,13 +1536,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -1585,13 +1578,13 @@ impl Journal {
             snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             orphans: OrphanReporting::default(),
-            activation_cursor: HashMap::new(),
+            activation_cursor: BTreeMap::new(),
             raft_entry: None,
             fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
-            cluster_variables: ClusterVariables::default(),
+            legacy_lenient_completion: false,
         }
     }
 
@@ -2018,7 +2011,7 @@ impl Journal {
     /// active instances" symptom). The cold side needs no filter — a terminal
     /// instance is `forget`-ten from the store on eviction, never spilled, so
     /// `cold.index` only ever holds dormant (non-terminal) instances.
-    pub fn collect_live_instance_keys(&self, out: &mut std::collections::HashSet<Key>) {
+    pub fn collect_live_instance_keys(&self, out: &mut std::collections::BTreeSet<Key>) {
         out.extend(
             self.state()
                 .instances
@@ -2047,7 +2040,7 @@ impl Journal {
     /// `Suspended` and `Terminating` alike can retain the flag (suspending or
     /// cancel-listener-deferring never rehydrates the payload) — matching
     /// [`collect_live_instance_keys`](Self::collect_live_instance_keys).
-    pub fn gc_spill_reference_keys(&self) -> std::collections::HashSet<Key> {
+    pub fn gc_spill_reference_keys(&self) -> std::collections::BTreeSet<Key> {
         self.state()
             .instances
             .values()
@@ -2072,7 +2065,7 @@ impl Journal {
     /// variant exists for tests that already hold the journal exclusively.
     /// Returns the number of orphaned rows reaped.
     pub fn gc_offheap_orphans(&self) -> u64 {
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         self.collect_live_instance_keys(&mut live);
         let spill_referenced = self.gc_spill_reference_keys();
         self.gc_offheap_orphans_with(&live, &spill_referenced)
@@ -2106,7 +2099,7 @@ impl Journal {
         // until every already-enqueued write is fsynced before capturing the
         // protection sets; the fence is still held, so nothing new enqueues.
         self.barrier().blocking_wait();
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         self.collect_live_instance_keys(&mut live);
         let spill_referenced = self.gc_spill_reference_keys();
         self.gc_offheap_orphans_with(&live, &spill_referenced)
@@ -2150,8 +2143,8 @@ impl Journal {
     /// and the next boot retries the remainder.
     pub fn gc_offheap_orphans_with(
         &self,
-        live: &std::collections::HashSet<Key>,
-        spill_referenced: &std::collections::HashSet<Key>,
+        live: &std::collections::BTreeSet<Key>,
+        spill_referenced: &std::collections::BTreeSet<Key>,
     ) -> u64 {
         let store = match self.spill_store() {
             Some(store) => store,
@@ -2457,7 +2450,7 @@ impl Journal {
         // on #1418). A rehydrated child is pushed onto the frontier itself, so
         // its own children are looked up under its key — the map needs no
         // re-keying as instances page back in.
-        let mut resident_children: HashMap<Key, Vec<Key>> = HashMap::new();
+        let mut resident_children: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
         for instance in self.engine.state().instances.values() {
             if let Some(parent) = instance.parent_process_instance_key {
                 resident_children
@@ -2468,7 +2461,7 @@ impl Journal {
         }
         let mut unavailable = None;
         let mut frontier = vec![root];
-        let mut seen: HashSet<Key> = HashSet::new();
+        let mut seen: BTreeSet<Key> = BTreeSet::new();
         while let Some(parent) = frontier.pop() {
             if !seen.insert(parent) {
                 continue;
@@ -3597,7 +3590,7 @@ impl Journal {
         // the overall read budget (`ACTIVATION_MAX_PASSES` passes) is spent —
         // so one poll can neither hide reachable ready work nor restore an
         // unbounded deferred-only backlog.
-        let mut seen: HashSet<Key> = HashSet::new();
+        let mut seen: BTreeSet<Key> = BTreeSet::new();
         let total_budget = budget.saturating_mul(ACTIVATION_MAX_PASSES);
         'passes: while restored < max_jobs {
             let Some(cold) = self.cold.as_ref() else {
@@ -3683,8 +3676,8 @@ impl Journal {
         // Pass 1: attempt restoration once per instance. Pass 2: refresh EVERY
         // retained job's projection, so a job whose instance was restored by a
         // later attempt in the batch never keeps the empty placeholder (#1388).
-        let mut attempted: HashSet<Key> = HashSet::new();
-        let mut rehydrated: HashSet<Key> = HashSet::new();
+        let mut attempted: BTreeSet<Key> = BTreeSet::new();
+        let mut rehydrated: BTreeSet<Key> = BTreeSet::new();
         let targets: Vec<(Key, Key)> = activated.iter().map(|j| (j.instance_key, j.key)).collect();
         for (instance_key, job_key) in targets {
             if attempted.insert(instance_key) && self.engine.is_variables_spilled(instance_key) {
@@ -3864,23 +3857,13 @@ impl Journal {
         self.engine.set_num_partitions(num_partitions);
     }
 
-    /// Enables leftover-tolerant ("lenient") job completion on the underlying
-    /// engine so a replicated `CompleteJob`/`FailJob`/`ThrowJobError` applies even
-    /// when this engine never observed the (leader-local) activation. See
-    /// [`Engine::set_lenient_completion`]. Set identically on every replica from
-    /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
-    pub fn set_lenient_completion(&mut self, lenient: bool) {
-        self.engine.set_lenient_completion(lenient);
-    }
-
-    /// Installs the shared [`ClusterVariables`] handle on this journal and its
-    /// engine, so FEEL expressions evaluated during command processing resolve the
-    /// host's live global + per-tenant cluster variables. The handle is retained so
-    /// it can be re-installed after a snapshot restore (see
-    /// [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot)).
-    pub fn set_cluster_variables(&mut self, cluster_variables: ClusterVariables) {
-        self.cluster_variables = cluster_variables.clone();
-        self.engine.set_cluster_variables(cluster_variables);
+    /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
+    /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
+    /// identically on every node from the activation policy at startup; kept
+    /// across snapshot restores / engine replacement like other host config.
+    pub fn set_legacy_lenient_completion(&mut self, lenient: bool) {
+        self.legacy_lenient_completion = lenient;
+        self.engine.set_legacy_lenient_completion(lenient);
     }
 
     /// The currently-held activation leases `(job_key, deadline)` on the
@@ -4621,7 +4604,7 @@ impl Journal {
     /// on disk), and a lean-mode miss whose legacy spill row still exists (a
     /// lean-over-legacy transition that has not migrated it yet) — all of which
     /// must fail closed rather than be quarantined (Copilot review on #1387).
-    fn peek_spilled_variables(&self, key: Key) -> Result<Option<HashMap<String, Value>>, String> {
+    fn peek_spilled_variables(&self, key: Key) -> Result<Option<BTreeMap<String, Value>>, String> {
         let legacy = self
             .spill
             .as_ref()
@@ -4779,10 +4762,10 @@ impl Journal {
     /// incident, #1447). Returns the cold keys proven absent (to be excluded
     /// from the streaming write).
     fn validate_offheap_for_streaming(&mut self) -> Option<Vec<Key>> {
-        use std::collections::HashSet;
+        use std::collections::BTreeSet;
         let strict = self.replicated_apply;
         let mut absent_cold: Vec<Key> = Vec::new();
-        let mut orphans: HashSet<Key> = HashSet::new();
+        let mut orphans: BTreeSet<Key> = BTreeSet::new();
 
         self.begin_fold();
 
@@ -4971,7 +4954,7 @@ impl Journal {
             if FAIL_AFTER_FLOOR.with(|f| f.get()) {
                 return Err(io::Error::other("injected crash after the floor"));
             }
-            let ups: Vec<(Key, &HashMap<String, Value>)> =
+            let ups: Vec<(Key, &BTreeMap<String, Value>)> =
                 upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
             vs.checkpoint(self.partition_id, covered, &ups, &forgets)
                 .map_err(io::Error::other)?;
@@ -5100,7 +5083,7 @@ impl Journal {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
             {
-                inst.variables = Arc::new(HashMap::new());
+                inst.variables = Arc::new(BTreeMap::new());
             }
         }
         Some((snap, cold_upserts, cold_orphans))
@@ -5264,7 +5247,7 @@ mod tests {
     #[test]
     fn poisoned_exporter_cell_lock_is_recovered_not_panicked() {
         let cell: ExporterCell =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
         // Poison the mutex: panic while holding the guard.
         let poison_target = std::sync::Arc::clone(&cell);
@@ -5548,7 +5531,7 @@ mod tests {
         let dispatch = Command::DispatchStartInstance {
             process_id: "demo".into(),
             start_element_id: "start".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             message_start: None,
@@ -5984,7 +5967,7 @@ mod tests {
         // SetVariables addresses the element scope: ensure_resident_for_command
         // must route it back to the cold instance and page it in (else the engine
         // would raise ScopeNotFound)
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("approved".to_string(), Value::Bool(true));
         let (events, _) = journal
             .apply_command(Command::set_variables(scope_key, vars))
@@ -6093,7 +6076,7 @@ mod tests {
         ));
 
         // ...but it is terminal, so it is NOT a live instance.
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         journal.collect_live_instance_keys(&mut live);
         assert!(
             !live.contains(&completed_key),
@@ -6106,7 +6089,7 @@ mod tests {
             .apply_command(Command::create_instance("demo"))
             .unwrap();
         let active_key = events.iter().find_map(|e| e.instance_key()).unwrap();
-        let mut live2 = std::collections::HashSet::new();
+        let mut live2 = std::collections::BTreeSet::new();
         journal.collect_live_instance_keys(&mut live2);
         assert!(
             live2.contains(&active_key),
@@ -6232,7 +6215,7 @@ mod tests {
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         // Two instances, both parked with non-empty variables so both spill.
@@ -6306,7 +6289,7 @@ mod tests {
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("demo", vars))
@@ -6375,7 +6358,7 @@ mod tests {
             .expect("valid listener process");
         let _ = journal.apply_command(Command::DeployProcess(def)).unwrap();
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("approval", vars))
@@ -6431,7 +6414,7 @@ mod tests {
             Some(ProcessInstanceState::Suspended)
         ));
 
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         journal.collect_live_instance_keys(&mut live);
         assert!(live.contains(&active_key), "an Active instance is live");
         assert!(
@@ -6452,7 +6435,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         // Two instances, both parked on the demo-work job with non-empty variables,
@@ -6500,7 +6483,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         let mut keys = Vec::new();
@@ -6567,7 +6550,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(nested()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("seed".to_string(), Value::Int(4));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("nested", vars))
@@ -6646,7 +6629,7 @@ mod tests {
             .apply_command(Command::DeployProcess(def("target", true)))
             .unwrap();
         let target_key = deployed_key(&events);
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("key".to_string(), Value::Str("k1".into()));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("source", vars))
@@ -6710,7 +6693,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(fork()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Int(7));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("fork", vars))
@@ -6797,7 +6780,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         for _ in 0..3 {
@@ -6911,7 +6894,7 @@ mod tests {
             .unwrap();
         let mut keys = Vec::new();
         for i in 0..n {
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
             let (events, _) = journal
                 .apply_command(Command::create_instance_with("demo", vars))
@@ -7063,7 +7046,7 @@ mod tests {
                 if i == 2 {
                     between(journal);
                 }
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert("data".to_string(), Value::Str(format!("p{i}")));
                 vars.insert("n".to_string(), Value::Int(i));
                 let (events, _) = journal
@@ -7153,7 +7136,7 @@ mod tests {
                 if i == 2 {
                     between(journal);
                 }
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert("data".to_string(), Value::Str(format!("p{i}")));
                 vars.insert("n".to_string(), Value::Int(i));
                 let (events, _) = journal
@@ -7276,7 +7259,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
         let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
-        let counter = |vars: &HashMap<String, Value>| match vars.get("counter") {
+        let counter = |vars: &BTreeMap<String, Value>| match vars.get("counter") {
             Some(Value::Int(n)) => *n,
             other => panic!("counter missing: {other:?}"),
         };
@@ -7284,13 +7267,13 @@ mod tests {
         let key = {
             let (writer, recovery) =
                 SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
-            let mut engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+            let mut engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
             j0.set_exporter(export_tx.clone(), Arc::new(AtomicU64::new(0)));
             j0.set_varstore(Arc::clone(&varstore));
             let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
-            let mut init = HashMap::new();
+            let mut init = BTreeMap::new();
             init.insert("counter".to_string(), Value::Int(1));
             let (events, commit) = j0
                 .apply_command(Command::create_instance_with("demo", init))
@@ -7300,7 +7283,7 @@ mod tests {
 
             // Lean checkpoint (capture + store checkpoint + snapshot publish).
             let (snap, covered, upserts, forgets) = j0.snapshot_and_rotate_lean().unwrap();
-            let ups: Vec<(Key, &HashMap<String, Value>)> =
+            let ups: Vec<(Key, &BTreeMap<String, Value>)> =
                 upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
             varstore.checkpoint(0, covered, &ups, &forgets).unwrap();
             crate::seglog::write_multi_snapshot_lean(&dir, vec![(0, covered, snap)]).unwrap();
@@ -7308,7 +7291,7 @@ mod tests {
             // Apply a Raft entry that increments the counter, and spill the
             // instance mid-apply (as the per-command cap / pressure sweep does).
             j0.begin_raft_entry();
-            let mut inc = HashMap::new();
+            let mut inc = BTreeMap::new();
             inc.insert("counter".to_string(), Value::Int(2));
             let _ = j0
                 .apply_command_at(Command::set_variables(key, inc), 0)
@@ -7324,7 +7307,7 @@ mod tests {
         };
 
         let recovery = crate::seglog::recover_multi(&dir, &[0], 1, Some(&varstore)).unwrap();
-        let engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+        let engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
             recovery.engines.into_iter().collect();
         let recovered = counter(&engines[&0].instance(key).unwrap().variables);
         // openraft re-applies the entry (an increment of the recovered value);
@@ -7361,7 +7344,7 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("cold-payload".to_string()));
         let (events, _) = journal
             .apply_command(Command::create_instance_with("demo", vars))
@@ -7410,7 +7393,7 @@ mod tests {
 
         // Persist the delta to the authoritative store (as the checkpoint loop
         // does), then recover: from_snapshot + install_variables(store).
-        let ups: Vec<(Key, &HashMap<String, Value>)> =
+        let ups: Vec<(Key, &BTreeMap<String, Value>)> =
             cold_upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
         varstore.checkpoint(0, 1, &ups, &[]).unwrap();
 
@@ -7959,7 +7942,7 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap());
         cold.set_cold_spill(store, 1, 0);
         let _ = cold.apply_command(Command::DeployProcess(demo())).unwrap();
-        let vars = std::collections::HashMap::from([(
+        let vars = std::collections::BTreeMap::from([(
             "data".to_string(),
             nanobpmn_engine_core::Value::Str("payload-0".into()),
         )]);
@@ -8175,7 +8158,7 @@ mod tests {
         assert_eq!(raw_row_count(&path, "cold", key), 1, "cold row kept");
         assert!(journal.offheap_read_failures() >= 1, "failure observable");
         assert!(journal.quarantined_orphans().is_empty());
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         journal.collect_live_instance_keys(&mut live);
         assert!(live.contains(&key), "instance not dropped");
         drop(journal);
@@ -8830,7 +8813,7 @@ mod tests {
         let key = keys[0];
         let inst = legacy.state.instances.get_mut(&key).unwrap();
         assert!(inst.variables_spilled);
-        let mut tail = HashMap::new();
+        let mut tail = BTreeMap::new();
         tail.insert("late".to_string(), Value::Str("tail-update".to_string()));
         inst.variables = Arc::new(tail);
 
@@ -8916,7 +8899,7 @@ mod tests {
         // its `maybe_spill` and re-sheds the orphan once it is spillable again
         // (it holds only its empty surviving map until a SetVariables repopulates
         // it, so here we give it a payload first).
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert(
             "data".to_string(),
             nanobpmn_engine_core::Value::Str("surviving".to_string()),
@@ -9319,6 +9302,64 @@ mod tests {
         }
     }
 
+    /// #1657: cluster variables are replicated engine state — a restart over
+    /// snapshot + journal tail recovers exactly the pre-restart set, kinds and
+    /// metadata included, with no host handle to re-link.
+    #[test]
+    fn cluster_variables_survive_snapshot_and_tail_recovery() {
+        use nanobpmn_engine_core::ClusterVariableKind;
+        let create = |name: &str, kind| Command::CreateClusterVariable {
+            tenant_id: None,
+            name: name.to_string(),
+            value: Value::Str("camunda.secrets.TOKEN".to_string()),
+            kind,
+            metadata: Default::default(),
+            distributed: false,
+        };
+        let dir = temp_dir_1556("cluster-vars");
+        let before = {
+            let (mut j, _) = Journal::open_segmented(&dir).unwrap();
+            let (_, c) = j
+                .apply_command_ref_at(
+                    create("inSnapshot", ClusterVariableKind::SecretReference),
+                    1,
+                    None,
+                )
+                .unwrap();
+            c.blocking_wait();
+            let (snap, covered) = j.snapshot_and_rotate().unwrap();
+            crate::seglog::write_snapshot(&dir, snap, covered).unwrap();
+            // The tail: one more create and an update, after the snapshot.
+            let (_, c) = j
+                .apply_command_ref_at(create("inTail", ClusterVariableKind::Json), 2, None)
+                .unwrap();
+            c.blocking_wait();
+            let (_, c) = j
+                .apply_command_ref_at(
+                    Command::UpdateClusterVariable {
+                        tenant_id: None,
+                        name: "inSnapshot".to_string(),
+                        value: Value::Int(2),
+                        metadata: Default::default(),
+                    },
+                    3,
+                    None,
+                )
+                .unwrap();
+            c.blocking_wait();
+            j.engine().cluster_variables().clone()
+        };
+        assert_eq!(
+            before.get(None, "inSnapshot").map(|v| v.kind),
+            Some(ClusterVariableKind::SecretReference)
+        );
+
+        let (j, _) = Journal::open_segmented(&dir).unwrap();
+        assert_eq!(j.engine().cluster_variables(), &before);
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Untagged single-partition segmented log: a referenced direct command,
     /// then a Raft entry batching two distinct references and an unreferenced
     /// command. Every persisted record carries its OWN command's reference; the
@@ -9445,7 +9486,7 @@ mod tests {
         let (key_a, before) = {
             let (writer, recovery) =
                 SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
-            let mut engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+            let mut engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
                 recovery.engines.into_iter().collect();
             let mut j = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
             let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
@@ -9480,7 +9521,7 @@ mod tests {
         };
 
         let recovery = crate::seglog::recover_multi(&dir, &[0], 1, Some(&varstore)).unwrap();
-        let engines: HashMap<u64, nanobpmn_engine_core::Engine> =
+        let engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
             recovery.engines.into_iter().collect();
         assert_eq!(
             engines[&0].instance(key_a).map(|i| format!("{i:?}")),

@@ -12,10 +12,16 @@
 //! at the engine's processing seam rather than per call site, every present and
 //! future `feel::eval*` call made while processing a command is covered.
 //!
-//! Outside an installed environment (ad-hoc evaluation APIs, unit tests) the
-//! builtins fall back to the wall clock, as before.
+//! Outside an installed environment the builtins **fail closed** (#1663, ADR
+//! 0066 audit #2): they return a typed [`FeelError`] — surfaced by the engine
+//! as an incident — rather than silently reading the host clock or entropy.
+//! Callers that are genuinely off the replicated apply path (ad-hoc evaluation
+//! APIs, host-side trigger expressions, tests) must opt in explicitly with
+//! [`with_host_env`], the single documented host-clock/entropy seam.
 
 use std::cell::Cell;
+
+use super::error::FeelError;
 
 /// A deterministic evaluation environment: a fixed clock and a seeded RNG.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,6 +71,46 @@ pub fn with_env<R>(env: &mut EvalEnv, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Runs `f` with an environment drawn from the **host** wall clock and fresh
+/// per-call entropy installed — the one explicit opt-in for evaluation that is
+/// off the replicated apply path (an ad-hoc `POST /expression/evaluation`, a
+/// host-side trigger, a test). Never call this from engine command processing:
+/// that path installs the replicated environment via [`with_env`], and a
+/// host-clock read there would let replicas diverge (#1642, #1663).
+pub fn with_host_env<R>(f: impl FnOnce() -> R) -> R {
+    let mut env = host_env();
+    with_env(&mut env, f)
+}
+
+/// The host clock + entropy environment behind [`with_host_env`]. This is the
+/// only place in the apply crate allowed to read the wall clock (see the
+/// `disallowed-methods` purity lint in `engine-core/clippy.toml`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "documented off-apply host seam (#1663): only reached via with_host_env"
+)]
+fn host_env() -> EvalEnv {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = (since.as_nanos() as u64).wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    EvalEnv::new(since.as_millis() as u64, seed)
+}
+
+/// The typed fail-closed error for a nondeterministic builtin evaluated with
+/// no environment installed (#1663).
+pub(crate) fn missing_env_error(builtin: &str) -> FeelError {
+    FeelError(format!(
+        "{builtin}() requires a replicated evaluation environment; refusing to read the \
+         host clock/entropy (evaluate inside engine command processing, or opt in \
+         explicitly with feel::with_host_env)"
+    ))
+}
+
 /// The installed clock reading, if any.
 pub(crate) fn now_ms() -> Option<u64> {
     ENV.with(|e| e.get().map(|env| env.now_ms))
@@ -96,7 +142,7 @@ mod tests {
 
     #[test]
     fn installed_env_pins_now_and_seeds_random() {
-        let ctx = std::collections::HashMap::new();
+        let ctx = std::collections::BTreeMap::new();
         let run = || {
             let mut env = EvalEnv::new(1_700_000_000_000, 42);
             with_env(&mut env, || {
@@ -110,7 +156,33 @@ mod tests {
         let (a, b) = (run(), run());
         assert_eq!(a, b);
         assert_eq!(a.0, Value::Str("2023-11-14".into()));
-        // Uninstalled again afterwards: falls back to the wall clock.
+        // Uninstalled again afterwards.
+        assert!(now_ms().is_none());
+    }
+
+    /// #1663 red test: with no environment installed the nondeterministic
+    /// builtins fail closed instead of reading the host clock / entropy.
+    #[test]
+    fn missing_env_fails_closed() {
+        let ctx = std::collections::BTreeMap::new();
+        for expr in ["now()", "today()", "random number()", "uuid()"] {
+            let err = crate::feel::eval(expr, &ctx).expect_err(expr);
+            assert!(
+                err.0
+                    .contains("requires a replicated evaluation environment"),
+                "{expr}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_env_is_an_explicit_opt_in() {
+        let ctx = std::collections::BTreeMap::new();
+        let v = with_host_env(|| crate::feel::eval("now()", &ctx)).unwrap();
+        assert!(matches!(v, Value::Str(_)), "{v:?}");
+        let a = with_host_env(|| crate::feel::eval("uuid()", &ctx)).unwrap();
+        let b = with_host_env(|| crate::feel::eval("uuid()", &ctx)).unwrap();
+        assert_ne!(a, b, "fresh entropy per host-env call");
         assert!(now_ms().is_none());
     }
 

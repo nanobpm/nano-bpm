@@ -14,7 +14,7 @@ fn conditional_process(id: &str, condition: &str) -> ProcessDefinition {
 
 fn evaluate(
     engine: &mut Engine,
-    variables: HashMap<String, Value>,
+    variables: BTreeMap<String, Value>,
     process_definition_key: Option<Key>,
 ) -> Result<Vec<Event>, EngineError> {
     engine.apply_command(Command::EvaluateConditionalStartEvents {
@@ -89,7 +89,7 @@ fn conditional_start_errors_and_non_booleans_are_not_satisfied() {
         .unwrap();
     // The referenced variable is absent: the condition does not hold and no
     // incident or instance results.
-    let events = evaluate(&mut engine, HashMap::new(), None).unwrap();
+    let events = evaluate(&mut engine, BTreeMap::new(), None).unwrap();
     assert!(created(&events).is_empty());
     assert!(engine.incidents().is_empty());
 }
@@ -152,7 +152,7 @@ fn conditional_evaluation_scoped_to_a_definition_key() {
     assert_eq!(instances[0].2, a_v1, "the instance runs the pinned version");
 
     // An unknown key is rejected, with nothing emitted.
-    let err = evaluate(&mut engine, HashMap::new(), Some(987_654_321)).unwrap_err();
+    let err = evaluate(&mut engine, BTreeMap::new(), Some(987_654_321)).unwrap_err();
     assert!(matches!(err, EngineError::ProcessNotFound { .. }));
 
     // Key 0 is an explicit (never-minted) key, not "unscoped": it must fail

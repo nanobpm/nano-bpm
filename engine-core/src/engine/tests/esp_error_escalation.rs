@@ -86,7 +86,7 @@ fn start(engine: &mut Engine, def: ProcessDefinition) -> Key {
     create_instance_key(engine, "p")
 }
 
-fn throw_error(engine: &mut Engine, code: &str, vars_in: HashMap<String, Value>) -> Vec<Event> {
+fn throw_error(engine: &mut Engine, code: &str, vars_in: BTreeMap<String, Value>) -> Vec<Event> {
     let job = engine.activate_jobs("work", "w", 10, 60_000, 0)[0].key;
     engine
         .apply_command(Command::throw_job_error_with(job, code, "boom", vars_in))
@@ -136,7 +136,7 @@ fn catch_all_error_event_subprocess_catches_any_code() {
         .build()
         .unwrap();
     let inst = start(&mut engine, def);
-    let events = throw_error(&mut engine, "WHATEVER", HashMap::new());
+    let events = throw_error(&mut engine, "WHATEVER", BTreeMap::new());
     assert!(activated(&events, "esp"));
     complete_one(&mut engine, "esp");
     assert!(engine.is_completed(inst));
@@ -150,7 +150,7 @@ fn exact_error_code_event_subprocess_beats_a_catch_all() {
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "exact"));
     assert!(!activated(&events, "any"));
 }
@@ -162,7 +162,7 @@ fn job_error_in_embedded_subprocess_is_caught_by_its_error_event_subprocess() {
         .build()
         .unwrap();
     let inst = start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "esp"));
     complete_one(&mut engine, "esp");
     // The sub-process completed via its ESP and the main flow continued.
@@ -178,7 +178,7 @@ fn error_propagates_from_a_subprocess_to_a_root_event_subprocess() {
         .build()
         .unwrap();
     let inst = start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "esp"));
     assert_eq!(job_types(&engine), vec!["esp".to_string()]);
     complete_one(&mut engine, "esp");
@@ -199,7 +199,7 @@ fn inner_error_event_subprocess_beats_an_error_boundary_on_the_subprocess() {
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "esp"));
     assert!(!activated(&events, "bnd"));
 }
@@ -218,7 +218,7 @@ fn error_boundary_on_the_throwing_task_beats_an_enclosing_event_subprocess() {
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "bnd"));
     assert!(!activated(&events, "esp"));
 }
@@ -234,7 +234,7 @@ fn exact_error_boundary_beats_a_catch_all_event_subprocess_at_the_same_scope() {
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "bnd"));
     assert!(!activated(&events, "esp"));
 }
@@ -246,7 +246,7 @@ fn unmatched_error_raises_an_unhandled_error_incident() {
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(!activated(&events, "esp"));
     let incidents = engine.active_incidents();
     assert_eq!(incidents.len(), 1);
@@ -430,7 +430,7 @@ fn error_boundary_without_a_code_is_a_catch_all() {
         .build()
         .unwrap();
     let inst = start(&mut engine, def);
-    let events = throw_error(&mut engine, "ANY", HashMap::new());
+    let events = throw_error(&mut engine, "ANY", BTreeMap::new());
     assert!(activated(&events, "bnd"));
     assert!(engine.is_completed(inst));
 }
@@ -552,7 +552,7 @@ fn empty_job_error_code_prefers_a_catch_all_event_subprocess_over_a_catch_all_bo
         .build()
         .unwrap();
     start(&mut engine, def);
-    let events = throw_error(&mut engine, "", HashMap::new());
+    let events = throw_error(&mut engine, "", BTreeMap::new());
     assert!(activated(&events, "esp"));
     assert!(!activated(&events, "bnd"));
 }
@@ -573,7 +573,7 @@ fn mi_spec() -> crate::model::MultiInstance {
 
 fn create_with_items(engine: &mut Engine, def: ProcessDefinition) -> (Key, Vec<Event>) {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars_in = HashMap::new();
+    let mut vars_in = BTreeMap::new();
     vars_in.insert(
         "items".to_string(),
         Value::List(vec![Value::Int(1), Value::Int(2)]),
@@ -597,7 +597,7 @@ fn catch_all_esp_inside_a_multi_instance_child_beats_an_exact_error_boundary_on_
         .build()
         .unwrap();
     let (inst, _) = create_with_items(&mut engine, def);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert!(activated(&events, "esp"), "the child's ESP catches");
     assert!(!activated(&events, "bnd"), "the body boundary does not");
     assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
@@ -632,7 +632,7 @@ fn error_reaching_a_multi_instance_body_boundary_tears_down_the_whole_loop() {
         .unwrap();
     let (inst, _) = create_with_items(&mut engine, def);
     assert_eq!(job_types(&engine), vec!["work", "work"]);
-    let events = throw_error(&mut engine, "E1", HashMap::new());
+    let events = throw_error(&mut engine, "E1", BTreeMap::new());
     assert_eq!(
         events
             .iter()

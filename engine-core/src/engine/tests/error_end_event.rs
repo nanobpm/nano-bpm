@@ -349,7 +349,7 @@ fn error_end_event_inside_a_multi_instance_child_is_caught_on_the_body() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert(
         "items".to_string(),
         Value::List(vec![Value::Int(1), Value::Int(2)]),

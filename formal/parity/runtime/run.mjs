@@ -88,6 +88,20 @@ export function discoverScenarios(corpusDir) {
     .map(loadScenario);
 }
 
+/**
+ * Whether a scenario is eligible to run on `backend`. A scenario may restrict
+ * itself via `backends` (the bounded-exhaustive corpus marks non-completing
+ * cases `backends: ["nano"]`, #1246): the bare-gateway Camunda backend only
+ * observes an instance through completion, so a non-completing scenario has no
+ * Camunda observation and would time out in `awaitCompletion` even when both
+ * engines behave correctly. A scenario with no `backends` field runs on every
+ * backend. exhaustive.mjs's runtimePhase applies the same rule; this is the
+ * shared runner's half of it.
+ */
+export function backendEligible(scenario, backend) {
+  return !scenario.backends || scenario.backends.includes(backend);
+}
+
 function camundaFromEnv() {
   const address = process.env.CAMUNDA_REST_ADDRESS;
   if (!address) return null;
@@ -178,10 +192,22 @@ async function main() {
       }
 
       if (camunda) {
-        const obs = await runScenario(camunda, scenario);
-        results.camunda = obs;
-        provides.camunda = camunda.provides;
-        console.log(`ok   ${scenario.name} [camunda]`);
+        // Honor the scenario's backend eligibility: a scenario marked
+        // `backends: ["nano"]` (a non-completing bounded-exhaustive case,
+        // #1246) has no Camunda observation — the bare-gateway backend only
+        // observes an instance through completion, so running it would time out
+        // in `awaitCompletion` even when both engines behave correctly. Skip it
+        // here exactly as exhaustive.mjs's runtimePhase does.
+        if (!backendEligible(scenario, "camunda")) {
+          console.log(
+            `skip ${scenario.name} [camunda] — scenario is backends: ${JSON.stringify(scenario.backends)}`,
+          );
+        } else {
+          const obs = await runScenario(camunda, scenario);
+          results.camunda = obs;
+          provides.camunda = camunda.provides;
+          console.log(`ok   ${scenario.name} [camunda]`);
+        }
       }
 
       if (results.nano && results.camunda) {

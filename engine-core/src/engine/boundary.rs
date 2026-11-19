@@ -32,8 +32,8 @@ impl Engine {
         &self,
         instance_key: Key,
         only_activity: Option<&str>,
-    ) -> HashMap<ElementId, Vec<(ElementId, ElementId)>> {
-        let mut wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
+    ) -> BTreeMap<ElementId, Vec<(ElementId, ElementId)>> {
+        let mut wiring: BTreeMap<ElementId, Vec<(ElementId, ElementId)>> = BTreeMap::new();
         if let Some(process) = self.process_of_instance(instance_key) {
             for e in process.elements.values() {
                 if let ElementKind::CompensationBoundaryEvent {
@@ -121,8 +121,8 @@ impl Engine {
         // order preserved within each scope), so the recursive traversal is
         // linear in the subscription count rather than re-filtering the whole
         // `compensable` list per nested scope.
-        let mut by_scope: HashMap<Key, Vec<crate::state::CompensationSubscription>> =
-            HashMap::new();
+        let mut by_scope: BTreeMap<Key, Vec<crate::state::CompensationSubscription>> =
+            BTreeMap::new();
         if let Some(instance) = self.state.instances.get(&instance_key) {
             for c in &instance.compensable {
                 by_scope.entry(c.scope).or_default().push(c.clone());
@@ -145,8 +145,8 @@ impl Engine {
         // for the first child only (#1424 review). Within one instance, two
         // boundaries sharing a handler each journal their OWN lifecycle
         // (boundary-id order).
-        let mut consumed_wiring: HashMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
-            HashMap::new();
+        let mut consumed_wiring: BTreeMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
+            BTreeMap::new();
         // Explicit stack (no recursion) so a deeply nested scope chain cannot
         // overflow; LIFO of per-scope cursors reproduces depth-first order.
         let mut stack: Vec<(
@@ -863,7 +863,7 @@ impl Engine {
         if let Some(instance) = self.state.instances.get(&instance_key) {
             let mut scopes: Vec<Key> = self.scope_descendants(instance_key, scope_eik);
             scopes.push(scope_eik);
-            let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+            let scope_set: std::collections::BTreeSet<Key> = scopes.iter().copied().collect();
             let clears_any = scopes.iter().any(|s| instance.compensable.has_scope(*s))
                 || instance
                     .compensation_waits
@@ -1214,7 +1214,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_id: &str,
-        host_vars: &HashMap<String, Value>,
+        host_vars: &BTreeMap<String, Value>,
     ) -> Result<(), expression::Failure> {
         let boundaries = self
             .process_of_instance(instance_key)
@@ -1244,7 +1244,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         host_element_id: &str,
-        host_vars: &HashMap<String, Value>,
+        host_vars: &BTreeMap<String, Value>,
         boundary: &crate::model::Element,
     ) -> Result<Option<Event>, expression::Failure> {
         let boundary_kind = |interrupting: bool| {
@@ -1409,7 +1409,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         element: &crate::model::Element,
     ) -> Result<Vec<Event>, expression::Failure> {
         let element_id = element.id.clone();

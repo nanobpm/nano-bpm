@@ -47,7 +47,7 @@ CONSTANTS
     Tgt,          \* [Flows -> Nodes] target element of each flow
     Start         \* the (single) none start event
 
-ElementKinds == {"start", "end", "task", "xor", "and", "or"}
+ElementKinds == {"start", "end", "task", "xor", "and", "or", "evt", "msg"}
 
 ASSUME Kind \in [Nodes -> ElementKinds]
 ASSUME Src \in [Flows -> Nodes] /\ Tgt \in [Flows -> Nodes]
@@ -68,6 +68,13 @@ IsJoin(n) == Kind[n] \in {"and", "or"} /\ Cardinality(In(n)) > 1
 ParJoins  == {n \in Nodes : Kind[n] = "and" /\ IsJoin(n)}
 IncJoins  == {n \in Nodes : Kind[n] = "or" /\ IsJoin(n)}
 Tasks     == {n \in Nodes : Kind[n] = "task"}
+\* Event-based gateways (#1246): a wait state like a task, but the external
+\* command that resumes it (a message correlation) picks ONE outgoing flow —
+\* the one leading to the intermediate catch event (`msg`) whose subscription
+\* was triggered. The other subscriptions are closed with the gateway. A `msg`
+\* catch event, reached only from such a gateway, is then a pass-through.
+EvtGateways == {n \in Nodes : Kind[n] = "evt"}
+WaitStates  == Tasks \cup EvtGateways
 
 NonEmptySubsets(S) == (SUBSET S) \ {{}}
 
@@ -226,13 +233,38 @@ DrainVia(f, S) ==
     LET n == Target(f) IN
     /\ pending[f] > 0
     /\ S \in Choices(n)
-    /\ CASE Kind[n] = "task"             -> ActivateTask(f)
+    /\ CASE Kind[n] \in {"task", "evt"}  -> ActivateTask(f)
          [] Kind[n] = "end"              -> ActivateEnd(f)
          [] IsJoin(n)                    -> ArriveJoin(f, S)
          [] OTHER                        -> PassThrough(f, S)
     /\ UNCHANGED completed
 
 Drain(f) == \E S \in Choices(Target(f)) : DrainVia(f, S)
+
+\* A drain choice that is a stuttering step in EVERY state: a pass-through
+\* (non-join, non-wait, non-end) element routing straight back onto its own
+\* incoming flow `f` takes and re-adds the same token and records nothing.
+\* Every other choice changes `pending` (or `fireCount`), so `<<DrainVia(f, S)>>_vars` is
+\* enabled exactly when `Drain(f)` is.
+StuttersVia(f, S) ==
+    LET n == Target(f) IN
+    /\ Kind[n] \notin {"task", "evt", "end"}
+    /\ ~IsJoin(n)
+    /\ S = {f}
+
+\* Strong fairness on every routing choice of `f`, factored. Because
+\* `ENABLED <<DrainVia(f, S)>>_vars` is the same for every non-stuttering choice
+\* S (it is `ENABLED <<Drain(f)>>_vars`), and a stuttering choice's SF is vacuous,
+\*     \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
+\* is EQUIVALENT to this single implication. Stated per choice, TLC expands each
+\* SF disjunction into its DNF tableau — 2^|Choices| branches, which runs out of
+\* memory on an inclusive split with four outgoing flows (#1246). Factored, it is
+\* one disjunction per flow.
+DrainFair(f) ==
+    []<>(ENABLED <<Drain(f)>>_vars)
+        => \A S \in Choices(Target(f)) :
+               ~StuttersVia(f, S) => []<><<DrainVia(f, S)>>_vars
+
 
 (* External command: a job worker completes a task. *)
 CompleteTask(t) ==
@@ -242,6 +274,18 @@ CompleteTask(t) ==
     /\ waiting' = [waiting EXCEPT ![t] = @ - 1]
     /\ pending'    = Add(pending, Out(t))
     /\ joinTokens' = TakeFlows(joinTokens, Out(t))
+    /\ UNCHANGED <<joinOpen, fireCount, premature, completed>>
+
+(* External command: a message correlates to one subscription of a waiting
+   event-based gateway (#1246), which completes and takes the flow `g` to the
+   triggered catch event. *)
+CorrelateEvent(n, g) ==
+    /\ Settled
+    /\ ~completed
+    /\ waiting[n] > 0
+    /\ waiting'    = [waiting EXCEPT ![n] = @ - 1]
+    /\ pending'    = Add(pending, {g})
+    /\ joinTokens' = TakeFlows(joinTokens, {g})
     /\ UNCHANGED <<joinOpen, fireCount, premature, completed>>
 
 (* `complete_finished_instances`. *)
@@ -259,6 +303,7 @@ Done == completed /\ UNCHANGED vars
 Next ==
     \/ \E f \in AllFlows : Drain(f)
     \/ \E t \in Tasks    : CompleteTask(t)
+    \/ \E n \in EvtGateways : \E g \in Out(n) : CorrelateEvent(n, g)
     \/ CompleteInstance
     \/ Done
 
@@ -275,8 +320,9 @@ Next ==
 \* (Fairness on Next as a whole would only guarantee that *some* step happens,
 \* so one task could starve.)
 Fairness ==
-    /\ \A f \in AllFlows : \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
+    /\ \A f \in AllFlows : DrainFair(f)
     /\ \A t \in Tasks    : SF_vars(CompleteTask(t))
+    /\ \A n \in EvtGateways : \A g \in Out(n) : SF_vars(CorrelateEvent(n, g))
     /\ WF_vars(CompleteInstance)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -308,7 +354,7 @@ ParallelJoinWaitsForEveryFlow == premature = {}
 \* still be open. Otherwise the instance can never complete: it is stuck
 \* forever on a join that no token will ever reach.
 NoStuckInstance ==
-    (Settled /\ ~completed /\ \A t \in Tasks : waiting[t] = 0)
+    (Settled /\ ~completed /\ \A t \in WaitStates : waiting[t] = 0)
         => \A n \in Nodes : ~joinOpen[n]
 
 \* Whether the process graph has no cycle. This is derived from the graph, never

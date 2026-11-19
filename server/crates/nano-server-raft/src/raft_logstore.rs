@@ -1771,7 +1771,7 @@ mod tests {
     /// Builds a large, compressible `Normal` entry (a `CreateInstance` carrying a
     /// business-like string payload) so the codec's size/shrink gates engage.
     fn big_entry(index: u64, payload_len: usize) -> Entry<RaftConfig> {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use nanobpmn_engine_core::{Command, Value};
         let mut s = String::with_capacity(payload_len + 32);
@@ -1779,7 +1779,7 @@ mod tests {
             s.push_str("order-customer-invoice-amount-region ");
         }
         s.truncate(payload_len);
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("p".to_string(), Value::Str(s));
         let cmd = Command::create_instance_with("demo", vars);
         let batch = crate::raft::ReplicatedBatch::single(cmd, 12_345);

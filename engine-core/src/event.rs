@@ -5,7 +5,7 @@
 //! carries enough data to rebuild state, the event stream is a replayable log —
 //! persist it however you like and replay to recover.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
 use crate::state::types::{
@@ -33,7 +33,7 @@ pub struct ActivateElementInstruction {
     /// Variables merged into the instance's root scope before the token is
     /// placed (Zeebe's global variable instructions). Empty for none.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The ancestor element instance (an existing flow-scope instance) to
     /// activate the element under (Zeebe `ancestorElementInstanceKey`). `None`
     /// (Zeebe's `-1`) = use the single existing instance of the flow scope, or
@@ -56,7 +56,7 @@ pub struct ActivateElementInstruction {
 pub struct VariableInstruction {
     /// The variables to set.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The element id of the scope to set them on; `None` = process root.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_id: Option<ElementId>,
@@ -425,6 +425,48 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
+    /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
+    /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
+    /// configuration state: carries no key; a shared journal tags it with the
+    /// partition that wrote it.
+    ClusterVariableCreated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+
+    /// A cluster variable's value and metadata were replaced (#1657; Zeebe
+    /// `ClusterVariableIntent.UPDATED`). Its id and kind are preserved.
+    ///
+    /// `kind` is the variable's preserved kind, captured by the applying
+    /// engine in the same turn that commits the update. Carrying it on the
+    /// event lets a gateway derive the response/fan-out record entirely from
+    /// the proposal's own events — a live-state re-read runs in a separate
+    /// actor turn, so a concurrent delete/recreate could otherwise combine
+    /// the new value with a replacement's kind (PR #1670 review). Additive
+    /// (`serde(default)`): records written before this field decode with the
+    /// `Json` default, which only the (unused) response projection ever read.
+    ClusterVariableUpdated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+    },
+
+    /// A cluster variable was deleted (#1657; Zeebe `ClusterVariableIntent.DELETED`).
+    ClusterVariableDeleted {
+        tenant_id: Option<String>,
+        name: String,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -434,7 +476,7 @@ pub enum Event {
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         created_at: u64,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -470,7 +512,7 @@ pub enum Event {
     /// Variables were merged into a process instance.
     VariablesUpdated {
         instance_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
 
     /// Variables were merged into a specific variable scope (Part C hierarchical
@@ -482,7 +524,7 @@ pub enum Event {
     ScopedVariablesUpdated {
         instance_key: Key,
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// A non-root variable scope was opened (Part C). Registers `scope_key`
     /// (a scope-owning element instance: sub-process, multi-instance body or
@@ -508,7 +550,7 @@ pub enum Event {
     EventSubProcessPayloadHeld {
         instance_key: Key,
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
 
     /// An element instance entered `ACTIVATING`. It registers the element
@@ -668,6 +710,16 @@ pub enum Event {
             serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
+        /// Mapping-time secret-reference provenance (#1640): the input-mapping
+        /// target paths holding trusted `camunda.secrets.<name>` references,
+        /// captured when the mappings ran (never re-derived later). Paths and
+        /// secret NAMES only — never plaintext. Additive: a pre-#1640 record
+        /// decodes to empty provenance, which resolves nothing (fail closed).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        secret_provenance: Vec<crate::state::SecretProvenance>,
     },
     /// A job was created for one execution listener in an element's sequential
     /// listener chain (ADR 0037). Distinct from [`Event::JobCreated`] so that
@@ -1362,7 +1414,7 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
         kind: MessageSubscriptionKind,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
     },
@@ -1400,6 +1452,14 @@ pub enum Event {
     /// record (skipping command re-execution) restores it from here and routes
     /// the next round-robin start identically to a peer that never restarted.
     /// Additive: a pre-existing record decodes with `0`.
+    /// The partition's lenient-completion mode was set (#1661, ADR 0066 slice
+    /// 2) by a replicated [`crate::Command::SetLenientCompletion`]. When
+    /// `lenient` is `true`, `CompleteJob` / `FailJob` / `ThrowJobError` no longer
+    /// require the job to have been activated on this replica (activation is
+    /// leader-local). Engine state, not host config: every replica flips it at
+    /// the same log index, a snapshot carries it and a journal replay restores
+    /// it. Additive variant (old journals never contain it).
+    LenientCompletionSet { lenient: bool },
     RaftEntryApplied {
         index: u64,
         raft_state: String,
@@ -1661,7 +1721,7 @@ pub enum Event {
         body_key: Key,
         child_key: Key,
         index: usize,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// A multi-instance child completed: its `output` (the evaluated
     /// `output_element`, if any) is recorded at `index` in the body's collected
@@ -1701,7 +1761,7 @@ pub enum Event {
         instance_key: Key,
         container_key: Key,
         child_key: Key,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// An ad-hoc tool child completed: its `output` (the container's evaluated
     /// `output_element`, if any) is appended to the container's accumulated
@@ -1837,7 +1897,7 @@ pub enum Event {
     StartInstanceDispatched {
         process_id: String,
         start_element_id: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         tags: Vec<String>,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -2122,9 +2182,28 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
+            | Event::LenientCompletionSet { .. }
             | Event::RoutedDeliveryRecorded { .. }
+            | Event::ClusterVariableCreated { .. }
+            | Event::ClusterVariableUpdated { .. }
+            | Event::ClusterVariableDeleted { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
+    }
+
+    /// `true` for the cluster-variable lifecycle events (#1657): keyless and
+    /// partition-agnostic, replicated to EVERY partition by the fan-out. Any
+    /// recovery path reading an untagged (legacy) journal must broadcast them
+    /// to every partition rather than route them by [`Event::owning_partition`]
+    /// (which assigns the keyless record to partition 0). The single canonical
+    /// predicate shared by the legacy demux and segmented recovery.
+    pub fn is_cluster_variable_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::ClusterVariableCreated { .. }
+                | Event::ClusterVariableUpdated { .. }
+                | Event::ClusterVariableDeleted { .. }
+        )
     }
 
     /// The decision evaluation an [`Event::DecisionEvaluated`] records — Zeebe's

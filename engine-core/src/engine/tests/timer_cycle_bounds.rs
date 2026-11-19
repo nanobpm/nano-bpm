@@ -214,7 +214,7 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
         .apply_command_at(
             Command::create_instance_with(
                 process_id,
-                HashMap::from([("cyc".to_string(), cycle.clone())]),
+                BTreeMap::from([("cyc".to_string(), cycle.clone())]),
             ),
             1_000,
         )
@@ -229,7 +229,7 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+            BTreeMap::from([("cyc".to_string(), Value::Int(42))]),
         ))
         .unwrap();
     engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
@@ -249,7 +249,7 @@ fn assert_rearm_incident_resumes_remaining_count(def: ProcessDefinition, process
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), cycle)]),
+            BTreeMap::from([("cyc".to_string(), cycle)]),
         ))
         .unwrap();
     let resolved = engine
@@ -389,7 +389,7 @@ fn event_subprocess_cycle_rearm_incident_resolution_after_completion_is_noop() {
         .apply_command_at(
             Command::create_instance_with(
                 "esp-complete",
-                HashMap::from([("cyc".to_string(), cycle.clone())]),
+                BTreeMap::from([("cyc".to_string(), cycle.clone())]),
             ),
             1_000,
         )
@@ -403,7 +403,7 @@ fn event_subprocess_cycle_rearm_incident_resolution_after_completion_is_noop() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+            BTreeMap::from([("cyc".to_string(), Value::Int(42))]),
         ))
         .unwrap();
     engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
@@ -421,7 +421,7 @@ fn event_subprocess_cycle_rearm_incident_resolution_after_completion_is_noop() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), cycle)]),
+            BTreeMap::from([("cyc".to_string(), cycle)]),
         ))
         .unwrap();
     let events = engine
@@ -490,7 +490,7 @@ fn migration_remaps_pending_cycle_rearm_boundary_id() {
         .apply_command_at(
             Command::create_instance_with(
                 "source",
-                HashMap::from([("cyc".to_string(), cycle.clone())]),
+                BTreeMap::from([("cyc".to_string(), cycle.clone())]),
             ),
             1_000,
         )
@@ -504,7 +504,7 @@ fn migration_remaps_pending_cycle_rearm_boundary_id() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), Value::Int(42))]),
+            BTreeMap::from([("cyc".to_string(), Value::Int(42))]),
         ))
         .unwrap();
     engine.trigger_timers(11_000); // fire 2 of 3; the re-arm fails
@@ -548,7 +548,7 @@ fn migration_remaps_pending_cycle_rearm_boundary_id() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("cyc".to_string(), cycle)]),
+            BTreeMap::from([("cyc".to_string(), cycle)]),
         ))
         .unwrap();
     engine

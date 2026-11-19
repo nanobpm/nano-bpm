@@ -9,6 +9,45 @@ appeared. See `formal/README.md#zeebe-parity-coverage-matrix` for the full
 workflow (mapping cells, the gap ratchet, bumping the pin). This file is the
 reference for the **cell-id grammar**.
 
+## The extension register (`extensions.json`, #1261)
+
+The coverage matrix defines the surface Nano must MATCH Zeebe on. The
+**extension register** is the complement: the **Nano-only** surface — elements,
+attributes and APIs Camunda 8 rejects or does not have. Nano is a strict
+superset of Camunda 8, so this register is the *only* surface allowed to
+differ. Three lists stay deliberately separate (reconciled, never merged):
+
+| List | Meaning |
+|---|---|
+| `coverage.json` `out-of-scope` | a **Zeebe** surface Nano does not implement (e.g. partition-internal records) |
+| `extensions.json` | a **Nano** surface Zeebe does not have (e.g. the `nano:*` what-if annotations) |
+| `formal/traces/allowlist.json` | a known **defect** on the *shared* surface |
+
+The register **never** lists a behavioural difference on Camunda's surface —
+that is a defect, tracked in the allowlist, not an extension. Each entry names
+the extension, a filed `issue`, a `note`, an optional `inert` flag (true when
+the extension is inert metadata Camunda deploys but has no semantics for), and a
+namespace-aware `match`. `extensions.mjs` is the CI guard:
+
+- every entry is well-formed and uniquely identified;
+- no entry collides with a `zeebe-surface.json` cell or a `coverage.json` rule
+  (a shared-surface difference is a defect, not an extension);
+- no parity-checked corpus model (`formal/corpus/bpmn/`) uses a registered
+  extension — the generator emits only Camunda-expressible models, so an
+  extension there means the corpus drifted off the shared surface;
+- the register and the divergence allowlist stay disjoint.
+
+The fourth rule — a registered extension must not be *accepted* by Camunda —
+needs a live runtime: `runtime/extension-acceptance.mjs` deploys a probe model
+per entry to Camunda and asserts it is rejected (or honoured only as inert
+metadata). It runs in `parity-camunda-daily.yml` (skip-tolerant locally).
+
+```bash
+node formal/parity/extensions.mjs   # the static guard (CI)
+node --test formal/parity/*.test.mjs # includes extensions.test.mjs
+```
+
+
 ## Cell-id grammar
 
 Every cell id is `<family>:<key>`, where `<family>` is one of the families
@@ -78,6 +117,7 @@ exists, while `failure:` records every site that raises it.
 | `zeebe-surface.json` | **derived, committed** — every cell + its source lines; never hand-edit |
 | `coverage.json` | ordered rules mapping each cell to evidence; `reviewedAt` pins the reviewed sha |
 | `gaps.json` | **derived, committed** ratchet baseline of `gap` cells; may only shrink |
+| `coverage/` | dual-engine branch coverage of the parity corpus (llvm-cov + JaCoCo), tagged against this matrix and ratcheted — see `coverage/README.md` (#1247) |
 | `nano-tested.json` | **derived, committed** ratchet baseline of `nano-tested` cells; may only shrink |
 | `check.mjs` | the guard: mapping, evidence, ratchets, per-site wildcard ban, parity-requires-trace |
 | `*.test.mjs` | extractor and guard tests (`node --test formal/parity/*.test.mjs`) |

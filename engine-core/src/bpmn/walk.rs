@@ -87,19 +87,19 @@ pub(crate) fn parse_with_captures(
     // Buffer for a timer event's nested `timeDate` (an absolute FEEL/ISO instant).
     let mut date_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
-    let mut errors: HashMap<String, String> = HashMap::new();
+    let mut errors: BTreeMap<String, String> = BTreeMap::new();
     // Definitions-level `<message id=… name=…>` declarations, with the
     // correlation-key variable from a nested `zeebe:subscription`: id -> decl.
-    let mut messages: HashMap<String, MessageDecl> = HashMap::new();
+    let mut messages: BTreeMap<String, MessageDecl> = BTreeMap::new();
     // Id of the `<message>` currently being read (to attach its subscription).
     let mut cur_message: Option<String> = None;
     // Definitions-level `<signal id=… name=…>` declarations: id -> name.
-    let mut signals: HashMap<String, String> = HashMap::new();
+    let mut signals: BTreeMap<String, String> = BTreeMap::new();
     // Definitions-level `<escalation id=… name=…>` declarations: id -> name.
     // Captured so the reference-integrity validator (#851) can resolve an
     // `escalationRef` against a declared escalation. The parser does not model
     // escalation execution today; this only records the declarations.
-    let mut escalations: HashMap<String, String> = HashMap::new();
+    let mut escalations: BTreeMap<String, String> = BTreeMap::new();
     // Stack of activity node indices that can carry a `zeebe:ioMapping`, so a
     // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.

@@ -2824,7 +2824,7 @@ impl ReadStore {
     /// transitions the row, the other is a no-op, so the instance is counted
     /// exactly once. Returns the number of rows reconciled — the amount by which
     /// the in-flight gauge was over-counting.
-    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::BTreeSet<Key>) -> usize {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let active: Vec<i64> = {
             let mut stmt = match conn.prepare("SELECT key FROM process_instances WHERE state = 0") {
@@ -4077,7 +4077,7 @@ fn upsert_variables(
     tx: &rusqlite::Transaction,
     instance_key: Key,
     scope_key: Key,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> rusqlite::Result<()> {
     if variables.is_empty() {
         return Ok(());
@@ -7117,9 +7117,16 @@ fn project_event(
         | Event::ProcessStartTimerFired { .. }
         // A Raft applied-entry record (#1405): no read-model state.
         | Event::RaftEntryApplied { .. }
+        // Replicated lenient-completion mode (#1661): engine-internal config.
+        | Event::LenientCompletionSet { .. }
         // Engine-internal routed-delivery dedup / close-tombstone ledger
         // (#1497): no read-model projection.
         | Event::RoutedDeliveryRecorded { .. }
+        // Cluster variables (#1657) are served from replicated engine state
+        // (the one source of truth), not projected into the read model.
+        | Event::ClusterVariableCreated { .. }
+        | Event::ClusterVariableUpdated { .. }
+        | Event::ClusterVariableDeleted { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
@@ -8367,6 +8374,7 @@ mod writability_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -8444,6 +8452,7 @@ mod writability_tests {
                     at: 600,
                     deadline: None,
                 }),
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -8530,6 +8539,7 @@ mod writability_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         apply_at(&store, &created, 9_000);
         let row = job_row(&store, 12);
@@ -8943,6 +8953,7 @@ mod definition_xml_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -9004,6 +9015,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             100,
         );
@@ -9215,6 +9227,7 @@ mod definition_xml_tests {
                     at: 600,
                     deadline: Some(70_000),
                 }),
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -9259,6 +9272,7 @@ mod definition_xml_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -9508,7 +9522,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         engine
             .apply_command_at(Command::DeployProcess(def), 1_000)
             .unwrap();
@@ -9582,7 +9598,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         let store = ReadStore::open(None).unwrap();
         let run = |engine: &mut Engine, cmd: Command, now: u64| {
             let events = engine.apply_command_at(cmd, now).unwrap();
@@ -9764,6 +9782,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobFailed {
                 job_key: 8_950,
@@ -9819,6 +9838,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobActivated {
                 job_key: 8_900,
@@ -9942,7 +9962,7 @@ mod definition_xml_tests {
         // Engine truth: only 11 is genuinely live (e.g. cold-spilled). 10 and 12
         // are orphans — their CREATE was projected but the terminal event never
         // was — so the engine holds no such instance.
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         live.insert(11u64);
 
         let reconciled = store.reconcile_orphaned_active(&live);
@@ -10577,7 +10597,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -10600,7 +10620,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: process_id.to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -10622,7 +10642,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -11416,7 +11436,7 @@ mod definition_xml_tests {
             .export(&[
                 &Event::VariablesUpdated {
                     instance_key,
-                    variables: std::collections::HashMap::from([(
+                    variables: std::collections::BTreeMap::from([(
                         "amount".to_string(),
                         Value::Int(10),
                     )]),
@@ -11424,7 +11444,7 @@ mod definition_xml_tests {
                 &Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key,
-                    variables: std::collections::HashMap::from([
+                    variables: std::collections::BTreeMap::from([
                         ("amount".to_string(), Value::Int(20)),
                         ("item".to_string(), Value::Int(7)),
                     ]),
@@ -11463,7 +11483,7 @@ mod definition_xml_tests {
             .export(&[&Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key,
-                variables: std::collections::HashMap::from([(
+                variables: std::collections::BTreeMap::from([(
                     "amount".to_string(),
                     Value::Int(99),
                 )]),
@@ -11731,6 +11751,7 @@ mod decision_deletion_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let task = |user_task_key| Event::UserTaskCreated {
             user_task_key,
@@ -11766,7 +11787,7 @@ mod decision_deletion_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -11912,7 +11933,7 @@ mod decision_deletion_tests {
 
 #[cfg(test)]
 mod element_instance_tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use nanobpmn_engine_core::{Event, JobKind, JobState, Key, ProcessBuilder};
 
@@ -11946,7 +11967,7 @@ mod element_instance_tests {
         Event::ProcessInstanceCreated {
             instance_key: INST,
             process_id: "p".to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             created_at: 1,
             tags: Vec::new(),
             business_id: None,
@@ -11974,7 +11995,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: CHILD,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 2,
                     tags: Vec::new(),
                     business_id: None,
@@ -12184,7 +12205,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: COMP_INST,
                     process_id: "comp".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12250,7 +12271,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: ESC_INST,
                     process_id: "esc".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12324,7 +12345,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: INST + 100,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -12457,7 +12478,7 @@ mod element_instance_tests {
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
                 kind: MessageSubscriptionKind::IntermediateCatch,
-                variables: std::collections::HashMap::new(),
+                variables: std::collections::BTreeMap::new(),
                 delivery_key: 0,
             }])
             .unwrap();
@@ -12578,6 +12599,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 7001,
@@ -12597,6 +12619,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 7002,
@@ -12662,6 +12685,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8001,
@@ -12691,6 +12715,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8002,
@@ -12719,6 +12744,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 2,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8003,
@@ -12781,6 +12807,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9001,
@@ -12800,6 +12827,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9002,
@@ -12846,6 +12874,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9101,
@@ -12866,6 +12895,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9102,
@@ -12914,6 +12944,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9201,
@@ -12933,6 +12964,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9202,
@@ -12951,6 +12983,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9203,
@@ -13002,6 +13035,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 // Durable activation with an explicitly-empty worker: the
                 // projection must land NULL, not `""`.
@@ -13077,6 +13111,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -13147,6 +13182,7 @@ mod element_instance_tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
             retry_backoff_until: None,
         };
         let mut state = State::default();
@@ -13330,6 +13366,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activate = |key, deadline| Event::JobActivated {
             job_key: key,
@@ -13457,6 +13494,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -13576,6 +13614,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -13694,6 +13733,7 @@ mod element_instance_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13799,6 +13839,7 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
                 retry_backoff_until: None,
             },
         );
@@ -13833,6 +13874,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13883,6 +13925,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -13970,6 +14013,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -14108,6 +14152,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7001,
@@ -14129,6 +14174,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7002,
@@ -14494,7 +14540,7 @@ mod element_instance_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7001,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: Some("biz-7".into()),
@@ -14696,7 +14742,7 @@ mod read_surface_tests {
         let top_instance = Event::ProcessInstanceCreated {
             instance_key: 10,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -14708,7 +14754,7 @@ mod read_surface_tests {
         let child_instance = Event::ProcessInstanceCreated {
             instance_key: 20,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -14777,6 +14823,7 @@ mod read_surface_tests {
                 created_at: 0,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
         assert_ne!(
@@ -14801,6 +14848,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -14884,6 +14932,7 @@ mod read_surface_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // First delivery stamps the batch-time fallback for both timestamps.
         apply_at(&store, &legacy, 1_000);
@@ -14952,6 +15001,7 @@ mod read_surface_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
                 9_000,
             );
@@ -15039,6 +15089,7 @@ mod read_surface_tests {
                         created_at: 1_000,
                         priority: 0,
                         retries: 3,
+                        secret_provenance: Vec::new(),
                     },
                     1_000,
                 );
@@ -15117,6 +15168,7 @@ mod read_surface_tests {
                 created_at: 123,
                 priority: 0,
                 retries: 0,
+                secret_provenance: Vec::new(),
             };
             apply_at(&store, &created, 1_000);
             apply_at(&store, &terminal, 2_000);
@@ -15178,6 +15230,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8600,
@@ -15267,6 +15320,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8601,
@@ -15341,6 +15395,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8602,
@@ -15404,6 +15459,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8620,
@@ -15468,6 +15524,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8605,
@@ -15525,6 +15582,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = |at: u64, worker: &str| Event::JobActivated {
             job_key: 8610,
@@ -15584,6 +15642,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // Same-tick activation: `activated_at == created_at` (both from the
         // engine's per-command `self.now`).
@@ -15654,6 +15713,7 @@ mod read_surface_tests {
             created_at: 123,
             priority: 0,
             retries: 1,
+            secret_provenance: Vec::new(),
         };
         let fail = Event::JobFailed {
             job_key: 8500,
@@ -15709,6 +15769,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -16635,7 +16696,7 @@ mod try_query_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -16695,6 +16756,7 @@ mod job_position_gate_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         }
     }
 
@@ -16750,7 +16812,7 @@ mod job_position_gate_tests {
 
 #[cfg(test)]
 mod adhoc_migration_export_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::{
         AdHocActivateElement, AdHocJobResult, Command, Engine, Event, ProcessDefinition,
@@ -16830,11 +16892,11 @@ mod adhoc_migration_export_tests {
         let ev = engine
             .apply_command(Command::complete_job_with_result(
                 agent[0].key,
-                HashMap::new(),
+                BTreeMap::new(),
                 AdHocJobResult {
                     activate_elements: vec![AdHocActivateElement {
                         element_id: "toolA".to_string(),
-                        variables: HashMap::new(),
+                        variables: BTreeMap::new(),
                     }],
                     ..Default::default()
                 },

@@ -103,7 +103,9 @@ pub use agent::{
     AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceMetricsDelta, AgentInstanceStatus,
     AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
-pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
+pub use cluster_vars::{
+    ClusterVariable, ClusterVariableKind, ClusterVariableState, DEFAULT_TENANT,
+};
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
 #[cfg(feature = "serde")]
@@ -135,6 +137,8 @@ pub use event::{
     SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
+#[cfg(feature = "serde")]
+pub use model::value_from_json;
 pub use model::{
     tool_name_of, tool_properties_of, AdHocActivateElement, AdHocImplementationType,
     AdHocJobResult, AdHocSubProcessDef, AdHocTool, AdHocToolKind, BindingType, BuildError,
@@ -151,8 +155,8 @@ pub use state::{
     IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
     JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
-    ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
-    UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES,
-    LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS, ROUTED_DELIVERY_LEDGER_CAP,
-    SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
+    ProcessInstanceState, SecretProvenance, SignalSubscription, StartTimer, State, Timer,
+    TimerKind, TimerState, UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY,
+    DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,
+    ROUTED_DELIVERY_LEDGER_CAP, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

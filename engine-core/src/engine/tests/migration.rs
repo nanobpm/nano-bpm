@@ -29,7 +29,7 @@ fn modify_terminates_one_element_and_activates_another() {
             inst,
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             vec![a_eik],
@@ -123,7 +123,7 @@ fn modify_activating_an_element_merges_global_variables() {
         .unwrap();
     let a_eik = active_eik_of(&engine, inst, "a");
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("approved".to_string(), Value::Bool(true));
     let events = engine
         .apply_command(Command::modify_instance(
@@ -175,7 +175,7 @@ fn modify_rejects_unknown_instance_and_element_ids() {
             inst,
             vec![ActivateElementInstruction {
                 element_id: "nope".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             vec![],
@@ -223,7 +223,7 @@ fn modify_survives_replay() {
                 inst,
                 vec![ActivateElementInstruction {
                     element_id: "b".into(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     ..Default::default()
                 }],
                 vec![a_eik],

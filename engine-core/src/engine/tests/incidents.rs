@@ -43,7 +43,7 @@ fn inline_script_task_raises_an_incident_when_the_expression_fails_and_recovers(
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("n".to_string(), Value::Int(41))]),
+            BTreeMap::from([("n".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     engine
@@ -73,7 +73,7 @@ fn should_raise_incident_when_inclusive_split_matches_no_flow() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let vars = BTreeMap::from([("temp".to_string(), Value::Int(20))]);
     let events = engine
         .apply_command(Command::create_instance_with("inc-stuck", vars))
         .unwrap();
@@ -121,7 +121,7 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "inc-redrive",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -142,7 +142,7 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("go".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     let resolved = engine
@@ -201,7 +201,7 @@ fn inclusive_join_incident_is_observed_by_the_step_driver() {
     engine
         .apply_command(Command::create_instance_with(
             "inc-redrive",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
 
@@ -645,7 +645,7 @@ fn should_raise_an_expression_incident_when_a_condition_cannot_evaluate() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([("name".to_string(), Value::Str("ann".into()))]);
+    let vars = BTreeMap::from([("name".to_string(), Value::Str("ann".into()))]);
     let created = engine
         .apply_command(Command::create_instance_with("typed", vars))
         .unwrap();
@@ -674,7 +674,7 @@ fn should_raise_incident_when_no_exclusive_flow_matches() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Int(7))]);
     let events = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -808,7 +808,7 @@ fn should_re_raise_a_gateway_incident_when_resolution_still_finds_no_flow() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -848,7 +848,7 @@ fn should_recover_a_gateway_incident_after_fixing_variables() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -859,7 +859,7 @@ fn should_recover_a_gateway_incident_after_fixing_variables() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("d".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("d".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     engine
@@ -1261,7 +1261,7 @@ fn input_mapping_eval_failure_raises_io_mapping_incident_and_no_job() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("x".to_string(), Value::Int(41))]),
+            BTreeMap::from([("x".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     engine
@@ -1333,7 +1333,7 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     let events = engine
@@ -1400,7 +1400,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     // Correlating drives completion, which applies the output mapping
     // `=bad + 1` (string + int) and fails: one output-phase `IoMapping` incident,
     // the token held in COMPLETING, and the subscription already consumed.
-    engine.correlate_message("approve", "A", HashMap::new(), 0);
+    engine.correlate_message("approve", "A", BTreeMap::new(), 0);
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
     assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
@@ -1423,7 +1423,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     let events = engine
@@ -1518,7 +1518,7 @@ fn subprocess_output_mapping_eval_failure_raises_io_mapping_incident() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
             true,
         ))
         .unwrap();
@@ -1607,7 +1607,7 @@ fn multi_instance_body_input_mapping_genuine_failure_raises_incident_and_recover
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("badFactor".to_string(), Value::Int(5))]),
+            BTreeMap::from([("badFactor".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     engine
@@ -1700,7 +1700,7 @@ fn multi_instance_body_output_mapping_genuine_failure_raises_incident_and_recove
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("badOut".to_string(), Value::Int(5))]),
+            BTreeMap::from([("badOut".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let events = engine
@@ -1768,7 +1768,7 @@ fn business_rule_task_unknown_decision_raises_incident() {
         )))
         .unwrap();
     let events = engine
-        .apply_command(Command::create_instance_with("brt", HashMap::new()))
+        .apply_command(Command::create_instance_with("brt", BTreeMap::new()))
         .unwrap();
     let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -1819,7 +1819,7 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1831,7 +1831,7 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         .into_iter()
         .next()
         .expect("tool job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("x".to_string()));
     engine
         .apply_command(Command::complete_job_with(tool.key, vars))
@@ -1900,7 +1900,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1912,7 +1912,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
         .into_iter()
         .next()
         .expect("tool job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("x".to_string()));
     engine
         .apply_command(Command::complete_job_with(tool.key, vars))
@@ -1926,7 +1926,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
     engine
         .apply_command(Command::set_variables_scoped(
             container,
-            HashMap::from([("results".to_string(), Value::List(Vec::new()))]),
+            BTreeMap::from([("results".to_string(), Value::List(Vec::new()))]),
             true,
         ))
         .unwrap();
@@ -2050,7 +2050,7 @@ fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("Unbound")],
                 ..Default::default()
@@ -2091,7 +2091,7 @@ fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -2124,7 +2124,7 @@ fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -2217,7 +2217,7 @@ fn adhoc_call_activity_tool_propagate_all_redrive_sees_post_incident_container_v
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -2362,7 +2362,7 @@ fn subprocess_input_mapping_failure_reenters_the_body_on_resolve() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("seed".to_string(), Value::Int(4))]),
+            BTreeMap::from([("seed".to_string(), Value::Int(4))]),
         ))
         .unwrap();
     engine
@@ -2460,7 +2460,7 @@ fn should_create_incident_if_job_type_expression_of_invalid_type() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2486,7 +2486,7 @@ fn should_create_incident_if_job_type_expression_is_empty_string() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2526,7 +2526,7 @@ fn should_create_incident_if_job_type_expression_of_non_string_scalar_type() {
         let created = engine
             .apply_command(Command::create_instance_with(
                 "job-type-incident",
-                HashMap::new(),
+                BTreeMap::new(),
             ))
             .unwrap();
         let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2618,7 +2618,7 @@ fn should_resolve_incident_after_job_type_expression_evaluation_failed() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("model".to_string(), Value::Str("kimi-k3".into()))]),
+            BTreeMap::from([("model".to_string(), Value::Str("kimi-k3".into()))]),
         ))
         .unwrap();
     let resolve_events = engine
@@ -2712,7 +2712,7 @@ fn job_type_expression_resolves_against_updated_variables() {
     engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     assert!(engine.active_incidents().is_empty());
@@ -2773,7 +2773,7 @@ fn adhoc_tool_job_type_failure_parks_container_before_any_child_creation() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2813,7 +2813,7 @@ fn adhoc_tool_job_type_failure_parks_container_before_any_child_creation() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -2873,7 +2873,7 @@ fn adhoc_tool_job_type_re_raise_after_resolve_keeps_container_parked() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2942,7 +2942,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::create_instance_with(
             "p",
-            HashMap::from([("counter".to_string(), Value::Int(1))]),
+            BTreeMap::from([("counter".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let inst = engine.state().instances.keys().copied().next().unwrap();
@@ -2954,7 +2954,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2965,7 +2965,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3028,7 +3028,7 @@ fn nested_declarative_adhoc_with_long_id_is_not_job_type_validated() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element(&long_id)],
                 ..Default::default()
@@ -3096,7 +3096,7 @@ fn adhoc_tool_job_type_redrive_applies_scope_corrections_over_the_frozen_seed() 
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element_with(
                     "toolA",
@@ -3116,7 +3116,7 @@ fn adhoc_tool_job_type_redrive_applies_scope_corrections_over_the_frozen_seed() 
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3189,7 +3189,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -3209,7 +3209,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::from([("result".to_string(), Value::Int(1))]),
+            BTreeMap::from([("result".to_string(), Value::Int(1))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3226,7 +3226,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::set_variables(
             engine.state().instances.keys().copied().next().unwrap(),
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3240,7 +3240,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::from([("result".to_string(), Value::Int(2))]),
+            BTreeMap::from([("result".to_string(), Value::Int(2))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3308,7 +3308,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3322,7 +3322,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3336,7 +3336,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3392,7 +3392,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("counter".to_string(), Value::Int(1))]),
+            BTreeMap::from([("counter".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let agent = engine
@@ -3406,7 +3406,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element_with(
                     "toolA",
@@ -3426,7 +3426,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3508,7 +3508,7 @@ fn adhoc_cancel_remaining_resolves_container_tool_type_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -3602,7 +3602,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -3622,7 +3622,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::from([("done".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("done".to_string(), Value::Bool(true))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3648,7 +3648,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3662,7 +3662,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::from([("done".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("done".to_string(), Value::Bool(false))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3791,7 +3791,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([
+            BTreeMap::from([
                 ("result".to_string(), Value::Int(0)),
                 ("toolType".to_string(), Value::Int(42)),
             ]),
@@ -3805,7 +3805,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -3818,7 +3818,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3829,7 +3829,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::complete_job_with(
             tool[0].key,
-            HashMap::from([("result".to_string(), Value::Int(1))]),
+            BTreeMap::from([("result".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let agent2 = engine
@@ -4628,7 +4628,7 @@ fn orphan_replica() -> (Engine, Key) {
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
     engine
         .apply_command_at(
-            Command::set_variables(key, HashMap::from([("x".into(), Value::Int(1))])),
+            Command::set_variables(key, BTreeMap::from([("x".into(), Value::Int(1))])),
             3,
         )
         .unwrap();
@@ -4767,7 +4767,7 @@ fn delayed_duplicate_after_resolve_is_a_noop_and_touches_no_variables() {
         // repair must never roll back).
         engine
             .apply_command_at(
-                Command::set_variables(key, HashMap::from([("x".into(), Value::Int(2))])),
+                Command::set_variables(key, BTreeMap::from([("x".into(), Value::Int(2))])),
                 52,
             )
             .unwrap();

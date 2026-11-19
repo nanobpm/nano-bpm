@@ -1,7 +1,7 @@
 //! The FEEL evaluator: walks an [`ast::Node`] tree producing a [`FeelVal`].
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::ast::{BinOp, CallArgs, Node, Quantifier, RangeNode};
@@ -13,12 +13,12 @@ use crate::model::Value;
 
 /// A lexical scope: a stack of frames over the engine's base variable map.
 pub struct Ctx<'a> {
-    base: &'a HashMap<String, Value>,
+    base: &'a BTreeMap<String, Value>,
     scopes: Vec<BTreeMap<String, FeelVal>>,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(base: &'a HashMap<String, Value>) -> Ctx<'a> {
+    pub fn new(base: &'a BTreeMap<String, Value>) -> Ctx<'a> {
         Ctx {
             base,
             scopes: Vec::new(),
@@ -44,7 +44,7 @@ impl<'a> Ctx<'a> {
 }
 
 /// Evaluates a parsed expression against the engine's variables.
-pub fn evaluate(node: &Node, base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+pub fn evaluate(node: &Node, base: &BTreeMap<String, Value>) -> Result<FeelVal, FeelError> {
     let mut ctx = Ctx::new(base);
     eval_node(node, &mut ctx)
 }
@@ -539,7 +539,7 @@ fn eval_binary(op: BinOp, lhs: &Node, rhs: &Node, ctx: &mut Ctx) -> Result<FeelV
         BinOp::Mul => mul(&l, &r),
         BinOp::Div => div(&l, &r),
         BinOp::Exp => match (l.as_f64(), r.as_f64()) {
-            (Some(a), Some(b)) => Some(FeelVal::num(a.powf(b))),
+            (Some(a), Some(b)) => Some(FeelVal::num(libm::pow(a, b))),
             _ => None,
         },
         BinOp::Eq => Some(eq_op(&l, &r)),

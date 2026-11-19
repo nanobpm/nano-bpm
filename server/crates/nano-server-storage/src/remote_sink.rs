@@ -18,7 +18,7 @@
 //! once a batch is enqueued for the transport, not once the remote target has
 //! acknowledged it. Ack-gated advancement is a later milestone (#133).
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -96,7 +96,7 @@ fn serialize_chunks(events: &[&Event], budget: usize) -> anyhow::Result<Vec<Vec<
 /// cumulative throughput.
 #[derive(Default)]
 pub struct InflightIndex {
-    active: Mutex<HashSet<Key>>,
+    active: Mutex<BTreeSet<Key>>,
 }
 
 impl InflightIndex {
@@ -456,7 +456,7 @@ impl ProjectionSink for TeeSink {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::Event;
 
@@ -466,7 +466,7 @@ mod tests {
         Event::ProcessInstanceCreated {
             instance_key: key,
             process_id: "p".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,

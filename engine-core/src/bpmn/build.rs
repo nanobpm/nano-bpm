@@ -532,10 +532,10 @@ impl ProcessAcc {
     /// (before ad-hoc pruning), mirroring what Zeebe validates at deploy.
     pub(super) fn capture(
         &self,
-        errors: &HashMap<String, String>,
-        messages: &HashMap<String, MessageDecl>,
-        signals: &HashMap<String, String>,
-        escalations: &HashMap<String, String>,
+        errors: &BTreeMap<String, String>,
+        messages: &BTreeMap<String, MessageDecl>,
+        signals: &BTreeMap<String, String>,
+        escalations: &BTreeMap<String, String>,
     ) -> crate::validate::ProcessCapture {
         use crate::validate::{FlowRefCapture, RefSite, TaskDefCapture, UnmodelledElement};
 
@@ -543,7 +543,7 @@ impl ProcessAcc {
             .flows
             .iter()
             .filter_map(|f| f.id.clone())
-            .collect::<std::collections::HashSet<String>>();
+            .collect::<std::collections::BTreeSet<String>>();
 
         let flow_refs = self
             .flow_refs
@@ -670,10 +670,10 @@ impl ProcessAcc {
     /// intermediate catch and boundary events.
     pub(super) fn build(
         mut self,
-        errors: &HashMap<String, String>,
-        messages: &HashMap<String, MessageDecl>,
-        signals: &HashMap<String, String>,
-        escalations: &HashMap<String, String>,
+        errors: &BTreeMap<String, String>,
+        messages: &BTreeMap<String, MessageDecl>,
+        signals: &BTreeMap<String, String>,
+        escalations: &BTreeMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
         // Reject `zeebe:executionListener`s declared where they can never fire
         // (#1197), rather than silently storing a listener that creates no job.
@@ -706,7 +706,7 @@ impl ProcessAcc {
         //   implicitly when its host completes and never entered by token flow,
         //   so it has no lifecycle to hang a listener on.
         {
-            let mut incoming: HashMap<&str, usize> = HashMap::new();
+            let mut incoming: BTreeMap<&str, usize> = BTreeMap::new();
             for flow in &self.flows {
                 if let Some(target) = flow.target.as_deref() {
                     *incoming.entry(target).or_default() += 1;
@@ -793,7 +793,7 @@ impl ProcessAcc {
         // activate-element contract can be honoured later (ADR 0023) without
         // re-parsing.
         let mut adhoc_catalog: Vec<crate::model::AdHocSubProcessDef> = Vec::new();
-        let adhoc_ids: std::collections::HashSet<String> = self
+        let adhoc_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_adhoc)
@@ -853,7 +853,7 @@ impl ProcessAcc {
             });
         }
         if !adhoc_ids.is_empty() {
-            let parent_of: HashMap<&str, &str> = self
+            let parent_of: BTreeMap<&str, &str> = self
                 .nodes
                 .iter()
                 .filter_map(|n| n.parent.as_deref().map(|p| (n.id.as_str(), p)))
@@ -923,7 +923,7 @@ impl ProcessAcc {
             // `adHocSubProcess` (agent-of-agents, #631) is NOT such a tool — it is
             // `is_adhoc` and keeps its own pruned-catalog handling — so exclude it
             // here.
-            let subprocess_tool_ids: std::collections::HashSet<String> = self
+            let subprocess_tool_ids: std::collections::BTreeSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| {
@@ -954,7 +954,7 @@ impl ProcessAcc {
                 }
                 false
             };
-            let pruned: std::collections::HashSet<String> = self
+            let pruned: std::collections::BTreeSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| inside_adhoc(&n.id) && !in_subprocess_tool(&n.id))
@@ -1096,7 +1096,7 @@ impl ProcessAcc {
             // non-existent element and hard-fail at runtime. More than one makes
             // the injection target ambiguous. Reject both at parse/deploy time
             // with a clear error rather than defaulting. Iterate in document
-            // order (over `self.nodes`, not the `HashSet`) so the error is
+            // order (over `self.nodes`, not the set) so the error is
             // deterministic when several tools are malformed.
             for n in self
                 .nodes
@@ -1123,7 +1123,7 @@ impl ProcessAcc {
             }
 
             // One catalog entry per ad-hoc container, in document order.
-            let mut index: HashMap<String, usize> = HashMap::new();
+            let mut index: BTreeMap<String, usize> = BTreeMap::new();
             for n in self.nodes.iter().filter(|n| n.is_adhoc) {
                 index.insert(n.id.clone(), adhoc_catalog.len());
                 // A container backed by a job (taskDefinition) is the agentic
@@ -1378,15 +1378,15 @@ impl ProcessAcc {
         }
         // Map each sub-process to its inner start event (a start node whose
         // parent is the sub-process).
-        let sub_starts: HashMap<String, String> = self
+        let sub_starts: BTreeMap<String, String> = self
             .nodes
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::Start))
             .filter_map(|n| n.parent.clone().map(|p| (p, n.id.clone())))
             .collect();
         // Ids of sequence flows declared as a gateway `default` flow.
-        let mut default_flow_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut default_flow_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         // The process-level start event's form id (`zeebe:formDefinition formId`),
         // captured as nodes are consumed and set on the built definition below.
         let mut start_form_id: Option<String> = None;
@@ -1395,7 +1395,7 @@ impl ProcessAcc {
         // `self.nodes` is consumed below so the boundary-handler resolution can
         // reject associations that point at a non-handler node (e.g. a
         // `textAnnotation`) and detect ambiguity.
-        let compensation_handler_ids: std::collections::HashSet<String> = self
+        let compensation_handler_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_for_compensation && n.kind.is_activity())
@@ -1412,12 +1412,12 @@ impl ProcessAcc {
         // outgoing flow), so a malformed `<endEvent>…<escalationEventDefinition/>`
         // with an outgoing flow would otherwise silently deploy as a routing
         // intermediate throw (#1173).
-        let flow_source_ids: std::collections::HashSet<String> =
+        let flow_source_ids: std::collections::BTreeSet<String> =
             self.flows.iter().filter_map(|f| f.source.clone()).collect();
         // Ids of the event sub-processes (`subProcess triggeredByEvent="true"`),
         // used to recognise a start event nested directly inside one (its
         // trigger) and to reject a flow into/out of the event sub-process.
-        let event_subprocess_ids: std::collections::HashSet<String> = self
+        let event_subprocess_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_event_subprocess)
@@ -1427,7 +1427,7 @@ impl ProcessAcc {
         // is an event sub-process), mapped esp id -> its start node ids (in
         // document order, so a "multiple start events" rejection is
         // deterministic).
-        let mut esp_starts: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut esp_starts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (i, n) in self.nodes.iter().enumerate() {
             if matches!(n.kind, NodeKind::Start)
                 && n.parent
@@ -1446,8 +1446,8 @@ impl ProcessAcc {
         // looks the result up. Resolution validates against the declared
         // messages/signals/errors/escalations (reference integrity, #851) and
         // applies the Zeebe `isInterrupting` default (`true`).
-        let mut esp_triggers: HashMap<String, (crate::model::EventSubProcessTrigger, bool)> =
-            HashMap::new();
+        let mut esp_triggers: BTreeMap<String, (crate::model::EventSubProcessTrigger, bool)> =
+            BTreeMap::new();
         // Ids of every node an escalation boundary event may legally attach to.
         // An escalation propagates *out* of the inner token scope it is raised
         // in, so only a container that opens such a scope — an embedded
@@ -1455,7 +1455,7 @@ impl ProcessAcc {
         // other activity (plain service/user task, call activity) is a dead
         // boundary that `find_catching_escalation_boundary` can never reach
         // (#1173).
-        let escalation_container_ids: std::collections::HashSet<String> = self
+        let escalation_container_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::SubProcess) || n.is_adhoc)
@@ -1470,13 +1470,13 @@ impl ProcessAcc {
         // agent-re-drive completion path is not wired for boundary interruption),
         // so the container would hang `Active` forever. Refuse the model at deploy
         // rather than mis-execute it (#1173); full runtime support is a follow-up.
-        let adhoc_container_ids: std::collections::HashSet<String> = self
+        let adhoc_container_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_adhoc)
             .map(|n| n.id.clone())
             .collect();
-        let node_parent: HashMap<String, String> = self
+        let node_parent: BTreeMap<String, String> = self
             .nodes
             .iter()
             .filter_map(|n| n.parent.clone().map(|p| (n.id.clone(), p)))
@@ -1987,7 +1987,7 @@ impl ProcessAcc {
         // Ids of the compensation boundary events. A compensation boundary is a
         // structural marker armed implicitly when its activity completes; it is
         // never reached by ordinary token flow (see the flow validation below).
-        let compensation_boundary_ids: std::collections::HashSet<String> = self
+        let compensation_boundary_ids: std::collections::BTreeSet<String> = self
             .boundaries
             .iter()
             .filter(|b| b.compensation)
@@ -2004,7 +2004,7 @@ impl ProcessAcc {
         // the new escalation boundary (#1173), whose handler would fire with no
         // escalation. Reject such models at deploy (see the flow validation below)
         // rather than mis-executing them.
-        let reactive_boundary_ids: std::collections::HashSet<String> = self
+        let reactive_boundary_ids: std::collections::BTreeSet<String> = self
             .boundaries
             .iter()
             .filter(|b| !b.compensation)
@@ -2385,10 +2385,10 @@ fn resolve_esp_trigger(
     process_id: &str,
     esp_id: &str,
     start: &NodeAcc,
-    messages: &HashMap<String, MessageDecl>,
-    signals: &HashMap<String, String>,
-    errors: &HashMap<String, String>,
-    escalations: &HashMap<String, String>,
+    messages: &BTreeMap<String, MessageDecl>,
+    signals: &BTreeMap<String, String>,
+    errors: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
 ) -> Result<crate::model::EventSubProcessTrigger, ParseError> {
     use crate::model::EventSubProcessTrigger as T;
     if let Some(message_ref) = &start.message_ref {

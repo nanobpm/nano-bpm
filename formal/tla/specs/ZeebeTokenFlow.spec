@@ -41,3 +41,19 @@ SPEC_EXPECTED=(
   # keeping the surplus taken record between firings (the "Tetris" principle).
   "ZMCParallelJoinSurplus      violates:JoinFiresAtMostOnce"
 )
+
+# The completing models the trace-validation harness anchors against the Rust
+# engine. Restricted to the parallel-only, routing-deterministic models: their
+# behaviour is unique up to interleaving, so the engine's observable milestone
+# multiset must equal the spec's exactly. Condition-routed models (xor/or) pick
+# branches nondeterministically in the spec and by FEEL data in the engine, so
+# they are model-checked but not (yet) trace-anchored. See formal/README.md.
+SPEC_TRACE_MODELS=(ZMCParallelDiamond)
+
+# The completion predicate and process-graph record the trace generator dumps,
+# in ZeebeTokenFlow's own vocabulary (see SPEC_TRACE_DONE / SPEC_TRACE_GRAPH
+# above). ZeebeTokenFlow's completion is `done` (the process instance's
+# ELEMENT_COMPLETED), and its graph vocabulary is the same as TokenFlow's.
+SPEC_TRACE_DONE="done"
+SPEC_TRACE_GRAPH="[nodes |-> MCNodes, kind |-> [n \in MCNodes |-> MCKind[n]],
+     edges |-> MCEdges, start |-> MCStart]"

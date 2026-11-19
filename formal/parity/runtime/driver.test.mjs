@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import {
@@ -16,9 +17,9 @@ import {
   incidentsFromSnapshot,
   rootVariablesFromSearch,
 } from "./nano-backend.mjs";
-import { CamundaBackend } from "./camunda-backend.mjs";
+import { CamundaBackend, BackendCleanupError } from "./camunda-backend.mjs";
 import { runScenario } from "./driver.mjs";
-import { discoverScenarios, installSignalCleanup } from "./run.mjs";
+import { discoverScenarios, installSignalCleanup, backendEligible } from "./run.mjs";
 import { EventEmitter } from "node:events";
 import {
   checkExpectations,
@@ -63,6 +64,24 @@ test("nano runs are deterministic — a re-run reproduces byte-identical observa
     await a.close();
     await b.close();
   }
+});
+
+test("backendEligible honors a scenario's backends restriction (#1246 review)", () => {
+  // The bounded-exhaustive corpus marks non-completing scenarios
+  // `backends: ["nano"]`: the bare-gateway Camunda backend only observes an
+  // instance through completion, so running one on Camunda would time out in
+  // `awaitCompletion` even when both engines behave correctly. The shared
+  // runner must skip it on camunda (and the differential) but still run nano.
+  const nanoOnly = { name: "stuck", backends: ["nano"] };
+  assert.equal(backendEligible(nanoOnly, "nano"), true);
+  assert.equal(backendEligible(nanoOnly, "camunda"), false);
+  // A scenario with no restriction runs on every backend.
+  assert.equal(backendEligible({ name: "plain" }, "camunda"), true);
+  assert.equal(backendEligible({ name: "plain" }, "nano"), true);
+  // An explicit both-backends list is eligible on both.
+  const both = { name: "both", backends: ["nano", "camunda"] };
+  assert.equal(backendEligible(both, "camunda"), true);
+  assert.equal(backendEligible(both, "nano"), true);
 });
 
 test("diffObservations only compares fields BOTH backends provide", () => {
@@ -368,6 +387,19 @@ test("CamundaBackend.observe defaults an absent processCompleted flag to complet
   assert.deepEqual(done.variables, { a: 3 });
 });
 
+test("CamundaBackend.observe strips route_* schedule variables like NanoBackend (#1246)", async () => {
+  // The driver's routing schedule (`route_*`) is fed INTO both backends, not a
+  // process outcome. NanoBackend.observe drops it; Camunda must too, or the
+  // differential reports a false `variables` mismatch on every routed scenario.
+  const backend = new CamundaBackend({ address: "http://localhost:8080/v2" });
+  const obs = await backend.observe({
+    pending: Promise.resolve({
+      variables: { route_G1: [["f2"]], corr: "k", out: 1 },
+    }),
+  });
+  assert.deepEqual(obs.variables, { corr: "k", out: 1 }, "route_* dropped, process variables kept");
+});
+
 test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset error", async () => {
   // A swallowed /clock/reset could leave the global clock pinned while the
   // runner reports success, so cleanup must fail loudly, not be caught (#1260).
@@ -396,6 +428,10 @@ test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset 
     assert.equal(backend.pinnedClockMs, null);
     mode = "fail";
     await assert.rejects(() => backend.reset(), /reset clock failed: HTTP 500/);
+    // A cleanup failure is a BackendCleanupError so the runner ABORTS the phase
+    // instead of recording a false divergence and continuing on a non-isolated
+    // backend (#1246 review).
+    await assert.rejects(() => backend.reset(), (err) => err instanceof BackendCleanupError);
   } finally {
     server.close();
     await once(server, "close");
@@ -455,6 +491,18 @@ test("job activation cap is shared, finite, and identical across backends", () =
   // unbounded nano activation (MAX_SAFE_INTEGER) would diverge from Camunda.
   assert.equal(Number.isSafeInteger(MAX_JOBS_TO_ACTIVATE), true);
   assert.ok(MAX_JOBS_TO_ACTIVATE > 0 && MAX_JOBS_TO_ACTIVATE < Number.MAX_SAFE_INTEGER);
+});
+
+test("the native replay activation cap matches the runtime cap (no cross-runner drift)", () => {
+  // engine-core/tests/parity_corpus.rs replays the same corpus natively for
+  // LLVM coverage and must activate with the same cap, or a scenario with more
+  // ready jobs of one type than the smaller cap completes a different number
+  // of jobs per `activateAndComplete` step on each runner. Parse the constant
+  // out of the Rust source so the two cannot drift apart silently.
+  const rs = readFileSync(new URL("../../../engine-core/tests/parity_corpus.rs", import.meta.url), "utf8");
+  const m = rs.match(/const MAX_JOBS_TO_ACTIVATE: usize = (\d+);/);
+  assert.ok(m, "parity_corpus.rs no longer declares MAX_JOBS_TO_ACTIVATE");
+  assert.equal(Number(m[1]), MAX_JOBS_TO_ACTIVATE);
 });
 
 test("a failed scenario aborts the in-flight awaitCompletion create (no hang until its deadline)", async () => {
@@ -550,6 +598,217 @@ test("cleanup cancels a failed scenario's still-running Camunda instance", async
   }
 });
 
+test("a REJECTED create (awaitCompletion timeout) still cancels its instance on reset (#1246)", async () => {
+  // Dropping the handle from #inflight on a create rejection would orphan the
+  // still-running instance; a later scenario reusing its job type could activate
+  // the leftover job. The handle must be retained until reset confirms the
+  // cancellation of every key it learned.
+  const cancelled = [];
+  let activations = 0;
+  const server = createServer((req, res) => {
+    // The create responds 504 (awaitCompletion timeout) — the instance is
+    // still running server-side, parked on its job.
+    if (req.url.endsWith("/process-instances") && req.method === "POST") {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end('{"message":"timeout"}');
+      return;
+    }
+    const m = req.url.match(/\/process-instances\/(\d+)\/cancellation$/);
+    if (m) {
+      cancelled.push(m[1]);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      activations++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"11","processInstanceKey":"777"}]}');
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const scenario = {
+      xml: "<definitions/>",
+      processId: "p",
+      steps: [{ op: "completeOneJob", jobType: "T1" }],
+    };
+    // The step completes a job (learning key 777), then observe() awaits the
+    // rejected create and the scenario fails.
+    await assert.rejects(() => runScenario(backend, scenario));
+    await backend.close();
+    assert.deepEqual(cancelled, ["777"], "the rejected create's instance must still be cancelled");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("completeOneJob activates and completes exactly ONE job of the type", async () => {
+  const completions = [];
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/jobs/activation")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"21","processInstanceKey":"5"}]}');
+      return;
+    }
+    const m = req.url.match(/\/jobs\/(\d+)\/completion$/);
+    if (m) {
+      completions.push(m[1]);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set() };
+    const n = await backend.completeOneJob(handle, "T1", {});
+    assert.equal(n, 1);
+    assert.deepEqual(completions, ["21"]);
+    assert.deepEqual([...handle.instanceKeys], ["5"]);
+    // No activatable job is a loud serialisation defect, like the batch op.
+    const empty = createServer((req, res) => {
+      if (req.url.endsWith("/jobs/activation")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"jobs":[]}');
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+    });
+    empty.listen(0);
+    await once(empty, "listening");
+    try {
+      const b2 = new CamundaBackend({ address: `http://127.0.0.1:${empty.address().port}` });
+      await assert.rejects(() => b2.completeOneJob({ instanceKeys: new Set() }, "T9", {}), /no 'T9' job became activatable/);
+    } finally {
+      empty.closeAllConnections();
+      empty.close();
+      await once(empty, "close");
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("publishMessage with a settled barrier long-polls the follow-on job and fails it back", async () => {
+  // The correlation barrier (#1246 review): the publication endpoint does not
+  // wait for correlation, so the driver must not advance while the message is
+  // still buffered. With `settled.jobType` the publish long-polls one
+  // activation of that type (the job exists only once the message correlated)
+  // and fails it back so the driver's own completion step re-activates it.
+  const calls = [];
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/messages/publication")) {
+      calls.push("publish");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      calls.push("activate");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[{"jobKey":"31","processInstanceKey":"5"}]}');
+      return;
+    }
+    const f = req.url.match(/\/jobs\/(\d+)\/failure$/);
+    if (f) {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        // JobFailRequest (spec/jobs.yaml) names the back-off `retryBackOff`
+        // (additionalProperties:false) — capture the body so the assertion
+        // below fails loudly if the driver sends the v1 `retryBackOffMs`.
+        calls.push(`failback:${f[1]}:${body}`);
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set() };
+    await backend.publishMessage(handle, "M", "k", {}, { jobType: "T1" });
+    assert.deepEqual(calls, [
+      "publish",
+      "activate",
+      'failback:31:{"retries":1,"retryBackOff":0}',
+    ]);
+    assert.deepEqual([...handle.instanceKeys], ["5"]);
+    // Without a barrier (catch leads straight to the end event) there is no
+    // activation — the awaitCompletion create settling is the barrier.
+    calls.length = 0;
+    await backend.publishMessage(handle, "M", "k", {}, undefined);
+    assert.deepEqual(calls, ["publish"]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("setVariables targets the instance's root scope and is loud without a known key", async () => {
+  const seen = [];
+  const server = createServer((req, res) => {
+    // Camunda v2 updates a scope's variables via
+    // `PUT /element-instances/{elementInstanceKey}/variables` — the mock requires
+    // BOTH the documented method and path so a wrong route fails loudly (#1246).
+    const m = req.url.match(/\/element-instances\/(\d+)\/variables$/);
+    if (m && req.method === "PUT") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        // The request body is a SetVariableRequest: `{ variables: {...} }`
+        // (additionalProperties:false), NOT a flat variables object (#1246).
+        seen.push({ key: m[1], body: JSON.parse(body || "{}") });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      });
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set(["8080"]) };
+    await backend.setVariables(handle, { route_G1: [["f2"]] });
+    assert.deepEqual(seen, [{ key: "8080", body: { variables: { route_G1: [["f2"]] } } }]);
+    await assert.rejects(
+      () => backend.setVariables({ instanceKeys: new Set() }, { a: 1 }),
+      /before the instance key is known/,
+    );
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
+
 test("SIGINT/SIGTERM run backend cleanup (unpin the cluster clock) before exiting", async () => {
   // A killed run must not leave the cluster-global Camunda clock pinned at epoch
   // 0, freezing timers for every other user of the cluster (#1260 review).
@@ -606,4 +865,90 @@ test("--require-camunda fails (never skips) when no Camunda runtime is reachable
 
   const tolerant = run(["--backend", "camunda"]);
   assert.equal(tolerant.status, 0, "without the flag the skip stays tolerant");
+});
+
+test("CamundaBackend settled.ack delivers the message ONCE, via synchronous correlation only (#1246 review)", async () => {
+  // Publishing and then correlating would send a SECOND message: it 404s once
+  // the first consumed the subscription, or leaves a stray buffered message.
+  // The ack must be the delivery itself.
+  const calls = [];
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"processInstanceKey":"1"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
+    assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 1, "exactly one correlation");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("CamundaBackend settled.ack waits for a delayed subscription: a 404 correlation is re-attempted, never published (#1246 review)", async () => {
+  // `/messages/correlation` is unbuffered: before the subscription opens it
+  // answers 404 and delivers NOTHING, so re-attempting it is a readiness wait
+  // (no second message), and the first 2xx is the single delivery + ack.
+  const calls = [];
+  let notReady = 2;
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      if (req.url.endsWith("/messages/correlation") && notReady-- > 0) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end('{"title":"NOT_FOUND"}');
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"processInstanceKey":"1"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
+    assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 3, "two not-ready 404s, then one delivery");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("CamundaBackend settled.ack fails loudly on a non-404 correlation error (#1246 review)", async () => {
+  const calls = [];
+  const server = createServer((req, res) => {
+    calls.push(req.url);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end('{"title":"INVALID_ARGUMENT"}');
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    await assert.rejects(
+      backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true }),
+      /HTTP 400/,
+    );
+    assert.equal(calls.length, 1, "a non-readiness error is never re-attempted");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
 });

@@ -19,7 +19,6 @@
 //! just maps the summary's job-type stats onto the generic [`MeasuredJobType`].
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +50,7 @@ pub struct MeasuredJobType {
 pub struct Calibration {
     /// The scenario's worker pool, with the assigned worker of each measured job
     /// type overridden from production. Keyed by worker id.
-    pub workers: HashMap<String, WorkerModel>,
+    pub workers: BTreeMap<String, WorkerModel>,
     /// Job types (in the scenario's default assignment) calibrated from data.
     pub calibrated: Vec<String>,
     /// Job types in the scenario's default assignment with no measured data — their
@@ -82,7 +81,7 @@ struct WorkerAcc {
 /// not referenced by any measured job type are left untouched.
 pub fn calibrate_from_measured(scenario: &Scenario, measured: &[MeasuredJobType]) -> Calibration {
     // Index measurements by job type (last write wins on duplicates).
-    let by_type: HashMap<&str, &MeasuredJobType> =
+    let by_type: BTreeMap<&str, &MeasuredJobType> =
         measured.iter().map(|m| (m.job_type.as_str(), m)).collect();
 
     // Fold each measured, assigned job type into its worker's accumulator.
@@ -165,7 +164,7 @@ pub fn apply(scenario: &Scenario, calibration: &Calibration) -> Scenario {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::harness::{Objective, ScenarioInput};
@@ -176,18 +175,18 @@ mod tests {
             cost,
             latency_ms,
             failure_rate,
-            output: HashMap::new(),
+            output: BTreeMap::new(),
         }
     }
 
     /// A two-task scenario: `classify -> fast`, `summarize -> deep`, with a latent
     /// candidate `cheap` that production never ran.
     fn scenario() -> Scenario {
-        let mut workers = HashMap::new();
+        let mut workers = BTreeMap::new();
         workers.insert("fast".to_string(), worker("fast", 1.0, 10, 0.0));
         workers.insert("deep".to_string(), worker("deep", 5.0, 100, 0.1));
         workers.insert("cheap".to_string(), worker("cheap", 0.5, 200, 0.4));
-        let mut task_workers = HashMap::new();
+        let mut task_workers = BTreeMap::new();
         task_workers.insert("classify".to_string(), "fast".to_string());
         task_workers.insert("summarize".to_string(), "deep".to_string());
         Scenario {
@@ -196,10 +195,10 @@ mod tests {
             process_id: None,
             workers,
             task_workers,
-            latent_options: HashMap::new(),
+            latent_options: BTreeMap::new(),
             inputs: vec![ScenarioInput {
-                vars: HashMap::new(),
-                expected: HashMap::new(),
+                vars: BTreeMap::new(),
+                expected: BTreeMap::new(),
             }],
             golden: None,
             objective: Objective::default(),

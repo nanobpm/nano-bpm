@@ -16,7 +16,8 @@ fn leader_and_follower(worker: &str) -> (Engine, Engine, Key) {
     let mut replicas: Vec<Engine> = (0..2)
         .map(|_| {
             let mut e = Engine::new();
-            e.set_lenient_completion(true);
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
             e.apply_command(Command::DeployProcess(linear_with_task()))
                 .unwrap();
             e.apply_command(Command::create_instance("order")).unwrap();
@@ -244,7 +245,8 @@ fn a_soft_jobs_stamped_terminal_deadline_agrees_on_every_replica() {
     let mut replicas: Vec<Engine> = (0..2)
         .map(|_| {
             let mut e = Engine::new();
-            e.set_lenient_completion(true);
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
             e.apply_command_at(Command::DeployProcess(linear_with_task()), 1)
                 .unwrap();
             e.apply_command_at(Command::create_instance("order"), 1)

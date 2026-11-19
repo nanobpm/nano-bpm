@@ -24,6 +24,25 @@
 
 import { emptyObservation, MAX_JOBS_TO_ACTIVATE } from "./observation.mjs";
 
+/**
+ * A backend CLEANUP failure (a process-instance cancellation or the clock reset
+ * inside `reset()`), distinguished from a scenario divergence. A reset that
+ * fails has NOT restored isolation — an uncancelled instance's reused job types
+ * stay activatable and would corrupt later scenarios' observations and any
+ * minimal reproduction shrunk from them — so the runner must ABORT the Camunda
+ * phase on this, not record one more `camunda:error` divergence and continue
+ * (#1246 review). `exhaustive.mjs`'s runtimePhase rethrows on `instanceof
+ * BackendCleanupError` instead of swallowing it as a per-scenario divergence;
+ * run.mjs's per-scenario loop has no such catch, so a cleanup failure already
+ * propagates out of `runScenario` and aborts the run there.
+ */
+export class BackendCleanupError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "BackendCleanupError";
+  }
+}
+
 const DEFAULT_ACTIVATE_TIMEOUT_MS = 60_000;
 const DEFAULT_LONG_POLL_MS = 30_000;
 // The `awaitCompletion` create call blocks until the instance completes. A
@@ -32,6 +51,10 @@ const DEFAULT_LONG_POLL_MS = 30_000;
 // scenario, not Camunda's short default (5s here) — otherwise the create times
 // out (504) before `observe()` can read the final result (#1260 review).
 const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
+// How long a `publishMessage` step keeps its message buffered for a subscription
+// still being opened (#1246). Bounded by the instance completion deadline: a
+// message nobody consumed by then belongs to a scenario that already failed.
+const PUBLISH_TTL_MS = DEFAULT_COMPLETION_TIMEOUT_MS;
 // The liveness probe must have a deadline. A reachable-but-wedged endpoint (a
 // provisioned service that accepts the TCP connection but never answers
 // `/topology`, or a network path that blackholes the request) would otherwise
@@ -39,6 +62,8 @@ const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
 // indefinitely. Bounding the probe turns that hang into the documented
 // unreachable-runtime skip (#1260 review).
 const DEFAULT_PING_TIMEOUT_MS = 10_000;
+// Poll interval while a `settled.ack` correlation waits for its subscription.
+const ACK_READINESS_POLL_MS = 50;
 // Every ordinary (non-long-poll) REST call — deploy, clock ops, message/signal
 // correlation, job completion — must also carry a deadline. `ping()` alone is
 // not enough: without a client-side timeout a reachable-but-wedged endpoint that
@@ -54,12 +79,23 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // long-poll into a spurious client abort).
 const REQUEST_TIMEOUT_MARGIN_MS = 15_000;
 
+/** A non-2xx Camunda REST response, carrying its status and parsed body. */
+export class CamundaHttpError extends Error {
+  constructor(message, { status, body }) {
+    super(message);
+    this.name = "CamundaHttpError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 function requireOk(res, body, what) {
   if (!res.ok) {
-    throw new Error(
+    throw new CamundaHttpError(
       `camunda ${what} failed: HTTP ${res.status} ${res.statusText} — ${
         typeof body === "string" ? body : JSON.stringify(body)
       }`,
+      { status: res.status, body },
     );
   }
 }
@@ -107,15 +143,21 @@ export class CamundaBackend {
     return h;
   }
 
-  // Handles whose awaitCompletion create is still in flight. `reset()` aborts the
-  // create (so a scenario that fails before `observe()` cannot keep the process
-  // alive until the create's ~135 s deadline) and cancels every instance key the
-  // scenario learned from its activated jobs, so a still-running instance cannot
-  // leave jobs for a later run of the same job type (#1260 review). An instance
-  // that never yielded a job has no known key (the bare gateway exposes no
-  // instance search); it is parked before its first job, which the next run's
-  // first activation of that type would complete along with its own (the
-  // activation cap leaves room), so the residue is bounded and never silent.
+  // Handles whose awaitCompletion create is still in flight OR whose instance
+  // may still be running. `reset()` aborts the create (so a scenario that fails
+  // before `observe()` cannot keep the process alive until the create's ~135 s
+  // deadline) and cancels every instance key the scenario learned from its
+  // activated jobs, so a still-running instance cannot leave jobs for a later
+  // run of the same job type (#1260 review). A handle whose create REJECTED
+  // (e.g. an awaitCompletion timeout on a stuck scenario) STAYS in the set
+  // until `reset()` confirms the cancellation: dropping it on rejection would
+  // orphan a still-running instance whose leftover jobs (generated graphs reuse
+  // job types like `T1`) a later scenario could activate, contaminating results
+  // (#1246 review). An instance that never yielded a job has no known key (the
+  // bare gateway exposes no instance search); it is parked before its first
+  // job, which the next run's first activation of that type would complete
+  // along with its own (the activation cap leaves room), so the residue is
+  // bounded and never silent.
   #inflight = new Set();
 
   async #json(method, path, body, what, { timeoutMs, signal } = {}) {
@@ -255,7 +297,15 @@ export class CamundaBackend {
         timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS,
         signal: handle.abort.signal,
       },
-    ).finally(() => this.#inflight.delete(handle));
+    );
+    // A create that SETTLED (completed instance) leaves nothing to cancel —
+    // drop it. A REJECTED create (awaitCompletion timeout on a stuck scenario,
+    // a transport failure) may still have a running instance: keep the handle
+    // in #inflight so `reset()` cancels every key it learned (#1246 review).
+    pending.then(
+      () => this.#inflight.delete(handle),
+      () => {},
+    );
     // Surface a create-time rejection eagerly rather than as an unhandled
     // rejection; the stored promise is still awaited in `observe`.
     pending.catch(() => {});
@@ -297,6 +347,46 @@ export class CamundaBackend {
     return jobs.length;
   }
 
+  // Complete EXACTLY ONE job of `jobType` (#1246): the bounded-exhaustive
+  // scenarios address a single job activation, so a run that holds two
+  // same-type jobs (a parallel split through an exclusive merge) is still
+  // driven deterministically — one completion per step, in the reference's
+  // order. `maxJobsToActivate: 1` keeps the step to one job even when more are
+  // activatable.
+  async completeOneJob(handle, jobType, variables) {
+    const job = await this.#activateOne(jobType);
+    if (job.processInstanceKey != null) handle.instanceKeys.add(String(job.processInstanceKey));
+    await this.#json(
+      "POST",
+      `/jobs/${job.jobKey ?? job.key}/completion`,
+      { variables: variables ?? {} },
+      "complete job",
+    );
+    return 1;
+  }
+
+  // Set (override) process-instance variables mid-run (#1246): a per-activation
+  // route schedule is delivered as the gateway's `route_<id>` list before the
+  // activation that reads it. The v2 API updates a scope's variables via
+  // `PUT /element-instances/{elementInstanceKey}/variables`, which accepts the
+  // PROCESS-instance key for the root scope (spec/element-instances.yaml:127).
+  async setVariables(handle, variables) {
+    const key = [...handle.instanceKeys][0];
+    if (key == null) {
+      throw new Error(
+        "setVariables before the instance key is known (no job activated yet) — " +
+          "the bare gateway exposes no instance lookup; schedule the route in the " +
+          "start variables or after the first job activation",
+      );
+    }
+    await this.#json(
+      "PUT",
+      `/element-instances/${key}/variables`,
+      { variables: variables ?? {} },
+      "set variables",
+    );
+  }
+
   async correlateMessage(_handle, name, correlationKey, variables) {
     await this.#json(
       "POST",
@@ -304,6 +394,123 @@ export class CamundaBackend {
       { name, correlationKey, variables: variables ?? {} },
       "correlate message",
     );
+  }
+
+  // A BUFFERED correlation (#1246). v2 `/messages/correlation` never buffers,
+  // and a bare gateway exposes no barrier for "the previous step's subscription
+  // is open" (see `start`), so correlating right after a job completion races
+  // the subscription. Publishing with a time-to-live closes the race without a
+  // sleep or a retry: the broker keeps the message until the subscription opens
+  // and correlates it then. A scenario using this op must give every scenario
+  // its own correlation key, so a buffered message can never reach another
+  // scenario's instance on the shared runtime.
+  //
+  // The publication endpoint does not wait for correlation
+  // (spec/messages.yaml), so the response alone is no barrier: the NEXT step
+  // could run while the message is still buffered, and an opposite
+  // message/job command order would execute in the same order on Camunda —
+  // missing coverage or producing a misleading difference from the settled
+  // reference execution. `settled` is the driver's barrier: when the scenario
+  // knows the correlation resumes the instance into a job of type
+  // `settled.jobType`, publish then LONG-POLL one activation of that type —
+  // the job exists only after the message correlated and the follow-on work
+  // activated — then FAIL the activation back (with retries) so the driver's
+  // own completion step re-activates and completes it. A correlation that
+  // leads straight to the end event has no job to barrier on; there the
+  // awaitCompletion create settling IS the barrier, and the driver waits it
+  // via `observe`.
+  //
+  // `settled.ack` (#1246 review): the correlation creates NO job but the
+  // instance SURVIVES (a parallel branch keeps running), so there is no
+  // correlation-created job to barrier on and no completion to await. Without
+  // an acknowledgement the driver advances to the next command while the
+  // buffered message is still in flight, and Camunda can run that command
+  // (e.g. complete the still-waiting T1) BEFORE the message correlates —
+  // inverting the scripted order. So the message is delivered through the
+  // SYNCHRONOUS `/messages/correlation` INSTEAD of a buffered publication: it
+  // returns only once a subscription correlated, so the delivery is its own
+  // acknowledgement and no second message is ever sent.
+  async publishMessage(handle, name, correlationKey, variables, settled) {
+    if (settled?.ack) {
+      // Correlate SYNCHRONOUSLY instead of publishing: `/messages/correlation`
+      // is itself the delivery and returns only once the message correlated,
+      // so it is the acknowledgement. Publishing first and then correlating
+      // would send a SECOND message (404 once the first consumed the
+      // subscription, or a stray buffered message if it wins — #1246 review).
+      //
+      // Unbuffered correlation answers 404 — and delivers NOTHING — while the
+      // subscription is not open yet (e.g. a message-first order racing the
+      // instance's start; spec/messages.yaml). So wait for subscription
+      // readiness by re-attempting ONLY on 404, bounded by the completion
+      // deadline: each 404 is a no-op, so exactly one message is ever
+      // delivered (the first 2xx). Any other error fails loudly at once.
+      const deadline = Date.now() + DEFAULT_COMPLETION_TIMEOUT_MS;
+      for (;;) {
+        const res = await fetch(`${this.base}/messages/correlation`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify({ name, correlationKey, variables: variables ?? {} }),
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
+        });
+        const text = await res.text();
+        if (res.status === 404 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, ACK_READINESS_POLL_MS));
+          continue;
+        }
+        requireOk(res, text, "correlate message");
+        return;
+      }
+    }
+    await this.#json(
+      "POST",
+      "/messages/publication",
+      {
+        name,
+        correlationKey,
+        timeToLive: PUBLISH_TTL_MS,
+        variables: variables ?? {},
+      },
+      "publish message",
+    );
+    if (settled?.jobType) {
+      const job = await this.#activateOne(settled.jobType);
+      if (job.processInstanceKey != null) handle.instanceKeys.add(String(job.processInstanceKey));
+      await this.#json(
+        "POST",
+        `/jobs/${job.jobKey ?? job.key}/failure`,
+        // JobFailRequest (spec/jobs.yaml) names the back-off field
+        // `retryBackOff` (int64) and sets `additionalProperties: false`, so the
+        // v1-style `retryBackOffMs` is schema-invalid and a conforming endpoint
+        // rejects the fail-back — stalling the barrier mid-scenario (#1246).
+        { retries: 1, retryBackOff: 0 },
+        "fail back barrier job",
+      );
+    }
+  }
+
+  async #activateOne(jobType) {
+    const activated = await this.#json(
+      "POST",
+      "/jobs/activation",
+      {
+        type: jobType,
+        maxJobsToActivate: 1,
+        timeout: DEFAULT_ACTIVATE_TIMEOUT_MS,
+        worker: "parity-runner",
+        requestTimeout: DEFAULT_LONG_POLL_MS,
+      },
+      "activate jobs",
+      { timeoutMs: DEFAULT_LONG_POLL_MS + REQUEST_TIMEOUT_MARGIN_MS },
+    );
+    const jobs = activated.jobs ?? [];
+    if (jobs.length === 0) {
+      throw new Error(
+        `no '${jobType}' job became activatable within ${DEFAULT_LONG_POLL_MS}ms — ` +
+          `the published message did not correlate into the expected job (a ` +
+          `correlation barrier miss), or the scenario is mis-ordered (do not retry)`,
+      );
+    }
+    return jobs[0];
   }
 
   async broadcastSignal(_handle, name, variables) {
@@ -331,6 +538,14 @@ export class CamundaBackend {
     // forward-compat with a server that does report the flag (#1260 review).
     obs.completed = result?.processCompleted !== false;
     obs.variables = result?.variables ?? {};
+    // The bounded-exhaustive scenarios drive routing through `route_*` start /
+    // set variables — the driver's own schedule, not a process outcome. Drop
+    // them from the observation so the oracle compares the variables the
+    // PROCESS produced. NanoBackend.observe does the same; without symmetry the
+    // differential reports a false mismatch on every routed scenario (#1246).
+    for (const k of Object.keys(obs.variables)) {
+      if (k.startsWith("route_")) delete obs.variables[k];
+    }
     return obs;
   }
 
@@ -351,8 +566,15 @@ export class CamundaBackend {
           );
         } catch (err) {
           // 404: the instance finished in the meantime — nothing left to cancel.
-          // Any other failure is loud, like the clock reset below.
-          if (!/HTTP 404/.test(String(err?.message))) throw err;
+          // Any other failure means the instance may STILL be live: its reused
+          // job types stay activatable and would corrupt later scenarios, so
+          // surface it as a cleanup failure the runner aborts on (#1246 review).
+          if (!/HTTP 404/.test(String(err?.message))) {
+            throw new BackendCleanupError(
+              `cancel process instance ${key} failed: ${err?.message ?? err}`,
+              { cause: err },
+            );
+          }
         }
       }
     }
@@ -375,8 +597,16 @@ export class CamundaBackend {
     // clock — which is exactly what we rewind. That failure must be loud too: a
     // swallowed `/clock/reset` (401/500/503) could leave the global clock pinned
     // while the runner reports success, so — unlike the transport-only skip in
-    // `ping()` — it is NOT caught (#1260 review).
-    await this.#json("POST", "/clock/reset", undefined, "reset clock");
+    // `ping()` — it is NOT caught (#1260 review). Surface it as a cleanup
+    // failure so the runner aborts the phase rather than record a divergence
+    // (#1246 review).
+    try {
+      await this.#json("POST", "/clock/reset", undefined, "reset clock");
+    } catch (err) {
+      throw new BackendCleanupError(`reset clock failed: ${err?.message ?? err}`, {
+        cause: err,
+      });
+    }
     this.pinnedClockMs = null;
   }
 

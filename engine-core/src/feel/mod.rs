@@ -42,9 +42,9 @@ mod regex;
 pub(crate) mod temporal;
 mod value;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub use env::{with_env, EvalEnv};
+pub use env::{with_env, with_host_env, EvalEnv};
 pub use error::FeelError;
 
 use crate::model::Value;
@@ -53,7 +53,7 @@ use crate::model::Value;
 ///
 /// A single leading `=` (the Zeebe FEEL marker) is stripped so callers can pass
 /// the raw model attribute (`=amount > 10`, `=jobType`) directly.
-pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError> {
+pub fn eval(expr: &str, ctx: &BTreeMap<String, Value>) -> Result<Value, FeelError> {
     Ok(evaluate(expr, ctx)?.into_value())
 }
 
@@ -64,7 +64,7 @@ pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError
 /// shape — otherwise `=date("2024-01-15")` would pass as a STRING (#1399).
 pub(crate) fn eval_typed(
     expr: &str,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
 ) -> Result<(Value, &'static str, Vec<&'static str>), FeelError> {
     let v = evaluate(expr, ctx)?;
     let kind = feel_kind(&v);
@@ -99,7 +99,7 @@ fn feel_kind(v: &value::FeelVal) -> &'static str {
 /// Evaluates a FEEL expression expecting a string result (job type, correlation
 /// key). Strings pass through; numbers/booleans/temporals use their natural FEEL
 /// rendering; `null` and structured values are an error.
-pub fn eval_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, FeelError> {
+pub fn eval_string(expr: &str, ctx: &BTreeMap<String, Value>) -> Result<String, FeelError> {
     let v = evaluate(expr, ctx)?;
     if matches!(v, value::FeelVal::Null) {
         return Err(FeelError(
@@ -116,7 +116,7 @@ pub fn eval_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, F
 
 /// Evaluates a FEEL expression expecting a boolean result (a sequence-flow
 /// condition). A non-boolean result is an error.
-pub fn eval_bool(expr: &str, ctx: &HashMap<String, Value>) -> Result<bool, FeelError> {
+pub fn eval_bool(expr: &str, ctx: &BTreeMap<String, Value>) -> Result<bool, FeelError> {
     match evaluate(expr, ctx)? {
         value::FeelVal::Bool(b) => Ok(b),
         other => Err(FeelError(format!(
@@ -134,8 +134,8 @@ pub fn eval_bool(expr: &str, ctx: &HashMap<String, Value>) -> Result<bool, FeelE
 /// `x.value > 1` yields `{x}`. Returns an empty set if the expression cannot be
 /// parsed — the caller then treats the condition as having no known dependency
 /// (and may re-evaluate conservatively).
-pub fn referenced_variables(expr: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+pub fn referenced_variables(expr: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
     let src = strip_marker(expr);
     if let Ok(tokens) = lexer::tokenize(src) {
         if let Ok(node) = parser::parse(tokens) {
@@ -186,8 +186,8 @@ pub fn secret_reference_name(s: &str) -> Option<&str> {
 /// JSON-kind cluster variable is not (the caller distinguishes those — this
 /// helper only sees the expression text). An unparseable expression yields an
 /// empty set.
-pub fn literal_secret_references(expr: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+pub fn literal_secret_references(expr: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
     let src = strip_marker(expr);
     if let Ok(tokens) = lexer::tokenize(src) {
         if let Ok(node) = parser::parse(tokens) {
@@ -205,7 +205,7 @@ pub fn literal_secret_references(expr: &str) -> std::collections::HashSet<String
 /// is not a reference to `a`). Any non-chain node recurses with a fresh
 /// accumulator, so `camunda.secrets.x + 1` still finds `x` while
 /// `f(camunda.secrets)` does not (the chain is not a full reference).
-fn collect_secret_paths(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+fn collect_secret_paths(node: &ast::Node, out: &mut std::collections::BTreeSet<String>) {
     if let Some(chain) = member_chain(node) {
         if chain.len() == 3 && chain[0] == "camunda" && chain[1] == "secrets" {
             out.insert(chain[2].clone());
@@ -241,7 +241,7 @@ fn member_chain(node: &ast::Node) -> Option<Vec<String>> {
 
 /// Recurses into every child of `node`, for the non-chain nodes of
 /// [`collect_secret_paths`].
-fn collect_vars_shallow(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+fn collect_vars_shallow(node: &ast::Node, out: &mut std::collections::BTreeSet<String>) {
     use ast::Node;
     let mut recur = |n: &ast::Node| collect_secret_paths(n, out);
     match node {
@@ -292,7 +292,7 @@ fn collect_vars_shallow(node: &ast::Node, out: &mut std::collections::HashSet<St
 /// base of a member/index access naturally yields the root variable. Names bound
 /// by `for`/`some`/`every`/`function(...)` are stored as plain strings (not
 /// `Var` nodes), so they are not collected as external dependencies.
-fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+fn collect_vars(node: &ast::Node, out: &mut std::collections::BTreeSet<String>) {
     use ast::Node;
     match node {
         Node::Var(name) => {
@@ -372,12 +372,12 @@ fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
 /// (`=[true, false][item]`). Returns an empty set if the expression
 /// cannot be parsed — the caller then sees no external reference (the
 /// evaluation itself surfaces the parse error).
-pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+pub fn free_variables(expr: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
     let src = strip_marker(expr);
     if let Ok(tokens) = lexer::tokenize(src) {
         if let Ok(node) = parser::parse(tokens) {
-            let mut bound = std::collections::HashSet::new();
+            let mut bound = std::collections::BTreeSet::new();
             collect_free_vars(&node, &mut bound, &mut out);
         }
     }
@@ -390,8 +390,8 @@ pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
 /// [`free_variables`]).
 fn collect_free_vars(
     node: &ast::Node,
-    bound: &mut std::collections::HashSet<String>,
-    out: &mut std::collections::HashSet<String>,
+    bound: &mut std::collections::BTreeSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
 ) {
     use ast::Node;
     match node {
@@ -524,7 +524,7 @@ fn collect_free_vars(
     }
 }
 
-fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, FeelError> {
+fn evaluate(expr: &str, ctx: &BTreeMap<String, Value>) -> Result<value::FeelVal, FeelError> {
     let src = strip_marker(expr);
     let tokens = lexer::tokenize(src)?;
     let node = parser::parse(tokens)?;
@@ -573,7 +573,7 @@ pub struct EvaluatedWithProvenance {
 /// origin tagging is tracked as a follow-up.
 pub fn eval_with_provenance(
     expr: &str,
-    ctx: &HashMap<String, Value>,
+    ctx: &BTreeMap<String, Value>,
     trusted_roots: impl IntoIterator<Item = String>,
 ) -> Result<EvaluatedWithProvenance, FeelError> {
     let src = strip_marker(expr);
@@ -581,7 +581,7 @@ pub fn eval_with_provenance(
     let node = parser::parse(tokens)?;
     let value = eval::evaluate(&node, ctx)?.into_value();
 
-    let trusted: HashSet<String> = trusted_roots.into_iter().collect();
+    let trusted: BTreeSet<String> = trusted_roots.into_iter().collect();
     // Trusted attribution is an occurrence MULTISET, reconciled against the
     // occurrences the result actually carries: a name is reported only when
     // every occurrence of it in the result is structurally attributed. Any
@@ -589,9 +589,9 @@ pub fn eval_with_provenance(
     // same text) or any attributed occurrence that did not survive (an
     // overwritten key) fails the name closed — `referencedSecrets` is keyed by
     // name, so one untrusted occurrence must taint the name (round-9 review).
-    let mut attributed = HashMap::new();
-    structural_secret_names(&node, ctx, &trusted, &HashSet::new(), &mut attributed);
-    let mut actual = HashMap::new();
+    let mut attributed = BTreeMap::new();
+    structural_secret_names(&node, ctx, &trusted, &BTreeSet::new(), &mut attributed);
+    let mut actual = BTreeMap::new();
     count_secret_names_value(&value, &mut actual);
     let mut referenced_secrets: Vec<String> = attributed
         .into_iter()
@@ -643,10 +643,10 @@ fn read_chain(node: &ast::Node) -> Option<(String, Vec<ReadStep>)> {
 /// context's variables.
 fn structural_secret_names(
     node: &ast::Node,
-    ctx: &HashMap<String, Value>,
-    trusted: &HashSet<String>,
-    shadowed: &HashSet<String>,
-    out: &mut HashMap<String, usize>,
+    ctx: &BTreeMap<String, Value>,
+    trusted: &BTreeSet<String>,
+    shadowed: &BTreeSet<String>,
+    out: &mut BTreeMap<String, usize>,
 ) {
     match node {
         ast::Node::Var(_) | ast::Node::Member(..) | ast::Node::Index(..) => {
@@ -677,7 +677,7 @@ fn structural_secret_names(
             .for_each(|n| structural_secret_names(n, ctx, trusted, shadowed, out)),
         ast::Node::Context(entries) => {
             // Duplicate keys overwrite: fail the whole literal closed.
-            let mut keys = HashSet::new();
+            let mut keys = BTreeSet::new();
             if !entries.iter().all(|(k, _)| keys.insert(k.as_str())) {
                 return;
             }
@@ -697,7 +697,7 @@ fn structural_secret_names(
 fn direct_read_value<'v>(
     root: &str,
     steps: &[ReadStep],
-    ctx: &'v HashMap<String, Value>,
+    ctx: &'v BTreeMap<String, Value>,
 ) -> Option<&'v Value> {
     let mut v = ctx.get(root)?;
     for step in steps {
@@ -712,7 +712,7 @@ fn direct_read_value<'v>(
 
 /// Counts every whole-string `camunda.secrets.<name>` reference occurrence in
 /// `v` (recursing into lists and maps).
-fn count_secret_names_value(v: &Value, out: &mut HashMap<String, usize>) {
+fn count_secret_names_value(v: &Value, out: &mut BTreeMap<String, usize>) {
     match v {
         Value::Str(s) => {
             if let Some(name) = secret_reference_name(s) {
@@ -761,7 +761,7 @@ mod tests {
         }
     }
 
-    fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+    fn ctx(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -937,7 +937,7 @@ mod tests {
     fn eval_with_provenance_round9_fail_closed() {
         let r = |s: &str| Value::Str(s.into());
         let tok = "camunda.secrets.TOKEN";
-        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+        let prov = |e: &str, c: &BTreeMap<String, Value>, trusted: &[&str]| {
             eval_with_provenance(
                 e,
                 c,
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn eval_with_provenance_fail_closed_structural_shapes() {
-        let prov = |e: &str, c: &HashMap<String, Value>, trusted: &[&str]| {
+        let prov = |e: &str, c: &BTreeMap<String, Value>, trusted: &[&str]| {
             eval_with_provenance(
                 e,
                 c,
@@ -1599,7 +1599,7 @@ mod tests {
             Ok(Value::Str("FEEL".into()))
         );
         // uuid() round-trips through base64 shape: 36 chars with dashes.
-        match eval("uuid()", &c) {
+        match with_host_env(|| eval("uuid()", &c)) {
             Ok(Value::Str(s)) => {
                 assert_eq!(s.len(), 36);
                 assert_eq!(s.chars().filter(|&ch| ch == '-').count(), 4);
@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(eval(r#"decimal(1.5, 0, "HALF_UP")"#, &c), Ok(Value::Int(2)));
         assert_eq!(eval(r#"decimal(1.5, 0, "DOWN")"#, &c), Ok(Value::Int(1)));
         assert_eq!(eval(r#"decimal(-1.5, 0, "FLOOR")"#, &c), Ok(Value::Int(-2)));
-        match eval("random number()", &c) {
+        match with_host_env(|| eval("random number()", &c)) {
             Ok(Value::Double(d)) => assert!((0.0..1.0).contains(&d)),
             other => panic!("random number() returned {other:?}"),
         }

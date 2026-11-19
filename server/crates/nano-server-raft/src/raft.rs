@@ -51,7 +51,7 @@
 // in a plain `cargo build`, so dead-code is allowed at the module level.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Write as _;
 use std::ops::RangeBounds;
@@ -484,6 +484,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
         // A structurally invalid process handed straight to deploy.
         E::InvalidProcessModel { .. } => (400, e.to_string()),
+        // Replicated cluster-variable mutations (#1657).
+        E::ClusterVariableAlreadyExists { .. } => (409, e.to_string()),
+        E::ClusterVariableNotFound { .. } => (404, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -961,7 +964,7 @@ pub struct PartitionStateMachine {
     /// concurrent DETACHED `build_snapshot` is mid-writing (or an install's
     /// promoted-but-unpublished file) out from under it. Registered via
     /// [`InFlightSnapshot`] BEFORE the file exists, removed on drop.
-    in_flight_snapshots: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    in_flight_snapshots: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
@@ -2360,7 +2363,7 @@ fn published_snapshot_supersedes(
 fn reap_superseded_snapshots(
     snapshot_dir: &Path,
     keep: &Path,
-    in_flight: &Mutex<std::collections::HashSet<PathBuf>>,
+    in_flight: &Mutex<std::collections::BTreeSet<PathBuf>>,
     partition_id: u64,
     node_id: NodeId,
 ) {
@@ -2424,12 +2427,12 @@ fn reap_superseded_snapshots(
 /// (#1488): while alive, [`reap_superseded_snapshots`] skips the path. Dropped
 /// on every exit path (success or error), so a failed build never pins a path.
 struct InFlightSnapshot {
-    set: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    set: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
     path: PathBuf,
 }
 
 impl InFlightSnapshot {
-    fn register(set: &Arc<Mutex<std::collections::HashSet<PathBuf>>>, path: &Path) -> Self {
+    fn register(set: &Arc<Mutex<std::collections::BTreeSet<PathBuf>>>, path: &Path) -> Self {
         set.lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(path.to_path_buf());
@@ -3816,7 +3819,7 @@ impl RaftPartition {
 /// untouched.
 #[derive(Default)]
 pub struct RaftRegistry {
-    partitions: Mutex<HashMap<u64, Arc<RaftPartition>>>,
+    partitions: Mutex<BTreeMap<u64, Arc<RaftPartition>>>,
 }
 
 impl RaftRegistry {
@@ -3919,7 +3922,7 @@ pub fn spawn_compaction_governor(registry: Arc<RaftRegistry>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Per-partition `last_applied` observed on the previous tick, to detect
         // quiescence (a partition that applied nothing since last tick).
-        let mut prev_applied: HashMap<u64, u64> = HashMap::new();
+        let mut prev_applied: BTreeMap<u64, u64> = BTreeMap::new();
         loop {
             interval.tick().await;
             for part in registry.all() {
@@ -4440,7 +4443,7 @@ mod tests {
         let incoming = dir.join(format!("incoming-{}-0.tmp", std::process::id()));
         std::fs::write(&incoming, b"partial").expect("write in-flight partial");
 
-        let in_flight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let in_flight = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
         // A file a concurrent build is still writing (registered in flight)
         // must survive the reap; once its guard drops it is reapable again.
         let building = dir.join("snap-g3-10.bin");
@@ -5032,14 +5035,14 @@ mod tests {
 
     #[test]
     fn creation_and_activation_are_low_priority_intake() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         // Fresh demand entering the system — process creation AND job activation
         // (a poll) — takes the low-priority lane. Putting activation on the high
         // lane lets a flood of empty polls from idle workers starve creation,
         // which is exactly what Zeebe avoids by NOT whitelisting JobBatch.ACTIVATE.
         assert!(is_creation_intake(&Command::CreateInstance {
             process_id: "p".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: vec![],
             business_id: None,
             process_definition_key: None,
@@ -5051,7 +5054,7 @@ mod tests {
         // #932: conditional-start evaluation creates instances — creation intake.
         assert!(is_creation_intake(
             &Command::EvaluateConditionalStartEvents {
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 process_definition_key: None,
             }
         ));
@@ -5061,7 +5064,7 @@ mod tests {
         // admission, so it can never permanently starve a create.
         assert!(!is_creation_intake(&Command::complete_job_with(
             1,
-            HashMap::new()
+            BTreeMap::new()
         )));
         assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
         assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
@@ -5491,7 +5494,7 @@ mod tests {
         for i in 0..3u64 {
             let key = src
                 .with(move |j| {
-                    let mut vars = HashMap::new();
+                    let mut vars = BTreeMap::new();
                     vars.insert("data".to_string(), Value::Str(format!("cold-{i}")));
                     let (ev, _) = j
                         .apply_command_at(
@@ -7221,7 +7224,7 @@ mod tests {
             .propose(wait_process_command(), 1_000)
             .await
             .expect("deploy");
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert(
             "data".to_string(),
             nanobpmn_engine_core::Value::Str("payload-0".to_string()),

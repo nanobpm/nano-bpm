@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::dmn::model::{DecisionLogic, DecisionType, HitPolicy};
 use crate::dmn::{evaluate, parse_dmn};
 use crate::model::Value;
 
-fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+fn ctx(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
