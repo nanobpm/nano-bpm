@@ -215,6 +215,24 @@ test("live: a parked playhead past a shrunken history clamps but does not start 
   });
 });
 
+test("live: a following playhead clamps to a shrunken history's new end", () => {
+  // The discard case behind nano-bpm#1686's review: a refetch after PENDING
+  // turns became DISCARDED shrinks the log, and a playhead parked at the old
+  // end must land on the new end in the SAME render — the scrubber derives
+  // `items[head.index]` synchronously, before the reconciliation effect can
+  // run, so an unclamped index crashes the view on `current.producedAt`.
+  assert.deepEqual(onHistoryChanged({ index: 4, follow: true }, 2), {
+    index: 1,
+    follow: true,
+  });
+  // Shrunk to nothing: no step is current, and follow re-arms for the next
+  // item (the same shape `initialPlayhead(0)` produces).
+  assert.deepEqual(onHistoryChanged({ index: 4, follow: true }, 0), {
+    index: -1,
+    follow: true,
+  });
+});
+
 // --- spans ----------------------------------------------------------------------
 
 test("model spans end at producedAt and last durationMs", () => {

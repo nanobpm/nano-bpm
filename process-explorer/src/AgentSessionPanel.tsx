@@ -157,6 +157,14 @@ function Scrubber({
     setHead((h) => onHistoryChanged(h, items.length));
   }, [items.length]);
 
+  // The effect above runs only after this render, but a refetch can also
+  // SHRINK the log — a discarded attempt's PENDING turns drop out of the
+  // filter (nano-bpm#1686) — leaving `head.index` past the new end for one
+  // render, where `items[head.index]` below is undefined. Clamp the render
+  // playhead synchronously; the effect still owns the state update (and the
+  // follow/park decision) after the commit.
+  const view = onHistoryChanged(head, items.length);
+
   // Open tool spans grow with the clock while the agent is active.
   const [now, setNow] = useState(() => Date.now());
   const hasOpen = active && spans.some((s) => s.endMs === null);
@@ -175,9 +183,9 @@ function Scrubber({
     act(a);
   };
 
-  const current = items[head.index];
-  const chapter = chapterAt(chapters, head.index);
-  const totals = totalsOf(items, head.index);
+  const current = items[view.index];
+  const chapter = chapterAt(chapters, view.index);
+  const totals = totalsOf(items, view.index);
   const window = timeWindow(items, spans, active, now);
 
   return (
@@ -190,8 +198,8 @@ function Scrubber({
           aria-label="Agent history playhead"
           aria-valuemin={1}
           aria-valuemax={items.length}
-          aria-valuenow={head.index + 1}
-          aria-valuetext={`Step ${head.index + 1} of ${items.length}, iteration ${chapter?.loopIteration ?? "-"}`}
+          aria-valuenow={view.index + 1}
+          aria-valuetext={`Step ${view.index + 1} of ${items.length}, iteration ${chapter?.loopIteration ?? "-"}`}
           onKeyDown={onKeyDown}
           onPointerDown={(e) => {
             // Capture the element now: React clears `currentTarget` after the
@@ -238,7 +246,7 @@ function Scrubber({
             aria-hidden
             className="absolute inset-y-0 w-0.5 bg-accent"
             style={{
-              left: `${((head.index + 0.5) / items.length) * 100}%`,
+              left: `${((view.index + 0.5) / items.length) * 100}%`,
             }}
           />
         </div>
@@ -280,7 +288,7 @@ function Scrubber({
             ⏭
           </Button>
           <span className="ml-2 text-xs text-fg-muted tabular-nums">
-            step {head.index + 1}/{items.length} · iteration{" "}
+            step {view.index + 1}/{items.length} · iteration{" "}
             {chapter?.loopIteration}
           </span>
           {active && (
@@ -306,7 +314,7 @@ function Scrubber({
           now={now}
           active={active}
           playheadMs={Date.parse(current.producedAt)}
-          currentStep={head.index}
+          currentStep={view.index}
           onSeek={(i) => setHead(seek(i, items.length))}
         />
       )}
@@ -315,11 +323,11 @@ function Scrubber({
 
       {/* Transcript up to the playhead; the current step is highlighted. */}
       <ol className="min-h-0 flex-1 space-y-2 overflow-auto px-4 py-3">
-        {items.slice(0, head.index + 1).map((item, i) => (
+        {items.slice(0, view.index + 1).map((item, i) => (
           <TranscriptItem
             key={item.historyItemKey}
             item={item}
-            current={i === head.index}
+            current={i === view.index}
             onSelect={() => setHead(seek(i, items.length))}
           />
         ))}
@@ -468,7 +476,7 @@ function TranscriptItem({
       <button
         type="button"
         onClick={onSelect}
-        aria-label={`Show step: ${item.role.toLowerCase().replace("_", " ")}, iteration ${item.loopIteration}`}
+        aria-label={`Show step: ${item.role.toLowerCase().replace("_", " ")}, iteration ${item.loopIteration}${isPendingItem(item) ? ", in progress" : ""}`}
         className="block w-full cursor-pointer rounded px-3 pt-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
       >
         <span className="mb-1 flex items-center gap-2 text-[11px] text-fg-faint">
