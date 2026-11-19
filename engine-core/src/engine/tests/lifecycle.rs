@@ -1909,6 +1909,64 @@ fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
 }
 
 #[test]
+fn inclusive_join_waits_for_sibling_token_still_in_transit() {
+    // #1248 (engine guard mutants on `has_active_path_to`). A parallel split
+    // feeds `j` over a short branch (`a`) and a long one (`x -> y -> z`). When
+    // `j`'s queued activation from `a` runs, `x` and `y` have completed and
+    // `z` is only a queued `Step::Activate` — no element on the long branch is
+    // ACTIVE. The join must count that in-transit token (Zeebe's
+    // `activeSequenceFlowIds`) and wait, firing exactly once with both tokens;
+    // ignoring queued activations fires `j` early on `a`'s token alone.
+    let def = ProcessBuilder::new("inc-in-transit")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .exclusive_gateway("a")
+        .exclusive_gateway("x")
+        .exclusive_gateway("y")
+        .exclusive_gateway("z")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("a", "j")
+        .connect("psplit", "x")
+        .connect("x", "y")
+        .connect("y", "z")
+        .connect("z", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inc-in-transit"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ParallelJoinFired { element_id, .. } if element_id == "j")
+            )
+            .count(),
+        1,
+        "the inclusive join must wait for the in-transit token and fire exactly once"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the join must route to the end exactly once"
+    );
+}
+
+#[test]
 fn inclusive_join_waits_while_a_link_throw_that_reaches_it_is_pending() {
     // #1168 regression (link-event reachability). An inclusive join `j` is
     // reachable from branch `a` (normal flow `a -> j`) AND from branch `b` via a
@@ -8386,5 +8444,59 @@ fn tag_only_form_and_resource_redeploys_are_not_skipped_as_duplicates() {
     assert_eq!(
         engine.state().resources["p.md"].version_tag.as_deref(),
         Some("v1")
+    );
+}
+
+#[test]
+fn inclusive_join_ignores_its_own_queued_activation_as_a_live_path() {
+    // #1248 (engine guard mutants on `has_active_path_to`). Both siblings `a`
+    // and `b` take their flows into `j` before either queued activation of `j`
+    // is processed, and `j`'s third incoming flow (from `d`) is unreachable.
+    // When the first activation of `j` runs, the only queued step is `j`'s
+    // own second activation: that is not a live path *to* the join (the join
+    // excludes itself), so it must activate and fire at once — not park as an
+    // open join waiting on itself.
+    let def = ProcessBuilder::new("inc-own-activation")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .exclusive_gateway("d")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "j")
+        .connect("b", "j")
+        .connect("d", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inc-own-activation"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, Event::ParallelJoinOpened { element_id, .. } if element_id == "j")
+        ),
+        "the join must not park waiting on its own queued activation"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ParallelJoinFired { element_id, .. } if element_id == "j")
+            )
+            .count(),
+        1,
+        "the join must fire exactly once"
     );
 }

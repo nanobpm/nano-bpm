@@ -19,7 +19,11 @@
 //   node formal/corpus/exhaustive.mjs --bound ci|nightly
 //        [--gateways N] [--flows M] [--kinds xor,and,or,evt]
 //        [--tlc] [--backend nano|camunda|both] [--require-camunda]
-//        [--record] [--out DIR]
+//        [--record] [--out DIR] [--coverage-dir DIR]
+//
+// `--coverage-dir DIR` (with --tlc) runs TLC with `-coverage` and keeps each
+// model log as DIR/<module>.log for the action-coverage gate
+// (formal/tla/coverage.mjs, #1248).
 //
 // The bound is configurable: `--bound` reads a named bound from bounds.json
 // (CI runs `ci`, the nightly/manual workflow `nightly`); --gateways/--flows/
@@ -53,7 +57,7 @@ export const BOUNDS_PATH = path.join(here, 'bounds.json')
 // Arguments and the bound
 
 export function parseArgs (argv) {
-  const a = { bound: null, gateways: null, flows: null, kinds: null, tlc: false, backend: null, requireCamunda: false, record: false, out: null }
+  const a = { bound: null, gateways: null, flows: null, kinds: null, tlc: false, backend: null, requireCamunda: false, record: false, out: null, coverageDir: null }
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i]
     const val = () => { if (i + 1 >= argv.length) throw new Error(`${x} needs a value`); return argv[++i] }
@@ -66,6 +70,7 @@ export function parseArgs (argv) {
     else if (x === '--require-camunda') a.requireCamunda = true
     else if (x === '--record') a.record = true
     else if (x === '--out') a.out = val()
+    else if (x === '--coverage-dir') a.coverageDir = val()
     else throw new Error(`unknown argument: ${x}`)
   }
   if (a.backend && !['nano', 'camunda', 'both'].includes(a.backend)) throw new Error(`--backend must be nano|camunda|both, got ${a.backend}`)
@@ -138,7 +143,7 @@ export function verdictFromLog (log, properties, exitCode) {
 
 // One TLC run in its OWN directory and JVM temp dir: concurrent TLC processes
 // sharing either clobber each other's extracted standard modules.
-function runTlc (jar, work, module, tla, cfg) {
+function runTlc (jar, work, module, tla, cfg, coverage = false) {
   const dir = fs.mkdtempSync(path.join(work, `${module}-`))
   for (const base of ['TokenFlow', 'ZeebeTokenFlow']) fs.copyFileSync(path.join(tlaDir, `${base}.tla`), path.join(dir, `${base}.tla`))
   fs.writeFileSync(path.join(dir, `${module}.tla`), tla)
@@ -153,6 +158,9 @@ function runTlc (jar, work, module, tla, cfg) {
       // defeating the fail-closed `Warning:` gate in verdictFromLog (#1246
       // review). Warnings stay visible; any that remain fail the run.
       '-XX:+UseParallelGC', '-Xmx256m', '-XX:TieredStopAtLevel=1', `-Djava.io.tmpdir=${path.join(dir, 'tmp')}`, '-cp', jar, 'tlc2.TLC', '-workers', '1', '-cleanup',
+      // TLC action coverage (#1248): the final statistics block is parsed by
+      // formal/tla/coverage.mjs, aggregated with formal/tla/check.sh's models.
+      ...(coverage ? ['-coverage', '60'] : []),
       '-continue', '-deadlock', '-lncheck', 'final', '-metadir', path.join(dir, `${module}.meta`), '-config', `${module}.cfg`, `${module}.tla`],
     { cwd: dir })
     let log = ''
@@ -196,7 +204,7 @@ async function pool (items, limit, fn) {
   return results
 }
 
-async function tlcPhase (entries, log) {
+async function tlcPhase (entries, log, coverageDir = null) {
   const jar = tlaJar()
   const specs = { TokenFlow: readSpec('TokenFlow'), ZeebeTokenFlow: readSpec('ZeebeTokenFlow') }
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'nanobpm-exhaustive-'))
@@ -207,7 +215,8 @@ async function tlcPhase (entries, log) {
       const verdict = {}
       for (const fam of ['TokenFlow', 'ZeebeTokenFlow']) {
         const module = entry.graph.families[fam].module
-        const { code, log: tlcLog } = await runTlc(jar, work, module, entry.artifacts.tla[fam], cfgFor(specs[fam]))
+        const { code, log: tlcLog } = await runTlc(jar, work, module, entry.artifacts.tla[fam], cfgFor(specs[fam]), coverageDir !== null)
+        if (coverageDir !== null) fs.writeFileSync(path.join(coverageDir, `${module}.log`), tlcLog)
         verdict[fam] = verdictFromLog(tlcLog, specs[fam].properties, code)
         if (verdict[fam] === 'error') {
           throw new Error(`TLC failed on ${module} (${entry.graph.key}):\n${tlcLog}`)
@@ -481,7 +490,8 @@ async function main () {
   const phasesRan = new Set()
   if (args.tlc) {
     log('tlc: nano spec (MC*) vs Zeebe reference (ZMC*) per graph')
-    divergences.push(...await tlcPhase(entries, log))
+    if (args.coverageDir) fs.mkdirSync(args.coverageDir, { recursive: true })
+    divergences.push(...await tlcPhase(entries, log, args.coverageDir))
     for (const k of ['tlc-refines', 'tlc-verdict', 'reference-vs-tlc']) phasesRan.add(k)
   }
   if (args.backend) {
