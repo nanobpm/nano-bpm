@@ -20407,10 +20407,8 @@ impl ServerImpl {
             // Legacy single-partition: every record (deployments and
             // `RaftEntryApplied` included) belongs to `p`.
             let events = Journal::read_events(&journal_path)?;
-            return Ok((
-                nanobpmn_engine_core::Engine::replay_partition(p, events),
-                Vec::new(),
-            ));
+            // Verified replay (#1664 review): never skip the chain check.
+            return Ok((Journal::replay_verified(p, events)?, Vec::new()));
         }
         // Segmented (either layout): read the recovery metadata from `p`'s
         // actor (BOUNDED — it may be the dead or wedged one the health probe
@@ -31144,6 +31142,7 @@ async fn main() {
                         .map(|p| {
                             let evs = per_partition.remove(&p).unwrap_or_default();
                             Journal::from_events_shared(p, evs, &shared)
+                                .unwrap_or_else(|e| refuse_to_start(&e))
                         })
                         .collect();
                     (journals, recovered, read_model)
@@ -31245,6 +31244,7 @@ async fn main() {
                         .map(|p| {
                             let evs = per_owned.remove(p).unwrap_or_default();
                             Journal::from_events_shared(*p, evs, &shared)
+                                .unwrap_or_else(|e| refuse_to_start(&e))
                         })
                         .collect();
                     (journals, recovered, read_model)
@@ -43400,6 +43400,10 @@ mod clustered_startup_tests {
         part0.raft.shutdown().await.ok();
     }
 
+    /// Serializes the tests that raise `nanobpm_raft_divergence_total` for
+    /// (p0, node 1) — see `a_diverged_follower_fail_stops_and_resyncs_from_the_leader`.
+    static DIVERGENCE_METRIC_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// ADR 0066 slice 5 (#1664) false-positive guard: no hosted member of
     /// partitions `0..partitions` on `nodes` fail-stopped on a divergence, and
     /// every two members that applied the same index carry the same chain.
@@ -43473,6 +43477,10 @@ mod clustered_startup_tests {
     /// positive after the resync).
     #[tokio::test]
     async fn a_diverged_follower_fail_stops_and_resyncs_from_the_leader() {
+        // The divergence metric is process-global per (partition, node):
+        // serialize every test that trips it so the exact-delta assertion
+        // never counts a concurrent test's increment.
+        let _metric = DIVERGENCE_METRIC_TESTS.lock().await;
         let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
         part0
             .propose(deploy_cmd("d-1"), 1_000)
@@ -43569,6 +43577,10 @@ mod clustered_startup_tests {
     /// persisted vote/log); recovery fails closed and leaves it down.
     #[tokio::test]
     async fn a_diverged_quorum_voter_is_not_rebuilt_empty() {
+        // The divergence metric is process-global per (partition, node):
+        // serialize every test that trips it so the exact-delta assertion
+        // never counts a concurrent test's increment.
+        let _metric = DIVERGENCE_METRIC_TESTS.lock().await;
         let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
         part0
             .propose(deploy_cmd("q-1"), 1_000)

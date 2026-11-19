@@ -7673,6 +7673,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1664 review: LEGACY (non-segmented) recovery verifies the recorded
+    /// chain too — `Journal::open_partition` and the canonical
+    /// `Journal::replay_verified` (used by `from_events_shared` and the
+    /// server's legacy rebuild) accept a faithful journal and fail CLOSED on a
+    /// tampered one, never silently replaying it unverified.
+    #[test]
+    fn legacy_recovery_verifies_recorded_chain_digests() {
+        let dir = temp_dir("digest-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.jsonl");
+        {
+            let mut journal = crate::journal::Journal::open_partition(&ok, 0).expect("open legacy");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        crate::journal::Journal::open_partition(&ok, 0)
+            .expect("a faithful legacy journal verifies");
+        let events = crate::journal::Journal::read_events(&ok).expect("read");
+        crate::journal::Journal::replay_verified(0, events).expect("verified replay");
+
+        let bad = dir.join("bad.jsonl");
+        {
+            let mut journal =
+                crate::journal::Journal::open_partition(&bad, 0).expect("open legacy");
+            digest_entry(&mut journal, 1, Command::DeployProcess(demo()));
+            journal.perturb_chain_for_test();
+            digest_entry(&mut journal, 2, Command::create_instance("demo"));
+        }
+        match crate::journal::Journal::open_partition(&bad, 0) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}"),
+            Ok(_) => panic!("a tampered legacy journal must fail closed"),
+        }
+        let events = crate::journal::Journal::read_events(&bad).expect("read");
+        match crate::journal::Journal::replay_verified(0, events) {
+            Err(e) => assert!(e.to_string().contains("index 2"), "names the entry: {e}"),
+            Ok(_) => panic!("a tampered legacy stream must fail closed"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Serialized event lines for the #1405 frame-integrity tests: a real
     /// command event followed by its entry's applied-entry marker.
     fn entry_lines(index: u64) -> (Vec<u8>, Vec<u8>) {

@@ -1481,9 +1481,16 @@ impl PartitionStateMachine {
              leader's at the same index — fail-stopping apply; the partition resyncs from the \
              leader's snapshot"
         );
-        self.digest.set_diverged(divergence.clone());
+        // Latch + quarantine under the snapshot publication lock (#1664
+        // review): an in-flight build/install that publishes afterwards sees
+        // the latch under that same lock and refuses, so a diverged state can
+        // never become the durable boot baseline again after the quarantine.
+        {
+            let _publish = self.engine.snapshot_publish_lock().await;
+            self.digest.set_diverged(divergence.clone());
+            quarantine_snapshot_ptr(&self.snapshot_dir, divergence.detected_at);
+        }
         self.engine.with(|journal| journal.abort_raft_entry()).await;
-        quarantine_snapshot_ptr(&self.snapshot_dir, divergence.detected_at);
         StorageError::from_io_error(
             ErrorSubject::StateMachine,
             ErrorVerb::Write,
@@ -1692,6 +1699,16 @@ impl PartitionStateMachine {
         // permit, a different lock domain that must never be held together
         // with the publication lock.
         let publish_guard: SnapshotPublishGuard = self.engine.snapshot_publish_lock().await;
+        // A latched divergence (#1664 review) refuses publication under the
+        // lock the latch is set under: never publish onto a diverged member.
+        if let Some(d) = self.digest.divergence() {
+            let _ = std::fs::remove_file(&current_path);
+            return Err(StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(d.to_string()),
+            )
+            .into());
+        }
         // Never regress the published snapshot (#1488 review): if a newer
         // snapshot is already published, this install is stale — discard its
         // file and leave the pointer, cache and engine untouched.
@@ -2057,6 +2074,17 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             barrier.wait().await;
         }
         let _publish = self.sm.engine.snapshot_publish_lock().await;
+        // A latched divergence (#1664 review) refuses publication under the
+        // lock the latch is set under: an already-captured build must never
+        // republish the diverged state as the boot baseline.
+        if let Some(d) = self.sm.digest.divergence() {
+            let _ = std::fs::remove_file(&path);
+            return Err(StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(d.to_string()),
+            )
+            .into());
+        }
         // Never regress the published snapshot (#1488 review): a build
         // captured at index N that reaches publication after a concurrent
         // install already published M > N must not replace the pointer/cache
@@ -3004,11 +3032,40 @@ struct Batcher {
     engine: DeepthiHandle,
 }
 
+/// Whether every member of `raft`'s current membership other than itself is
+/// known (via `transport`) to support `feature` (#1664). Unknown counts as
+/// unsupported.
+async fn all_members_support(
+    raft: &openraft::Raft<RaftConfig>,
+    transport: &dyn RaftTransport,
+    feature: &'static str,
+) -> bool {
+    let (me, members): (NodeId, Vec<NodeId>) = {
+        let m = raft.metrics();
+        let m = m.borrow();
+        (
+            m.id,
+            m.membership_config
+                .membership()
+                .nodes()
+                .map(|(id, _)| *id)
+                .collect(),
+        )
+    };
+    for id in members.into_iter().filter(|id| *id != me) {
+        if !transport.peer_supports(id, feature).await {
+            return false;
+        }
+    }
+    true
+}
+
 impl Batcher {
     fn spawn(
         raft: openraft::Raft<RaftConfig>,
         engine: DeepthiHandle,
         digest: DigestLedger,
+        transport: Arc<dyn RaftTransport>,
     ) -> Self {
         let (hi_tx, mut hi_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
@@ -3064,7 +3121,21 @@ impl Batcher {
                 let n = items.len();
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
-                let batch = ReplicatedBatch::new(items).with_digest(digest.latest_claim());
+                // Rolling-upgrade gate (#1664 / #1661): stamp only while
+                // every other member advertises the digest capability, so a
+                // mixed-version group never compares (never false-positives).
+                let claim = if all_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST,
+                )
+                .await
+                {
+                    digest.latest_claim()
+                } else {
+                    None
+                };
+                let batch = ReplicatedBatch::new(items).with_digest(claim);
                 match raft.client_write(batch).await {
                     Ok(res) => {
                         let mut out = res.data.items;
@@ -3492,18 +3563,16 @@ impl RaftPartition {
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let digest = state_machine.digest.clone();
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(
-            Arc::new(NullTransport),
-            partition_id,
-            snapshot_progress.clone(),
-        );
+        let transport: Arc<dyn RaftTransport> = Arc::new(NullTransport);
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         let mut members = BTreeMap::new();
         members.insert(node_id, BasicNode::new(addr));
         raft.initialize(members).await?;
 
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
         let (orphan_stop, orphan_watcher, orphan_drainer) =
             wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
@@ -3559,11 +3628,9 @@ impl RaftPartition {
         // re-applies neither's entries (#1405).
         state_machine.restore_newest_boot_state().await?;
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(
-            Arc::new(NullTransport),
-            partition_id,
-            snapshot_progress.clone(),
-        );
+        let transport: Arc<dyn RaftTransport> = Arc::new(NullTransport);
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         // A fresh log needs the one-shot membership bootstrap; a recovered log
@@ -3574,7 +3641,7 @@ impl RaftPartition {
             raft.initialize(members).await?;
         }
 
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
         let (orphan_stop, orphan_watcher, orphan_drainer) =
             wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
@@ -3660,7 +3727,8 @@ impl RaftPartition {
             state_machine.restore_from_current_snapshot().await?;
         }
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
         // `Raft` inside each arm avoids needing a common concrete store type. The
@@ -3681,7 +3749,7 @@ impl RaftPartition {
                 (raft, Arc::new(AtomicI64::new(0)))
             }
         };
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
         let (orphan_stop, orphan_watcher, orphan_drainer) =
             wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         // Keep the state machine's leader signal fresh so its terminal-eviction
@@ -5055,6 +5123,45 @@ mod tests {
         assert!(
             ptr.path.exists(),
             "the pointer's snapshot file survives every reap"
+        );
+    }
+
+    /// #1664 review: a snapshot build captured BEFORE a divergence latch
+    /// trips, released into publication AFTER it, must not publish — the
+    /// diverged state can never become the durable boot baseline again.
+    #[tokio::test]
+    async fn a_build_captured_before_a_divergence_never_publishes_after_it() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.test_writer_barrier = Some(Arc::clone(&barrier));
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        // Divergence latches (and quarantines) while the build is parked.
+        let chain = ChainDigest::genesis(1);
+        let _ = sm
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 2,
+                leader: chain,
+                local: chain.fold(1, &[]),
+            })
+            .await;
+        barrier.wait().await;
+        let built = build.await.expect("build task");
+        assert!(built.is_err(), "a latched divergence refuses publication");
+        assert!(
+            read_snapshot_ptr(&dir).is_none(),
+            "no boot-baseline pointer is published after the latch"
         );
     }
 
@@ -7531,6 +7638,116 @@ mod tests {
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");
         }
+    }
+
+    /// An in-process transport whose member `legacy` runs an OLDER binary that
+    /// does not advertise the digest capability (#1664 mixed-version test).
+    struct MixedVersion {
+        inner: crate::raft_net::LocalCluster,
+        legacy: NodeId,
+    }
+
+    impl RaftTransport for MixedVersion {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn peer_supports<'a>(
+            &'a self,
+            target: NodeId,
+            _feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            let ok = target != self.legacy;
+            Box::pin(async move { ok })
+        }
+    }
+
+    /// Boots a 3-voter p0 group (node 0 leader) over `transport`, perturbs
+    /// follower 2's chain, proposes past the next digest point and reports
+    /// whether follower 2 fail-stopped on a divergence.
+    async fn perturbed_follower_fail_stops(
+        cluster: crate::raft_net::LocalCluster,
+        transport: Arc<dyn RaftTransport>,
+    ) -> bool {
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        parts[0]
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
+        wait_all_applied(&parts).await;
+        parts[2]
+            .sm_engine()
+            .with(|j| j.perturb_chain_for_test())
+            .await;
+        for t in 2..5 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        let stopped = wait_until(1_500, || parts[2].divergence().is_some()).await;
+        assert!(parts[0].divergence().is_none() && parts[1].divergence().is_none());
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        stopped
+    }
+
+    /// #1664 review (rolling upgrade): with an OLD member in the group the
+    /// leader stamps no digest claim, so a mixed-version cluster never
+    /// compares and never false-positive fail-stops — even a follower whose
+    /// chain really differs. Control: the same injection in an all-new group
+    /// IS detected (proving the gate, not the injection, is what suppresses).
+    #[tokio::test]
+    async fn a_mixed_version_group_never_compares_digests() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let mixed: Arc<dyn RaftTransport> = Arc::new(MixedVersion {
+            inner: cluster.clone(),
+            legacy: 1,
+        });
+        assert!(
+            !perturbed_follower_fail_stops(cluster, mixed).await,
+            "a mixed-version group must never compare digests"
+        );
+        let cluster = LocalCluster::default();
+        let all_new: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        assert!(
+            perturbed_follower_fail_stops(cluster, all_new).await,
+            "an all-new group detects the divergence"
+        );
     }
 
     /// Waits until every member has applied up to the leader's (node 0's)

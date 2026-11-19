@@ -1409,6 +1409,17 @@ impl Journal {
         Self::open_partition(path, 0)
     }
 
+    /// The canonical legacy (non-segmented) replay (#1664 review): re-derives
+    /// every recorded chain digest in the partition's COMPLETE event stream
+    /// before replaying it, and fails closed (`InvalidData`) on a mismatch —
+    /// never replaying a journal whose bytes no longer reproduce their
+    /// recorded chain. Every legacy recovery path goes through here, so
+    /// verification can never be skipped by one of them.
+    pub fn replay_verified(partition_id: u64, events: Vec<Event>) -> io::Result<Engine> {
+        crate::seglog::verify_replayed_chain(None, &events)?;
+        Ok(Engine::replay_partition(partition_id, events))
+    }
+
     /// Like [`Journal::open`] but the engine owns `partition_id`'s key namespace.
     /// Replay only advances this partition's local key counter (foreign keys, e.g.
     /// a deployment replicated from partition 0, are applied to state but do not
@@ -1420,7 +1431,7 @@ impl Journal {
 
         let events = Self::read_events(path)?;
         if !events.is_empty() {
-            engine = Engine::replay_partition(partition_id, events);
+            engine = Self::replay_verified(partition_id, events)?;
             fresh = false;
         }
 
@@ -1507,18 +1518,21 @@ impl Journal {
     /// each event to `partition_of(key)`); they reconstruct the engine exactly as
     /// [`Journal::open_partition`] would. The journal owns a cloned sender into
     /// the shared writer, so the writer thread stays alive as long as it does.
+    ///
+    /// Fails closed (`InvalidData`) when the events' recorded chain digests do
+    /// not re-derive (#1664) — see [`Journal::replay_verified`].
     pub fn from_events_shared(
         partition_id: u64,
         events: Vec<Event>,
         shared: &SharedWriter,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let fresh = events.is_empty();
         let engine = if fresh {
             Engine::with_partition(partition_id)
         } else {
-            Engine::replay_partition(partition_id, events)
+            Self::replay_verified(partition_id, events)?
         };
-        Self {
+        Ok(Self {
             engine,
             partition_id,
             writer: Some(shared.sender()),
@@ -1543,7 +1557,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        }
+        })
     }
 
     /// Builds a partition journal that persists through a segmented
