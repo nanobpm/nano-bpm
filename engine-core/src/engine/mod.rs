@@ -5649,6 +5649,12 @@ impl Engine {
                 // 4b. Event-based gateway races (#1554): validate where mapped
                 //     catch events land and collect unmapped race members to
                 //     withdraw (exempt from the step-5 mapping requirement).
+                //     The check is keyed by element id, so it cannot tell two
+                //     activations of ONE gateway racing in one scope (#1676)
+                //     apart — it validates the shape; the withdrawal below
+                //     re-keys the persisted per-activation race membership
+                //     (`races`) onto the mapped target gateway, which is what
+                //     the runtime's sibling isolation actually consults.
                 let withdrawn = Self::check_migrated_event_gateway_races(
                     instance_key,
                     &source_def.definition,
@@ -5656,6 +5662,12 @@ impl Engine {
                     &mapped,
                     &active_elements,
                     |eik| self.scope_of(instance_key, eik),
+                    |eik| {
+                        self.state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.races.get(&eik).copied())
+                    },
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
@@ -6041,6 +6053,17 @@ impl Engine {
                     &target_definition,
                     &mapped,
                 )?;
+                // The persisted race membership (#1676) needs NO re-keying
+                // here: the gateway element instance that armed a catch
+                // completes as it arms, so the `races` value is an opaque
+                // per-activation identity, not a live `active` lookup — the
+                // runtime (`withdraw_event_gateway_siblings`) only compares
+                // two catches' identities for EQUALITY. Twin activations of
+                // one gateway keep their distinct identities across the
+                // mapping, so the migrated races stay independent. The
+                // withdrawn members' entries are dropped by their
+                // `ElementCompleted` reducers (`withdraw_catch_instance`
+                // below).
                 let withdrawals: Vec<Event> = withdrawn
                     .into_iter()
                     .flat_map(|(eik, eid)| self.withdraw_catch_instance(instance_key, eik, eid))

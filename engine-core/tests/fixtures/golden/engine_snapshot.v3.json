@@ -1,6 +1,6 @@
 {
-  "next_local": 108,
-  "now": 1700000000027,
+  "next_local": 125,
+  "now": 1700000000029,
   "num_partitions": 1,
   "partition_id": 0,
   "raft_applied": null,
@@ -74,6 +74,7 @@
       "order": 5,
       "sync": 1,
       "trip": 1,
+      "twins": 1,
       "whole": 1,
       "whole-done": 1
     },
@@ -636,6 +637,7 @@
       "order-v2": 1,
       "sync": 1,
       "trip": 1,
+      "twins": 1,
       "whole": 1
     },
     "instances": {
@@ -687,6 +689,54 @@
         "variables": {
           "orderId": {
             "Int": 7
+          }
+        },
+        "variables_spilled": false
+      },
+      "111": {
+        "activating": [],
+        "active": {
+          "118": "onM2",
+          "120": "onM1",
+          "122": "onM2",
+          "124": "onM1"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000029,
+        "esp_held_payloads": {},
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
+        "key": 111,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 110,
+        "process_id": "twins",
+        "races": {
+          "118": 116,
+          "120": 116,
+          "122": 117,
+          "124": 117
+        },
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "terminated_epoch": 0,
+        "variables": {
+          "key": {
+            "Str": "k"
           }
         },
         "variables_spilled": false
@@ -1435,6 +1485,46 @@
         },
         "message_name": "esp-msg",
         "state": "Open"
+      },
+      "119": {
+        "correlation_key": "k",
+        "element_id": "onM2",
+        "element_instance_key": 118,
+        "instance_key": 111,
+        "key": 119,
+        "kind": "IntermediateCatch",
+        "message_name": "M2",
+        "state": "Open"
+      },
+      "121": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 120,
+        "instance_key": 111,
+        "key": 121,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
+        "state": "Open"
+      },
+      "123": {
+        "correlation_key": "k",
+        "element_id": "onM2",
+        "element_instance_key": 122,
+        "instance_key": 111,
+        "key": 123,
+        "kind": "IntermediateCatch",
+        "message_name": "M2",
+        "state": "Open"
+      },
+      "125": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 124,
+        "instance_key": 111,
+        "key": 125,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
+        "state": "Open"
       }
     },
     "process_versions": {
@@ -1603,6 +1693,203 @@
         },
         "deployment_key": 99,
         "key": 100,
+        "version": 1
+      },
+      "110": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "merge"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "merge"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "gw": {
+              "end_listeners": [],
+              "id": "gw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EventBasedGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM1"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM2"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "merge": {
+              "end_listeners": [],
+              "id": "merge",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ExclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "gw"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM1": {
+              "end_listeners": [],
+              "id": "onM1",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "M1"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM2": {
+              "end_listeners": [],
+              "id": "onM2",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "M2"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "twins",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "deployment_key": 109,
+        "key": 110,
         "version": 1
       },
       "19": {
@@ -4530,6 +4817,203 @@
         },
         "deployment_key": 33,
         "key": 34,
+        "version": 1
+      },
+      "twins": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "merge"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "merge"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "gw": {
+              "end_listeners": [],
+              "id": "gw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EventBasedGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM1"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM2"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "merge": {
+              "end_listeners": [],
+              "id": "merge",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ExclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "gw"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM1": {
+              "end_listeners": [],
+              "id": "onM1",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "M1"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM2": {
+              "end_listeners": [],
+              "id": "onM2",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "M2"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "twins",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "deployment_key": 109,
+        "key": 110,
         "version": 1
       },
       "whole": {

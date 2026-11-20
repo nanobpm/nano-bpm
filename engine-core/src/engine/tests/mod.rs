@@ -168,6 +168,16 @@ fn complete_one(engine: &mut Engine, job_type: &str) -> Vec<Event> {
         .unwrap()
 }
 
+/// Test helper: count the `ElementCompleted` events for one element id in an
+/// event batch (shared by the message-cardinality and event-gateway-migration
+/// tests).
+fn completions(events: &[Event], id: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == id))
+        .count()
+}
+
 /// start -> charge (service task, PT5S interrupting timer boundary) -> done
 ///                       \--(timer "timeout")--> escalated
 fn process_with_timer_boundary() -> ProcessDefinition {
