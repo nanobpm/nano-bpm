@@ -285,6 +285,39 @@ fn legacy_record_missing_a_defaulted_field_replays() {
     let _engine = Engine::replay(std::iter::once(decoded));
 }
 
+/// **Pre-#1676 `ElementActivating`.** An activation journaled before the
+/// event-based-gateway race identity existed carries no `race` key: it must
+/// decode with `race: None` (the additive `serde(default)` contract). A
+/// replayed legacy catch is never retroactively enrolled into a race — the
+/// applier only inserts a `races` membership when the frame carries one.
+#[test]
+fn pre_1676_element_activating_decodes_with_no_race() {
+    let legacy_line = r#"{"ElementActivating":{"instance_key":1,"element_instance_key":2,"element_id":"onM1","scope":0}}"#;
+    let decoded =
+        decode_event_json(legacy_line).expect("pre-#1676 ElementActivating (no race) decodes");
+    match &decoded {
+        Event::ElementActivating { race, .. } => {
+            assert!(race.is_none(), "a missing race must default to None")
+        }
+        other => panic!("expected ElementActivating, got {other:?}"),
+    }
+    // Replaying a journal that contains it must not error/panic, and the
+    // replayed instance carries no race membership for the legacy catch (the
+    // applier inserts one only from a `Some(race)` frame).
+    let engine = Engine::replay(std::iter::once(decoded));
+    let enrolled = engine
+        .snapshot()
+        .state
+        .instances
+        .values()
+        .flat_map(|i| i.races.keys())
+        .any(|k| *k == 2);
+    assert!(
+        !enrolled,
+        "a pre-#1676 activation must not be retroactively enrolled into a race"
+    );
+}
+
 /// **Pre-#1640 `JobCreated`.** A job journaled before mapping-time secret
 /// provenance existed has no `secret_provenance` key: it must decode to EMPTY
 /// provenance and replay into a job that resolves nothing (fail closed) — an

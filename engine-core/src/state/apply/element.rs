@@ -16,6 +16,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             element_instance_key,
             element_id,
             scope,
+            race,
         } => {
             register_token(
                 state,
@@ -26,6 +27,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             );
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.activating.insert(*element_instance_key);
+                if let Some(gateway) = race {
+                    instance.races.insert(*element_instance_key, *gateway);
+                }
             }
         }
         Event::ElementActivated {
@@ -73,6 +77,8 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 // A split gateway's carried activation-time selection (#1402)
                 // dies with it. A no-op for every other element.
                 instance.gateway_routes.remove(element_instance_key);
+                // An armed catch leaves its event-based gateway race (#1676).
+                instance.races.remove(element_instance_key);
                 // An event sub-process container's held start payload dies
                 // with the container (normal completion or interrupt teardown).
                 instance.esp_held_payloads.remove(element_instance_key);

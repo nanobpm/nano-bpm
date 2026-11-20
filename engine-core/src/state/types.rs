@@ -966,6 +966,18 @@ pub struct ProcessInstance {
     /// variables exactly as before.
     #[cfg_attr(feature = "serde", serde(default))]
     pub gateway_routes: BTreeMap<Key, Vec<usize>>,
+    /// The event-based gateway race each armed catch element instance belongs
+    /// to (#1676): catch element instance -> the gateway element instance whose
+    /// deferred choice armed it. Inserted by an [`crate::Event::ElementActivating`]
+    /// carrying a `race`, removed when the catch completes or terminates. A race
+    /// winner withdraws only siblings sharing its race, so two activations of
+    /// one gateway in the same scope never withdraw each other's catches.
+    /// `serde(default)` and omitted when empty: older snapshots decode unchanged.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub races: BTreeMap<Key, Key>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index

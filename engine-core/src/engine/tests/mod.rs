@@ -28,6 +28,7 @@ mod jobs;
 mod join_scopes;
 mod lifecycle;
 mod listeners;
+mod message_cardinality;
 mod migration;
 mod migration_compensation;
 mod migration_event_gateway;
@@ -165,6 +166,16 @@ fn complete_one(engine: &mut Engine, job_type: &str) -> Vec<Event> {
     engine
         .apply_command(Command::complete_job(job.key))
         .unwrap()
+}
+
+/// Test helper: count the `ElementCompleted` events for one element id in an
+/// event batch (shared by the message-cardinality and event-gateway-migration
+/// tests).
+fn completions(events: &[Event], id: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == id))
+        .count()
 }
 
 /// start -> charge (service task, PT5S interrupting timer boundary) -> done

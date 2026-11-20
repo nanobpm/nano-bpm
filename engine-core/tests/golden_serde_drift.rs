@@ -878,6 +878,67 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("create cluster variable"),
     );
 
+    // Event-based-gateway race witness (#1676): two activations of ONE gateway
+    // (a fork both of whose branches pass the merge) arm two independent
+    // races, so the journal pins the additive `ElementActivating.race` field
+    // non-default and the snapshot pins the persisted `races` membership
+    // (catch element instance -> arming gateway activation) non-empty. Left
+    // waiting on its messages: no job, so the one-job-per-instance
+    // determinism contract holds.
+    let twins: ProcessDefinition = ProcessBuilder::new("twins")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .exclusive_gateway("merge")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end")
+        .connect("start", "fork")
+        .connect("fork", "merge")
+        .connect("fork", "merge")
+        .connect("merge", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end")
+        .connect("onM2", "end")
+        .build()
+        .expect("build twins process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(twins), T0 + 28)
+            .expect("deploy twins"),
+    );
+    let mut twin_vars = BTreeMap::new();
+    twin_vars.insert("key".to_string(), Value::Str("k".to_string()));
+    let twin_created = engine
+        .apply_command_at(Command::create_instance_with("twins", twin_vars), T0 + 29)
+        .expect("create twins instance");
+    // The witness must actually arm two races (four catches, two per gateway
+    // activation) carrying a non-default `race` — otherwise the golden would
+    // pin an empty/default shape and the drift guard would stay green if the
+    // field were dropped or renamed.
+    let twin_inst = twin_created
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("twins instance key");
+    assert!(
+        twin_created
+            .iter()
+            .any(|e| matches!(e, Event::ElementActivating { race: Some(_), .. })),
+        "the twins scenario must journal a non-default ElementActivating.race"
+    );
+    journal.extend(twin_created);
+    assert_eq!(
+        engine
+            .snapshot()
+            .state
+            .instances
+            .get(&twin_inst)
+            .map(|i| i.races.len()),
+        Some(4),
+        "the twins snapshot must persist four armed race memberships"
+    );
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }

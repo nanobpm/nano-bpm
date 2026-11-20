@@ -146,6 +146,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     parked_joins: Default::default(),
                     activating: Default::default(),
                     gateway_routes: BTreeMap::new(),
+                    races: BTreeMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
                     multi_instances: BTreeMap::new(),
@@ -383,6 +384,12 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // teardown (terminate end event, or termination) mid-activation
                 // would strand it on the terminal shell otherwise.
                 instance.gateway_routes.clear();
+                // An event-based gateway's armed-catch race membership (#1676)
+                // is removed per catch as each completes or terminates, but a
+                // whole-instance teardown (top-level terminate end, or
+                // cancellation) bypasses those per-catch terminal events — clear
+                // the map so no armed race is stranded on the terminal shell.
+                instance.races.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
@@ -786,6 +793,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // A split gateway's carried activation-time selection (#1402):
                 // same forced-teardown rationale as the join bookkeeping above.
                 instance.gateway_routes.clear();
+                // An event-based gateway's armed-catch race membership (#1676):
+                // same forced-teardown rationale — a cancel bypasses the
+                // per-catch terminal events that would remove each entry.
+                instance.races.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
