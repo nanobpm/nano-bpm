@@ -38,7 +38,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { GATEWAY_KINDS, EDGE_LABELS, BOUNDARY_LABELS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor } from './enumerate.mjs'
+import { GATEWAY_KINDS, EDGE_LABELS, BOUNDARY_LABELS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor, stepSignatures } from './enumerate.mjs'
 import { bpmnFor } from './generate.mjs'
 import { openBackends, checkScenario } from './exhaustive.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
@@ -294,8 +294,58 @@ export function corpusProblems (cases) {
     if (typeof c.fixed !== 'boolean') problems.push(`committed fuzz case ${label} needs a boolean "fixed"`)
     if (!c.skeleton || !c.scenario) problems.push(`committed fuzz case ${label} needs "skeleton" and "scenario"`)
     else if (materialize(c.skeleton).key !== c.graph.key) problems.push(`committed fuzz case ${label}: its skeleton no longer materialises to graph ${c.graph.key}`)
+    else {
+      const derived = rederive(c)
+      if (!derived) problems.push(`committed fuzz case ${label}: its scenario is no longer a behaviour of the current Reference — re-derive it (rederive / rederivedScenarios) and re-judge the case`)
+      else if (canonJson(derived.expect) !== canonJson(c.scenario.expect)) problems.push(`committed fuzz case ${label}: its frozen "expect" is stale against the current Reference — re-derive it and re-judge the case`)
+    }
   }
   return problems
+}
+
+/**
+ * Canonical JSON of a scenario part: object keys sorted, and the
+ * per-execution `correlationKey` (derived from the scenario NAME) ignored, so
+ * two derivations of the same behaviour compare equal.
+ */
+export function canonJson (v) {
+  return JSON.stringify(v, (k, x) => k === 'correlationKey'
+    ? undefined
+    : x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x)
+}
+
+/**
+ * Every scenario the CURRENT Reference derives for a committed case's graph
+ * under the case's own route variables, whose start variables equal the
+ * case's — restricted to runs following the case's recorded command sequence
+ * unless `exhaustive` (every command order, cancellation included).
+ */
+export function rederivedScenarios (c, { exhaustive = false } = {}) {
+  const graph = materialize(c.skeleton)
+  const vars = c.scenario.variables ?? {}
+  const route = Object.fromEntries(Object.entries(vars).filter(([k]) => k.startsWith('route_')))
+  // By default follow only the case's own recorded command sequence: every
+  // other order yields different steps, and enumerating them all grows
+  // factorially with independent parallel jobs (#1747 review).
+  const follow = exhaustive ? null : stepSignatures(c.scenario.steps)
+  const { scenarios } = scenariosFor(graph, exploreOrders(graph, route, { cancel: true, follow }))
+  return scenarios.filter((s) => canonJson(s.variables ?? {}) === canonJson(vars))
+}
+
+/**
+ * The current-Reference scenario a committed case's frozen scenario must still
+ * be — the same start variables and the same steps — or null.
+ *
+ * A committed case freezes its scenario's `expect` from the Reference that
+ * found it. If the Reference is later corrected (#1693: it took a fork's flows
+ * in document order where Zeebe takes them reversed), the frozen expectation
+ * silently keeps "reproducing" a divergence that is a REFERENCE defect, not an
+ * engine one. Re-deriving every case on each replay makes that drift fail
+ * loudly instead.
+ */
+export function rederive (c) {
+  const steps = canonJson(c.scenario.steps)
+  return rederivedScenarios(c).find((s) => canonJson(s.steps) === steps) ?? null
 }
 
 /**

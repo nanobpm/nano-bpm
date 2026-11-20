@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { test } from 'node:test'
 
-import { Reference, wellFormed, materialize, randomRun, flowCount } from './enumerate.mjs'
+import { Reference, wellFormed, materialize, randomRun, flowCount, stepSignatures, commandSignature } from './enumerate.mjs'
 import {
   parseArgs,
   caseSeed,
@@ -17,6 +17,9 @@ import {
   shrinkGraph,
   shrinkRuns,
   corpusProblems,
+  rederive,
+  rederivedScenarios,
+  canonJson,
   judgeCase,
   caseRunnable,
   shorterRepro,
@@ -175,6 +178,20 @@ test('corpusProblems: a committed case needs an issue, a fixed flag and a reprod
   assert.match(corpusProblems([{ ...ok, graph: { ...ok.graph, key: 'other' } }])[0], /no longer materialises/)
 })
 
+test('corpusProblems: a frozen scenario must still be a current-Reference behaviour (#1693)', () => {
+  const ok = sampleCase()
+  assert.ok(rederive(ok), 'a freshly recorded case re-derives')
+  const staleExpect = { ...ok, scenario: { ...ok.scenario, expect: { ...ok.scenario.expect, completed: !ok.scenario.expect.completed } } }
+  assert.match(corpusProblems([staleExpect])[0], /frozen "expect" is stale/)
+  const unreachable = { ...ok, scenario: { ...ok.scenario, steps: [...ok.scenario.steps, { op: 'completeOneJob', jobType: 'NoSuchTask' }] } }
+  assert.match(corpusProblems([unreachable])[0], /no longer a behaviour of the current Reference/)
+})
+
+test('canonJson ignores key order and the per-execution correlation key', () => {
+  assert.equal(canonJson({ b: 1, a: { d: 2, c: 3 }, correlationKey: 'x' }), canonJson({ a: { c: 3, d: 2 }, b: 1, correlationKey: 'y' }))
+  assert.notEqual(canonJson([1, 2]), canonJson([2, 1]))
+})
+
 test('judgeCase: open cases must reproduce, fixed cases must agree (regression guard)', () => {
   const c = sampleCase()
   assert.equal(judgeCase(c, [{ signature: 'nano:x' }]), null)
@@ -240,4 +257,18 @@ test('shrinkGraph checkpoints each accepted reduction, so an aborted shrink keep
   assert.ok(latest, 'a reproducer was checkpointed before the failure')
   assert.equal(latest.d.signature, 's')
   assert.ok(latest.d.cand, 'the checkpoint is the accepted reduction, not just the initial case')
+})
+
+test('guided rederive (#1747 review): following the recorded order finds exactly what exhaustive search finds', () => {
+  for (const c of loadCorpus()) {
+    const steps = canonJson(c.scenario.steps)
+    const pick = (ss) => ss.filter((s) => canonJson(s.steps) === steps).map((s) => canonJson(s.expect))
+    assert.deepEqual(pick(rederivedScenarios(c)), pick(rederivedScenarios(c, { exhaustive: true })), `${c.signature} (${c.graph?.id})`)
+  }
+})
+
+test('stepSignatures / commandSignature fail closed on an unknown op', () => {
+  assert.throws(() => stepSignatures([{ op: 'teleport' }]), /unknown scenario step op/)
+  assert.throws(() => commandSignature({ id: 'g' }, { op: 'teleport' }), /unknown command op/)
+  assert.deepEqual(stepSignatures([{ op: 'setVariables', variables: {} }, { op: 'advanceTime', ms: 1 }, { op: 'cancelInstance' }]), ['tick', 'cancel'])
 })
