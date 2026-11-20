@@ -531,6 +531,7 @@ mod tests {
                 process_id: "P".into(),
                 started_at: 1000,
                 creation_variables: [("input".to_string(), json!("x"))].into_iter().collect(),
+                terminal_variables: None,
                 stimuli: vec![
                     RecordedStimulus {
                         seq: 1,
@@ -751,6 +752,7 @@ mod tests {
                 process_id: "P".into(),
                 started_at: 1000,
                 creation_variables: [("input".to_string(), json!("x"))].into_iter().collect(),
+                terminal_variables: None,
                 stimuli: vec![RecordedStimulus {
                     seq: 1,
                     at: 1100,

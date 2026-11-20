@@ -253,6 +253,10 @@ pub struct RecordedInstance {
     pub started_at: u64,
     pub creation_variables: BTreeMap<String, Json>,
     pub stimuli: Vec<RecordedStimulus>,
+    /// The recorded terminal ROOT variable state (#1739), when the source
+    /// captured it. `None` for a trace from a source that predates it (or whose
+    /// terminal snapshot was byte-capped).
+    pub terminal_variables: Option<BTreeMap<String, Json>>,
 }
 
 /// One recorded input, values resolved (and `None` when the stimulus carried no
@@ -332,12 +336,20 @@ impl RecordedInstance {
         // but sort defensively so attribution never depends on transport order.
         stimuli.sort_by_key(|s| s.seq);
 
+        // The terminal snapshot is an observation, not an input: a byte-capped
+        // one only loses the comparison target, never the replay itself.
+        let terminal_variables = trace
+            .terminal_variables
+            .as_ref()
+            .and_then(|v| resolve(v).ok());
+
         Ok(Self {
             instance_key: trace.instance_key.clone(),
             process_id: trace.process_id.clone(),
             started_at: trace.started_at,
             creation_variables,
             stimuli,
+            terminal_variables,
         })
     }
 }
@@ -876,9 +888,19 @@ pub fn replay_instance_with_mocks(
     }
 }
 
-/// The recorded terminal variable state: creation inputs merged with every
-/// stimulus delta in `seq` order (last-writer-wins) — the original run's output.
+/// The recorded terminal ROOT variable state the replay must conserve (#1739).
+///
+/// Compared SEPARATELY from the stimulus inputs: when the source recorded its
+/// terminal root state, that is the target. Stimulus payloads are inputs, not
+/// root writes — an interrupting/non-interrupting boundary message's payload
+/// is local to the boundary unless propagated — so folding them would expect
+/// keys the run never left at the root. Only a trace from a source that
+/// predates terminal capture falls back to creation inputs merged with every
+/// stimulus delta in `seq` order (last-writer-wins).
 fn recorded_terminal(rec: &RecordedInstance) -> BTreeMap<String, Json> {
+    if let Some(terminal) = &rec.terminal_variables {
+        return terminal.clone();
+    }
     let mut acc = rec.creation_variables.clone();
     for s in &rec.stimuli {
         if let Some(vars) = &s.variables {
@@ -1244,6 +1266,7 @@ mod tests {
             started_at: 1000,
             creation_variables: map(creation),
             stimuli,
+            terminal_variables: None,
         }
     }
 
@@ -1321,6 +1344,7 @@ mod tests {
             started_at: 1000,
             creation_variables: creation,
             stimuli: vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+            terminal_variables: None,
         };
         let defs = parse_bpmn(TWO_TASK).unwrap();
 
@@ -1466,6 +1490,7 @@ mod tests {
             started_at: 1000,
             creation_variables: map(&[("input", json!("x"))]),
             stimuli: vec![],
+            terminal_variables: None,
         };
         let defs = parse_bpmn(ERROR_BOUNDARY).unwrap();
 
@@ -1593,6 +1618,7 @@ mod tests {
             elements: vec![],
             incidents: vec![],
             creation_variables: None,
+            terminal_variables: None,
             stimuli: Some(vec![]),
             stimuli_truncated: true,
             domain_signals: vec![],
@@ -1616,6 +1642,7 @@ mod tests {
             elements: vec![],
             incidents: vec![],
             creation_variables: None,
+            terminal_variables: None,
             stimuli: None,
             stimuli_truncated: false,
             domain_signals: vec![],
@@ -1625,6 +1652,53 @@ mod tests {
             RecordedInstance::from_trace(&trace),
             Err(ReplayUnavailable::NoCapture)
         ));
+    }
+
+    /// #1739: the replay's terminal target is the recorded terminal ROOT state,
+    /// compared separately from the stimulus inputs — a message payload that
+    /// stayed local to its boundary (only an output-mapped name reached the
+    /// root) is an input, not a root key the candidate must reproduce.
+    #[test]
+    fn terminal_target_is_the_recorded_root_state_not_a_stimulus_fold() {
+        let message = RecordedStimulus {
+            seq: 1,
+            at: 1100,
+            kind: "message".to_string(),
+            reference: Some("Task".to_string()),
+            variables: Some(map(&[("reason", json!("fraud"))])),
+        };
+        let mut r = rec(&[("input", json!("x"))], vec![message]);
+        r.terminal_variables = Some(map(&[("input", json!("x")), ("r", json!("fraud"))]));
+        assert_eq!(
+            recorded_terminal(&r),
+            map(&[("input", json!("x")), ("r", json!("fraud"))]),
+            "the boundary-local payload key is not expected at the root"
+        );
+        // A trace from a source that predates terminal capture still folds.
+        r.terminal_variables = None;
+        assert_eq!(
+            recorded_terminal(&r),
+            map(&[("input", json!("x")), ("reason", json!("fraud"))])
+        );
+    }
+
+    #[test]
+    fn from_trace_keeps_the_terminal_root_state() {
+        use crate::contracts::Variables;
+        let trace = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            outcome: "COMPLETED".into(),
+            stimuli: Some(vec![]),
+            terminal_variables: Some(Variables {
+                truncated: false,
+                bytes: 10,
+                values: Some(json!({ "out": 1 })),
+            }),
+            ..Default::default()
+        };
+        let r = RecordedInstance::from_trace(&trace).unwrap();
+        assert_eq!(r.terminal_variables, Some(map(&[("out", json!(1))])));
     }
 
     #[test]
@@ -1644,6 +1718,7 @@ mod tests {
                 bytes: 99999,
                 values: None,
             }),
+            terminal_variables: None,
             stimuli: Some(vec![Stimulus {
                 seq: 1,
                 at: 1,
@@ -1678,6 +1753,7 @@ mod tests {
                 bytes: 10,
                 values: Some(json!({ "input": "x" })),
             }),
+            terminal_variables: None,
             // Deliberately out of order to prove the sort.
             stimuli: Some(vec![
                 Stimulus {
@@ -1821,6 +1897,7 @@ mod tests {
             started_at: 1000,
             creation_variables: map(creation),
             stimuli,
+            terminal_variables: None,
         }
     }
 

@@ -4344,7 +4344,12 @@
       "element_instance_key": 0,
       "instance_key": 101,
       "message_key": 106,
-      "subscription_key": 103
+      "subscription_key": 103,
+      "variables": {
+        "payload": {
+          "Int": 42
+        }
+      }
     }
   },
   {

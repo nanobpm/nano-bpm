@@ -54,6 +54,11 @@ pub struct InstanceTrace {
     /// `c8 nano --capture`); `None` otherwise. Drives recorded-input replay.
     #[serde(default)]
     pub creation_variables: Option<Variables>,
+    /// The instance's terminal ROOT variable state (#1739), present when the
+    /// source captured variables and the instance has ended. Replay compares
+    /// its terminal output against this, separately from the stimulus inputs.
+    #[serde(default)]
+    pub terminal_variables: Option<Variables>,
     /// The ordered Tier-2 recorded-input stimulus log. Present only under
     /// `NANOBPMN_TRACE_STIMULI`; `None` otherwise.
     #[serde(default)]

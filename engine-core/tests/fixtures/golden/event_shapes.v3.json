@@ -355,6 +355,7 @@
   "MessageCorrelated.instance_key",
   "MessageCorrelated.message_key",
   "MessageCorrelated.subscription_key",
+  "MessageCorrelated.variables",
   "MessageIntermediateCatchEvent",
   "MessageIntermediateCatchEvent.correlation_key",
   "MessageIntermediateCatchEvent.message_name",

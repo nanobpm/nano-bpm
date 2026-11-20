@@ -358,6 +358,7 @@ mod tests {
                 .collect(),
             incidents: vec![],
             creation_variables: None,
+            terminal_variables: None,
             stimuli: None,
             stimuli_truncated: false,
             domain_signals: vec![],
