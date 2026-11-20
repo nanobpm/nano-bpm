@@ -4406,5 +4406,602 @@
         "Str": "camunda.secrets.TOKEN"
       }
     }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 109
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 109,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "fork": {
+            "end_listeners": [],
+            "id": "fork",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "merge"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "merge"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "gw": {
+            "end_listeners": [],
+            "id": "gw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EventBasedGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "onM1"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "onM2"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "merge": {
+            "end_listeners": [],
+            "id": "merge",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ExclusiveGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "gw"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "onM1": {
+            "end_listeners": [],
+            "id": "onM1",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "MessageIntermediateCatchEvent": {
+                "correlation_key": "=key",
+                "message_name": "M1"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "onM2": {
+            "end_listeners": [],
+            "id": "onM2",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "MessageIntermediateCatchEvent": {
+                "correlation_key": "=key",
+                "message_name": "M2"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "fork"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "twins",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 110,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000029,
+      "instance_key": 111,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 110,
+      "process_id": "twins",
+      "tags": [],
+      "variables": {
+        "key": {
+          "Str": "k"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 112,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 112,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 112,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 112,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 111,
+      "to": "fork"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "fork",
+      "element_instance_key": 113,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "fork",
+      "element_instance_key": 113,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "fork",
+      "element_instance_key": 113,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "fork",
+      "element_instance_key": 113,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 111,
+      "to": "merge"
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 111,
+      "to": "merge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "merge",
+      "element_instance_key": 114,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "merge",
+      "element_instance_key": 114,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "GatewayRouteSelected": {
+      "element_id": "merge",
+      "element_instance_key": 114,
+      "flows": [
+        0
+      ],
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "merge",
+      "element_instance_key": 114,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "merge",
+      "element_instance_key": 114,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "merge",
+      "instance_key": 111,
+      "to": "gw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "merge",
+      "element_instance_key": 115,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "merge",
+      "element_instance_key": 115,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "GatewayRouteSelected": {
+      "element_id": "merge",
+      "element_instance_key": 115,
+      "flows": [
+        0
+      ],
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "merge",
+      "element_instance_key": 115,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "merge",
+      "element_instance_key": 115,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "merge",
+      "instance_key": 111,
+      "to": "gw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "gw",
+      "element_instance_key": 116,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "gw",
+      "element_instance_key": 116,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "gw",
+      "element_instance_key": 117,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "gw",
+      "element_instance_key": 117,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "gw",
+      "element_instance_key": 116,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "gw",
+      "element_instance_key": 116,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "gw",
+      "instance_key": 111,
+      "to": "onM2"
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "gw",
+      "instance_key": 111,
+      "to": "onM1"
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "gw",
+      "element_instance_key": 117,
+      "instance_key": 111
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "gw",
+      "element_instance_key": 117,
+      "instance_key": 111
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "gw",
+      "instance_key": 111,
+      "to": "onM2"
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "gw",
+      "instance_key": 111,
+      "to": "onM1"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "onM2",
+      "element_instance_key": 118,
+      "instance_key": 111,
+      "race": 116,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "onM2",
+      "element_instance_key": 118,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM2",
+      "element_instance_key": 118,
+      "instance_key": 111,
+      "kind": "IntermediateCatch",
+      "message_name": "M2",
+      "subscription_key": 119
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "onM1",
+      "element_instance_key": 120,
+      "instance_key": 111,
+      "race": 116,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "onM1",
+      "element_instance_key": 120,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM1",
+      "element_instance_key": 120,
+      "instance_key": 111,
+      "kind": "IntermediateCatch",
+      "message_name": "M1",
+      "subscription_key": 121
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "onM2",
+      "element_instance_key": 122,
+      "instance_key": 111,
+      "race": 117,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "onM2",
+      "element_instance_key": 122,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM2",
+      "element_instance_key": 122,
+      "instance_key": 111,
+      "kind": "IntermediateCatch",
+      "message_name": "M2",
+      "subscription_key": 123
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "onM1",
+      "element_instance_key": 124,
+      "instance_key": 111,
+      "race": 117,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "onM1",
+      "element_instance_key": 124,
+      "instance_key": 111,
+      "scope": 0
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM1",
+      "element_instance_key": 124,
+      "instance_key": 111,
+      "kind": "IntermediateCatch",
+      "message_name": "M1",
+      "subscription_key": 125
+    }
   }
 ]

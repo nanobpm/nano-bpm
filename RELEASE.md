@@ -65,6 +65,36 @@ with an unpublished boundary warning must not be distributed.
 
 Open a PR titled e.g. `chore(release): gateway v0.0.24 + nano-bernd 0.3.0 + engine-wasm 0.10.0`, converge review, merge.
 
+### 1a. Call out every determinism upgrade boundary in the release notes
+
+Raft members **re-execute** committed commands (ADR 0066, "Rolling upgrade",
+option C), so a release whose previous-release determinism allowlist
+(`engine-core/examples/determinism/divergence-allowlist.json`) carries any
+`"upgrade": "upgrade-boundary"` entry **forbids rolling upgrades across it**:
+a mixed-version cluster spanning that release would journal different events
+for the same command. Since #1702 the cluster-join handshake **enforces** this
+— a member whose version straddles a declared boundary is refused at join with
+a typed `JoinRejection::UpgradeBoundary` error naming both versions and the
+boundary. The boundary table is derived at build time from the append-only
+ledger `engine-core/examples/determinism/upgrade-boundaries.json`, and the build
+fails if a live allowlist `upgrade-boundary` entry is missing from it — so
+ratifying a boundary forces the ledger append, and the later (mandatory)
+allowlist expiry never lifts the join restriction. A peer that advertises no
+version (pre-#1702) is refused by every release build once any boundary exists.
+
+Every `upgrade-boundary` entry **must be called out in the release notes** as:
+"no rolling upgrade across this release; quiesce and upgrade all nodes". The
+`determinism_corpus cross-release` CLI already prints the lines to source this
+from — one per boundary entry:
+
+```
+determinism_corpus: UPGRADE BOUNDARY (no rolling upgrade across this release; call out in the release notes): <entry>
+```
+
+Run it (CI's previous-release determinism gate does) and copy each
+`UPGRADE BOUNDARY` line into the release notes verbatim, with the entry's
+issue link.
+
 ### 2. Tag every bumped train from the merge commit
 
 ```bash

@@ -387,6 +387,11 @@ enum Step {
         /// per flow (#1233). Build flow activations with
         /// [`Engine::take_flow`], never by hand.
         via: Option<IncomingFlow>,
+        /// The event-based gateway element instance whose deferred choice this
+        /// activation arms (#1676), or `None` for any other activation. Carried
+        /// onto [`Event::ElementActivating`] so a race winner withdraws exactly
+        /// the siblings armed by the SAME gateway activation.
+        race: Option<Key>,
     },
     /// Re-run ONLY the catch walk of an [`ErrorEndEvent`](ElementKind::ErrorEndEvent)
     /// parked by an `UNHANDLED_ERROR` incident (#1592). The element already
@@ -1671,6 +1676,7 @@ impl Engine {
             element_id: start_event,
             scope: 0,
             via: None,
+            race: None,
         });
         instance_key
     }
@@ -3885,6 +3891,7 @@ impl Engine {
                             element_id: boundary_id,
                             scope: boundary_scope,
                             via: None,
+                            race: None,
                         });
                     }
                     // Unhandled: the token parks on an incident.
@@ -4746,6 +4753,12 @@ impl Engine {
                 // message arrives, it takes precedence and the message-start-event
                 // instance creation below is suppressed (issue #1156).
                 let mut correlated_to_subscription = false;
+                // Message cardinality (Zeebe `MessageCorrelator`, #1676): one
+                // message correlates to at most ONE subscription per process
+                // instance — the lowest-keyed open one. Two tokens armed on the
+                // same catch (e.g. two activations of one event-based gateway)
+                // are resumed one per message, never both by the first.
+                let mut correlated_instances: BTreeSet<Key> = BTreeSet::new();
 
                 for subscription_key in matched {
                     // A boundary correlation earlier in this batch may have
@@ -4761,6 +4774,9 @@ impl Engine {
                     // no new instance is started from a message start event.
                     correlated_to_subscription = true;
                     let instance_key = subscription.instance_key;
+                    if correlated_instances.contains(&instance_key) {
+                        continue;
+                    }
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
@@ -4780,6 +4796,7 @@ impl Engine {
                         // advance its token inline. This is the only path a
                         // single-partition host ever takes, so its log is
                         // byte-identical to the pre-placement engine.
+                        correlated_instances.insert(instance_key);
                         self.advance_correlated_token(
                             &mut log,
                             &mut queue,
@@ -4799,6 +4816,7 @@ impl Engine {
                         // stable delivery identity (#1497) on THIS (the message)
                         // partition so the instance partition dedups a re-driven
                         // continuation after a lost ack.
+                        correlated_instances.insert(instance_key);
                         let delivery_key = self.mint_key();
                         self.emit(
                             &mut log,
@@ -5631,6 +5649,12 @@ impl Engine {
                 // 4b. Event-based gateway races (#1554): validate where mapped
                 //     catch events land and collect unmapped race members to
                 //     withdraw (exempt from the step-5 mapping requirement).
+                //     The check is keyed by element id, so it cannot tell two
+                //     activations of ONE gateway racing in one scope (#1676)
+                //     apart — it validates the shape; the withdrawal below
+                //     re-keys the persisted per-activation race membership
+                //     (`races`) onto the mapped target gateway, which is what
+                //     the runtime's sibling isolation actually consults.
                 let withdrawn = Self::check_migrated_event_gateway_races(
                     instance_key,
                     &source_def.definition,
@@ -5638,6 +5662,12 @@ impl Engine {
                     &mapped,
                     &active_elements,
                     |eik| self.scope_of(instance_key, eik),
+                    |eik| {
+                        self.state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.races.get(&eik).copied())
+                    },
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
@@ -6023,6 +6053,17 @@ impl Engine {
                     &target_definition,
                     &mapped,
                 )?;
+                // The persisted race membership (#1676) needs NO re-keying
+                // here: the gateway element instance that armed a catch
+                // completes as it arms, so the `races` value is an opaque
+                // per-activation identity, not a live `active` lookup — the
+                // runtime (`withdraw_event_gateway_siblings`) only compares
+                // two catches' identities for EQUALITY. Twin activations of
+                // one gateway keep their distinct identities across the
+                // mapping, so the migrated races stay independent. The
+                // withdrawn members' entries are dropped by their
+                // `ElementCompleted` reducers (`withdraw_catch_instance`
+                // below).
                 let withdrawals: Vec<Event> = withdrawn
                     .into_iter()
                     .flat_map(|(eik, eid)| self.withdraw_catch_instance(instance_key, eik, eid))
@@ -6517,6 +6558,7 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             }
             // Non-interrupting boundary timer: leave the activity (and
@@ -6531,6 +6573,7 @@ impl Engine {
                     element_id: boundary_element_id.clone(),
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
+                    race: None,
                 });
                 // A repeating cycle re-arms for the next interval; a
                 // bounded `Rn/…` cycle stops after its n-th fire
@@ -7058,6 +7101,7 @@ impl Engine {
                         element_id: boundary_element_id,
                         scope,
                         via: None,
+                        race: None,
                     });
                 }
                 // Non-interrupting boundary: leave the activity running and spawn a
@@ -7072,6 +7116,7 @@ impl Engine {
                         element_id: boundary_element_id,
                         scope: self.scope_of(instance_key, element_instance_key),
                         via: None,
+                        race: None,
                     });
                 }
                 state::MessageSubscriptionKind::EventSubProcess {
@@ -7167,6 +7212,7 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             }
             // Non-interrupting boundary subscription: leave the activity (and its
@@ -7182,6 +7228,7 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
+                    race: None,
                 });
             }
             state::MessageSubscriptionKind::EventSubProcess {
@@ -7252,6 +7299,7 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             }
             state::MessageSubscriptionKind::NonInterruptingBoundary {
@@ -7262,6 +7310,7 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
+                    race: None,
                 });
             }
             state::MessageSubscriptionKind::EventSubProcess {
@@ -7841,6 +7890,7 @@ impl Engine {
             element_id,
             scope,
             via: Some(_),
+            ..
         } = step
         else {
             return Vec::new();
@@ -7921,7 +7971,8 @@ impl Engine {
                 element_id,
                 scope,
                 via,
-            } => self.activate(instance_key, element_id, scope, via, pending),
+                race,
+            } => self.activate(instance_key, element_id, scope, via, race, pending),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -8239,7 +8290,7 @@ impl Engine {
                 ..
             } => {
                 debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
-                self.activate(instance_key, element_id, scope, None, pending)
+                self.activate(instance_key, element_id, scope, None, None, pending)
             }
             Step::TriggerEventSubProcess { .. } => {
                 debug_assert!(false, "TriggerEventSubProcess is dispatched by run_with");
@@ -8347,6 +8398,7 @@ impl Engine {
         element_id: String,
         scope: Key,
         via: Option<IncomingFlow>,
+        race: Option<Key>,
         pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
         // A parallel or inclusive gateway with more than one incoming flow is a
@@ -8355,7 +8407,24 @@ impl Engine {
             return self.activate_join(instance_key, element_id, scope, via, join, pending);
         }
         let element_instance_key = self.mint_key();
-        self.activate_with_key(instance_key, element_id, scope, element_instance_key)
+        let (mut events, followups) =
+            self.activate_with_key(instance_key, element_id, scope, element_instance_key);
+        if race.is_some() {
+            // Tag the catch with the gateway activation that armed it (#1676).
+            for event in &mut events {
+                if let Event::ElementActivating {
+                    element_instance_key: eik,
+                    race: tagged,
+                    ..
+                } = event
+                {
+                    if *eik == element_instance_key {
+                        *tagged = race;
+                    }
+                }
+            }
+        }
+        (events, followups)
     }
 
     /// Activates `element_id` with a caller-minted `element_instance_key` (every
@@ -8408,6 +8477,7 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
             scope,
+            race: None,
         }];
         let mut followups = Vec::new();
 
@@ -9611,6 +9681,7 @@ impl Engine {
                     element_id: start_event,
                     scope: element_instance_key,
                     via: None,
+                    race: None,
                 });
             }
             // A triggered event sub-process opens its own token scope and
@@ -9629,6 +9700,7 @@ impl Engine {
                     element_id: start_event,
                     scope: element_instance_key,
                     via: None,
+                    race: None,
                 });
             }
             // A call activity spawns a distinct **child process instance** of its
@@ -9825,6 +9897,7 @@ impl Engine {
                 element_instance_key,
                 element_id: element_id.clone(),
                 scope,
+                race: None,
             },
             Event::ElementActivated {
                 instance_key,
@@ -9872,6 +9945,7 @@ impl Engine {
                 element_instance_key: body_key,
                 element_id: element_id.clone(),
                 scope,
+                race: None,
             },
             // No `ElementActivated` yet: Zeebe's `MultiInstanceBodyProcessor`
             // evaluates the body's input mappings, input collection and boundary
@@ -10313,6 +10387,7 @@ impl Engine {
                             element_instance_key: child_key,
                             element_id: element_id.clone(),
                             scope: body_key,
+                            race: None,
                         },
                         Event::ElementActivated {
                             instance_key,
@@ -10347,6 +10422,7 @@ impl Engine {
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
                 scope: body_key,
+                race: None,
             },
             Event::ElementActivated {
                 instance_key,
@@ -10759,6 +10835,7 @@ impl Engine {
                     element_id: start_event,
                     scope: child_key,
                     via: None,
+                    race: None,
                 });
             }
             // A multi-instance child that is a CALL ACTIVITY parks its token on a
@@ -12476,6 +12553,7 @@ impl Engine {
                 element_instance_key: inner_key,
                 element_id: inner_element_id.clone(),
                 scope: container_key,
+                race: None,
             },
             Event::ElementActivated {
                 instance_key,
@@ -12488,6 +12566,7 @@ impl Engine {
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
                 scope: inner_key,
+                race: None,
             },
             Event::ElementActivated {
                 instance_key,
@@ -12711,6 +12790,7 @@ impl Engine {
                     element_id: start_event,
                     scope: child_key,
                     via: None,
+                    race: None,
                 });
             }
             // A `callActivity` tool (issue #1159): spawn a distinct CHILD PROCESS
@@ -14525,6 +14605,7 @@ impl Engine {
                     element_id: catch_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             }
             return (events, followups);
@@ -14567,7 +14648,9 @@ impl Engine {
         }
 
         let mut followups = Vec::new();
-        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+        for (taken, step) in
+            self.take_completion_flows(instance_key, element_instance_key, &element_id, scope)
+        {
             events.extend(taken);
             followups.push(step);
         }
@@ -14960,6 +15043,7 @@ impl Engine {
                     element_id: catch_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             }
             return (events, followups);
@@ -15004,7 +15088,9 @@ impl Engine {
             &element_id,
             scope,
         ));
-        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+        for (taken, step) in
+            self.take_completion_flows(instance_key, element_instance_key, &element_id, scope)
+        {
             events.extend(taken);
             followups.push(step);
         }
@@ -15068,6 +15154,7 @@ impl Engine {
                         element_id: esp_id,
                         scope: scope_eik,
                         via: None,
+                        race: None,
                     });
                 }
                 return (events, followups);
@@ -15125,6 +15212,7 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
+                    race: None,
                 });
                 let _ = caught_element_id;
             }
@@ -15206,6 +15294,7 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
+                    race: None,
                 });
             }
         }
@@ -15364,6 +15453,7 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
+                    race: None,
                 });
             }
             // Unhandled: raise an `UNHANDLED_ERROR` incident on the end event's
@@ -15546,6 +15636,12 @@ impl Engine {
         };
         // Every active element instance of a losing sibling in this token scope.
         // Sorted by element-instance key for a deterministic, replay-stable log.
+        // The winner's race (#1676): when it was armed by a recorded gateway
+        // activation, only catches of that SAME activation are its siblings —
+        // another activation of the gateway in this scope races on its own.
+        // A catch armed before races were journaled carries none and falls back
+        // to the element-id + scope match.
+        let race = instance.races.get(&winner_eik).copied();
         let mut losers: Vec<(Key, String)> = instance
             .active
             .iter()
@@ -15553,6 +15649,7 @@ impl Engine {
                 **eik != winner_eik
                     && sibling_ids.contains(&eid.as_str())
                     && self.scope_of(instance_key, **eik) == scope
+                    && race.is_none_or(|r| instance.races.get(eik) == Some(&r))
             })
             .map(|(eik, eid)| (*eik, eid.clone()))
             .collect();
@@ -17047,8 +17144,37 @@ impl Engine {
                 element_id: to,
                 scope,
                 via: Some(flow),
+                race: None,
             },
         )
+    }
+
+    /// The outgoing flows a completing flow-node element instance takes
+    /// ([`Engine::take_all_flows`]) — the one implementation shared by
+    /// `complete` and `finalize_completion`. An event-based gateway arms its
+    /// targets as ONE deferred-choice race identified by the gateway's element
+    /// instance (#1676), so each activation it queues carries that `race`: a
+    /// second activation of the same gateway in the same scope arms a separate
+    /// race and never withdraws (or is withdrawn by) the first.
+    fn take_completion_flows(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Vec<(Vec<Event>, Step)> {
+        let race = matches!(
+            self.element_kind(instance_key, element_id),
+            Some(ElementKind::EventBasedGateway)
+        )
+        .then_some(element_instance_key);
+        let mut flows = self.take_all_flows(instance_key, element_id, scope);
+        for (_, step) in &mut flows {
+            if let Step::Activate { race: slot, .. } = step {
+                *slot = race;
+            }
+        }
+        flows
     }
 
     /// [`Engine::take_flow`] for every outgoing flow of `from`, in execution
@@ -17152,6 +17278,7 @@ impl Engine {
                     element_instance_key: eik,
                     element_id: element_id.clone(),
                     scope,
+                    race: None,
                 });
                 // #1437: a join bypasses `activate_with_key`, so the
                 // listener-scope registration there never runs for it — register
@@ -17258,6 +17385,7 @@ impl Engine {
                 element_id,
                 scope: step_scope,
                 via: Some(_),
+                ..
             } if *key == instance_key && *step_scope == scope && element_id != join => {
                 Some(element_id.as_str())
             }

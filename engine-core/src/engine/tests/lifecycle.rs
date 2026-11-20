@@ -2292,6 +2292,7 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         element_id: "inner".to_string(),
         scope: sub_eik,
         via: None,
+        race: None,
     };
 
     // While the scope is live the guard admits the activation.
@@ -2315,6 +2316,7 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         element_id: "after".to_string(),
         scope: 0,
         via: None,
+        race: None,
     }));
 }
 
@@ -4363,6 +4365,92 @@ fn local_variable_write_stays_in_the_target_scope() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, child);
     assert!(writes[0].1.contains_key("a"));
+}
+
+#[test]
+fn an_equal_value_local_does_not_capture_a_propagating_write() {
+    // #1711 / Zeebe `VariableBehavior.mergeDocument`: a scope consumes a
+    // propagating entry only when it holds the name with a DIFFERENT value. An
+    // equal-valued local emits no record AND does not stop the walk — the
+    // write propagates to the nearest ancestor holding a different value.
+    // Scenario: a parallel-MI child seeds a local `result: null`
+    // (outputElement) while the process scope holds `result: 85`; the child
+    // completes with `{"result": null}` and Zeebe emits
+    // `VARIABLE UPDATED result = null` at the PROCESS scope.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("result", Value::Int(85))]),
+        },
+    );
+    let child: Key = 900_005;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("result", Value::Null)]),
+        },
+    );
+
+    // The child's null local equals the written null: no child-scope record,
+    // and the write reaches the root, which holds a different value (85).
+    let writes =
+        engine.propagate_variables(key, child, vars(&[("result", Value::Null)]), false, &[]);
+    assert_eq!(
+        writes,
+        vec![(key, vars(&[("result", Value::Null)]))],
+        "the null write must update the root scope, not die at the equal-valued child local"
+    );
+}
+
+#[test]
+fn an_equal_value_at_every_scope_emits_no_write() {
+    // The same walk must still drop a write when NO scope on the chain would
+    // change: an equal value at the root, no descendant re-defining it — the
+    // root would be rewritten with the same value, so nothing is emitted
+    // (Zeebe `setLocalVariable` writes no record for an equal value, #1537).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(7))]),
+        },
+    );
+    let child: Key = 900_006;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    let events = engine.propagated_updates(key, child, vars(&[("x", Value::Int(7))]), false, &[]);
+    assert!(
+        events.is_empty(),
+        "an equal value at every scope emits no record, got {events:?}"
+    );
 }
 
 #[test]

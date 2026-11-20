@@ -611,6 +611,8 @@ async fn cluster_ws_handler(
         header(cluster_join::CLUSTER_PARTITIONS_HEADER),
         header(cluster_join::CLUSTER_FEATURES_HEADER),
         &required,
+        &cluster_join::local_version_header(),
+        header(cluster_join::CLUSTER_VERSION_HEADER),
     ) {
         use axum::response::IntoResponse as _;
         tracing::warn!("refusing /cluster join: {rejection}");
@@ -620,15 +622,26 @@ async fn cluster_ws_handler(
         .server
         .advertise_cluster_features
         .load(std::sync::atomic::Ordering::Relaxed);
+    let advertise_version = state
+        .server
+        .advertise_cluster_version
+        .load(std::sync::atomic::Ordering::Relaxed);
     let worker = params.worker.unwrap_or_default();
     let mut response = ws.on_upgrade(move |socket| handle_socket(socket, state, worker));
-    // Answer with our own partition count + features so the dialer can refuse
-    // a mismatch from its side and learn what we can decode.
+    // Answer with our own partition count + features + version so the dialer
+    // can refuse a mismatch from its side and learn what we can decode.
     let response_headers = response.headers_mut();
     if advertise_features
         && let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_features_header())
     {
         response_headers.insert(cluster_join::CLUSTER_FEATURES_HEADER, value);
+    }
+    // The version header has its OWN advertisement gate (#1702): a test clears
+    // it to model a pre-#1702 binary, independently of feature negotiation.
+    if advertise_version
+        && let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_version_header())
+    {
+        response_headers.insert(cluster_join::CLUSTER_VERSION_HEADER, value);
     }
     response_headers.insert(
         cluster_join::CLUSTER_PARTITIONS_HEADER,

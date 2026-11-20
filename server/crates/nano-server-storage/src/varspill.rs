@@ -1831,6 +1831,7 @@ mod tests {
                 parked_joins: Default::default(),
                 activating: Default::default(),
                 gateway_routes: BTreeMap::new(),
+                races: BTreeMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),

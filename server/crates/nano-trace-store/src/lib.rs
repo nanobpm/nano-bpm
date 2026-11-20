@@ -661,6 +661,7 @@ impl Inner {
                 element_instance_key,
                 element_id,
                 scope,
+                ..
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
@@ -1919,6 +1920,7 @@ mod tests {
                 element_instance_key: 3,
                 element_id: "task".into(),
                 scope: 2,
+                race: None,
             }],
             1010,
         );
@@ -1930,6 +1932,7 @@ mod tests {
                 element_instance_key: 3,
                 element_id: "task".into(),
                 scope: 0,
+                race: None,
             }],
             1020,
         );

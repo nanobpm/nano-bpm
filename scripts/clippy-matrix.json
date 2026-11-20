@@ -149,6 +149,15 @@
       "scope": "all-targets",
       "features": [],
       "why": "not(feature = \"console\") code in nano-server-storage: in every workspace run nano-server-console's dependency forces `console` on (Cargo feature unification), so only an isolated package run compiles it off."
+    },
+    {
+      "id": "server-falcon-protocol-isolated",
+      "job": "server",
+      "dir": "server/crates/nano-falcon-protocol",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"test-hooks\") code in nano-falcon-protocol: the gateway binary's dev-dependencies force `test-hooks` on (Cargo feature unification) in every workspace run, so only an isolated package run compiles the production (test-hooks-off) path."
     }
   ],
   "excludedCrates": {

@@ -639,6 +639,14 @@ impl Engine {
     /// ancestor scope (from the target upward) that already defines it; a name
     /// defined nowhere is created in the root scope. Root-only instances collapse
     /// to a single root write, matching the flat engine.
+    ///
+    /// The walk mirrors Zeebe `VariableBehavior.mergeDocument` exactly: at each
+    /// scope, from the target up to (and including) the root, a name the scope
+    /// holds with a DIFFERENT value is written there (UPDATED) and stops; a name
+    /// the scope holds with an EQUAL value is NOT consumed — no record, and the
+    /// name keeps propagating to the parent (#1711: a null completion value
+    /// equal to an MI child's null-valued local still updates the process-scope
+    /// `result` above it). A name no ancestor holds is CREATED at the root.
     pub(crate) fn propagate_variables(
         &self,
         instance_key: Key,
@@ -678,11 +686,51 @@ impl Engine {
         }
         let mut by_scope: BTreeMap<Key, BTreeMap<String, Value>> = BTreeMap::new();
         for (name, value) in variables {
-            let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
-            if unchanged(dest, &name, &value) {
-                continue;
+            // Walk from the target scope upward. A scope holding the name with
+            // an equal value does NOT capture the write (Zeebe consumes an
+            // entry only when its value differs, #1711); the name keeps
+            // propagating until a scope holds it with a different value, or
+            // the root creates it. With suppression disabled (a job of the
+            // instance still holds secret provenance, #1640) an equal value
+            // DOES capture — the write is kept so revocation stays a
+            // replayable effect.
+            let mut dest = None;
+            let mut cur = target;
+            loop {
+                let holds = if cur == root {
+                    instance.variables.contains_key(&name)
+                } else {
+                    instance
+                        .scope_variables
+                        .get(&cur)
+                        .is_some_and(|m| m.contains_key(&name))
+                };
+                if holds && !unchanged(cur, &name, &value) {
+                    dest = Some(cur);
+                    break;
+                }
+                if cur == root {
+                    break;
+                }
+                match instance.scope_parents.get(&cur) {
+                    Some(&parent) if parent != cur => cur = parent,
+                    _ => break,
+                }
             }
-            by_scope.entry(dest).or_default().insert(name, value);
+            // No scope captured the write. Either the name is new everywhere —
+            // the root creates it — or the walk ended at the ROOT holding an
+            // equal value (suppression on), in which case nothing is emitted
+            // (Zeebe `setLocalVariable` writes no record for an equal value,
+            // #1537). With suppression disabled an equal value captures at its
+            // scope, so a `None` there can only mean "new everywhere".
+            let dest = match dest {
+                Some(scope) => Some(scope),
+                None if suppress && unchanged(root, &name, &value) => None,
+                None => Some(root),
+            };
+            if let Some(dest) = dest {
+                by_scope.entry(dest).or_default().insert(name, value);
+            }
         }
         by_scope.into_iter().collect()
     }
@@ -824,38 +872,6 @@ impl Engine {
                 .get(&scope)
                 .and_then(|m| m.get(name))
         })
-    }
-
-    /// The nearest scope (from `scope` upward to the root) that already defines
-    /// `name`, or `None` if no scope in the chain holds it.
-    fn scope_defining(
-        &self,
-        instance: &crate::state::ProcessInstance,
-        scope: Key,
-        name: &str,
-    ) -> Option<Key> {
-        let root = instance.key;
-        let mut cur = scope;
-        loop {
-            let holds = if cur == root {
-                instance.variables.contains_key(name)
-            } else {
-                instance
-                    .scope_variables
-                    .get(&cur)
-                    .is_some_and(|m| m.contains_key(name))
-            };
-            if holds {
-                return Some(cur);
-            }
-            if cur == root {
-                return None;
-            }
-            match instance.scope_parents.get(&cur) {
-                Some(&parent) if parent != cur => cur = parent,
-                _ => return None,
-            }
-        }
     }
 
     /// Resolves a job's type at job-creation time (Zeebe

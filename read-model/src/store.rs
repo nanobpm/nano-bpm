@@ -5272,6 +5272,7 @@ fn project_event(
             element_instance_key,
             element_id,
             scope,
+            ..
         } => {
             // A token parked in `ACTIVATING` on an activation-time incident
             // never emits `ElementActivated`, so stamp its scope here. `0` is
@@ -8430,6 +8431,7 @@ mod writability_tests {
             parked_joins: Default::default(),
             activating: Default::default(),
             gateway_routes: Default::default(),
+            races: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -8934,6 +8936,7 @@ mod definition_xml_tests {
             parked_joins: Default::default(),
             activating: Default::default(),
             gateway_routes: Default::default(),
+            races: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -9201,6 +9204,7 @@ mod definition_xml_tests {
             parked_joins: Default::default(),
             activating: Default::default(),
             gateway_routes: Default::default(),
+            races: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -12049,6 +12053,7 @@ mod element_instance_tests {
             element_instance_key: TASK_EI,
             element_id: "t".to_string(),
             scope,
+            race: None,
         };
         store.export(&[&activating(77)]).unwrap();
         assert_eq!(store.element_instance(TASK_EI).unwrap().scope_key, 77);
@@ -12070,6 +12075,7 @@ mod element_instance_tests {
                     element_instance_key: TASK_EI,
                     element_id: "t".to_string(),
                     scope: 0,
+                    race: None,
                 },
                 &Event::ElementActivated {
                     instance_key: INST,

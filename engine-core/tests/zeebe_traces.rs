@@ -983,6 +983,7 @@ impl<'a> NanoRun<'a> {
                 element_instance_key,
                 element_id,
                 scope,
+                ..
             } => {
                 let flow_scope = if *scope == 0 { *instance_key } else { *scope };
                 self.flow_scopes.insert(*element_instance_key, flow_scope);
@@ -3790,6 +3791,7 @@ fn multi_instance_body_outgoing_flow_uses_the_enclosing_scope() {
         element_instance_key: eik,
         element_id: "mi".into(),
         scope,
+        race: None,
     };
     run.render(&activating(body, sub));
     run.render(&activating(child, body));

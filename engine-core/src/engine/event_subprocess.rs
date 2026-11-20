@@ -539,6 +539,7 @@ impl Engine {
             element_id: esp_element_id,
             scope: scope_eik,
             via: None,
+            race: None,
         });
     }
 
