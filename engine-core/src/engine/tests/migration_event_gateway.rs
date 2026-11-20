@@ -392,11 +392,18 @@ fn migration_race_check_treats_each_scope_as_its_own_race() {
         (20, "t1".to_string()),
         (21, "t2".to_string()),
     ];
-    let mut withdrawn =
-        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |eik| {
-            eik / 10
-        })
-        .unwrap();
+    let mut withdrawn = Engine::check_migrated_event_gateway_races(
+        1,
+        &source,
+        &target,
+        &mapped,
+        &active,
+        |eik| eik / 10,
+        // No persisted race identity in this fixture: every catch falls back
+        // to the element-id + scope grouping.
+        |_| None,
+    )
+    .unwrap();
     withdrawn.sort();
     assert_eq!(withdrawn, [(11, "t2".to_string()), (21, "t2".to_string())]);
 }
@@ -433,9 +440,16 @@ fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
         (11, "a2".to_string()),
         (12, "s".to_string()),
     ];
-    let err =
-        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |_| 1)
-            .unwrap_err();
+    let err = Engine::check_migrated_event_gateway_races(
+        1,
+        &source,
+        &target,
+        &mapped,
+        &active,
+        |_| 1,
+        |_| None,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, EngineError::UnsupportedMigration { .. }),
         "{err:?}"
@@ -451,16 +465,31 @@ fn migration_race_check_rejects_paused_gateways_merged_onto_one_target() {
     let mapped: BTreeMap<String, String> =
         pairs(&[("gwA", "gw"), ("gwB", "gw")]).into_iter().collect();
     let active = vec![(10, "gwA".to_string()), (11, "gwB".to_string())];
-    let err =
-        Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |_| 1)
-            .unwrap_err();
+    let err = Engine::check_migrated_event_gateway_races(
+        1,
+        &source,
+        &target,
+        &mapped,
+        &active,
+        |_| 1,
+        |_| None,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, EngineError::UnsupportedMigration { .. }),
         "{err:?}"
     );
     // In separate scopes they are separate races.
-    Engine::check_migrated_event_gateway_races(1, &source, &target, &mapped, &active, |k| k)
-        .unwrap();
+    Engine::check_migrated_event_gateway_races(
+        1,
+        &source,
+        &target,
+        &mapped,
+        &active,
+        |k| k,
+        |_| None,
+    )
+    .unwrap();
 }
 
 /// Copilot #1564: the migration fact reports a withdrawn member's
@@ -596,4 +625,105 @@ fn race_index_excludes_private_catch_of_gateway_with_two_incoming_flows() {
     assert!(index.owner_of("private").is_none());
     assert!(index.members_of(def.element("gw2").unwrap()).is_empty());
     assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
+}
+
+/// start -> fork(and) => merge(xor) -> gw(event-based) -> { onM1 | onM2 } -> end
+///
+/// Two activations of ONE gateway race independently in the root scope
+/// (#1676); `sfx` renames every element so a migration maps the race onto new
+/// ids. The persisted per-activation race membership must follow the mapping:
+/// a winner of one migrated race withdraws only ITS OWN sibling, never the
+/// other race's.
+fn twin_gateway_race(id: &str, sfx: &str) -> ProcessDefinition {
+    let e = |n: &str| format!("{n}{sfx}");
+    ProcessBuilder::new(id)
+        .start_event(e("start"))
+        .parallel_gateway(e("fork"))
+        .exclusive_gateway(e("merge"))
+        .event_based_gateway(e("gw"))
+        .message_intermediate_catch_event(e("onM1"), "M1", "=key")
+        .message_intermediate_catch_event(e("onM2"), "M2", "=key")
+        .end_event(e("end"))
+        .connect(e("start"), e("fork"))
+        .connect(e("fork"), e("merge"))
+        .connect(e("fork"), e("merge"))
+        .connect(e("merge"), e("gw"))
+        .connect(e("gw"), e("onM1"))
+        .connect(e("gw"), e("onM2"))
+        .connect(e("onM1"), e("end"))
+        .connect(e("onM2"), e("end"))
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn migration_rekeys_persisted_race_membership_per_activation() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, twin_gateway_race("source", ""));
+    let target_key = deploy_for_migration(&mut engine, twin_gateway_race("target", "2"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("key", Value::Str("k".into()))]),
+    );
+    // Two races armed: four catches, two per gateway activation.
+    assert_eq!(engine.instance(inst).unwrap().races.len(), 4);
+
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[
+                ("start", "start2"),
+                ("fork", "fork2"),
+                ("merge", "merge2"),
+                ("gw", "gw2"),
+                ("onM1", "onM12"),
+                ("onM2", "onM22"),
+                ("end", "end2"),
+            ]),
+        ))
+        .unwrap();
+
+    // The persisted membership survived the mapping: still two DISTINCT races
+    // (the two gateway activations), each with two members. The identity is
+    // the arming gateway activation's element-instance key — an opaque
+    // per-activation value the runtime compares for equality, not a live
+    // `active` lookup (the gateway completes as it arms its catches).
+    let races = &engine.instance(inst).unwrap().races;
+    assert_eq!(
+        races.len(),
+        4,
+        "every armed catch keeps its race: {races:?}"
+    );
+    let distinct: BTreeSet<Key> = races.values().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "two independent races survive the migration: {races:?}"
+    );
+
+    // A winner of one migrated race withdraws only its own sibling: the other
+    // race still runs and can be won by the second message.
+    let first = engine
+        .apply_command(Command::correlate_message("M1", "k"))
+        .unwrap();
+    assert_eq!(completions(&first, "onM12"), 1, "M1 wins one migrated race");
+    assert_eq!(
+        completions(&first, "onM22"),
+        1,
+        "only the winning race's sibling is withdrawn"
+    );
+    let second = engine
+        .apply_command(Command::correlate_message("M2", "k"))
+        .unwrap();
+    assert_eq!(
+        completions(&second, "onM22"),
+        1,
+        "the surviving race is still winnable after migration"
+    );
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Completed
+    );
 }

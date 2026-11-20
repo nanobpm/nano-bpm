@@ -854,6 +854,7 @@ impl Engine {
                     element_id: planned.element_id,
                     scope,
                     via: None,
+                    race: None,
                 });
             } else {
                 self.activate_with_local_variables(
@@ -911,6 +912,7 @@ impl Engine {
                 element_instance_key: key,
                 element_id: element_id.clone(),
                 scope: parent,
+                race: None,
             },
             Event::ElementActivated {
                 instance_key,
@@ -1060,6 +1062,7 @@ impl Engine {
                 element_instance_key: eik,
                 element_id: element_id.clone(),
                 scope,
+                race: None,
             },
         );
         // A multi-instance body becomes ACTIVATED in its fan-out
@@ -1124,6 +1127,7 @@ impl Engine {
             element_id: element_id.clone(),
             scope,
             via: None,
+            race: None,
         };
         if self.step_targets_dead_scope(&step) {
             return;
