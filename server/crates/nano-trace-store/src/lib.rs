@@ -638,6 +638,41 @@ impl Inner {
                     }
                 }
             }
+            Event::ScopedVariablesUpdated {
+                instance_key,
+                variables,
+                ..
+            } => {
+                // A scope-local payload (Part C hierarchical scoping) — e.g. an
+                // output-mapped message-boundary payload propagated to its flow
+                // scope (#1535). The running `current_variables` merge tracks
+                // the ROOT scope only, so it stays on `VariablesUpdated`; but
+                // the stimulus attribution must capture this delta too, or an
+                // output-mapped boundary's payload is lost from the recorded
+                // inputs and the trace cannot reproduce the mapping on replay.
+                if self.capture_stimuli
+                    && let Some(t) = self.instances.get_mut(instance_key)
+                {
+                    t.last_at = now;
+                    let snap = snapshot_vars(variables, self.vars_max_bytes);
+                    match t.pending_stimulus.take() {
+                        Some(idx) => {
+                            if let Some(s) = t.stimuli.as_mut().and_then(|v| v.get_mut(idx)) {
+                                s.variables = Some(snap);
+                            }
+                        }
+                        None => {
+                            t.record_stimulus(
+                                "variablesSet",
+                                None,
+                                Some(snap),
+                                now,
+                                self.stimuli_max,
+                            );
+                        }
+                    }
+                }
+            }
             Event::ElementActivating {
                 instance_key,
                 element_instance_key,
@@ -1635,6 +1670,17 @@ mod tests {
         }
     }
 
+    fn scoped_vars_updated(key: u64, scope_key: u64, vars: &[(&str, Value)]) -> Event {
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key,
+            variables: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
     #[test]
     fn stimuli_off_keeps_no_log() {
         // Tier 1 only: variables captured, but no recorded-input log.
@@ -1742,6 +1788,47 @@ mod tests {
 
         assert_eq!(stimuli[2].kind, "timer");
         assert!(stimuli[2].variables.is_none(), "timer carries no payload");
+    }
+
+    /// #1535 (review): an output-mapped message boundary propagates its payload
+    /// to the flow scope as `ScopedVariablesUpdated` (not `VariablesUpdated`).
+    /// The stimulus attribution must capture that delta, or the payload is lost
+    /// from the recorded inputs and the trace cannot reproduce the mapping.
+    #[test]
+    fn output_mapped_message_boundary_payload_is_captured() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        // A message boundary correlates, then its output-mapped payload lands
+        // in the boundary's flow scope via ScopedVariablesUpdated.
+        store.ingest(
+            &[
+                &Event::MessageCorrelated {
+                    subscription_key: 5,
+                    message_key: 6,
+                    instance_key: 1,
+                    element_instance_key: 3,
+                    element_id: "msg-boundary".into(),
+                },
+                &scoped_vars_updated(1, 3, &[("mappedReason", Value::Str("r-1".into()))]),
+            ],
+            1030,
+        );
+
+        let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
+        assert_eq!(stimuli.len(), 1);
+        assert_eq!(stimuli[0].kind, "message");
+        assert_eq!(stimuli[0].reference.as_deref(), Some("msg-boundary"));
+        assert_eq!(
+            stimuli[0]
+                .variables
+                .as_ref()
+                .unwrap()
+                .values
+                .as_ref()
+                .unwrap()["mappedReason"],
+            serde_json::json!("r-1"),
+            "the scope-local payload is attributed to the message correlation"
+        );
     }
 
     #[test]

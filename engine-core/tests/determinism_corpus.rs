@@ -475,6 +475,92 @@ fn prev_release_gate_allowlisted_scenario_admits_only_the_declared_divergence() 
     assert!(err.contains("STALE") && err.contains("at or past"), "{err}");
 }
 
+/// #1535 / #1632: a behavioural change that REPLACES one event with another
+/// (termination-for-completion) or newly populates a golden-added field
+/// (adhoc `ElementActivating.scope`) is ratified by `variant_substitutions` /
+/// `field_overrides`, and the new variant is not rejected as undeclared when
+/// the scenario declares it in `only_in_head`.
+#[test]
+fn prev_release_gate_variant_substitution_and_field_override() {
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    // An entry whose events include BOTH an `ElementCompleted` (the
+    // substitution source) and an `ElementActivated` (the field-override
+    // target), so one entry exercises both mechanisms.
+    let i = {
+        let scenarios = labels();
+        head.iter()
+            .filter(|r| r.get("state").is_none())
+            .enumerate()
+            .find(|(idx, r)| {
+                scenarios[*idx] == scenario
+                    && r.get("events")
+                        .and_then(|e| e.as_array())
+                        .is_some_and(|ev| {
+                            ev.iter().any(|e| e.get("ElementCompleted").is_some())
+                                && ev.iter().any(|e| e.get("ElementActivated").is_some())
+                        })
+            })
+            .map(|(idx, _)| idx)
+            .expect("an entry with both ElementCompleted and ElementActivated")
+    };
+
+    // --- variant_substitutions: prev completes what head terminates. Build a
+    // prev that renames head's ElementCompleted -> ElementTerminated on the
+    // entry, so head has ElementCompleted only and prev has ElementTerminated
+    // only for the same entity.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            let obj = e.as_object_mut().unwrap();
+            if let Some(body) = obj.remove("ElementCompleted") {
+                obj.insert("ElementTerminated".to_owned(), body);
+            }
+        }
+    }
+    // Undeclared: the substitution is a divergence (the new variant is not
+    // golden-added here, so it surfaces as a plain per-entry divergence).
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
+    assert!(err.contains(&format!("scenario {scenario}")), "{err}");
+    // Declared via only_in_head/only_in_prev + variant_substitutions: passes.
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {
+            "only_in_prev": [{"variant": "ElementTerminated"}],
+            "only_in_head": [{"variant": "ElementCompleted"}],
+            "variant_substitutions": [{"prev": "ElementTerminated", "head": "ElementCompleted"}]
+        },
+        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let report = checked(&head, &prev, allow, &["ElementTerminated"]).unwrap();
+    assert_eq!(report.ratified_divergent_entries, 1);
+
+    // --- field_overrides: head populates a golden-added field prev decodes
+    // to the default. Give head's ElementActivated a non-zero scope where prev
+    // has none (decodes to 0).
+    let mut head2 = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut head2)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(body) = e.get_mut("ElementActivated") {
+                body["scope"] = serde_json::json!(123u64);
+            }
+        }
+    }
+    // Undeclared: the populated field is a real divergence.
+    let err = checked(&head2, &head, no_allowlist(), &["ElementActivated.scope"]).unwrap_err();
+    assert!(err.contains(&format!("scenario {scenario}")), "{err}");
+    // Declared via field_overrides: passes.
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {"field_overrides": [{"variant": "ElementActivated", "field": "scope", "value": 0}]},
+        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let report = checked(&head2, &head, allow, &["ElementActivated.scope"]).unwrap();
+    assert_eq!(report.ratified_divergent_entries, 1);
+}
+
 /// #1698 (review): `remint_keys` rewrites every key reference to the identity
 /// of the entity it references (from that side's own creation events), so a
 /// clean re-mint (a bijection on keys, the #1244 fork order) reconciles while
