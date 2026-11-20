@@ -97,6 +97,14 @@ jobs:
         uses: ./.github/actions/engine-wasm-pkg
       - name: Report + ratchet unit tests
         run: node --test formal/parity/coverage/*.test.mjs
+      - name: Resolve pinned JaCoCo version
+        id: jacoco
+        run: echo "version=$(sed -n 's/^JACOCO_VERSION="\(.*\)"$/\1/p' formal/parity/coverage/zeebe-coverage.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          # SHA-256-verified by zeebe-coverage.sh on every use (#1770).
+          path: ~/.cache/nanobpm-jacoco
+          key: jacoco-${{ steps.jacoco.outputs.version }}
       - name: Measure zeebe/engine coverage while the corpus runs
         run: formal/parity/coverage/zeebe-coverage.sh "$RUNNER_TEMP/zeebe-jacoco.xml" ci
       - name: Report (tagged against the coverage matrix) + ratchet

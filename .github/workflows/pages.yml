@@ -99,7 +99,7 @@ jobs:
           set -euo pipefail
           src="https://raw.githubusercontent.com/nanobpm/nano-workforce/main/install.sh"
           out="website/_site/install.sh"
-          curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$src"
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$out" "$src"
           head -n1 "$out" | grep -q '^#!/bin/sh' || { echo "::error::mirrored install.sh has no #!/bin/sh shebang"; exit 1; }
           bytes=$(wc -c < "$out")
           [ "$bytes" -ge 2000 ] || { echo "::error::mirrored install.sh implausibly small (${bytes} bytes)"; exit 1; }
