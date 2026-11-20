@@ -1819,6 +1819,108 @@ fn prev_release_gate_mi_child_identity_is_order_independent() {
         .expect("a pure reorder of an MI child's sightings reconciles");
 }
 
+/// #1528 (review): a NESTED multi-instance — the same inner MI element active
+/// under several outer children — activates one inner body per outer child, and
+/// every inner body's generic activation names the same (instance, element id).
+/// An encounter-order ordinal on that base would swap the two bodies'
+/// identities when a ratified `reorder` permutes the entry, failing a valid
+/// `reorder` + `remint_keys` comparison; the bodies' identities must be derived
+/// from their canonical PARENT SCOPE (the outer child) instead, so the reorder
+/// reconciles.
+#[test]
+fn prev_release_gate_nested_mi_body_identity_is_order_independent() {
+    // A self-contained entry: an instance whose outer MI body (element `outer`)
+    // activates two children, each activating an inner MI body (element
+    // `inner`) with one child of its own. `prev` is the SAME events reversed —
+    // a pure reorder — so the inner bodies' activations arrive in the opposite
+    // order. With `reorder` + `remint_keys` declared, the two must reconcile:
+    // each inner body's canonical identity is derived from its outer child's
+    // identity, not from which body activation was folded first.
+    let entry = |order: &[&str]| -> serde_json::Value {
+        let events: Vec<serde_json::Value> = order
+            .iter()
+            .map(|kind| match *kind {
+                "create" => serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+                "outer_body" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":11,"instance_key":10,"scope":0}}),
+                "outer_child0" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":12,"instance_key":10,"scope":11}}),
+                "outer_child0_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":12,"index":0,"instance_key":10,"local_variables":{}}}),
+                "outer_child1" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":13,"instance_key":10,"scope":11}}),
+                "outer_child1_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":13,"index":1,"instance_key":10,"local_variables":{}}}),
+                // The same inner MI element, one body per outer child: both
+                // generic activations name (instance 10, element `inner`) — an
+                // encounter-order ordinal cannot tell them apart.
+                "inner_body0" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":14,"instance_key":10,"scope":12}}),
+                "inner_child0" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":15,"instance_key":10,"scope":14}}),
+                "inner_child0_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":14,"child_key":15,"index":0,"instance_key":10,"local_variables":{}}}),
+                "inner_body1" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":16,"instance_key":10,"scope":13}}),
+                "inner_child1" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":17,"instance_key":10,"scope":16}}),
+                "inner_child1_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":16,"child_key":17,"index":0,"instance_key":10,"local_variables":{}}}),
+                other => panic!("unknown event {other}"),
+            })
+            .collect();
+        serde_json::json!({"i": 0, "events": events})
+    };
+    let forward = entry(&[
+        "create",
+        "outer_body",
+        "outer_child0",
+        "outer_child0_mi",
+        "inner_body0",
+        "inner_child0",
+        "inner_child0_mi",
+        "outer_child1",
+        "outer_child1_mi",
+        "inner_body1",
+        "inner_child1",
+        "inner_child1_mi",
+    ]);
+    let reversed = entry(&[
+        "inner_child1_mi",
+        "inner_child1",
+        "inner_body1",
+        "outer_child1_mi",
+        "outer_child1",
+        "inner_child0_mi",
+        "inner_child0",
+        "inner_body0",
+        "outer_child0_mi",
+        "outer_child0",
+        "outer_body",
+        "create",
+    ]);
+    // One state checkpoint each (same format) so the state comparison is live —
+    // a real snapshot from a corpus run, so it decodes under the head type.
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![forward, state()];
+    let prev = vec![reversed, state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx).expect(
+        "a pure reorder of a nested loop's body activations reconciles: each inner \
+         body's identity is derived from its canonical parent scope (its outer child)",
+    );
+}
+
 /// #1528 (review): the mint bypass for an MI child's generic re-sighting is
 /// restricted to that lifecycle — a key reused for an UNRELATED entity (a
 /// `UserTaskCreated` reusing its child's key, or a child reusing a job key)

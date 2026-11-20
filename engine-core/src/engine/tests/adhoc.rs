@@ -2421,10 +2421,10 @@ fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::ElementCompleted { element_instance_key, element_id, .. }
+            Event::ElementTerminated { element_instance_key, element_id, .. }
                 if *element_instance_key == ask && element_id == "ask"
         )),
-        "the open body user-task element instance is torn down, not orphaned; events: {events:?}"
+        "the open body user-task element instance is torn down (TERMINATED — cancelled, not completed; #1528 review), not orphaned; events: {events:?}"
     );
     // The parked human task inside the body must be explicitly cancelled, not
     // just its element instance completed — otherwise the `user_tasks` entry
@@ -3804,15 +3804,16 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
         )),
         "the nested container's in-flight leaf job was cancelled; events: {events:?}"
     );
-    // The leaf descendant's element instance was completed — not left orphaned in
-    // the read-model element-instance tree.
+    // The leaf descendant's element instance was terminated (cancelled, not
+    // completed — #1528 review) — not left orphaned in the read-model
+    // element-instance tree.
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::ElementCompleted { element_instance_key, element_id, .. }
+            Event::ElementTerminated { element_instance_key, element_id, .. }
                 if *element_instance_key == leaf && element_id == "leaf"
         )),
-        "the nested container's leaf element instance was completed; events: {events:?}"
+        "the nested container's leaf element instance was terminated; events: {events:?}"
     );
     assert!(engine.is_completed(inst), "the whole instance completes");
     assert!(

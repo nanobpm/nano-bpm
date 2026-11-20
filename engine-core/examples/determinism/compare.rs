@@ -1114,9 +1114,18 @@ impl KeyIds {
     /// does not depend on which sighting order the entry's events arrived in
     /// (#1528 review: an MI child's generic `ElementActivating` and its
     /// `MultiInstanceChildActivated` must yield ONE identity either way).
-    /// A key already carrying a DIFFERENT base is a collision and fails
-    /// closed — a `UserTaskCreated` reusing its child's key, or a child
-    /// reusing a job key, is an inconsistent mint, not a re-sighting.
+    ///
+    /// The re-sighting is consistent — and a key already carrying a DIFFERENT
+    /// entity is a collision that fails closed — decided by EXACT identity
+    /// (a `resight` base never carries an ordinal suffix), with ONE tolerance:
+    /// the existing identity may be the same base plus an ordinal suffix a
+    /// prior ordinal `mint` assigned (`{base}#{n}`). The segments of an
+    /// identity themselves contain `#` (an instance base is
+    /// `instance:{pid}#{n}`, an `mi-child:…` identity ends in the child index),
+    /// so a naive `rsplit_once('#')` base comparison would both accept an
+    /// unrelated entity that differs only in its trailing segment AND reject
+    /// this exact re-sighting of a minted identity — compare the whole string
+    /// instead (#1528 review).
     fn resight(&mut self, key: u64, base: &str) -> Result<(), String> {
         match self.ids.get(&key) {
             None => {
@@ -1124,10 +1133,12 @@ impl KeyIds {
                 Ok(())
             }
             Some(existing) => {
-                let existing_base = existing
-                    .rsplit_once('#')
-                    .map_or(existing.as_str(), |(b, _)| b);
-                if existing_base == base {
+                let same_entity = existing == base
+                    || existing.strip_prefix(base).is_some_and(|rest| {
+                        rest.strip_prefix('#')
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    });
+                if same_entity {
                     Ok(())
                 } else {
                     Err(format!(
@@ -1191,9 +1202,20 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
     // Pass 2a: register every MI BODY's element identity first — a body is
     // usually activated in the same entry as its children, and a child's
     // identity embeds its body's CANONICAL identity, so the body must be
-    // known before any child is derived (#1528 review). Nested bodies are
-    // element activations too, so they are covered here as well; a later
-    // pass-3 sighting of the same key re-mints idempotently (same base).
+    // known before any child is derived (#1528 review). A body is derived
+    // from its canonical PARENT SCOPE (`scope` on its activation, resolved
+    // through the identities registered so far — pass 1's instance, an outer
+    // body's pass-2a identity, an outer child's pass-2b `mi-child:…`
+    // identity), never from an encounter-order ordinal: the same inner MI
+    // element activates one body per OUTER child, so an
+    // `element:{instance}:{id}` base cannot tell those bodies apart and an
+    // ordinal `mint` would swap their identities under a pure reorder (#1528
+    // review). A `resight` keeps the registration independent of whether the
+    // body's `ElementActivating` or its `ElementActivated` is folded first.
+    // A body activated in an EARLIER entry than its parent scope's own
+    // registration (a ratified cross-entry reorder) derives from that scope's
+    // `?orphan:<raw>` token — still deterministic, and identical on both
+    // sides of a clean remint.
     let body_keys: BTreeSet<u64> = parsed
         .iter()
         .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
@@ -1208,9 +1230,12 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             str_of(body, "element_id"),
         ) {
             if body_keys.contains(&k) {
-                let instance = u64_of(body, "instance_key")
-                    .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
-                ids.mint(k, format!("element:{instance}:{id}"))?;
+                let parent = match u64_of(body, "scope") {
+                    Some(0) | None => u64_of(body, "instance_key")
+                        .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone()),
+                    Some(scope) => ids.owner(scope).clone(),
+                };
+                ids.resight(k, &format!("mi-body:{parent}:{id}"))?;
             }
         }
     }
@@ -1305,17 +1330,23 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             // sighting — a `ParallelJoinOpened` parking on the child's key,
             // or an activation for a DIFFERENT element reusing it — goes
             // through `mint`, which rejects the key reuse for an unrelated
-            // entity as the collision it is (#1528 review).
+            // entity as the collision it is (#1528 review). An MI BODY's key
+            // was likewise already registered by pass 2a under its
+            // parent-scope-derived `mi-body:…` identity, so its generic
+            // `ElementActivating`/`ElementActivated` is skipped the same way
+            // — otherwise the generic base (`element:{instance}:{id}`) would
+            // collide with the `mi-body:…` base on the same key.
             let generic_child_resight = base.starts_with("element:")
                 && matches!(variant.as_str(), "ElementActivating" | "ElementActivated")
-                && mi_child_activations
-                    .get(&k)
-                    .is_some_and(|(reg_instance, reg_element)| {
-                        let instance = u64_of(body, "instance_key")
-                            .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
-                        let element_id = str_of(body, "element_id").unwrap_or("?");
-                        reg_instance == &instance && reg_element == element_id
-                    });
+                && (body_keys.contains(&k)
+                    || mi_child_activations
+                        .get(&k)
+                        .is_some_and(|(reg_instance, reg_element)| {
+                            let instance = u64_of(body, "instance_key")
+                                .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                            let element_id = str_of(body, "element_id").unwrap_or("?");
+                            reg_instance == &instance && reg_element == element_id
+                        }));
             if !generic_child_resight {
                 ids.mint(k, base)?;
             }

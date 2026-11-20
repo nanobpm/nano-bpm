@@ -1987,4 +1987,63 @@ fn multi_instance_teardown_cancels_every_child_user_task_once() {
         engine.instance(key).unwrap().multi_instances.is_empty(),
         "the loop's runtime record is cleared"
     );
+
+    // The cancelled children are torn down WITHOUT completing: each reports
+    // `ElementTerminating`/`ElementTerminated` and NEVER
+    // `ElementCompleting`/`ElementCompleted` — the completed lifecycle drives
+    // completion listeners, metrics and compensation eligibility for work that
+    // did not finish (#1535; #1528 review). The COMPLETED child is only the one
+    // whose task we completed.
+    let task_to_eik: std::collections::BTreeMap<Key, Key> = engine
+        .state()
+        .user_tasks
+        .values()
+        .map(|t| (t.key, t.element_instance_key))
+        .collect();
+    let mut torn_down: Vec<Key> = expected
+        .iter()
+        .map(|task| task_to_eik[task])
+        .collect::<Vec<_>>();
+    torn_down.sort_unstable();
+    let mut terminated: Vec<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementTerminated {
+                element_instance_key,
+                ..
+            } => Some(*element_instance_key),
+            _ => None,
+        })
+        .collect();
+    terminated.sort_unstable();
+    assert_eq!(
+        terminated, torn_down,
+        "every cancelled child is reported TERMINATED (one per torn-down child)"
+    );
+    let terminating: std::collections::BTreeSet<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementTerminating {
+                element_instance_key,
+                ..
+            } => Some(*element_instance_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        terminating,
+        torn_down.iter().copied().collect(),
+        "every cancelled child is reported TERMINATING"
+    );
+    for child_eik in &torn_down {
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::ElementCompleting { element_instance_key, .. }
+                | Event::ElementCompleted { element_instance_key, .. }
+                if element_instance_key == child_eik
+            )),
+            "a cancelled child must never be reported COMPLETING/COMPLETED ({child_eik})"
+        );
+    }
 }

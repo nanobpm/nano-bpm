@@ -749,6 +749,15 @@ impl Engine {
     /// completing it) without touching compensation state. An interrupting
     /// event sub-process uses it directly, so compensable activities completed
     /// in the scope stay compensable from inside the event sub-process.
+    ///
+    /// `user_tasks_by_eik` is the caller's per-teardown element-instance →
+    /// `Created` user-task index, when it already built one. When it is `None`
+    /// (an interrupting boundary, an interrupting event sub-process, a thrown
+    /// error / terminate end), the fallback is built ONCE here and shared across
+    /// every member, so tearing down N members with open user tasks is
+    /// O(total user tasks + N) rather than rescanning the whole
+    /// `state.user_tasks` map once per member (#1528 review). The index buckets
+    /// preserve key order, so the emitted events are identical either way.
     pub(crate) fn element_teardown_events(
         &self,
         instance_key: Key,
@@ -762,6 +771,14 @@ impl Engine {
         // whose flow scope is not itself a member as roots, recursing into the
         // members nested under each.
         let member_set: BTreeSet<Key> = members.iter().copied().collect();
+        let fallback_index;
+        let user_tasks_by_eik = match user_tasks_by_eik {
+            Some(index) => Some(index),
+            None => {
+                fallback_index = self.created_user_tasks_by_element_instance();
+                Some(&fallback_index)
+            }
+        };
         let mut events = Vec::new();
         for &eik in members {
             if !member_set.contains(&self.scope_of(instance_key, eik)) {
@@ -1000,6 +1017,13 @@ impl Engine {
                 .cloned()
                 .unwrap_or_default(),
             None => {
+                // The `None` fallback scans every retained user task; a caller
+                // tearing down N members must not pay it N times — it builds the
+                // shared index once (`element_teardown_events`, #1528 review).
+                // The probe lets a regression test assert that scan count.
+                #[cfg(test)]
+                self.user_task_scan_count
+                    .set(self.user_task_scan_count.get() + 1);
                 let mut scanned: Vec<&state::UserTask> = self
                     .state
                     .user_tasks

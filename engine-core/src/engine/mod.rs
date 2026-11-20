@@ -207,6 +207,13 @@ pub struct Engine {
     /// Per-command scratch: reset by every `plan_command_at`. Never
     /// snapshotted.
     operation_reference: Option<i64>,
+    /// Test-only probe (#1528 review): counts every linear scan of
+    /// `state.user_tasks` a `None`-index teardown fallback performs, so a
+    /// regression test can assert an N-member teardown scans ONCE (the shared
+    /// fallback index), never once per member. Never snapshotted; always 0 in
+    /// production builds.
+    #[cfg(test)]
+    pub(crate) user_task_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -720,6 +727,8 @@ impl Engine {
             legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
+            #[cfg(test)]
+            user_task_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -893,6 +902,8 @@ impl Engine {
             legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
+            #[cfg(test)]
+            user_task_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -11671,8 +11682,12 @@ impl Engine {
     }
 
     /// Builds the events that cancel a still-running multi-instance child (its job
-    /// and element instance), for an early body completion. Returns events (it
-    /// does not emit) so it composes inside a `process_step` result.
+    /// and element instance), for an early body completion. The child is torn down
+    /// WITHOUT completing, so its element lifecycle is
+    /// `ElementTerminating`/`ElementTerminated` (Zeebe writes TERMINATED for a
+    /// cancelled instance, #1535) — never `ElementCompleting`/`ElementCompleted`,
+    /// which would report unfinished work as completed (#1528 review). Returns
+    /// events (it does not emit) so it composes inside a `process_step` result.
     ///
     /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
     /// user-task index built once by [`Self::complete_multi_instance_body`] (see
@@ -11758,16 +11773,17 @@ impl Engine {
         // byte-identical in the common case — mirrors the interrupting-boundary
         // teardown's body-root incident resolution.
         events.extend(self.resolve_incidents_on(instance_key, child_eik));
-        events.push(Event::ElementCompleting {
-            instance_key,
-            element_instance_key: child_eik,
-            element_id: element_id.clone(),
-        });
-        events.push(Event::ElementCompleted {
-            instance_key,
-            element_instance_key: child_eik,
-            element_id,
-        });
+        // The child is CANCELLED (its completion condition's remaining instances,
+        // an ad-hoc container torn down early), not completed: report it with
+        // `ElementTerminating`/`ElementTerminated` — never
+        // `ElementCompleting`/`ElementCompleted`, which drive completion
+        // listeners, metrics and compensation eligibility for work that did not
+        // finish (#1535, Zeebe's TERMINATED lifecycle for torn-down elements;
+        // #1528 review).
+        let [terminating, terminated] =
+            boundary::termination_events(instance_key, child_eik, element_id);
+        events.push(terminating);
+        events.push(terminated);
         events
     }
 
@@ -11841,16 +11857,13 @@ impl Engine {
             // keeps it cancelled. Yields nothing when the container has no
             // incident, so the behaviour is byte-identical in the common case.
             events.extend(self.resolve_incidents_on(instance_key, child));
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: child,
-                element_id: nested_element_id.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: child,
-                element_id: nested_element_id,
-            });
+            // The nested container is CANCELLED with its MI body, not completed:
+            // terminate its element instance (#1535) rather than report it as
+            // completed (#1528 review — same class as `cancel_mi_child_events`).
+            let [terminating, terminated] =
+                boundary::termination_events(instance_key, child, nested_element_id);
+            events.push(terminating);
+            events.push(terminated);
             events.push(Event::AdHocCompleted {
                 instance_key,
                 container_key: child,

@@ -1897,6 +1897,123 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
     assert!(engine.is_completed(instance_key));
 }
 
+/// #1528 (review): an interrupting boundary on a multi-instance USER TASK tears
+/// down N parallel children through `element_teardown_events` with NO caller
+/// index (`user_tasks_by_eik: None`), which must build its fallback
+/// element-instance → `Created` user-task index ONCE and share it across the
+/// member list — not rescan the whole `state.user_tasks` map once per child (an
+/// O(N × tasks) blow-up). This test drives a 32-child interrupt and asserts the
+/// emitted cancellation set is exactly the children's tasks (no duplicates, no
+/// orphans), which is the behaviour the shared fallback index must preserve
+/// byte-for-byte.
+///
+/// The scan count is asserted through the test-only `user_task_scan_count`
+/// probe: the `None` fallback scans `state.user_tasks` at most once for the
+/// whole teardown, never once per member.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_user_task_cancels_every_child_task_once() {
+    const N: i64 = 32;
+    // start -> each(MI userTask) --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-ut-boundary")
+        .start_event("start")
+        .user_task("each")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                "mi-ut-boundary",
+                vars(&[("items", Value::List((0..N).map(Value::Int).collect()))]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Every child parked on its own user task.
+    let created_tasks: std::collections::BTreeSet<Key> = engine
+        .state()
+        .user_tasks
+        .values()
+        .filter(|t| t.state == state::UserTaskState::Created)
+        .map(|t| t.key)
+        .collect();
+    assert_eq!(created_tasks.len(), N as usize, "one user task per child");
+
+    // The timer interrupts the whole loop.
+    engine.user_task_scan_count.set(0);
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        engine.user_task_scan_count.get() <= 1,
+        "the N-member teardown scanned `state.user_tasks` at most once (the shared \
+         fallback index), never once per member: {}",
+        engine.user_task_scan_count.get()
+    );
+
+    let canceled_events: Vec<Key> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserTaskCanceled { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .collect();
+    let canceled: std::collections::BTreeSet<Key> = canceled_events.iter().copied().collect();
+    assert_eq!(
+        canceled_events.len(),
+        canceled.len(),
+        "no child's task may be cancelled twice in the journal"
+    );
+    assert_eq!(
+        canceled, created_tasks,
+        "each child's task is cancelled exactly once (no duplicate, none missed)"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.state != state::UserTaskState::Created),
+        "no child user task is left Created after the interrupt"
+    );
+    assert!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count()
+            == 1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        engine.is_completed(instance_key),
+        "the instance completes after the loop is torn down"
+    );
+}
+
 /// The lifecycle records an element emits between activation and its final
 /// rest, in order: Completing/Completed/Terminating/Terminated only.
 fn lifecycle_of<'e>(events: &'e [Event], id: &str) -> Vec<&'e Event> {
