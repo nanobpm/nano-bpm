@@ -1769,3 +1769,170 @@ fn reversioning_a_timer_start_process_retires_the_superseded_timer() {
         "one armed start timer starts one instance, not two"
     );
 }
+
+/// #1712 (Zeebe parity): when one tick makes several timers due, each timer's
+/// TRIGGER runs to completion, in key order, before the next one fires. An
+/// earlier-due catch timer's completion and the follow-on task's activation
+/// (and job) must therefore precede a later interrupting boundary timer's
+/// termination of its activity — not the other way round (the eager teardown
+/// that #1712 reports). A second boundary timer on the same, now-interrupted
+/// activity is disarmed by then and must not fire (Zeebe rejects it).
+#[test]
+fn a_timer_batch_runs_each_trigger_to_completion_in_key_order() {
+    // start -> fork -+-> w (catch, 5s) -> after (task) -> end1
+    //                +-> pre (none throw) -> host (task, b1 5s + b2 5s) -> end2
+    // (`pre` delays the host's activation so the catch timer is armed first
+    // and carries the lower key.)
+    //                                       b1 -> end3, b2 -> end4
+    let def = ProcessBuilder::new("batch")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .service_task("after", "after")
+        .end_event("end1")
+        .intermediate_throw_event("pre")
+        .service_task("host", "host")
+        .timer_boundary_event("b1", "host", 5_000)
+        .timer_boundary_event("b2", "host", 5_000)
+        .end_event("end2")
+        .end_event("end3")
+        .end_event("end4")
+        .connect("start", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "host")
+        .connect("w", "after")
+        .connect("after", "end1")
+        .connect("host", "end2")
+        .connect("b1", "end3")
+        .connect("b2", "end4")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("batch"), 1_000)
+        .unwrap();
+    let mut keys: Vec<(Key, String)> = engine
+        .timers()
+        .iter()
+        .map(|t| (t.key, t.element_id.to_string()))
+        .collect();
+    keys.sort();
+    assert_eq!(keys.len(), 3, "catch + two boundary timers armed: {keys:?}");
+    assert_eq!(keys[0].1, "w", "the catch timer has the lowest key");
+
+    let fired = engine.trigger_timers(6_000);
+    let pos = |pred: &dyn Fn(&Event) -> bool| {
+        fired
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("missing event in {fired:#?}"))
+    };
+    let w_completed =
+        pos(&|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "w"));
+    let after_activated =
+        pos(&|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "after"));
+    let host_terminating =
+        pos(&|e| matches!(e, Event::ElementTerminating { element_id, .. } if element_id == "host"));
+    let b1_activated =
+        pos(&|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "b1"));
+    assert!(
+        w_completed < after_activated && after_activated < host_terminating,
+        "the catch timer's trigger (completion + next activation) must run to \
+         completion before the boundary timer interrupts its host: {fired:#?}"
+    );
+    assert!(host_terminating < b1_activated);
+    let triggered = fired
+        .iter()
+        .filter(|e| matches!(e, Event::TimerTriggered { .. }))
+        .count();
+    assert_eq!(
+        triggered, 2,
+        "the second boundary timer is disarmed, not fired"
+    );
+    assert!(!fired
+        .iter()
+        .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "b2")));
+}
+
+/// #1712 review (r4642239002): an earlier timer of a batch that ends a parent
+/// (here a top-level terminate end) must cascade-cancel its call-activity
+/// children — transitively — BEFORE the batch's next timer is selected, so a
+/// due timer in a child or grandchild never fires (and never creates work) on
+/// an instance that is already being torn down.
+#[test]
+fn a_timer_batch_cascades_parent_teardown_before_firing_descendant_timers() {
+    // parent: start -> fork -+-> stop_wait (catch 5s) -> stop (terminate end)
+    //                        +-> call (child)
+    // child:  start -> call (grandchild) ; grandchild: start -> gw (5s) -> work
+    let parent = ProcessBuilder::new("parent")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("stop_wait", 5_000)
+        .terminate_end_event("stop")
+        .call_activity("call", "child")
+        .end_event("end")
+        .connect("start", "fork")
+        .connect("fork", "stop_wait")
+        .connect("fork", "call")
+        .connect("stop_wait", "stop")
+        .connect("call", "end")
+        .build()
+        .unwrap();
+    let child = ProcessBuilder::new("child")
+        .start_event("cs")
+        .call_activity("ccall", "grand")
+        .end_event("ce")
+        .connect("cs", "ccall")
+        .connect("ccall", "ce")
+        .build()
+        .unwrap();
+    let grand = ProcessBuilder::new("grand")
+        .start_event("gs")
+        .timer_intermediate_catch_event("gw", 5_000)
+        .service_task("work", "work")
+        .end_event("ge")
+        .connect("gs", "gw")
+        .connect("gw", "work")
+        .connect("work", "ge")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    for def in [parent, child, grand] {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    engine
+        .apply_command_at(Command::create_instance("parent"), 1_000)
+        .unwrap();
+    let mut keys: Vec<(Key, String)> = engine
+        .timers()
+        .iter()
+        .map(|t| (t.key, t.element_id.to_string()))
+        .collect();
+    keys.sort();
+    assert_eq!(keys.len(), 2, "parent + grandchild catch timers: {keys:?}");
+    assert_eq!(keys[0].1, "stop_wait", "the parent's timer fires first");
+
+    let fired = engine.trigger_timers(6_000);
+    let triggered: Vec<&Event> = fired
+        .iter()
+        .filter(|e| matches!(e, Event::TimerTriggered { .. }))
+        .collect();
+    assert_eq!(
+        triggered.len(),
+        1,
+        "the grandchild's timer is cancelled by the cascade, not fired: {fired:#?}"
+    );
+    assert!(
+        !fired.iter().any(
+            |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "work")
+        ),
+        "no work may start in a torn-down grandchild: {fired:#?}"
+    );
+    let terminated = fired
+        .iter()
+        .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
+        .count();
+    assert_eq!(terminated, 2, "child and grandchild are terminated");
+}

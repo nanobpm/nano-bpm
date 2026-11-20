@@ -30,9 +30,9 @@
     },
     {
       "scenario": "g-3",
-      "issue": "#1712",
-      "reason": "interrupting boundary timer in a multi-timer batch: the attached activity is terminated (correct since #1535) but eagerly, before the earlier-due catch timer's follow-ups (record ordering only)",
-      "nanoTrace": "e54566911f6a643f"
+      "issue": "#1539",
+      "reason": "step 6 only (record ordering): a parallel multi-instance sub-process's children run their inner flow depth-first in nano but interleave in Zeebe's FIFO worklist (#1539). The step-4 multi-timer batch ordering (#1712) now matches Zeebe.",
+      "nanoTrace": "8e00f0339bcc57bf"
     },
     {
       "scenario": "g-4",
@@ -62,19 +62,19 @@
       "scenario": "g-11",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "6adaa72096e15187"
+      "nanoTrace": "9a3e5c416d0b5de7"
     },
     {
       "scenario": "g-18",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "fb1550137bc30b6e"
+      "nanoTrace": "20ec19ca5b6cb8dc"
     },
     {
       "scenario": "g-26",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local",
-      "nanoTrace": "64bf06ffa72a9fcd"
+      "nanoTrace": "93fd9e6cb78e3071"
     },
     {
       "scenario": "g-30",
