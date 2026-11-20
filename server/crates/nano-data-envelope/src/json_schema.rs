@@ -226,7 +226,7 @@ mod tests {
         format!(
             r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                 xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
-                xmlns:nano="http://nanobpm.io/schema/nano/1.0">
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
               <bpmn:process id="orders">
                 <bpmn:extensionElements><nano:shapes>{shapes}</nano:shapes></bpmn:extensionElements>
               </bpmn:process>

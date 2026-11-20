@@ -9,8 +9,14 @@
 //! - **name** — `<toolName>_<messageSubscriptionKey>`; **title** — `toolName`.
 //! - **description** — the `purpose` / `inputs` / `when_to_use` /
 //!   `when_not_to_use` / `results` properties joined with Camunda's labels.
-//! - **inputSchema** — the reserved optional `businessId`, plus one property
-//!   per `io.camunda.tool:input_N_{name,type,description,required}` group.
+//! - **inputSchema** — the reserved optional `businessId`, plus either the
+//!   start message's **data envelope** (`io.nanobpm.dataEnvelope.in` on the
+//!   `bpmn:message` → a `nano:shape`, derived by the canonical
+//!   [`nano_data_envelope::json_schema`] mapping, issue #1738) or — when the
+//!   message carries no envelope (Camunda parity) — one property per
+//!   `io.camunda.tool:input_N_{name,type,description,required}` group. When
+//!   both are declared the envelope wins and the conflict is surfaced in the
+//!   console catalog's `warnings` (never silently merged).
 //! - **outputSchema** — `{processInstanceKey}`.
 //! - **call** — correlates the start message with a random-UUID correlation
 //!   key through the SAME `correlate_message_impl` the REST `correlateMessage`
@@ -28,6 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use nano_data_envelope::json_schema::message_input_schema;
 use nanobpm_gateway_rest::models;
 // The tool-metadata property prefix (single source: engine-core).
 use nanobpmn_engine_core::TOOL_PROPERTY_PREFIX;
@@ -98,6 +105,28 @@ struct ProcessTool {
     process_definition_version: i32,
     process_name: Option<String>,
     properties: BTreeMap<String, String>,
+    /// The start message's data envelope, when it resolves: `(shape id,
+    /// object schema)`.
+    envelope: Option<(String, Value)>,
+}
+
+impl ProcessTool {
+    /// The advertised (and enforced) input schema.
+    fn input_schema(&self) -> Value {
+        resolve_input_schema(self.envelope.as_ref().map(|(_, s)| s), &self.properties)
+    }
+
+    /// Authoring conflicts surfaced to the console (never silently merged).
+    fn warnings(&self) -> Vec<String> {
+        match &self.envelope {
+            Some((shape, _)) if has_input_properties(&self.properties) => vec![format!(
+                "The start message declares data envelope `{shape}` and \
+                 `{TOOL_PROPERTY_PREFIX}input_N_*` properties; the envelope defines the \
+                 inputSchema and the input_N_* properties are ignored."
+            )],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The open tool subscriptions: message start subscriptions that carry a
@@ -121,6 +150,12 @@ fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
             let tool_name = s.tool_name.filter(|n| !n.is_empty())?;
             let properties = serde_json::from_str::<BTreeMap<String, String>>(&s.tool_properties)
                 .unwrap_or_default();
+            let envelope = server
+                .store
+                .process_definition_xml(s.process_definition_key)
+                .and_then(|xml| {
+                    message_input_schema(&xml, &s.message_name, Some(s.process_id.as_str()))
+                });
             Some(ProcessTool {
                 name: format!("{tool_name}{TOOL_NAME_DELIMITER}{}", s.subscription_key),
                 tool_name,
@@ -130,6 +165,7 @@ fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
                 process_definition_version: def.version,
                 process_name: def.name.clone(),
                 properties,
+                envelope,
             })
         })
         .collect();
@@ -160,6 +196,50 @@ pub(crate) fn build_description(props: &BTreeMap<String, String>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Whether any `io.camunda.tool:input_N_*` property is declared.
+fn has_input_properties(props: &BTreeMap<String, String>) -> bool {
+    props
+        .keys()
+        .any(|k| k.strip_prefix(TOOL_PROPERTY_PREFIX).is_some_and(|r| r.starts_with("input_")))
+}
+
+/// The tool input schema: the data-envelope object schema (with the reserved
+/// `businessId` added; an envelope field of that name is shadowed), or — with
+/// no envelope — the `input_N_*` schema of [`build_input_schema`].
+pub(crate) fn resolve_input_schema(
+    envelope: Option<&Value>,
+    props: &BTreeMap<String, String>,
+) -> Value {
+    let Some(envelope) = envelope else {
+        return build_input_schema(props);
+    };
+    let mut schema = envelope.clone();
+    if let Some(obj) = schema.as_object_mut() {
+        if let Some(Value::Object(properties)) = obj.get_mut("properties") {
+            properties.insert(BUSINESS_ID_ARGUMENT.into(), business_id_schema());
+        }
+        let required: Vec<Value> = obj
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| {
+                r.iter()
+                    .filter(|n| *n != BUSINESS_ID_ARGUMENT)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        obj.remove("required");
+        if !required.is_empty() {
+            obj.insert("required".into(), Value::Array(required));
+        }
+    }
+    schema
+}
+
+fn business_id_schema() -> Value {
+    json!({ "type": "string", "description": BUSINESS_ID_DESCRIPTION })
 }
 
 /// Build the input schema: `businessId` plus every complete
@@ -206,10 +286,7 @@ pub(crate) fn build_input_schema(props: &BTreeMap<String, String>) -> Value {
         }
         properties.insert(name.to_string(), Value::Object(schema));
     }
-    properties.insert(
-        BUSINESS_ID_ARGUMENT.into(),
-        json!({ "type": "string", "description": BUSINESS_ID_DESCRIPTION }),
-    );
+    properties.insert(BUSINESS_ID_ARGUMENT.into(), business_id_schema());
     let mut schema = json!({ "type": "object", "properties": properties });
     if !required.is_empty() {
         schema["required"] = Value::Array(required);
@@ -223,29 +300,52 @@ const JSON_SCHEMA_TYPES: [&str; 7] = [
     "string", "integer", "number", "boolean", "object", "array", "null",
 ];
 
-/// Validate tool `arguments` against an input schema produced by
-/// [`build_input_schema`]: every `required` property must be present and
-/// every supplied property with a declared JSON-Schema `type` must match it.
+/// Validate tool `arguments` against the input schema advertised in
+/// `tools/list` ([`resolve_input_schema`]) — recursively, so an envelope's
+/// nested objects and `list` arrays are enforced too: every `required`
+/// property must be present and every supplied value with a declared
+/// JSON-Schema `type` must match it (array `items` are checked per element).
 /// Undeclared arguments pass through (they become process variables), and an
 /// unrecognised declared type is not enforced.
 pub(crate) fn validate_arguments(
     schema: &Value,
     arguments: &Map<String, Value>,
 ) -> Result<(), String> {
+    validate_object(schema, arguments, "")
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}.{name}")
+    }
+}
+
+fn validate_object(schema: &Value, object: &Map<String, Value>, path: &str) -> Result<(), String> {
     if let Some(required) = schema["required"].as_array() {
         for name in required.iter().filter_map(Value::as_str) {
-            if !arguments.contains_key(name) {
-                return Err(format!("Missing required argument `{name}`"));
+            if !object.contains_key(name) {
+                return Err(format!(
+                    "Missing required argument `{}`",
+                    join_path(path, name)
+                ));
             }
         }
     }
     let Some(properties) = schema["properties"].as_object() else {
         return Ok(());
     };
-    for (name, value) in arguments {
-        let Some(ty) = properties.get(name).and_then(|p| p["type"].as_str()) else {
-            continue;
-        };
+    for (name, value) in object {
+        if let Some(property) = properties.get(name) {
+            validate_value(property, value, &join_path(path, name))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    if let Some(ty) = schema["type"].as_str() {
         let matches = match ty {
             "string" => value.is_string(),
             // JSON Schema `integer` includes integral floats (`3.0`, `3e0`).
@@ -264,10 +364,20 @@ pub(crate) fn validate_arguments(
             _ => true,
         };
         if !matches {
-            return Err(format!("Argument `{name}` must be of type {ty}"));
+            return Err(format!("Argument `{path}` must be of type {ty}"));
         }
     }
-    Ok(())
+    match value {
+        Value::Object(object) => validate_object(schema, object, path),
+        Value::Array(items) => match schema.get("items") {
+            Some(item_schema) => items
+                .iter()
+                .enumerate()
+                .try_for_each(|(i, v)| validate_value(item_schema, v, &format!("{path}[{i}]"))),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
 }
 
 fn output_schema() -> Value {
@@ -290,7 +400,7 @@ fn descriptor(tool: &ProcessTool) -> Value {
         "name": tool.name,
         "title": tool.tool_name,
         "description": build_description(&tool.properties),
-        "inputSchema": build_input_schema(&tool.properties),
+        "inputSchema": tool.input_schema(),
         "outputSchema": output_schema(),
     })
 }
@@ -326,6 +436,13 @@ pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
             v["processDefinitionId"] = json!(t.process_definition_id);
             v["processDefinitionVersion"] = json!(t.process_definition_version);
             v["processName"] = json!(t.process_name);
+            v["inputSchemaSource"] = json!(if t.envelope.is_some() {
+                "dataEnvelope"
+            } else {
+                "toolProperties"
+            });
+            v["dataEnvelope"] = json!(t.envelope.as_ref().map(|(id, _)| id));
+            v["warnings"] = json!(t.warnings());
             v
         })
         .collect();
@@ -364,7 +481,7 @@ async fn call_tool(server: &ServerImpl, name: String, args: Value) -> Value {
         _ => return tool_error_result("`arguments` must be an object", 400),
     };
     // Validate against the SAME schema advertised in `tools/list`.
-    if let Err(msg) = validate_arguments(&build_input_schema(&tool.properties), &arguments) {
+    if let Err(msg) = validate_arguments(&tool.input_schema(), &arguments) {
         return tool_error_result(&msg, 400);
     }
     // `businessId` is a reserved tool argument, not a process variable. A
@@ -602,6 +719,144 @@ mod tests {
                     "businessId": { "type": "string", "description": BUSINESS_ID_DESCRIPTION },
                 },
                 "required": ["email"],
+            })
+        );
+    }
+
+    const ENVELOPE_FIXTURE: &str = include_str!("fixtures/mcp-process-with-envelope.bpmn");
+    const ENVELOPE_PROPERTY: &str =
+        r#"<zeebe:property name="io.nanobpm.dataEnvelope.in" value="PlaceOrder" />"#;
+
+    /// Issue #1738: the start message's data envelope defines the inputSchema
+    /// (nested reference, list, required, descriptions), takes precedence over
+    /// `input_N_*`, and the console catalog reflects it with the conflict.
+    #[tokio::test]
+    async fn envelope_derives_input_schema_and_wins_over_input_properties() {
+        let server = ServerImpl::default();
+        deploy_xml(&server, ENVELOPE_FIXTURE).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let tool = &tools[0];
+        assert_eq!(tool["title"], json!("place-order"));
+        assert_eq!(tool["description"], json!("Place an order."));
+        assert_eq!(
+            tool["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "orderId": { "type": "string", "description": "The order id." },
+                    "note": { "type": "string" },
+                    "customer": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } },
+                        "required": ["email"],
+                        "description": "Who is ordering.",
+                    },
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "sku": { "type": "string" },
+                                "qty": { "type": "integer" },
+                            },
+                            "required": ["sku", "qty"],
+                        },
+                        "description": "The order lines.",
+                    },
+                    "businessId": { "type": "string", "description": BUSINESS_ID_DESCRIPTION },
+                },
+                "required": ["orderId", "customer", "lines"],
+            })
+        );
+
+        let catalog = console_catalog(&server, true);
+        let entry = &catalog["tools"][0];
+        assert_eq!(entry["inputSchema"], tool["inputSchema"]);
+        assert_eq!(entry["inputSchemaSource"], json!("dataEnvelope"));
+        assert_eq!(entry["dataEnvelope"], json!("PlaceOrder"));
+        let warnings = entry["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{entry}");
+        assert!(
+            warnings[0].as_str().unwrap().contains("PlaceOrder"),
+            "{warnings:?}"
+        );
+
+        // Calls validate against the SAME derived schema (nested + list).
+        let name = tool["name"].as_str().unwrap().to_string();
+        let ok = json!({ "orderId": "o-1", "customer": { "email": "a@b" },
+            "lines": [ { "sku": "x", "qty": 2 } ] });
+        for (args, expect) in [
+            (json!({ "orderId": "o-1", "customer": { "email": "a@b" } }), "lines"),
+            (json!({ "orderId": "o-1", "customer": {}, "lines": [] }), "customer.email"),
+            (
+                json!({ "orderId": "o-1", "customer": { "email": "a@b" },
+                    "lines": [ { "sku": "x", "qty": "two" } ] }),
+                "lines[0].qty",
+            ),
+        ] {
+            let r = rpc(
+                &server,
+                "tools/call",
+                json!({ "name": name, "arguments": args }),
+            )
+            .await;
+            assert_eq!(r["isError"], json!(true), "{r}");
+            let text = r["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(expect), "{expect}: {text}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(server.store.process_instances().is_empty());
+        // The legacy input_N `legacy` (required) is ignored under an envelope.
+        let r = rpc(
+            &server,
+            "tools/call",
+            json!({ "name": name, "arguments": ok }),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(false), "{r}");
+    }
+
+    /// Without an envelope the `input_N_*` properties define the schema
+    /// (Camunda parity) and no conflict is reported.
+    #[tokio::test]
+    async fn without_envelope_input_properties_are_the_fallback() {
+        let server = ServerImpl::default();
+        let xml = ENVELOPE_FIXTURE.replace(ENVELOPE_PROPERTY, "");
+        assert_ne!(xml, ENVELOPE_FIXTURE);
+        deploy_xml(&server, &xml).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        assert_eq!(
+            tools[0]["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "legacy": { "type": "string" },
+                    "businessId": { "type": "string", "description": BUSINESS_ID_DESCRIPTION },
+                },
+                "required": ["legacy"],
+            })
+        );
+        let entry = &console_catalog(&server, true)["tools"][0];
+        assert_eq!(entry["inputSchemaSource"], json!("toolProperties"));
+        assert_eq!(entry["dataEnvelope"], Value::Null);
+        assert_eq!(entry["warnings"], json!([]));
+    }
+
+    #[test]
+    fn envelope_schema_reserves_business_id() {
+        let envelope = json!({
+            "type": "object",
+            "properties": { "businessId": { "type": "integer" } },
+            "required": ["businessId"],
+        });
+        let schema = resolve_input_schema(Some(&envelope), &BTreeMap::new());
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "businessId": { "type": "string", "description": BUSINESS_ID_DESCRIPTION },
+                },
             })
         );
     }
