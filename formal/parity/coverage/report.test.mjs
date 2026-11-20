@@ -12,8 +12,10 @@ import { test } from 'node:test';
 import {
   checkRatchet,
   floor1,
+  loadZeebeExcludes,
   parseJacoco,
   parseLlvmCov,
+  selfTest,
   tagNano,
   tagZeebe,
   updateBaseline,
@@ -85,6 +87,99 @@ test('jacoco: branch counters per line; uncovered = any missed branch', () => {
   );
 });
 
+// A JaCoCo fixture shaped like the real timing-dependent surface (#1707): a
+// background-scheduler package, its subpackage, and one volatile line in an
+// otherwise-deterministic package.
+const JACOCO_TIMING = `<?xml version="1.0"?><report name="x">
+<package name="io/camunda/zeebe/engine/processing/message"><sourcefile name="MessageCorrelator.java">
+<line nr="64" mi="0" ci="1" mb="1" cb="1"/>
+<line nr="78" mi="0" ci="1" mb="2" cb="0"/>
+</sourcefile></package>
+<package name="io/camunda/zeebe/engine/processing/message/command"><sourcefile name="SubscriptionCommandSender.java">
+<line nr="40" mi="0" ci="1" mb="1" cb="1"/>
+</sourcefile></package>
+<package name="io/camunda/zeebe/engine/processing/common"><sourcefile name="ExpressionProcessor.java">
+<line nr="507" mi="0" ci="1" mb="1" cb="1"/>
+<line nr="600" mi="0" ci="1" mb="0" cb="2"/>
+</sourcefile></package>
+<package name="io/camunda/zeebe/engine/processing/deployment"><sourcefile name="DeployProcessor.java">
+<line nr="12" mi="0" ci="2" mb="0" cb="2"/>
+</sourcefile></package>
+</report>`;
+
+test('jacoco excludes: timing-dependent packages (recursively) and lines leave the measured set (#1707)', () => {
+  const exclude = {
+    packages: ['io/camunda/zeebe/engine/processing/message'],
+    lines: ['zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:507'],
+  };
+  const m = parseJacoco(JACOCO_TIMING, { exclude });
+  // Only the deployment line and the non-excluded ExpressionProcessor line remain.
+  assert.equal(m.total, 4);
+  assert.equal(m.covered, 4);
+  assert.equal(m.percent, 100);
+  assert.deepEqual(
+    m.excluded.map((s) => `${s.file}:${s.line}`).sort(),
+    [
+      'zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:507',
+      'zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageCorrelator.java:64',
+      'zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageCorrelator.java:78',
+      // the command SUBpackage is covered by the recursive package rule
+      'zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/command/SubscriptionCommandSender.java:40',
+    ].sort(),
+  );
+  // Without the exclusion the same input measures the volatile branches too.
+  const full = parseJacoco(JACOCO_TIMING);
+  assert.equal(full.total, 12);
+  assert.equal(full.covered, 7);
+});
+
+test('zeebe-excludes.json: the checked-in list is well-formed and names its justifying issues', () => {
+  const spec = JSON.parse(readFileSync(new URL('./zeebe-excludes.json', import.meta.url), 'utf8'));
+  const exclude = loadZeebeExcludes(spec);
+  assert.ok(exclude.packages.includes('io/camunda/zeebe/engine/processing/message'));
+  assert.ok(exclude.packages.includes('io/camunda/zeebe/engine/state/message'));
+  assert.ok(exclude.lines.includes('zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:507'));
+  // validation rejects an unexplained or duplicate exclusion
+  assert.throws(() => loadZeebeExcludes({ packages: [{ match: 'a/b' }] }), /issue/);
+  assert.throws(() => loadZeebeExcludes({ packages: [{ match: 'a/b', issue: 1 }, { match: 'a/b', issue: 2 }] }), /duplicate/);
+  assert.throws(() => loadZeebeExcludes({ lines: [{ issue: 1 }] }), /match/);
+});
+
+test('self-test: identical inputs must give an identical covered count (#1707)', () => {
+  // Deterministic measurement: passes silently.
+  assert.deepEqual(selfTest({ zeebe: () => parseJacoco(JACOCO_TIMING) }, { runs: 3 }), []);
+  // A nondeterministic measurement (a line whose counters flip between runs)
+  // fails loudly, naming the differing branch. `runs: 2` → exactly one
+  // comparison (run 2 vs run 1), so exactly one error.
+  let flip = 0;
+  const flaky = () => {
+    flip += 1;
+    const xml = flip === 1 ? JACOCO_TIMING : JACOCO_TIMING.replace('nr="600" mi="0" ci="1" mb="0" cb="2"', 'nr="600" mi="0" ci="1" mb="1" cb="1"');
+    return parseJacoco(xml);
+  };
+  const errors = selfTest({ zeebe: flaky }, { runs: 2 });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /nondeterministic/);
+  assert.match(errors[0], /ExpressionProcessor\.java:600/);
+});
+
+test('the exclusions collapse a measurement that differs only on excluded lines (#1707)', () => {
+  // Two parses of inputs that differ ONLY on an excluded line (the #1700
+  // same-commit pair differed exactly this way) must measure identically.
+  const exclude = loadZeebeExcludes(JSON.parse(readFileSync(new URL('./zeebe-excludes.json', import.meta.url), 'utf8')));
+  const runA = JACOCO_TIMING; // MessageCorrelator:64 mb=1 cb=1
+  const runB = JACOCO_TIMING.replace('nr="64" mi="0" ci="1" mb="1" cb="1"', 'nr="64" mi="0" ci="1" mb="2" cb="0"');
+  const a = parseJacoco(runA, { exclude });
+  const b = parseJacoco(runB, { exclude });
+  assert.deepEqual(signatureOf(a), signatureOf(b));
+  // …while WITHOUT the exclusions they differ (the defect the issue reports).
+  assert.notDeepEqual(signatureOf(parseJacoco(runA)), signatureOf(parseJacoco(runB)));
+});
+
+function signatureOf(m) {
+  return { covered: m.covered, total: m.total, sites: m.sitesAll.map((s) => `${s.file}:${s.line}=${s.missed}/${s.coveredBranches}`).sort() };
+}
+
 test('zeebe triage: tagged against the coverage matrix by line, then file, with status', () => {
   const surface = {
     cells: [
@@ -113,12 +208,11 @@ test('ratchet: a drop below the floor or a unit switch fails; at/above passes', 
   assert.deepEqual(checkRatchet({ zeebe: { unit: 'branch', percent: 1 } }, base), []);
 });
 
-test('ratchet: the documented slack absorbs live-broker scheduling variance (#1679)', () => {
-  // zeebe JaCoCo measures against a live Camunda 8, so its branch count swings
-  // run to run; `slackPercent` is the absorption band, applied at CHECK time
-  // (effective floor = floorPercent − slackPercent), exactly once. The
-  // observed 12.45% vs a 12.6% floor is inside the 0.2% band; 12.39% is
-  // beyond it.
+test('ratchet: slackPercent (when a baseline carries it) absorbs live-broker variance; the committed zeebe floor no longer does (#1707)', () => {
+  // slackPercent is still supported for a side measured against a live broker,
+  // applied at CHECK time (effective floor = floorPercent − slackPercent),
+  // exactly once. The observed 12.45% vs a 12.6% floor is inside the 0.2%
+  // band; 12.39% is beyond it.
   const base = { zeebe: { unit: 'branch', floorPercent: 12.6, slackPercent: 0.2 } };
   assert.deepEqual(
     checkRatchet({ zeebe: { unit: 'branch', percent: 12.45, covered: 1033, total: 8296 } }, base),
@@ -133,6 +227,10 @@ test('ratchet: the documented slack absorbs live-broker scheduling variance (#16
   // The deterministic side (no slack) stays a hard floor.
   const nano = { nano: { unit: 'region', floorPercent: 15.9 } };
   assert.match(checkRatchet({ nano: { unit: 'region', percent: 15.89, covered: 1, total: 2 } }, nano)[0], /dropped below/);
+  // #1707: the committed zeebe baseline is the deterministic measured set, so
+  // it carries NO slack — the floor is hard.
+  const committed = JSON.parse(readFileSync(new URL('./baseline.json', import.meta.url), 'utf8'));
+  assert.equal(committed.zeebe.slackPercent, undefined, 'the deterministic zeebe measured set needs no slack band');
 });
 
 test('update: floors only rise unless --allow-lower', () => {
