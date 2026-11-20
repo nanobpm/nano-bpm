@@ -2378,6 +2378,19 @@ fn boundary_streams(
     head_after: serde_json::Value,
     prev_after: serde_json::Value,
 ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    boundary_streams_with(head_after, prev_after, vec![], vec![])
+}
+
+/// [`boundary_streams`] with extra events appended to each side's divergent
+/// entry 1 (e.g. a `JobCreated` minting a key on each side).
+fn boundary_streams_with(
+    head_after: serde_json::Value,
+    prev_after: serde_json::Value,
+    head_extra: Vec<serde_json::Value>,
+    prev_extra: Vec<serde_json::Value>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut head_events = vec![user_task_created(500, 32, 10)];
+    head_events.extend(head_extra);
     let at = |mut e: serde_json::Value, i: u64| {
         e["i"] = serde_json::json!(i);
         e
@@ -2385,13 +2398,13 @@ fn boundary_streams(
     let head = vec![
         at(mi_entry(11, 12, vec![]), 0),
         state_at(0, 3),
-        at(mi_entry(31, 32, vec![user_task_created(500, 32, 10)]), 1),
+        at(mi_entry(31, 32, head_events), 1),
         head_after,
     ];
     let prev = vec![
         at(mi_entry(11, 12, vec![]), 0),
         state_at(0, 3),
-        at(mi_entry(31, 32, vec![]), 1),
+        at(mi_entry(31, 32, prev_extra), 1),
         prev_after,
     ];
     (head, prev)
@@ -2635,79 +2648,105 @@ fn prev_release_gate_boundary_projection_preserves_reference_identity() {
     );
 }
 
-/// #1528 (review): excluding the ratified instance must also normalize its
-/// DERIVED contributions (`inflight_by_process`, `terminal_epoch`,
-/// `recently_terminated`) and every key collection (`jobs_by_instance`,
-/// `activatable_jobs`, `activated_jobs`): a checkpoint from each side's real
-/// behaviour compares equal through the projection, while an unrelated
+/// The post-boundary checkpoint of the ratified-instance scenario: the
+/// ratified instance 10 (process `p`) is added, with its creation counted,
+/// and the retained job `33` of the UNRELATED instance 30 is stored under
+/// `job_key` (a key reminted on one side only must reconcile through that
+/// side's own `KeyIds`, #1764).
+fn with_ratified(job_key: u64) -> serde_json::Value {
+    let mut s = state_at(1, 3);
+    let state = s["state"]["state"].as_object_mut().expect("state");
+    let mut inst = state["instances"]
+        .as_object()
+        .expect("instances")
+        .values()
+        .next()
+        .expect("a template instance")
+        .clone();
+    inst["key"] = serde_json::json!(10u64);
+    inst["process_id"] = serde_json::json!("p");
+    inst["state"] = serde_json::json!("Active");
+    state["instances"]
+        .as_object_mut()
+        .expect("instances")
+        .insert("10".to_owned(), inst);
+    for counts in ["inflight_by_process", "created_by_process"] {
+        let n = state[counts]["p"].as_u64().unwrap_or(0);
+        state[counts]["p"] = serde_json::json!(n + 1);
+    }
+    let jobs = state["jobs"].as_object_mut().expect("jobs");
+    let mut job = jobs.remove("33").expect("job 33");
+    job["key"] = serde_json::json!(job_key);
+    jobs.insert(job_key.to_string(), job);
+    let set = state["jobs_by_instance"]["30"]
+        .as_array_mut()
+        .expect("jobs_by_instance[30]");
+    assert_eq!(set.len(), 1, "one job under instance 30");
+    set[0] = serde_json::json!(job_key);
+    let slot = state["activatable_jobs"]["payment"]
+        .as_array_mut()
+        .expect("activatable_jobs[payment]");
+    let pos = slot
+        .iter()
+        .position(|e| e[1].as_u64() == Some(33))
+        .expect("job 33 in the activatable index");
+    slot[pos][1] = serde_json::json!(job_key);
+    s
+}
+
+/// The prev behaviour completes the ratified instance at the boundary: it
+/// turns terminal, its process's in-flight count drops, `terminal_epoch`
+/// advances and the instance joins `recently_terminated`.
+fn completed_ratified(job_key: u64) -> serde_json::Value {
+    let mut s = with_ratified(job_key);
+    let state = s["state"]["state"].as_object_mut().expect("state");
+    state["instances"]["10"]["state"] = serde_json::json!("Completed");
+    let n = state["inflight_by_process"]["p"].as_u64().expect("p count");
+    if n == 1 {
+        state["inflight_by_process"]
+            .as_object_mut()
+            .expect("counts")
+            .remove("p");
+    } else {
+        state["inflight_by_process"]["p"] = serde_json::json!(n - 1);
+    }
+    let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch");
+    state["terminal_epoch"] = serde_json::json!(epoch + 1);
+    state["recently_terminated"]
+        .as_array_mut()
+        .expect("recently_terminated")
+        .push(serde_json::json!(10u64));
+    s
+}
+
+/// A `JobCreated` minting `job_key` for the MI child 32 of instance 10.
+fn job_created(job_key: u64) -> serde_json::Value {
+    serde_json::json!({"JobCreated": {"created_at": 1, "element_id": "review",
+        "element_instance_key": 32, "instance_key": 10, "job_key": job_key,
+        "job_type": "payment", "priority": 50, "retries": 3}})
+}
+
+/// The ratified scenario with each side's job mint declared re-mintable.
+fn remint_unbalanced_expected() -> serde_json::Value {
+    let mut e = unbalanced_expected();
+    e["remint_keys"] = serde_json::json!(true);
+    e
+}
+
+/// #1528/#1764: excluding the ratified instance must also normalize its
+/// DERIVED contributions (`inflight_by_process`, `created_by_process`,
+/// `terminal_epoch`, `recently_terminated`): a checkpoint from each side's
+/// real behaviour compares equal through the projection, while an unrelated
 /// derived-counter change still fails.
 #[test]
 fn prev_release_gate_boundary_projection_normalizes_derived_state() {
-    // Add the ratified instance 10 (parked on its user task) to the
-    // post-boundary checkpoint, with one retained job of an UNRELATED
-    // instance reminted to a post-boundary key (raw keys differ past the
-    // boundary, so the remint must reconcile through the projection).
-    let with_ratified = || {
-        let mut s = state_at(1, 3);
-        let state = s["state"]["state"].as_object_mut().expect("state");
-        let template = state["instances"]
-            .as_object()
-            .expect("instances")
-            .values()
-            .next()
-            .expect("a template instance")
-            .clone();
-        let mut inst = template;
-        inst["key"] = serde_json::json!(10u64);
-        inst["process_id"] = serde_json::json!("p");
-        inst["state"] = serde_json::json!("Active");
-        state["instances"]
-            .as_object_mut()
-            .expect("instances")
-            .insert("10".to_owned(), inst);
-        // The unrelated job (whose instance is "30") reminted: key 33 -> 133.
-        let jobs = state["jobs"].as_object_mut().expect("jobs");
-        let job = jobs.remove("33").expect("job 33");
-        jobs.insert("133".to_owned(), job);
-        let set = state["jobs_by_instance"]["30"]
-            .as_array_mut()
-            .expect("jobs_by_instance[30]");
-        assert_eq!(set.len(), 1, "one job under instance 30");
-        set[0] = serde_json::json!(133u64);
-        let slot = state["activatable_jobs"]["payment"]
-            .as_array_mut()
-            .expect("activatable_jobs[payment]");
-        let pos = slot
-            .iter()
-            .position(|e| e[1].as_u64() == Some(33))
-            .expect("job 33 in the activatable index");
-        slot[pos][1] = serde_json::json!(133u64);
-        s
-    };
-
-    // The prev behaviour completes the ratified instance at the boundary:
-    // its process's inflight count drops, `terminal_epoch` advances, and the
-    // instance joins `recently_terminated`; head's instance stays parked.
-    // Both are the DECLARED divergence — the projection must reconcile them.
-    let mut prev_after = with_ratified();
-    {
-        let state = prev_after["state"]["state"].as_object_mut().expect("state");
-        state["inflight_by_process"]["p"] = serde_json::json!(0u64);
-        let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch");
-        state["terminal_epoch"] = serde_json::json!(epoch + 1);
-        state["recently_terminated"]
-            .as_array_mut()
-            .expect("recently_terminated")
-            .push(serde_json::json!(10u64));
-    }
-    let (head, prev) = boundary_streams(with_ratified(), prev_after);
+    let (head, prev) = boundary_streams(with_ratified(33), completed_ratified(33));
     checked_s(&head, &prev, unbalanced_expected()).unwrap_or_else(|e| {
         panic!("the declared completion of the ratified instance reconciles: {e}")
     });
 
-    // But an UNRELATED derived-counter change (another process's inflight
-    // count) is still caught.
-    let mut unrelated = with_ratified();
+    // An UNRELATED derived-counter change (another process's count) fails.
+    let mut unrelated = with_ratified(33);
     let counts = unrelated["state"]["state"]["inflight_by_process"]
         .as_object_mut()
         .expect("inflight_by_process");
@@ -2717,12 +2756,123 @@ fn prev_release_gate_boundary_projection_normalizes_derived_state() {
         .map(|(k, v)| (k.clone(), v.as_u64().expect("count")))
         .expect("a second process count");
     counts[&other] = serde_json::json!(base + 1);
-    let (head, prev) = boundary_streams(unrelated, with_ratified());
+    let (head, prev) = boundary_streams(unrelated, with_ratified(33));
     let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
     assert!(
         err.contains("outside the ratified"),
         "an unrelated inflight count change must fail: {err}"
     );
+}
+
+/// #1764: only the ratified instance's OWN contribution to its process's
+/// counts is subtracted — a wrong count contributed by ANOTHER instance of
+/// the SAME process still fails (the whole process entry is never dropped).
+#[test]
+fn prev_release_gate_boundary_projection_counts_scoped_to_ratified_instance() {
+    for counts in ["inflight_by_process", "created_by_process"] {
+        let mut wrong = with_ratified(33);
+        let n = wrong["state"]["state"][counts]["p"]
+            .as_u64()
+            .expect("p count");
+        wrong["state"]["state"][counts]["p"] = serde_json::json!(n + 1);
+        let (head, prev) = boundary_streams(wrong, completed_ratified(33));
+        let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+        assert!(
+            err.contains("outside the ratified"),
+            "a second `p` instance's {counts} change must fail: {err}"
+        );
+    }
+}
+
+/// #1764: keys are canonicalized through EACH SIDE's own `KeyIds`: a
+/// retained job reminted on one side only (each side's `JobCreated` mints a
+/// different raw key for the same entity) reconciles, while the same raw-key
+/// difference WITHOUT a mint explaining it still fails.
+#[test]
+fn prev_release_gate_boundary_projection_canonicalizes_through_key_ids() {
+    let (head, prev) = boundary_streams_with(
+        with_ratified(133),
+        completed_ratified(33),
+        vec![job_created(133)],
+        vec![job_created(33)],
+    );
+    checked_s(&head, &prev, remint_unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a one-sided remint reconciles through KeyIds: {e}"));
+
+    let (head, prev) = boundary_streams(with_ratified(133), completed_ratified(33));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "an unexplained raw-key remint must fail: {err}"
+    );
+}
+
+/// #1764: `jobs_by_instance` keeps its owner→jobs association — swapping
+/// two unrelated owners' job sets fails (a sorted multiset would hide it).
+#[test]
+fn prev_release_gate_boundary_projection_preserves_reverse_index_owners() {
+    let mut swapped = with_ratified(33);
+    let index = swapped["state"]["state"]["jobs_by_instance"]
+        .as_object_mut()
+        .expect("jobs_by_instance");
+    let owners: Vec<String> = index
+        .iter()
+        .filter(|(k, v)| *k != "10" && v.as_array().is_some_and(|a| !a.is_empty()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let (a, b) = match owners.as_slice() {
+        [a, b, ..] => (a.clone(), b.clone()),
+        _ => {
+            // Only one owner: re-point its set at a second (job-less) owner.
+            let a = owners.first().cloned().expect("an owner with jobs");
+            (a, "30000".to_owned())
+        }
+    };
+    let va = index.remove(&a).unwrap_or(serde_json::json!([]));
+    let vb = index.remove(&b).unwrap_or(serde_json::json!([]));
+    index.insert(a, vb);
+    index.insert(b, va);
+    let (head, prev) = boundary_streams(swapped, with_ratified(33));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "swapping jobs_by_instance owners must fail: {err}"
+    );
+}
+
+/// #1764: the State rules apply ONLY at their typed path — a business
+/// variable named like a State field (`jobs`, `terminal_epoch`,
+/// `inflight_by_process`) is data, so changing its value fails.
+#[test]
+fn prev_release_gate_boundary_projection_rules_are_path_anchored() {
+    for name in [
+        "jobs",
+        "terminal_epoch",
+        "inflight_by_process",
+        "next_local",
+    ] {
+        let set = |v: i64| {
+            let mut s = with_ratified(33);
+            let inst = s["state"]["state"]["instances"]
+                .as_object_mut()
+                .expect("instances")
+                .iter_mut()
+                .find(|(k, _)| *k != "10")
+                .map(|(_, v)| v)
+                .expect("an unrelated instance");
+            inst["variables"]
+                .as_object_mut()
+                .expect("variables")
+                .insert(name.to_owned(), serde_json::json!({"Int": v}));
+            s
+        };
+        let (head, prev) = boundary_streams(set(1), set(2));
+        let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+        assert!(
+            err.contains("outside the ratified"),
+            "a variable named `{name}` is data and must be compared: {err}"
+        );
+    }
 }
 
 /// #1528 (review): the one-task-per-child validation must run even when the
@@ -2839,4 +2989,27 @@ fn prev_release_gate_nested_mi_body_scope_is_order_independent() {
         .unwrap();
     reordered.swap(pos, pos + 1);
     nested_gate(mixed(0), reordered).expect("the authoritative scope wins regardless of order");
+}
+/// #1764 guard: every serialized field of `State` and `EngineSnapshot` is
+/// classified by exactly one projection rule — adding a field without
+/// classifying it fails here (and fails the gate closed at runtime).
+#[test]
+fn state_projection_classifies_every_state_field() {
+    compare::projection_rule_drift().expect("projection rules match the schema");
+    let fields =
+        compare::struct_fields_in(include_str!("../src/state/types.rs"), "State").expect("State");
+    assert!(fields.contains("lenient_completion") && fields.contains("instances"));
+    assert!(
+        !fields.contains("deferred_jobs"),
+        "a #[serde(skip)] field is never serialized, so never classified"
+    );
+    // The derivation sees a newly declared field.
+    let src = "pub struct State {\n    pub a: u64,\n    #[cfg_attr(feature = \"serde\", serde(skip))]\n    pub b: BTreeMap<Key, u64>,\n    /// doc <\n    pub c: Option<(u64, String)>,\n}\n";
+    assert_eq!(
+        compare::struct_fields_in(src, "State").expect("parsed"),
+        ["a", "c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
 }

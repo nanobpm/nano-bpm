@@ -193,7 +193,8 @@
         ],
         "only_in_head": [
           {
-            "variant": "UserTaskCreated"
+            "variant": "UserTaskCreated",
+            "element_id": "review"
           }
         ],
         "unbalanced": {

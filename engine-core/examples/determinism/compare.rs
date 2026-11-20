@@ -80,126 +80,358 @@ fn is_key_field(name: &str) -> bool {
     name == "key" || name == "scope" || name.ends_with("_key") || name.ends_with("_keys")
 }
 
-/// The schema-known numeric-keyed entity maps of [`EngineSnapshot`]'s `State`
-/// (every `BTreeMap<Key, _>` field it declares). Only these maps are
-/// canonicalized as key-indexed entity collections; any OTHER numeric-keyed
-/// object (an instance's `scope_parents`, a business variable name, a FEEL
-/// context) is DATA whose key→value associations are preserved.
-fn is_entity_map_field(name: &str) -> bool {
-    matches!(
-        name,
-        "process_versions"
-            | "instances"
-            | "jobs"
-            | "settled_jobs"
-            | "user_tasks"
-            | "incidents"
-            | "timers"
-            | "message_subscriptions"
-            | "signal_subscriptions"
-            | "conditional_subscriptions"
-            | "start_timers"
-            | "decision_requirements_versions"
-            | "decision_versions"
-            | "form_versions"
-            | "resource_versions"
-            | "variables_lost_quarantined"
-            | "jobs_by_instance"
-    )
+// ---- Post-boundary snapshot projection, DERIVED from the State schema (#1764)
+//
+// Past a ratified upgrade-boundary `unbalanced` divergence the raw snapshots
+// cannot agree (the ratified instances' declared state change, and every later
+// minted key shifts), so they are compared through a projection. The
+// projection is anchored to the serialized TYPES: every field of
+// `EngineSnapshot` and of `State` is classified exactly once in
+// [`SNAPSHOT_FIELD_RULES`] / [`STATE_FIELD_RULES`], the special handling
+// applies ONLY at that typed path (a business variable named `jobs` or
+// `terminal_epoch` is data, never an entity map or a counter), and a
+// serialized field with no rule fails the comparison closed. The guard test
+// `state_projection_classifies_every_state_field` derives the field lists from
+// the struct source (`struct_fields_in`), so adding a field to `State` without
+// classifying it fails CI — a new field is compared by default only once a
+// reviewer has decided how.
+
+/// How the post-boundary projection treats one serialized snapshot field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldRule {
+    /// Compared exactly, with every nested `key`/`*_key`/`scope` reference
+    /// canonicalized through the side's own [`KeyIds`] and every nested
+    /// object owned by a ratified instance dropped.
+    Exact,
+    /// The snapshot's key allocator: every later mint shifts it, so dropped.
+    Allocator,
+    /// The `State` itself: projected field by field with [`STATE_FIELD_RULES`].
+    State,
+    /// A `BTreeMap<Key, T>` entity map: each entry is re-keyed by its entity
+    /// identity (associations preserved), and entries of (or owned by) a
+    /// ratified instance are dropped.
+    EntityMap,
+    /// A `BTreeMap<Key, BTreeSet<Key>>` owner→keys reverse index: the owner
+    /// and every member are canonicalized (owner association preserved), and
+    /// a ratified instance's entry / owned members are dropped.
+    KeyIndex,
+    /// A `BTreeMap<String, BTreeSet<(i64, Key)>>` worker-type index: each
+    /// member's key is canonicalized and ratified-owned members dropped.
+    PriorityKeyIndex,
+    /// An ordered collection of keys (`BTreeSet<Key>` / `VecDeque<Key>`):
+    /// canonicalized in place, ratified-owned keys dropped.
+    KeyList,
+    /// `created_by_process`: the ratified instances' OWN creations are
+    /// subtracted from their process's count — every other instance of that
+    /// process (and every other process) is still compared exactly.
+    CreatedCount,
+    /// `inflight_by_process`: the ratified instances' OWN in-flight
+    /// contributions (one per non-terminal ratified instance) are subtracted.
+    InflightCount,
+    /// `terminal_epoch`: advanced by the ratified instance's terminal
+    /// transition on one side only and not isolatable, so dropped — but ONLY
+    /// when an instance is ratified; otherwise compared exactly.
+    TerminalEpoch,
 }
 
-/// The derived counters/indices of [`State`] an excluded (ratified) instance
-/// contributes to. Past the boundary that instance's own contribution is the
-/// declared divergence, so the projection normalizes it: the per-process
-/// counts drop the excluded instance's process entries, the terminal epoch
-/// and the recently-terminated ring drop the excluded instance's terminal
-/// transition, and the key collections (`jobs_by_instance`,
-/// `activatable_jobs`, `activated_jobs`) drop the excluded instance's keys.
-/// Every OTHER process/instance contribution is still compared exactly.
-fn is_derived_counter_field(name: &str) -> bool {
-    matches!(
-        name,
-        "inflight_by_process" | "created_by_process" | "terminal_epoch" | "recently_terminated"
-    )
-}
+/// Every serialized field of `EngineSnapshot` (`src/engine/mod.rs`).
+pub const SNAPSHOT_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("state", FieldRule::State),
+    ("partition_id", FieldRule::Exact),
+    ("next_local", FieldRule::Allocator),
+    ("num_partitions", FieldRule::Exact),
+    ("now", FieldRule::Exact),
+    ("start_dispatch_rr", FieldRule::Exact),
+    ("raft_applied", FieldRule::Exact),
+];
 
-/// The key-insensitive projection of a canonical snapshot past a ratified
-/// upgrade-boundary divergence (#1528 review). The divergence shifts every
-/// later minted key and changes ITS OWN instances' state by declaration, so
-/// the projection (a) drops every record owned by a ratified instance
-/// (`excluded`: a keyed entity-map entry under such a key, or an object
-/// naming it as `instance_key` / `process_instance_key`), (b) canonicalizes
-/// every key reference to its entity identity (never one common placeholder,
-/// so a mis-owned retained entity still diverges) and every schema-known
-/// key-indexed entity map to the sorted multiset of its projected values,
-/// (c) drops the snapshot root's key allocator (`next_local`) — and ONLY the
-/// root's, so a nested FEEL context entry of the same name is preserved as
-/// data — and (d) normalizes the excluded instance's derived contributions
-/// (`inflight_by_process`, `terminal_epoch`, `recently_terminated`, and the
-/// `jobs_by_instance` / `activatable_jobs` / `activated_jobs` key
-/// collections). Every other field — flags, variables, counts of
-/// jobs/tasks/timers of every other instance, and every non-entity
-/// numeric-keyed map's key→value associations — is still compared, so an
-/// unrelated post-boundary state regression fails.
-///
-/// `path` is the dot-separated field path from the snapshot root, used to
-/// scope the allocator drop to the root and the entity-map canonicalization
-/// to schema-known fields. `entity_map` is true when `value` is the VALUE of
-/// a schema-known entity-map field (so its numeric keys are entity keys).
-fn boundary_projection(
-    value: &Json,
-    excluded: &BTreeSet<u64>,
-    path: &str,
-    entity_map: bool,
-) -> Option<Json> {
-    match value {
-        Json::Object(map) => {
-            for owner in ["instance_key", "process_instance_key"] {
-                if map
-                    .get(owner)
-                    .and_then(Json::as_u64)
-                    .is_some_and(|k| excluded.contains(&k))
-                {
-                    return None;
+/// Every serialized field of `State` (`src/state/types.rs`). Fields marked
+/// `#[serde(skip)]` never reach a snapshot and are not listed.
+pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("processes", FieldRule::Exact),
+    ("process_versions", FieldRule::EntityMap),
+    ("instances", FieldRule::EntityMap),
+    ("jobs", FieldRule::EntityMap),
+    ("settled_jobs", FieldRule::EntityMap),
+    ("routed_deliveries", FieldRule::Exact),
+    ("cluster_variables", FieldRule::Exact),
+    ("user_tasks", FieldRule::EntityMap),
+    ("incidents", FieldRule::EntityMap),
+    ("timers", FieldRule::EntityMap),
+    ("message_subscriptions", FieldRule::EntityMap),
+    ("signal_subscriptions", FieldRule::EntityMap),
+    ("conditional_subscriptions", FieldRule::EntityMap),
+    ("message_start_subscriptions", FieldRule::Exact),
+    ("start_timers", FieldRule::EntityMap),
+    ("activatable_jobs", FieldRule::PriorityKeyIndex),
+    ("activated_jobs", FieldRule::KeyList),
+    ("jobs_by_instance", FieldRule::KeyIndex),
+    ("inflight_by_process", FieldRule::InflightCount),
+    ("created_by_process", FieldRule::CreatedCount),
+    ("decision_requirements", FieldRule::Exact),
+    ("decision_requirements_versions", FieldRule::EntityMap),
+    ("decisions", FieldRule::Exact),
+    ("decision_versions", FieldRule::EntityMap),
+    ("forms", FieldRule::Exact),
+    ("form_versions", FieldRule::EntityMap),
+    ("resources", FieldRule::Exact),
+    ("resource_versions", FieldRule::EntityMap),
+    ("variables_lost_quarantined", FieldRule::EntityMap),
+    ("recently_terminated", FieldRule::KeyList),
+    ("terminal_epoch", FieldRule::TerminalEpoch),
+    ("lenient_completion", FieldRule::Exact),
+];
+
+/// The serialized field names of `struct <name> { … }` declared in `source`
+/// — every named field except those marked `#[serde(skip)]` (plain or under
+/// `cfg_attr`). Derived from the source so the projection's rule tables
+/// cannot silently drift from the schema (#1764).
+pub fn struct_fields_in(source: &str, name: &str) -> Option<BTreeSet<String>> {
+    let header = format!("struct {name} {{");
+    let mut lines = source
+        .lines()
+        .skip_while(|l| !l.trim_end().ends_with(&header));
+    lines.next()?;
+    let mut out = BTreeSet::new();
+    let mut depth = 1usize;
+    let mut skipped = false;
+    let mut attr = String::new();
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        if depth == 1 {
+            if !attr.is_empty() || t.starts_with("#[") {
+                attr.push_str(t);
+                if attr.matches('[').count() <= attr.matches(']').count() {
+                    let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
+                    skipped |= compact.contains("serde(skip)") || compact.contains("serde(skip,");
+                    attr.clear();
+                }
+                continue;
+            }
+            if !t.is_empty() && t != "}" {
+                let decl = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub(super) "))
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                if let Some((field, _)) = decl.split_once(':') {
+                    if is_field_name(field) && !std::mem::take(&mut skipped) {
+                        out.insert(field.to_owned());
+                    }
                 }
             }
-            // A schema-known entity map: canonicalize each entry's key to the
-            // entity identity and drop the ratified instance's entries, then
-            // sort the projected values into a multiset (key-insensitive).
-            if entity_map {
-                let mut items: Vec<Json> = map
-                    .iter()
-                    .filter(|(k, _)| k.parse::<u64>().is_ok_and(|k| !excluded.contains(&k)))
-                    .filter_map(|(_, v)| boundary_projection(v, excluded, path, false))
-                    .collect();
-                items.sort_by_key(|v| v.to_string());
-                return Some(Json::Array(items));
+        }
+        let opens = t.matches('{').count() + t.matches('<').count();
+        let closes = t.matches('}').count() + t.matches('>').count() - t.matches("->").count();
+        depth = (depth + opens).saturating_sub(closes);
+        if depth == 0 {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The schema drift of the rule tables: every serialized field of `State`
+/// and `EngineSnapshot`, derived from their source, must carry exactly one
+/// rule, and every rule must name a real field. Checked before any
+/// post-boundary projection (and by the guard test), so a new `State` field
+/// can never be silently projected away or silently compared under an
+/// unreviewed rule (#1764).
+pub fn projection_rule_drift() -> Result<(), String> {
+    for (name, source, rules) in [
+        (
+            "State",
+            include_str!("../../src/state/types.rs"),
+            STATE_FIELD_RULES,
+        ),
+        (
+            "EngineSnapshot",
+            include_str!("../../src/engine/mod.rs"),
+            SNAPSHOT_FIELD_RULES,
+        ),
+    ] {
+        let fields = struct_fields_in(source, name)
+            .ok_or_else(|| format!("struct {name} not found in its source"))?;
+        let mut ruled = BTreeSet::new();
+        for (f, _) in rules {
+            if !ruled.insert((*f).to_owned()) {
+                return Err(format!("{name}.{f} has two projection rules"));
+            }
+        }
+        let unclassified: Vec<_> = fields.difference(&ruled).collect();
+        let stale: Vec<_> = ruled.difference(&fields).collect();
+        if !unclassified.is_empty() || !stale.is_empty() {
+            return Err(format!(
+                "post-boundary projection rules drift from {name}: unclassified \
+                 {unclassified:?}, stale {stale:?} — classify every serialized field \
+                 (#1764)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One side's view for the projection: its own corpus-wide key identities
+/// (so a key re-minted on only one side canonicalizes to the same entity
+/// identity on both, #1764), its ratified instances, and every entity key
+/// those instances own in this snapshot.
+struct ProjectionSide<'a> {
+    ids: &'a KeyIds,
+    excluded: &'a BTreeSet<u64>,
+    owned: BTreeSet<u64>,
+}
+
+impl ProjectionSide<'_> {
+    fn is_excluded(&self, k: u64) -> bool {
+        self.excluded.contains(&k) || self.owned.contains(&k)
+    }
+
+    /// The canonical token of a key reference: the side's entity identity, or
+    /// the raw key when this side never minted it (so it must then be equal
+    /// on both sides — fail closed on an unexplained remint).
+    fn token(&self, k: u64) -> String {
+        self.ids
+            .get(&k)
+            .cloned()
+            .unwrap_or_else(|| format!("#key:{k}"))
+    }
+
+    fn owned_by_excluded(&self, map: &serde_json::Map<String, Json>) -> bool {
+        ["instance_key", "process_instance_key"].iter().any(|f| {
+            map.get(*f)
+                .and_then(Json::as_u64)
+                .is_some_and(|k| self.excluded.contains(&k))
+        })
+    }
+}
+
+/// Every entity key (of any [`FieldRule::EntityMap`]) whose entity is a
+/// ratified instance or is owned by one (`instance_key` /
+/// `process_instance_key`).
+fn owned_entity_keys(
+    state: &serde_json::Map<String, Json>,
+    excluded: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    for (field, rule) in STATE_FIELD_RULES {
+        if *rule != FieldRule::EntityMap {
+            continue;
+        }
+        let Some(map) = state.get(*field).and_then(Json::as_object) else {
+            continue;
+        };
+        for (k, v) in map {
+            let Ok(k) = k.parse::<u64>() else { continue };
+            let owned = excluded.contains(&k)
+                || ["instance_key", "process_instance_key"].iter().any(|f| {
+                    v.get(*f)
+                        .and_then(Json::as_u64)
+                        .is_some_and(|o| excluded.contains(&o))
+                });
+            if owned {
+                out.insert(k);
+            }
+        }
+    }
+    out
+}
+
+/// The post-boundary projection of a canonical `EngineSnapshot` (#1764).
+fn boundary_projection(
+    snapshot: &Json,
+    ids: &KeyIds,
+    excluded: &BTreeSet<u64>,
+) -> Result<Json, String> {
+    projection_rule_drift()?;
+    let root = snapshot.as_object().ok_or("snapshot is not an object")?;
+    let owned = root
+        .get("state")
+        .and_then(Json::as_object)
+        .map(|s| owned_entity_keys(s, excluded))
+        .unwrap_or_default();
+    let side = ProjectionSide {
+        ids,
+        excluded,
+        owned,
+    };
+    project_fields(root, SNAPSHOT_FIELD_RULES, "$", &side, root)
+}
+
+fn project_fields(
+    map: &serde_json::Map<String, Json>,
+    rules: &[(&str, FieldRule)],
+    path: &str,
+    side: &ProjectionSide<'_>,
+    parent: &serde_json::Map<String, Json>,
+) -> Result<Json, String> {
+    let mut out = serde_json::Map::new();
+    for (k, v) in map {
+        let rule = rules
+            .iter()
+            .find(|(f, _)| f == k)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| {
+                format!(
+                    "post-boundary projection has no rule for serialized field {path}.{k} — \
+                     classify it in STATE_FIELD_RULES / SNAPSHOT_FIELD_RULES (#1764)"
+                )
+            })?;
+        let projected = match rule {
+            FieldRule::Allocator => continue,
+            FieldRule::State => {
+                let state = v.as_object().ok_or("snapshot state is not an object")?;
+                project_fields(
+                    state,
+                    STATE_FIELD_RULES,
+                    &format!("{path}.{k}"),
+                    side,
+                    state,
+                )?
+            }
+            FieldRule::Exact => match project_value(v, side) {
+                Some(p) => p,
+                None => continue,
+            },
+            FieldRule::EntityMap => project_entity_map(v, side, &format!("{path}.{k}"))?,
+            FieldRule::KeyIndex => project_key_index(v, side, &format!("{path}.{k}"))?,
+            FieldRule::PriorityKeyIndex => project_priority_index(v, side),
+            FieldRule::KeyList => project_key_list(v, side),
+            FieldRule::CreatedCount => project_count(v, side, parent, false),
+            FieldRule::InflightCount => project_count(v, side, parent, true),
+            FieldRule::TerminalEpoch => {
+                if side.excluded.is_empty() {
+                    v.clone()
+                } else {
+                    Json::Null
+                }
+            }
+        };
+        out.insert(k.clone(), projected);
+    }
+    Ok(Json::Object(out))
+}
+
+/// A nested value: key references canonicalized, objects owned by a ratified
+/// instance dropped, variable (`Value`) maps kept verbatim (their keys and
+/// tagged values are application data, never key references).
+fn project_value(value: &Json, side: &ProjectionSide<'_>) -> Option<Json> {
+    match value {
+        Json::Object(map) => {
+            if side.owned_by_excluded(map) {
+                return None;
+            }
+            if is_value_map(map) {
+                return Some(value.clone());
             }
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                // Drop the key allocator ONLY at the snapshot root (`$.next_local`),
-                // never a nested data entry of the same name.
-                if path.is_empty() && k == "next_local" {
-                    continue;
-                }
-                let child_path = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}.{k}")
-                };
                 let projected = if is_key_field(k) {
-                    // A key reference: canonicalize to the entity identity so a
-                    // mis-owned reference still diverges, never a placeholder.
-                    key_identity(v, excluded)
-                } else if is_derived_counter_field(k) {
-                    derived_counter_projection(k, v, excluded, map)
-                } else if is_entity_map_field(k) {
-                    match boundary_projection(v, excluded, &child_path, true) {
-                        Some(p) => p,
-                        None => continue,
-                    }
+                    key_reference(v, side)
                 } else {
-                    match boundary_projection(v, excluded, &child_path, false) {
+                    match project_value(v, side) {
                         Some(p) => p,
                         None => continue,
                     }
@@ -211,108 +443,178 @@ fn boundary_projection(
         Json::Array(items) => Some(Json::Array(
             items
                 .iter()
-                .filter_map(|v| boundary_projection(v, excluded, path, false))
+                .filter_map(|v| project_value(v, side))
                 .collect(),
         )),
         other => Some(other.clone()),
     }
 }
 
-/// A key value (or list of keys) with each raw key replaced by the identity
-/// of the entity it references. Unlike a common placeholder, the identity
-/// preserves WHICH entity is referenced, so a reference re-pointed at the
-/// wrong entity (an ownership regression) still diverges. A reference to an
-/// excluded (ratified) instance's own key is dropped (the entity is gone
-/// from the projection), and a reference to a key never minted keeps a
-/// distinct orphan token.
-fn key_identity(v: &Json, excluded: &BTreeSet<u64>) -> Json {
+/// A key reference (or list of them) canonicalized to entity identities; a
+/// reference to a ratified instance's own key becomes `null`.
+fn key_reference(v: &Json, side: &ProjectionSide<'_>) -> Json {
     match v {
         Json::Number(n) if n.is_u64() => {
             let k = n.as_u64().unwrap_or(0);
-            if excluded.contains(&k) {
+            if side.excluded.contains(&k) {
                 Json::Null
             } else {
-                Json::String(format!("#key:{k}"))
+                Json::String(side.token(k))
             }
         }
-        Json::Array(items) => {
-            Json::Array(items.iter().map(|i| key_identity(i, excluded)).collect())
+        Json::Array(items) => Json::Array(items.iter().map(|i| key_reference(i, side)).collect()),
+        other => project_value(other, side).unwrap_or(Json::Null),
+    }
+}
+
+fn project_entity_map(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<Json, String> {
+    let Some(map) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    let mut out = serde_json::Map::new();
+    for (k, entry) in map {
+        let raw = k
+            .parse::<u64>()
+            .map_err(|_| format!("{path} entry key {k:?} is not an entity key"))?;
+        if side.is_excluded(raw) {
+            continue;
         }
+        let Some(projected) = project_value(entry, side) else {
+            continue;
+        };
+        let token = side.token(raw);
+        if out.insert(token.clone(), projected).is_some() {
+            return Err(format!(
+                "{path}: two entries canonicalize to entity {token}"
+            ));
+        }
+    }
+    Ok(Json::Object(out))
+}
+
+fn project_key_index(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<Json, String> {
+    let Some(map) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    let mut out = serde_json::Map::new();
+    for (k, members) in map {
+        let raw = k
+            .parse::<u64>()
+            .map_err(|_| format!("{path} owner key {k:?} is not an entity key"))?;
+        if side.is_excluded(raw) {
+            continue;
+        }
+        let token = side.token(raw);
+        if out
+            .insert(token.clone(), project_key_set(members, side))
+            .is_some()
+        {
+            return Err(format!("{path}: two owners canonicalize to entity {token}"));
+        }
+    }
+    Ok(Json::Object(out))
+}
+
+/// A SET of keys: canonicalized, ratified-owned keys dropped, and re-sorted
+/// (set order is raw-key order, which a remint permutes).
+fn project_key_set(v: &Json, side: &ProjectionSide<'_>) -> Json {
+    match project_key_list(v, side) {
+        Json::Array(mut items) => {
+            items.sort_by_key(ToString::to_string);
+            Json::Array(items)
+        }
+        other => other,
+    }
+}
+
+/// An ordered key collection: canonicalized in place, ratified-owned keys
+/// dropped.
+fn project_key_list(v: &Json, side: &ProjectionSide<'_>) -> Json {
+    match v {
+        Json::Array(items) => Json::Array(
+            items
+                .iter()
+                .filter(|i| i.as_u64().is_none_or(|k| !side.is_excluded(k)))
+                .map(|i| key_reference(i, side))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
 
-/// Normalizes one derived counter/index field for the excluded (ratified)
-/// instance's contribution. `parent` is the enclosing `State` object (so the
-/// per-process counts can find the excluded instance's process id). The
-/// per-process counts drop the excluded instance's process entry (its count
-/// is the declared divergence); `terminal_epoch` and `recently_terminated`
-/// drop the excluded instance's terminal transition; the key collections
-/// drop the excluded instance's keys. Every other contribution is preserved
-/// exactly.
-fn derived_counter_projection(
-    name: &str,
-    v: &Json,
-    excluded: &BTreeSet<u64>,
-    parent: &serde_json::Map<String, Json>,
-) -> Json {
-    match name {
-        // `recently_terminated`: drop the excluded instance's keys.
-        "recently_terminated" => match v {
-            Json::Array(items) => Json::Array(
-                items
-                    .iter()
-                    .filter(|i| i.as_u64().is_none_or(|k| !excluded.contains(&k)))
-                    .cloned()
-                    .collect(),
-            ),
-            other => other.clone(),
-        },
-        // The per-process counts: drop the excluded instance's OWN process
-        // entry (its count is the declared divergence — the head instance
-        // stays parked, the prev one completes). Every OTHER process's count
-        // is still compared exactly.
-        "inflight_by_process" | "created_by_process" => {
-            let excluded_pids: BTreeSet<String> = excluded
-                .iter()
-                .filter_map(|k| {
-                    parent
-                        .get("instances")
-                        .and_then(Json::as_object)
-                        .and_then(|i| i.get(&k.to_string()))
-                        .and_then(|inst| inst.get("process_id"))
-                        .and_then(Json::as_str)
-                        .map(str::to_owned)
-                })
-                .collect();
-            match v {
-                Json::Object(map) => {
-                    let mut out = map.clone();
-                    for pid in &excluded_pids {
-                        out.remove(pid);
-                    }
-                    Json::Object(out)
-                }
-                other => other.clone(),
-            }
-        }
-        // `terminal_epoch`: the excluded instance's terminal transition
-        // advances it on the completing side only. The projection cannot
-        // isolate that contribution key-insensitively, so it is dropped — but
-        // ONLY when there IS an excluded (ratified) instance whose transition
-        // is the declared divergence; with none, the epoch is compared exactly
-        // (an unrelated terminal transition still fails). The per-instance
-        // `terminated_epoch` and the `recently_terminated` ring still record
-        // WHICH instances terminated, and are compared.
-        "terminal_epoch" => {
-            if excluded.is_empty() {
-                v.clone()
-            } else {
-                Json::Null
-            }
-        }
-        _ => v.clone(),
+/// `activatable_jobs`: `{type: [[priority, job_key], …]}`.
+fn project_priority_index(v: &Json, side: &ProjectionSide<'_>) -> Json {
+    let Some(map) = v.as_object() else {
+        return v.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (job_type, members) in map {
+        let mut items: Vec<Json> = members
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| {
+                m.get(1)
+                    .and_then(Json::as_u64)
+                    .is_none_or(|k| !side.is_excluded(k))
+            })
+            .map(|m| match m.as_array() {
+                Some(pair) => Json::Array(
+                    pair.iter()
+                        .enumerate()
+                        .map(|(i, x)| {
+                            if i == 1 {
+                                key_reference(x, side)
+                            } else {
+                                x.clone()
+                            }
+                        })
+                        .collect(),
+                ),
+                None => m.clone(),
+            })
+            .collect();
+        items.sort_by_key(ToString::to_string);
+        out.insert(job_type.clone(), Json::Array(items));
     }
+    Json::Object(out)
+}
+
+/// A per-process count minus ONLY the ratified instances' own
+/// contributions: each ratified instance still resident in `instances`
+/// contributed one creation, and one in-flight count while non-terminal. A
+/// count that reaches zero is dropped (the engine drops a zero in-flight
+/// entry). Every other instance's contribution is compared exactly.
+fn project_count(
+    v: &Json,
+    side: &ProjectionSide<'_>,
+    state: &serde_json::Map<String, Json>,
+    inflight: bool,
+) -> Json {
+    let Some(map) = v.as_object() else {
+        return v.clone();
+    };
+    let mut out = map.clone();
+    for k in side.excluded {
+        let Some(inst) = state.get("instances").and_then(|i| i.get(k.to_string())) else {
+            continue;
+        };
+        let Some(pid) = inst.get("process_id").and_then(Json::as_str) else {
+            continue;
+        };
+        let terminal = matches!(
+            inst.get("state").and_then(Json::as_str),
+            Some("Completed" | "Terminated")
+        );
+        if inflight && terminal {
+            continue;
+        }
+        if let Some(n) = out.get(pid).and_then(Json::as_u64) {
+            out.insert(pid.to_owned(), Json::from(n.saturating_sub(1)));
+        }
+    }
+    out.retain(|_, n| n.as_u64() != Some(0));
+    Json::Object(out)
 }
 
 /// Compares state checkpoints (through the head `EngineSnapshot` type) when
@@ -323,6 +625,7 @@ fn compare_states(
     entries: usize,
     erasable: &Vocab,
     boundary: &RatifiedBoundary,
+    (head_ids, prev_ids): (&KeyIds, &KeyIds),
 ) -> Result<CrossReleaseReport, String> {
     if head_states.len() != prev_states.len() {
         return Err(format!(
@@ -362,8 +665,8 @@ fn compare_states(
         // instances — every other state is still checked (#1528 review).
         if let (Some(from), Some(i)) = (boundary.from, at.as_u64()) {
             if i >= from {
-                if boundary_projection(&hs, &boundary.head_instances, "", false)
-                    != boundary_projection(&ps, &boundary.prev_instances, "", false)
+                if boundary_projection(&hs, head_ids, &boundary.head_instances)?
+                    != boundary_projection(&ps, prev_ids, &boundary.prev_instances)?
                 {
                     return Err(format!(
                         "durable state diverges at entry {at} outside the ratified \
@@ -2600,6 +2903,7 @@ pub fn cross_release_checked(
         prev_entries.len(),
         &state_erasable,
         &boundary,
+        (&head_ids, &prev_ids),
     )?;
     // Report the fields actually erased (present on the head side of their
     // own stream), not the whole candidate set.
