@@ -8,7 +8,7 @@ import os from 'node:os';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildReport } from './report.mjs';
-import { BASELINE_FILE, checkRatchet, unparseableByClass } from './unparseable-ratchet.mjs';
+import { BASELINE_FILE, checkBaseGrowth, checkRatchet, unparseableByClass } from './unparseable-ratchet.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const A = 'zeebe/x/ATest';
@@ -55,4 +55,28 @@ test('the report surfaces unparseable counts per test class, flagging fully unpa
     { testClass: A, unparseable: 1, harvested: 1, fullyUnparseable: false },
     { testClass: B, unparseable: 2, harvested: 0, fullyUnparseable: true },
   ]);
+});
+
+// Cross-branch guard (#1525 review): `--update` can rewrite the baseline to
+// admit a regression, so CI compares the head baseline with the target
+// branch's copy. Growth is admitted only across a Zeebe pin bump.
+const SAME_PIN = { sha: 'a' };
+test('base growth: a newly unparseable class is rejected', () => {
+  const errs = checkBaseGrowth({ classes: { A: 1, B: 2 } }, { classes: { A: 1 } }, SAME_PIN, SAME_PIN);
+  assert.equal(errs.length, 1);
+  assert.match(errs[0], /B/);
+});
+test('base growth: an increased count is rejected', () => {
+  const errs = checkBaseGrowth({ classes: { A: 3 } }, { classes: { A: 1 } }, SAME_PIN, SAME_PIN);
+  assert.equal(errs.length, 1);
+  assert.match(errs[0], /A.*1 -> 3/);
+});
+test('base growth: shrinks and removals pass', () => {
+  assert.deepEqual(checkBaseGrowth({ classes: { A: 1 } }, { classes: { A: 2, B: 1 } }, SAME_PIN, SAME_PIN), []);
+});
+test('base growth: a Zeebe pin bump may grow the baseline', () => {
+  assert.deepEqual(checkBaseGrowth({ classes: { A: 3, C: 1 } }, { classes: { A: 1 } }, { sha: 'b' }, SAME_PIN), []);
+});
+test('base growth: a malformed base baseline fails closed', () => {
+  assert.equal(checkBaseGrowth({ classes: { A: 1 } }, {}, SAME_PIN, SAME_PIN).length, 1);
 });

@@ -3,6 +3,8 @@
 //
 //   node formal/harvest/unparseable-ratchet.mjs            # check (CI gate)
 //   node formal/harvest/unparseable-ratchet.mjs --update   # rewrite the baseline
+//   node formal/harvest/unparseable-ratchet.mjs --base-baseline <target-branch baseline> \
+//        --base-pin <target-branch zeebe-test-pin.json>      # + cross-branch growth check (CI)
 //
 // The report counts unparseable models in aggregate only, so a whole family of
 // Zeebe behaviours (e.g. every `multiinstance/*Test.java`) could silently stay
@@ -17,6 +19,13 @@
 //   * a class whose count SHRANK (or vanished) also fails until the baseline is
 //     regenerated with `--update`, so progress is locked in and the baseline
 //     never carries slack a later regression could hide behind.
+//
+//
+// `--update` alone could rewrite the baseline to admit a regression, so CI
+// also compares the HEAD baseline against the TARGET branch's copy
+// (`--base-baseline`, cf. formal/parity's `--base-gaps`): a class added or a
+// count increased fails, unless the Zeebe pin changed (new upstream tests may
+// legitimately arrive unparseable).
 //
 // The single source of truth for the per-class grouping is `unparseableByClass`
 // below; report.mjs surfaces the same grouping in report.json.
@@ -90,6 +99,42 @@ export function checkRatchet(current, baseline) {
   return errors;
 }
 
+/**
+ * Cross-branch growth check: the head baseline may not add a class or increase
+ * a count relative to the target branch's baseline, unless the Zeebe pin sha
+ * differs. Returns error strings (empty = pass). Fails closed on malformed input.
+ */
+export function checkBaseGrowth(headBaseline, baseBaseline, headPin, basePin) {
+  const isClasses = (b) => b && typeof b.classes === 'object' && b.classes !== null;
+  if (!isClasses(headBaseline) || !isClasses(baseBaseline)) {
+    return ['base growth check: both baselines must have a `classes` object'];
+  }
+  if (!headPin?.sha || !basePin?.sha) {
+    return ['base growth check: both zeebe-test-pin.json files must carry a `sha`'];
+  }
+  if (headPin.sha !== basePin.sha) return [];
+  const errors = [];
+  const base = baseBaseline.classes;
+  for (const [cls, n] of Object.entries(headBaseline.classes)) {
+    if (!Object.hasOwn(base, cls)) {
+      errors.push(`regression: baseline adds ${cls} (${n} unparseable model(s)) vs the target branch at the same Zeebe pin`);
+    } else if (n > base[cls]) {
+      errors.push(`regression: baseline grows ${cls} ${base[cls]} -> ${n} vs the target branch at the same Zeebe pin`);
+    }
+  }
+  return errors;
+}
+
+const readJson = (f) => JSON.parse(readFileSync(f, 'utf8'));
+
+function argValue(args, flag) {
+  const i = args.indexOf(flag);
+  if (i < 0) return null;
+  const v = args[i + 1];
+  if (!v || v.startsWith('--')) throw new Error(`${flag} needs a file path`);
+  return v;
+}
+
 function main() {
   const args = process.argv.slice(2);
   const cIdx = args.indexOf('--corpus');
@@ -108,6 +153,16 @@ function main() {
   }
   const baseline = existsSync(BASELINE_FILE) ? JSON.parse(readFileSync(BASELINE_FILE, 'utf8')) : null;
   const errors = checkRatchet(current, baseline);
+  const baseBaselinePath = argValue(args, '--base-baseline');
+  const basePinPath = argValue(args, '--base-pin');
+  if (baseBaselinePath || basePinPath) {
+    if (!baseBaselinePath || !basePinPath) {
+      errors.push('--base-baseline and --base-pin must be given together');
+    } else {
+      const headPin = readJson(join(here, 'zeebe-test-pin.json'));
+      errors.push(...checkBaseGrowth(baseline, readJson(baseBaselinePath), headPin, readJson(basePinPath)));
+    }
+  }
   if (errors.length) {
     for (const e of errors) console.error(`::error::${e}`);
     process.exit(1);

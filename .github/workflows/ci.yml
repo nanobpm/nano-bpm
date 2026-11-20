@@ -970,6 +970,8 @@ jobs:
       - name: Harvest tests
         run: node --test formal/harvest/*.test.mjs
       - name: Harvested corpus is derived from the pinned Zeebe tests
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
         run: |
           # The derived artifacts must all be committed: regenerating a deleted
           # file recreates it as UNTRACKED, which `git diff` cannot see — so
@@ -978,7 +980,18 @@ jobs:
           git ls-files --error-unmatch formal/harvest/report.json \
             $(git ls-files formal/harvest/corpus)
           formal/harvest/harvest.sh
-          git diff --exit-code -- formal/harvest/corpus formal/harvest/report.json
+          git diff --exit-code -- formal/harvest/corpus formal/harvest/report.json formal/harvest/unparseable-baseline.json
+          # The unparseable baseline is shrink-only ACROSS branches too (#1525):
+          # `--update` could otherwise admit a regression. Compare against the
+          # target branch's copy (absent until the ratchet first lands there).
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          if git cat-file -e FETCH_HEAD:formal/harvest/unparseable-baseline.json 2>/dev/null; then
+            git show FETCH_HEAD:formal/harvest/unparseable-baseline.json > "$RUNNER_TEMP/base-unparseable.json"
+            git show FETCH_HEAD:formal/harvest/zeebe-test-pin.json > "$RUNNER_TEMP/base-harvest-pin.json"
+            node formal/harvest/unparseable-ratchet.mjs --base-baseline "$RUNNER_TEMP/base-unparseable.json" --base-pin "$RUNNER_TEMP/base-harvest-pin.json"
+          else
+            echo "::notice::no formal/harvest/unparseable-baseline.json on $BASE_REF yet; baseline growth not checked"
+          fi
           # A regeneration that produces an artifact the commit forgot to add
           # (or leaves one a pin bump made obsolete) must fail the build, not
           # pass silently: `git diff` is blind to untracked files.
