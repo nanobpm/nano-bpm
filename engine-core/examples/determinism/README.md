@@ -62,9 +62,14 @@ ignored silently:
 
    Release-note line for the current `upgrade-boundary` entries (the
    `cross-release` command also prints each one as an `UPGRADE BOUNDARY`
-   line to call out): "**Behaviour change at the upgrade boundary: during a
-   rolling upgrade, multi-instance user tasks created by old and new leaders
-   differ until all members run this release (#1528).**"
+   line to call out): "**Behaviour change at the upgrade boundary: this
+   release changes what a multi-instance user task does (each child now
+   creates a real user task, #1528). Raft members re-execute committed
+   commands, so a rolling upgrade would leave replicas' journals and state
+   permanently divergent — do NOT roll this release across the cluster.
+   Upgrade only with the cluster quiesced and ALL members on this release;
+   upgrading the remaining members afterwards does not undo a divergence a
+   mixed-version window already wrote.**"
 
    An entry **expires** (must be removed) once the
    previous release is at or past `introduced_in`, and a **stale** entry —

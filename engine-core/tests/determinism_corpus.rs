@@ -1719,6 +1719,216 @@ fn prev_release_gate_unbalanced_divergence_requires_an_explicit_declaration() {
     );
 }
 
+/// The index (among the non-state entry records) of the
+/// `multi-instance-user-tasks` CREATE entry — the one whose events carry the
+/// MI body, its children, and the per-child `UserTaskCreated` events.
+fn mi_create_entry(records: &[serde_json::Value]) -> usize {
+    entry_emitting(
+        records,
+        "multi-instance-user-tasks",
+        "MultiInstanceChildActivated",
+    )
+}
+
+/// The `multi-instance-user-tasks` divergence declaration (`remint_keys` +
+/// the unbalanced per-child `UserTaskCreated`), mirroring the allowlist.
+fn mi_declaration() -> serde_json::Value {
+    serde_json::json!({"divergences": [{
+        "scenario": "multi-instance-user-tasks",
+        "expected": {
+            "reorder": true,
+            "remint_keys": true,
+            "only_in_head": [{"variant": "UserTaskCreated"}],
+            "only_in_prev": [
+                {"variant": "ElementActivated", "element_id": "review"},
+                {"variant": "ElementCompleted", "element_id": "review"},
+                {"variant": "SequenceFlowTaken", "from": "review"}
+            ],
+            "unbalanced": {"reason": "Zeebe parity: an MI userTask child creates a real user task"}
+        },
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]})
+}
+
+/// #1528 (review): an MI child's canonical identity is independent of the
+/// entry's event order — whether its generic `ElementActivating` or its
+/// `MultiInstanceChildActivated` is seen first, the child canonicalizes to the
+/// same `mi-child:…` identity, so a pure reorder reconciles.
+#[test]
+fn prev_release_gate_mi_child_identity_is_order_independent() {
+    // A self-contained entry: an instance whose MI body (element `review`)
+    // activates one child. `prev` is the SAME events reversed — a pure
+    // reorder (same keys, permuted order), so the child's generic
+    // `ElementActivating` now precedes its `MultiInstanceChildActivated`. With
+    // `reorder` + `remint_keys` declared, the two must reconcile: the child's
+    // canonical identity is the same whichever sighting comes first.
+    let entry = |order: &[&str]| -> serde_json::Value {
+        let events: Vec<serde_json::Value> = order
+            .iter()
+            .map(|kind| match *kind {
+                "create" => serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+                "body_activating" => serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":11,"instance_key":10,"scope":0}}),
+                "child_activating" => serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":12,"instance_key":10,"scope":11}}),
+                "child_activated" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":12,"index":0,"instance_key":10,"local_variables":{}}}),
+                other => panic!("unknown event {other}"),
+            })
+            .collect();
+        serde_json::json!({"i": 0, "events": events})
+    };
+    let forward = entry(&[
+        "create",
+        "body_activating",
+        "child_activating",
+        "child_activated",
+    ]);
+    let reversed = entry(&[
+        "child_activated",
+        "child_activating",
+        "body_activating",
+        "create",
+    ]);
+    // One state checkpoint each (same format) so the state comparison is live —
+    // a real snapshot from a corpus run, so it decodes under the head type.
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![forward.clone(), state()];
+    let prev = vec![reversed, state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx)
+        .expect("a pure reorder of an MI child's sightings reconciles");
+}
+
+/// #1528 (review): the mint bypass for an MI child's generic re-sighting is
+/// restricted to that lifecycle — a key reused for an UNRELATED entity (a
+/// `UserTaskCreated` reusing its child's key, or a child reusing a job key)
+/// is a collision and fails closed, never silently accepted.
+#[test]
+fn prev_release_gate_remint_rejects_unrelated_key_collisions() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+
+    // A `UserTaskCreated` reusing its child's key: set the first
+    // `UserTaskCreated`'s `user_task_key` to the child's key.
+    let mut prev = head.clone();
+    let child_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .nth(i)
+        .and_then(|r| r.get("events").cloned())
+        .and_then(|e| e.as_array().cloned())
+        .and_then(|events| {
+            events.iter().find_map(|e| {
+                e.get("MultiInstanceChildActivated")?
+                    .get("child_key")?
+                    .as_u64()
+            })
+        })
+        .expect("a child key");
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(utc) = e.get_mut("UserTaskCreated") {
+                utc["user_task_key"] = serde_json::json!(child_key);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a UserTaskCreated reusing its child's key must fail as a collision: {err}"
+    );
+
+    // A child reusing a JOB key: set the first `MultiInstanceChildActivated`'s
+    // `child_key` to a job key minted elsewhere in the corpus.
+    let job_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .filter_map(|r| r.get("events")?.as_array().cloned())
+        .flatten()
+        .find_map(|e| e.get("JobCreated")?.get("job_key")?.as_u64())
+        .expect("a job key");
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(mica) = e.get_mut("MultiInstanceChildActivated") {
+                mica["child_key"] = serde_json::json!(job_key);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a child reusing a job key must fail as a collision: {err}"
+    );
+}
+
+/// #1528 (review): an `unbalanced` declaration must not ratify a WRONG
+/// one-sided event. A surplus `UserTaskCreated` whose owning
+/// `element_instance_key` its own side never minted (a wrong-child /
+/// wrong-owner event) fails even under a valid declaration; and a corrupted
+/// (undecodable) surplus event fails too.
+#[test]
+fn prev_release_gate_unbalanced_rejects_wrong_one_sided_events() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+
+    // A wrong-owner surplus: point the first `UserTaskCreated`'s
+    // `element_instance_key` at a key the head side never mints.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(utc) = e.get_mut("UserTaskCreated") {
+                utc["element_instance_key"] = serde_json::json!(9_999_999u64);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("never minted") || err.contains("UNDECLARED extra divergence"),
+        "a wrong-owner surplus UserTaskCreated must fail: {err}"
+    );
+
+    // A corrupted surplus: mangle a `UserTaskCreated` so it no longer decodes
+    // under the head `Event` type (a non-object body).
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if e.get("UserTaskCreated").is_some() {
+                *e = serde_json::json!({"UserTaskCreated": "corrupted"});
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("does not decode") || err.contains("UNDECLARED extra divergence"),
+        "a corrupted surplus UserTaskCreated must fail: {err}"
+    );
+}
+
 /// Drift guard: every unit variant declared anywhere in engine-core/src is
 /// covered by `compare::unit_variants` (derived from `ENGINE_TYPE_SOURCES`).
 #[test]
