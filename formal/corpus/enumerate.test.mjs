@@ -586,3 +586,20 @@ test('error classes mask ids and numbers so one defect is one signature', () => 
   assert.equal(errorClass(new Error("no 'T1' job became activatable within 30000ms\nmore")),
     errorClass(new Error("no 'T7' job became activatable within 5ms")))
 })
+
+test('Reference takes a fork\'s flows in reverse document order, as Zeebe (#1693, #1675)', () => {
+  // Gen_a0e9274136: G1 forks to G2 (f2) and G3 (f3); G2 can reach the inclusive
+  // join G3 over f4 but routes to E (f5). Zeebe takes f3 BEFORE f2, so G3 is
+  // evaluated while G2's activation is still in transit and is rejected; G2
+  // then routes away and G3 is never re-evaluated — live Camunda 8 strands the
+  // instance with no T1 job. A document-order (f2 first) reference drains G2
+  // before G3 and wrongly expects completion.
+  const g = materialize({ kinds: ['or', 'or', 'or'], edges: [[0, 1, 'direct'], [1, 2, 'direct'], [1, 3, 'direct'], [2, 3, 'direct'], [2, 4, 'direct'], [3, 4, 'task']] })
+  const ref = new Reference(g, { route_G1: [['f2', 'f3']], route_G2: [['f5']] })
+  assert.equal(ref.completed, false)
+  assert.equal(ref.jobsCreated.T1, undefined)
+  assert.equal(ref.joinsFired.G3, undefined)
+  assert.deepEqual(ref.commands(), [])
+  // The order is per element: the reversed fork still takes BOTH flows.
+  assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f5: 1 })
+})
