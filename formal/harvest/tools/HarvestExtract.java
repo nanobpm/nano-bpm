@@ -202,10 +202,17 @@ public final class HarvestExtract {
         if (!m.getName().equals(name) || m.getParameterCount() != args.size()) continue;
         // Only replay no-arg and String-arg builder methods — the harvester only
         // ever emits those. A Consumer/lambda overload is never statically
-        // resolvable and is rejected upstream.
+        // resolvable and is rejected upstream. A model-object argument (the
+        // Message/Signal built by invokeNestedEventBuilder) matches by
+        // assignability so message(Message)/signal(Message) resolve.
         boolean ok = true;
-        for (Class<?> pt : m.getParameterTypes()) {
-          if (pt != String.class && !pt.isPrimitive() && args.size() > 0) { ok = false; break; }
+        Class<?>[] pts = m.getParameterTypes();
+        for (int k = 0; k < pts.length; k++) {
+          Class<?> pt = pts[k];
+          Object a = args.get(k);
+          if (pt == String.class || pt.isPrimitive()) continue;
+          if (a != null && pt.isInstance(a)) continue; // model-object arg
+          if (args.size() > 0) { ok = false; break; }
         }
         if (!ok) continue;
         m.setAccessible(true);
@@ -217,6 +224,52 @@ public final class HarvestExtract {
         target.getClass().getSimpleName() + "." + name + "(" + args.size() + " args)");
   }
 
+  // A no-arg `message()` / `signal()` emitted for a Consumer-form call
+  // (`message(m -> m.name(…)…)`). There is no no-arg `message()` on the activity
+  // builder — the Consumer form creates a Message and hands a MessageBuilder to
+  // the lambda. Reproduce it: create an empty Message via the activity's model,
+  // pass it to `message(Message)` (which attaches it to the element), then
+  // return a MessageBuilder over it so the flattened `name`/`zeebeCorrelationKey`
+  // calls land on the message. `signal()` likewise via SignalBuilder.
+  @SuppressWarnings("unchecked")
+  static Object invokeNestedEventBuilder(Object activityBuilder, String name) throws Exception {
+    Class<?> msgClass = Class.forName(name.equals("signal")
+        ? "io.camunda.zeebe.model.bpmn.instance.Signal"
+        : "io.camunda.zeebe.model.bpmn.instance.Message");
+    // every activity builder carries its BpmnModelInstance in a field on the
+    // AbstractBpmnModelElementBuilder base — find it reflectively.
+    Object model = null;
+    Class<?> c = activityBuilder.getClass();
+    while (c != null && model == null) {
+      for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+        if (BpmnModelInstance.class.isAssignableFrom(f.getType())) {
+          f.setAccessible(true);
+          model = f.get(activityBuilder);
+          break;
+        }
+      }
+      c = c.getSuperclass();
+    }
+    if (model == null) throw new NoSuchMethodException("no BpmnModelInstance on " + activityBuilder.getClass());
+    Object msg = ((BpmnModelInstance) model).newInstance(
+        (Class<? extends org.camunda.bpm.model.xml.instance.ModelElementInstance>) msgClass);
+    // Register the Message/Signal under <definitions> so the element's
+    // messageRef can resolve it ("element is not part of model" otherwise).
+    Object definitions = ((BpmnModelInstance) model).getDefinitions();
+    Class<?> definitionsClass = Class.forName("io.camunda.zeebe.model.bpmn.instance.Definitions");
+    java.lang.reflect.Method addChild = definitionsClass.getMethod(
+        "addChildElement", org.camunda.bpm.model.xml.instance.ModelElementInstance.class);
+    addChild.invoke(definitions, msg);
+    // attach via message(Message) / signal(Message) on the activity builder
+    invoke(activityBuilder, name, java.util.List.of(msg));
+    String builderClass = name.equals("signal")
+        ? "io.camunda.zeebe.model.bpmn.builder.zeebe.SignalBuilder"
+        : "io.camunda.zeebe.model.bpmn.builder.zeebe.MessageBuilder";
+    return Class.forName(builderClass)
+        .getDeclaredConstructor(BpmnModelInstance.class, msgClass)
+        .newInstance(model, msg);
+  }
+
   @SuppressWarnings("unchecked")
   static java.util.Map<String, Object> run(java.util.Map<String, Object> prog) {
     java.util.Map<String, Object> res = new java.util.LinkedHashMap<>();
@@ -225,6 +278,13 @@ public final class HarvestExtract {
     try {
       String processId = (String) prog.get("processId");
       Object builder = Bpmn.createExecutableProcess(processId);
+      // A stack of enclosing builders. A builder method whose argument was a
+      // nested config lambda (multiInstance, message, …) returns a NESTED
+      // builder (the MI builder, the MessageBuilder); the harvester flattens the
+      // nested lambda's calls into the IR and emits a `pop` marker where the
+      // lambda ends. We push the enclosing builder before the nested calls run
+      // and `pop` restores it, so the chain continues on the activity builder.
+      java.util.Deque<Object> stack = new java.util.ArrayDeque<>();
       for (Object callObj : (List<Object>) prog.get("calls")) {
         java.util.Map<String, Object> call = (java.util.Map<String, Object>) callObj;
         String m = (String) call.get("m");
@@ -232,7 +292,27 @@ public final class HarvestExtract {
         if (m.equals("done")) {
           break;
         }
-        builder = invoke(builder, m, args);
+        if (m.equals("pop")) {
+          // Return to the enclosing builder after a nested config lambda.
+          if (!stack.isEmpty()) builder = stack.pop();
+          continue;
+        }
+        // A method that opens a nested config lambda pushes the current builder
+        // so `pop` can return to it. We detect it by the return type: if the
+        // invoke returns a builder of a DIFFERENT family (the nested builder),
+        // the next calls target it until `pop`.
+        Object next;
+        if ((m.equals("message") || m.equals("signal")) && args.isEmpty()) {
+          // Consumer-form message(m -> …)/signal(s -> …): no no-arg overload
+          // exists, so build the nested Message/Signal builder explicitly.
+          next = invokeNestedEventBuilder(builder, m);
+        } else {
+          next = invoke(builder, m, args);
+        }
+        if (opensNestedScope(m)) {
+          stack.push(builder);
+        }
+        builder = next;
       }
       BpmnModelInstance model = ((AbstractFlowNodeBuilder<?, ?>) builder).done();
       ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -246,6 +326,14 @@ public final class HarvestExtract {
       res.put("error", t.getClass().getSimpleName() + (msg == null ? "" : ": " + msg));
     }
     return res;
+  }
+
+  // Builder methods that take a nested config lambda and return a NESTED builder
+  // (the harvester flattens that lambda's calls into the IR, then emits `pop`).
+  // Only these push the enclosing builder; every other call's return value simply
+  // becomes the current builder (the normal fluent chain).
+  private static boolean opensNestedScope(String m) {
+    return m.equals("multiInstance") || m.equals("message") || m.equals("signal");
   }
 
   public static void main(String[] argv) throws Exception {

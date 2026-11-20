@@ -32,14 +32,19 @@ test('splitArgs splits top-level commas, respecting nesting and quotes', () => {
 
 // --- resolveArg --------------------------------------------------------------
 
-test('resolveArg resolves literals and constants, rejects expressions', () => {
+test('resolveArg resolves literals, constants and placeholder locals, rejects expressions', () => {
   assert.equal(resolveArg('"hello"'), 'hello');
   assert.equal(resolveArg('"a" + "b"'), 'ab');
   assert.equal(resolveArg('42'), 42);
   assert.equal(resolveArg('true'), true);
   assert.equal(resolveArg('PROCESS_ID', { PROCESS_ID: 'process' }), 'process');
-  assert.equal(typeof resolveArg('someVar'), 'symbol'); // UNRESOLVED
+  // a lowercase identifier resolves to a placeholder (its own name): a runtime
+  // value like `jobType`, opaque to the harvested model (#1524)
+  assert.equal(resolveArg('jobType'), 'jobType');
+  // an UNDECLARED uppercase constant stays unresolved — a real fidelity gap
+  assert.equal(typeof resolveArg('SOME_CONSTANT'), 'symbol'); // UNRESOLVED
   assert.equal(typeof resolveArg('b -> b.x()'), 'symbol'); // lambda, not a value
+  assert.equal(typeof resolveArg('a.b()'), 'symbol'); // a call, not a value
 });
 
 // --- collectConstants --------------------------------------------------------
@@ -66,8 +71,221 @@ test('resolveLambda flattens a flat config-lambda chain', () => {
   ]);
 });
 
-test('resolveLambda rejects a nested lambda', () => {
+test('resolveLambda rejects a nested lambda on an unsupported method', () => {
+  // zeebeLinkedResources is not in REPLAYABLE, so its lambda arg stays unresolved.
   assert.equal(typeof resolveLambda('b -> b.zeebeLinkedResources(l -> l.resourceId("x"))'), 'symbol');
+});
+
+// --- multi-instance support (#1524) ------------------------------------------
+// The defect class: Zeebe's `processing/bpmn/multiinstance/*Test.java` models
+// all landed in unparseable.json because the harvester (a) did not know the
+// `multiInstance(b -> …)` builder method and its MI config calls, and (b) could
+// not resolve lambda args bound to test-class constants/locals (`jobType`) —
+// so the MI output-element scoping tests had no harvested coverage (#1518).
+
+test('resolveLambda flattens a multiInstance config lambda (nested one level)', () => {
+  const lam = resolveLambda(
+    't -> t.zeebeJobType("type1").multiInstance(b -> b.zeebeInputCollectionExpression("items").zeebeInputElement("item"))');
+  assert.deepEqual(lam, [
+    { m: 'zeebeJobType', args: ['type1'] },
+    { m: 'multiInstance', args: [] },
+    { m: 'zeebeInputCollectionExpression', args: ['items'] },
+    { m: 'zeebeInputElement', args: ['item'] },
+    { m: 'pop', args: [] }, // return to the enclosing activity builder
+  ]);
+});
+
+test('resolveLambda resolves constant-bound args inside a multiInstance lambda', () => {
+  const constants = { INPUT_COLLECTION: 'items', INPUT_ELEMENT: 'item', JOB_TYPE: 'type1' };
+  const lam = resolveLambda(
+    't -> t.zeebeJobType(JOB_TYPE).multiInstance(b -> b.parallel().zeebeInputCollectionExpression(INPUT_COLLECTION).zeebeInputElement(INPUT_ELEMENT).zeebeOutputElementExpression("result").zeebeOutputCollection("results"))',
+    constants);
+  assert.deepEqual(lam, [
+    { m: 'zeebeJobType', args: ['type1'] },
+    { m: 'multiInstance', args: [] },
+    { m: 'parallel', args: [] },
+    { m: 'zeebeInputCollectionExpression', args: ['items'] },
+    { m: 'zeebeInputElement', args: ['item'] },
+    { m: 'zeebeOutputElementExpression', args: ['result'] },
+    { m: 'zeebeOutputCollection', args: ['results'] },
+    { m: 'pop', args: [] },
+  ]);
+});
+
+test('resolveLambda resolves a lambda arg bound to a test-class local (jobType)', () => {
+  // `jobType` is a non-constant identifier (an instance field / local in the
+  // Zeebe test). Its exact value is irrelevant to the harvested MODEL — the
+  // scenario driver completes jobs by element id — so it resolves to a stable
+  // placeholder rather than making the chain unparseable.
+  const lam = resolveLambda('t -> t.zeebeJobType(jobType)');
+  assert.deepEqual(lam, [{ m: 'zeebeJobType', args: ['jobType'] }]);
+});
+
+test('resolveLambda still rejects a lambda whose body is not a flat chain', () => {
+  // a helper-method call on the lambda parameter (miBuilder.accept(m)) is not a
+  // builder call and must stay unresolved — replaying it would invent surface.
+  assert.equal(
+    typeof resolveLambda('m -> { m.zeebeInputCollectionExpression("items"); miBuilder.accept(m); }'),
+    'symbol');
+});
+
+test('parseChain harvests a multi-instance service task (Zeebe MultiInstanceActivityTest shape)', () => {
+  const src = `
+    private static final String PROCESS_ID = "process";
+    private static final String ELEMENT_ID = "task";
+    private static final String INPUT_COLLECTION_EXPRESSION = "items";
+    private static final String INPUT_ELEMENT_VARIABLE = "item";
+    private static final String OUTPUT_COLLECTION_VARIABLE = "results";
+    private static final String OUTPUT_ELEMENT_EXPRESSION = "result";
+    BpmnModelInstance m = Bpmn.createExecutableProcess(PROCESS_ID)
+        .startEvent()
+        .serviceTask(
+            ELEMENT_ID,
+            t -> t.zeebeJobType(jobType).multiInstance(
+                b -> b.zeebeInputCollectionExpression(INPUT_COLLECTION_EXPRESSION)
+                    .zeebeInputElement(INPUT_ELEMENT_VARIABLE)
+                    .zeebeOutputElementExpression(OUTPUT_ELEMENT_EXPRESSION)
+                    .zeebeOutputCollection(OUTPUT_COLLECTION_VARIABLE)))
+        .endEvent()
+        .done();
+  `;
+  const clean = stripComments(src);
+  const chain = parseChain(clean, clean.indexOf('Bpmn.createExecutableProcess'), collectConstants(clean));
+  assert.equal(chain.processId, 'process');
+  assert.equal(chain.reason, null);
+  assert.deepEqual(chain.calls.map((c) => c.m), [
+    'startEvent', 'serviceTask', 'zeebeJobType', 'multiInstance',
+    'zeebeInputCollectionExpression', 'zeebeInputElement',
+    'zeebeOutputElementExpression', 'zeebeOutputCollection', 'pop', 'endEvent',
+  ]);
+  assert.deepEqual(chain.calls[1], { m: 'serviceTask', args: ['task'] });
+  assert.deepEqual(chain.calls[4], { m: 'zeebeInputCollectionExpression', args: ['items'] });
+});
+
+test('parseChain harvests a multi-instance sub-process (sequential, expression collection)', () => {
+  const src = `
+    BpmnModelInstance m = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .subProcess("subprocess")
+        .multiInstance(
+            m -> m.sequential().zeebeInputCollectionExpression("=[1,2,3]").zeebeInputElement("item"))
+        .embeddedSubProcess()
+        .startEvent()
+        .userTask("A")
+        .endEvent()
+        .done();
+  `;
+  const clean = stripComments(src);
+  const chain = parseChain(clean, clean.indexOf('Bpmn.createExecutableProcess'), {});
+  assert.equal(chain.reason, null);
+  assert.deepEqual(chain.calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'multiInstance', 'sequential',
+    'zeebeInputCollectionExpression', 'zeebeInputElement', 'pop',
+    'embeddedSubProcess', 'startEvent', 'userTask', 'endEvent',
+  ]);
+});
+
+test('parseChain harvests a receive task with a message lambda AND a multiInstance lambda', () => {
+  const src = `
+    private static final String MESSAGE_NAME = "test";
+    private static final String INPUT_ELEMENT = "item";
+    BpmnModelInstance m = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .receiveTask(
+            "task",
+            t -> t.message(m -> m.name(MESSAGE_NAME).zeebeCorrelationKeyExpression(INPUT_ELEMENT))
+                .multiInstance(
+                    b -> b.zeebeInputCollectionExpression("items").zeebeInputElement(INPUT_ELEMENT)))
+        .endEvent()
+        .done();
+  `;
+  const clean = stripComments(src);
+  const chain = parseChain(clean, clean.indexOf('Bpmn.createExecutableProcess'), collectConstants(clean));
+  assert.equal(chain.reason, null);
+  assert.deepEqual(chain.calls.map((c) => c.m), [
+    'startEvent', 'receiveTask', 'message', 'name', 'zeebeCorrelationKeyExpression', 'pop',
+    'multiInstance', 'zeebeInputCollectionExpression', 'zeebeInputElement', 'pop', 'endEvent',
+  ]);
+  assert.deepEqual(chain.calls[3], { m: 'name', args: ['test'] });
+});
+
+test('collectConstants picks up non-static final locals bound to literals', () => {
+  const src = `
+    final String processId = "processId";
+    final var jobType = "nestedMiJobType";
+    BpmnModelInstance m = Bpmn.createExecutableProcess(processId).startEvent().endEvent().done();
+  `;
+  const clean = stripComments(src);
+  const c = collectConstants(clean);
+  assert.equal(c.processId, 'processId');
+  assert.equal(c.jobType, 'nestedMiJobType');
+  const chain = parseChain(clean, clean.indexOf('Bpmn.createExecutableProcess'), c);
+  assert.equal(chain.processId, 'processId');
+  assert.equal(chain.reason, null);
+});
+
+// --- named Consumer fields + .andThen composition (#1524) ---------------------
+// The Zeebe MI tests bind the shared MI config to a
+// `static final Consumer<MultiInstanceLoopCharacteristicsBuilder>
+// INPUT_VARIABLE_BUILDER = m -> m.zeebeInput…;` and reference it by name (or
+// `.andThen(...)`-compose it) in the chain. The harvester resolves the named
+// field and the composition to the flat MI config calls.
+
+test('parseChain resolves a named Consumer field as the multiInstance argument', () => {
+  const src = `
+    private static final String PROCESS_ID = "process";
+    private static final Consumer<MultiInstanceLoopCharacteristicsBuilder> MI =
+        m -> m.zeebeInputCollectionExpression("items").zeebeInputElement("item");
+    BpmnModelInstance p = Bpmn.createExecutableProcess(PROCESS_ID)
+        .startEvent()
+        .serviceTask("task", t -> t.zeebeJobType(jobType).multiInstance(MI))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains.length, 1);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'serviceTask', 'zeebeJobType', 'multiInstance',
+    'zeebeInputCollectionExpression', 'zeebeInputElement', 'pop', 'endEvent',
+  ]);
+});
+
+test('parseChain resolves a named Consumer .andThen(inline lambda) composition', () => {
+  const src = `
+    private static final Consumer<MultiInstanceLoopCharacteristicsBuilder> MI =
+        m -> m.zeebeInputCollectionExpression("items");
+    BpmnModelInstance p = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .serviceTask("task", t -> t.zeebeJobType(jobType).multiInstance(MI.andThen(m -> m.parallel())))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'serviceTask', 'zeebeJobType', 'multiInstance',
+    'zeebeInputCollectionExpression', 'parallel', 'pop', 'endEvent',
+  ]);
+});
+
+test('parseChain leaves a runtime-parameterised Consumer composition unparseable', () => {
+  // `INPUT_VARIABLE_BUILDER.andThen(builder)` where `builder` is a method
+  // PARAMETER (the runtime parallel/sequential customizer in the Zeebe
+  // parameterized test) has no static value — the chain stays unparseable
+  // rather than invent behaviour. This is why MultiInstanceActivityTest's
+  // process(miBuilder) helper models are not harvested (#1524 follow-up).
+  const src = `
+    private static final Consumer<MultiInstanceLoopCharacteristicsBuilder> IVB =
+        m -> m.zeebeInputCollectionExpression("items");
+    BpmnModelInstance p = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .serviceTask("task", t -> t.zeebeJobType(jobType).multiInstance(IVB.andThen(builder)))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.match(chains[0].reason, /^unresolved-arg:serviceTask/);
 });
 
 // --- parseChain / parseFile --------------------------------------------------
@@ -102,7 +320,11 @@ test('parseChain resolves a PROCESS_ID constant', () => {
 });
 
 test('parseChain flags a non-literal process id as unparseable', () => {
-  const src = 'Bpmn.createExecutableProcess(processId).startEvent().endEvent().done();';
+  // An UPPERCASE undeclared identifier names a constant the harvester failed to
+  // resolve — a real fidelity gap, so the chain stays unparseable. (A lowercase
+  // identifier resolves to a placeholder — see resolveArg — so it does not
+  // exercise this path.)
+  const src = 'Bpmn.createExecutableProcess(PROCESS_ID).startEvent().endEvent().done();';
   const clean = stripComments(src);
   const chain = parseChain(clean, clean.indexOf('Bpmn.createExecutableProcess'), {});
   assert.equal(chain.reason, 'process-id-not-literal');
@@ -168,6 +390,34 @@ test('scenarioFor flags a conditional model as needing variables', () => {
   const g = bpmnToGraph(xml);
   g.processId = 'process';
   const { scenario } = scenarioFor(g);
+  assert.ok(scenario.needs.includes('variables'));
+});
+
+test('scenarioFor tags a multi-instance model as needing variables (driver limitation)', () => {
+  // A multi-instance service task carries a multiInstanceLoopCharacteristics
+  // child; its input collection must be supplied as a variable at create, which
+  // the empty-variable runner cannot do — so it routes to out-of-scope
+  // (driver limitation), never to unverified (#1524).
+  const xml = `<?xml version="1.0"?>
+  <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:ns0="http://camunda.org/schema/zeebe/1.0">
+    <process id="process" isExecutable="true">
+      <startEvent id="start"><outgoing>f1</outgoing></startEvent>
+      <serviceTask id="task">
+        <extensionElements><ns0:taskDefinition type="type1"/></extensionElements>
+        <multiInstanceLoopCharacteristics id="mi1">
+          <extensionElements><ns0:loopCharacteristics inputCollection="=items" inputElement="item"/></extensionElements>
+        </multiInstanceLoopCharacteristics>
+        <incoming>f1</incoming><outgoing>f2</outgoing>
+      </serviceTask>
+      <endEvent id="end"><incoming>f2</incoming></endEvent>
+      <sequenceFlow id="f1" sourceRef="start" targetRef="task"/>
+      <sequenceFlow id="f2" sourceRef="task" targetRef="end"/>
+    </process>
+  </definitions>`;
+  const g = bpmnToGraph(xml);
+  g.processId = 'process';
+  const { scenario, outOfScope } = scenarioFor(g);
+  assert.equal(outOfScope, null);
   assert.ok(scenario.needs.includes('variables'));
 });
 

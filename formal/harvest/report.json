@@ -9,12 +9,17 @@
   },
   "counts": {
     "scannedFiles": 81,
-    "harvested": 53,
-    "runnable": 33,
-    "unverified": 4,
-    "outOfScope": 486
+    "harvested": 86,
+    "runnable": 42,
+    "unverified": 6,
+    "outOfScope": 475
   },
   "unverified": [
+    {
+      "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-5-processId",
+      "processId": "processId",
+      "detail": "instance-did-not-complete"
+    },
     {
       "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-17-process",
       "processId": "process",
@@ -23,6 +28,11 @@
     {
       "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-18-process",
       "processId": "process",
+      "detail": "instance-did-not-complete"
+    },
+    {
+      "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-5-processId",
+      "processId": "processId",
       "detail": "instance-did-not-complete"
     },
     {
@@ -37,13 +47,17 @@
     }
   ],
   "outOfScopeBreakdown": {
-    "unparseable": 470,
+    "unparseable": 437,
     "normalise": 2,
-    "run": 14
+    "run": 36
   },
   "runnableIds": [
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-0-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-3-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-1-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-1-child-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-3-grandchild-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityInterruptionTest-0-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-11-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-12-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-13-wf-child",
@@ -55,7 +69,11 @@
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-6-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-7-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-JobPriorityTest-0-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-0-processId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-1-processId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-2-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-2-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-behavior-BpmnProcessDeletionBehaviorTest-0-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventCompatibilityTest-0-child-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-21-child-process",
@@ -74,6 +92,7 @@
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-3-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-4-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-6-process",
-    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-7-process"
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-7-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-1-wf-child"
   ]
 }
