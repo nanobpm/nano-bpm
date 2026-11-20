@@ -4800,3 +4800,73 @@ fn adhoc_user_task_tool_form_miss_resolution_creates_the_task() {
     );
     assert!(engine.active_incidents().is_empty());
 }
+
+/// #1537 review: an ad-hoc tool's `AdHocToolCompleted` appends to the
+/// container's `outputCollection` in the SAME batch as the tool's output
+/// mappings. A tool output mapping restoring `results=[]` must not be judged
+/// "unchanged" against the committed (pre-append) `[]`: the append makes it
+/// `[7]`, so the restoring write must be kept or the collection ends `[7]`.
+#[test]
+fn adhoc_tool_output_mapping_restoring_collection_after_append_is_kept() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=7" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+                <zeebe:ioMapping>
+                  <zeebe:output source="=[]" target="results" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![])),
+        "collection seeded empty"
+    );
+    let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0).remove(0);
+    engine
+        .apply_command(Command::complete_job_with(tool.key, BTreeMap::new()))
+        .unwrap();
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![])),
+        "the tool's restoring output mapping must win over the same-batch append"
+    );
+}

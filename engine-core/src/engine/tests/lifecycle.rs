@@ -1055,6 +1055,62 @@ fn inline_script_task_result_is_visible_to_output_mappings() {
     );
 }
 
+/// #1743 review: the script result and the output mappings are planned in one
+/// batch before either applies, so the equal-value filter (#1537) must compare
+/// against the earlier planned write, not only committed state. Root `x=0`:
+/// the result writes `x=1`, then the output mapping restores `x=0` — the
+/// restoring write must survive (variant 1). Repeating the pending value
+/// (`x=1` again) is the redundant write that may be dropped (variant 2).
+#[test]
+fn output_mapping_after_script_result_compares_against_the_pending_write() {
+    for (restore_to, expected) in [(0, 0), (1, 1)] {
+        let def = ProcessBuilder::new("pending-cmp")
+            .start_event("start")
+            .script_task("calc", "=1", "x")
+            .with_io(
+                "calc",
+                crate::model::IoMapping {
+                    inputs: Vec::new(),
+                    outputs: vec![crate::model::Mapping {
+                        source: format!("={restore_to}"),
+                        target: "x".to_string(),
+                    }],
+                },
+            )
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "calc")
+            .connect("calc", "work")
+            .connect("work", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "pending-cmp",
+                vars(&[("x", Value::Int(0))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("x"),
+            Some(&Value::Int(expected)),
+            "restore_to={restore_to}"
+        );
+        let x_writes = created
+            .iter()
+            .filter(|e| match e {
+                Event::VariablesUpdated { variables, .. } => variables.contains_key("x"),
+                Event::ScopedVariablesUpdated { variables, .. } => variables.contains_key("x"),
+                _ => false,
+            })
+            .count();
+        let want = if restore_to == 0 { 2 } else { 1 };
+        assert_eq!(x_writes, want, "restore_to={restore_to}");
+    }
+}
+
 /// Cancelling an instance whose catch subscription is canonically placed on
 /// another partition emits a routable `MessageSubscriptionClosing` (carrying
 /// the message name + correlation key the host needs to address the message
@@ -4257,6 +4313,7 @@ fn variable_propagation_updates_nearest_defining_scope_else_root() {
             ("c", Value::Int(9)),
         ]),
         false,
+        &[],
     );
     let mut by_scope: std::collections::BTreeMap<Key, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -4302,7 +4359,7 @@ fn local_variable_write_stays_in_the_target_scope() {
 
     // A local write pins every value to the child scope even though `a` is
     // defined at root (Zeebe `local=true` / input-mapping semantics).
-    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true);
+    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true, &[]);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, child);
     assert!(writes[0].1.contains_key("a"));
@@ -4533,10 +4590,10 @@ fn local_write_shadows_an_inherited_root_variable_until_the_scope_is_destroyed()
     );
 
     // local=true pins the write to the child scope even though `x` is a root var.
-    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true);
+    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true, &[]);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, child);
-    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true) {
+    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true, &[]) {
         apply_raw(&mut engine, event);
     }
 

@@ -1845,10 +1845,19 @@ fn one_signal_broadcast_seeds_every_concurrent_host_scopes_start_payload() {
             variables: vars(&[("payload", Value::Int(42))]),
         })
         .unwrap();
+    // Each host scope's start event receives the payload locally. (Both then
+    // map it to the same root `mapped`; the second, equal-value write is
+    // skipped as in Zeebe's `VariableBehavior` (#1537), so `mapped` is written
+    // once.)
+    assert_eq!(
+        writes_of(&events, "payload"),
+        vec![Value::Int(42), Value::Int(42)],
+        "both host scopes' start events received the payload: {events:?}"
+    );
     assert_eq!(
         writes_of(&events, "mapped"),
-        vec![Value::Int(42), Value::Int(42)],
-        "both host scopes' start events mapped the payload: {events:?}"
+        vec![Value::Int(42)],
+        "the shared root `mapped` is written once, the equal rewrite skipped: {events:?}"
     );
 }
 

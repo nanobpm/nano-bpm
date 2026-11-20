@@ -3049,6 +3049,7 @@ impl Engine {
                             instance_key,
                             element_instance_key,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3062,6 +3063,7 @@ impl Engine {
                             element_instance_key,
                             &element_id,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3431,6 +3433,7 @@ impl Engine {
                             element_instance_key,
                             &element_id,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3885,9 +3888,13 @@ impl Engine {
                             true,
                         );
                         if !variables.is_empty() {
-                            for event in
-                                self.propagated_updates(instance_key, scope_eik, variables, true)
-                            {
+                            for event in self.propagated_updates(
+                                instance_key,
+                                scope_eik,
+                                variables,
+                                true,
+                                &[],
+                            ) {
                                 self.emit(&mut log, event);
                             }
                         }
@@ -3982,6 +3989,7 @@ impl Engine {
                                 boundary_scope,
                                 variables,
                                 true,
+                                &[],
                             ) {
                                 self.emit(&mut log, event);
                             }
@@ -4802,7 +4810,8 @@ impl Engine {
                     // propagate to the nearest ancestor defining each name, else
                     // root. A root-scoped (or root-only-instance) write collapses
                     // to the flat `VariablesUpdated`.
-                    for event in self.propagated_updates(instance_key, scope_key, variables, local)
+                    for event in
+                        self.propagated_updates(instance_key, scope_key, variables, local, &[])
                     {
                         self.emit(&mut log, event);
                     }
@@ -7411,7 +7420,7 @@ impl Engine {
                     }
                     if !output_updates.is_empty() {
                         for event in
-                            self.propagated_updates(instance_key, scope, output_updates, false)
+                            self.propagated_updates(instance_key, scope, output_updates, false, &[])
                         {
                             self.emit(log, event);
                         }
@@ -7464,7 +7473,9 @@ impl Engine {
                 self.emit(log, event);
             }
             if !output_updates.is_empty() {
-                for event in self.propagated_updates(instance_key, scope, output_updates, false) {
+                for event in
+                    self.propagated_updates(instance_key, scope, output_updates, false, &[])
+                {
                     self.emit(log, event);
                 }
             }
@@ -8388,7 +8399,7 @@ impl Engine {
             view_overlay = Some(payload);
         }
         if let Some(payload) = propagate_boundary_payload {
-            events.extend(self.propagated_updates(instance_key, scope, payload, false));
+            events.extend(self.propagated_updates(instance_key, scope, payload, false, &events));
         }
         let (body_events, body_followups) = match view_overlay {
             None => self.activate_body(
@@ -11193,7 +11204,13 @@ impl Engine {
         // scope — for a top-level loop that is the root, collapsing to the flat
         // `VariablesUpdated`, byte-identical to the pre-scoping engine.
         if let Some(map) = &collection_map {
-            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                scope,
+                map.clone(),
+                false,
+                &events,
+            ));
         }
         events.push(Event::ElementCompleting {
             instance_key,
@@ -11236,6 +11253,7 @@ impl Engine {
                         scope,
                         output_updates,
                         false,
+                        &events,
                     ));
                 }
                 events.push(job);
@@ -11266,7 +11284,13 @@ impl Engine {
         // mapped result is visible before its throw resumes (matching the
         // end-listener path, which propagated them when the body parked).
         if !output_updates.is_empty() {
-            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                scope,
+                output_updates,
+                false,
+                &events,
+            ));
         }
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
@@ -12887,6 +12911,7 @@ impl Engine {
                 container_key,
                 output_updates.clone(),
                 false,
+                &events,
             ));
         }
         // Completion condition (ADR 0023 seam 4): a declared `<completionCondition>`
@@ -13106,6 +13131,7 @@ impl Engine {
                 container_key,
                 output_updates.clone(),
                 false,
+                &events,
             ));
         }
         // Completion condition (ADR 0023 seam 4) is evaluated after EVERY tool
@@ -13620,7 +13646,13 @@ impl Engine {
         });
         if let Some(map) = &collection_map {
             if !is_nested_tool {
-                events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+                events.extend(self.propagated_updates(
+                    instance_key,
+                    scope,
+                    map.clone(),
+                    false,
+                    &events,
+                ));
             }
         }
 
@@ -14152,7 +14184,13 @@ impl Engine {
         // `VariablesUpdated`, keeping their journals byte-identical.
         if let Some(update) = &script_update {
             let flow_scope = self.completion_scope(instance_key, element_instance_key);
-            events.extend(self.propagated_updates(instance_key, flow_scope, update.clone(), false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                flow_scope,
+                update.clone(),
+                false,
+                &events,
+            ));
         }
         // Output mappings (zeebe:output): merge the projection evaluated above
         // (before the completion events) into the element's enclosing (flow) scope
@@ -14163,7 +14201,13 @@ impl Engine {
         // to a single flat `VariablesUpdated`, unchanged from the flat engine.
         if !output_updates.is_empty() {
             let flow_scope = self.scope_of(instance_key, element_instance_key);
-            events.extend(self.propagated_updates(instance_key, flow_scope, output_updates, false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                flow_scope,
+                output_updates,
+                false,
+                &events,
+            ));
         }
         let scope = self.scope_of(instance_key, element_instance_key);
 
@@ -14395,7 +14439,13 @@ impl Engine {
                 match projected {
                     Ok(updates) => {
                         vars.extend(updates.clone());
-                        events.extend(self.propagated_updates(instance_key, scope, updates, false));
+                        events.extend(self.propagated_updates(
+                            instance_key,
+                            scope,
+                            updates,
+                            false,
+                            &events,
+                        ));
                     }
                     Err(failure) => {
                         return vec![self.io_mapping_incident(
@@ -15534,6 +15584,7 @@ impl Engine {
                     flow_scope,
                     output_updates,
                     false,
+                    &events,
                 ));
             }
             // The chain always (re)starts at listener 0 (#1406); the outputs were
@@ -16115,18 +16166,20 @@ impl Engine {
             crate::model::TaskListenerEventType::Completing
         ) && !pending.variables.is_empty()
         {
+            // Insert variable merges just before the completion event so the
+            // completing token sees them; they are compared against the writes
+            // planned ahead of that point.
+            let insert_at = events
+                .iter()
+                .position(|e| matches!(e, Event::UserTaskCompleted { .. }))
+                .unwrap_or(events.len());
             let var_events = self.completion_variable_events(
                 instance_key,
                 element_instance_key,
                 &element_id,
                 pending.variables,
+                &events[..insert_at],
             );
-            // Insert variable merges just before the completion event so the
-            // completing token sees them.
-            let insert_at = events
-                .iter()
-                .position(|e| matches!(e, Event::UserTaskCompleted { .. }))
-                .unwrap_or(events.len());
             for (offset, ev) in var_events.into_iter().enumerate() {
                 events.insert(insert_at + offset, ev);
             }
@@ -17351,6 +17404,7 @@ impl Engine {
                 container_key,
                 child_variables,
                 false,
+                &events,
             ));
         }
         // Hand off to the shared ad-hoc tool completion leaf path, passing the

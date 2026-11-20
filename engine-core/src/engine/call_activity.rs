@@ -264,6 +264,7 @@ impl Engine {
                 CallScope::PreRegistered => None,
             },
             input_results.clone(),
+            &[],
         );
         let child_vars = if propagate_all_parent {
             let mut merged = element_vars.clone();
@@ -597,6 +598,7 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 changed,
+                &events,
             ));
         }
         events.extend([
@@ -624,13 +626,20 @@ impl Engine {
                 scope,
                 child_variables.clone(),
                 false,
+                &events,
             ));
         }
         if !outputs.is_empty() {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => {
                     if !updates.is_empty() {
-                        events.extend(self.propagated_updates(instance_key, scope, updates, false));
+                        events.extend(self.propagated_updates(
+                            instance_key,
+                            scope,
+                            updates,
+                            false,
+                            &events,
+                        ));
                     }
                 }
                 Err(failure) => {
