@@ -28,6 +28,7 @@ mod jobs;
 mod join_scopes;
 mod lifecycle;
 mod listeners;
+mod message_cardinality;
 mod migration;
 mod migration_compensation;
 mod migration_event_gateway;

@@ -569,6 +569,18 @@ pub enum Event {
         /// `ElementActivated`, which records the scope.
         #[cfg_attr(feature = "serde", serde(default))]
         scope: Key,
+        /// The event-based gateway element instance whose deferred choice armed
+        /// this (catch) element instance, `None` for every other activation
+        /// (#1676). Siblings of a race winner are withdrawn only within the same
+        /// race, so two activations of one gateway in one scope race
+        /// independently. Additive: `serde(default)` and omitted when `None`, so
+        /// older journals decode unchanged and other activations serialize
+        /// byte-identically.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        race: Option<Key>,
     },
     /// An element instance reached `ACTIVATED`.
     ElementActivated {

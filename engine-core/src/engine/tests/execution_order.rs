@@ -346,6 +346,7 @@ fn legacy_visibly_opened_join_replays_and_fires_once() {
                     element_instance_key,
                     element_id: element_id.clone(),
                     scope,
+                    race: None,
                 },
                 Event::ElementActivated {
                     instance_key,

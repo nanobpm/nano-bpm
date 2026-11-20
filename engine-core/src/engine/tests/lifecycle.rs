@@ -2292,6 +2292,7 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         element_id: "inner".to_string(),
         scope: sub_eik,
         via: None,
+        race: None,
     };
 
     // While the scope is live the guard admits the activation.
@@ -2315,6 +2316,7 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         element_id: "after".to_string(),
         scope: 0,
         via: None,
+        race: None,
     }));
 }
 
