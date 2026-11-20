@@ -27,6 +27,7 @@
 //! closes, so derivation always terminates.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -114,8 +115,12 @@ pub fn shape_json_schema(
     shape_id: &str,
     process_id: Option<&str>,
 ) -> Result<Option<Value>, SchemaError> {
+    let mut index: HashMap<&str, Vec<&ShapeDecl>> = HashMap::new();
+    for s in shapes {
+        index.entry(s.id.as_str()).or_default().push(s);
+    }
     let resolver = Resolver {
-        shapes,
+        index,
         process_id,
         ops: Cell::new(MAX_EXPANDED_OPS),
         bytes: Cell::new(MAX_EXPANDED_BYTES),
@@ -133,20 +138,31 @@ pub fn shape_json_schema(
 }
 
 /// An object schema under construction: ordered properties plus the
-/// (unique, declaration-ordered) required names.
+/// (unique, declaration-ordered) required names. Required membership is a
+/// hash index (`required`) over an append-only order log (`required_order`),
+/// so every insertion and membership check is O(1) rather than a linear scan.
 #[derive(Default)]
 struct Obj {
     properties: Map<String, Value>,
-    required: Vec<String>,
+    required: HashSet<String>,
+    /// Every time a name became required, in order; stale/duplicate entries
+    /// are dropped in [`Obj::required_names`] (the last occurrence wins).
+    required_order: Vec<String>,
 }
 
 impl Obj {
     fn set(&mut self, name: &str, schema: Value, required: bool) {
         self.properties.insert(name.to_string(), schema);
-        self.required.retain(|r| r != name);
         if required {
-            self.required.push(name.to_string());
+            self.required.insert(name.to_string());
+            self.required_order.push(name.to_string());
+        } else {
+            self.required.remove(name);
         }
+    }
+
+    fn is_required(&self, name: &str) -> bool {
+        self.required.contains(name)
     }
 
     fn spread(&mut self, other: Obj) {
@@ -156,10 +172,25 @@ impl Obj {
         }
     }
 
+    /// The unique required names, ordered by when each last became required.
+    fn required_names(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        let mut names: Vec<&str> = self
+            .required_order
+            .iter()
+            .rev()
+            .filter(|n| self.required.contains(*n) && seen.insert(n.as_str()))
+            .map(String::as_str)
+            .collect();
+        names.reverse();
+        names
+    }
+
     fn into_schema(self) -> Value {
+        let required = self.required_names();
         let mut v = json!({ "type": "object", "properties": self.properties });
-        if !self.required.is_empty() {
-            v["required"] = json!(self.required);
+        if !required.is_empty() {
+            v["required"] = json!(required);
         }
         v
     }
@@ -182,7 +213,9 @@ pub const MAX_EXPANDED_BYTES: usize = 1 << 20;
 pub const MAX_DEPTH: usize = 32;
 
 struct Resolver<'a> {
-    shapes: &'a [ShapeDecl],
+    /// Every declared shape by id (declaration order), built once per
+    /// derivation so a reference lookup is O(1) in the catalog size.
+    index: HashMap<&'a str, Vec<&'a ShapeDecl>>,
     process_id: Option<&'a str>,
     /// Remaining op-expansion budget.
     ops: Cell<usize>,
@@ -194,13 +227,12 @@ struct Resolver<'a> {
 
 impl<'a> Resolver<'a> {
     fn find(&self, id: &str) -> Option<&'a ShapeDecl> {
-        let mut candidates = self.shapes.iter().filter(|s| s.id == id);
-        let first = candidates.next()?;
-        if first.process.as_deref() == self.process_id {
-            return Some(first);
-        }
+        let candidates = self.index.get(id)?;
+        let first = *candidates.first()?;
         Some(
             candidates
+                .iter()
+                .copied()
                 .find(|s| s.process.as_deref() == self.process_id)
                 .unwrap_or(first),
         )
@@ -275,9 +307,7 @@ impl<'a> Resolver<'a> {
                     let inner = self.resolve(r#ref, stack);
                     for field in fields {
                         let found = inner.as_ref().and_then(|o| {
-                            o.properties
-                                .get(field)
-                                .map(|s| (s, o.required.contains(field)))
+                            o.properties.get(field).map(|s| (s, o.is_required(field)))
                         });
                         // Every projected copy is charged (op + its size)
                         // before it is cloned, so repeated projections of a
@@ -299,9 +329,17 @@ impl<'a> Resolver<'a> {
                     list,
                     description,
                 } => {
+                    // A type naming a declared shape is an object even where
+                    // it closes a cycle (as for `reference`); only a
+                    // fused-domain type is left unconstrained.
                     let item = scalar_schema(r#type).unwrap_or_else(|| {
+                        let fallback = if self.find(r#type).is_some() {
+                            json!({ "type": "object" })
+                        } else {
+                            json!({})
+                        };
                         self.resolve(r#type, stack)
-                            .map_or_else(|| json!({}), Obj::into_schema)
+                            .map_or(fallback, Obj::into_schema)
                     });
                     let schema = field(item, *list, description.as_deref());
                     obj.set(name, schema, *optional != Some(true));
@@ -382,6 +420,62 @@ mod tests {
             schema,
             json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
         );
+    }
+
+    #[test]
+    fn cyclic_extend_keeps_object_type() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order"><nano:extend name="child" type="Order" optional="true" /></nano:shape>"#,
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schema,
+            json!({"type":"object","properties":{"child":{"type":"object"}}})
+        );
+    }
+
+    #[test]
+    fn required_order_is_last_declaration_and_unique() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order"><nano:extend name="a" type="string" /><nano:extend name="b" type="string" /><nano:extend name="a" type="number" /><nano:extend name="b" type="string" optional="true" /></nano:shape>"#,
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema["required"], json!(["a"]));
+    }
+
+    #[test]
+    fn wide_catalog_and_wide_carry_derive_quickly() {
+        // 20k shapes, 9k references to the last one; and a 9k-field carry.
+        let mut shapes = String::from(r#"<nano:shape id="Order">"#);
+        for i in 0..9_000 {
+            shapes.push_str(&format!(r#"<nano:reference name="r{i}" ref="E19999" />"#));
+        }
+        shapes.push_str("</nano:shape>");
+        for i in 0..20_000 {
+            shapes.push_str(&format!(r#"<nano:shape id="E{i}"></nano:shape>"#));
+        }
+        let start = std::time::Instant::now();
+        let (_, schema) = message_input_schema(&shapes_doc(&shapes), "placeOrder", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema["required"].as_array().unwrap().len(), 9_000);
+
+        let mut wide = String::from(
+            r#"<nano:shape id="Order"><nano:carry ref="W" /></nano:shape><nano:shape id="W">"#,
+        );
+        for i in 0..9_000 {
+            wide.push_str(&format!(r#"<nano:extend name="f{i}" type="string" />"#));
+        }
+        wide.push_str("</nano:shape>");
+        let (_, schema) = message_input_schema(&shapes_doc(&wide), "placeOrder", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema["required"].as_array().unwrap().len(), 9_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

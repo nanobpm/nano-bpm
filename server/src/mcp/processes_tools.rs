@@ -375,8 +375,19 @@ pub(crate) fn validate_arguments(
     validate_object(schema, arguments, "")
 }
 
+/// Append a field name to an error path unambiguously, in the same notation
+/// as the console's `inputRows` (`console/src/lib/mcpProcesses.ts`): a plain
+/// identifier as `.name`, anything else (dots, brackets, quotes, empty)
+/// JSON-quoted as `["…"]`, so distinct argument paths never render the same.
 fn join_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '-'));
+    if !plain {
+        format!("{parent}[{}]", Value::String(name.to_string()))
+    } else if parent.is_empty() {
         name.to_string()
     } else {
         format!("{parent}.{name}")
@@ -1138,6 +1149,29 @@ mod tests {
         let schema = build_input_schema(&props);
         assert_eq!(schema["required"], json!(["amount"]));
         assert_eq!(schema["properties"]["amount"]["type"], json!("number"));
+    }
+
+    #[test]
+    fn error_paths_quote_non_identifier_names() {
+        assert_eq!(join_path("", "a"), "a");
+        assert_eq!(join_path("a", "b"), "a.b");
+        assert_eq!(join_path("", "customer.email"), r#"["customer.email"]"#);
+        assert_eq!(join_path("customer", "email"), "customer.email");
+        assert_eq!(join_path("a", "x[0]"), r#"a["x[0]"]"#);
+        assert_eq!(join_path("a", ""), r#"a[""]"#);
+        let schema = json!({"type":"object","required":["customer.email","customer"],
+            "properties":{"customer":{"type":"object","required":["email"],
+                "properties":{"email":{"type":"string"}}}}});
+        let top = json!({"customer": {"email": "x"}});
+        assert_eq!(
+            validate_arguments(&schema, top.as_object().unwrap()).unwrap_err(),
+            r#"Missing required argument `["customer.email"]`"#
+        );
+        let nested = json!({"customer.email": "x", "customer": {}});
+        assert_eq!(
+            validate_arguments(&schema, nested.as_object().unwrap()).unwrap_err(),
+            "Missing required argument `customer.email`"
+        );
     }
 
     #[test]
