@@ -17539,6 +17539,12 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        // Only an instance whose definition contains a call activity can own a
+        // child, so prune the rest before the resident-instance scan: a batch
+        // of N independent `start → timer → end` fires then costs O(1) per
+        // fire instead of an O(resident) scan each (r4642363545). An instance
+        // no longer resident (unknown definition) is kept — fail safe.
+        ended.retain(|k| self.may_own_call_activity_child(*k));
         if ended.is_empty() {
             return;
         }
@@ -17574,7 +17580,9 @@ impl Engine {
             children.sort_unstable();
             for child in children {
                 self.discard_and_terminate_instance(log, child);
-                ended.insert(child);
+                if self.may_own_call_activity_child(child) {
+                    ended.insert(child);
+                }
             }
         }
     }
@@ -17918,6 +17926,16 @@ impl Engine {
         if let Some((instance_key, job_key, lease, commit)) = resolution {
             self.settle_job_history(log, instance_key, job_key, &lease, commit);
         }
+    }
+
+    /// Whether `instance_key` can own a call-activity child: `false` only when
+    /// its definition is known and contains no call activity.
+    fn may_own_call_activity_child(&self, instance_key: Key) -> bool {
+        self.process_of_instance(instance_key).is_none_or(|d| {
+            d.elements
+                .values()
+                .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }))
+        })
     }
 
     fn process_of_instance(&self, instance_key: Key) -> Option<&crate::model::ProcessDefinition> {
