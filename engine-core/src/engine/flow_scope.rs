@@ -81,6 +81,110 @@ impl Engine {
         }
     }
 
+    /// The variable-write events that merge an element's **local** variables
+    /// into its own element-instance scope (Zeebe `mergeLocalDocument`).
+    ///
+    /// An element without a registered variable scope (no input mappings, no
+    /// listener scope yet) gets one registered first — idempotently: a scope
+    /// that already exists emits nothing — so the local write is readable by the
+    /// rest of the element's lifecycle (its output mappings, later listeners)
+    /// through the scope chain.
+    pub(crate) fn local_element_variable_events(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        variables: BTreeMap<String, Value>,
+    ) -> Vec<Event> {
+        if variables.is_empty() {
+            return Vec::new();
+        }
+        let scope_registered = self
+            .state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.scope_parents.contains_key(&element_instance_key));
+        let mut events = Vec::with_capacity(2);
+        if !scope_registered {
+            events.push(Event::VariableScopeCreated {
+                instance_key,
+                scope_key: element_instance_key,
+                parent_scope_key: self.scope_of(instance_key, element_instance_key),
+            });
+        }
+        events.push(Event::ScopedVariablesUpdated {
+            instance_key,
+            scope_key: element_instance_key,
+            variables,
+        });
+        events
+    }
+
+    /// The variable-write events for a task's **completion variables** (job
+    /// result / user-task completion), with Zeebe's
+    /// `JobCompleteProcessor` / `UserTaskCompleteProcessor` semantics (#1533):
+    ///
+    /// - the element declares **output mappings** → the variables are merged
+    ///   LOCAL to the task's element instance (`mergeLocalDocument`); only the
+    ///   output mappings then write to the flow scope, so the raw completion
+    ///   variables never reach the process scope;
+    /// - otherwise → they propagate from [`Self::completion_scope`] upward
+    ///   (`mergeDocument`).
+    ///
+    /// This is the single canonical routing for every task-completion path, so
+    /// the job, user-task and deferred (completing-listener) user-task paths
+    /// cannot drift apart.
+    pub(crate) fn completion_variable_events(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        variables: BTreeMap<String, Value>,
+    ) -> Vec<Event> {
+        if variables.is_empty() {
+            return Vec::new();
+        }
+        if !self.element_has_output_mappings(instance_key, element_instance_key, element_id) {
+            let flow_scope = self.completion_scope(instance_key, element_instance_key);
+            self.propagated_updates(instance_key, flow_scope, variables, false)
+        } else {
+            self.local_element_variable_events(instance_key, element_instance_key, variables)
+        }
+    }
+
+    /// Whether the element instance declares output mappings, resolving them
+    /// from wherever they live: an ad-hoc tool is pruned from the flat graph and
+    /// keeps its `zeebe:ioMapping` only in the container's catalog, so the flat
+    /// [`Self::io_outputs`] lookup alone would miss it and leak raw completion
+    /// variables past the mapping (#1533 review).
+    fn element_has_output_mappings(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> bool {
+        if !self.io_outputs(instance_key, element_id).is_empty() {
+            return true;
+        }
+        let Some((container_key, _)) =
+            self.adhoc_tool_container_of(instance_key, element_instance_key)
+        else {
+            return false;
+        };
+        let Some(container_element_id) = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.element_id.clone())
+        else {
+            return false;
+        };
+        !self
+            .adhoc_tool_io(instance_key, &container_element_id, element_id)
+            .outputs
+            .is_empty()
+    }
+
     /// Every ancestor scope element instance of `element_instance_key`,
     /// **innermost first**, excluding the process root (`0`). Cycle-safe.
     pub(crate) fn ancestor_element_instances(

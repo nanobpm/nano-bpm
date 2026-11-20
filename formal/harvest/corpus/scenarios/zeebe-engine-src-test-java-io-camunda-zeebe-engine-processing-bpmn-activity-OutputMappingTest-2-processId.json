@@ -1,0 +1,15 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "processId",
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "userTasks": [
+    "userTaskId"
+  ],
+  "userTaskCompletionOrder": [
+    "userTaskId"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": []
+}
