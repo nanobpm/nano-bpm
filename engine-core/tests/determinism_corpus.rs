@@ -1048,6 +1048,42 @@ fn string_valued_map_keys_are_never_fields() {
     );
 }
 
+/// #1528 (review): a golden-added field nested under a VARIANT's map field
+/// (a `ProcessDeployed` process's `elements` map, whose values are element
+/// structs) must be erased under that variant's context — not left in place
+/// because the map walk kept the stale `$` root context. This is the
+/// divergence the previous-release gate reports on every deploy when a
+/// release adds a per-element field (e.g. `properties`).
+#[test]
+fn erasure_reaches_fields_under_a_variant_map_field() {
+    // ProcessDeployed -> process -> elements -> {id} -> properties.
+    let deploy = serde_json::json!({"ProcessDeployed": {"process": {
+        "id": "p",
+        "elements": {"task": {"id": "task", "properties": {}, "kind": "x"}}
+    }}});
+    let mut erased = deploy.clone();
+    let erasable: compare::Vocab = ["ProcessDeployed.properties".to_owned()].into();
+    compare::erase_fields(&mut erased, "$", &erasable);
+    assert_eq!(
+        erased,
+        serde_json::json!({"ProcessDeployed": {"process": {
+            "id": "p",
+            "elements": {"task": {"id": "task", "kind": "x"}}
+        }}}),
+        "a golden-added field under a variant's map field must be erased"
+    );
+
+    // A field the golden does NOT record as added under that variant stays —
+    // the erasure never over-reaches into map data it cannot name.
+    let mut kept = deploy.clone();
+    let erasable: compare::Vocab = ["ProcessDeployed.name".to_owned()].into();
+    compare::erase_fields(&mut kept, "$", &erasable);
+    assert_eq!(
+        kept, deploy,
+        "only the listed field is erased; the element id/kind survive"
+    );
+}
+
 /// Drift guard: every String-keyed map field declared ANYWHERE in
 /// engine-core/src is covered by `compare::data_map_fields` (derived from
 /// `ENGINE_TYPE_SOURCES`); a map declared in an unlisted file fails here.
@@ -1586,6 +1622,100 @@ fn prev_release_gate_ratified_patterns_reconcile_across_entries() {
     assert!(
         err.contains("UNDECLARED extra divergence"),
         "an unrelated extra event must fail: {err}"
+    );
+}
+
+/// #1528: an UNBALANCED scenario divergence (the change adds events with no
+/// counterpart on the previous release — e.g. an MI user task's
+/// `UserTaskCreated` per child, which the old build never emits) is ratified
+/// only by an explicit, scenario-scoped `unbalanced` declaration that names
+/// its issue and reason. (a) An undeclared unbalanced diff still FAILS;
+/// (b) a declared one passes only for its named scenario — the same diff in
+/// another scenario still fails; (c) a declaration without a reason or an
+/// issue is rejected.
+#[test]
+fn prev_release_gate_unbalanced_divergence_requires_an_explicit_declaration() {
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    // The synthetic previous release: `head` with the scenario's
+    // `UserTaskAssigned` events removed (a release that never emits them
+    // there) — an imbalance, not a move. Dropped ONLY in `scenario` (the
+    // corpus emits `UserTaskAssigned` in other scenarios too, and those must
+    // keep agreeing). The variant is unknown to `added`, so the
+    // new-variant pre-filter cannot fire — the scenario comparison is what
+    // is exercised.
+    let scenarios = labels();
+    let mut prev = head.clone();
+    let mut dropped = 0;
+    for (idx, r) in entries_mut(&mut prev).into_iter().enumerate() {
+        if scenarios[idx] != scenario {
+            continue;
+        }
+        if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+            let before = events.len();
+            events.retain(|e| e.get("UserTaskAssigned").is_none());
+            dropped += before - events.len();
+        }
+    }
+    assert!(
+        dropped > 0,
+        "the corpus must emit UserTaskAssigned in {scenario}"
+    );
+    let declare = |expected: serde_json::Value, issue: &str| {
+        serde_json::json!({"divergences": [{
+            "scenario": scenario, "expected": expected, "introduced_in": "v0.0.2",
+            "issue": issue, "upgrade": "upgrade-boundary",
+            "rationale": "upgrade-boundary: test"
+        }]})
+    };
+    let patterns = serde_json::json!({"only_in_head": [{"variant": "UserTaskAssigned"}]});
+
+    // (a) Undeclared: the imbalance fails — as a missing declaration, and as
+    // an unbalanced ratified pattern when the patterns are declared without
+    // the `unbalanced` marker.
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
+    assert!(err.contains(&format!("scenario {scenario}")), "{err}");
+    let err = checked(&head, &prev, declare(patterns.clone(), "#0"), &[]).unwrap_err();
+    assert!(err.contains("unbalanced"), "{err}");
+
+    // (c) A declaration without a reason — or a divergence without an issue —
+    // is rejected: the ratification must be traceable to a reviewed decision.
+    let no_reason = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "  "}
+    });
+    let err = checked(&head, &prev, declare(no_reason, "#0"), &[]).unwrap_err();
+    assert!(err.contains("non-empty reason AND a named issue"), "{err}");
+    let no_issue = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let err = checked(&head, &prev, declare(no_issue, "  "), &[]).unwrap_err();
+    assert!(err.contains("non-empty reason AND a named issue"), "{err}");
+
+    // (b) Declared, with issue and reason: the named scenario passes.
+    let declared = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let report = checked(&head, &prev, declare(declared.clone(), "#1528"), &[]).unwrap();
+    assert!(report.ratified_divergent_entries > 0);
+
+    // (b) … and ONLY the named scenario: declaring a DIFFERENT scenario
+    // leaves this one undeclared, so the same diff fails.
+    let wrong_scenario = serde_json::json!({"divergences": [{
+        "scenario": "messages-signals-conditional",
+        "expected": {
+            "only_in_head": [{"variant": "UserTaskAssigned"}],
+            "unbalanced": {"reason": "a real reason"}
+        },
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let err = checked(&head, &prev, wrong_scenario, &[]).unwrap_err();
+    assert!(
+        err.contains(&format!("scenario {scenario}")),
+        "an unbalanced declaration is scenario-scoped; {scenario} must fail when only another scenario is declared: {err}"
     );
 }
 

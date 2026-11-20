@@ -138,6 +138,74 @@
       "issue": "#1632",
       "upgrade": "upgrade-boundary",
       "rationale": "upgrade-boundary: not feature-gated. Ad-hoc sub-process activation (#1632) now records the real enclosing scope on ElementActivating for a tool's `<container>#innerInstance` and its tool child (the container's element-instance key), where the previous release's journal carries no `ElementActivating.scope` field and decodes it to the serde default `0`. The field is golden-recorded as added since the previous release, so it is erased from both sides where it holds the default; here head populates it, a one-field behavioural refinement declared as a field_overrides normalization to `0` on both sides. Every other event - the activation, the job, the completion - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals `scope: 0` (absent) where a new member journals the real scope, so a mixed-version cluster journals different events for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    },
+    {
+      "scenario": "multi-instance-user-tasks",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true,
+        "only_in_prev": [
+          {
+            "variant": "ElementCompleting",
+            "element_id": "review"
+          },
+          {
+            "variant": "ElementCompleted",
+            "element_id": "review"
+          },
+          {
+            "variant": "MultiInstanceChildCompleted"
+          },
+          {
+            "variant": "MultiInstanceCompleted"
+          },
+          {
+            "variant": "SequenceFlowTaken",
+            "from": "review"
+          },
+          {
+            "variant": "ElementActivating",
+            "element_id": "end"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "end"
+          },
+          {
+            "variant": "ElementCompleting",
+            "element_id": "end"
+          },
+          {
+            "variant": "ElementCompleted",
+            "element_id": "end"
+          },
+          {
+            "variant": "ProcessInstanceCompleted"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "UserTaskCreated"
+          }
+        ],
+        "unbalanced": {
+          "reason": "Zeebe parity: an MI userTask child creates a real user task (#1528). The previous release completed each MI child at once (its child ElementCompleting/ElementCompleted, MultiInstanceChildCompleted, the results VariablesUpdated, MultiInstanceCompleted, and the body's advance to `end` all fire in the create entry); the head build parks each child on a real UserTaskCreated and waits, so those completions never fire and one UserTaskCreated per child appears instead \u2014 events with no counterpart on the other build, an imbalance, not a move. The scenario's CompleteUserTask targets a never-created key so BOTH builds reject it (a compared err entry), keeping the divergence on the create entry alone."
+        }
+      },
+      "introduced_in": "v0.0.29",
+      "issue": "#1528",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1528): a multi-instance on a direct userTask now creates one real user task per child and parks the child on it, instead of completing each child at once. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C), so a previous-release member completes the children immediately while a new member creates tasks and waits \u2014 mixed-version members journal different events for the same command. The new behaviour emits only EXISTING user-task event variants (no new variant for older replicas to decode), so no cluster feature flag applies; the release requires an all-nodes-same-version (quiesced) upgrade. The declared patterns cannot balance \u2014 the previous release never emits these events at all \u2014 so the divergence is ratified with the explicit scenario-scoped `unbalanced` declaration naming this issue and reason."
+    },
+    {
+      "scenario": "newest-variants",
+      "expected": {
+        "remint_keys": true
+      },
+      "introduced_in": "v0.0.29",
+      "issue": "#1528",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1528): the multi-instance user task scenario mints two per-child user-task keys the previous release never mints, so every key minted AFTER that scenario \u2014 including this scenario's order instance, element instances and job \u2014 is offset by a clean one-key-per-entity bijection. remint_keys rewrites every key reference to the identity of the entity it references, so the offset reconciles while any reference to the wrong or an un-minted entity still diverges. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C), so the release requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
     }
   ]
 }

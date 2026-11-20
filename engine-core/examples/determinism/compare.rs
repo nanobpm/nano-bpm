@@ -596,7 +596,10 @@ pub struct ObservationalVariant {
 /// arriving token's), so the matched events reconcile at SCENARIO level — the
 /// multiset matched on one side must equal the multiset matched on the other
 /// (same scenario, same element, same instance after the ratified remint). An
-/// unbalanced pattern (removed but never re-added, or the reverse) fails.
+/// unbalanced pattern (removed but never re-added, or the reverse) fails —
+/// unless the divergence carries an explicit [`Unbalanced`] declaration
+/// (#1528), the scoped ratification for an upgrade-boundary behavioural
+/// change whose new events have NO counterpart on the previous release.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
@@ -650,6 +653,43 @@ pub struct Expected {
     /// events are rewritten — the per-entry strict comparison is unaffected.
     #[serde(default)]
     pub variant_substitutions: Vec<VariantSubstitution>,
+    /// The explicit ratification for a scenario whose declared
+    /// `only_in_prev` / `only_in_head` patterns do NOT balance (#1528): the
+    /// behavioural change emits (or stops emitting) events that have no
+    /// counterpart on the other build at all — e.g. an MI user task's
+    /// `UserTaskCreated` per child, which the previous release never emits
+    /// because it completed each child at once. `None` (the default) keeps
+    /// the strict balance requirement. Because an unbalanced declaration
+    /// weakens the lost-event guard, it is valid only on a divergence that
+    /// also names its issue and a non-empty reason (see
+    /// [`Unbalanced::valid`]).
+    #[serde(default)]
+    pub unbalanced: Option<Unbalanced>,
+}
+
+/// The scoped ratification of an UNBALANCED scenario divergence (#1528):
+/// after the declared `only_in_prev` / `only_in_head` events are dropped, the
+/// two sides' matched multisets may differ — the change adds or removes
+/// events outright rather than moving them. Everything outside the declared
+/// patterns is still compared strictly per entry, and the declaration is
+/// scenario-scoped (the `Divergence` carries it), so it cannot mask a
+/// divergence anywhere else.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unbalanced {
+    /// Why the imbalance is the intended new behaviour — must name the
+    /// behavioural change (e.g. "Zeebe parity: an MI userTask child creates a
+    /// real user task"), never a blanket "events differ".
+    pub reason: String,
+}
+
+impl Unbalanced {
+    /// Whether this declaration may ratify an unbalanced scenario: it must
+    /// carry a non-empty reason AND the divergence must name its tracking
+    /// issue, so the declaration is always traceable to a reviewed decision.
+    fn valid(&self, issue: &str) -> bool {
+        !self.reason.trim().is_empty() && !issue.trim().is_empty()
+    }
 }
 
 /// Renames one event variant to another for scenario-level reconciliation
@@ -685,13 +725,20 @@ impl FieldOverride {
     }
 }
 
-/// Matches an event by variant and, optionally, its `element_id`.
+/// Matches an event by variant and, optionally, its `element_id` and/or (for a
+/// `SequenceFlowTaken`) its `from` source element.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventPattern {
     pub variant: String,
     #[serde(default)]
     pub element_id: Option<String>,
+    /// A `SequenceFlowTaken` carries no `element_id`; its source element is
+    /// `from`. Scoping on it lets a divergence name ONE flow (the body's
+    /// advance, `review → end`) without also matching a flow both sides take
+    /// (the entry into the body, `start → review`) — #1528.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 impl EventPattern {
@@ -702,6 +749,10 @@ impl EventPattern {
         self.element_id
             .as_deref()
             .is_none_or(|id| body.get("element_id").and_then(Json::as_str) == Some(id))
+            && self
+                .from
+                .as_deref()
+                .is_none_or(|f| body.get("from").and_then(Json::as_str) == Some(f))
     }
 }
 
@@ -779,6 +830,28 @@ impl KeyIds {
 
 /// Folds `events`' minted keys into `ids` (one side, in corpus order).
 fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> {
+    // Pre-register every `ProcessInstanceCreated` in this entry FIRST: an
+    // element activation references its owning `instance_key`, and a ratified
+    // `reorder` may move the creation event AFTER those references within the
+    // entry. Two passes keep the owner resolvable regardless of intra-entry
+    // order.
+    for e in events {
+        let Ok(v) = serde_json::from_str::<Json>(e) else {
+            continue;
+        };
+        if let Some(("ProcessInstanceCreated", body)) = v
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .map(|(k, b)| (k.as_str(), b))
+        {
+            if let (Some(k), Some(pid)) = (
+                body.get("instance_key").and_then(Json::as_u64),
+                body.get("process_id").and_then(Json::as_str),
+            ) {
+                ids.mint(k, format!("instance:{pid}"))?;
+            }
+        }
+    }
     for e in events {
         let Ok(v) = serde_json::from_str::<Json>(e) else {
             continue;
@@ -795,12 +868,48 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
                 // `ParallelJoinOpened` mints the (parked, #1244) join's
                 // element-instance key without activating it; the firing
                 // entry's `ElementActivating` re-sights the same key for the
-                // same base (idempotent).
-                u64_of("element_instance_key").zip(str_of("element_id").map(|id| {
-                    let instance =
-                        u64_of("instance_key").map_or_else(|| "?".to_owned(), |k| k.to_string());
-                    format!("element:{instance}:{id}")
-                }))
+                // same base (idempotent). The owning instance is its CANONICAL
+                // identity (the `ProcessInstanceCreated` mint), not its raw
+                // key, so a corpus-wide instance-key offset (#1528) does not
+                // leak into every element identity.
+                u64_of("element_instance_key")
+                    .zip(str_of("element_id"))
+                    .map(|(k, id)| {
+                        let instance = u64_of("instance_key")
+                            .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                        (k, format!("element:{instance}:{id}"))
+                    })
+            }
+            "MultiInstanceChildActivated" => {
+                // A multi-instance child mints its element-instance key at
+                // activation. The child's `ElementActivating` re-sights the
+                // same key, but under a base that cannot distinguish the
+                // children (same element id, same instance), so the child key
+                // is registered HERE — keyed by the MI body plus the child
+                // ordinal — to keep each child's identity distinct. This
+                // matters when a release changes what a child mints: #1528
+                // adds a per-child user-task key, so the head build's child
+                // keys interleave with the task keys while the previous
+                // release's stay contiguous — a clean per-child remint that
+                // only a distinct child identity reconciles.
+                u64_of("child_key").zip(u64_of("index")).map(|(k, index)| {
+                    let body = u64_of("body_key").map_or_else(|| "?".to_owned(), |b| b.to_string());
+                    let instance = u64_of("instance_key")
+                        .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                    (k, format!("mi-child:{instance}:{body}#{index}"))
+                })
+            }
+            "ProcessInstanceCreated" => {
+                // The process-instance key itself. A release that mints extra
+                // keys mid-corpus (#1528's per-child user-task keys) shifts
+                // every LATER instance key, so the instance must canonicalize
+                // to WHICH instance it is, not its raw key. The base is the
+                // process id; `mint` appends the per-process creation ordinal,
+                // so two instances of one process stay distinct while the same
+                // instance agrees across the offset.
+                u64_of("instance_key")
+                    .zip(str_of("process_id"))
+                    .map(|(k, pid)| (k, format!("instance:{pid}")))
             }
             "JobCreated" | "ExecutionListenerJobCreated" | "TaskListenerJobCreated" => {
                 u64_of("job_key").map(|k| {
@@ -814,6 +923,11 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
                     u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
                 (k, format!("timer:{owner}"))
             }),
+            "UserTaskCreated" => u64_of("user_task_key").map(|k| {
+                let owner =
+                    u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                (k, format!("user-task:{owner}"))
+            }),
             "MessageSubscriptionCreated"
             | "SignalSubscriptionCreated"
             | "ConditionalSubscriptionCreated" => u64_of("subscription_key").map(|k| {
@@ -824,7 +938,34 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             _ => None,
         };
         if let Some((k, base)) = minted {
-            ids.mint(k, base)?;
+            // A multi-instance child's key is sighted by its generic
+            // `ElementActivating`/`ElementActivated` (base `element:…`, which
+            // cannot tell the children apart) AND by its
+            // `MultiInstanceChildActivated` (a DISTINCT `mi-child:…` base keyed
+            // by the child ordinal). Whichever comes first, the distinct child
+            // identity must win: a generic re-sighting of an identified child
+            // is idempotent, and a child activation refines an earlier generic
+            // mint. Two DIFFERENT generic entities, or two different children,
+            // sharing one key still fails closed in `mint`.
+            let is_child = base.starts_with("mi-child:");
+            match ids.get(&k) {
+                Some(existing) => {
+                    let existing_base = existing
+                        .rsplit_once('#')
+                        .map_or(existing.as_str(), |(b, _)| b);
+                    let existing_is_child = existing_base.starts_with("mi-child:");
+                    if is_child && !existing_is_child {
+                        // Refine the generic mint to the child identity.
+                        ids.ids.insert(k, base);
+                    } else if !is_child && existing_is_child {
+                        // Generic re-sight of an identified child: keep the
+                        // child identity.
+                    } else {
+                        ids.mint(k, base)?;
+                    }
+                }
+                None => ids.mint(k, base)?,
+            }
         }
     }
     Ok(())
@@ -1213,25 +1354,28 @@ pub fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
             }
             map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
             for (k, v) in map.iter_mut() {
+                // A variant tag becomes the context for everything under it —
+                // including the VALUES of a map field, whose entries are
+                // structs of that variant's shape (a `ProcessDeployed`
+                // process's `elements` map holds element structs whose fields
+                // are `ProcessDeployed.*`). Passing the stale outer `ctx`
+                // (`$`) instead would leave a golden-added field under a map
+                // unerased — the divergence the previous-release gate then
+                // reports on every deploy (#1528 review).
+                let next = if is_variant_tag(k) { k.as_str() } else { ctx };
                 if is_field_name(k) && data_map_fields().contains(k) {
                     // A map field: its keys are DATA, never
                     // erased; only its values (which may be structs) are
-                    // descended into.
+                    // descended into — under the CURRENT context (`next`).
                     if let Json::Object(entries) = v {
                         if !is_value_map(entries) {
                             entries
                                 .values_mut()
-                                .for_each(|e| erase_fields(e, ctx, erasable));
+                                .for_each(|e| erase_fields(e, next, erasable));
                         }
                     }
                     continue;
                 }
-                let next = if is_variant_tag(k) {
-                    // An externally-tagged variant: it becomes the context.
-                    k.as_str()
-                } else {
-                    ctx
-                };
                 erase_fields(v, next, erasable);
             }
         }
@@ -1546,22 +1690,40 @@ pub fn cross_release_checked(
             }
         }
         if head_matched != prev_matched {
-            let show = |m: &BTreeMap<String, usize>| {
-                m.iter()
-                    .map(|(k, n)| format!("{n} x {k}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            return Err(format!(
-                "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
-                 ({}, {:?}) — an event removed on one side never re-appears on the other \
-                 (a real loss, not a move):\n  head-side patterns matched:\n{}\n  \
-                 prev-side patterns matched (parked joins excepted):\n{}",
-                d.issue,
-                expected,
-                show(&head_matched),
-                show(&prev_matched)
-            ));
+            // An UNBALANCED declaration (#1528) ratifies the mismatch — the
+            // change adds or removes events outright, so the declared
+            // patterns can never reconcile as a move — but only when it is
+            // traceable: a non-empty reason on the declaration and the
+            // divergence's issue named. Anything else fails closed.
+            match &expected.unbalanced {
+                Some(u) if u.valid(&d.issue) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "scenario {scenario}: an unbalanced divergence declaration is valid \
+                         only with a non-empty reason AND a named issue ({}) — the \
+                         declaration must be traceable to a reviewed decision",
+                        d.issue
+                    ));
+                }
+                None => {
+                    let show = |m: &BTreeMap<String, usize>| {
+                        m.iter()
+                            .map(|(k, n)| format!("{n} x {k}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    return Err(format!(
+                        "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
+                         ({}, {:?}) — an event removed on one side never re-appears on the other \
+                         (a real loss, not a move):\n  head-side patterns matched:\n{}\n  \
+                         prev-side patterns matched (parked joins excepted):\n{}",
+                        d.issue,
+                        expected,
+                        show(&head_matched),
+                        show(&prev_matched)
+                    ));
+                }
+            }
         }
         ratified_entries += pend.entries.len();
         ratified_scenarios.insert(scenario);

@@ -49,6 +49,23 @@ ignored silently:
      (quiesced) upgrade; no rolling upgrade across it. Every such entry must
      be called out in the release notes.
 
+   A divergence whose declared `only_in_*` events have NO counterpart on the
+   other build — the change adds (or stops emitting) events outright rather
+   than moving them (#1528: an MI user task's `UserTaskCreated` per child,
+   which the previous release never emits) — can never balance. Ratify it
+   with the explicit `"unbalanced": {"reason": "…"}` marker on the scenario's
+   `expected`: the marker is valid only with a non-empty `reason` and the
+   divergence's `issue` named, stays scoped to its scenario, and everything
+   outside the declared patterns is still compared strictly per entry. Use
+   it only for an upgrade-boundary behavioural change a human has reviewed;
+   it weakens the lost-event guard for that scenario.
+
+   Release-note line for the current `upgrade-boundary` entries (the
+   `cross-release` command also prints each one as an `UPGRADE BOUNDARY`
+   line to call out): "**Behaviour change at the upgrade boundary: during a
+   rolling upgrade, multi-instance user tasks created by old and new leaders
+   differ until all members run this release (#1528).**"
+
    An entry **expires** (must be removed) once the
    previous release is at or past `introduced_in`, and a **stale** entry —
    one the run never needs — fails too, so the file cannot drift.

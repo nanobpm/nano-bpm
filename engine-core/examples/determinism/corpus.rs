@@ -857,6 +857,78 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
         }
     }
 
+    // ---- Multi-instance user tasks (#1528) --------------------------------
+    // A multi-instance on a DIRECT user task creates one user task per child
+    // (the previous release completed each child at once — an upgrade-boundary
+    // behavioural change, ratified in `divergence-allowlist.json`). The
+    // scenario emits a FIXED number of commands so the filtered
+    // (previous-release) corpus keeps the unfiltered shape (`build_excluding`
+    // rejects a shape change): the completion below targets a never-created
+    // task key so BOTH builds reject it (`err` == `err`, a valid compared
+    // entry), keeping the behavioural divergence entirely on the CREATE entry.
+    g.scenario("multi-instance-user-tasks");
+    let mi_review = ProcessBuilder::new("mi_review")
+        .start_event("start")
+        .user_task("review")
+        .with_multi_instance(
+            "review",
+            nanobpmn_engine_core::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                // No output aggregation: an `output_element` seeds a
+                // child-local `decision = null` on the head build that the
+                // previous release never seeds, a `local_variables` payload
+                // difference no event-pattern normalization reconciles (and
+                // the field is not golden-recorded as added, so it is not
+                // erased). The divergence this scenario exists to ratify is
+                // the per-child user task, not output collection.
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                // `true` (the BPMN default): with no completion condition the
+                // flag never fires, and the default keeps the deploy's
+                // `cancel_remaining_instances` field at the value the previous
+                // release's lossy decode treats as benign — so the scenario's
+                // deployment is KEPT in the filtered corpus and the divergence
+                // is actually exercised, not excluded as a dependent.
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .expect("mi_review");
+    g.push(Command::DeployProcess(mi_review));
+    let mi = g.push(create(
+        "mi_review",
+        vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+    ));
+    let mi_tasks = all(&mi, "UserTaskCreated", "user_task_key");
+    if g.exclude.is_empty() {
+        assert_eq!(
+            mi_tasks.len(),
+            2,
+            "one user task per MI child (the head behaviour #1528 ratifies)"
+        );
+    }
+    // Complete a NEVER-CREATED task key: BOTH builds reject it (`err` ==
+    // `err`, a valid compared entry), so the scenario keeps a
+    // release-independent shape (`build_excluding` rejects a shape change)
+    // while the behavioural divergence stays entirely on the CREATE entry —
+    // head's per-child `UserTaskCreated` events against prev's immediate
+    // child completions, which the allowlist's unbalanced declaration
+    // ratifies. Completing a real harvested task would emit a
+    // `UserTaskCompleted` lifecycle on head that prev (which minted no task)
+    // rejects — a per-entry ok/err mismatch no event-pattern normalization
+    // reconciles.
+    let never_created = mi_tasks.iter().max().copied().unwrap_or(0) + 100_000;
+    g.push(Command::complete_user_task_with(
+        never_created,
+        vars(&[("decision", Value::Int(10))]),
+    ));
+
     // ---- Newest log variants last (see module doc) ------------------------
     g.scenario("newest-variants");
     g.push_json(json!({"CreateClusterVariable": {
