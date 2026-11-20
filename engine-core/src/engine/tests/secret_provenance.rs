@@ -335,6 +335,51 @@ fn a_post_creation_variable_write_revokes_provenance() {
     }
 }
 
+/// #1743 review: an equal-value overwrite of the trusted local `payload` (the
+/// same map, restated by an untrusted writer) is still a write the job can
+/// see, so it must revoke provenance even though equal-value writes are
+/// otherwise suppressed (#1537). Covers the local element-scope overwrite and
+/// the propagating root write of an equal value.
+#[test]
+fn an_equal_value_overwrite_still_revokes_provenance() {
+    for local in [true, false] {
+        let mut engine = engine_with_cluster_vars();
+        let (prov, _) = run(
+            &mut engine,
+            task(vec![m("=apiCfg", "payload.auth")]),
+            BTreeMap::from([("rootVar".to_string(), Value::Int(1))]),
+        );
+        assert_eq!(prov, vec![site("payload.auth")]);
+        let job = engine.state.jobs.values().next().unwrap().clone();
+        let (scope, name) = if local {
+            (job.element_instance_key, "payload")
+        } else {
+            (job.instance_key, "rootVar")
+        };
+        let current = if local {
+            engine.state.instances[&job.instance_key].scope_variables[&scope]["payload"].clone()
+        } else {
+            Value::Int(1)
+        };
+        let log = engine
+            .apply_command(Command::set_variables_scoped(
+                scope,
+                BTreeMap::from([(name.to_string(), current)]),
+                local,
+            ))
+            .unwrap();
+        assert!(
+            log.iter().any(|e| matches!(
+                e,
+                Event::VariablesUpdated { .. } | Event::ScopedVariablesUpdated { .. }
+            )),
+            "local={local}: the revoking write must be journaled: {log:?}"
+        );
+        let job = engine.state.jobs.values().next().unwrap();
+        assert!(job.secret_provenance.is_empty(), "local={local}");
+    }
+}
+
 /// A write to a scope the job cannot see (a sibling branch, e.g. a parallel
 /// task's own input-mapping scope) cannot replace the job's inputs, so it must
 /// keep the job's provenance; a write to an ancestor scope still revokes it.
