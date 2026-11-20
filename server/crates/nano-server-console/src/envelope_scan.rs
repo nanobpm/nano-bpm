@@ -279,6 +279,11 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     // `process_id` also keys a start event's entry (the process is the start's
     // identity for a start-instance call).
     let mut process_id: Option<String> = None;
+    // Depth of the open `<process>` start tag: only a start event that is a
+    // *direct* child (depth == process_depth + 1) is a process-level start. A
+    // start nested in a `subProcess` shares `process_id` but is not the
+    // process's entry point (mirrors engine-core's model).
+    let mut process_depth: Option<usize> = None;
     let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut cur_shape: Option<(usize, ShapeDecl)> = None;
     // Model-level metadata (ADR 0040 §5): `nano:meta` key/value elements that sit
@@ -313,7 +318,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         } else {
                             cur = Some((depth, acc));
                         }
-                    } else if ln == "startEvent" {
+                    } else if ln == "startEvent" && process_depth.is_some_and(|d| depth == d + 1) {
                         // A `bpmn:startEvent` keys by its enclosing process (read
                         // from the most recent open `<process>`). Whether it is a
                         // *none* start (an envelope carrier) is only decidable at
@@ -373,6 +378,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                     && let Some(id) = attr(attrs, "id")
                 {
                     process_id = Some(id.to_string());
+                    process_depth = Some(depth);
                 }
                 if cur_shape.is_none() {
                     if ln == "shape" {
@@ -1030,6 +1036,51 @@ mod tests {
     /// definitions and/or a `zeebe:properties` envelope), inside `doc`'s process.
     fn start_event(id: &str, body: &str) -> String {
         format!(r#"<bpmn:startEvent id="{id}" name="{id}">{body}</bpmn:startEvent>"#)
+    }
+
+    fn nested_start_doc(outer: &str, nested_first: bool) -> String {
+        let sub = format!(
+            r#"<bpmn:subProcess id="sub">{}</bpmn:subProcess>"#,
+            start_event(
+                "inner",
+                "<bpmn:extensionElements><zeebe:properties>\
+                 <zeebe:property name=\"io.nanobpm.dataEnvelope.in\" value=\"Inner\" />\
+                 </zeebe:properties></bpmn:extensionElements>"
+            )
+        );
+        if nested_first {
+            doc(&format!("{sub}{outer}"))
+        } else {
+            doc(&format!("{outer}{sub}"))
+        }
+    }
+
+    #[test]
+    fn a_subprocess_start_never_supplies_the_process_start_envelope() {
+        let outer_typed = start_event(
+            "s",
+            &format!(
+                "<bpmn:extensionElements><zeebe:properties>{IN_ORDER}</zeebe:properties>\
+                 </bpmn:extensionElements>"
+            ),
+        );
+        for nested_first in [true, false] {
+            let got = starts(&nested_start_doc(&outer_typed, nested_first));
+            assert_eq!(
+                got,
+                vec![StartIo {
+                    process: "p".into(),
+                    input_type: Some("Order".into()),
+                }],
+                "nested_first={nested_first}"
+            );
+            // Outer start without an envelope: the nested one must not leak in.
+            let got = starts(&nested_start_doc(&start_event("s", ""), nested_first));
+            assert!(
+                got.iter().all(|s| s.input_type.is_none()),
+                "nested_first={nested_first}: {got:?}"
+            );
+        }
     }
 
     #[test]

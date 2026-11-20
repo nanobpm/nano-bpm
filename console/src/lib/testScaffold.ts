@@ -150,7 +150,11 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
  * definition. A typed start (message/timer/…) is skipped — its envelope lives
  * on the referenced `bpmn:message`, not the event.
  */
-function noneStartEnvelope(scope: string): string | undefined {
+function noneStartEnvelope(processBody: string): string | undefined {
+  // Only a *direct* process-level start is the process's entry point; a start
+  // nested in a subprocess must never supply it (mirrors the server-side scan
+  // and engine-core's model). Strip nested subprocess bodies, innermost first.
+  const scope = stripSubProcesses(processBody);
   const startRe = /<[\w-]*:?startEvent\b([^>]*?)(\/?)>/g;
   for (let m = startRe.exec(scope); m; m = startRe.exec(scope)) {
     if (m[2] === "/") {
@@ -169,6 +173,18 @@ function noneStartEnvelope(scope: string): string | undefined {
     if (inVal) return inVal;
   }
   return undefined;
+}
+
+const SUBPROCESS_RE =
+  /<([\w-]*:?(?:subProcess|adHocSubProcess|transaction))\b[^>]*?(?:\/>|>(?:(?!<[\w-]*:?(?:subProcess|adHocSubProcess|transaction)\b)[\s\S])*?<\/\1>)/g;
+
+/** A process body with every (possibly nested) subprocess element removed. */
+function stripSubProcesses(body: string): string {
+  for (;;) {
+    const next = body.replace(SUBPROCESS_RE, "");
+    if (next === body) return next;
+    body = next;
+  }
 }
 
 /** Element ids that a start event flows directly into, within a scope of xml. */

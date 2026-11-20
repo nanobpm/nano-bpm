@@ -256,3 +256,34 @@ test("prefillSignalBroadcast seeds the signal name only (name-only correlation)"
   const form = prefillSignalBroadcast({ signalName: "cancel-all" });
   assert.deepEqual(form, { signalName: "cancel-all", variables: "{}" });
 });
+
+test("a subprocess's start event never supplies the process start envelope", () => {
+  const nested =
+    '<bpmn:subProcess id="sub"><bpmn:subProcess id="sub2"></bpmn:subProcess>' +
+    '<bpmn:startEvent id="Inner"><bpmn:extensionElements><zeebe:properties>' +
+    '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="InnerIn" />' +
+    "</zeebe:properties></bpmn:extensionElements></bpmn:startEvent></bpmn:subProcess>";
+  const typedOuter =
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+    '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+    "</zeebe:properties></bpmn:extensionElements>";
+  for (const nestedFirst of [true, false]) {
+    const place = (outer: string) =>
+      nestedFirst
+        ? XML.replace('<bpmn:startEvent id="Start">', nested + outer)
+        : XML.replace("</bpmn:process>", nested + "</bpmn:process>").replace(
+            '<bpmn:startEvent id="Start">',
+            outer,
+          );
+    // Outer start declares an envelope: it wins regardless of XML order.
+    assert.equal(
+      parseModelEnvelopes(place(typedOuter)).startEnvelopes.get("p"),
+      "ReviewIn",
+    );
+    // Outer start has none: the nested envelope must not leak in, and the
+    // entry-task heuristic stays in place.
+    const m = parseModelEnvelopes(place('<bpmn:startEvent id="Start">'));
+    assert.equal(m.startEnvelopes.size, 0, `nestedFirst=${nestedFirst}`);
+    assert.equal(JSON.parse(scaffoldStartVars(m)).prUrl, "");
+  }
+});
