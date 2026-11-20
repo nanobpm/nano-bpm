@@ -4016,7 +4016,12 @@ fn mi_child_input_element_named_loop_counter_is_rendered_once() {
     let records = run.render_mi_child_variables(7, "task".into(), &vars, Some("loopCounter"), 1);
     let names: Vec<_> = records
         .iter()
-        .map(|r| (r["value"]["name"].as_str().unwrap().to_string(), r["intent"].as_str().unwrap().to_string()))
+        .map(|r| {
+            (
+                r["value"]["name"].as_str().unwrap().to_string(),
+                r["intent"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     assert_eq!(
         names,
