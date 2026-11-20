@@ -1,0 +1,327 @@
+{
+  "scenario" : "mi-user-task-sequential",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "mi-user-task-sequential",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "mi-user-task-sequential",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f1",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "review",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "review",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "CREATED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "items",
+      "value" : [ 1, 2 ],
+      "scopeElementId" : "mi-user-task-sequential",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "results",
+      "value" : [ null, null ],
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "item",
+      "value" : 1,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "decision",
+      "value" : null,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "loopCounter",
+      "value" : 1,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "completeUserTask",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "COMPLETED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "CREATED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "decision",
+      "value" : "a",
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "results",
+      "value" : [ "a", null ],
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "item",
+      "value" : 2,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "decision",
+      "value" : null,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "loopCounter",
+      "value" : 2,
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 4
+    } ]
+  }, {
+    "step" : 2,
+    "op" : "completeUserTask",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 2
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "review",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "review",
+      "bpmnElementType" : "MULTI_INSTANCE_BODY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f2",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "mi-user-task-sequential",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "mi-user-task-sequential",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "COMPLETED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "decision",
+      "value" : "b",
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 4
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "results",
+      "value" : [ "a", "b" ],
+      "scopeElementId" : "review",
+      "processInstanceKey" : 1,
+      "scopeKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "results",
+      "value" : [ "a", "b" ],
+      "scopeElementId" : "mi-user-task-sequential",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  } ]
+}

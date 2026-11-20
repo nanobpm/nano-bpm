@@ -197,13 +197,15 @@ fn main() {
                 Ok(r) => eprintln!(
                     "determinism_corpus: {} entries agree with the previous release \
                      ({} ratified-divergent, {} observational events filtered, additive fields \
-                     erased {:?}); {} state checkpoints identical, {} skipped (snapshot format bump)",
+                     erased {:?}); {} state checkpoints identical, {} skipped (snapshot format bump), {} compared outside the ratified \
+                     upgrade-boundary instances",
                     r.base.entries,
                     r.ratified_divergent_entries,
                     r.observational_filtered,
                     r.erased_fields,
                     r.base.states_compared,
-                    r.base.states_skipped_format_bump
+                    r.base.states_skipped_format_bump,
+                    r.base.states_compared_outside_ratified_boundary
                 ),
                 Err(e) => fail("DIVERGENCE vs previous release", &e),
             }

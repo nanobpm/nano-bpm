@@ -523,18 +523,66 @@ fn prev_release_gate_variant_substitution_and_field_override() {
     let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
     assert!(err.contains(&format!("scenario {scenario}")), "{err}");
     // Declared via only_in_head/only_in_prev + variant_substitutions: passes.
-    let allow = serde_json::json!({"divergences": [{
-        "scenario": scenario,
-        "expected": {
-            "only_in_prev": [{"variant": "ElementTerminated"}],
-            "only_in_head": [{"variant": "ElementCompleted"}],
+    let substituted = entries_mut(&mut head.clone())[i]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e.get("ElementCompleted").is_some())
+        .count();
+    let allow_with = |count: Option<usize>| {
+        // Both lifecycle kinds on both sides, as the real MI cancel entry
+        // declares (the patterns cannot single out the substituted events).
+        let both =
+            serde_json::json!([{"variant": "ElementTerminated"}, {"variant": "ElementCompleted"}]);
+        let mut expected = serde_json::json!({
+            "only_in_prev": both.clone(),
+            "only_in_head": both,
             "variant_substitutions": [{"prev": "ElementTerminated", "head": "ElementCompleted"}]
-        },
-        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
-        "rationale": "upgrade-boundary: test"
-    }]});
-    let report = checked(&head, &prev, allow, &["ElementTerminated"]).unwrap();
+        });
+        if let Some(n) = count {
+            expected["substituted_head_events"] = serde_json::json!(n);
+        }
+        serde_json::json!({"divergences": [{
+            "scenario": scenario,
+            "expected": expected,
+            "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
+            "rationale": "upgrade-boundary: test"
+        }]})
+    };
+    let report = checked(
+        &head,
+        &prev,
+        allow_with(Some(substituted)),
+        &["ElementTerminated"],
+    )
+    .unwrap();
     assert_eq!(report.ratified_divergent_entries, 1);
+    // #1528 review: a substitution without the pinned head-form count fails
+    // closed (a regression to the prev kind would otherwise balance).
+    let err = checked(&head, &prev, allow_with(None), &["ElementTerminated"]).unwrap_err();
+    assert!(err.contains("substituted_head_events"), "{err}");
+    // #1528 review: ONE substituted event regressing to the prev lifecycle
+    // kind on head still balances under the projection, but the pinned count
+    // catches it.
+    let mut regressed = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut regressed)[i].get_mut("events")
+    {
+        let e = events
+            .iter_mut()
+            .find(|e| e.get("ElementCompleted").is_some())
+            .unwrap();
+        let obj = e.as_object_mut().unwrap();
+        let body = obj.remove("ElementCompleted").unwrap();
+        obj.insert("ElementTerminated".to_owned(), body);
+    }
+    let err = checked(
+        &regressed,
+        &prev,
+        allow_with(Some(substituted)),
+        &["ElementTerminated"],
+    )
+    .unwrap_err();
+    assert!(err.contains("regressed"), "{err}");
 
     // --- field_overrides: head populates a golden-added field prev decodes
     // to the default. Give head's ElementActivated a non-zero scope where prev
@@ -1045,6 +1093,42 @@ fn string_valued_map_keys_are_never_fields() {
     assert_eq!(
         nested,
         serde_json::json!({"Snap": {"processes": {"p1": {"kept": 2}}}})
+    );
+}
+
+/// #1528 (review): a golden-added field nested under a VARIANT's map field
+/// (a `ProcessDeployed` process's `elements` map, whose values are element
+/// structs) must be erased under that variant's context — not left in place
+/// because the map walk kept the stale `$` root context. This is the
+/// divergence the previous-release gate reports on every deploy when a
+/// release adds a per-element field (e.g. `properties`).
+#[test]
+fn erasure_reaches_fields_under_a_variant_map_field() {
+    // ProcessDeployed -> process -> elements -> {id} -> properties.
+    let deploy = serde_json::json!({"ProcessDeployed": {"process": {
+        "id": "p",
+        "elements": {"task": {"id": "task", "properties": {}, "kind": "x"}}
+    }}});
+    let mut erased = deploy.clone();
+    let erasable: compare::Vocab = ["ProcessDeployed.properties".to_owned()].into();
+    compare::erase_fields(&mut erased, "$", &erasable);
+    assert_eq!(
+        erased,
+        serde_json::json!({"ProcessDeployed": {"process": {
+            "id": "p",
+            "elements": {"task": {"id": "task", "kind": "x"}}
+        }}}),
+        "a golden-added field under a variant's map field must be erased"
+    );
+
+    // A field the golden does NOT record as added under that variant stays —
+    // the erasure never over-reaches into map data it cannot name.
+    let mut kept = deploy.clone();
+    let erasable: compare::Vocab = ["ProcessDeployed.name".to_owned()].into();
+    compare::erase_fields(&mut kept, "$", &erasable);
+    assert_eq!(
+        kept, deploy,
+        "only the listed field is erased; the element id/kind survive"
     );
 }
 
@@ -1589,6 +1673,1093 @@ fn prev_release_gate_ratified_patterns_reconcile_across_entries() {
     );
 }
 
+/// #1528: an UNBALANCED scenario divergence (the change adds events with no
+/// counterpart on the previous release — e.g. an MI user task's
+/// `UserTaskCreated` per child, which the old build never emits) is ratified
+/// only by an explicit, scenario-scoped `unbalanced` declaration that names
+/// its issue and reason. (a) An undeclared unbalanced diff still FAILS;
+/// (b) a declared one passes only for its named scenario — the same diff in
+/// another scenario still fails; (c) a declaration without a reason or an
+/// issue is rejected.
+#[test]
+fn prev_release_gate_unbalanced_divergence_requires_an_explicit_declaration() {
+    let head = head_records();
+    let scenario = "jobs-and-user-tasks";
+    // The synthetic previous release: `head` with the scenario's
+    // `UserTaskAssigned` events removed (a release that never emits them
+    // there) — an imbalance, not a move. Dropped ONLY in `scenario` (the
+    // corpus emits `UserTaskAssigned` in other scenarios too, and those must
+    // keep agreeing). The variant is unknown to `added`, so the
+    // new-variant pre-filter cannot fire — the scenario comparison is what
+    // is exercised.
+    let scenarios = labels();
+    let mut prev = head.clone();
+    let mut dropped = 0;
+    for (idx, r) in entries_mut(&mut prev).into_iter().enumerate() {
+        if scenarios[idx] != scenario {
+            continue;
+        }
+        if let Some(serde_json::Value::Array(events)) = r.get_mut("events") {
+            let before = events.len();
+            events.retain(|e| e.get("UserTaskAssigned").is_none());
+            dropped += before - events.len();
+        }
+    }
+    assert!(
+        dropped > 0,
+        "the corpus must emit UserTaskAssigned in {scenario}"
+    );
+    let declare = |expected: serde_json::Value, issue: &str| {
+        serde_json::json!({"divergences": [{
+            "scenario": scenario, "expected": expected, "introduced_in": "v0.0.2",
+            "issue": issue, "upgrade": "upgrade-boundary",
+            "rationale": "upgrade-boundary: test"
+        }]})
+    };
+    let patterns = serde_json::json!({"only_in_head": [{"variant": "UserTaskAssigned"}]});
+
+    // (a) Undeclared: the imbalance fails — as a missing declaration, and as
+    // an unbalanced ratified pattern when the patterns are declared without
+    // the `unbalanced` marker.
+    let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
+    assert!(err.contains(&format!("scenario {scenario}")), "{err}");
+    let err = checked(&head, &prev, declare(patterns.clone(), "#0"), &[]).unwrap_err();
+    assert!(err.contains("unbalanced"), "{err}");
+
+    // (c) A declaration without a reason — or a divergence without an issue —
+    // is rejected: the ratification must be traceable to a reviewed decision.
+    let no_reason = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "  "}
+    });
+    let err = checked(&head, &prev, declare(no_reason, "#0"), &[]).unwrap_err();
+    assert!(err.contains("non-empty reason AND a named issue"), "{err}");
+    let no_issue = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let err = checked(&head, &prev, declare(no_issue, "  "), &[]).unwrap_err();
+    assert!(err.contains("non-empty reason AND a named issue"), "{err}");
+
+    // (b) Declared, with issue and reason: the named scenario passes.
+    let declared = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskAssigned"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let report = checked(&head, &prev, declare(declared.clone(), "#1528"), &[]).unwrap();
+    assert!(report.ratified_divergent_entries > 0);
+
+    // (b) … and ONLY the named scenario: declaring a DIFFERENT scenario
+    // leaves this one undeclared, so the same diff fails.
+    let wrong_scenario = serde_json::json!({"divergences": [{
+        "scenario": "messages-signals-conditional",
+        "expected": {
+            "only_in_head": [{"variant": "UserTaskAssigned"}],
+            "unbalanced": {"reason": "a real reason"}
+        },
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let err = checked(&head, &prev, wrong_scenario, &[]).unwrap_err();
+    assert!(
+        err.contains(&format!("scenario {scenario}")),
+        "an unbalanced declaration is scenario-scoped; {scenario} must fail when only another scenario is declared: {err}"
+    );
+}
+
+/// The index (among the non-state entry records) of the
+/// `multi-instance-user-tasks` CREATE entry — the one whose events carry the
+/// MI body, its children, and the per-child `UserTaskCreated` events.
+fn mi_create_entry(records: &[serde_json::Value]) -> usize {
+    entry_emitting(
+        records,
+        "multi-instance-user-tasks",
+        "MultiInstanceChildActivated",
+    )
+}
+
+/// The `multi-instance-user-tasks` divergence declaration (`remint_keys` +
+/// the unbalanced per-child `UserTaskCreated`), mirroring the allowlist.
+fn mi_declaration() -> serde_json::Value {
+    serde_json::json!({"divergences": [{
+        "scenario": "multi-instance-user-tasks",
+        "expected": {
+            "reorder": true,
+            "remint_keys": true,
+            "only_in_head": [{"variant": "UserTaskCreated"}],
+            "only_in_prev": [
+                {"variant": "ElementActivated", "element_id": "review"},
+                {"variant": "ElementCompleted", "element_id": "review"},
+                {"variant": "SequenceFlowTaken", "from": "review"}
+            ],
+            "unbalanced": {"reason": "Zeebe parity: an MI userTask child creates a real user task"}
+        },
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]})
+}
+
+/// #1528 (review): an MI child's canonical identity is independent of the
+/// entry's event order — whether its generic `ElementActivating` or its
+/// `MultiInstanceChildActivated` is seen first, the child canonicalizes to the
+/// same `mi-child:…` identity, so a pure reorder reconciles.
+#[test]
+fn prev_release_gate_mi_child_identity_is_order_independent() {
+    // A self-contained entry: an instance whose MI body (element `review`)
+    // activates one child. `prev` is the SAME events reversed — a pure
+    // reorder (same keys, permuted order), so the child's generic
+    // `ElementActivating` now precedes its `MultiInstanceChildActivated`. With
+    // `reorder` + `remint_keys` declared, the two must reconcile: the child's
+    // canonical identity is the same whichever sighting comes first.
+    let entry = |order: &[&str]| -> serde_json::Value {
+        let events: Vec<serde_json::Value> = order
+            .iter()
+            .map(|kind| match *kind {
+                "create" => serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+                "body_activating" => serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":11,"instance_key":10,"scope":0}}),
+                "child_activating" => serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":12,"instance_key":10,"scope":11}}),
+                "child_activated" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":12,"index":0,"instance_key":10,"local_variables":{}}}),
+                other => panic!("unknown event {other}"),
+            })
+            .collect();
+        serde_json::json!({"i": 0, "events": events})
+    };
+    let forward = entry(&[
+        "create",
+        "body_activating",
+        "child_activating",
+        "child_activated",
+    ]);
+    let reversed = entry(&[
+        "child_activated",
+        "child_activating",
+        "body_activating",
+        "create",
+    ]);
+    // One state checkpoint each (same format) so the state comparison is live —
+    // a real snapshot from a corpus run, so it decodes under the head type.
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![forward.clone(), state()];
+    let prev = vec![reversed, state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx)
+        .expect("a pure reorder of an MI child's sightings reconciles");
+}
+
+/// #1528 (review): a NESTED multi-instance — the same inner MI element active
+/// under several outer children — activates one inner body per outer child, and
+/// every inner body's generic activation names the same (instance, element id).
+/// An encounter-order ordinal on that base would swap the two bodies'
+/// identities when a ratified `reorder` permutes the entry, failing a valid
+/// `reorder` + `remint_keys` comparison; the bodies' identities must be derived
+/// from their canonical PARENT SCOPE (the outer child) instead, so the reorder
+/// reconciles.
+#[test]
+fn prev_release_gate_nested_mi_body_identity_is_order_independent() {
+    // A self-contained entry: an instance whose outer MI body (element `outer`)
+    // activates two children, each activating an inner MI body (element
+    // `inner`) with one child of its own. `prev` is the SAME events reversed —
+    // a pure reorder — so the inner bodies' activations arrive in the opposite
+    // order. With `reorder` + `remint_keys` declared, the two must reconcile:
+    // each inner body's canonical identity is derived from its outer child's
+    // identity, not from which body activation was folded first.
+    let entry = |order: &[&str]| -> serde_json::Value {
+        let events: Vec<serde_json::Value> = order
+            .iter()
+            .map(|kind| match *kind {
+                "create" => serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+                "outer_body" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":11,"instance_key":10,"scope":0}}),
+                "outer_child0" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":12,"instance_key":10,"scope":11}}),
+                "outer_child0_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":12,"index":0,"instance_key":10,"local_variables":{}}}),
+                "outer_child1" => serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":13,"instance_key":10,"scope":11}}),
+                "outer_child1_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":11,"child_key":13,"index":1,"instance_key":10,"local_variables":{}}}),
+                // The same inner MI element, one body per outer child: both
+                // generic activations name (instance 10, element `inner`) — an
+                // encounter-order ordinal cannot tell them apart.
+                "inner_body0" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":14,"instance_key":10,"scope":12}}),
+                "inner_child0" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":15,"instance_key":10,"scope":14}}),
+                "inner_child0_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":14,"child_key":15,"index":0,"instance_key":10,"local_variables":{}}}),
+                "inner_body1" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":16,"instance_key":10,"scope":13}}),
+                "inner_child1" => serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":17,"instance_key":10,"scope":16}}),
+                "inner_child1_mi" => serde_json::json!({"MultiInstanceChildActivated":{"body_key":16,"child_key":17,"index":0,"instance_key":10,"local_variables":{}}}),
+                other => panic!("unknown event {other}"),
+            })
+            .collect();
+        serde_json::json!({"i": 0, "events": events})
+    };
+    let forward = entry(&[
+        "create",
+        "outer_body",
+        "outer_child0",
+        "outer_child0_mi",
+        "inner_body0",
+        "inner_child0",
+        "inner_child0_mi",
+        "outer_child1",
+        "outer_child1_mi",
+        "inner_body1",
+        "inner_child1",
+        "inner_child1_mi",
+    ]);
+    let reversed = entry(&[
+        "inner_child1_mi",
+        "inner_child1",
+        "inner_body1",
+        "outer_child1_mi",
+        "outer_child1",
+        "inner_child0_mi",
+        "inner_child0",
+        "inner_body0",
+        "outer_child0_mi",
+        "outer_child0",
+        "outer_body",
+        "create",
+    ]);
+    // One state checkpoint each (same format) so the state comparison is live —
+    // a real snapshot from a corpus run, so it decodes under the head type.
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![forward, state()];
+    let prev = vec![reversed, state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx).expect(
+        "a pure reorder of a nested loop's body activations reconciles: each inner \
+         body's identity is derived from its canonical parent scope (its outer child)",
+    );
+}
+
+/// Runs the cross-release gate over ONE synthetic entry per side (plus a
+/// real state checkpoint so the state comparison is live), with `reorder` +
+/// `remint_keys` declared for the scenario.
+fn nested_gate(
+    head_events: Vec<serde_json::Value>,
+    prev_events: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![serde_json::json!({"i": 0, "events": head_events}), state()];
+    let prev = vec![serde_json::json!({"i": 0, "events": prev_events}), state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx).map(|_| ())
+}
+
+/// A nested MI tree (outer body 11 → children 12, 13 → inner bodies 14, 16 →
+/// inner children 15, 17), every element-instance key offset by `shift` (the
+/// instance key 10 stays put), each inner child parking one job (key 30+).
+fn nested_tree(shift: u64) -> Vec<serde_json::Value> {
+    let k = |raw: u64| raw + shift;
+    vec![
+        serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(11),"instance_key":10,"scope":0}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(12),"instance_key":10,"scope":k(11)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(12),"index":0,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(13),"instance_key":10,"scope":k(11)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(13),"index":1,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(14),"instance_key":10,"scope":k(12)}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(15),"instance_key":10,"scope":k(14)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(14),"child_key":k(15),"index":0,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(16),"instance_key":10,"scope":k(13)}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(17),"instance_key":10,"scope":k(16)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(16),"child_key":k(17),"index":0,"instance_key":10,"local_variables":{}}}),
+    ]
+}
+
+/// #1528 (review): an inner MI body activated in the SAME entry as the outer
+/// child that is its parent scope must derive its identity from that child's
+/// canonical `mi-child:…` identity, not a raw-key `?orphan:` token — so a
+/// clean REMINT of the whole nested tree (every key shifted) reconciles.
+/// Registration is parent-before-child to a fixpoint.
+#[test]
+fn prev_release_gate_nested_mi_tree_reconciles_under_remint() {
+    nested_gate(nested_tree(0), nested_tree(100))
+        .expect("a reminted nested MI tree reconciles: inner bodies derive from their outer child");
+}
+
+/// #1528 (review): two executions of the SAME MI activity in one parent scope
+/// (a loop-back) must keep DISTINCT body identities — and so distinct child
+/// identities — or `remint_keys` would hide a reference that points to the
+/// wrong execution. Swapping which execution's child owns a job must fail.
+#[test]
+fn prev_release_gate_repeated_mi_body_executions_stay_distinct() {
+    let tree = |shift: u64, job_owner: u64| {
+        let k = |raw: u64| raw + shift;
+        vec![
+            serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+            // Execution 1 of MI activity `a`.
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(11),"instance_key":10,"scope":0}}),
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(12),"instance_key":10,"scope":k(11)}}),
+            serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(12),"index":0,"instance_key":10,"local_variables":{}}}),
+            // Execution 2 of the same activity, same parent scope.
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(13),"instance_key":10,"scope":0}}),
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(14),"instance_key":10,"scope":k(13)}}),
+            serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(13),"child_key":k(14),"index":0,"instance_key":10,"local_variables":{}}}),
+            serde_json::json!({"JobCreated":{"job_key":20,"element_instance_key":k(job_owner),"element_id":"a","job_type":"w","instance_key":10}}),
+        ]
+    };
+    // Positive control: a clean remint plus a pure reorder reconciles.
+    let mut reversed = tree(100, 12);
+    reversed.reverse();
+    nested_gate(tree(0, 12), reversed).expect("a reminted, reordered tree reconciles");
+    assert!(
+        nested_gate(tree(0, 12), tree(100, 14)).is_err(),
+        "a job re-pointed at the OTHER execution's child must not reconcile"
+    );
+}
+
+/// #1528 (review): the mint bypass for an MI child's generic re-sighting is
+/// restricted to that lifecycle — a key reused for an UNRELATED entity (a
+/// `UserTaskCreated` reusing its child's key, or a child reusing a job key)
+/// is a collision and fails closed, never silently accepted.
+#[test]
+fn prev_release_gate_remint_rejects_unrelated_key_collisions() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+
+    // A `UserTaskCreated` reusing its child's key: set the first
+    // `UserTaskCreated`'s `user_task_key` to the child's key.
+    let mut prev = head.clone();
+    let child_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .nth(i)
+        .and_then(|r| r.get("events").cloned())
+        .and_then(|e| e.as_array().cloned())
+        .and_then(|events| {
+            events.iter().find_map(|e| {
+                e.get("MultiInstanceChildActivated")?
+                    .get("child_key")?
+                    .as_u64()
+            })
+        })
+        .expect("a child key");
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(utc) = e.get_mut("UserTaskCreated") {
+                utc["user_task_key"] = serde_json::json!(child_key);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a UserTaskCreated reusing its child's key must fail as a collision: {err}"
+    );
+
+    // A child reusing a JOB key: set the first `MultiInstanceChildActivated`'s
+    // `child_key` to a job key minted elsewhere in the corpus.
+    let job_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .filter_map(|r| r.get("events")?.as_array().cloned())
+        .flatten()
+        .find_map(|e| e.get("JobCreated")?.get("job_key")?.as_u64())
+        .expect("a job key");
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(mica) = e.get_mut("MultiInstanceChildActivated") {
+                mica["child_key"] = serde_json::json!(job_key);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a child reusing a job key must fail as a collision: {err}"
+    );
+}
+
+/// #1528 (review): the mint bypass for an MI child's generic re-sighting is
+/// restricted to the child's OWN `ElementActivating`/`ElementActivated` — a
+/// sighting naming the SAME owning instance and element id the child was
+/// registered with. An `ElementActivating` for a DIFFERENT element, or a
+/// `ParallelJoinOpened` parking on the child's key, also produces an
+/// `element:` base but is NOT that lifecycle re-sighting, so it must fall
+/// through to `mint` and fail as the collision it is.
+#[test]
+fn prev_release_gate_remint_rejects_mi_child_key_reuse_by_other_elements() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+    let child_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .nth(i)
+        .and_then(|r| r.get("events").cloned())
+        .and_then(|e| e.as_array().cloned())
+        .and_then(|events| {
+            events.iter().find_map(|e| {
+                e.get("MultiInstanceChildActivated")?
+                    .get("child_key")?
+                    .as_u64()
+            })
+        })
+        .expect("a child key");
+
+    // (1) An `ElementActivating` for a DIFFERENT element reusing the child's key.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(ea) = e.get_mut("ElementActivating") {
+                if ea.get("element_instance_key").and_then(|k| k.as_u64()) == Some(child_key) {
+                    ea["element_id"] = serde_json::json!("approve"); // the child is `review`
+                    break;
+                }
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "an ElementActivating for a different element reusing the child's key must collide: {err}"
+    );
+
+    // (2) A parked `ParallelJoinOpened` reusing the child's key.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        events.push(serde_json::json!({"ParallelJoinOpened":{
+            "instance_key":10,
+            "element_instance_key":child_key,
+            "element_id":"join",
+            "scope":0
+        }}));
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a parked ParallelJoinOpened reusing the child's key must collide: {err}"
+    );
+}
+
+/// #1528 (review): an `unbalanced` declaration must not ratify a WRONG
+/// one-sided event. A surplus `UserTaskCreated` whose owning
+/// `element_instance_key` its own side never minted (a wrong-child /
+/// wrong-owner event) fails even under a valid declaration; and a corrupted
+/// (undecodable) surplus event fails too.
+#[test]
+fn prev_release_gate_unbalanced_rejects_wrong_one_sided_events() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+
+    // A wrong-owner surplus: point the first `UserTaskCreated`'s
+    // `element_instance_key` at a key the head side never mints.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(utc) = e.get_mut("UserTaskCreated") {
+                utc["element_instance_key"] = serde_json::json!(9_999_999u64);
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("never minted") || err.contains("UNDECLARED extra divergence"),
+        "a wrong-owner surplus UserTaskCreated must fail: {err}"
+    );
+
+    // A corrupted surplus: mangle a `UserTaskCreated` so it no longer decodes
+    // under the head `Event` type (a non-object body).
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if e.get("UserTaskCreated").is_some() {
+                *e = serde_json::json!({"UserTaskCreated": "corrupted"});
+                break;
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("does not decode") || err.contains("UNDECLARED extra divergence"),
+        "a corrupted surplus UserTaskCreated must fail: {err}"
+    );
+}
+
+/// [`head_records`], computed once per test binary (a full corpus run).
+fn cached_head_records() -> &'static [serde_json::Value] {
+    static CACHE: std::sync::OnceLock<Vec<serde_json::Value>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(head_records)
+}
+
+/// A real `UserTaskCreated` event from the corpus (so it decodes under the
+/// head `Event` type), re-keyed to `user_task_key` / `owner`.
+fn user_task_created(user_task_key: u64, owner: u64, instance: u64) -> serde_json::Value {
+    let mut e = cached_head_records()
+        .iter()
+        .filter_map(|r| r.get("events")?.as_array().cloned())
+        .flatten()
+        .find(|e| e.get("UserTaskCreated").is_some())
+        .expect("the corpus emits UserTaskCreated");
+    let body = e.get_mut("UserTaskCreated").expect("body");
+    body["user_task_key"] = serde_json::json!(user_task_key);
+    body["element_instance_key"] = serde_json::json!(owner);
+    body["element_id"] = serde_json::json!("review");
+    if body.get("instance_key").is_some() {
+        body["instance_key"] = serde_json::json!(instance);
+    }
+    e
+}
+
+/// A self-contained MI create entry: instance 10, body `body` activating one
+/// child `child`, plus `extra` events.
+fn mi_entry(body: u64, child: u64, extra: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut events = vec![
+        serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+        serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":body,"instance_key":10,"scope":0}}),
+        serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":child,"instance_key":10,"scope":body}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":body,"child_key":child,"index":0,"instance_key":10,"local_variables":{}}}),
+    ];
+    events.extend(extra);
+    serde_json::json!({"i": 0, "events": events})
+}
+
+/// An MI create entry like [`mi_entry`] but with TWO children `c1`, `c2`.
+fn mi_entry2(body: u64, c1: u64, c2: u64, extra: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut e = mi_entry(body, c1, vec![]);
+    let events = e["events"].as_array_mut().expect("events");
+    events.push(serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":c2,"instance_key":10,"scope":body}}));
+    events.push(serde_json::json!({"MultiInstanceChildActivated":{"body_key":body,"child_key":c2,"index":1,"instance_key":10,"local_variables":{}}}));
+    events.extend(extra);
+    e
+}
+
+/// A real state checkpoint at position `i` with snapshot `format`.
+fn state_at(i: u64, format: u64) -> serde_json::Value {
+    let mut s = cached_head_records()
+        .iter()
+        .find(|r| r.get("state").is_some())
+        .cloned()
+        .expect("a state checkpoint");
+    s["i"] = serde_json::json!(i);
+    s["format"] = serde_json::json!(format);
+    s
+}
+
+/// `cross_release_checked` over a single-scenario (`s`) synthetic run.
+fn checked_s(
+    head: &[serde_json::Value],
+    prev: &[serde_json::Value],
+    expected: serde_json::Value,
+) -> Result<compare::CheckedReport, String> {
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": expected,
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let n = head.iter().filter(|r| r.get("state").is_none()).count();
+    let scenarios = vec!["s".to_string(); n];
+    let allowlist = compare::parse_allowlist(&allow.to_string())?;
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(head, prev, &ctx)
+}
+
+/// #1528 (review): an MI body activated in the SAME entry as its child, with
+/// both keys differing across releases, reconciles under `remint_keys` — the
+/// body's identity is registered before the child's is derived from it.
+#[test]
+fn prev_release_gate_same_entry_body_and_child_remint() {
+    let head = vec![mi_entry(11, 12, vec![]), state_at(0, 3)];
+    let prev = vec![mi_entry(21, 22, vec![]), state_at(0, 3)];
+    checked_s(&head, &prev, serde_json::json!({"remint_keys": true}))
+        .expect("a same-entry body+child remint reconciles");
+}
+
+/// #1528 (review): the one-sided surplus owner check runs with AND without
+/// `remint_keys`, and whatever the snapshot formats — a surplus
+/// `UserTaskCreated` naming an unminted owner always fails.
+#[test]
+fn prev_release_gate_unbalanced_owner_check_is_unconditional() {
+    let bad = || user_task_created(500, 9_999_999, 10);
+    let good = || user_task_created(500, 12, 10);
+    let expected = |remint: bool| {
+        serde_json::json!({
+            "remint_keys": remint,
+            "only_in_head": [{"variant": "UserTaskCreated"}],
+            "unbalanced": {"reason": "a real reason"}
+        })
+    };
+    for remint in [false, true] {
+        for prev_format in [3, 2] {
+            let prev = vec![mi_entry(11, 12, vec![]), state_at(0, prev_format)];
+            let ok_head = vec![mi_entry(11, 12, vec![good()]), state_at(0, 3)];
+            checked_s(&ok_head, &prev, expected(remint)).unwrap_or_else(|e| {
+                panic!("remint={remint} format={prev_format}: a valid surplus passes: {e}")
+            });
+            let bad_head = vec![mi_entry(11, 12, vec![bad()]), state_at(0, 3)];
+            let err = checked_s(&bad_head, &prev, expected(remint)).unwrap_err();
+            assert!(
+                err.contains("never minted"),
+                "remint={remint} format={prev_format}: a wrong-owner surplus must fail: {err}"
+            );
+        }
+    }
+}
+
+/// The `unbalanced` divergence of [`prev_release_gate_same_format_ratified_state_change`].
+fn unbalanced_expected() -> serde_json::Value {
+    serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskCreated"}],
+        "unbalanced": {"reason": "a real reason"}
+    })
+}
+
+/// Head/prev streams: a plain entry 0 + checkpoint, then the ratified
+/// divergent entry 1 (head adds a task) + `head_after` / `prev_after`.
+fn boundary_streams(
+    head_after: serde_json::Value,
+    prev_after: serde_json::Value,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let at = |mut e: serde_json::Value, i: u64| {
+        e["i"] = serde_json::json!(i);
+        e
+    };
+    let head = vec![
+        at(mi_entry(11, 12, vec![]), 0),
+        state_at(0, 3),
+        at(mi_entry(31, 32, vec![user_task_created(500, 32, 10)]), 1),
+        head_after,
+    ];
+    let prev = vec![
+        at(mi_entry(11, 12, vec![]), 0),
+        state_at(0, 3),
+        at(mi_entry(31, 32, vec![]), 1),
+        prev_after,
+    ];
+    (head, prev)
+}
+
+/// #1528 (review): with the SAME snapshot format on both sides, checkpoints
+/// past a ratified upgrade-boundary `unbalanced` divergence are compared
+/// key-insensitively with the ratified instances excluded — a key shift
+/// passes, but an UNRELATED state change, an undecodable checkpoint, or a
+/// difference before the divergence still fails.
+#[test]
+fn prev_release_gate_same_format_ratified_state_change() {
+    // A shifted key allocator (every later key moves) is not a regression.
+    let mut shifted = state_at(1, 3);
+    shifted["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let (head, prev) = boundary_streams(shifted, state_at(1, 3));
+    let report = checked_s(&head, &prev, unbalanced_expected())
+        .expect("a key shift after the divergent entry passes");
+    assert_eq!(report.base.states_compared, 1);
+    assert_eq!(report.base.states_compared_outside_ratified_boundary, 1);
+
+    // An unrelated post-boundary state change is still caught.
+    let mut unrelated = state_at(1, 3);
+    let flag = unrelated["state"]["state"]["lenient_completion"]
+        .as_bool()
+        .expect("lenient_completion in the snapshot");
+    unrelated["state"]["state"]["lenient_completion"] = serde_json::json!(!flag);
+    let (head, prev) = boundary_streams(unrelated, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("outside the ratified"), "{err}");
+
+    // A malformed post-boundary checkpoint still fails to decode.
+    let mut malformed = state_at(1, 3);
+    malformed["state"] = serde_json::Value::Null;
+    let (head, prev) = boundary_streams(malformed, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("does not decode"), "{err}");
+
+    // A state difference BEFORE the divergent entry is compared strictly.
+    let (mut head, prev) = boundary_streams(state_at(1, 3), state_at(1, 3));
+    head[1]["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("durable state diverges at entry 0"), "{err}");
+}
+
+/// #1528 (review): an `unbalanced` marker is validated even when the matched
+/// events balance, and a balanced scenario never enables the boundary
+/// projection (its later checkpoints are still compared strictly).
+#[test]
+fn prev_release_gate_unbalanced_marker_on_balanced_pattern() {
+    let head = vec![mi_entry(11, 12, vec![]), state_at(0, 3)];
+    let prev = vec![mi_entry(21, 22, vec![]), state_at(0, 3)];
+    let err = checked_s(
+        &head,
+        &prev,
+        serde_json::json!({"remint_keys": true, "unbalanced": {"reason": ""}}),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-empty reason"), "{err}");
+
+    let mut shifted = state_at(0, 3);
+    shifted["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let head = vec![mi_entry(11, 12, vec![]), shifted];
+    let err = checked_s(
+        &head,
+        &prev,
+        serde_json::json!({"remint_keys": true, "unbalanced": {"reason": "real"}}),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("durable state diverges at entry 0 (same"),
+        "a balanced scenario compares strictly: {err}"
+    );
+}
+
+/// #1528 (review): the surplus `UserTaskCreated` must be exactly one per
+/// activated MI child — a duplicate owner, a task on another valid (minted)
+/// element instance, or a child without its task all fail.
+#[test]
+fn prev_release_gate_unbalanced_one_task_per_child() {
+    let expected = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskCreated"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let prev = vec![mi_entry2(11, 12, 13, vec![]), state_at(0, 2)];
+    let run = |tasks: Vec<serde_json::Value>| {
+        checked_s(
+            &[mi_entry2(11, 12, 13, tasks), state_at(0, 3)],
+            &prev,
+            expected.clone(),
+        )
+    };
+    run(vec![
+        user_task_created(500, 12, 10),
+        user_task_created(501, 13, 10),
+    ])
+    .expect("one task per child passes");
+    for (case, tasks) in [
+        (
+            "duplicate owner",
+            vec![
+                user_task_created(500, 12, 10),
+                user_task_created(501, 12, 10),
+            ],
+        ),
+        (
+            "wrong valid owner",
+            vec![
+                user_task_created(500, 12, 10),
+                user_task_created(501, 11, 10),
+            ],
+        ),
+        ("missing child", vec![user_task_created(500, 12, 10)]),
+    ] {
+        let err = run(tasks).unwrap_err();
+        assert!(
+            err.contains("one task per") || err.contains("share the owner"),
+            "{case} must fail: {err}"
+        );
+    }
+}
+
+/// #1528 (review): the boundary projection must be schema-aware, not
+/// shape-heuristic. (a) A numeric-keyed map that is NOT a schema entity map
+/// (an instance's `scope_parents`) keeps its key→value associations, so
+/// swapping two of its values in an UNRELATED instance fails. (b) A numeric
+/// business-variable NAME is data, not a key: renaming `"1"` to `"2"` fails.
+/// (c) A nested FEEL context entry named `next_local` is data: only the
+/// SNAPSHOT ROOT's key allocator is dropped, so a changed nested
+/// `next_local` fails.
+#[test]
+fn prev_release_gate_boundary_projection_is_schema_aware() {
+    let unrelated = |mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut s = state_at(1, 3);
+        let instances = s["state"]["state"]["instances"]
+            .as_object_mut()
+            .expect("instances map");
+        let key = instances
+            .keys()
+            .find(|k| k.parse::<u64>().ok() != Some(10))
+            .cloned()
+            .expect("an instance other than the ratified 10");
+        mutate(&mut instances[&key]);
+        s
+    };
+
+    // (a) swap two scope-parent values inside an unrelated instance.
+    let swapped = unrelated(&|inst| {
+        let parents = inst["scope_parents"]
+            .as_object_mut()
+            .expect("scope_parents");
+        parents.insert("91".to_owned(), serde_json::json!(92u64));
+        parents.insert("92".to_owned(), serde_json::json!(91u64));
+        let tmp = parents["91"].clone();
+        *parents.get_mut("91").unwrap() = parents["92"].clone();
+        *parents.get_mut("92").unwrap() = tmp;
+    });
+    let (head, prev) = boundary_streams(swapped, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "a swapped scope_parents entry in an unrelated instance must fail: {err}"
+    );
+
+    // (b) rename a numeric business-variable name ("1" -> "2").
+    let renamed = unrelated(&|inst| {
+        let vars = inst["variables"].as_object_mut().expect("variables");
+        vars.insert("1".to_owned(), serde_json::json!({"Int": 7}));
+        let value = vars.remove("1").unwrap();
+        vars.insert("2".to_owned(), value);
+    });
+    let (head, prev) = boundary_streams(renamed, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "renaming a numeric business-variable name must fail: {err}"
+    );
+
+    // (c) a nested FEEL context entry named `next_local` is data.
+    let nested = unrelated(&|inst| {
+        let vars = inst["variables"].as_object_mut().expect("variables");
+        vars.insert(
+            "ctx".to_owned(),
+            serde_json::json!({"Map": {"next_local": {"Int": 1}}}),
+        );
+        vars["ctx"]["Map"]["next_local"] = serde_json::json!({"Int": 2});
+    });
+    let (head, prev) = boundary_streams(nested, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "a nested `next_local` data entry must not be erased: {err}"
+    );
+
+    // Sanity: the ROOT allocator difference still passes (it is the one
+    // field the projection drops).
+    let mut shifted = state_at(1, 3);
+    shifted["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let (head, prev) = boundary_streams(shifted, state_at(1, 3));
+    checked_s(&head, &prev, unbalanced_expected())
+        .expect("the root key allocator difference still passes");
+}
+
+/// #1528 (review): the boundary projection canonicalizes key REFERENCES to
+/// their entity identities, not to one common placeholder — an unrelated
+/// retained job whose `element_instance_key` points at the WRONG active
+/// element must still fail after the boundary.
+#[test]
+fn prev_release_gate_boundary_projection_preserves_reference_identity() {
+    let mut wrong_owner = state_at(1, 3);
+    let elements: Vec<u64> = wrong_owner["state"]["state"]["instances"]
+        .as_object()
+        .expect("instances")
+        .values()
+        .filter(|i| i["key"].as_u64() != Some(10))
+        .flat_map(|i| {
+            i["active"].as_object().into_iter().flat_map(|m| {
+                m.keys()
+                    .filter_map(|k| k.parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let job = wrong_owner["state"]["state"]["jobs"]
+        .as_object_mut()
+        .expect("jobs map")
+        .values_mut()
+        .find(|j| j["instance_key"].as_u64() != Some(10))
+        .expect("a retained job of an unrelated instance");
+    let wrong = elements
+        .iter()
+        .copied()
+        .find(|e| Some(*e) != job["element_instance_key"].as_u64())
+        .expect("a second active element to mis-point at");
+    job["element_instance_key"] = serde_json::json!(wrong);
+    let (head, prev) = boundary_streams(wrong_owner, state_at(1, 3));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "a mis-owned retained job after the boundary must fail: {err}"
+    );
+}
+
+/// #1528 (review): excluding the ratified instance must also normalize its
+/// DERIVED contributions (`inflight_by_process`, `terminal_epoch`,
+/// `recently_terminated`) and every key collection (`jobs_by_instance`,
+/// `activatable_jobs`, `activated_jobs`): a checkpoint from each side's real
+/// behaviour compares equal through the projection, while an unrelated
+/// derived-counter change still fails.
+#[test]
+fn prev_release_gate_boundary_projection_normalizes_derived_state() {
+    // Add the ratified instance 10 (parked on its user task) to the
+    // post-boundary checkpoint, with one retained job of an UNRELATED
+    // instance reminted to a post-boundary key (raw keys differ past the
+    // boundary, so the remint must reconcile through the projection).
+    let with_ratified = || {
+        let mut s = state_at(1, 3);
+        let state = s["state"]["state"].as_object_mut().expect("state");
+        let template = state["instances"]
+            .as_object()
+            .expect("instances")
+            .values()
+            .next()
+            .expect("a template instance")
+            .clone();
+        let mut inst = template;
+        inst["key"] = serde_json::json!(10u64);
+        inst["process_id"] = serde_json::json!("p");
+        inst["state"] = serde_json::json!("Active");
+        state["instances"]
+            .as_object_mut()
+            .expect("instances")
+            .insert("10".to_owned(), inst);
+        // The unrelated job (whose instance is "30") reminted: key 33 -> 133.
+        let jobs = state["jobs"].as_object_mut().expect("jobs");
+        let job = jobs.remove("33").expect("job 33");
+        jobs.insert("133".to_owned(), job);
+        let set = state["jobs_by_instance"]["30"]
+            .as_array_mut()
+            .expect("jobs_by_instance[30]");
+        assert_eq!(set.len(), 1, "one job under instance 30");
+        set[0] = serde_json::json!(133u64);
+        let slot = state["activatable_jobs"]["payment"]
+            .as_array_mut()
+            .expect("activatable_jobs[payment]");
+        let pos = slot
+            .iter()
+            .position(|e| e[1].as_u64() == Some(33))
+            .expect("job 33 in the activatable index");
+        slot[pos][1] = serde_json::json!(133u64);
+        s
+    };
+
+    // The prev behaviour completes the ratified instance at the boundary:
+    // its process's inflight count drops, `terminal_epoch` advances, and the
+    // instance joins `recently_terminated`; head's instance stays parked.
+    // Both are the DECLARED divergence — the projection must reconcile them.
+    let mut prev_after = with_ratified();
+    {
+        let state = prev_after["state"]["state"].as_object_mut().expect("state");
+        state["inflight_by_process"]["p"] = serde_json::json!(0u64);
+        let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch");
+        state["terminal_epoch"] = serde_json::json!(epoch + 1);
+        state["recently_terminated"]
+            .as_array_mut()
+            .expect("recently_terminated")
+            .push(serde_json::json!(10u64));
+    }
+    let (head, prev) = boundary_streams(with_ratified(), prev_after);
+    checked_s(&head, &prev, unbalanced_expected()).unwrap_or_else(|e| {
+        panic!("the declared completion of the ratified instance reconciles: {e}")
+    });
+
+    // But an UNRELATED derived-counter change (another process's inflight
+    // count) is still caught.
+    let mut unrelated = with_ratified();
+    let counts = unrelated["state"]["state"]["inflight_by_process"]
+        .as_object_mut()
+        .expect("inflight_by_process");
+    let (other, base) = counts
+        .iter()
+        .find(|(k, _)| **k != "p")
+        .map(|(k, v)| (k.clone(), v.as_u64().expect("count")))
+        .expect("a second process count");
+    counts[&other] = serde_json::json!(base + 1);
+    let (head, prev) = boundary_streams(unrelated, with_ratified());
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "an unrelated inflight count change must fail: {err}"
+    );
+}
+
+/// #1528 (review): the one-task-per-child validation must run even when the
+/// side emits NO surplus `UserTaskCreated` at all — every activated MI child
+/// of an element the declaration's `only_in_*` patterns name must carry its
+/// task, so an all-tasks-missing stream fails.
+#[test]
+fn prev_release_gate_unbalanced_all_tasks_missing_fails() {
+    let expected = serde_json::json!({
+        "reorder": true,
+        "only_in_head": [
+            {"variant": "UserTaskCreated", "element_id": "review"},
+            {"variant": "VariablesUpdated"}
+        ],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let prev = vec![mi_entry2(11, 12, 13, vec![]), state_at(0, 2)];
+    // Head activates the same two children but emits NO UserTaskCreated. It
+    // adds a declared `VariablesUpdated` so the entry diverges (the declared
+    // patterns are unbalanced) and the scenario reaches the surplus
+    // validation; the all-tasks-missing check is what must fail.
+    let head_entry = mi_entry2(
+        11,
+        12,
+        13,
+        vec![
+            serde_json::json!({"VariablesUpdated":{"instance_key":10,"scope":11,"variables":{"x":{"Int":1}}}}),
+        ],
+    );
+    let head = vec![head_entry, state_at(0, 3)];
+    let err = checked_s(&head, &prev, expected).unwrap_err();
+    assert!(
+        err.contains("one task per activated child"),
+        "an all-tasks-missing surplus must fail: {err}"
+    );
+}
+
 /// Drift guard: every unit variant declared anywhere in engine-core/src is
 /// covered by `compare::unit_variants` (derived from `ENGINE_TYPE_SOURCES`).
 #[test]
@@ -1617,4 +2788,55 @@ fn unit_variants_cover_every_engine_unit_variant() {
         missing.is_empty(),
         "unit variants not covered by ENGINE_TYPE_SOURCES (add their file): {missing:?}"
     );
+}
+
+/// #1528 (review): the MI BODY's generic-activation mint bypass covers only
+/// the body's OWN activation (same instance, same element). An activation of
+/// a DIFFERENT element reusing the body's key, or a job reusing it, is a
+/// collision and fails closed.
+#[test]
+fn prev_release_gate_rejects_mi_body_key_reuse() {
+    let other_element = |shift: u64| {
+        let mut t = nested_tree(shift);
+        t.push(serde_json::json!({"ElementActivating":{"element_id":"zzz","element_instance_key":11 + shift,"instance_key":10,"scope":0}}));
+        t
+    };
+    let err = nested_gate(other_element(0), other_element(100)).unwrap_err();
+    assert!(err.contains("minted for two entities"), "{err}");
+
+    let job_first = |shift: u64| {
+        let mut t = nested_tree(shift);
+        t.insert(1, serde_json::json!({"JobCreated":{"job_key":11 + shift,"element_instance_key":12 + shift,"element_id":"outer","job_type":"w","instance_key":10}}));
+        t
+    };
+    let err = nested_gate(job_first(0), job_first(100)).unwrap_err();
+    assert!(err.contains("minted for two entities"), "{err}");
+}
+
+/// #1528 (review): a permitted reorder may put a historical scope-less
+/// `ElementActivating` AFTER the body's `ElementActivated` (which carries the
+/// real parent scope). The authoritative scope must win regardless of order,
+/// so a mixed-version nested stream still reconciles under reorder + remint.
+#[test]
+fn prev_release_gate_nested_mi_body_scope_is_order_independent() {
+    let mixed = |shift: u64| {
+        let mut t = nested_tree(shift);
+        // Inner body 14 (scope 12): add its ElementActivated (authoritative
+        // scope) and move a scope-less historical ElementActivating after it.
+        let pos = t
+            .iter()
+            .position(|e| e["ElementActivating"]["element_instance_key"] == 14 + shift)
+            .unwrap();
+        t[pos] = serde_json::json!({"ElementActivated":{"element_id":"inner","element_instance_key":14 + shift,"instance_key":10,"scope":12 + shift}});
+        t.insert(pos + 1, serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":14 + shift,"instance_key":10}}));
+        t
+    };
+    let mut reordered = mixed(100);
+    // Same tree on the other side, with the scope-less record FIRST.
+    let pos = reordered
+        .iter()
+        .position(|e| e["ElementActivated"]["element_instance_key"] == 114)
+        .unwrap();
+    reordered.swap(pos, pos + 1);
+    nested_gate(mixed(0), reordered).expect("the authoritative scope wins regardless of order");
 }

@@ -65,6 +65,256 @@ fn canonical_state(record: &Json, side: &str, erasable: &Vocab) -> Result<Json, 
     Ok(v)
 }
 
+/// The scope of a ratified upgrade-boundary `unbalanced` divergence for the
+/// same-format state comparison: the first divergent entry, and each side's
+/// process instances that the divergent entries touch.
+#[derive(Debug, Default)]
+struct RatifiedBoundary {
+    from: Option<u64>,
+    head_instances: BTreeSet<u64>,
+    prev_instances: BTreeSet<u64>,
+}
+
+/// Whether a field name holds an entity key (or a list of them).
+fn is_key_field(name: &str) -> bool {
+    name == "key" || name == "scope" || name.ends_with("_key") || name.ends_with("_keys")
+}
+
+/// The schema-known numeric-keyed entity maps of [`EngineSnapshot`]'s `State`
+/// (every `BTreeMap<Key, _>` field it declares). Only these maps are
+/// canonicalized as key-indexed entity collections; any OTHER numeric-keyed
+/// object (an instance's `scope_parents`, a business variable name, a FEEL
+/// context) is DATA whose key→value associations are preserved.
+fn is_entity_map_field(name: &str) -> bool {
+    matches!(
+        name,
+        "process_versions"
+            | "instances"
+            | "jobs"
+            | "settled_jobs"
+            | "user_tasks"
+            | "incidents"
+            | "timers"
+            | "message_subscriptions"
+            | "signal_subscriptions"
+            | "conditional_subscriptions"
+            | "start_timers"
+            | "decision_requirements_versions"
+            | "decision_versions"
+            | "form_versions"
+            | "resource_versions"
+            | "variables_lost_quarantined"
+            | "jobs_by_instance"
+    )
+}
+
+/// The derived counters/indices of [`State`] an excluded (ratified) instance
+/// contributes to. Past the boundary that instance's own contribution is the
+/// declared divergence, so the projection normalizes it: the per-process
+/// counts drop the excluded instance's process entries, the terminal epoch
+/// and the recently-terminated ring drop the excluded instance's terminal
+/// transition, and the key collections (`jobs_by_instance`,
+/// `activatable_jobs`, `activated_jobs`) drop the excluded instance's keys.
+/// Every OTHER process/instance contribution is still compared exactly.
+fn is_derived_counter_field(name: &str) -> bool {
+    matches!(
+        name,
+        "inflight_by_process" | "created_by_process" | "terminal_epoch" | "recently_terminated"
+    )
+}
+
+/// The key-insensitive projection of a canonical snapshot past a ratified
+/// upgrade-boundary divergence (#1528 review). The divergence shifts every
+/// later minted key and changes ITS OWN instances' state by declaration, so
+/// the projection (a) drops every record owned by a ratified instance
+/// (`excluded`: a keyed entity-map entry under such a key, or an object
+/// naming it as `instance_key` / `process_instance_key`), (b) canonicalizes
+/// every key reference to its entity identity (never one common placeholder,
+/// so a mis-owned retained entity still diverges) and every schema-known
+/// key-indexed entity map to the sorted multiset of its projected values,
+/// (c) drops the snapshot root's key allocator (`next_local`) — and ONLY the
+/// root's, so a nested FEEL context entry of the same name is preserved as
+/// data — and (d) normalizes the excluded instance's derived contributions
+/// (`inflight_by_process`, `terminal_epoch`, `recently_terminated`, and the
+/// `jobs_by_instance` / `activatable_jobs` / `activated_jobs` key
+/// collections). Every other field — flags, variables, counts of
+/// jobs/tasks/timers of every other instance, and every non-entity
+/// numeric-keyed map's key→value associations — is still compared, so an
+/// unrelated post-boundary state regression fails.
+///
+/// `path` is the dot-separated field path from the snapshot root, used to
+/// scope the allocator drop to the root and the entity-map canonicalization
+/// to schema-known fields. `entity_map` is true when `value` is the VALUE of
+/// a schema-known entity-map field (so its numeric keys are entity keys).
+fn boundary_projection(
+    value: &Json,
+    excluded: &BTreeSet<u64>,
+    path: &str,
+    entity_map: bool,
+) -> Option<Json> {
+    match value {
+        Json::Object(map) => {
+            for owner in ["instance_key", "process_instance_key"] {
+                if map
+                    .get(owner)
+                    .and_then(Json::as_u64)
+                    .is_some_and(|k| excluded.contains(&k))
+                {
+                    return None;
+                }
+            }
+            // A schema-known entity map: canonicalize each entry's key to the
+            // entity identity and drop the ratified instance's entries, then
+            // sort the projected values into a multiset (key-insensitive).
+            if entity_map {
+                let mut items: Vec<Json> = map
+                    .iter()
+                    .filter(|(k, _)| k.parse::<u64>().is_ok_and(|k| !excluded.contains(&k)))
+                    .filter_map(|(_, v)| boundary_projection(v, excluded, path, false))
+                    .collect();
+                items.sort_by_key(|v| v.to_string());
+                return Some(Json::Array(items));
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                // Drop the key allocator ONLY at the snapshot root (`$.next_local`),
+                // never a nested data entry of the same name.
+                if path.is_empty() && k == "next_local" {
+                    continue;
+                }
+                let child_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                let projected = if is_key_field(k) {
+                    // A key reference: canonicalize to the entity identity so a
+                    // mis-owned reference still diverges, never a placeholder.
+                    key_identity(v, excluded)
+                } else if is_derived_counter_field(k) {
+                    derived_counter_projection(k, v, excluded, map)
+                } else if is_entity_map_field(k) {
+                    match boundary_projection(v, excluded, &child_path, true) {
+                        Some(p) => p,
+                        None => continue,
+                    }
+                } else {
+                    match boundary_projection(v, excluded, &child_path, false) {
+                        Some(p) => p,
+                        None => continue,
+                    }
+                };
+                out.insert(k.clone(), projected);
+            }
+            Some(Json::Object(out))
+        }
+        Json::Array(items) => Some(Json::Array(
+            items
+                .iter()
+                .filter_map(|v| boundary_projection(v, excluded, path, false))
+                .collect(),
+        )),
+        other => Some(other.clone()),
+    }
+}
+
+/// A key value (or list of keys) with each raw key replaced by the identity
+/// of the entity it references. Unlike a common placeholder, the identity
+/// preserves WHICH entity is referenced, so a reference re-pointed at the
+/// wrong entity (an ownership regression) still diverges. A reference to an
+/// excluded (ratified) instance's own key is dropped (the entity is gone
+/// from the projection), and a reference to a key never minted keeps a
+/// distinct orphan token.
+fn key_identity(v: &Json, excluded: &BTreeSet<u64>) -> Json {
+    match v {
+        Json::Number(n) if n.is_u64() => {
+            let k = n.as_u64().unwrap_or(0);
+            if excluded.contains(&k) {
+                Json::Null
+            } else {
+                Json::String(format!("#key:{k}"))
+            }
+        }
+        Json::Array(items) => {
+            Json::Array(items.iter().map(|i| key_identity(i, excluded)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Normalizes one derived counter/index field for the excluded (ratified)
+/// instance's contribution. `parent` is the enclosing `State` object (so the
+/// per-process counts can find the excluded instance's process id). The
+/// per-process counts drop the excluded instance's process entry (its count
+/// is the declared divergence); `terminal_epoch` and `recently_terminated`
+/// drop the excluded instance's terminal transition; the key collections
+/// drop the excluded instance's keys. Every other contribution is preserved
+/// exactly.
+fn derived_counter_projection(
+    name: &str,
+    v: &Json,
+    excluded: &BTreeSet<u64>,
+    parent: &serde_json::Map<String, Json>,
+) -> Json {
+    match name {
+        // `recently_terminated`: drop the excluded instance's keys.
+        "recently_terminated" => match v {
+            Json::Array(items) => Json::Array(
+                items
+                    .iter()
+                    .filter(|i| i.as_u64().is_none_or(|k| !excluded.contains(&k)))
+                    .cloned()
+                    .collect(),
+            ),
+            other => other.clone(),
+        },
+        // The per-process counts: drop the excluded instance's OWN process
+        // entry (its count is the declared divergence — the head instance
+        // stays parked, the prev one completes). Every OTHER process's count
+        // is still compared exactly.
+        "inflight_by_process" | "created_by_process" => {
+            let excluded_pids: BTreeSet<String> = excluded
+                .iter()
+                .filter_map(|k| {
+                    parent
+                        .get("instances")
+                        .and_then(Json::as_object)
+                        .and_then(|i| i.get(&k.to_string()))
+                        .and_then(|inst| inst.get("process_id"))
+                        .and_then(Json::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            match v {
+                Json::Object(map) => {
+                    let mut out = map.clone();
+                    for pid in &excluded_pids {
+                        out.remove(pid);
+                    }
+                    Json::Object(out)
+                }
+                other => other.clone(),
+            }
+        }
+        // `terminal_epoch`: the excluded instance's terminal transition
+        // advances it on the completing side only. The projection cannot
+        // isolate that contribution key-insensitively, so it is dropped — but
+        // ONLY when there IS an excluded (ratified) instance whose transition
+        // is the declared divergence; with none, the epoch is compared exactly
+        // (an unrelated terminal transition still fails). The per-instance
+        // `terminated_epoch` and the `recently_terminated` ring still record
+        // WHICH instances terminated, and are compared.
+        "terminal_epoch" => {
+            if excluded.is_empty() {
+                v.clone()
+            } else {
+                Json::Null
+            }
+        }
+        _ => v.clone(),
+    }
+}
+
 /// Compares state checkpoints (through the head `EngineSnapshot` type) when
 /// both builds share a `SNAPSHOT_FORMAT_VERSION`, erasing `erasable` fields.
 fn compare_states(
@@ -72,6 +322,7 @@ fn compare_states(
     prev_states: &[&Json],
     entries: usize,
     erasable: &Vocab,
+    boundary: &RatifiedBoundary,
 ) -> Result<CrossReleaseReport, String> {
     if head_states.len() != prev_states.len() {
         return Err(format!(
@@ -83,7 +334,7 @@ fn compare_states(
     if head_states.is_empty() {
         return Err("no state checkpoints to compare (run with --state-every)".into());
     }
-    let (mut compared, mut skipped) = (0, 0);
+    let (mut compared, mut skipped, mut projected) = (0, 0, 0);
     for (h, p) in head_states.iter().zip(prev_states.iter()) {
         let at = h.get("i").cloned().unwrap_or(Json::Null);
         if p.get("i") != h.get("i") {
@@ -98,7 +349,32 @@ fn compare_states(
             skipped += 1;
             continue;
         }
-        if canonical_state(h, "head", erasable)? != canonical_state(p, "prev", erasable)? {
+        // Always decode both checkpoints: a snapshot that no longer decodes
+        // fails whatever the comparison mode (#1528 review).
+        let (hs, ps) = (
+            canonical_state(h, "head", erasable)?,
+            canonical_state(p, "prev", erasable)?,
+        );
+        // Past a ratified upgrade-boundary `unbalanced` divergence the raw
+        // snapshots cannot agree (its declared state change, and every later
+        // minted key shifts), so they are compared through the
+        // key-insensitive projection that excludes only the ratified
+        // instances — every other state is still checked (#1528 review).
+        if let (Some(from), Some(i)) = (boundary.from, at.as_u64()) {
+            if i >= from {
+                if boundary_projection(&hs, &boundary.head_instances, "", false)
+                    != boundary_projection(&ps, &boundary.prev_instances, "", false)
+                {
+                    return Err(format!(
+                        "durable state diverges at entry {at} outside the ratified \
+                         upgrade-boundary instances (same snapshot format {hf:?})"
+                    ));
+                }
+                projected += 1;
+                continue;
+            }
+        }
+        if hs != ps {
             return Err(format!(
                 "durable state diverges at entry {at} (same snapshot format {hf:?})"
             ));
@@ -109,6 +385,7 @@ fn compare_states(
         entries,
         states_compared: compared,
         states_skipped_format_bump: skipped,
+        states_compared_outside_ratified_boundary: projected,
     })
 }
 
@@ -118,6 +395,10 @@ pub struct CrossReleaseReport {
     pub entries: usize,
     pub states_compared: usize,
     pub states_skipped_format_bump: usize,
+    /// Checkpoints at or after the first entry of a ratified upgrade-boundary
+    /// `unbalanced` divergence, compared key-insensitively with the ratified
+    /// instances excluded (see `boundary_projection`).
+    pub states_compared_outside_ratified_boundary: usize,
 }
 
 // ---- Previous-release gate: golden-derived additive set (#1698) ----------
@@ -596,7 +877,10 @@ pub struct ObservationalVariant {
 /// arriving token's), so the matched events reconcile at SCENARIO level — the
 /// multiset matched on one side must equal the multiset matched on the other
 /// (same scenario, same element, same instance after the ratified remint). An
-/// unbalanced pattern (removed but never re-added, or the reverse) fails.
+/// unbalanced pattern (removed but never re-added, or the reverse) fails —
+/// unless the divergence carries an explicit [`Unbalanced`] declaration
+/// (#1528), the scoped ratification for an upgrade-boundary behavioural
+/// change whose new events have NO counterpart on the previous release.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
@@ -650,6 +934,52 @@ pub struct Expected {
     /// events are rewritten — the per-entry strict comparison is unaffected.
     #[serde(default)]
     pub variant_substitutions: Vec<VariantSubstitution>,
+    /// The EXACT number of head-side `only_in_head`-matched events whose raw
+    /// variant is a substitution's `head` variant (#1528 review). Because the
+    /// substitution projects both lifecycle kinds onto one form, the balance
+    /// alone cannot tell a legitimately substituted event from a REGRESSION
+    /// back to the `prev` kind (e.g. a cancelled child completing again): both
+    /// balance. Pinning the head-form count fails closed on any such
+    /// regression. Required whenever `variant_substitutions` is non-empty.
+    #[serde(default)]
+    pub substituted_head_events: Option<usize>,
+    /// The explicit ratification for a scenario whose declared
+    /// `only_in_prev` / `only_in_head` patterns do NOT balance (#1528): the
+    /// behavioural change emits (or stops emitting) events that have no
+    /// counterpart on the other build at all — e.g. an MI user task's
+    /// `UserTaskCreated` per child, which the previous release never emits
+    /// because it completed each child at once. `None` (the default) keeps
+    /// the strict balance requirement. Because an unbalanced declaration
+    /// weakens the lost-event guard, it is valid only on a divergence that
+    /// also names its issue and a non-empty reason (see
+    /// [`Unbalanced::valid`]).
+    #[serde(default)]
+    pub unbalanced: Option<Unbalanced>,
+}
+
+/// The scoped ratification of an UNBALANCED scenario divergence (#1528):
+/// after the declared `only_in_prev` / `only_in_head` events are dropped, the
+/// two sides' matched multisets may differ — the change adds or removes
+/// events outright rather than moving them. Everything outside the declared
+/// patterns is still compared strictly per entry, and the declaration is
+/// scenario-scoped (the `Divergence` carries it), so it cannot mask a
+/// divergence anywhere else.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unbalanced {
+    /// Why the imbalance is the intended new behaviour — must name the
+    /// behavioural change (e.g. "Zeebe parity: an MI userTask child creates a
+    /// real user task"), never a blanket "events differ".
+    pub reason: String,
+}
+
+impl Unbalanced {
+    /// Whether this declaration may ratify an unbalanced scenario: it must
+    /// carry a non-empty reason AND the divergence must name its tracking
+    /// issue, so the declaration is always traceable to a reviewed decision.
+    fn valid(&self, issue: &str) -> bool {
+        !self.reason.trim().is_empty() && !issue.trim().is_empty()
+    }
 }
 
 /// Renames one event variant to another for scenario-level reconciliation
@@ -685,13 +1015,20 @@ impl FieldOverride {
     }
 }
 
-/// Matches an event by variant and, optionally, its `element_id`.
+/// Matches an event by variant and, optionally, its `element_id` and/or (for a
+/// `SequenceFlowTaken`) its `from` source element.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventPattern {
     pub variant: String,
     #[serde(default)]
     pub element_id: Option<String>,
+    /// A `SequenceFlowTaken` carries no `element_id`; its source element is
+    /// `from`. Scoping on it lets a divergence name ONE flow (the body's
+    /// advance, `review → end`) without also matching a flow both sides take
+    /// (the entry into the body, `start → review`) — #1528.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 impl EventPattern {
@@ -702,6 +1039,10 @@ impl EventPattern {
         self.element_id
             .as_deref()
             .is_none_or(|id| body.get("element_id").and_then(Json::as_str) == Some(id))
+            && self
+                .from
+                .as_deref()
+                .is_none_or(|f| body.get("from").and_then(Json::as_str) == Some(f))
     }
 }
 
@@ -775,56 +1116,344 @@ impl KeyIds {
         self.ids.insert(key, format!("{base}#{n}"));
         Ok(())
     }
+
+    /// Re-sights `key` for `base`, the identity of an entity `key` may already
+    /// carry. Unlike [`KeyIds::mint`] this never assigns a new ordinal: an
+    /// unseen key canonicalizes to the base itself (no `#n`), so the result
+    /// does not depend on which sighting order the entry's events arrived in
+    /// (#1528 review: an MI child's generic `ElementActivating` and its
+    /// `MultiInstanceChildActivated` must yield ONE identity either way).
+    ///
+    /// The re-sighting is consistent — and a key already carrying a DIFFERENT
+    /// entity is a collision that fails closed — decided by EXACT identity
+    /// (a `resight` base never carries an ordinal suffix), with ONE tolerance:
+    /// the existing identity may be the same base plus an ordinal suffix a
+    /// prior ordinal `mint` assigned (`{base}#{n}`). The segments of an
+    /// identity themselves contain `#` (an instance base is
+    /// `instance:{pid}#{n}`, an `mi-child:…` identity ends in the child index),
+    /// so a naive `rsplit_once('#')` base comparison would both accept an
+    /// unrelated entity that differs only in its trailing segment AND reject
+    /// this exact re-sighting of a minted identity — compare the whole string
+    /// instead (#1528 review).
+    fn resight(&mut self, key: u64, base: &str) -> Result<(), String> {
+        match self.ids.get(&key) {
+            None => {
+                self.ids.insert(key, base.to_owned());
+                Ok(())
+            }
+            Some(existing) => {
+                let same_entity = existing == base
+                    || existing.strip_prefix(base).is_some_and(|rest| {
+                        rest.strip_prefix('#')
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    });
+                if same_entity {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "key {key} minted for two entities across the corpus ({existing} vs {base})"
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// Folds `events`' minted keys into `ids` (one side, in corpus order).
+///
+/// Three passes keep every identity independent of the entry's event order
+/// (a ratified `reorder` may permute it): first the `ProcessInstanceCreated`
+/// mints (an element activation references its owning `instance_key`, which
+/// the reorder may move after the reference), then the
+/// `MultiInstanceChildActivated` mints (a child's identity must not depend on
+/// whether its generic `ElementActivating` or its child activation is seen
+/// first — #1528 review), then every other mint.
 fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> {
-    for e in events {
-        let Ok(v) = serde_json::from_str::<Json>(e) else {
-            continue;
-        };
-        // Every event is a single-key externally-tagged object; a bare
-        // unit-variant string carries no keys to canonicalize.
-        let Some((variant, body)) = v.as_object().and_then(|o| o.iter().next()) else {
-            continue;
-        };
-        let u64_of = |f: &str| body.get(f).and_then(Json::as_u64);
-        let str_of = |f: &str| body.get(f).and_then(Json::as_str);
+    let parsed: Vec<(String, Json)> = events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+        .filter_map(|v| {
+            // Every event is a single-key externally-tagged object; a bare
+            // unit-variant string carries no keys to canonicalize.
+            variant_body(&v).map(|(variant, body)| (variant.to_owned(), body.clone()))
+        })
+        .collect();
+    let u64_of = |body: &Json, f: &str| body.get(f).and_then(Json::as_u64);
+    fn str_of<'a>(body: &'a Json, f: &str) -> Option<&'a str> {
+        body.get(f).and_then(Json::as_str)
+    }
+    // Pass 1: the process-instance key itself. A release that mints extra
+    // keys mid-corpus (#1528's per-child user-task keys) shifts every LATER
+    // instance key, so the instance must canonicalize to WHICH instance it
+    // is, not its raw key. The base is the process id; `mint` appends the
+    // per-process creation ordinal, so two instances of one process stay
+    // distinct while the same instance agrees across the offset.
+    for (_, body) in parsed
+        .iter()
+        .filter(|(variant, _)| *variant == "ProcessInstanceCreated")
+    {
+        if let (Some(k), Some(pid)) = (u64_of(body, "instance_key"), str_of(body, "process_id")) {
+            ids.mint(k, format!("instance:{pid}"))?;
+        }
+    }
+    // Pass 2: a multi-instance child mints its element-instance key at
+    // activation. The child's `ElementActivating` re-sights the same key but
+    // under a base that cannot tell the children apart (same element id, same
+    // instance), so the child's identity is registered HERE — keyed by the
+    // body element's CANONICAL identity plus the child ordinal, so equivalent
+    // bodies with different raw keys across releases still agree (#1528
+    // review) and the identity is the same whichever sighting comes first
+    // (a `resight`, never an ordinal mint). This matters when a release
+    // changes what a child mints: #1528 adds a per-child user-task key, so
+    // the head build's child keys interleave with the task keys while the
+    // previous release's stay contiguous — a clean per-child remint that
+    // only a distinct, order-independent child identity reconciles.
+    // Pass 2a: register every MI BODY's element identity first — a body is
+    // usually activated in the same entry as its children, and a child's
+    // identity embeds its body's CANONICAL identity, so the body must be
+    // known before any child is derived (#1528 review). A body is derived
+    // from its canonical PARENT SCOPE (`scope` on its activation, resolved
+    // through the identities registered so far — pass 1's instance, an outer
+    // body's pass-2a identity, an outer child's pass-2b `mi-child:…`
+    // identity), never from an encounter-order ordinal: the same inner MI
+    // element activates one body per OUTER child, so an
+    // `element:{instance}:{id}` base cannot tell those bodies apart and an
+    // ordinal `mint` would swap their identities under a pure reorder (#1528
+    // review). Bodies are collected from both their `ElementActivating` and
+    // `ElementActivated` sightings into one record, so the registration is
+    // independent of which is folded first.
+    // A body activated in an EARLIER entry than its parent scope's own
+    // registration (a ratified cross-entry reorder) derives from that scope's
+    // `?orphan:<raw>` token — still deterministic, and identical on both
+    // sides of a clean remint.
+    type Bodies = BTreeMap<u64, (Option<u64>, Option<u64>, String)>;
+    type Children = BTreeMap<u64, (Option<u64>, u64, Option<u64>)>;
+    fn parent_ready(ids: &KeyIds, bodies: &Bodies, children: &Children, p: Option<u64>) -> bool {
+        p.is_none_or(|p| {
+            ids.get(&p).is_some() || !(bodies.contains_key(&p) || children.contains_key(&p))
+        })
+    }
+    let body_keys: BTreeSet<u64> = parsed
+        .iter()
+        .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
+        .filter_map(|(_, body)| u64_of(body, "body_key"))
+        .collect();
+    // body key -> (parent scope key, or None for the process scope; instance
+    // key; element id), from the body's own generic activation.
+    // Folded `ElementActivating` sightings FIRST and `ElementActivated`
+    // sightings SECOND, so the authoritative `ElementActivated` scope wins
+    // regardless of corpus order — a permitted reorder may put a historical
+    // scope-less `ElementActivating` after its `ElementActivated`, and must not
+    // overwrite the real parent scope with the process scope (#1528 review).
+    // A scope-less sighting never erases a scope already recorded.
+    let mut bodies: Bodies = BTreeMap::new();
+    for wanted in ["ElementActivating", "ElementActivated"] {
+        for (_, body) in parsed.iter().filter(|(variant, _)| *variant == wanted) {
+            if let (Some(k), Some(id)) = (
+                u64_of(body, "element_instance_key"),
+                str_of(body, "element_id"),
+            ) {
+                if body_keys.contains(&k) {
+                    let scope = u64_of(body, "scope")
+                        .filter(|s| *s != 0)
+                        .or_else(|| bodies.get(&k).and_then(|(s, _, _)| *s));
+                    bodies.insert(k, (scope, u64_of(body, "instance_key"), id.to_owned()));
+                }
+            }
+        }
+    }
+    // body key -> (raw instance key, element id) of the body's OWN activation,
+    // so pass 3 skips only that activation's generic re-sighting (#1528
+    // review), never another element's/instance's activation reusing the key.
+    let body_activations: BTreeMap<u64, (Option<u64>, String)> = bodies
+        .iter()
+        .map(|(k, (_, instance, id))| (*k, (*instance, id.clone())))
+        .collect();
+    // child key -> (body key, child index, instance key).
+    let mut children: Children = BTreeMap::new();
+    for (_, body) in parsed
+        .iter()
+        .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
+    {
+        if let (Some(k), Some(index)) = (u64_of(body, "child_key"), u64_of(body, "index")) {
+            children.insert(
+                k,
+                (
+                    u64_of(body, "body_key"),
+                    index,
+                    u64_of(body, "instance_key"),
+                ),
+            );
+        }
+    }
+    // Register bodies and children in PARENT-BEFORE-CHILD order, to a
+    // fixpoint (#1528 review): an inner MI body activated in the same entry
+    // as the outer child that is its parent scope must see that child's
+    // `mi-child:…` identity, not a raw-key `?orphan:` token (which a clean
+    // remint would make unequal). A node is ready once its parent is either
+    // registered or NOT pending registration in this entry (then it
+    // legitimately resolves to whatever `owner` yields).
+    //
+    // Bodies sharing a base (the SAME MI activity executed twice in one
+    // parent scope, e.g. via a loop-back) are told apart by an ordinal
+    // assigned in RAW-KEY order — never encounter order — so the identity
+    // is reorder-stable (a reorder permutes events, not key values) and
+    // remint-stable (keys are allocated monotonically, so a release that
+    // shifts them preserves their relative order). Each execution therefore
+    // keeps a distinct identity, and its children with it (#1528 review).
+    let mut mi_child_activations: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    let owner_or =
+        |ids: &KeyIds, k: Option<u64>| k.map_or_else(|| "?".to_owned(), |k| ids.owner(k));
+    loop {
+        let ready_bodies: Vec<u64> = bodies
+            .iter()
+            .filter(|(_, (scope, _, _))| parent_ready(ids, &bodies, &children, *scope))
+            .map(|(k, _)| *k)
+            .collect();
+        let mut by_base: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for k in &ready_bodies {
+            let (scope, instance, id) = &bodies[k];
+            let parent = match scope {
+                None => owner_or(ids, *instance),
+                Some(s) => ids.owner(*s),
+            };
+            by_base
+                .entry(format!("mi-body:{parent}:{id}"))
+                .or_default()
+                .push(*k);
+        }
+        for (base, keys) in by_base {
+            // `keys` is ascending (BTreeMap iteration), i.e. raw-key order.
+            for k in keys {
+                // Always validated: `mint` is idempotent for the same base and
+                // fails closed when the key already belongs to another entity
+                // (e.g. a job) (#1528 review).
+                ids.mint(k, base.clone())?;
+            }
+        }
+        for k in &ready_bodies {
+            bodies.remove(k);
+        }
+        let ready_children: Vec<u64> = children
+            .iter()
+            .filter(|(_, (body_key, _, _))| parent_ready(ids, &bodies, &children, *body_key))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &ready_children {
+            let (body_key, index, instance_key) = children[k];
+            let body_id = owner_or(ids, body_key);
+            let instance = owner_or(ids, instance_key);
+            ids.resight(*k, &format!("mi-child:{instance}:{body_id}#{index}"))?;
+            let child_element_id = parsed
+                .iter()
+                .filter(|(variant, _)| {
+                    *variant == "ElementActivating" || *variant == "ElementActivated"
+                })
+                .find(|(_, b)| u64_of(b, "element_instance_key") == Some(*k))
+                .and_then(|(_, b)| str_of(b, "element_id"))
+                .unwrap_or("?");
+            mi_child_activations.insert(*k, (instance, child_element_id.to_owned()));
+            children.remove(k);
+        }
+        if ready_bodies.is_empty() && ready_children.is_empty() {
+            // Empty: done. Otherwise a parent cycle, impossible for a real
+            // scope tree — fail closed rather than guess.
+            if !bodies.is_empty() || !children.is_empty() {
+                return Err(format!(
+                    "multi-instance scope cycle among keys {:?} / {:?}",
+                    bodies.keys().collect::<Vec<_>>(),
+                    children.keys().collect::<Vec<_>>()
+                ));
+            }
+            break;
+        }
+    }
+    // Pass 3: every other mint, in corpus order.
+    for (variant, body) in &parsed {
         let minted = match variant.as_str() {
             "ElementActivating" | "ElementActivated" | "ParallelJoinOpened" => {
                 // `ParallelJoinOpened` mints the (parked, #1244) join's
                 // element-instance key without activating it; the firing
                 // entry's `ElementActivating` re-sights the same key for the
-                // same base (idempotent).
-                u64_of("element_instance_key").zip(str_of("element_id").map(|id| {
-                    let instance =
-                        u64_of("instance_key").map_or_else(|| "?".to_owned(), |k| k.to_string());
-                    format!("element:{instance}:{id}")
-                }))
+                // same base (idempotent). The owning instance is its CANONICAL
+                // identity (the `ProcessInstanceCreated` mint), not its raw
+                // key, so a corpus-wide instance-key offset (#1528) does not
+                // leak into every element identity.
+                u64_of(body, "element_instance_key")
+                    .zip(str_of(body, "element_id"))
+                    .map(|(k, id)| {
+                        let instance = u64_of(body, "instance_key")
+                            .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                        (k, format!("element:{instance}:{id}"))
+                    })
             }
+            "ProcessInstanceCreated" | "MultiInstanceChildActivated" => None, // passes 1 and 2
             "JobCreated" | "ExecutionListenerJobCreated" | "TaskListenerJobCreated" => {
-                u64_of("job_key").map(|k| {
-                    let owner = u64_of("element_instance_key")
+                u64_of(body, "job_key").map(|k| {
+                    let owner = u64_of(body, "element_instance_key")
                         .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
                     (k, format!("job:{variant}:{owner}"))
                 })
             }
-            "TimerCreated" => u64_of("timer_key").map(|k| {
-                let owner =
-                    u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+            "TimerCreated" => u64_of(body, "timer_key").map(|k| {
+                let owner = u64_of(body, "element_instance_key")
+                    .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
                 (k, format!("timer:{owner}"))
+            }),
+            "UserTaskCreated" => u64_of(body, "user_task_key").map(|k| {
+                let owner = u64_of(body, "element_instance_key")
+                    .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                (k, format!("user-task:{owner}"))
             }),
             "MessageSubscriptionCreated"
             | "SignalSubscriptionCreated"
-            | "ConditionalSubscriptionCreated" => u64_of("subscription_key").map(|k| {
-                let owner =
-                    u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+            | "ConditionalSubscriptionCreated" => u64_of(body, "subscription_key").map(|k| {
+                let owner = u64_of(body, "element_instance_key")
+                    .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
                 (k, format!("subscription:{owner}"))
             }),
             _ => None,
         };
         if let Some((k, base)) = minted {
-            ids.mint(k, base)?;
+            // A multi-instance child's key was already registered by pass 2
+            // under its distinct `mi-child:…` identity; its generic
+            // `ElementActivating`/`ElementActivated` is a lifecycle
+            // re-sighting of THAT identity (the generic base cannot tell the
+            // children apart), so it is skipped — but only when the sighting
+            // IS that child's own activation: the variant is
+            // `ElementActivating`/`ElementActivated`, and the sighting names
+            // the SAME owning instance and element id the child was
+            // registered with (captured structurally at pass 2, since the
+            // `mi-child:…` identity string is not parseable — its instance
+            // and body segments themselves contain `:`/`#`). Every other
+            // sighting — a `ParallelJoinOpened` parking on the child's key,
+            // or an activation for a DIFFERENT element reusing it — goes
+            // through `mint`, which rejects the key reuse for an unrelated
+            // entity as the collision it is (#1528 review). An MI BODY's key
+            // was likewise already registered by pass 2a under its
+            // parent-scope-derived `mi-body:…` identity, so its generic
+            // `ElementActivating`/`ElementActivated` is skipped the same way
+            // — otherwise the generic base (`element:{instance}:{id}`) would
+            // collide with the `mi-body:…` base on the same key.
+            let generic_child_resight = base.starts_with("element:")
+                && matches!(variant.as_str(), "ElementActivating" | "ElementActivated")
+                && (body_activations
+                    .get(&k)
+                    .is_some_and(|(reg_instance, reg_element)| {
+                        *reg_instance == u64_of(body, "instance_key")
+                            && str_of(body, "element_id") == Some(reg_element.as_str())
+                    })
+                    || mi_child_activations
+                        .get(&k)
+                        .is_some_and(|(reg_instance, reg_element)| {
+                            let instance = u64_of(body, "instance_key")
+                                .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                            let element_id = str_of(body, "element_id").unwrap_or("?");
+                            reg_instance == &instance && reg_element == element_id
+                        }));
+            if !generic_child_resight {
+                ids.mint(k, base)?;
+            }
         }
     }
     Ok(())
@@ -1067,6 +1696,207 @@ fn parked_join_activations(
     out
 }
 
+/// One side's matched events and key identities, for
+/// [`validate_unbalanced_surplus`].
+struct MatchedSide<'a> {
+    /// The canonicalized matched multiset (keys are identity strings).
+    canonical: &'a BTreeMap<String, usize>,
+    /// The same matched events RAW (decodable under the head `Event` type).
+    raw: &'a BTreeMap<String, usize>,
+    /// This side's corpus-wide key identities.
+    ids: &'a KeyIds,
+    /// Whether the declaration remints keys — the `canonical` multiset was
+    /// projected with this setting, so the surplus lookup must be too.
+    remint: bool,
+    /// The ratified lifecycle-kind substitutions the `canonical` multiset was
+    /// projected with, so the surplus lookup projects identically.
+    subs: &'a [VariantSubstitution],
+    /// Every raw event of this side's divergent entries.
+    entries: &'a [&'a String],
+}
+
+/// Validates the one-sided surplus an `unbalanced` declaration ratifies
+/// (#1528 review): the events only one side emits (the asymmetric remainder
+/// of the two matched multisets). The declaration says the change ADDS or
+/// REMOVES events outright — it must not ratify a WRONG event. So:
+///
+/// * every surplus event must still decode under the head `Event` type (a
+///   corrupted or truncated one fails); and
+/// * regardless of snapshot format (when formats differ the durable-state
+///   comparison is skipped, so this is the ONLY payload check), the surplus
+///   must be internally consistent: a `UserTaskCreated` whose owning element instance
+///   its own side never minted points at a wrong or missing child — not a
+///   clean one-sided emission — and fails.
+///
+/// Counts are otherwise the declaration's own contract (it ratifies exactly
+/// the imbalance it reviewed); this check guards the surplus's SHAPE, not its
+/// size. The `raw` multisets carry each side's matched events RAW (the
+/// `canonical` multisets hold identity strings in the key positions, which no
+/// longer decode); the owner check resolves the raw `element_instance_key`
+/// against the side's own mints.
+/// The `only_in_*` patterns of the side being validated (its own
+/// declaration's patterns), so the required-children check knows which
+/// elements the divergence declares a per-child task for.
+fn validate_unbalanced_surplus(
+    scenario: &str,
+    head: MatchedSide<'_>,
+    prev: MatchedSide<'_>,
+    head_patterns: &[EventPattern],
+    prev_patterns: &[EventPattern],
+) -> Result<(), String> {
+    // The asymmetric remainder of a side's canonical multiset, as raw events:
+    // the raw events whose canonical projection is in the surplus.
+    let surplus_raw = |side: &MatchedSide, other: &MatchedSide| {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for (re, n) in side.raw {
+            let v: Json = match serde_json::from_str(re) {
+                Ok(v) => v,
+                Err(_) => {
+                    out.push((re.clone(), *n));
+                    continue;
+                }
+            };
+            let proj = pattern_projection(&v, side.ids, side.remint, side.subs).to_string();
+            let extra = side
+                .canonical
+                .get(&proj)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(other.canonical.get(&proj).copied().unwrap_or(0));
+            if extra > 0 {
+                out.push((re.clone(), extra));
+            }
+        }
+        out
+    };
+    for (side_name, side, other, patterns) in [
+        ("head", &head, &prev, head_patterns),
+        ("prev", &prev, &head, prev_patterns),
+    ] {
+        // The owners of this side's surplus `UserTaskCreated`, by element id.
+        let mut task_owners: BTreeMap<String, BTreeMap<u64, usize>> = BTreeMap::new();
+        for (event, extra) in surplus_raw(side, other) {
+            // Decode under the head type: a corrupted surplus event fails.
+            let decoded = nanobpmn_engine_core::decode_event_json(&event).map_err(|e| {
+                format!(
+                    "scenario {scenario}: a {side_name}-side surplus event does not decode under head: {e}: {event}"
+                )
+            })?;
+            // The owning element instance of a one-sided `UserTaskCreated`
+            // must be an entity its own side minted — otherwise the task
+            // hangs off a wrong or missing child.
+            let v = serde_json::to_value(&decoded).map_err(|e| e.to_string())?;
+            if let Some(("UserTaskCreated", body)) = variant_body(&v) {
+                if let Some(owner) = body.get("element_instance_key").and_then(Json::as_u64) {
+                    if side.ids.get(&owner).is_none() {
+                        return Err(format!(
+                            "scenario {scenario}: a {side_name}-side surplus `UserTaskCreated` \
+                             (x{extra}) names an owning element_instance_key {owner} its own \
+                             side never minted — a wrong-child/wrong-owner event, not a clean \
+                             one-sided emission: {event}"
+                        ));
+                    }
+                    let element = body
+                        .get("element_id")
+                        .and_then(Json::as_str)
+                        .unwrap_or("?")
+                        .to_owned();
+                    *task_owners
+                        .entry(element)
+                        .or_default()
+                        .entry(owner)
+                        .or_insert(0) += extra;
+                }
+            }
+        }
+        // One task per activated multi-instance child of that element: a
+        // duplicate owner, a task on a non-child (another valid but wrong
+        // element instance) or a child left without its task all fail
+        // (#1528 review). The required-children check runs even when the side
+        // emitted NO surplus `UserTaskCreated` at all: for every element the
+        // declaration's `only_in_*` patterns name a `UserTaskCreated` for,
+        // every activated MI child must carry exactly one task — so an
+        // all-tasks-missing stream fails rather than passing silently.
+        let children = mi_children_by_element(side.entries);
+        let declared_task_elements: BTreeSet<String> = patterns
+            .iter()
+            .filter(|p| p.variant == "UserTaskCreated")
+            .map(|p| p.element_id.clone().unwrap_or_default())
+            .collect();
+        for element in declared_task_elements {
+            let owners = task_owners.get(&element).cloned().unwrap_or_default();
+            let want = children.get(&element).cloned().unwrap_or_default();
+            if owners.is_empty() && !want.is_empty() {
+                return Err(format!(
+                    "scenario {scenario}: the {side_name}-side surplus emits NO `UserTaskCreated` \
+                     for element {element}, but its activated multi-instance children are \
+                     {want:?} — one task per activated child"
+                ));
+            }
+        }
+        for (element, owners) in &task_owners {
+            if let Some((owner, n)) = owners.iter().find(|(_, n)| **n > 1) {
+                return Err(format!(
+                    "scenario {scenario}: {n} {side_name}-side surplus `UserTaskCreated` for \
+                     element {element} share the owner {owner} — one task per child"
+                ));
+            }
+            let got: BTreeSet<u64> = owners.keys().copied().collect();
+            let want = children.get(element).cloned().unwrap_or_default();
+            if got != want {
+                return Err(format!(
+                    "scenario {scenario}: the {side_name}-side surplus `UserTaskCreated` for \
+                     element {element} are owned by {got:?}, but the activated multi-instance \
+                     children are {want:?} — one task per activated child"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The process instances `events` touch (every event body's `instance_key`).
+fn instance_keys_of(events: &[&String]) -> BTreeSet<u64> {
+    events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+        .filter_map(|v| {
+            variant_body(&v).and_then(|(_, body)| body.get("instance_key").and_then(Json::as_u64))
+        })
+        .collect()
+}
+
+/// The multi-instance children `events` activate, by element id: the child
+/// keys of `MultiInstanceChildActivated`, labelled with the element id of
+/// their own `ElementActivating`/`ElementActivated`.
+fn mi_children_by_element(events: &[&String]) -> BTreeMap<String, BTreeSet<u64>> {
+    let parsed: Vec<Json> = events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+        .collect();
+    let children: BTreeSet<u64> = parsed
+        .iter()
+        .filter_map(|v| match variant_body(v) {
+            Some(("MultiInstanceChildActivated", b)) => b.get("child_key").and_then(Json::as_u64),
+            _ => None,
+        })
+        .collect();
+    let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for v in &parsed {
+        if let Some(("ElementActivating" | "ElementActivated", b)) = variant_body(v) {
+            if let (Some(k), Some(id)) = (
+                b.get("element_instance_key").and_then(Json::as_u64),
+                b.get("element_id").and_then(Json::as_str),
+            ) {
+                if children.contains(&k) {
+                    out.entry(id.to_owned()).or_default().insert(k);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A ratified behavioural change in one corpus scenario.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1213,25 +2043,28 @@ pub fn erase_fields(value: &mut Json, ctx: &str, erasable: &Vocab) {
             }
             map.retain(|k, _| !is_field_name(k) || !erasable.contains(&format!("{ctx}.{k}")));
             for (k, v) in map.iter_mut() {
+                // A variant tag becomes the context for everything under it —
+                // including the VALUES of a map field, whose entries are
+                // structs of that variant's shape (a `ProcessDeployed`
+                // process's `elements` map holds element structs whose fields
+                // are `ProcessDeployed.*`). Passing the stale outer `ctx`
+                // (`$`) instead would leave a golden-added field under a map
+                // unerased — the divergence the previous-release gate then
+                // reports on every deploy (#1528 review).
+                let next = if is_variant_tag(k) { k.as_str() } else { ctx };
                 if is_field_name(k) && data_map_fields().contains(k) {
                     // A map field: its keys are DATA, never
                     // erased; only its values (which may be structs) are
-                    // descended into.
+                    // descended into — under the CURRENT context (`next`).
                     if let Json::Object(entries) = v {
                         if !is_value_map(entries) {
                             entries
                                 .values_mut()
-                                .for_each(|e| erase_fields(e, ctx, erasable));
+                                .for_each(|e| erase_fields(e, next, erasable));
                         }
                     }
                     continue;
                 }
-                let next = if is_variant_tag(k) {
-                    // An externally-tagged variant: it becomes the context.
-                    k.as_str()
-                } else {
-                    ctx
-                };
                 erase_fields(v, next, erasable);
             }
         }
@@ -1472,6 +2305,7 @@ pub fn cross_release_checked(
     // shape is the only exception and is validated exactly, per entity. A
     // pattern removed but never re-added (a real loss) still fails.
     let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
+    let mut boundary = RatifiedBoundary::default();
     for (scenario, pend) in &pending {
         let d = pend.divergence;
         let expected = &d.expected;
@@ -1483,9 +2317,21 @@ pub fn cross_release_checked(
         // lifecycle event never balances.
         let mut head_matched: BTreeMap<String, usize> = BTreeMap::new();
         let mut prev_matched: BTreeMap<String, usize> = BTreeMap::new();
+        // The same matched events RAW (pre-canonicalization), so the
+        // `unbalanced` surplus validation can decode them under the head
+        // `Event` type (the canonical multisets hold identity strings in the
+        // key positions, which no longer decode).
+        let mut head_matched_raw: BTreeMap<String, usize> = BTreeMap::new();
+        let mut prev_matched_raw: BTreeMap<String, usize> = BTreeMap::new();
+        // Head-side matched events in a substitution's `head` (raw) form.
+        let mut head_substituted = 0usize;
         // Every head event of the divergent entries, canonical — the parked
         // join exception below looks up head's `ParallelJoinOpened` here.
         let mut head_all: Vec<Json> = Vec::new();
+        // Every RAW event of the divergent entries, per side — the surplus
+        // owner check derives the activated user-task children from these.
+        let (mut head_entry_events, mut prev_entry_events): (Vec<&String>, Vec<&String>) =
+            (Vec::new(), Vec::new());
         for (i, hc, pc) in &pend.entries {
             let (Some(hs), Some(ps)) = (hc, pc) else {
                 return Err(format!(
@@ -1504,8 +2350,17 @@ pub fn cross_release_checked(
                     render(ps)
                 ));
             }
+            head_entry_events.extend(hs.iter());
+            prev_entry_events.extend(ps.iter());
             for e in hs {
                 if let Ok(v) = serde_json::from_str::<Json>(e) {
+                    if expected.only_in_head.iter().any(|p| p.matches(&v))
+                        && variant_body(&v).is_some_and(|(tag, _)| {
+                            expected.variant_substitutions.iter().any(|s| s.head == tag)
+                        })
+                    {
+                        head_substituted += 1;
+                    }
                     head_all.push(pattern_projection(
                         &v,
                         &head_ids,
@@ -1530,6 +2385,49 @@ pub fn cross_release_checked(
                 &expected.variant_substitutions,
                 &mut prev_matched,
             );
+            // The raw counterparts, for the `unbalanced` surplus validation.
+            collect_matched(
+                hs,
+                &expected.only_in_head,
+                &head_ids,
+                false,
+                &expected.variant_substitutions,
+                &mut head_matched_raw,
+            );
+            collect_matched(
+                ps,
+                &expected.only_in_prev,
+                &prev_ids,
+                false,
+                &expected.variant_substitutions,
+                &mut prev_matched_raw,
+            );
+        }
+        // Fail closed on a lifecycle-kind regression the substitution would
+        // otherwise mask (#1528 review): pin the head-form count exactly.
+        if !expected.variant_substitutions.is_empty() {
+            let Some(want) = expected.substituted_head_events else {
+                return Err(format!(
+                    "scenario {scenario}: variant_substitutions require \
+                     substituted_head_events (the exact head-form event count) — \
+                     without it a regression to the prev lifecycle kind balances ({})",
+                    d.issue
+                ));
+            };
+            let got = head_substituted;
+            if got != want {
+                return Err(format!(
+                    "scenario {scenario}: expected exactly {want} head-side substituted \
+                     lifecycle events ({:?}), found {got} — a substituted event \
+                     regressed to (or newly diverged from) the prev lifecycle kind ({})",
+                    expected
+                        .variant_substitutions
+                        .iter()
+                        .map(|s| s.head.as_str())
+                        .collect::<Vec<_>>(),
+                    d.issue
+                ));
+            }
         }
         // The one ratified exception (#1244): a PARKED join. The previous
         // release activated it visibly (exactly one `ElementActivating` +
@@ -1545,26 +2443,123 @@ pub fn cross_release_checked(
                 }
             }
         }
-        if head_matched != prev_matched {
-            let show = |m: &BTreeMap<String, usize>| {
-                m.iter()
-                    .map(|(k, n)| format!("{n} x {k}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            return Err(format!(
-                "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
-                 ({}, {:?}) — an event removed on one side never re-appears on the other \
-                 (a real loss, not a move):\n  head-side patterns matched:\n{}\n  \
-                 prev-side patterns matched (parked joins excepted):\n{}",
-                d.issue,
-                expected,
-                show(&head_matched),
-                show(&prev_matched)
-            ));
+        // An `unbalanced` marker is validated whether or not the matched
+        // events balance (#1528 review): an untraceable marker fails even on
+        // a reorder-only scenario, never silently enabling the boundary
+        // state projection below. And whenever a VALID marker is present, the
+        // required-children check runs even when the matched multisets
+        // balance (both empty): a side that emits NO `UserTaskCreated` for an
+        // element the declaration names still owes one task per activated MI
+        // child, so an all-tasks-missing stream fails rather than passing
+        // silently (#1528 review).
+        if let Some(u) = &expected.unbalanced {
+            if !u.valid(&d.issue) {
+                return Err(format!(
+                    "scenario {scenario}: an unbalanced divergence declaration is valid \
+                     only with a non-empty reason AND a named issue ({}) — the \
+                     declaration must be traceable to a reviewed decision",
+                    d.issue
+                ));
+            }
+            validate_unbalanced_surplus(
+                scenario,
+                MatchedSide {
+                    canonical: &head_matched,
+                    raw: &head_matched_raw,
+                    ids: &head_ids,
+                    remint,
+                    subs: &expected.variant_substitutions,
+                    entries: &head_entry_events,
+                },
+                MatchedSide {
+                    canonical: &prev_matched,
+                    raw: &prev_matched_raw,
+                    ids: &prev_ids,
+                    remint,
+                    subs: &expected.variant_substitutions,
+                    entries: &prev_entry_events,
+                },
+                &expected.only_in_head,
+                &expected.only_in_prev,
+            )?;
+        }
+        let unbalanced_surplus = head_matched != prev_matched;
+        if unbalanced_surplus {
+            // An UNBALANCED declaration (#1528) ratifies the mismatch — the
+            // change adds or removes events outright, so the declared
+            // patterns can never reconcile as a move — but only when it is
+            // traceable: a non-empty reason on the declaration and the
+            // divergence's issue named. Anything else fails closed.
+            match &expected.unbalanced {
+                Some(_) => {
+                    // Already validated above (the marker is present and
+                    // valid, and the surplus check ran unconditionally).
+                }
+                None => {
+                    let show = |m: &BTreeMap<String, usize>| {
+                        m.iter()
+                            .map(|(k, n)| format!("{n} x {k}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    return Err(format!(
+                        "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
+                         ({}, {:?}) — an event removed on one side never re-appears on the other \
+                         (a real loss, not a move):\n  head-side patterns matched:\n{}\n  \
+                         prev-side patterns matched (parked joins excepted):\n{}",
+                        d.issue,
+                        expected,
+                        show(&head_matched),
+                        show(&prev_matched)
+                    ));
+                }
+            }
         }
         ratified_entries += pend.entries.len();
         ratified_scenarios.insert(scenario);
+        // Only an ACCEPTED one-sided surplus (an unbalanced divergence that
+        // really is unbalanced, and whose surplus validated above) scopes the
+        // same-format boundary state projection.
+        if unbalanced_surplus && d.upgrade == UpgradeMode::UpgradeBoundary {
+            let first = pend
+                .entries
+                .iter()
+                .filter_map(|(i, _, _)| head_entries[*i].get("i").and_then(Json::as_u64))
+                .min();
+            boundary.from = match (boundary.from, first) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            // Exclude the ratified instances by IDENTITY (the union over
+            // both sides), so an instance only one side's divergent events
+            // name is excluded on both, at its own raw key.
+            let identities: BTreeSet<String> = instance_keys_of(&head_entry_events)
+                .into_iter()
+                .map(|k| head_ids.owner(k))
+                .chain(
+                    instance_keys_of(&prev_entry_events)
+                        .into_iter()
+                        .map(|k| prev_ids.owner(k)),
+                )
+                .collect();
+            for (ids, out) in [
+                (&head_ids, &mut boundary.head_instances),
+                (&prev_ids, &mut boundary.prev_instances),
+            ] {
+                out.extend(
+                    ids.ids
+                        .iter()
+                        .filter(|(_, id)| identities.contains(*id))
+                        .map(|(k, _)| *k),
+                );
+                // A key never minted on either side (`?orphan:<raw>`) is
+                // excluded at its raw value on both.
+                out.extend(identities.iter().filter_map(|id| {
+                    id.strip_prefix("?orphan:")
+                        .and_then(|r| r.parse::<u64>().ok())
+                }));
+            }
+        }
     }
     for o in &ctx.allowlist.observational_variants {
         if !observed.contains(&o.variant) {
@@ -1604,6 +2599,7 @@ pub fn cross_release_checked(
         &prev_states,
         prev_entries.len(),
         &state_erasable,
+        &boundary,
     )?;
     // Report the fields actually erased (present on the head side of their
     // own stream), not the whole candidate set.

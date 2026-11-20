@@ -1964,3 +1964,235 @@ fn a_process_only_redeploy_with_a_missing_deployment_bound_linked_resource_is_a_
         "the process is never re-versioned by an unrepairable binding"
     );
 }
+
+/// Issue #1528 regression — a multi-instance on a DIRECT user task must create
+/// one user task per child and park each child on it, rather than completing
+/// the children immediately. Completing each task feeds the loop's
+/// `outputElement` (resolved in the child's completion scope) into the
+/// `outputCollection`, and the instance only completes after every task.
+fn direct_mi_user_task_process_with_listeners(
+    sequential: bool,
+    listeners: Vec<crate::model::TaskListener>,
+) -> crate::model::ProcessDefinition {
+    ProcessBuilder::new("mi_review")
+        .start_event("start")
+        .user_task("review")
+        .with_multi_instance(
+            "review",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=decision".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "sink")
+        .connect("sink", "end")
+        .with_task_listeners("review", listeners)
+        .build()
+        .unwrap()
+}
+
+fn created_user_tasks(events: &[Event]) -> Vec<Key> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn direct_mi_user_task_creates_a_task_per_child_and_collects_output_element() {
+    for sequential in [false, true] {
+        run_direct_mi_user_task(sequential, false);
+    }
+}
+
+/// #1719 review — a `completing` task listener DEFERS the completion; the
+/// deferred commit must propagate the submitted variables from the MI child's
+/// own scope (`completion_scope`), not the body, or the child's seeded
+/// `decision = null` shadows the submitted value and the aggregate collects
+/// null. Covers parallel and sequential.
+#[test]
+fn direct_mi_user_task_with_completing_listener_collects_submitted_output_element() {
+    for sequential in [false, true] {
+        run_direct_mi_user_task(sequential, true);
+    }
+}
+
+fn run_direct_mi_user_task(sequential: bool, completing_listener: bool) {
+    {
+        let listeners = if completing_listener {
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Completing,
+                job_type: "on-complete".to_string(),
+                retries: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                direct_mi_user_task_process_with_listeners(sequential, listeners),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "mi_review",
+                vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let mut pending = created_user_tasks(&created);
+        assert_eq!(
+            pending.len(),
+            if sequential { 1 } else { 2 },
+            "each active MI child must park on its own user task (sequential={sequential})"
+        );
+        assert!(!engine.is_completed(key));
+
+        let mut n = 0;
+        while let Some(task) = pending.first().copied() {
+            pending.remove(0);
+            n += 1;
+            let mut done = engine
+                .apply_command(Command::complete_user_task_with(
+                    task,
+                    vars(&[("decision", Value::Int(n * 10))]),
+                ))
+                .unwrap();
+            if completing_listener {
+                let jobs = engine.activate_jobs("on-complete", "W", 10, 1_000, 0);
+                assert_eq!(jobs.len(), 1, "one completing listener job per task");
+                done.extend(
+                    engine
+                        .apply_command(Command::complete_job(jobs[0].key))
+                        .unwrap(),
+                );
+            }
+            pending.extend(created_user_tasks(&done));
+        }
+        assert_eq!(
+            n, 2,
+            "exactly one user task per item (sequential={sequential})"
+        );
+        // The body drained and the token parked on the sink task, so the
+        // aggregate is observable on the still-running instance.
+        assert!(!engine.is_completed(key));
+        assert!(
+            engine
+                .state()
+                .jobs
+                .values()
+                .any(|j| j.job_type == "sink-work"),
+            "token advanced past the MI body (sequential={sequential})"
+        );
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("results"),
+            Some(&Value::List(vec![Value::Int(10), Value::Int(20)])),
+            "outputElement collected per child (sequential={sequential})"
+        );
+    }
+}
+
+/// #1719 review — creation-time expressions on a multi-instance user task
+/// (assignee, creating-listener job type) must be evaluated in EACH child's
+/// own scope, after its input mapping. Distinct per-child items and a
+/// per-child input mapping make a body- or sibling-scope evaluation visible.
+#[test]
+fn direct_mi_user_task_evaluates_creation_expressions_in_each_child_scope() {
+    use crate::model::{IoMapping, Mapping, UserTaskProps};
+    let def = ProcessBuilder::new("mi_scope")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: Some("=who".to_string()),
+                ..Default::default()
+            },
+        )
+        .with_multi_instance(
+            "review",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "review",
+            IoMapping {
+                inputs: vec![Mapping {
+                    source: "=\"user-\" + item".to_string(),
+                    target: "who".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .with_task_listeners(
+            "review",
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Creating,
+                job_type: "=\"create-\" + item".to_string(),
+                retries: None,
+            }],
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi_scope",
+            vars(&[(
+                "items",
+                Value::List(vec![
+                    Value::Str("a".to_string()),
+                    Value::Str("b".to_string()),
+                ]),
+            )]),
+        ))
+        .unwrap();
+
+    for item in ["a", "b"] {
+        let jobs = engine.activate_jobs(format!("create-{item}"), "W", 10, 1_000, 0);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "exactly one creating-listener job typed from child item {item}"
+        );
+        engine
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+    }
+
+    let mut assignees: Vec<Option<String>> = engine
+        .state()
+        .user_tasks
+        .values()
+        .filter(|t| t.element_id == "review")
+        .map(|t| t.assignee.clone())
+        .collect();
+    assignees.sort();
+    assert_eq!(
+        assignees,
+        vec![Some("user-a".to_string()), Some("user-b".to_string())],
+        "each child's assignee resolves from its own mapped value"
+    );
+}
