@@ -60,12 +60,20 @@ fi
 # reads build.target-dir from config on EVERY invocation, so direct `cargo`
 # runs honor it (a direnv .envrc would not: nothing sources it without a
 # configured direnv hook) — unless the caller already exported a
-# CARGO_TARGET_DIR (which overrides config). A caller-set value with a space
-# is rejected with a clear message instead of an autoconf error that looks
-# like a toolchain bug.
+# CARGO_TARGET_DIR (which overrides config). A caller-set value that is
+# relative or contains a space is rejected with a clear message instead of an
+# autoconf error that looks like a toolchain bug.
 wt_target_dir=""
 if [[ "$wt" = *" "* ]]; then
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        # Cargo resolves a RELATIVE CARGO_TARGET_DIR under the workspace root,
+        # which is the spaced worktree here — so it must be absolute as well as
+        # space-free, or jemalloc's configure still word-splits it (#1716).
+        if [[ "$CARGO_TARGET_DIR" != /* ]]; then
+            echo "error: CARGO_TARGET_DIR ($CARGO_TARGET_DIR) is relative, so Cargo resolves it under the spaced worktree ($wt)" >&2
+            echo "       and tikv-jemalloc-sys still cannot build (#1716). Use an ABSOLUTE space-free CARGO_TARGET_DIR." >&2
+            exit 1
+        fi
         if [[ "$CARGO_TARGET_DIR" = *" "* ]]; then
             echo "error: CARGO_TARGET_DIR ($CARGO_TARGET_DIR) contains a space and the worktree path ($wt) does too;" >&2
             echo "       tikv-jemalloc-sys cannot build with a spaced target dir (#1716). Use a space-free CARGO_TARGET_DIR." >&2
@@ -75,7 +83,22 @@ if [[ "$wt" = *" "* ]]; then
         hash=$(printf '%s' "$wt" | cksum | cut -d' ' -f1)
         wt_target_dir="$HOME/.local/share/nanobpm/target/$hash"
         mkdir -p "$wt/.cargo"
-        printf '[build]\ntarget-dir = "%s"\n' "$wt_target_dir" > "$wt/.cargo/config.toml"
+        # MERGE [build].target-dir into the worktree's .cargo/config.toml rather
+        # than overwrite it: the tracked config also carries the Linux mold
+        # link flags and the wasm32 wsqlite3 build-script override (epic #796),
+        # and clobbering the file would silently drop both. The tracked config
+        # has no [build] table today, so appending one cannot collide; if it
+        # ever gains one, fail loudly instead of writing a duplicate-table TOML
+        # error into the file.
+        if grep -qE '^\[build\]' "$wt/.cargo/config.toml"; then
+            echo "error: $wt/.cargo/config.toml already has a [build] table; merge target-dir into it by hand (#1716)" >&2
+            exit 1
+        fi
+        {
+            cat "$wt/.cargo/config.toml"
+            printf '\n# Pinned by scripts/new-worktree.sh: the worktree path contains a\n# space, which breaks tikv-jemalloc-sys (#1716). Build into a space-free dir.\n[build]\ntarget-dir = "%s"\n' "$wt_target_dir"
+        } > "$wt/.cargo/config.toml.new"
+        mv "$wt/.cargo/config.toml.new" "$wt/.cargo/config.toml"
         echo "note: worktree path contains a space; pinned a space-free CARGO_TARGET_DIR via $wt/.cargo/config.toml (#1716)" >&2
     fi
 fi

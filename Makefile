@@ -102,9 +102,9 @@ FMT_CRATES := $(call encode,$(ENGINE_DIR)) $(call encode,$(PROJECT_ROOT)/server)
 #    under the (space-free) XDG data home. Consumers of a built artifact
 #    (engine-core/scripts/verify-wasm-ffi.mjs, emit-dist.mjs) resolve Cargo's
 #    EFFECTIVE target dir via lib-cargo-target-dir.mjs rather than assuming
-#    engine-core/target. An explicit CARGO_TARGET_DIR with a space fails fast
-#    with a clear message instead of an autoconf error that looks like a
-#    toolchain bug.
+#    engine-core/target. An explicit CARGO_TARGET_DIR that is relative or has a
+#    space fails fast with a clear message instead of an autoconf error that
+#    looks like a toolchain bug.
 # 2. GNU make cannot express a prerequisite whose path contains a space
 #    (whitespace is the prerequisite separator and backslash-escaping is not
 #    honored on target/prerequisite lines), so the file-target rules for the
@@ -120,8 +120,23 @@ ifneq ($(findstring $(SPACE),$(PROJECT_ROOT)),)
     CHECKOUT_HASH := $(shell printf '%s' "$(PROJECT_ROOT)" | cksum | cut -d' ' -f1)
     export CARGO_TARGET_DIR := $(HOME)/.local/share/nanobpm/target/$(CHECKOUT_HASH)
     $(info note: checkout path contains a space; CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) (jemalloc configure splits spaced paths, #1716))
-  else ifneq ($(findstring $(SPACE),$(CARGO_TARGET_DIR)),)
-    $(error CARGO_TARGET_DIR ($(CARGO_TARGET_DIR)) contains a space: tikv-jemalloc-sys cannot build there (#1716). Point it at a space-free directory, e.g. $$HOME/.local/share/nanobpm/target)
+  else
+    # Caller chose a target dir. It must be ABSOLUTE and space-free: a relative
+    # value (e.g. CARGO_TARGET_DIR=target) is space-free as text but Cargo
+    # resolves it under the (spaced) workspace root, so jemalloc's configure
+    # still word-splits it (#1716). Reject both failure shapes with a clear
+    # message instead of an autoconf error that looks like a toolchain bug.
+    #
+    # Check the space FIRST: $(findstring) matches a space anywhere, whereas
+    # the absolute test below uses $(filter /%,…), which word-splits a spaced
+    # value and so only works once the value is known to be a single word.
+    ifneq ($(findstring $(SPACE),$(CARGO_TARGET_DIR)),)
+      $(error CARGO_TARGET_DIR ($(CARGO_TARGET_DIR)) contains a space: tikv-jemalloc-sys cannot build there (#1716). Point it at a space-free directory, e.g. $$HOME/.local/share/nanobpm/target)
+    endif
+    # Space-free now, so a single word: $(filter /%,…) is a safe absolute test.
+    ifneq ($(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR))
+      $(error CARGO_TARGET_DIR ($(CARGO_TARGET_DIR)) is relative, so Cargo resolves it under the spaced checkout and tikv-jemalloc-sys still cannot build (#1716). Use an ABSOLUTE space-free path, e.g. $$HOME/.local/share/nanobpm/target)
+    endif
   endif
 endif
 

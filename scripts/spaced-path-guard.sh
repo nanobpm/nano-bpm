@@ -107,6 +107,16 @@ if [ -f "${NEW_WORKTREE}" ] && grep -qP '>\s*\S*\.envrc' "${NEW_WORKTREE}"; then
 	fail "scripts/new-worktree.sh writes a direnv .envrc for CARGO_TARGET_DIR — nothing sources it, so direct cargo runs still build under the spaced worktree (#1716). Pin [build] target-dir in the worktree's .cargo/config.toml instead"
 fi
 
+# … and when it writes .cargo/config.toml it must MERGE (append [build] onto
+# the tracked config), not OVERWRITE it — the tracked config carries the Linux
+# mold link flags and the wasm32 wsqlite3 build-script override (epic #796),
+# which a bare `> config.toml` clobber would silently drop. Detect a direct
+# overwrite of config.toml (a `>` redirect that is NOT the merge's
+# config.toml.new temp file).
+if [ -f "${NEW_WORKTREE}" ] && grep -qP '>\s*\S*\.cargo/config\.toml\b(?!\.new)' "${NEW_WORKTREE}"; then
+	fail "scripts/new-worktree.sh overwrites the worktree's .cargo/config.toml — that drops the tracked mold flags and wsqlite3 override (#1716 / epic #796). Merge [build] target-dir onto the existing config instead"
+fi
+
 # --- 2. Functional probe: run fmt-check from a directory whose path has a ----
 # --- space. Opt-in: needs the pinned nightly rustfmt + codegen stubs.      ---
 if [ "${NANOBPMN_SPACED_PROBE:-0}" = 1 ]; then
@@ -132,6 +142,12 @@ if [ "${NANOBPMN_SPACED_PROBE:-0}" = 1 ]; then
 		[ -d "${ROOT}/${d}/examples" ] && cp -R "${ROOT}/${d}/examples" "${probe}/${d}/"
 		[ -d "${ROOT}/${d}/benches" ] && cp -R "${ROOT}/${d}/benches" "${probe}/${d}/"
 	done
+	# server/Cargo.toml patches crates.io deps to RELATIVE paths under
+	# third_party/ (openraft -> ../third_party/openraft-0.9.24, …). The probe
+	# cannot load the server workspace — and so `make fmt-check` fails
+	# regardless of formatting — unless those vendored crates exist at the same
+	# relative location. Copy the whole (small) third_party/ tree.
+	cp -R "${ROOT}/third_party" "${probe}/third_party"
 	# fmt-stub-codegen.sh locates the repo root via git, so the probe dir must
 	# be a git work tree.
 	git -C "${probe}" init -q
