@@ -2103,3 +2103,96 @@ fn run_direct_mi_user_task(sequential: bool, completing_listener: bool) {
         );
     }
 }
+
+/// #1719 review — creation-time expressions on a multi-instance user task
+/// (assignee, creating-listener job type) must be evaluated in EACH child's
+/// own scope, after its input mapping. Distinct per-child items and a
+/// per-child input mapping make a body- or sibling-scope evaluation visible.
+#[test]
+fn direct_mi_user_task_evaluates_creation_expressions_in_each_child_scope() {
+    use crate::model::{IoMapping, Mapping, UserTaskProps};
+    let def = ProcessBuilder::new("mi_scope")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: Some("=who".to_string()),
+                ..Default::default()
+            },
+        )
+        .with_multi_instance(
+            "review",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "review",
+            IoMapping {
+                inputs: vec![Mapping {
+                    source: "=\"user-\" + item".to_string(),
+                    target: "who".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .with_task_listeners(
+            "review",
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Creating,
+                job_type: "=\"create-\" + item".to_string(),
+                retries: None,
+            }],
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi_scope",
+            vars(&[(
+                "items",
+                Value::List(vec![
+                    Value::Str("a".to_string()),
+                    Value::Str("b".to_string()),
+                ]),
+            )]),
+        ))
+        .unwrap();
+
+    for item in ["a", "b"] {
+        let jobs = engine.activate_jobs(format!("create-{item}"), "W", 10, 1_000, 0);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "exactly one creating-listener job typed from child item {item}"
+        );
+        engine
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+    }
+
+    let mut assignees: Vec<Option<String>> = engine
+        .state()
+        .user_tasks
+        .values()
+        .filter(|t| t.element_id == "review")
+        .map(|t| t.assignee.clone())
+        .collect();
+    assignees.sort();
+    assert_eq!(
+        assignees,
+        vec![Some("user-a".to_string()), Some("user-b".to_string())],
+        "each child's assignee resolves from its own mapped value"
+    );
+}
