@@ -824,6 +824,10 @@ impl<'a> NanoRun<'a> {
         // `outputElement` nil seed), then `loopCounter` last.
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
         let mut out = Vec::new();
+        // An `inputElement` named `loopCounter` is written once, by the
+        // counter block below — emitting it here too would produce a
+        // duplicate (CREATED + spurious UPDATED) binding.
+        let input_element = input_element.filter(|n| *n != "loopCounter");
         if let Some((name, v)) = input_element.and_then(|n| vars.get_key_value(n)) {
             out.push(self.variable_record(
                 child_key,
@@ -3996,5 +4000,29 @@ fn zeebe_golden_projects_to_spec_milestones() {
         golden_in_fixture_ids, spec_milestones,
         "golden and spec milestone multisets must be identical once renamed into \
          the fixture's id space\n  golden: {golden_in_fixture_ids:?}\n  spec:   {spec_milestones:?}"
+    );
+}
+
+#[test]
+fn mi_child_input_element_named_loop_counter_is_rendered_once() {
+    let (_, sc, _) = first_scenario();
+    let mut run = NanoRun::new(&sc);
+    let vars: BTreeMap<String, Value> = [
+        ("loopCounter".to_string(), Value::Int(1)),
+        ("out".to_string(), Value::Null),
+    ]
+    .into_iter()
+    .collect();
+    let records = run.render_mi_child_variables(7, "task".into(), &vars, Some("loopCounter"), 1);
+    let names: Vec<_> = records
+        .iter()
+        .map(|r| (r["value"]["name"].as_str().unwrap().to_string(), r["intent"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("out".to_string(), "CREATED".to_string()),
+            ("loopCounter".to_string(), "CREATED".to_string()),
+        ]
     );
 }
