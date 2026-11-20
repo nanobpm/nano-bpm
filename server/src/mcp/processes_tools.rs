@@ -118,15 +118,41 @@ impl ProcessTool {
 
     /// Authoring conflicts surfaced to the console (never silently merged).
     fn warnings(&self) -> Vec<String> {
-        match &self.envelope {
-            Some((shape, _)) if has_input_properties(&self.properties) => vec![format!(
-                "The start message declares data envelope `{shape}` and \
-                 `{TOOL_PROPERTY_PREFIX}input_N_*` properties; the envelope defines the \
-                 inputSchema and the input_N_* properties are ignored."
-            )],
-            _ => Vec::new(),
-        }
+        envelope_warnings(self.envelope.as_ref(), &self.properties)
     }
+}
+
+/// Authoring conflicts between the start message's data envelope and the
+/// tool properties: an envelope next to `input_N_*` properties (the latter are
+/// ignored), and an envelope field named like the reserved `businessId`
+/// argument (stripped from the variables, so that field is never delivered).
+pub(crate) fn envelope_warnings(
+    envelope: Option<&(String, Value)>,
+    props: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let Some((shape, schema)) = envelope else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if has_input_properties(props) {
+        warnings.push(format!(
+            "The start message declares data envelope `{shape}` and \
+             `{TOOL_PROPERTY_PREFIX}input_N_*` properties; the envelope defines the \
+             inputSchema and the input_N_* properties are ignored."
+        ));
+    }
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|p| p.contains_key(BUSINESS_ID_ARGUMENT))
+    {
+        warnings.push(format!(
+            "Data envelope `{shape}` declares a field `{BUSINESS_ID_ARGUMENT}`, which is \
+             the reserved MCP argument and is never passed as a process variable; rename \
+             the envelope field."
+        ));
+    }
+    warnings
 }
 
 /// The open tool subscriptions: message start subscriptions that carry a

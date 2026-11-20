@@ -179,3 +179,17 @@ test("replaceOp swaps an op outright, leaving no stale fields (retype)", () => {
   // Out-of-range is a no-op returning the same array.
   assert.equal(replaceOp(ops, 5, newOp("carry")), ops);
 });
+
+test("changeOpKind preserves a field description across extend <-> reference", () => {
+  const ext: ShapeOp = { op: "extend", name: "a", type: "string", description: "Doc." };
+  const ref = changeOpKind(ext, "reference");
+  assert.deepEqual(ref, { op: "reference", name: "a", ref: "", description: "Doc." });
+  assert.deepEqual(changeOpKind(ref, "extend"), {
+    op: "extend",
+    name: "a",
+    type: "string",
+    description: "Doc.",
+  });
+  // carry has no description slot.
+  assert.deepEqual(changeOpKind(ext, "carry"), { op: "carry", ref: "" });
+});

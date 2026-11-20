@@ -76,10 +76,18 @@ pub fn shape_json_schema(
     shape_id: &str,
     process_id: Option<&str>,
 ) -> Option<Value> {
-    let resolver = Resolver { shapes, process_id };
+    let resolver = Resolver {
+        shapes,
+        process_id,
+        budget: std::cell::Cell::new(MAX_EXPANDED_OPS),
+    };
     let shape = resolver.find(shape_id)?;
     let mut stack = Vec::new();
-    Some(resolver.object(shape, &mut stack).into_schema())
+    let obj = resolver.object(shape, &mut stack);
+    // An acyclic graph of shared references can still expand exponentially;
+    // an exhausted budget means the schema is incomplete, so derive nothing
+    // rather than advertise a truncated contract.
+    (resolver.budget.get() > 0).then(|| obj.into_schema())
 }
 
 /// An object schema under construction: ordered properties plus the
@@ -115,9 +123,16 @@ impl Obj {
     }
 }
 
+/// The most shape ops a single derivation may expand (counting every op of
+/// every nested occurrence), bounding the work and the schema size for
+/// acyclic graphs whose shared references expand exponentially.
+pub const MAX_EXPANDED_OPS: usize = 10_000;
+
 struct Resolver<'a> {
     shapes: &'a [ShapeDecl],
     process_id: Option<&'a str>,
+    /// Remaining op-expansion budget; `0` once exhausted.
+    budget: std::cell::Cell<usize>,
 }
 
 impl<'a> Resolver<'a> {
@@ -148,6 +163,11 @@ impl<'a> Resolver<'a> {
         stack.push(shape.id.clone());
         let mut obj = Obj::default();
         for op in &shape.ops {
+            let left = self.budget.get();
+            if left == 0 {
+                break;
+            }
+            self.budget.set(left - 1);
             match op {
                 ShapeOp::Carry { r#ref } => {
                     if let Some(inner) = self.resolve(r#ref, stack) {
@@ -155,11 +175,11 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 ShapeOp::Project { r#ref, fields, .. } => {
-                    let mut inner = self.resolve(r#ref, stack);
+                    let inner = self.resolve(r#ref, stack);
                     for field in fields {
-                        match inner.as_mut().and_then(|o| {
+                        match inner.as_ref().and_then(|o| {
                             let required = o.required.contains(field);
-                            o.properties.remove(field).map(|s| (s, required))
+                            o.properties.get(field).cloned().map(|s| (s, required))
                         }) {
                             Some((schema, required)) => obj.set(field, schema, required),
                             None => obj.set(field, json!({}), false),
@@ -188,7 +208,8 @@ impl<'a> Resolver<'a> {
                     description,
                 } => {
                     let inner = self.resolve(r#ref, stack);
-                    if *spread == Some(true) && *list != Some(true) {
+                    // `spread` wins over `list`, as in the reifier (`domain_types.ts`).
+                    if *spread == Some(true) {
                         if let Some(inner) = inner {
                             obj.spread(inner);
                         }
@@ -221,6 +242,53 @@ fn field(item: Value, list: Option<bool>, description: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shapes_doc(shapes: &str) -> String {
+        doc(shapes, ENVELOPE)
+    }
+
+    #[test]
+    fn repeated_projection_keeps_typed_required_field() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order"><nano:project ref="Base" fields="a,a" /></nano:shape>
+               <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        assert_eq!(
+            schema,
+            json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
+        );
+    }
+
+    #[test]
+    fn spread_wins_over_list() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order"><nano:reference name="b" ref="Base" spread="true" list="true" /></nano:shape>
+               <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        assert_eq!(
+            schema,
+            json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
+        );
+    }
+
+    #[test]
+    fn exponential_acyclic_expansion_is_bounded() {
+        let mut shapes = String::from(
+            r#"<nano:shape id="Order"><nano:reference name="l" ref="S0" /><nano:reference name="r" ref="S0" /></nano:shape>"#,
+        );
+        for i in 0..25 {
+            shapes.push_str(&format!(
+                r#"<nano:shape id="S{i}"><nano:reference name="l" ref="S{n}" /><nano:reference name="r" ref="S{n}" /></nano:shape>"#,
+                n = i + 1
+            ));
+        }
+        shapes.push_str(
+            r#"<nano:shape id="S25"><nano:extend name="x" type="string" /></nano:shape>"#,
+        );
+        assert!(message_input_schema(&shapes_doc(&shapes), "placeOrder", None).is_none());
+    }
 
     fn doc(shapes: &str, message_props: &str) -> String {
         format!(
