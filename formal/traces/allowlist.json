@@ -20,13 +20,13 @@
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed + call-activity input mapping not local (#1536)",
-      "nanoTrace": "274d14533053d674"
+      "nanoTrace": "caa9352862837c44"
     },
     {
       "scenario": "g-2",
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "05a6c2c2fd2f98c1"
+      "nanoTrace": "1ac56d307597479b"
     },
     {
       "scenario": "g-3",
@@ -36,15 +36,15 @@
     },
     {
       "scenario": "g-4",
-      "issue": "#1533",
-      "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "4b977466001b96c0"
+      "issue": "#1711",
+      "reason": "a null completion value equal to the MI child's null-valued local is not propagated (Zeebe updates the process-scope result)",
+      "nanoTrace": "22b8187942dcf7b4"
     },
     {
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "b6246a9d01d8ccb0"
+      "nanoTrace": "1506d2748f35dd0d"
     },
     {
       "scenario": "g-6",
@@ -56,7 +56,7 @@
       "scenario": "g-8",
       "issue": "#1535",
       "reason": "interrupting timer boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "2eddf682a5d964ed"
+      "nanoTrace": "e1b16ffacf038916"
     },
     {
       "scenario": "g-9",
@@ -68,7 +68,7 @@
       "scenario": "g-10",
       "issue": "#1535",
       "reason": "interrupting message boundary on a user task: COMPLETED instead of TERMINATED, no USER_TASK CANCELED",
-      "nanoTrace": "8b153ddd7737c87b"
+      "nanoTrace": "f3fecc5338d83ccc"
     },
     {
       "scenario": "g-11",
@@ -78,21 +78,15 @@
     },
     {
       "scenario": "g-12",
-      "issue": "#1533",
-      "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "171c9b593927a7b8"
+      "issue": "#1535",
+      "reason": "a task interrupted by a message boundary completes instead of terminating",
+      "nanoTrace": "32ad2d735a6060c0"
     },
     {
       "scenario": "g-13",
-      "issue": "#1533",
-      "reason": "output-mapped user task completion leaks to the process scope; MI outputCollection not body-local (#1534) + #1518",
-      "nanoTrace": "a67e5b6fd510c471"
-    },
-    {
-      "scenario": "g-14",
       "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "915aff81a749e715"
+      "reason": "MI outputCollection not body-local (#1534) + #1518; #1533 (output-mapped completion leak) fixed",
+      "nanoTrace": "71b6de1fec0753b8"
     },
     {
       "scenario": "g-15",
@@ -101,46 +95,16 @@
       "nanoTrace": "aa52e4955dbd913e"
     },
     {
-      "scenario": "g-16",
-      "issue": "#1533",
-      "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "9c220727647d0c57"
-    },
-    {
-      "scenario": "g-17",
-      "issue": "#1533",
-      "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "a07f0a7af60fde36"
-    },
-    {
       "scenario": "g-18",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
       "nanoTrace": "b73282d8a918c858"
     },
     {
-      "scenario": "g-20",
-      "issue": "#1533",
-      "reason": "completion variables of a task with output mappings leak to the process scope",
-      "nanoTrace": "6f99114b46e53c62"
-    },
-    {
-      "scenario": "g-22",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "8e7f8638abcb5850"
-    },
-    {
       "scenario": "g-24",
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "68195c07c3e2306f"
-    },
-    {
-      "scenario": "g-25",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "6cd6d594b57ba19a"
+      "nanoTrace": "887d7a7c160bfcc2"
     },
     {
       "scenario": "g-26",
@@ -158,7 +122,7 @@
       "scenario": "g-30",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "2ff4050efbdca69d"
+      "nanoTrace": "69af519d14988e10"
     },
     {
       "scenario": "esp-message-interrupting",

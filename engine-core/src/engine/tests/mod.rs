@@ -13,6 +13,7 @@ mod boundary;
 mod call_activity;
 mod cluster_variables;
 mod compensation_escalation;
+mod completion_variables;
 mod conditional_start;
 mod error_end_event;
 mod esp_error_escalation;
