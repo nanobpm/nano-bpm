@@ -336,12 +336,14 @@ impl RecordedInstance {
         // but sort defensively so attribution never depends on transport order.
         stimuli.sort_by_key(|s| s.seq);
 
-        // The terminal snapshot is an observation, not an input: a byte-capped
-        // one only loses the comparison target, never the replay itself.
-        let terminal_variables = trace
-            .terminal_variables
-            .as_ref()
-            .and_then(|v| resolve(v).ok());
+        // A present-but-capped terminal snapshot must NOT degrade to `None`:
+        // `None` means "legacy trace" and selects the stimulus-fold comparison
+        // target, which is wrong whenever a boundary remaps local inputs (#1759).
+        // Only an absent field takes the legacy path.
+        let terminal_variables = match &trace.terminal_variables {
+            Some(v) => Some(resolve(v)?),
+            None => None,
+        };
 
         Ok(Self {
             instance_key: trace.instance_key.clone(),
@@ -1699,6 +1701,27 @@ mod tests {
         };
         let r = RecordedInstance::from_trace(&trace).unwrap();
         assert_eq!(r.terminal_variables, Some(map(&[("out", json!(1))])));
+    }
+
+    #[test]
+    fn from_trace_rejects_a_capped_terminal_snapshot_instead_of_legacy_fold() {
+        use crate::contracts::Variables;
+        let trace = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            outcome: "COMPLETED".into(),
+            stimuli: Some(vec![]),
+            terminal_variables: Some(Variables {
+                truncated: true,
+                bytes: 99999,
+                values: None,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            RecordedInstance::from_trace(&trace),
+            Err(ReplayUnavailable::SnapshotTruncated)
+        ));
     }
 
     #[test]

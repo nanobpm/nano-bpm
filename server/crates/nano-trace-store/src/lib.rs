@@ -613,13 +613,23 @@ impl Inner {
                 variables,
             } => {
                 if !self.capture_vars {
+                    // An update we do not observe makes the running root state
+                    // incomplete for good: invalidate it so neither a terminal
+                    // nor an incident snapshot can publish stale values, even
+                    // if capture is re-enabled later (#1759).
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.current_variables = None;
+                    }
                     return;
                 }
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    let running = t.current_variables.get_or_insert_with(BTreeMap::new);
-                    for (k, v) in variables {
-                        running.insert(k.clone(), v.clone());
+                    // `None` means the history is incomplete (capture was off at
+                    // creation or was interrupted): never rebuild a partial map.
+                    if let Some(running) = t.current_variables.as_mut() {
+                        for (k, v) in variables {
+                            running.insert(k.clone(), v.clone());
+                        }
                     }
                     // Tier 2: attribute this delta to the completion it followed
                     // (a job/user-task output; a message payload is read from
@@ -2805,5 +2815,32 @@ mod tests {
         let stimuli = store.get(1).unwrap().stimuli.unwrap();
         assert_eq!(kinds(&stimuli), ["message", "variablesSet"]);
         assert_eq!(stimulus_values(&stimuli[0]), None);
+    }
+
+    /// Class guard (#1759): a root-state history interrupted by a capture
+    /// toggle is incomplete, so no terminal snapshot may publish stale values —
+    /// even after capture is re-enabled.
+    #[test]
+    fn interrupted_capture_publishes_no_stale_terminal_state() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("x", Value::Int(0))])], 1000);
+        store.set_capture(Some(false), None);
+        store.ingest(&[&vars_updated(1, &[("x", Value::Int(1))])], 1010);
+        store.set_capture(Some(true), None);
+        store.ingest(&[&vars_updated(1, &[("y", Value::Int(2))])], 1020);
+        store.ingest(&[&completed(1)], 1030);
+        assert!(store.get(1).unwrap().terminal_variables.is_none());
+    }
+
+    /// Sibling (#1759): an instance created while capture was off has no root
+    /// baseline; enabling capture mid-flight must not build a partial terminal.
+    #[test]
+    fn capture_enabled_mid_instance_publishes_no_partial_terminal_state() {
+        let store = TraceStore::new(8);
+        store.ingest(&[&created(1, &[("x", Value::Int(0))])], 1000);
+        store.set_capture(Some(true), None);
+        store.ingest(&[&vars_updated(1, &[("y", Value::Int(2))])], 1010);
+        store.ingest(&[&completed(1)], 1020);
+        assert!(store.get(1).unwrap().terminal_variables.is_none());
     }
 }
