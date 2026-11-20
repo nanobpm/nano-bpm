@@ -24,6 +24,15 @@
 //   task    a flow through one serviceTask (a wait state)  (2 flows)
 //   msg     a flow through one message intermediateCatchEvent (2 flows);
 //           exactly the outgoing edges of an event-based gateway
+//   timer   a flow through one timer intermediateCatchEvent (2 flows), a wait
+//           state the `tick` command (advanceTime) resumes (#1673)
+//   sub     a flow through an embedded subProcess wrapping one inner service
+//           task (container + inner start/task/end), a wait state from the
+//           outside — only its 2 OUTER flows count against the bound (#1673)
+//   btimer  a `task` whose serviceTask carries an interrupting TIMER boundary
+//           event; the boundary's outgoing flow lands on the edge's target
+//           (3 flows: in, task-out, boundary-out)              (#1673)
+//   bmsg    the same with an interrupting MESSAGE boundary     (#1673)
 //
 // so a task (and a catch event) has exactly one incoming and one outgoing flow,
 // and two wait states are never chained without a gateway between them (a chain
@@ -34,7 +43,16 @@
 //     MIXED gateway (>= 2 in, >= 2 out — synchronise, then route, exactly as
 //     engine-core's inclusive/parallel gateways do) — never a 1-in-1-out no-op.
 //   - An event-based gateway (`evt`) is a split whose every outgoing edge is a
-//     `msg` edge; no other node has a `msg` edge.
+//     `msg` edge; no other node has a `msg` edge. A `timer` edge is allowed
+//     anywhere a `task` edge is (it is a wait state like any other).
+//   - A `btimer`/`bmsg` edge carries its boundary's OUTGOING flow to the same
+//     target, so the target of such an edge has TWO incoming flows (the task's
+//     and the boundary's). That target must be able to receive two tokens over
+//     the run: an `xor` merge (pass-through) or an `and`/`or` join/mixed
+//     gateway — never a plain 1-in element, which the boundary path would
+//     over-activate. The boundary can fire at most once per task activation
+//     (interrupting), and only INSTEAD of the task's own completion, so the
+//     pair still delivers exactly one token to the target per activation.
 //   - The skeleton is acyclic. Every node then lies on a path S -> E (S is the
 //     only source, E the only sink), so there is no dead element.
 //
@@ -49,11 +67,17 @@ import {
   tlaFor,
   routeVariable,
   messageName,
-  CORRELATION_KEY_VARIABLE
+  CORRELATION_KEY_VARIABLE,
+  TIMER_TICK_MS
 } from './generate.mjs'
 
 export const GATEWAY_KINDS = ['xor', 'and', 'or', 'evt']
-const LABEL_COST = { direct: 1, task: 2, msg: 2 }
+// Every edge label of the skeleton vocabulary (#1673): the wait-state kinds the
+// Reference models a command for. `BOUNDARY_LABELS` carry an interrupting
+// boundary event on their task.
+export const EDGE_LABELS = ['direct', 'task', 'msg', 'timer', 'sub', 'btimer', 'bmsg']
+export const BOUNDARY_LABELS = ['btimer', 'bmsg']
+const LABEL_COST = { direct: 1, task: 2, msg: 2, timer: 2, sub: 2, btimer: 3, bmsg: 3 }
 
 // ---------------------------------------------------------------------------
 // Skeleton enumeration
@@ -66,9 +90,16 @@ const LABEL_COST = { direct: 1, task: 2, msg: 2 }
  * topological numbering) yields every DAG; `canonicalKey` then removes the
  * duplicates the numbering introduces.
  */
-export function * enumerateSkeletons ({ gateways, flows, kinds = GATEWAY_KINDS }) {
+export function * enumerateSkeletons ({ gateways, flows, kinds = GATEWAY_KINDS, labels = null }) {
   for (const k of kinds) {
     if (!GATEWAY_KINDS.includes(k)) throw new Error(`unknown gateway kind ${JSON.stringify(k)} (known: ${GATEWAY_KINDS.join(', ')})`)
+  }
+  // The edge labels in scope: the full vocabulary by default, narrowed by
+  // `labels` (a fuzzer `--labels` flag shapes the generator the way `--kinds`
+  // shapes the gateways). `msg` is forced by an `evt` gateway regardless.
+  const plain = (labels ?? EDGE_LABELS).filter((l) => l !== 'msg')
+  for (const l of plain) {
+    if (!EDGE_LABELS.includes(l) || l === 'msg') throw new Error(`unknown edge label ${JSON.stringify(l)} (known: ${EDGE_LABELS.filter((x) => x !== 'msg').join(', ')}; msg is implied by evt)`)
   }
   for (let k = 0; k <= gateways; k++) {
     for (const kindTuple of tuples(kinds, k)) {
@@ -79,7 +110,13 @@ export function * enumerateSkeletons ({ gateways, flows, kinds = GATEWAY_KINDS }
         for (let j = i + 1; j <= E; j++) {
           if (i === 0 && j === E && k > 0) continue // S would need a 2nd out-flow
           const fromEvt = i > 0 && kindTuple[i - 1] === 'evt'
-          for (const label of fromEvt ? ['msg'] : ['direct', 'task']) slots.push([i, j, label])
+          // A boundary's outgoing flow lands on the edge's target, so a
+          // boundary edge may only target a node that accepts two incoming
+          // tokens: an `xor` merge or an `and`/`or` join/mixed gateway (E is
+          // fine too — it simply consumes both). A 1-in-1-out target would be
+          // over-activated by the boundary path.
+          const boundaryOk = j === E || (j > 0 && kindTuple[j - 1] !== 'evt')
+          for (const label of fromEvt ? ['msg'] : boundaryOk ? plain : plain.filter((l) => !BOUNDARY_LABELS.includes(l))) slots.push([i, j, label])
         }
       }
       yield * multisets(slots, flows, (edges) => wellFormed(kindTuple, edges))
@@ -132,6 +169,13 @@ export function wellFormed (kinds, edges) {
     inDeg[j]++
     const fromEvt = i > 0 && i <= k && kinds[i - 1] === 'evt'
     if (fromEvt !== (label === 'msg')) return false
+    // A boundary edge's target receives the boundary's outgoing flow too, so it
+    // must be a merge-capable node (a gateway other than the split-only `evt`)
+    // or E — never a plain pass-through that the boundary path over-activates.
+    if (BOUNDARY_LABELS.includes(label)) {
+      if (j !== E && (j === 0 || j > k || kinds[j - 1] === 'evt')) return false
+      inDeg[j]++ // the boundary's own outgoing flow
+    }
   }
   if (outDeg[0] !== 1 || inDeg[0] !== 0) return false
   if (inDeg[E] < 1 || outDeg[E] !== 0) return false
@@ -204,22 +248,54 @@ export function materialize (skel) {
   for (let i = 1; i <= k; i++) kinds[perm[i] - 1] = skel.kinds[i - 1]
   const edges = skel.edges.map(([i, j, l]) => [perm[i], perm[j], l])
     .sort((a, b) => (edgeStr(a) < edgeStr(b) ? -1 : edgeStr(a) > edgeStr(b) ? 1 : 0))
+  const graph = { boundaryOf: Object.create(null) }
   const hash = createHash('sha256').update(key).digest('hex').slice(0, 10)
   const id = `Gen_${hash}`
   const name = (i) => (i === 0 ? 'S' : i === k + 1 ? 'E' : `G${i}`)
   const nodes = { S: 'start' }
   for (let i = 1; i <= k; i++) nodes[`G${i}`] = kinds[i - 1]
   const graphEdges = []
-  let f = 0; let t = 0; let m = 0
+  let f = 0; let t = 0; let m = 0; let w = 0; let p = 0; let b = 0
   const flow = (from, to) => graphEdges.push({ id: `f${++f}`, from, to })
   for (const [i, j, label] of edges) {
     if (label === 'direct') {
       flow(name(i), name(j))
+    } else if (label === 'sub') {
+      // An embedded subProcess wrapping ONE inner service task (#1673): the
+      // container `P` is entered by the skeleton edge's entry flow and left by
+      // its exit flow; its inner chain (inner start -> inner task -> inner end)
+      // is scoped to it. Entering the container activates the inner start; the
+      // inner end's arrival completes the container and routes the exit flow.
+      // The container carries 2 outer + 3 inner flows, but only the 2 OUTER
+      // ones count against the `flows` bound (the inner chain is fixed
+      // structure, not enumerated shape).
+      const sub = `P${++p}`
+      nodes[sub] = 'sub'
+      nodes[`${sub}s`] = 'start'
+      nodes[`${sub}t`] = 'task'
+      nodes[`${sub}e`] = 'subend'
+      flow(name(i), sub)
+      flow(sub, name(j))
+      flow(`${sub}s`, `${sub}t`)
+      flow(`${sub}t`, `${sub}e`)
+    } else if (BOUNDARY_LABELS.includes(label)) {
+      // A service task carrying an interrupting boundary event (#1673): the
+      // task's own outgoing flow AND the boundary's outgoing flow both land on
+      // the edge's target. The boundary node has no incoming flow (it is
+      // attached, not flowed into); `attachedTo` links it to its task.
+      const task = `T${++t}`
+      const bd = `B${++b}`
+      nodes[task] = 'task'
+      nodes[bd] = label === 'btimer' ? 'btimer' : 'bmsg'
+      flow(name(i), task)
+      flow(task, name(j))
+      flow(bd, name(j))
+      graph.boundaryOf[bd] = task
     } else {
-      const w = label === 'task' ? `T${++t}` : `M${++m}`
-      nodes[w] = label === 'task' ? 'task' : 'msg'
-      flow(name(i), w)
-      flow(w, name(j))
+      const n = label === 'task' ? `T${++t}` : label === 'msg' ? `M${++m}` : `W${++w}`
+      nodes[n] = label
+      flow(name(i), n)
+      flow(n, name(j))
     }
   }
   nodes.E = 'end'
@@ -230,6 +306,9 @@ export function materialize (skel) {
     start: 'S',
     nodes,
     edges: graphEdges,
+    // The task each boundary node is attached to (boundary node id -> task id),
+    // empty when the graph has no boundary events (#1673).
+    boundaryOf: graph.boundaryOf,
     families: {
       TokenFlow: { module: `MC${id}`, comment: [`Bounded-exhaustive graph ${key}`, shape] },
       ZeebeTokenFlow: { module: `ZMC${id}`, comment: [`Zeebe reference of bounded-exhaustive graph ${key}`, shape] }
@@ -342,6 +421,16 @@ export class Reference {
     // straight off the run instead of re-deriving it.
     this.joinsFired = Object.create(null)
     this.completed = false
+    // Set by the `cancel` command (#1673): the instance was terminated by the
+    // driver, so it never completes. A cancelled run's scenario is nano-only
+    // (the bare-gateway Camunda backend observes an instance only through its
+    // awaitCompletion create response, which a cancellation rejects).
+    this.cancelled = false
+    // Armed timers (#1673): node id -> due clock (in ticks). A `timer` catch
+    // arms on activation; an interrupting timer boundary arms when its task
+    // activates. The virtual clock advances one tick per `tick` command.
+    this.clock = 0
+    this.timers = Object.create(null)
     // Per-gateway count of activations already routed: the next choice of `n`
     // is `route[routeVariable(n)][activations[n]]` (padded with its last entry).
     this.activations = Object.create(null)
@@ -368,6 +457,7 @@ export class Reference {
     c.takenFlows = { ...this.takenFlows }
     c.joinsFired = { ...this.joinsFired }
     c.activations = { ...this.activations }
+    c.timers = { ...this.timers }
     c.route = Object.fromEntries(Object.entries(this.route).map(([k, v]) => [k, [...v]]))
     c.joinTokens = Object.fromEntries(Object.entries(this.joinTokens).map(([j, a]) => [j, { ...a }]))
     return c
@@ -377,6 +467,8 @@ export class Reference {
   isJoin (n) { return ['and', 'or'].includes(this.kind(n)) && this.inn[n].length > 1 }
   isRouted (n) { return ['xor', 'or'].includes(this.kind(n)) && this.out[n].length > 1 }
   target (f) { return f === '<create>' ? this.graph.start : this.graph.edges.find((e) => e.id === f).to }
+  /** The task a boundary node is attached to (undefined for non-boundaries). */
+  attachedTo (n) { return (this.graph.boundaryOf ?? {})[n] }
 
   /** The flow ids `n`'s next activation takes under `route` (its choice). */
   choice (n, settleChoice) {
@@ -483,7 +575,38 @@ export class Reference {
       const kind = this.kind(n)
       if (kind === 'task' || kind === 'evt') {
         this.waiting[n] += 1
-        if (kind === 'task') this.jobsCreated[n] = (this.jobsCreated[n] ?? 0) + 1
+        if (kind === 'task') {
+          this.jobsCreated[n] = (this.jobsCreated[n] ?? 0) + 1
+          // Arm the interrupting TIMER boundary attached to this task (#1673):
+          // its timer is due one tick after the task activates. (A message
+          // boundary opens a subscription instead — no clock state.)
+          for (const [bd, task] of Object.entries(this.graph.boundaryOf ?? {})) {
+            if (task === n && this.kind(bd) === 'btimer') this.timers[bd] = this.clock + 1
+          }
+        }
+      } else if (kind === 'timer') {
+        // A timer intermediate catch (#1673): a wait state resumed by the
+        // `tick` command once its timer is due. Every generated timer is due
+        // after exactly one tick (the scenario drives the clock).
+        this.waiting[n] += 1
+        this.timers[n] = this.clock + 1
+      } else if (kind === 'sub') {
+        // Entering an embedded sub-process (#1673): the container rests as a
+        // wait state while its inner flow runs — activate its inner start event
+        // (a pass-through drained right away). The container completes when the
+        // inner end drains (the `subend` branch below).
+        this.waiting[n] += 1
+        this.complete(n)
+        this.complete(`${n}s`)
+        this.take(this.out[`${n}s`])
+      } else if (kind === 'subend') {
+        // A sub-process's inner end event consumes its token; its drain is what
+        // completes the container scope, which then routes its outgoing flow.
+        this.complete(n)
+        const sub = n.slice(0, -1) // `${sub}e` -> the container id
+        this.waiting[sub] -= 1
+        this.complete(sub)
+        this.take(this.out[sub])
       } else if (kind === 'end') {
         this.complete(n) // the token is consumed at the end event
       } else if (this.isJoin(n)) {
@@ -523,13 +646,38 @@ export class Reference {
 
   /** The commands possible in this settled state. */
   commands () {
-    if (this.completed) return []
+    if (this.completed || this.cancelled) return []
     const cmds = []
     for (const n of Object.keys(this.graph.nodes)) {
+      if (this.kind(n) === 'task' && this.waiting[n] > 0) {
+        cmds.push({ op: 'complete', node: n })
+        // An interrupting boundary on a waiting task can fire INSTEAD of the
+        // task's completion (#1673): the timer boundary on a `tick` once due,
+        // the message boundary on a `correlateBoundary`.
+        for (const [bd, task] of Object.entries(this.graph.boundaryOf ?? {})) {
+          if (task !== n) continue
+          if (this.kind(bd) === 'btimer') {
+            if ((this.timers[bd] ?? Infinity) <= this.clock) cmds.push({ op: 'fireBoundary', node: bd, task: n })
+          } else {
+            cmds.push({ op: 'correlateBoundary', node: bd, task: n })
+          }
+        }
+      }
       if (this.waiting[n] === 0) continue
-      if (this.kind(n) === 'task') cmds.push({ op: 'complete', node: n })
-      else for (const e of this.out[n]) cmds.push({ op: 'correlate', node: n, flow: e.id, catch: e.to })
+      if (this.kind(n) === 'timer') {
+        if ((this.timers[n] ?? Infinity) <= this.clock) cmds.push({ op: 'fireTimer', node: n })
+      } else if (this.kind(n) === 'evt') {
+        for (const e of this.out[n]) cmds.push({ op: 'correlate', node: n, flow: e.id, catch: e.to })
+      }
     }
+    // The clock can always advance while any timer is armed but not yet due —
+    // the `tick` command that makes a `timer` catch / timer boundary fireable
+    // (#1673). With no armed timer a tick is a no-op the explorer skips. A
+    // tick that changes NOTHING (no timer becomes due) is offered at most once
+    // per state — the explorer's step cap keeps the walk finite.
+    if (Object.keys(this.timers).length > 0) cmds.push({ op: 'tick' })
+    // Instance cancellation (#1673): always a legal command on a live instance.
+    cmds.push({ op: 'cancel' })
     return cmds
   }
 
@@ -566,6 +714,46 @@ export class Reference {
 
   apply (cmd) {
     const next = this.clone()
+    // Instance cancellation (#1673): every token is discarded, every timer and
+    // subscription withdrawn, and the instance is terminated — it never
+    // completes. Nothing drains afterwards.
+    if (cmd.op === 'cancel') {
+      next.cancelled = true
+      next.queue = []
+      for (const n of Object.keys(next.graph.nodes)) { next.waiting[n] = 0; next.joinOpen[n] = false }
+      next.timers = Object.create(null)
+      return next
+    }
+    // A clock tick (#1673): advance the virtual clock. Due timers become
+    // fireable commands (fireTimer / fireBoundary) — the tick itself moves no
+    // token, exactly as the engine's advanceTime only RELEASES due timers.
+    if (cmd.op === 'tick') {
+      next.clock += 1
+      return next
+    }
+    if (cmd.op === 'fireBoundary' || cmd.op === 'correlateBoundary') {
+      // An interrupting boundary (#1673): the attached task is TERMINATED
+      // (Zeebe: ELEMENT_TERMINATED — its pending job is cancelled, never
+      // completed) and the boundary event completes, routing its outgoing
+      // flow. The waiting token sits on the TASK; an interrupted task does
+      // NOT complete, so no completion is recorded for it.
+      next.waiting[cmd.task] -= 1
+      next.complete(cmd.node)
+      delete next.timers[cmd.node]
+      next.take(next.out[cmd.node])
+      next.settle()
+      return next
+    }
+    if (cmd.op === 'fireTimer') {
+      // A timer catch fires (#1673): the event completes and its outgoing flow
+      // is taken; the timer is consumed.
+      next.waiting[cmd.node] -= 1
+      next.complete(cmd.node)
+      delete next.timers[cmd.node]
+      next.take(next.out[cmd.node])
+      next.settle()
+      return next
+    }
     next.waiting[cmd.node] -= 1
     // Completing a task completes the task; correlating completes the gateway.
     // The selected CATCH completes as a pass-through when its flow drains
@@ -575,6 +763,13 @@ export class Reference {
     // — so the branch-sensitive milestone is the catch's own OUTGOING
     // continuation (only the winner's is taken), not the catch's completion.
     next.complete(cmd.node)
+    if (cmd.op === 'complete') {
+      // Completing a task withdraws its still-armed interrupting boundary timer
+      // (#1673): the boundary can no longer fire once its activity is gone.
+      for (const [bd, task] of Object.entries(next.graph.boundaryOf ?? {})) {
+        if (task === cmd.node) delete next.timers[bd]
+      }
+    }
     if (cmd.op === 'correlate') {
       // The engine arms EVERY catch of an event-based gateway at once: the
       // gateway's completion takes every outgoing flow (each catch completes,
@@ -603,8 +798,17 @@ export class Reference {
  * that ends with wait states still held is stuck (left to TLC / the nano-only
  * scenarios).
  */
-export function exploreOrders (graph, route = {}, { limit = Infinity } = {}) {
+export function exploreOrders (graph, route = {}, { limit = Infinity, maxSteps = null } = {}) {
   const runs = []
+  // The command vocabulary includes `tick` and `cancel` (#1673): a tick is a
+  // no-op unless it makes a timer due, and a cancel ends the run — but both
+  // are offered at EVERY settled state, which would explode the tree (every
+  // prefix gains a cancel leaf, and ticks multiply). Bound the walk: at most
+  // `maxSteps` commands (default: 2 per wait-state-bearing node + 2, enough
+  // for every task/catch to complete, every timer to be ticked due and fired,
+  // and one cancel), and offer `cancel` only once a run has at least one step
+  // (cancelling a just-created instance is one case, not one per graph shape).
+  const stepCap = maxSteps ?? 2 * Object.values(graph.nodes).filter((k) => ['task', 'msg', 'timer', 'sub', 'evt'].includes(k)).length + 2
   const rec = (state, steps) => {
     if (runs.length >= limit) return
     // Branch on routing decisions first: a queued unrouted activation of a
@@ -616,7 +820,9 @@ export function exploreOrders (graph, route = {}, { limit = Infinity } = {}) {
       for (const c of p.choices) rec(state.decide(p.node, p.activation, c), steps)
       return
     }
-    const cmds = state.commands()
+    let cmds = state.commands()
+    if (steps.length >= stepCap) cmds = cmds.filter((c) => c.op === 'cancel')
+    if (steps.length === 0) cmds = cmds.filter((c) => c.op !== 'cancel')
     if (cmds.length === 0) {
       runs.push(runOf(state, steps))
       return
@@ -632,6 +838,11 @@ const runOf = (state, steps) => ({
   steps,
   route: state.route,
   completed: state.completed,
+  // Set when the run ends in a `cancel` command (#1673): the instance was
+  // terminated by the driver. A cancelled run's scenario is nano-only (the
+  // bare-gateway Camunda backend observes an instance only through its
+  // awaitCompletion create response, which a cancellation rejects).
+  cancelled: state.cancelled,
   jobsCreated: { ...state.jobsCreated },
   completedElements: { ...state.completedElements },
   takenFlows: { ...state.takenFlows },
@@ -681,7 +892,7 @@ export function randomRun (graph, pick) {
  * Camunda backend only observes an instance through completion.
  */
 export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) => `${graph.id}-o${o}` } = {}) {
-  const hasMsg = Object.values(graph.nodes).includes('msg')
+  const hasMsg = Object.values(graph.nodes).some((k) => k === 'msg' || k === 'bmsg')
   const scenarios = []
   runs.forEach((run, o) => {
     const name = names(o)
@@ -810,6 +1021,30 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         }
         if (Object.keys(cmdVars).length > 0) step.variables = { ...step.variables, ...cmdVars }
         steps.push(step)
+      } else if (c.op === 'tick') {
+        // Advance the virtual clock one tick (#1673). The driver's advanceTime
+        // moves BOTH engines' pinned clocks by the same tick; due timers are
+        // released by the engine. The step is a no-op when no timer is armed.
+        steps.push({ op: 'advanceTime', ms: TIMER_TICK_MS })
+      } else if (c.op === 'fireTimer' || c.op === 'fireBoundary') {
+        // A due timer fired (a timer catch, or an interrupting timer boundary):
+        // the engine releases it ON the advanceTime tick that made it due, so
+        // the scenario needs no separate step — the token move is covered by
+        // the preceding advanceTime. These commands exist in the Reference
+        // only to order the token move after the tick. Emit nothing.
+      } else if (c.op === 'correlateBoundary') {
+        // An interrupting MESSAGE boundary (#1673): correlate its message. The
+        // boundary's subscription is keyed on the scenario correlation key,
+        // exactly like a catch event's.
+        const step = { op: 'publishMessage', name: messageName(graph.id, c.node), correlationKey: name }
+        if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
+        steps.push(step)
+      } else if (c.op === 'cancel') {
+        // Instance cancellation (#1673): the driver cancels the instance. The
+        // run ends here — no further steps, and the scenario is nano-only (a
+        // cancelled instance's awaitCompletion create rejects on Camunda, so
+        // the bare-gateway backend cannot observe it).
+        steps.push({ op: 'cancelInstance' })
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
         if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
@@ -862,6 +1097,10 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
       steps,
       expect: {
         completed: run.completed,
+        // A cancelled run (#1673) pins `cancelled: true`: the nano observation
+        // reads it off the ProcessInstanceCancelled event. Absent for a run
+        // that was not cancelled (the observation defaults to false).
+        ...(run.cancelled ? { cancelled: true } : {}),
         jobsCreated: run.jobsCreated,
         // The route variables are the scenario's own schedule, not an outcome —
         // the oracle pins only the variables the PROCESS produced (the
@@ -881,6 +1120,10 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
       // runtime corpus export (`--out` strips it); it is the in-memory link from
       // a scenario back to its generating run.
       run,
+      // A non-completing run — including a CANCELLED one (#1673) — is observed
+      // by nano only: the bare-gateway Camunda backend learns an instance's
+      // outcome through its awaitCompletion create response, which a stuck or
+      // cancelled instance never answers with `processCompleted: true`.
       ...(run.completed ? {} : { backends: ['nano'] })
     })
   })

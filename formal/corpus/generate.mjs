@@ -97,6 +97,11 @@ export const messageId = (nodeId) => `Message_${nodeId}`
 // sets it to a value unique to that scenario, so a buffered (TTL) message can
 // never correlate a different scenario's instance on a shared Camunda runtime.
 export const CORRELATION_KEY_VARIABLE = 'correlationKey'
+// The virtual-clock tick every generated timer uses (#1673): a timer catch or
+// timer boundary is due exactly one tick after it arms, and the scenario drives
+// the clock one `advanceTime` step per `tick` command. The value matches the
+// traces fuzzer's tick (formal/traces/fuzz/generate.mjs TICK_MS).
+export const TIMER_TICK_MS = 60_000
 // CASE arm order for MCKind; `task` is the OTHER fallback.
 const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor', 'evt', 'msg']
 

@@ -63,6 +63,7 @@ export class NanoBackend {
   constructor() {
     this.provides = new Set([
       "completed",
+      "cancelled",
       "variables",
       "completedElements",
       "sequenceFlows",
@@ -169,6 +170,13 @@ export class NanoBackend {
     this.engine.advanceTime(ms);
   }
 
+  // Cancel (terminate) the running instance (#1673): every token is discarded,
+  // pending jobs/timers/subscriptions cancelled, and the instance transitions
+  // to terminated — the `ProcessInstanceTerminated` event `observe` reads.
+  async cancelInstance(handle) {
+    this.engine.cancelInstance(handle.processInstanceKey);
+  }
+
   async observe(handle) {
     const pik = handle.processInstanceKey;
     const events = JSON.parse(this.engine.events());
@@ -188,6 +196,11 @@ export class NanoBackend {
           break;
         case "ProcessInstanceCompleted":
           obs.completed = true;
+          break;
+        case "ProcessInstanceTerminated":
+          // The instance was terminated (a `cancelInstance` step, #1673) —
+          // distinct from completion: a terminated instance never completes.
+          obs.cancelled = true;
           break;
         default:
           break;
