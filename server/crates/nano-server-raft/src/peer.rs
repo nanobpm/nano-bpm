@@ -75,6 +75,34 @@ impl std::fmt::Display for PeerError {
 
 impl std::error::Error for PeerError {}
 
+/// Maps a failed WebSocket handshake to [`PeerError::Connect`], keeping the
+/// peer's HTTP rejection **body** in the message. A gateway that enforces the
+/// cluster secret or a determinism upgrade boundary (#1702) refuses the join
+/// with HTTP 409 whose body names both versions, the boundary, and the
+/// quiesce/upgrade procedure — the only instructions the joining node's
+/// operator gets. `tungstenite::Error`'s `Display` keeps the status but drops
+/// that body, so a refused join would surface as a bare `409 Conflict` with no
+/// way to tell a secret mismatch from an upgrade boundary.
+fn connect_error(e: tokio_tungstenite::tungstenite::Error) -> PeerError {
+    use tokio_tungstenite::tungstenite::Error;
+    match e {
+        Error::Http(resp) => {
+            let status = resp.status();
+            let body = resp
+                .body()
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            if body.is_empty() {
+                PeerError::Connect(format!("HTTP error: {status}"))
+            } else {
+                PeerError::Connect(format!("HTTP error: {status}: {body}"))
+            }
+        }
+        other => PeerError::Connect(other.to_string()),
+    }
+}
+
 /// A peer's answer to a forwarded unary command — the `status`/`body` of its
 /// `CommandResult` frame, mapped straight back to the originating client.
 #[derive(Debug, Clone)]
@@ -364,7 +392,7 @@ impl PeerLink {
         )
         .await
         {
-            Ok(res) => res.map_err(|e| PeerError::Connect(e.to_string()))?,
+            Ok(res) => res.map_err(connect_error)?,
             Err(_) => {
                 return Err(PeerError::Connect(format!(
                     "connect timed out after {:?}",
@@ -2330,5 +2358,58 @@ mod tests {
             short_circuits, 15,
             "every other caller in the burst must short-circuit under the connect lock"
         );
+    }
+
+    /// #1702 (review): a gateway that REFUSES the WebSocket upgrade — the
+    /// cluster-secret check or a determinism upgrade boundary — answers HTTP
+    /// 409 with a body naming the versions, the boundary, and the
+    /// quiesce/upgrade procedure. That body is the only instruction the
+    /// joining node's operator gets, so `PeerError::Connect` must carry it,
+    /// not just tungstenite's bare `HTTP error: 409 Conflict` Display. This
+    /// drives a real `PeerLink` dial against a rejecting gateway (the dialer
+    /// tests above only exercise acceptors that return 101).
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite's accept_hdr callback signature fixes the Err type"
+    )]
+    #[tokio::test]
+    async fn a_rejected_dial_reports_the_refusal_body() {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        use tokio_tungstenite::tungstenite::http::StatusCode;
+
+        const REFUSAL: &str = "no rolling upgrade across determinism boundary v0.0.28: \
+                               this node runs v0.0.29, the peer runs v0.0.27 — quiesce \
+                               the cluster and upgrade all nodes together";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let callback = move |_req: &Request, _resp: Response| {
+                        let refusal: ErrorResponse =
+                            tokio_tungstenite::tungstenite::http::Response::builder()
+                                .status(StatusCode::CONFLICT)
+                                .body(Some(REFUSAL.to_string()))
+                                .expect("a static refusal response builds");
+                        Err(refusal)
+                    };
+                    let _ = tokio_tungstenite::accept_hdr_async(stream, callback).await;
+                });
+            }
+        });
+
+        let err = match PeerLink::connect_as(&format!("http://{addr}"), Some(1)).await {
+            Ok(_) => panic!("a rejecting gateway must fail the dial"),
+            Err(e) => e.to_string(),
+        };
+        for needle in ["409", "0.0.28", "0.0.27", "quiesce"] {
+            assert!(
+                err.contains(needle),
+                "the connect error preserves the refusal's {needle:?}: {err}"
+            );
+        }
     }
 }
