@@ -8349,9 +8349,9 @@ impl Engine {
         // boundary instance; with no output mappings Zeebe then propagates the
         // whole payload to the flow scope (an output-mapped boundary
         // propagates only its mapped targets, on completion).
-        let boundary_payload = self
-            .boundary_payloads
-            .remove(&(instance_key, scope, element_id.clone()));
+        let boundary_payload =
+            self.boundary_payloads
+                .remove(&(instance_key, scope, element_id.clone()));
         let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
             !self
                 .process_of_instance(instance_key)
@@ -15009,8 +15009,11 @@ impl Engine {
                 // instance, as in Zeebe).
                 // TERMINATING before the inner scope's teardown, TERMINATED
                 // after it (#1535, Zeebe parity).
-                let [terminating, terminated] =
-                    boundary::termination_events(instance_key, caught_eik, caught_element_id.clone());
+                let [terminating, terminated] = boundary::termination_events(
+                    instance_key,
+                    caught_eik,
+                    caught_element_id.clone(),
+                );
                 events.push(terminating);
                 for event in self.scope_teardown_events(instance_key, caught_eik) {
                     if matches!(

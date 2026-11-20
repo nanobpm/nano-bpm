@@ -1719,7 +1719,10 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
     assert!(
         matches!(
             review_lifecycle.as_slice(),
-            [Event::ElementTerminating { .. }, Event::ElementTerminated { .. }]
+            [
+                Event::ElementTerminating { .. },
+                Event::ElementTerminated { .. }
+            ]
         ),
         "the interrupted task is terminated, not completed: {review_lifecycle:?}"
     );
@@ -1731,9 +1734,14 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
         .expect("the interrupted user task is canceled");
     let terminated_at = fired
         .iter()
-        .position(|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "review"))
+        .position(
+            |e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "review"),
+        )
         .unwrap();
-    assert!(canceled_at < terminated_at, "USER_TASK CANCELED precedes TERMINATED");
+    assert!(
+        canceled_at < terminated_at,
+        "USER_TASK CANCELED precedes TERMINATED"
+    );
     assert!(fired.iter().any(|e| matches!(
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "timed-out"
