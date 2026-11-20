@@ -20,8 +20,10 @@
 //! - `carry ref` — spreads a referenced *shape*'s fields; a fused domain
 //!   entity is not resolvable from the model alone, so it contributes nothing
 //!   (undeclared arguments still pass through as process variables).
-//! - `project ref fields` — picks the named fields of a referenced shape, or
-//!   declares them unconstrained (and optional) for a domain entity.
+//! - `project ref fields` — picks the named fields of a referenced shape (a
+//!   field the resolved shape lacks is an invalid projection and fails the
+//!   derivation), or declares them unconstrained (and optional) for a domain
+//!   entity the model alone cannot resolve.
 //!
 //! A reference cycle resolves to an unconstrained object at the point it
 //! closes, so derivation always terminates.
@@ -60,6 +62,10 @@ pub enum SchemaError {
     TooLarge,
     /// The reference nesting exceeded [`MAX_DEPTH`].
     TooDeep,
+    /// A `project` names a field its resolved (locally declared) shape does
+    /// not have: an invalid projection, rejected rather than weakened to an
+    /// unconstrained optional field.
+    UnknownProjectedField,
 }
 
 impl std::fmt::Display for SchemaError {
@@ -71,6 +77,10 @@ impl std::fmt::Display for SchemaError {
                  {MAX_EXPANDED_BYTES} bytes"
             ),
             Self::TooDeep => write!(f, "its shape references nest deeper than {MAX_DEPTH}"),
+            Self::UnknownProjectedField => write!(
+                f,
+                "it projects a field that the referenced shape does not declare"
+            ),
         }
     }
 }
@@ -115,13 +125,22 @@ pub fn shape_json_schema(
     shape_id: &str,
     process_id: Option<&str>,
 ) -> Result<Option<Value>, SchemaError> {
-    let mut index: HashMap<&str, Vec<&ShapeDecl>> = HashMap::new();
+    // Preselect one declaration per id, once: the first declared on
+    // `process_id`, else the first declared at all.
+    let mut index: HashMap<&str, &ShapeDecl> = HashMap::new();
     for s in shapes {
-        index.entry(s.id.as_str()).or_default().push(s);
+        let on_process = s.process.as_deref() == process_id;
+        index
+            .entry(s.id.as_str())
+            .and_modify(|cur| {
+                if on_process && cur.process.as_deref() != process_id {
+                    *cur = s;
+                }
+            })
+            .or_insert(s);
     }
     let resolver = Resolver {
         index,
-        process_id,
         ops: Cell::new(MAX_EXPANDED_OPS),
         bytes: Cell::new(MAX_EXPANDED_BYTES),
         error: Cell::new(None),
@@ -213,10 +232,9 @@ pub const MAX_EXPANDED_BYTES: usize = 1 << 20;
 pub const MAX_DEPTH: usize = 32;
 
 struct Resolver<'a> {
-    /// Every declared shape by id (declaration order), built once per
-    /// derivation so a reference lookup is O(1) in the catalog size.
-    index: HashMap<&'a str, Vec<&'a ShapeDecl>>,
-    process_id: Option<&'a str>,
+    /// The preferred declaration per shape id, selected once per derivation
+    /// so a reference lookup is O(1) in the catalog size (duplicates too).
+    index: HashMap<&'a str, &'a ShapeDecl>,
     /// Remaining op-expansion budget.
     ops: Cell<usize>,
     /// Remaining byte budget.
@@ -227,15 +245,7 @@ struct Resolver<'a> {
 
 impl<'a> Resolver<'a> {
     fn find(&self, id: &str) -> Option<&'a ShapeDecl> {
-        let candidates = self.index.get(id)?;
-        let first = *candidates.first()?;
-        Some(
-            candidates
-                .iter()
-                .copied()
-                .find(|s| s.process.as_deref() == self.process_id)
-                .unwrap_or(first),
-        )
+        self.index.get(id).copied()
     }
 
     fn fail(&self, e: SchemaError) {
@@ -316,9 +326,19 @@ impl<'a> Resolver<'a> {
                         if !self.charge(size) {
                             break;
                         }
-                        match found {
-                            Some((schema, required)) => obj.set(field, schema.clone(), required),
-                            None => obj.set(field, json!({}), false),
+                        match (found, inner.is_some()) {
+                            (Some((schema, required)), _) => {
+                                obj.set(field, schema.clone(), required)
+                            }
+                            // A resolved local shape without the field: the
+                            // projection is invalid; never weaken the contract.
+                            (None, true) => {
+                                self.fail(SchemaError::UnknownProjectedField);
+                                break;
+                            }
+                            // An unresolved (external / fused-domain) type:
+                            // documented pass-through.
+                            (None, false) => obj.set(field, json!({}), false),
                         }
                     }
                 }
@@ -405,6 +425,97 @@ mod tests {
 
     fn shapes_doc(shapes: &str) -> String {
         doc(shapes, ENVELOPE)
+    }
+
+    #[test]
+    fn projecting_a_missing_field_of_a_local_shape_is_rejected() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order">
+                 <nano:extend name="qty" type="integer" />
+                 <nano:project ref="Base" fields="qty" />
+               </nano:shape>
+               <nano:shape id="Base"><nano:extend name="other" type="string" /></nano:shape>"#,
+        );
+        assert_eq!(
+            message_input_schema(&xml, "placeOrder", None),
+            Err(("Order".into(), SchemaError::UnknownProjectedField))
+        );
+    }
+
+    #[test]
+    fn projecting_from_an_unresolved_domain_type_passes_through() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order"><nano:project ref="Customer" fields="tier" /></nano:shape>"#,
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schema,
+            json!({ "type": "object", "properties": { "tier": {} } })
+        );
+    }
+
+    #[test]
+    fn foreign_namespace_shape_is_not_selected() {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                xmlns:vendor="https://example.com/vendor"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders">
+                <bpmn:extensionElements>
+                  <vendor:shape id="Order"><vendor:extend name="bogus" type="string" /></vendor:shape>
+                  <nano:shapes><nano:shape id="Order">
+                    <vendor:extend name="alsoBogus" type="string" />
+                    <nano:extend name="orderId" type="string" />
+                  </nano:shape></nano:shapes>
+                </bpmn:extensionElements>
+              </bpmn:process>
+              <bpmn:message id="m" name="placeOrder">
+                <bpmn:extensionElements><zeebe:properties>{ENVELOPE}</zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+            </bpmn:definitions>"#
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": { "orderId": { "type": "string" } },
+                "required": ["orderId"]
+            })
+        );
+    }
+
+    #[test]
+    fn many_duplicate_ids_off_process_resolve_to_the_first() {
+        // 20,000 same-id declarations on other processes plus 4,000 references:
+        // the preferred declaration is preselected once, keeping the first.
+        let mut shapes = String::from(r#"<nano:shape id="Order">"#);
+        for i in 0..4_000 {
+            shapes.push_str(&format!(r#"<nano:reference name="f{i}" ref="T" />"#));
+        }
+        shapes.push_str("</nano:shape>");
+        let mut xml = shapes_doc(&shapes);
+        let mut others = String::new();
+        others.push_str(r#"<bpmn:process id="p0"><bpmn:extensionElements><nano:shapes><nano:shape id="T"><nano:extend name="first" type="string" /></nano:shape></nano:shapes></bpmn:extensionElements></bpmn:process>"#);
+        for i in 1..20_000 {
+            others.push_str(&format!(r#"<bpmn:process id="p{i}"><bpmn:extensionElements><nano:shapes><nano:shape id="T" /></nano:shapes></bpmn:extensionElements></bpmn:process>"#));
+        }
+        xml = xml.replace(
+            "</bpmn:definitions>",
+            &format!("{others}</bpmn:definitions>"),
+        );
+        let (_, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schema["properties"]["f3999"]["properties"],
+            json!({ "first": { "type": "string" } })
+        );
     }
 
     #[test]

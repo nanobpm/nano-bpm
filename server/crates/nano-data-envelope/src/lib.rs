@@ -22,7 +22,7 @@
 //! Zeebe-pure. It reuses only the engine's generic XML tokenizer
 //! ([`nanobpmn_engine_core::xml`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use nanobpmn_engine_core::xml::{Token, attr, local_name, tokenize};
@@ -203,6 +203,8 @@ struct Accum {
     output_type: Option<String>,
     /// A worker's declared `zeebe:header` keys, in author order (deduped).
     header_keys: Vec<String>,
+    /// Hash index over `header_keys`, so deduplication is linear.
+    header_seen: HashSet<String>,
     /// A start event's event-definition child count: zero at close = a none
     /// start (an envelope carrier); any definition = a typed start whose
     /// envelope lives elsewhere (a message start's on the `bpmn:message`).
@@ -217,6 +219,7 @@ impl Accum {
             input_type: None,
             output_type: None,
             header_keys: Vec::new(),
+            header_seen: HashSet::new(),
             event_defs: 0,
         }
     }
@@ -300,6 +303,10 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     // as siblings of the `nano:shapes` container under a process's extension
     // elements (never inside a `nano:shape`), tagged with the enclosing process.
     let mut meta: Vec<MetaDecl> = Vec::new();
+    // In-scope `xmlns[:prefix]` declarations, one frame per open element, so a
+    // shape-vocabulary element is recognised only in the Nano shapes namespace
+    // (a foreign `vendor:shape` with the same local name is ignored).
+    let mut ns_frames: Vec<Vec<(String, String)>> = Vec::new();
 
     for tok in &tokens {
         match tok {
@@ -309,6 +316,18 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                 self_closing,
             } => {
                 let ln = local_name(name);
+                let frame: Vec<(String, String)> = attrs
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k == "xmlns" {
+                            Some((String::new(), v.clone()))
+                        } else {
+                            k.strip_prefix("xmlns:").map(|p| (p.to_string(), v.clone()))
+                        }
+                    })
+                    .collect();
+                ns_frames.push(frame);
+                let in_nano_ns = namespace_of(name, &ns_frames) == Some(NANO_SHAPES_NS);
                 if cur.is_none() {
                     if SERVICE_TASK_LOCALS.contains(&ln) {
                         // A self-closing service task carries no `taskDefinition`
@@ -373,7 +392,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         "header" if matches!(acc.kind, Kind::Worker) => {
                             if let Some(k) = attr(attrs, "key") {
                                 let k = k.trim();
-                                if !k.is_empty() && !acc.header_keys.iter().any(|e| e == k) {
+                                if !k.is_empty() && acc.header_seen.insert(k.to_string()) {
                                     acc.header_keys.push(k.to_string());
                                 }
                             }
@@ -391,7 +410,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                     process_depth = Some(depth);
                 }
                 if cur_shape.is_none() {
-                    if ln == "shape" {
+                    if ln == "shape" && in_nano_ns {
                         let decl = ShapeDecl {
                             id: shape_attr(attrs, "id").unwrap_or_default(),
                             name: shape_attr(attrs, "name"),
@@ -406,6 +425,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                             cur_shape = Some((depth, decl));
                         }
                     } else if ln == "meta"
+                        && in_nano_ns
                         && let Some(key) = shape_attr(attrs, "key")
                     {
                         // A model-level `nano:meta` sibling of `nano:shapes`. Only
@@ -418,15 +438,19 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         });
                     }
                 } else if let Some((_, decl)) = cur_shape.as_mut()
+                    && in_nano_ns
                     && let Some(op) = parse_shape_op(ln, attrs)
                 {
                     decl.ops.push(op);
                 }
-                if !self_closing {
+                if *self_closing {
+                    ns_frames.pop();
+                } else {
                     depth += 1;
                 }
             }
             Token::End { .. } => {
+                ns_frames.pop();
                 depth = depth.saturating_sub(1);
                 if let Some((open_depth, acc)) = cur.take() {
                     if depth == open_depth {
@@ -456,6 +480,22 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
         meta,
         starts: starts.into_values().collect(),
     }
+}
+
+/// The Nano shapes XML namespace (`xmlns:nano`); shape-vocabulary elements
+/// (`shape`, its ops, `meta`) are recognised only in this namespace.
+pub const NANO_SHAPES_NS: &str = "https://nanobpm.io/schema/shapes/1.0";
+
+/// Resolve the namespace URI of a qualified element name against the in-scope
+/// declaration frames (innermost wins); `None` when the prefix is undeclared.
+fn namespace_of<'a>(name: &str, frames: &'a [Vec<(String, String)>]) -> Option<&'a str> {
+    let prefix = name.split_once(':').map_or("", |(p, _)| p);
+    frames
+        .iter()
+        .rev()
+        .flat_map(|f| f.iter())
+        .find(|(p, _)| p == prefix)
+        .map(|(_, uri)| uri.as_str())
 }
 
 /// Parse one `nano:shape` composition child into a `ShapeOp`. An op missing its
@@ -554,9 +594,11 @@ fn flush(
                 });
             fill(&mut entry.input_type, acc.input_type);
             fill(&mut entry.output_type, acc.output_type);
-            // Union header keys across duplicate task entries, first-seen order.
+            // Union header keys across duplicate task entries, first-seen order
+            // (hash-indexed, so the union is linear in the header count).
+            let mut seen: HashSet<String> = entry.header_keys.iter().cloned().collect();
             for k in acc.header_keys {
-                if !entry.header_keys.contains(&k) {
+                if seen.insert(k.clone()) {
                     entry.header_keys.push(k);
                 }
             }
@@ -634,8 +676,9 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
                 });
             fill(&mut entry.input_type, io.input_type);
             fill(&mut entry.output_type, io.output_type);
+            let mut seen: HashSet<String> = entry.header_keys.iter().cloned().collect();
             for k in io.header_keys {
-                if !entry.header_keys.contains(&k) {
+                if seen.insert(k.clone()) {
                     entry.header_keys.push(k);
                 }
             }
@@ -863,6 +906,47 @@ mod tests {
               </bpmn:extensionElements>
             </bpmn:serviceTask>"#
         )
+    }
+
+    #[test]
+    fn many_distinct_header_keys_dedup_linearly() {
+        let headers: Vec<(String, String)> = (0..9_000)
+            .map(|i| (format!("h{i}"), "v".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let body = format!(
+            "{}{}",
+            task_with_headers("t1", "charge", &refs, IN_ORDER),
+            task_with_headers("t2", "charge", &refs, IN_ORDER)
+        );
+        let ws = workers(&doc(&body));
+        assert_eq!(ws[0].header_keys.len(), 9_000);
+        assert_eq!(ws[0].header_keys[8_999], "h8999");
+    }
+
+    #[test]
+    fn foreign_namespace_shape_vocabulary_is_ignored() {
+        let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:vendor="https://example.com/vendor"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders"><bpmn:extensionElements>
+                <vendor:shape id="S"><vendor:carry ref="X" /></vendor:shape>
+                <vendor:meta key="k" value="v" />
+                <nano:shapes><nano:shape id="S"><vendor:carry ref="Y" /><nano:carry ref="Order" /></nano:shape></nano:shapes>
+              </bpmn:extensionElements></bpmn:process>
+            </bpmn:definitions>"#;
+        let scan = scan_bpmn(xml);
+        assert_eq!(scan.shapes.len(), 1);
+        assert_eq!(
+            scan.shapes[0].ops,
+            vec![ShapeOp::Carry {
+                r#ref: "Order".into()
+            }]
+        );
+        assert!(scan.meta.is_empty());
     }
 
     #[test]
