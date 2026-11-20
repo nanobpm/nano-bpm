@@ -753,14 +753,14 @@ impl<'a> NanoRun<'a> {
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
+        // Every variable the engine's event carries is rendered — the adapter
+        // must NOT drop an equal-value rewrite (it once did, hiding #1537): Zeebe
+        // skips such writes in `VariableBehavior`, so the engine must never emit
+        // them, and a regression has to surface as a trace divergence.
         sorted
             .into_iter()
-            .filter_map(|(name, v)| {
-                let value = to_json(v);
-                let unchanged = self.values.get(&(scope_key, name.clone())) == Some(&value);
-                (!unchanged).then(|| {
-                    self.variable_record(scope_key, scope_label.clone(), name, value, instance)
-                })
+            .map(|(name, v)| {
+                self.variable_record(scope_key, scope_label.clone(), name, to_json(v), instance)
             })
             .collect()
     }

@@ -115,6 +115,9 @@ impl Engine {
         register_under: Option<Key>,
         variables: BTreeMap<String, Value>,
     ) -> Vec<Event> {
+        // `mergeLocalDocument` skips an equal-value write just like the
+        // propagating merge does (#1537).
+        let variables = self.drop_unchanged(instance_key, element_instance_key, variables);
         if variables.is_empty() {
             return Vec::new();
         }

@@ -653,19 +653,71 @@ impl Engine {
         };
         let root = instance.key;
         let target = self.variable_scope_of(instance, target_scope);
+        // Zeebe `VariableBehavior` skips a write whose value equals the one the
+        // destination scope already holds: no VARIABLE record at all (#1537).
+        // Applied here — the single resolver every propagated merge goes
+        // through — so no caller can emit an unchanged write.
+        let unchanged = |dest: Key, name: &str, value: &Value| {
+            Self::value_in_scope(instance, dest, name) == Some(value)
+        };
         // Fast path: local write, or a root-only instance — one scope, no walk.
-        if local {
-            return vec![(target, variables)];
-        }
-        if instance.scope_variables.is_empty() && instance.scope_parents.is_empty() {
-            return vec![(root, variables)];
+        if local || (instance.scope_variables.is_empty() && instance.scope_parents.is_empty()) {
+            let dest = if local { target } else { root };
+            let changed: BTreeMap<String, Value> = variables
+                .into_iter()
+                .filter(|(name, value)| !unchanged(dest, name, value))
+                .collect();
+            return vec![(dest, changed)];
         }
         let mut by_scope: BTreeMap<Key, BTreeMap<String, Value>> = BTreeMap::new();
         for (name, value) in variables {
             let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
+            if unchanged(dest, &name, &value) {
+                continue;
+            }
             by_scope.entry(dest).or_default().insert(name, value);
         }
         by_scope.into_iter().collect()
+    }
+
+    /// `variables` minus every name whose value `scope` already holds
+    /// (directly, not via an ancestor). Zeebe's `VariableBehavior` writes no
+    /// record for an equal-value write (#1537); every engine merge path that
+    /// writes into a known scope filters through here.
+    pub(crate) fn drop_unchanged(
+        &self,
+        instance_key: Key,
+        scope: Key,
+        variables: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return variables;
+        };
+        // The exact scope written — NOT `variable_scope_of`, which would map a
+        // not-yet-registered element scope up to its parent and compare against
+        // a value the write does not replace.
+        let scope = if scope == 0 { instance.key } else { scope };
+        variables
+            .into_iter()
+            .filter(|(name, value)| Self::value_in_scope(instance, scope, name) != Some(value))
+            .collect()
+    }
+
+    /// The value `name` holds directly in `scope` (the root scope reads the
+    /// instance's root variables), without walking ancestors.
+    fn value_in_scope<'a>(
+        instance: &'a crate::state::ProcessInstance,
+        scope: Key,
+        name: &str,
+    ) -> Option<&'a Value> {
+        if scope == instance.key {
+            instance.variables.get(name)
+        } else {
+            instance
+                .scope_variables
+                .get(&scope)
+                .and_then(|m| m.get(name))
+        }
     }
 
     /// The nearest scope (from `scope` upward to the root) that already defines
