@@ -3026,41 +3026,24 @@ impl Engine {
                         // scope yet: register it idempotently, or the local
                         // write below would be unreadable to the rest of the
                         // chain. A registered scope emits nothing.
-                        let scope_registered = self
-                            .state
-                            .instances
-                            .get(&instance_key)
-                            .map(|i| i.scope_parents.contains_key(&element_instance_key))
-                            .unwrap_or(false);
-                        if !scope_registered {
-                            self.emit(
-                                &mut log,
-                                Event::VariableScopeCreated {
-                                    instance_key,
-                                    scope_key: element_instance_key,
-                                    parent_scope_key: self
-                                        .scope_of(instance_key, element_instance_key),
-                                },
-                            );
+                        for event in self.local_element_variable_events(
+                            instance_key,
+                            element_instance_key,
+                            variables,
+                        ) {
+                            self.emit(&mut log, event);
                         }
-                        self.emit(
-                            &mut log,
-                            Event::ScopedVariablesUpdated {
-                                instance_key,
-                                scope_key: element_instance_key,
-                                variables,
-                            },
-                        );
                     } else {
-                        // Job result variables propagate from the task's enclosing
-                        // (flow) scope upward — each name updates the nearest ancestor
-                        // scope that defines it, defaulting to root. For a root-only
-                        // instance this collapses to the flat `VariablesUpdated`,
-                        // byte-identical to the pre-scoping engine.
-                        let flow_scope = self.completion_scope(instance_key, element_instance_key);
-                        for event in
-                            self.propagated_updates(instance_key, flow_scope, variables, false)
-                        {
+                        // Job result variables: task-local when the element has
+                        // output mappings (#1533), otherwise propagated from the
+                        // task's flow scope upward (see
+                        // `completion_variable_events`).
+                        for event in self.completion_variable_events(
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            variables,
+                        ) {
                             self.emit(&mut log, event);
                         }
                     }
@@ -3421,13 +3404,15 @@ impl Engine {
                         },
                     );
                     if !variables.is_empty() {
-                        // User-task completion variables propagate from the task's
-                        // enclosing (flow) scope upward, defaulting to root (flat
-                        // `VariablesUpdated` for a root-only instance).
-                        let flow_scope = self.completion_scope(instance_key, element_instance_key);
-                        for event in
-                            self.propagated_updates(instance_key, flow_scope, variables, false)
-                        {
+                        // User-task completion variables: task-local when the
+                        // element has output mappings (#1533), otherwise
+                        // propagated from the task's flow scope upward.
+                        for event in self.completion_variable_events(
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            variables,
+                        ) {
                             self.emit(&mut log, event);
                         }
                     }
@@ -16087,9 +16072,12 @@ impl Engine {
             crate::model::TaskListenerEventType::Completing
         ) && !pending.variables.is_empty()
         {
-            let flow_scope = self.scope_of(instance_key, element_instance_key);
-            let var_events =
-                self.propagated_updates(instance_key, flow_scope, pending.variables, false);
+            let var_events = self.completion_variable_events(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                pending.variables,
+            );
             // Insert variable merges just before the completion event so the
             // completing token sees them.
             let insert_at = events
