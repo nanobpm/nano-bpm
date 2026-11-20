@@ -1964,3 +1964,102 @@ fn a_process_only_redeploy_with_a_missing_deployment_bound_linked_resource_is_a_
         "the process is never re-versioned by an unrepairable binding"
     );
 }
+
+/// Issue #1528 regression — a multi-instance on a DIRECT user task must create
+/// one user task per child and park each child on it, rather than completing
+/// the children immediately. Completing each task feeds the loop's
+/// `outputElement` (resolved in the child's completion scope) into the
+/// `outputCollection`, and the instance only completes after every task.
+fn direct_mi_user_task_process(sequential: bool) -> crate::model::ProcessDefinition {
+    ProcessBuilder::new("mi_review")
+        .start_event("start")
+        .user_task("review")
+        .with_multi_instance(
+            "review",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=decision".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap()
+}
+
+fn created_user_tasks(events: &[Event]) -> Vec<Key> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn direct_mi_user_task_creates_a_task_per_child_and_collects_output_element() {
+    for sequential in [false, true] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(direct_mi_user_task_process(
+                sequential,
+            )))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "mi_review",
+                vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let mut pending = created_user_tasks(&created);
+        assert_eq!(
+            pending.len(),
+            if sequential { 1 } else { 2 },
+            "each active MI child must park on its own user task (sequential={sequential})"
+        );
+        assert!(!engine.is_completed(key));
+
+        let mut n = 0;
+        while let Some(task) = pending.first().copied() {
+            pending.remove(0);
+            n += 1;
+            let done = engine
+                .apply_command(Command::complete_user_task_with(
+                    task,
+                    vars(&[("decision", Value::Int(n * 10))]),
+                ))
+                .unwrap();
+            pending.extend(created_user_tasks(&done));
+        }
+        assert_eq!(
+            n, 2,
+            "exactly one user task per item (sequential={sequential})"
+        );
+        // The body drained and the token parked on the sink task, so the
+        // aggregate is observable on the still-running instance.
+        assert!(!engine.is_completed(key));
+        assert!(
+            engine
+                .state()
+                .jobs
+                .values()
+                .any(|j| j.job_type == "sink-work"),
+            "token advanced past the MI body (sequential={sequential})"
+        );
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("results"),
+            Some(&Value::List(vec![Value::Int(10), Value::Int(20)])),
+            "outputElement collected per child (sequential={sequential})"
+        );
+    }
+}

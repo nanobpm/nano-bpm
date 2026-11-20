@@ -9511,157 +9511,16 @@ impl Engine {
             // expressions declared on the element are resolved against the
             // element's scoped view at creation time.
             Some(ElementKind::UserTask(props)) => {
-                // Zeebe `BpmnUserTaskBehavior.evaluateUserTaskExpressions`: any
-                // failure is an EXTRACT_VALUE_ERROR and no task is created.
-                let ResolvedUserTask {
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                } = self.resolve_user_task_props(&element_vars, &props)?;
-                let user_task_key = self.mint_key();
-                // Resolve the form linkage, enforcing the Zeebe invariant that
-                // `formId` and `externalReference` are mutually exclusive (an
-                // external reference wins and suppresses `form_key` resolution)
-                // and dispatching on the declared binding (Zeebe
-                // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
-                // `deployment`/`versionTag` miss raises a resolvable incident
-                // and creates no task: the element stays parked in ACTIVATING
-                // (the token only advances on task completion) and resolving
-                // the incident re-runs the activation body.
-                let (form_key, external_form_reference) =
-                    match self.resolve_user_task_form_linkage(instance_key, &props) {
-                        crate::engine::resolve::FormLinkage::Unbound {
-                            external_form_reference,
-                        } => (None, external_form_reference),
-                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
-                            (Some(form_key), None)
-                        }
-                        crate::engine::resolve::FormLinkage::Miss { reason } => {
-                            events.push(Event::IncidentRaised {
-                                incident_key: self.mint_key(),
-                                instance_key,
-                                element_instance_key,
-                                element_id: element_id.clone(),
-                                kind: state::IncidentKind::CalledElementError,
-                                // The form lookup runs AFTER the element's input
-                                // mappings and `start` listeners already succeeded
-                                // (#1193 review): resolution must re-run ONLY the
-                                // activation body, never re-apply the (possibly
-                                // non-idempotent, e.g. `=counter + 1 -> counter`)
-                                // inputs or re-fire the completed start listeners.
-                                // `gate_activated` re-tags this
-                                // `ActivationBodyPending` and withholds
-                                // `ElementActivated` when the token is still
-                                // ACTIVATING.
-                                redrive: Some(state::IoMappingRedrive::ActivationBody),
-                                reason,
-                                job_key: None,
-                                created_at: self.now,
-                            });
-                            return Ok((events, followups));
-                        }
-                    };
-                // An initial assignee (zeebe:assignmentDefinition) must fire the
-                // `assigning` listeners exactly as a runtime assign does (Zeebe
-                // parity: the assignee is stripped off the CREATED record and
-                // routed through an assigning transition once the task is
-                // available). With no assigning listeners the assignee stays on
-                // CREATED, keeping listener-free/plain-assignee tasks
-                // byte-identical.
-                let has_assigning_listeners = !self
-                    .task_listeners_of(
-                        instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Assigning,
-                    )
-                    .is_empty();
-                let route_initial_assignee = assignee.is_some() && has_assigning_listeners;
-                let (created_assignee, deferred_initial_assignee) = if route_initial_assignee {
-                    (None, assignee)
-                } else {
-                    (assignee, None)
-                };
-                events.push(Event::UserTaskCreated {
-                    user_task_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    created_at: self.now,
-                    assignee: created_assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                    form_key,
-                    external_form_reference,
-                });
-                // Creating task listeners (ADR 0037 §6): the task record exists
-                // but is not yet available for work until the creating chain
-                // drains. The pending transition blocks assign/complete/update
-                // meanwhile. Listener-free user tasks skip this entirely.
-                let creating = self.task_listeners_of(
+                if !self.activate_user_task(
+                    &mut events,
                     instance_key,
                     &element_id,
-                    crate::model::TaskListenerEventType::Creating,
-                );
-                if let Some(first) = creating.first().cloned() {
-                    let pending = state::PendingUserTaskTransition {
-                        event_type: crate::model::TaskListenerEventType::Creating,
-                        // Carried through the creating chain, then routed into an
-                        // assigning transition when creating drains.
-                        assignee: deferred_initial_assignee,
-                        update: None,
-                        variables: std::collections::BTreeMap::new(),
-                        corrections: crate::model::UserTaskCorrections::default(),
-                    };
-                    events.extend(self.start_task_listener_chain(
-                        user_task_key,
-                        instance_key,
-                        element_instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Creating,
-                        pending,
-                        &first,
-                        // The task's input mappings were staged but not yet
-                        // applied when this chain starts: the first listener's
-                        // `type`/`retries` resolve against the post-input view
-                        // (#1398 review).
-                        Some(&element_vars),
-                    ));
-                } else if let Some(initial) = deferred_initial_assignee {
-                    // No creating listeners: the task is available at once, so the
-                    // initial assignee's assigning transition starts immediately.
-                    let assigning = self.task_listeners_of(
-                        instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Assigning,
-                    );
-                    if let Some(first) = assigning.first().cloned() {
-                        let pending = state::PendingUserTaskTransition {
-                            event_type: crate::model::TaskListenerEventType::Assigning,
-                            assignee: Some(initial),
-                            update: None,
-                            variables: std::collections::BTreeMap::new(),
-                            corrections: crate::model::UserTaskCorrections::default(),
-                        };
-                        events.extend(self.start_task_listener_chain(
-                            user_task_key,
-                            instance_key,
-                            element_instance_key,
-                            &element_id,
-                            crate::model::TaskListenerEventType::Assigning,
-                            pending,
-                            &first,
-                            // Same staged post-input view as the creating chain
-                            // above (the initial assignee's assigning chain also
-                            // starts before the input writes land).
-                            Some(&element_vars),
-                        ));
-                    }
+                    element_instance_key,
+                    &element_vars,
+                    &props,
+                    state::IoMappingRedrive::ActivationBody,
+                )? {
+                    return Ok((events, followups));
                 }
                 self.arm_boundaries_preserving_host(
                     &mut events,
@@ -10542,7 +10401,14 @@ impl Engine {
         child_vars: &BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
-        match self.try_mi_child_behaviour(instance_key, element_id.clone(), child_key, child_vars) {
+        match self.try_mi_child_behaviour(
+            instance_key,
+            element_id.clone(),
+            body_key,
+            child_key,
+            child_index,
+            child_vars,
+        ) {
             Ok(planned) => planned,
             Err(failure) => {
                 self.next_local = key_mark;
@@ -10561,11 +10427,187 @@ impl Engine {
         }
     }
 
+    /// Creates the user task for an activated `userTask` element instance —
+    /// resolving its assignment/scheduling/priority expressions and form
+    /// linkage against `element_vars`, emitting `UserTaskCreated`, and starting
+    /// the creating (or initial-assigning) task-listener chain. Shared by the
+    /// normal activation path and multi-instance children (#1528) so both
+    /// create the identical record. Boundary arming is the caller's concern.
+    ///
+    /// Returns `Ok(false)` when a form-linkage miss raised an incident (tagged
+    /// with `form_miss_redrive`) and no task was created.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_user_task(
+        &mut self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: &str,
+        element_instance_key: Key,
+        element_vars: &BTreeMap<String, Value>,
+        props: &crate::model::UserTaskProps,
+        form_miss_redrive: state::IoMappingRedrive,
+    ) -> Result<bool, expression::Failure> {
+        // Zeebe `BpmnUserTaskBehavior.evaluateUserTaskExpressions`: any
+        // failure is an EXTRACT_VALUE_ERROR and no task is created.
+        let ResolvedUserTask {
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+        } = self.resolve_user_task_props(element_vars, props)?;
+        let user_task_key = self.mint_key();
+        // Resolve the form linkage, enforcing the Zeebe invariant that
+        // `formId` and `externalReference` are mutually exclusive (an
+        // external reference wins and suppresses `form_key` resolution)
+        // and dispatching on the declared binding (Zeebe
+        // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
+        // `deployment`/`versionTag` miss raises a resolvable incident
+        // and creates no task: the element stays parked in ACTIVATING
+        // (the token only advances on task completion) and resolving
+        // the incident re-runs the activation body.
+        let (form_key, external_form_reference) = match self
+            .resolve_user_task_form_linkage(instance_key, props)
+        {
+            crate::engine::resolve::FormLinkage::Unbound {
+                external_form_reference,
+            } => (None, external_form_reference),
+            crate::engine::resolve::FormLinkage::Resolved { form_key } => (Some(form_key), None),
+            crate::engine::resolve::FormLinkage::Miss { reason } => {
+                events.push(Event::IncidentRaised {
+                    incident_key: self.mint_key(),
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    kind: state::IncidentKind::CalledElementError,
+                    // The form lookup runs AFTER the element's input
+                    // mappings and `start` listeners already succeeded
+                    // (#1193 review): resolution must re-run ONLY the
+                    // activation body, never re-apply the (possibly
+                    // non-idempotent, e.g. `=counter + 1 -> counter`)
+                    // inputs or re-fire the completed start listeners.
+                    // `gate_activated` re-tags this
+                    // `ActivationBodyPending` and withholds
+                    // `ElementActivated` when the token is still
+                    // ACTIVATING.
+                    redrive: Some(form_miss_redrive),
+                    reason,
+                    job_key: None,
+                    created_at: self.now,
+                });
+                return Ok(false);
+            }
+        };
+        // An initial assignee (zeebe:assignmentDefinition) must fire the
+        // `assigning` listeners exactly as a runtime assign does (Zeebe
+        // parity: the assignee is stripped off the CREATED record and
+        // routed through an assigning transition once the task is
+        // available). With no assigning listeners the assignee stays on
+        // CREATED, keeping listener-free/plain-assignee tasks
+        // byte-identical.
+        let has_assigning_listeners = !self
+            .task_listeners_of(
+                instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Assigning,
+            )
+            .is_empty();
+        let route_initial_assignee = assignee.is_some() && has_assigning_listeners;
+        let (created_assignee, deferred_initial_assignee) = if route_initial_assignee {
+            (None, assignee)
+        } else {
+            (assignee, None)
+        };
+        events.push(Event::UserTaskCreated {
+            user_task_key,
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            created_at: self.now,
+            assignee: created_assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+            form_key,
+            external_form_reference,
+        });
+        // Creating task listeners (ADR 0037 §6): the task record exists
+        // but is not yet available for work until the creating chain
+        // drains. The pending transition blocks assign/complete/update
+        // meanwhile. Listener-free user tasks skip this entirely.
+        let creating = self.task_listeners_of(
+            instance_key,
+            element_id,
+            crate::model::TaskListenerEventType::Creating,
+        );
+        if let Some(first) = creating.first().cloned() {
+            let pending = state::PendingUserTaskTransition {
+                event_type: crate::model::TaskListenerEventType::Creating,
+                // Carried through the creating chain, then routed into an
+                // assigning transition when creating drains.
+                assignee: deferred_initial_assignee,
+                update: None,
+                variables: std::collections::BTreeMap::new(),
+                corrections: crate::model::UserTaskCorrections::default(),
+            };
+            events.extend(self.start_task_listener_chain(
+                user_task_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Creating,
+                pending,
+                &first,
+                // The task's input mappings were staged but not yet
+                // applied when this chain starts: the first listener's
+                // `type`/`retries` resolve against the post-input view
+                // (#1398 review).
+                Some(element_vars),
+            ));
+        } else if let Some(initial) = deferred_initial_assignee {
+            // No creating listeners: the task is available at once, so the
+            // initial assignee's assigning transition starts immediately.
+            let assigning = self.task_listeners_of(
+                instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Assigning,
+            );
+            if let Some(first) = assigning.first().cloned() {
+                let pending = state::PendingUserTaskTransition {
+                    event_type: crate::model::TaskListenerEventType::Assigning,
+                    assignee: Some(initial),
+                    update: None,
+                    variables: std::collections::BTreeMap::new(),
+                    corrections: crate::model::UserTaskCorrections::default(),
+                };
+                events.extend(self.start_task_listener_chain(
+                    user_task_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    crate::model::TaskListenerEventType::Assigning,
+                    pending,
+                    &first,
+                    // Same staged post-input view as the creating chain
+                    // above (the initial assignee's assigning chain also
+                    // starts before the input writes land).
+                    Some(element_vars),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     fn try_mi_child_behaviour(
         &mut self,
         instance_key: Key,
         element_id: String,
+        body_key: Key,
         child_key: Key,
+        child_index: usize,
         child_vars: &BTreeMap<String, Value>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let mut events = Vec::new();
@@ -10744,6 +10786,26 @@ impl Engine {
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
+            }
+            // A multi-instance child that is a USER TASK creates its own user
+            // task and parks on it — exactly like a normally-activated user task
+            // (see `try_activation_body`), minus the per-child boundary arming
+            // (boundaries live on the body). Completing the task routes the child
+            // back through `complete` → `complete_mi_child` (#1528). A form
+            // linkage miss re-runs only this child's behaviour on resolve.
+            Some(ElementKind::UserTask(props)) => {
+                self.activate_user_task(
+                    &mut events,
+                    instance_key,
+                    &element_id,
+                    child_key,
+                    child_vars,
+                    &props,
+                    state::IoMappingRedrive::MiChildBehaviour {
+                        body_key,
+                        index: child_index,
+                    },
+                )?;
             }
             _ => {
                 followups.push(Step::Complete {

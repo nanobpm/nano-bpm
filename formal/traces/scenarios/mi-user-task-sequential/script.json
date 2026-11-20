@@ -1,0 +1,26 @@
+{
+  "description": "#1528: a sequential multi-instance on a direct zeebe:userTask creates one user task per child and parks on it (no immediate child completion); completing each task feeds outputElement into outputCollection, and the body completes after the last child.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "mi-user-task-sequential",
+      "variables": {
+        "items": [1, 2]
+      }
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review",
+      "variables": {
+        "decision": "a"
+      }
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review",
+      "variables": {
+        "decision": "b"
+      }
+    }
+  ]
+}

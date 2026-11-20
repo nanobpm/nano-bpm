@@ -524,6 +524,10 @@ struct NanoRun<'a> {
     /// adapter renders Zeebe's records from them. Only bodies NAMING an
     /// `outputCollection` appear here.
     mi_output: BTreeMap<Key, (String, Vec<J>)>,
+    /// Each multi-instance body's `inputElement` name: Zeebe creates the
+    /// child's `inputElement` variable FIRST, then the `outputElement` seed,
+    /// then `loopCounter` (#1528), so the child renderer needs it to order.
+    mi_input_element: BTreeMap<Key, String>,
 }
 
 fn event(value_type: &str, intent: &str, value: J) -> J {
@@ -566,6 +570,7 @@ impl<'a> NanoRun<'a> {
             known: BTreeMap::new(),
             values: BTreeMap::new(),
             mi_output: BTreeMap::new(),
+            mi_input_element: BTreeMap::new(),
         }
     }
 
@@ -811,12 +816,25 @@ impl<'a> NanoRun<'a> {
         child_key: Key,
         scope_label: String,
         vars: &BTreeMap<String, Value>,
+        input_element: Option<&str>,
         instance: Key,
     ) -> Vec<J> {
+        // Zeebe's order (as captured in the `mi-user-task-sequential` golden):
+        // the `inputElement` binding, then the remaining seeds (the
+        // `outputElement` nil seed), then `loopCounter` last.
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
         let mut out = Vec::new();
+        if let Some((name, v)) = input_element.and_then(|n| vars.get_key_value(n)) {
+            out.push(self.variable_record(
+                child_key,
+                scope_label.clone(),
+                name,
+                to_json(v),
+                instance,
+            ));
+        }
         for (name, v) in &sorted {
-            if name.as_str() == "loopCounter" {
+            if name.as_str() == "loopCounter" || Some(name.as_str()) == input_element {
                 continue;
             }
             out.push(self.variable_record(
@@ -1073,9 +1091,13 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 body_key,
                 items,
+                input_element,
                 output_collection,
                 ..
             } => {
+                if let Some(name) = input_element {
+                    self.mi_input_element.insert(*body_key, name.clone());
+                }
                 // The authoritative body key (its lifecycle events carry the
                 // ACTIVITY's element id, shared with the task children, so the
                 // type lookup alone cannot label it). Normally already recorded
@@ -1155,16 +1177,24 @@ impl<'a> NanoRun<'a> {
             // `loopCounter`) are Zeebe VARIABLE CREATED records on the child.
             Event::MultiInstanceChildActivated {
                 instance_key,
+                body_key,
                 child_key,
                 local_variables,
                 ..
             } => {
+                let input_element = self.mi_input_element.get(body_key).cloned();
                 let scope = self
                     .element_ids
                     .get(child_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{child_key}"));
-                self.render_mi_child_variables(*child_key, scope, local_variables, *instance_key)
+                self.render_mi_child_variables(
+                    *child_key,
+                    scope,
+                    local_variables,
+                    input_element.as_deref(),
+                    *instance_key,
+                )
             }
             // A multi-instance child's completion records its output at `index`
             // in the body's `outputCollection`: Zeebe writes the updated
